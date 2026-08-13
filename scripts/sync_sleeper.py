@@ -91,6 +91,7 @@ def build_players_index(needed_ids):
         index[pid] = {
             "name": name,
             "position": p.get("position"),
+            "fantasy_positions": p.get("fantasy_positions") or [],
             "team": p.get("team"),
             "age": p.get("age"),
             "status": p.get("status"),
@@ -98,14 +99,17 @@ def build_players_index(needed_ids):
         }
 
     if missing:
+        # DEF/team-defense entries use team abbreviations (e.g. "DET") as
+        # their "player_id" instead of a numeric ID, and aren't in the
+        # players dump the same way. Handle those, log anything else.
         for pid in missing:
             if pid.isalpha() and len(pid) <= 3:
-                index[pid] = {"name": f"{pid} DEF", "position": "DEF", "team": pid,
-                               "age": None, "status": None, "injury_status": None}
+                index[pid] = {"name": f"{pid} DEF", "position": "DEF", "fantasy_positions": ["DEF"],
+                               "team": pid, "age": None, "status": None, "injury_status": None}
             else:
                 print(f"WARNING: player_id {pid} not found in players pool")
-                index[pid] = {"name": f"Unknown ({pid})", "position": None, "team": None,
-                               "age": None, "status": None, "injury_status": None}
+                index[pid] = {"name": f"Unknown ({pid})", "position": None, "fantasy_positions": [],
+                               "team": None, "age": None, "status": None, "injury_status": None}
 
     return index
 
