@@ -61,23 +61,26 @@ def load_players_cache():
     return cache
 
 
-def build_players_index(needed_ids):
+def load_or_fetch_full_pool():
+    """Return the full Sleeper /players/nfl dump (thousands of players),
+    using the 20h cache if fresh, else pulling fresh and re-caching."""
+    cache = load_players_cache()
+    if cache is not None:
+        return cache["players"]
+    print("Players cache stale or missing — pulling full /players/nfl dump (~5MB)...")
+    pool = fetch_json(f"{BASE}/players/nfl")
+    with open(os.path.join(DATA_DIR, "players_cache.json"), "w") as f:
+        json.dump({"_fetched_at": time.time(), "players": pool}, f)
+    print(f"Cached {len(pool)} players.")
+    return pool
+
+
+def build_players_index(needed_ids, pool):
     """
     Return {player_id: {name, position, team, age}} for exactly the IDs we
     need (every player who appears in any roster, taxi, or reserve slot this
-    run). Reuses the cached full dump if it's fresh enough; otherwise pulls
-    the full /players/nfl dump once and re-caches it.
+    run), given an already-loaded full player pool.
     """
-    cache = load_players_cache()
-    if cache is not None:
-        pool = cache["players"]
-    else:
-        print("Players cache stale or missing — pulling full /players/nfl dump (~5MB)...")
-        pool = fetch_json(f"{BASE}/players/nfl")
-        with open(os.path.join(DATA_DIR, "players_cache.json"), "w") as f:
-            json.dump({"_fetched_at": time.time(), "players": pool}, f)
-        print(f"Cached {len(pool)} players.")
-
     index = {}
     missing = []
     for pid in needed_ids:
@@ -112,6 +115,53 @@ def build_players_index(needed_ids):
                                "team": None, "age": None, "status": None, "injury_status": None}
 
     return index
+
+
+# Sleeper's fine-grained position labels, collapsed to the buckets this
+# tool's scoring model actually uses (mirrors normalizePos() in the JS
+# tool, kept in sync manually since this is a separate Python script).
+POS_BUCKET = {
+    "DE": "DL", "DT": "DL", "DL": "DL", "OLB": "LB", "ILB": "LB", "LB": "LB",
+    "CB": "DB", "S": "DB", "SS": "DB", "FS": "DB", "DB": "DB",
+    "QB": "QB", "RB": "RB", "WR": "WR", "TE": "TE",
+}
+
+
+def compute_free_agents(pool, rostered_ids):
+    """
+    Full player pool minus everyone rostered on any of the 12 teams,
+    filtered to fantasy-relevant positions with a real current NFL team
+    (excludes retired/out-of-league players, kickers, team defenses, and
+    anyone Sleeper doesn't have an active NFL team on file for). Computed
+    server-side here rather than shipping the full ~5MB raw dump to a
+    browser and filtering client-side — this file stays a few hundred
+    entries, not thousands.
+    """
+    free_agents = []
+    for pid, p in pool.items():
+        if pid in rostered_ids:
+            continue
+        if not p.get("team"):
+            continue
+        raw_pos = p.get("position")
+        bucket = POS_BUCKET.get(raw_pos)
+        if not bucket:
+            continue
+        first = p.get("first_name") or ""
+        last = p.get("last_name") or ""
+        name = (first + " " + last).strip() or p.get("full_name") or f"Player {pid}"
+        free_agents.append({
+            "player_id": pid,
+            "name": name,
+            "pos": bucket,
+            "raw_position": raw_pos,
+            "team": p.get("team"),
+            "age": p.get("age"),
+            "status": p.get("status"),
+            "injury_status": p.get("injury_status"),
+        })
+    return free_agents
+
 
 
 def resolve_roster(roster, players_index):
@@ -158,7 +208,8 @@ def main():
     needed_ids = set()
     for r in rosters_raw:
         needed_ids.update(r.get("players") or [])
-    players_index = build_players_index(needed_ids)
+    full_pool = load_or_fetch_full_pool()
+    players_index = build_players_index(needed_ids, full_pool)
 
     resolved_rosters = []
     my_roster = None
@@ -170,6 +221,12 @@ def main():
         resolved_rosters.append(resolved)
         if owner.get("username") == config.get("my_username"):
             my_roster = resolved
+
+    free_agents = compute_free_agents(full_pool, needed_ids)
+    with open(os.path.join(DATA_DIR, "free_agents.json"), "w") as f:
+        json.dump({"synced_at": time.time(), "league_id": league_id,
+                    "count": len(free_agents), "free_agents": free_agents}, f, indent=2)
+    print(f"Wrote free_agents.json ({len(free_agents)} unrostered fantasy-relevant players)")
 
     with open(os.path.join(DATA_DIR, "league_rosters.json"), "w") as f:
         json.dump({"synced_at": time.time(), "league_id": league_id,
