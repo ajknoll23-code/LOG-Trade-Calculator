@@ -126,6 +126,38 @@ POS_BUCKET = {
     "QB": "QB", "RB": "RB", "WR": "WR", "TE": "TE",
 }
 
+# Kept in sync manually with POSITION_WEIGHT in trade-desk.html — only the
+# values that matter for picking between DL/LB/DB eligible positions need
+# to be accurate here, not the full set.
+POSITION_WEIGHT = {"QB": 1.30, "RB": 0.89, "WR": 1.00, "TE": 0.82, "DL": 0.81, "LB": 1.17, "DB": 1.00}
+
+
+def pick_best_position(fantasy_positions, fallback_raw_pos):
+    """
+    Python port of pickBestPosition() in trade-desk.html — MUST stay
+    logically identical, or free_agents.json's position bucketing silently
+    drifts from PLAYER_DB's, breaking the position-verified name-collision
+    check in the free agent board for any dual-eligible player. Found this
+    the hard way 2026-08-14: the first version of this script used only
+    the single raw `position` field, while PLAYER_DB assigns dual DL/LB
+    eligible players (a lot of real EDGE defenders) to whichever bucket
+    currently scores higher — collapsing "real data" matches from 246 down
+    to 4, almost entirely wiping out DL/LB/DB specifically, because that's
+    exactly the class of player this mismatch hits.
+    """
+    if not fantasy_positions:
+        return POS_BUCKET.get(fallback_raw_pos)
+    eligible = []
+    for fp in fantasy_positions:
+        bucket = POS_BUCKET.get(fp)
+        if bucket and bucket not in eligible:
+            eligible.append(bucket)
+    if not eligible:
+        return POS_BUCKET.get(fallback_raw_pos)
+    if len(eligible) == 1:
+        return eligible[0]
+    return max(eligible, key=lambda p: POSITION_WEIGHT.get(p, 0))
+
 
 def compute_free_agents(pool, rostered_ids):
     """
@@ -144,7 +176,7 @@ def compute_free_agents(pool, rostered_ids):
         if not p.get("team"):
             continue
         raw_pos = p.get("position")
-        bucket = POS_BUCKET.get(raw_pos)
+        bucket = pick_best_position(p.get("fantasy_positions"), raw_pos)
         if not bucket:
             continue
         first = p.get("first_name") or ""
