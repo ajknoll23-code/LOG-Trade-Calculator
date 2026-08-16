@@ -218,6 +218,48 @@ def resolve_roster(roster, players_index):
     }
 
 
+def compute_roster_changes(data_dir, new_rosters):
+    """
+    Diff the new roster pull against whatever league_rosters.json already
+    exists on disk from the previous sync, to catch real mid-cycle trades/
+    adds without needing a dedicated historical database — just compares
+    today's pull to yesterday's. Returns [] on a true first run (nothing
+    to diff against yet) rather than flagging every single player as
+    "new," which would be noise, not signal.
+    """
+    old_path = os.path.join(data_dir, "league_rosters.json")
+    if not os.path.exists(old_path):
+        return []
+    try:
+        with open(old_path) as f:
+            old_data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return []
+
+    def flatten(rosters):
+        mapping = {}
+        for r in rosters:
+            for slot in ("starters", "bench", "taxi", "reserve_ir"):
+                for p in r.get(slot) or []:
+                    mapping[p["player_id"]] = {"roster_id": r["roster_id"], "team_name": r.get("team_name"), "name": p.get("name")}
+        return mapping
+
+    old_map = flatten(old_data.get("rosters") or [])
+    new_map = flatten(new_rosters)
+
+    changes = []
+    for pid, new_info in new_map.items():
+        old_info = old_map.get(pid)
+        if old_info is None:
+            continue  # can't distinguish "just added from free agency" from "first time this player appears in a roster we track" without more history -- skip rather than guess
+        if old_info["roster_id"] != new_info["roster_id"]:
+            changes.append({
+                "player_id": pid, "name": new_info["name"],
+                "old_team": old_info["team_name"], "new_team": new_info["team_name"],
+            })
+    return changes
+
+
 def main():
     os.makedirs(DATA_DIR, exist_ok=True)
     config = load_config()
@@ -260,9 +302,15 @@ def main():
                     "count": len(free_agents), "free_agents": free_agents}, f, indent=2)
     print(f"Wrote free_agents.json ({len(free_agents)} unrostered fantasy-relevant players)")
 
+    roster_changes = compute_roster_changes(DATA_DIR, resolved_rosters)
+    if roster_changes:
+        print(f"Detected {len(roster_changes)} mid-cycle roster change(s) since the last sync:")
+        for c in roster_changes:
+            print(f"  {c['name']}: {c['old_team']} -> {c['new_team']}")
+
     with open(os.path.join(DATA_DIR, "league_rosters.json"), "w") as f:
         json.dump({"synced_at": time.time(), "league_id": league_id,
-                    "rosters": resolved_rosters}, f, indent=2)
+                    "rosters": resolved_rosters, "recent_changes": roster_changes}, f, indent=2)
 
     if my_roster is not None:
         with open(os.path.join(DATA_DIR, "my_roster.json"), "w") as f:
