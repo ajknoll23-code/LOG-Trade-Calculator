@@ -2901,6 +2901,95 @@ function confirmTeamSelection(){
    league's roster_positions ever change. */
 const POSITION_TARGET_DEPTH = { QB:4, RB:5, WR:5, TE:4, DL:5, LB:5, DB:5 };
 
+/* ---------- Team Utility: real lineup optimization, not a label ----------
+   Added 2026-08-16. Deliberately separate from playerValue() — a player's
+   fundamental value never changes based on who owns him. This answers a
+   genuinely different question: how much does adding THIS player actually
+   improve a SPECIFIC roster's starting lineup, accounting for real slot
+   constraints (Superflex, WR/TE/QB flex, 2 IDP_FLEX, dual eligibility) —
+   not just "his value is 80, so utility is roughly 80."
+   Uses a greedy most-constrained-slot-first assignment, not a formally
+   proven optimal solver (true optimal is a bipartite matching problem).
+   For this roster's slot structure — mostly single-position slots plus a
+   few flexible ones — greedy-by-most-restrictive gets very close to true
+   optimal and is dramatically simpler to verify correct in a single JS
+   file. Flagged here explicitly rather than quietly presented as
+   "the" optimal lineup. */
+const LINEUP_SLOTS = [
+  { name:'QB',  eligible:['QB'] },
+  { name:'RB1', eligible:['RB'] },
+  { name:'RB2', eligible:['RB'] },
+  { name:'WR1', eligible:['WR'] },
+  { name:'WR2', eligible:['WR'] },
+  { name:'TE',  eligible:['TE'] },
+  { name:'FLEX',      eligible:['WR','TE','QB'] },
+  { name:'SUPERFLEX', eligible:['QB','RB','WR','TE'] },
+  { name:'DL1', eligible:['DL'] },
+  { name:'DL2', eligible:['DL'] },
+  { name:'LB1', eligible:['LB'] },
+  { name:'LB2', eligible:['LB'] },
+  { name:'DB1', eligible:['DB'] },
+  { name:'DB2', eligible:['DB'] },
+  { name:'IDP_FLEX1', eligible:['DL','LB','DB'] },
+  { name:'IDP_FLEX2', eligible:['DL','LB','DB'] },
+];
+
+/* Given an array of {key, pos, val} player objects, assign them to legal
+   lineup slots (most-restrictive slots first — e.g. QB before SUPERFLEX,
+   single-position slots before the IDP_FLEX pair) and return the optimal
+   lineup found plus its total value. */
+function optimizeLineup(players){
+  const slotsByConstraint = [...LINEUP_SLOTS].sort((a,b) => a.eligible.length - b.eligible.length);
+  const available = [...players].sort((a,b) => b.val - a.val);
+  const used = new Set();
+  const lineup = [];
+  let total = 0;
+
+  for(const slot of slotsByConstraint){
+    let best = null;
+    for(const p of available){
+      if(used.has(p.key)) continue;
+      if(!slot.eligible.includes(p.pos)) continue;
+      best = p;
+      break; // available is value-sorted descending, first eligible = best
+    }
+    if(best){
+      used.add(best.key);
+      lineup.push({ slot: slot.name, ...best });
+      total += best.val;
+    }
+  }
+  return { lineup, total, startersFilled: lineup.length, slotsTotal: LINEUP_SLOTS.length };
+}
+
+/* The actual Team Utility calculation: optimize the roster's lineup before
+   and after hypothetically adding one player, and return the marginal
+   gain. This is real lineup-aware marginal value (option B from the
+   design doc this was built against), not just "value minus worst
+   starter at the position" (option C) — a genuine, if greedy-not-provably-
+   optimal, re-optimization. */
+function calculateTeamUtility(candidateKey, candidatePos, candidateVal, rosterKeys){
+  const rosterPlayers = rosterKeys
+    .map(key => {
+      const info = PLAYER_DB[key];
+      if(!info || info.pos === 'K') return null;
+      return { key, pos: info.pos, val: playerValueByKey(key) };
+    })
+    .filter(p => p && p.val !== null);
+
+  const before = optimizeLineup(rosterPlayers);
+  const afterPlayers = [...rosterPlayers.filter(p => p.key !== candidateKey),
+    { key: candidateKey, pos: candidatePos, val: candidateVal }];
+  const after = optimizeLineup(afterPlayers);
+
+  return {
+    beforeTotal: before.total,
+    afterTotal: after.total,
+    marginalUtility: after.total - before.total,
+    enteredStartingLineup: after.lineup.some(p => p.key === candidateKey),
+  };
+}
+
 /* A player counts as "quality" depth if their curated role tier is
    Elite/Every-Down/Starter. We deliberately use role tier rather than the raw
    production multiplier here: production multipliers are calibrated against
@@ -3209,11 +3298,26 @@ function assetRowHTML(side, a){
     const tooltipText = `Confidence: ${conf.tier}\n` + conf.factors.join('\n');
     confBadge = `<span title="${escapeHtml(tooltipText)}" style="display:inline-block;width:7px;height:7px;border-radius:50%;background:${confColors[conf.tier]};margin-left:6px;vertical-align:middle;cursor:help;"></span>`;
   }
+  /* Team Utility line — only shown for player-type assets on the side
+     you'd be RECEIVING from (the opposite of state.myTeamSide), since
+     "how much would acquiring this player help my roster" only makes
+     sense for players you don't already have. Requires a confirmed real
+     roster to evaluate against. Deliberately a separate line from the
+     fundamental value above it, never blended into it. */
+  let utilityLine = '';
+  if(a.type === 'player' && state.teamConfirmed && side !== state.myTeamSide){
+    const util = calculateTeamUtility(normalizeName(a.name), a.pos, a.value, MY_ROSTER);
+    const sign = util.marginalUtility >= 0 ? '+' : '';
+    const color = util.marginalUtility > 0 ? 'var(--green)' : (util.marginalUtility < 0 ? 'var(--text-dim)' : 'var(--text-dim)');
+    const startText = util.enteredStartingLineup ? 'starts for you' : "doesn't crack your lineup";
+    utilityLine = `<div class="asset-meta" style="margin-top:2px;">Team Utility: <span style="color:${color};">${sign}${util.marginalUtility.toLocaleString()}</span> · ${startText}</div>`;
+  }
   return `
     <div class="asset-row">
       <div class="asset-info">
         <div class="asset-title">${a.name}${confBadge}</div>
         <div class="asset-meta">${meta}</div>
+        ${utilityLine}
       </div>
       <div class="asset-right">
         <div class="asset-value">${a.value.toLocaleString()}</div>
@@ -3516,12 +3620,12 @@ function renderTradeImpact(){
 const MAULING_TIERS = [
   { max: 0.08,  label: 'Just A Trade',                  emoji: '🤝', flavor: 'Nothing to see here. Boring, even.' },
   { max: 0.18,  label: "Somebody's Getting Nervous",     emoji: '👀', flavor: 'Not alarming yet. Yet.' },
-  { max: 0.30,  label: 'Soft Rape Incoming',             emoji: '🤏', flavor: 'One side should probably double-check this before it gets weird.' },
-  { max: 0.45,  label: 'Full Trade Rape In Progress',    emoji: '🐺', flavor: 'This is a certified Getting Got. No lube.' },
-  { max: 0.65,  label: 'Apex Predator Trade Rape™',      emoji: '🦁', flavor: 'Somewhere, a certain someone is smiling with their pants around their ankles.' },
-  { max: Infinity, label: 'Call The League Front Office', emoji: '🚨', flavor: 'This trade should require a permission slip and a safe word.' },
+  { max: 0.30,  label: 'The Predator Has Been Spotted',  emoji: '🦈', flavor: 'One side should probably double-check this.' },
+  { max: 0.45,  label: 'Full Mauling In Progress',       emoji: '🐺', flavor: 'This is a certified Getting Got.' },
+  { max: 0.65,  label: 'Apex Predator Special™',         emoji: '🦁', flavor: 'Somewhere, a certain someone is smiling.' },
+  { max: Infinity, label: 'Call The League Front Office', emoji: '🚨', flavor: 'This trade should require a permission slip.' },
 ];
-  
+
 function renderMauling(){
   const wrap = document.getElementById('maulingWrap');
   if(!wrap) return;
