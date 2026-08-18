@@ -187,12 +187,23 @@ def main():
         if not pid:
             continue
         weekly_scores = []
+        weeks_played = []
+        weeks_excluded = []  # diagnostic: weeks with SOME stats entry but not counted as played
         games_played = 0
         for week, week_data in all_weeks.items():
             stats = week_data.get(pid)
             if stats and stats.get("gp", 0) >= 1:
                 games_played += 1
+                weeks_played.append(week)
                 weekly_scores.append(score_week(stats))
+            elif stats:
+                # has SOME real stats entry for this week, just didn't clear the
+                # gp>=1 bar -- worth knowing about specifically, since this is
+                # exactly the kind of case that could silently undercount a real
+                # game (e.g. Lamar Jackson: confirmed 13 real games, script found
+                # 12 on the first pass -- this diagnostic exists specifically to
+                # find which single week that was, instead of guessing)
+                weeks_excluded.append({"week": week, "gp_value": stats.get("gp"), "gms_active_value": stats.get("gms_active")})
         if games_played == 0:
             continue
         total = sum(weekly_scores)
@@ -203,11 +214,25 @@ def main():
             "games_played": games_played, "total_points": round(total, 1),
             "true_ppg": round(true_ppg, 2), "season_total_ppg": round(season_total_ppg, 2),
             "dilution_pct": round((1 - season_total_ppg / true_ppg) * 100, 1) if true_ppg else 0,
+            "weeks_played": weeks_played,
+            "weeks_with_data_but_excluded": weeks_excluded,
         })
 
     results.sort(key=lambda r: -r["true_ppg"])
     with open(os.path.join(SCRIPT_DIR, "ppg_results.json"), "w") as f:
         json.dump(results, f, indent=2)
+
+    # Print the diagnostic detail specifically for anyone with an excluded-but-
+    # present week, so a mismatch like the Lamar Jackson one shows up directly
+    # in the log instead of needing a follow-up round of manual checking.
+    flagged = [r for r in results if r["weeks_with_data_but_excluded"]]
+    if flagged:
+        print()
+        print("=== Players with a week that had SOME stats data but wasn't counted as played ===")
+        for r in flagged:
+            print(f"{r['player']}: played weeks {r['weeks_played']}")
+            for w in r["weeks_with_data_but_excluded"]:
+                print(f"    week {w['week']}: gp={w['gp_value']}, gms_active={w['gms_active_value']} -- has a stats entry but gp check excluded it")
 
     print()
     print(f"{'Player':20s} {'Pos':4s} {'GP':3s} {'True PPG':9s} {'Season/17 PPG':14s} {'Dilution'}")
