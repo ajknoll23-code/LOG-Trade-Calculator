@@ -42,9 +42,35 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # players are needed here (not every alias in the main file matters for
 # this lookup), but keeping the same source of truth rather than a
 # separately-maintained list.
+# Ported directly from the main tool's real ALIASES map -- the FULL
+# list this time, not just the 3 entries that happened to matter for the
+# original 30-player test. Expanding to the full player database means
+# many more of these could plausibly come up.
 ALIASES = {
+    'j greenard': 'jonathan greenard',
+    'k thibodeaux': 'kayvon thibodeaux',
+    'k mckinstry': 'koolaid mckinstry',
+    'c gardnerjohnson': 'cj gardnerjohnson',
+    't stevenson': 'tyrique stevenson',
+    'c gonzalez': 'christian gonzalez',
+    't henderson': 'treveyon henderson',
+    'w robinson': 'wandale robinson',
+    'm fitzpatrick': 'minkah fitzpatrick',
+    'd overshown': 'demarvion overshown',
     'a st brown': 'amonra st brown',
+    'c schwesinger': 'carson schwesinger',
+    'a van ginkel': 'andrew van ginkel',
+    'd ezeiruaku': 'donovan ezeiruaku',
+    'r stevenson': 'rhamondre stevenson',
+    't mcmillan': 'tetairoa mcmillan',
+    'd witherspoon': 'devon witherspoon',
+    'n singleton': 'nicholas singleton',
+    'd stribling': 'dezhaun stribling',
+    'j croskeymerritt': 'jacory croskeymerritt',
+    'c rozeboom': 'christian rozeboom',
+    't ferguson': 'terrance ferguson',
     'jsmithnjigba': 'jaxon smithnjigba',
+    'matthew hibner': 'matt hibner',
     'jeremiah love': 'jeremiyah love',
 }
 
@@ -158,14 +184,14 @@ def fetch_all_weeks():
 
 
 def main():
-    with open(os.path.join(SCRIPT_DIR, "top30_players.json")) as f:
-        top30 = json.load(f)
+    with open(os.path.join(SCRIPT_DIR, "all_players.json")) as f:
+        all_players = json.load(f)
 
     player_index = fetch_player_index()
     name_to_candidates = build_name_to_id_map(player_index)
 
     unmatched = []
-    for p in top30:
+    for p in all_players:
         key = p["key"]
         if key not in name_to_candidates:
             aliased = ALIASES.get(key)
@@ -187,7 +213,7 @@ def main():
     all_weeks = fetch_all_weeks()
 
     results = []
-    for p in top30:
+    for p in all_players:
         pid = p.get("sleeper_id")
         if not pid:
             continue
@@ -250,10 +276,31 @@ def main():
             for w in r["weeks_with_data_but_excluded"]:
                 print(f"    week {w['week']}: gp={w['gp_value']}, gms_active={w['gms_active_value']} -- has a stats entry but gp check excluded it")
 
+    # 553 players is too much for a full table to be scannable in a log --
+    # summarize instead of dumping everything. Full detail is still in
+    # ppg_results.json for anyone who wants to look up a specific player.
     print()
+    print(f"Total players scored: {len(results)} of {len(all_players)} in the input list")
+    unmatched_count = len(all_players) - len(results)
+    if unmatched_count:
+        print(f"({unmatched_count} did not resolve or had zero recorded games -- see WARNING/NOTE lines above)")
+
+    print()
+    print("=== Top 15 by dilution % (biggest gap between true PPG and the old season-total method) ===")
+    by_dilution = sorted(results, key=lambda r: -r["dilution_pct"])[:15]
     print(f"{'Player':20s} {'Pos':4s} {'GP':3s} {'True PPG':9s} {'Season/17 PPG':14s} {'Dilution'}")
-    for r in results:
+    for r in by_dilution:
         print(f"{r['player']:20s} {r['pos']:4s} {r['games_played']:<3d} {r['true_ppg']:<9.2f} {r['season_total_ppg']:<14.2f} {r['dilution_pct']:.1f}%")
+
+    print()
+    print("=== Top 15 by true PPG (highest real per-game production, position-agnostic) ===")
+    by_ppg = sorted(results, key=lambda r: -r["true_ppg"])[:15]
+    print(f"{'Player':20s} {'Pos':4s} {'GP':3s} {'True PPG':9s} {'Season/17 PPG':14s} {'Dilution'}")
+    for r in by_ppg:
+        print(f"{r['player']:20s} {r['pos']:4s} {r['games_played']:<3d} {r['true_ppg']:<9.2f} {r['season_total_ppg']:<14.2f} {r['dilution_pct']:.1f}%")
+
+    print()
+    print("Full results for all players written to ppg_results.json in the repo.")
 
 
 if __name__ == "__main__":
