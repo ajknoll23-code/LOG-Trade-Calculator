@@ -189,37 +189,35 @@ def resolve_player_id(name, known_pos, name_to_candidates):
     return None, f"'{name}' had {len(position_matches)} Sleeper entries at the SAME position ({known_pos}) -- ambiguous, could not safely resolve"
 
 
-# TEMPORARY DIAGNOSTIC -- added 2026-08-19 to resolve the 4 real name
-# collisions the full run couldn't safely disambiguate on its own (Kyle
-# Williams, Myles Murphy, Chris Jones, Chris Johnson -- see the ALIASES
-# comment above). Prints every Sleeper candidate for each name, with
-# enough real identifying detail (team, status, experience) to pick the
-# right one by eye from the Actions log, instead of hand-searching
-# Sleeper's app. Safe to delete once these 4 are resolved and hardcoded
-# into MANUAL_ID_OVERRIDES below -- it does not affect scoring.
-COLLISION_NAMES_TO_INSPECT = ['kyle williams', 'myles murphy', 'chris jones', 'chris johnson']
-
-def print_collision_candidates(names, player_index):
-    print()
-    print("=== Collision diagnostic: candidates for names that couldn't be safely resolved ===")
-    for target_name in names:
-        print(f"\n--- '{target_name}' ---")
-        found_any = False
-        for pid, p in player_index.items():
-            full_name = p.get("full_name") or f"{p.get('first_name','')} {p.get('last_name','')}"
-            norm = full_name.strip().lower()
-            for ch in [".", "'", "-"]:
-                norm = norm.replace(ch, "")
-            norm = " ".join(norm.split())
-            if norm == target_name:
-                found_any = True
-                print(f"  sleeper_id={pid}  pos={p.get('position')}  team={p.get('team')}  "
-                      f"status={p.get('status')}  active={p.get('active')}  "
-                      f"years_exp={p.get('years_exp')}  birth_date={p.get('birth_date')}")
-        if not found_any:
-            print("  (no candidates found -- unexpected, check spelling)")
-    print()
-    print("=== End collision diagnostic ===\n")
+# Real name collisions that position-matching alone can never safely
+# resolve (multiple real people, same normalized name, same expected
+# position). Found via the full 553-player run, then disambiguated
+# 2026-08-19 using a one-off diagnostic (since removed) that printed each
+# Sleeper candidate's team/status/years_exp -- picked whichever candidate's
+# real-world details (current team, experience matching a known active
+# player) actually matched the real person, verified against outside
+# sources, not guessed from the name alone.
+#
+# 'chris jones' is worth a special note: the real Chris Jones (Chiefs DT)
+# was in Sleeper's index tagged specifically as position "DT", not the
+# generic "DL" this tool expects -- that's WHY position-matching missed
+# him even though he was right there in the candidate list. This is a
+# live instance of the "DL sub-position bias" issue already flagged as an
+# open item (DT vs DE/EDGE potentially needing separate handling) -- worth
+# revisiting when that gets addressed generally, since this hardcoded
+# override is a workaround for this one player, not a fix for the
+# underlying position-bucket gap.
+#
+# 'chris johnson' -> 13370 is a 2026 draft rookie (Dolphins CB), same
+# situation as e-mcneilwarren above: the ID is now correct, but he was in
+# college during the 2025 season this pipeline scores, so he'll still
+# show zero games for this run. Not a bug.
+MANUAL_ID_OVERRIDES = {
+    'kyle williams': '12547',      # WR, Patriots
+    'myles murphy': '10875',       # DL, Bengals
+    'chris jones': '3558',         # DT, Chiefs
+    'chris johnson': '13370',      # DB, Dolphins (2026 rookie, 0 games expected this run)
+}
 
 
 def fetch_all_weeks():
@@ -238,12 +236,17 @@ def main():
         all_players = json.load(f)
 
     player_index = fetch_player_index()
-    print_collision_candidates(COLLISION_NAMES_TO_INSPECT, player_index)
     name_to_candidates = build_name_to_id_map(player_index)
 
     unmatched = []
     for p in all_players:
         key = p["key"]
+        # Manual overrides take priority -- these are known name collisions
+        # that position-matching can never safely resolve on its own, so
+        # don't even attempt the normal path for them.
+        if key in MANUAL_ID_OVERRIDES:
+            p["sleeper_id"] = MANUAL_ID_OVERRIDES[key]
+            continue
         if key not in name_to_candidates:
             aliased = ALIASES.get(key)
             if aliased and aliased in name_to_candidates:
