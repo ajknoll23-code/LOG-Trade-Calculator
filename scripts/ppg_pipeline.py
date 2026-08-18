@@ -49,7 +49,12 @@ ALIASES = {
 }
 
 SEASON = "2025"
-WEEKS = range(1, 18)  # regular season, weeks 1-17
+WEEKS = range(1, 19)  # regular season is 18 WEEKS (17 games + 1 bye per team) --
+                        # range(1,18) was a real bug that silently undercounted
+                        # every player whose bye fell earlier in the season,
+                        # found 2026-08-18 via 5 of 7 manually-verified players
+                        # coming back exactly 1 game short, including two who'd
+                        # never been flagged by any other diagnostic at all.
 
 # ---- This league's EXACT scoring rules ----
 # Confirmed explicitly this session: half-PPR, 0.2/rush attempt, 6pt
@@ -192,17 +197,28 @@ def main():
         games_played = 0
         for week, week_data in all_weeks.items():
             stats = week_data.get(pid)
-            if stats and stats.get("gp", 0) >= 1:
+            # REVERTED 2026-08-18: the gms_active OR-logic below was a real
+            # mistake, not a minor tweak -- confirmed wrong by real ground
+            # truth (Blake Cashman genuinely did NOT play weeks 2-5, despite
+            # gms_active=1 on all four). gms_active does not reliably mean
+            # "played" -- more likely "was on the active roster that week"
+            # (dressed/eligible), which can be true even with zero real snaps
+            # (healthy scratch, working back from injury, etc.). gp -- actual
+            # recorded participation -- is the trustworthy signal. Went back
+            # to trusting it alone rather than assuming a theory was correct
+            # without verifying it against reality first.
+            was_active = stats and (stats.get("gp") or 0) >= 1
+            if was_active:
                 games_played += 1
                 weeks_played.append(week)
                 weekly_scores.append(score_week(stats))
             elif stats:
-                # has SOME real stats entry for this week, just didn't clear the
-                # gp>=1 bar -- worth knowing about specifically, since this is
-                # exactly the kind of case that could silently undercount a real
-                # game (e.g. Lamar Jackson: confirmed 13 real games, script found
-                # 12 on the first pass -- this diagnostic exists specifically to
-                # find which single week that was, instead of guessing)
+                # Informational only -- do NOT assume these weeks should
+                # count. gms_active=1 here does not prove the player
+                # actually played (see the note above); this is worth a
+                # human look, not an automatic correction. Confirmed real
+                # cases where a human check said "no, he genuinely didn't
+                # play" despite this flag firing.
                 weeks_excluded.append({"week": week, "gp_value": stats.get("gp"), "gms_active_value": stats.get("gms_active")})
         if games_played == 0:
             continue
