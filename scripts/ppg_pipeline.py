@@ -267,6 +267,14 @@ def main():
     all_weeks = fetch_all_weeks()
 
     results = []
+    zero_game_players = []  # captured instead of silently dropped -- this is
+        # the list that needs a human look, same as Fred Warner and the
+        # collisions did. "had_any_data" distinguishes two very different
+        # cases: True means Sleeper had SOME weekly entry for this player
+        # this season (worth checking why none of it counted as "played"),
+        # False means Sleeper had literally nothing all season (much more
+        # likely a genuine case -- true rookie who hadn't debuted, or
+        # someone who spent the whole year on IR/practice squad).
     for p in all_players:
         pid = p.get("sleeper_id")
         if not pid:
@@ -301,6 +309,10 @@ def main():
                 # play" despite this flag firing.
                 weeks_excluded.append({"week": week, "gp_value": stats.get("gp"), "gms_active_value": stats.get("gms_active")})
         if games_played == 0:
+            zero_game_players.append({
+                "player": p["key"], "pos": p["pos"], "sleeper_id": pid,
+                "had_any_data": bool(weeks_excluded),
+            })
             continue
         total = sum(weekly_scores)
         true_ppg = total / games_played
@@ -329,6 +341,25 @@ def main():
             print(f"{r['player']}: played weeks {r['weeks_played']}")
             for w in r["weeks_with_data_but_excluded"]:
                 print(f"    week {w['week']}: gp={w['gp_value']}, gms_active={w['gms_active_value']} -- has a stats entry but gp check excluded it")
+
+    # NEW: the zero-game list itself, split by whether Sleeper had ANY data
+    # for the player this season. "had_any_data=True" is the more suspicious
+    # bucket -- something showed up in the weekly stats but never counted as
+    # a played game, worth a closer look same as Fred Warner/the collisions
+    # got. "had_any_data=False" is more likely genuine (true rookie who
+    # hadn't debuted yet in 2025, or someone who spent the whole season on
+    # IR/practice squad) but still worth a skim, not assumed clean.
+    if zero_game_players:
+        with_data = [z for z in zero_game_players if z["had_any_data"]]
+        without_data = [z for z in zero_game_players if not z["had_any_data"]]
+        print()
+        print(f"=== {len(zero_game_players)} players resolved to a real Sleeper ID but showed ZERO played games this season ===")
+        print(f"--- {len(with_data)} of these HAD some Sleeper data this season (worth a closer look -- see the flagged section above for why none of it counted) ---")
+        for z in sorted(with_data, key=lambda x: x["player"]):
+            print(f"  {z['player']:25s} {z['pos']:4s} sleeper_id={z['sleeper_id']}")
+        print(f"--- {len(without_data)} of these had NO Sleeper data at all this season (more likely genuine -- true rookie or full-season IR/practice squad) ---")
+        for z in sorted(without_data, key=lambda x: x["player"]):
+            print(f"  {z['player']:25s} {z['pos']:4s} sleeper_id={z['sleeper_id']}")
 
     # 553 players is too much for a full table to be scannable in a log --
     # summarize instead of dumping everything. Full detail is still in
