@@ -72,6 +72,23 @@ ALIASES = {
     'jsmithnjigba': 'jaxon smithnjigba',
     'matthew hibner': 'matt hibner',
     'jeremiah love': 'jeremiyah love',
+
+    # Added 2026-08-18 after the full 553-player run flagged these 9 as
+    # unresolved. 5 of the 9 were genuine alias gaps (below) -- the other 4
+    # (kyle williams, myles murphy, chris jones, chris johnson) are real
+    # name collisions this can't safely disambiguate and are NOT handled
+    # here; see the separate rostered-player cross-reference fix for those.
+    'kylavon chaisson': 'klavon chaisson',  # PLAYER_DB/all_players.json spell
+        # this "kylavon" (with a Y) -- PROD_MULT_DATA's real production
+        # entry and Sleeper's own name field both use "klavon" (no Y).
+        # Verified directly against PLAYER_DB/PROD_MULT_DATA, not guessed.
+    'k lambertsmith': 'keandre lambertsmith',  # KeAndre Lambert-Smith, WR, Chargers
+    'j owusukoramoah': 'jeremiah owusukoramoah',  # Jeremiah Owusu-Koramoah
+    'g nussmeier': 'garrett nussmeier',
+    'e mcneilwarren': 'emmanuel mcneilwarren',  # Emmanuel McNeil-Warren, S,
+        # Browns -- 2026 draft rookie (college during the 2025 season this
+        # pipeline scores), so this alias won't unlock any 2025 stats for
+        # him. Adding it now anyway so next season's run resolves cleanly.
 }
 
 SEASON = "2025"
@@ -172,6 +189,39 @@ def resolve_player_id(name, known_pos, name_to_candidates):
     return None, f"'{name}' had {len(position_matches)} Sleeper entries at the SAME position ({known_pos}) -- ambiguous, could not safely resolve"
 
 
+# TEMPORARY DIAGNOSTIC -- added 2026-08-19 to resolve the 4 real name
+# collisions the full run couldn't safely disambiguate on its own (Kyle
+# Williams, Myles Murphy, Chris Jones, Chris Johnson -- see the ALIASES
+# comment above). Prints every Sleeper candidate for each name, with
+# enough real identifying detail (team, status, experience) to pick the
+# right one by eye from the Actions log, instead of hand-searching
+# Sleeper's app. Safe to delete once these 4 are resolved and hardcoded
+# into MANUAL_ID_OVERRIDES below -- it does not affect scoring.
+COLLISION_NAMES_TO_INSPECT = ['kyle williams', 'myles murphy', 'chris jones', 'chris johnson']
+
+def print_collision_candidates(names, player_index):
+    print()
+    print("=== Collision diagnostic: candidates for names that couldn't be safely resolved ===")
+    for target_name in names:
+        print(f"\n--- '{target_name}' ---")
+        found_any = False
+        for pid, p in player_index.items():
+            full_name = p.get("full_name") or f"{p.get('first_name','')} {p.get('last_name','')}"
+            norm = full_name.strip().lower()
+            for ch in [".", "'", "-"]:
+                norm = norm.replace(ch, "")
+            norm = " ".join(norm.split())
+            if norm == target_name:
+                found_any = True
+                print(f"  sleeper_id={pid}  pos={p.get('position')}  team={p.get('team')}  "
+                      f"status={p.get('status')}  active={p.get('active')}  "
+                      f"years_exp={p.get('years_exp')}  birth_date={p.get('birth_date')}")
+        if not found_any:
+            print("  (no candidates found -- unexpected, check spelling)")
+    print()
+    print("=== End collision diagnostic ===\n")
+
+
 def fetch_all_weeks():
     all_weeks = {}
     for week in WEEKS:
@@ -188,6 +238,7 @@ def main():
         all_players = json.load(f)
 
     player_index = fetch_player_index()
+    print_collision_candidates(COLLISION_NAMES_TO_INSPECT, player_index)
     name_to_candidates = build_name_to_id_map(player_index)
 
     unmatched = []
