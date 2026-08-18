@@ -32,6 +32,22 @@ import requests
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Ported directly from the main tool's real ALIASES map (trade-desk.html) --
+# found the hard way 2026-08-18: ALIASES only ever got consulted in ONE
+# code path (live-roster-sync merging), so every new piece of code that
+# does its own name matching has to remember to reuse it, or aliased names
+# silently fail. This script didn't, on the first pass -- fixed now rather
+# than patching just the specific names that happened to get caught this
+# time. Only the entries actually relevant to real NFL free-agent/rostered
+# players are needed here (not every alias in the main file matters for
+# this lookup), but keeping the same source of truth rather than a
+# separately-maintained list.
+ALIASES = {
+    'a st brown': 'amonra st brown',
+    'jsmithnjigba': 'jaxon smithnjigba',
+    'jeremiah love': 'jeremiyah love',
+}
+
 SEASON = "2025"
 WEEKS = range(1, 18)  # regular season, weeks 1-17
 
@@ -78,6 +94,18 @@ def fetch_player_index():
 
 
 def build_name_to_id_map(player_index):
+    """
+    Returns name -> LIST of (pid, position) candidates, not a single ID.
+    A single-ID last-write-wins mapping is exactly the bug already found
+    and fixed once in this project (the free-agent board's Justin
+    Jefferson/Devonta Smith collision) -- rebuilt here after Lamar Jackson
+    silently resolved to zero games despite genuinely playing 13, almost
+    certainly because Sleeper's full player index (which includes
+    thousands of historical/practice-squad/inactive players, not just
+    current rosters) has another real person sharing his exact name, and
+    the old version took whichever came last in iteration order with no
+    way to tell they were different people.
+    """
     def normalize(s):
         s = s.strip().lower()
         for ch in [".", "'", "-"]:
@@ -87,8 +115,30 @@ def build_name_to_id_map(player_index):
     mapping = {}
     for pid, p in player_index.items():
         full_name = p.get("full_name") or f"{p.get('first_name','')} {p.get('last_name','')}"
-        mapping[normalize(full_name)] = pid
+        key = normalize(full_name)
+        mapping.setdefault(key, []).append((pid, p.get("position")))
     return mapping
+
+
+def resolve_player_id(name, known_pos, name_to_candidates):
+    """
+    Position-verified resolution -- picks the candidate whose Sleeper
+    position matches what we already know about this player, rather than
+    trusting a bare name match. Returns (pid, warning) -- warning is None
+    on a clean single match, or a string explaining what happened
+    otherwise, so collisions get surfaced instead of silently guessed at.
+    """
+    candidates = name_to_candidates.get(name)
+    if not candidates:
+        return None, None  # genuinely no match -- handled by the existing unmatched-name path
+    if len(candidates) == 1:
+        return candidates[0][0], None
+    position_matches = [c for c in candidates if c[1] == known_pos]
+    if len(position_matches) == 1:
+        return position_matches[0][0], f"'{name}' had {len(candidates)} Sleeper entries sharing this name -- resolved via position match ({known_pos})"
+    if len(position_matches) == 0:
+        return None, f"'{name}' had {len(candidates)} Sleeper entries, none at the expected position ({known_pos}) -- could not safely resolve, treating as unmatched"
+    return None, f"'{name}' had {len(position_matches)} Sleeper entries at the SAME position ({known_pos}) -- ambiguous, could not safely resolve"
 
 
 def fetch_all_weeks():
@@ -107,19 +157,33 @@ def main():
         top30 = json.load(f)
 
     player_index = fetch_player_index()
-    name_to_id = build_name_to_id_map(player_index)
+    name_to_candidates = build_name_to_id_map(player_index)
 
-    unmatched = [p["key"] for p in top30 if p["key"] not in name_to_id]
+    unmatched = []
+    for p in top30:
+        key = p["key"]
+        if key not in name_to_candidates:
+            aliased = ALIASES.get(key)
+            if aliased and aliased in name_to_candidates:
+                key = aliased
+                p["key"] = aliased  # resolve in place so downstream lookups use the working name
+        pid, warning = resolve_player_id(key, p["pos"], name_to_candidates)
+        if warning:
+            print(f"NOTE: {warning}")
+        if pid:
+            p["sleeper_id"] = pid
+        else:
+            unmatched.append(p["key"])
     if unmatched:
-        print(f"WARNING: {len(unmatched)} of 30 names didn't resolve to a Sleeper ID: {unmatched}")
-        print("These likely need manual alias resolution -- same class of problem as the")
-        print("name-matching work done elsewhere in this project. Not fixed automatically here.")
+        print(f"WARNING: {len(unmatched)} of 30 names could not be safely resolved to a Sleeper ID: {unmatched}")
+        print("Either a genuinely new alias is needed, or a real name collision that position")
+        print("matching alone couldn't disambiguate -- check the NOTE lines above for which.")
 
     all_weeks = fetch_all_weeks()
 
     results = []
     for p in top30:
-        pid = name_to_id.get(p["key"])
+        pid = p.get("sleeper_id")
         if not pid:
             continue
         weekly_scores = []
