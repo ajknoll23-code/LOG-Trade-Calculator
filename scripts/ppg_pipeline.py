@@ -23,6 +23,14 @@ before trusting the full batch.
 
 USAGE: python3 ppg_pipeline.py
 Requires: requests (pip install requests --break-system-packages)
+
+2026-08-19 UPDATE: now also writes each player's individual weekly point
+totals (weekly_points, parallel to weeks_played) to ppg_results.json, not
+just the season aggregate. This doesn't change any existing field or any
+player's true_ppg/games_played -- purely additive. It exists to support
+deriving the k=3 shrinkage constant (see index.html's productionMultiplier
+methodology) from real within-player vs. between-player variance instead
+of the current chosen-by-inspection value.
 """
 
 import json
@@ -279,7 +287,13 @@ def main():
         pid = p.get("sleeper_id")
         if not pid:
             continue
-        weekly_scores = []
+        weekly_scores = []  # parallel to weeks_played -- weekly_scores[i] is
+            # the real score for weeks_played[i]. Added 2026-08-19 to support
+            # deriving the k shrinkage constant from real within-player vs.
+            # between-player variance (sigma^2_within / sigma^2_between)
+            # instead of the k=3 chosen-by-inspection value -- that
+            # computation needs each week's individual score, not just the
+            # season total, and previously only the total was kept.
         weeks_played = []
         weeks_excluded = []  # diagnostic: weeks with SOME stats entry but not counted as played
         games_played = 0
@@ -323,6 +337,9 @@ def main():
             "true_ppg": round(true_ppg, 2), "season_total_ppg": round(season_total_ppg, 2),
             "dilution_pct": round((1 - season_total_ppg / true_ppg) * 100, 1) if true_ppg else 0,
             "weeks_played": weeks_played,
+            "weekly_points": [round(s, 2) for s in weekly_scores],  # parallel
+                # array to weeks_played -- see the comment above weekly_scores
+                # for why this is now captured.
             "weeks_with_data_but_excluded": weeks_excluded,
         })
 
