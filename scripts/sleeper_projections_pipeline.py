@@ -46,29 +46,81 @@ WEEKS = range(1, 19)
 
 def score_week(stats):
     """
-    Identical to ppg_pipeline.py's score_week -- copied rather than
+    Identical to ppg_pipeline.py's score_week (rewritten 2026-08-19 against
+    the league's complete real scoring sheet -- see that file's version for
+    the full explanation of what was added and why). Copied rather than
     imported so this script has no dependency on that file and can be
     dropped into scripts/ standalone. Any change to league scoring rules
     needs to be made in both places; that's an accepted tradeoff for
     keeping the two pipelines independently runnable.
     """
     pts = 0.0
-    pts += stats.get("pass_yd", 0) * 0.04
+
+    pass_yd = stats.get("pass_yd", 0)
+    pts += pass_yd * 0.04
     pts += stats.get("pass_td", 0) * 4.0
+    pts += stats.get("pass_2pt", 0) * 2.0
     pts += stats.get("pass_int", 0) * -2.0
+    if pass_yd >= 400:
+        pts += 3.0
+    elif pass_yd >= 300:
+        pts += 2.0
+
+    rush_yd = stats.get("rush_yd", 0)
     pts += stats.get("rush_att", 0) * 0.2
-    pts += stats.get("rush_yd", 0) * 0.1
+    pts += rush_yd * 0.1
     pts += stats.get("rush_td", 0) * 6.0
+    pts += stats.get("rush_2pt", 0) * 2.0
+    if rush_yd >= 200:
+        pts += 3.0
+    elif rush_yd >= 100:
+        pts += 2.0
+
+    rec_yd = stats.get("rec_yd", 0)
     pts += stats.get("rec", 0) * 0.5
-    pts += stats.get("rec_yd", 0) * 0.1
+    pts += rec_yd * 0.1
     pts += stats.get("rec_td", 0) * 6.0
+    pts += stats.get("rec_2pt", 0) * 2.0
+    if rec_yd >= 200:
+        pts += 3.0
+    elif rec_yd >= 100:
+        pts += 2.0
+
     pts += stats.get("fum_lost", 0) * -2.0
-    pts += stats.get("idp_tkl_solo", 0) * 1.5
-    pts += stats.get("idp_tkl_ast", 0) * 0.75
-    pts += stats.get("idp_sack", stats.get("sack", 0)) * 3.0
+    pts += stats.get("fum_rec_td", 0) * 6.0
+
+    solo = stats.get("idp_tkl_solo", 0)
+    ast = stats.get("idp_tkl_ast", 0)
+    pts += solo * 1.5
+    pts += ast * 0.75
     pts += stats.get("idp_tkl_loss", 0) * 2.0
-    pts += stats.get("idp_int", stats.get("int", 0)) * 6.0
-    pts += stats.get("idp_pass_def", 0) * 3.0
+
+    sacks = stats.get("idp_sack", stats.get("sack", 0))
+    pts += sacks * 3.0
+    pts += stats.get("idp_qb_hit", 0) * 2.0
+
+    ints = stats.get("idp_int", stats.get("int", 0))
+    pts += ints * 6.0
+    pts += stats.get("idp_fum_rec", 0) * 4.0
+    pts += stats.get("idp_ff", 0) * 3.0
+    pts += stats.get("idp_safety", 0) * 3.0
+    pts += stats.get("blk_kick", 0) * 6.0
+    pts += stats.get("idp_td", 0) * 6.0
+
+    pd = stats.get("idp_pass_def", 0)
+    pts += pd * 3.0
+
+    if (solo + ast) >= 10:
+        pts += 2.0
+    if sacks >= 2:
+        pts += 2.0
+    if pd >= 3:
+        pts += 2.0
+
+    pts += stats.get("st_td", 0) * 6.0
+    pts += stats.get("st_ff", 0) * 3.0
+    pts += stats.get("st_fum_rec", 0) * 3.0
+
     return pts
 
 

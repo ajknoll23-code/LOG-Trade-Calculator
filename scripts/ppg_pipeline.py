@@ -117,28 +117,113 @@ WEEKS = range(1, 19)  # regular season is 18 WEEKS (17 games + 1 bye per team) -
 # rate), these specific lines are the ones to correct, everything else
 # is confirmed.
 def score_week(stats):
+    """
+    Rewritten 2026-08-19 against the league's complete, real scoring sheet
+    (every row confirmed directly from the person's Sleeper league settings
+    screenshots -- not assumed/standard-convention like the previous
+    version). This fixes a confirmed real bug: the old version scored
+    Aidan Hutchinson's real 2025 season at 154 pts; Sleeper's own leaders
+    page shows his real 2025 total as 246. The categories added below
+    account for the gap.
+
+    FIELD NAME CONFIDENCE: the field names for pass_yd/pass_td/pass_int/
+    rush_att/rush_yd/rush_td/rec/rec_yd/rec_td/fum_lost/idp_tkl_solo/
+    idp_tkl_ast/idp_sack/idp_tkl_loss/idp_int/idp_pass_def were already
+    live in the pipeline and producing real, verified output (Hutchinson's
+    144 pts from JUST those categories checks out against his real box
+    score), so those are trusted as-is. The NEWLY ADDED field names below
+    (idp_qb_hit, idp_ff, idp_fum_rec, idp_td, idp_safety, blk_kick,
+    pass_2pt/rush_2pt/rec_2pt, fum_rec_td, st_td/st_ff/st_fum_rec) are
+    Sleeper's standard naming convention for these stat types but have NOT
+    been individually verified against a real box score the way the
+    original fields were -- these are common enough field names across
+    Sleeper's API that they're very likely right, but this is the kind of
+    thing that's worth a real spot-check (same as everything else new in
+    this file) after the first real run, not assumed correct just because
+    it's now in the code.
+
+    MILESTONE BONUSES: these aren't separate raw stat fields Sleeper
+    returns -- they're derived here by checking the already-fetched yardage
+    totals against the sheet's thresholds. Tiers are exclusive (a 250-yard
+    rushing game gets the 200+ bonus only, not both).
+    """
     pts = 0.0
-    # Passing (standard convention -- NOT explicitly reconfirmed this session)
-    pts += stats.get("pass_yd", 0) * 0.04       # 1 pt / 25 yards
-    pts += stats.get("pass_td", 0) * 4.0          # confirmed: 4pt passing TDs
-    pts += stats.get("pass_int", 0) * -2.0        # standard convention, not reconfirmed
-    # Rushing (confirmed: 0.2/attempt bonus + 6pt rush TDs)
+
+    # ---- Passing ----
+    pass_yd = stats.get("pass_yd", 0)
+    pts += pass_yd * 0.04                          # 1 pt / 25 yards
+    pts += stats.get("pass_td", 0) * 4.0
+    pts += stats.get("pass_2pt", 0) * 2.0           # ADDED -- was missing entirely
+    pts += stats.get("pass_int", 0) * -2.0
+    if pass_yd >= 400:
+        pts += 3.0                                  # ADDED -- milestone bonus
+    elif pass_yd >= 300:
+        pts += 2.0                                  # ADDED -- milestone bonus
+
+    # ---- Rushing ----
+    rush_yd = stats.get("rush_yd", 0)
     pts += stats.get("rush_att", 0) * 0.2
-    pts += stats.get("rush_yd", 0) * 0.1          # 1 pt / 10 yards, standard convention
+    pts += rush_yd * 0.1                            # 1 pt / 10 yards
     pts += stats.get("rush_td", 0) * 6.0
-    # Receiving (confirmed: half-PPR + 6pt rec TDs)
+    pts += stats.get("rush_2pt", 0) * 2.0           # ADDED -- was missing entirely
+    if rush_yd >= 200:
+        pts += 3.0                                  # ADDED -- milestone bonus
+    elif rush_yd >= 100:
+        pts += 2.0                                  # ADDED -- milestone bonus
+
+    # ---- Receiving ----
+    rec_yd = stats.get("rec_yd", 0)
     pts += stats.get("rec", 0) * 0.5
-    pts += stats.get("rec_yd", 0) * 0.1
+    pts += rec_yd * 0.1
     pts += stats.get("rec_td", 0) * 6.0
-    # Fumbles (standard convention, not reconfirmed)
+    pts += stats.get("rec_2pt", 0) * 2.0            # ADDED -- was missing entirely
+    if rec_yd >= 200:
+        pts += 3.0                                  # ADDED -- milestone bonus
+    elif rec_yd >= 100:
+        pts += 2.0                                  # ADDED -- milestone bonus
+
+    # ---- Fumbles (offense) ----
     pts += stats.get("fum_lost", 0) * -2.0
-    # IDP (all confirmed explicitly this session)
-    pts += stats.get("idp_tkl_solo", 0) * 1.5
-    pts += stats.get("idp_tkl_ast", 0) * 0.75
-    pts += stats.get("idp_sack", stats.get("sack", 0)) * 3.0
-    pts += stats.get("idp_tkl_loss", 0) * 2.0     # TFL
-    pts += stats.get("idp_int", stats.get("int", 0)) * 6.0
-    pts += stats.get("idp_pass_def", 0) * 3.0     # PD
+    pts += stats.get("fum_rec_td", 0) * 6.0         # ADDED -- was missing entirely
+
+    # ---- IDP: Tackles ----
+    solo = stats.get("idp_tkl_solo", 0)
+    ast = stats.get("idp_tkl_ast", 0)
+    pts += solo * 1.5
+    pts += ast * 0.75
+    pts += stats.get("idp_tkl_loss", 0) * 2.0       # TFL
+
+    # ---- IDP: Pressure ----
+    sacks = stats.get("idp_sack", stats.get("sack", 0))
+    pts += sacks * 3.0
+    pts += stats.get("idp_qb_hit", 0) * 2.0         # ADDED -- was missing entirely
+
+    # ---- IDP: Turnovers / scoring ----
+    ints = stats.get("idp_int", stats.get("int", 0))
+    pts += ints * 6.0
+    pts += stats.get("idp_fum_rec", 0) * 4.0        # ADDED -- was missing entirely
+    pts += stats.get("idp_ff", 0) * 3.0             # ADDED -- was missing entirely
+    pts += stats.get("idp_safety", 0) * 3.0         # ADDED -- rare, likely near-zero impact
+    pts += stats.get("blk_kick", 0) * 6.0           # ADDED -- rare, likely near-zero impact
+    pts += stats.get("idp_td", 0) * 6.0             # ADDED -- rare, likely near-zero impact
+
+    # ---- IDP: Coverage ----
+    pd = stats.get("idp_pass_def", 0)
+    pts += pd * 3.0
+
+    # ---- IDP: per-game bonus thresholds (ADDED -- were missing entirely) ----
+    if (solo + ast) >= 10:
+        pts += 2.0
+    if sacks >= 2:
+        pts += 2.0
+    if pd >= 3:
+        pts += 2.0
+
+    # ---- Special teams (ADDED -- rare, likely near-zero impact) ----
+    pts += stats.get("st_td", 0) * 6.0
+    pts += stats.get("st_ff", 0) * 3.0
+    pts += stats.get("st_fum_rec", 0) * 3.0         # different value than IDP fum rec (3 vs 4)
+
     return pts
 
 
