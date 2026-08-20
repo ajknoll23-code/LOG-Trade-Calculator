@@ -136,6 +136,15 @@ def bradley_terry(pairs, iterations=200, tol=1e-6):
     standard normalization -- what matters is relative strength between
     players, not the absolute scale).
     """
+    if not pairs:
+        # Real edge case, not just theoretical -- hit this exact case on
+        # 2026-08-20 when the Sheet fetch returned zero rows despite real
+        # votes existing (a separate real problem, not this function's
+        # fault -- see fetch_votes()). Failing gracefully here means a
+        # fetch problem shows up as an honest "no data" result instead of
+        # crashing the whole job with a ZeroDivisionError.
+        return {}
+
     players = set()
     for w, l in pairs:
         players.add(w)
