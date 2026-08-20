@@ -2968,6 +2968,153 @@ function playerValueByKey(key){
   return playerValue(info.pos, info.age, info.role, titleCase(key));
 }
 
+/* ---------- Team Utility Engine ----------
+   Answers a different question than playerValue(): not "how much is this
+   player worth in the abstract" but "how much does this specific player
+   actually help THIS roster, right now." Full design and self-audit in
+   team-utility-design-and-audit.md -- this is the V1 implementation of
+   that design, current-season only, no competitive-window weighting, no
+   multi-year modeling, greedy lineup fill rather than a full
+   assignment-problem solver (justified in the design doc for a roster
+   this size).
+
+   ARCHITECTURE (enforced, not just described): calculateTeamUtility() and
+   calculateTradeImpact() only ever call playerValueByKey() for a player's
+   intrinsic worth -- never a second, parallel value calculation. This is
+   the direct fix for the double-counting risk the design doc's audit
+   flagged in the very first draft of this idea. */
+
+/* Real roster_positions for this league, already established and used
+   elsewhere in this file (see POSITION_TARGET_DEPTH's comment) -- pulled
+   from Sleeper's actual league settings, not assumed. 17 real starters:
+   QB, RB, RB, WR, WR, TE, FLEX, SUPER_FLEX, K, DL, DL, LB, LB, DB, DB,
+   IDP_FLEX, IDP_FLEX. */
+const TU_DEDICATED_SLOTS = [
+  {pos:'QB', count:1}, {pos:'RB', count:2}, {pos:'WR', count:2}, {pos:'TE', count:1},
+  {pos:'DL', count:2}, {pos:'LB', count:2}, {pos:'DB', count:2}, {pos:'K', count:1},
+];
+const TU_FLEX_SLOTS = [
+  {name:'FLEX', eligible:['RB','WR','TE'], count:1},
+  {name:'SUPER_FLEX', eligible:['QB','RB','WR','TE'], count:1},
+  {name:'IDP_FLEX', eligible:['DL','LB','DB'], count:2},
+];
+const TU_BENCH_WEIGHT = 0.15; // unvalidated guess, flagged as such in the
+  // design doc -- the single most likely constant in this whole feature
+  // to need real recalibration once it produces outputs someone reacts to,
+  // the same way the Hutchinson/Moehrig gut-check caught the position
+  // weights. Not derived from anything; a starting point, not an answer.
+
+/* Greedy lineup fill: dedicated slots first (each takes the highest-value
+   remaining eligible player), then flex slots (each round takes the
+   single highest-value remaining player eligible for any still-open flex
+   slot). Provably optimal for this specific league's nested eligibility
+   structure (flex sets are supersets of the dedicated sets feeding them)
+   -- see the design doc's Section 6 for the actual argument, not repeated
+   here. Returns {starters: [{key,pos,value}], bench: [{key,pos,value}]}. */
+function tuOptimizeLineup(players){
+  // players: [{key, pos, value}] -- expects real playerValueByKey() output
+  // already attached, not raw PLAYER_DB entries, so this function has no
+  // value-calculation logic of its own (see the architecture note above).
+  const remaining = players.slice().sort((a,b) => b.value - a.value);
+  const starters = [];
+
+  for(const slot of TU_DEDICATED_SLOTS){
+    let filled = 0;
+    for(let i = 0; i < remaining.length && filled < slot.count; i++){
+      if(remaining[i].pos === slot.pos){
+        starters.push(remaining[i]);
+        remaining.splice(i, 1);
+        i--; // account for the splice shifting indices
+        filled++;
+      }
+    }
+  }
+
+  const flexRemaining = TU_FLEX_SLOTS.map(s => ({...s})); // mutable copy of counts
+  let flexCapacity = flexRemaining.reduce((s,f) => s + f.count, 0);
+  while(flexCapacity > 0){
+    // find the single highest-value remaining player eligible for any
+    // still-open flex slot
+    let bestIdx = -1, bestSlot = null;
+    for(let i = 0; i < remaining.length; i++){
+      const p = remaining[i];
+      const openSlot = flexRemaining.find(f => f.count > 0 && f.eligible.includes(p.pos));
+      if(openSlot){ bestIdx = i; bestSlot = openSlot; break; } // remaining is
+        // already value-sorted descending, so the first eligible match IS
+        // the highest-value eligible player -- no need to scan further
+    }
+    if(bestIdx === -1) break; // nobody left is eligible for any open flex slot
+    starters.push(remaining[bestIdx]);
+    remaining.splice(bestIdx, 1);
+    bestSlot.count--;
+    flexCapacity--;
+  }
+
+  return { starters, bench: remaining };
+}
+
+function tuSum(list){
+  return list.reduce((s,p) => s + p.value, 0);
+}
+
+/* Builds the {key,pos,value} list tuOptimizeLineup expects, from a list of
+   PLAYER_DB keys. Silently skips anyone with no PLAYER_DB entry or no
+   computable value -- consistent with how the rest of this file treats
+   missing data (skip, don't fabricate), not a Team-Utility-specific
+   choice. */
+function tuPlayersFromKeys(keys){
+  const out = [];
+  for(const key of keys){
+    const info = PLAYER_DB[key];
+    if(!info) continue;
+    const val = playerValueByKey(key);
+    if(val && val > 0) out.push({ key, pos: info.pos, value: val });
+  }
+  return out;
+}
+
+/* The core V1 formula from the design doc:
+   TeamUtility = 0.85 x (post-trade lineup value - pre-trade lineup value)
+               + 0.15 x (post-trade bench value - pre-trade bench value)
+   Computed directly from a real roster-simulation diff, not from any
+   separate "marginal value" shortcut -- pre and post lineups are each
+   independently optimized from scratch. */
+function calculateTeamUtility(preRosterKeys, postRosterKeys){
+  const pre = tuOptimizeLineup(tuPlayersFromKeys(preRosterKeys));
+  const post = tuOptimizeLineup(tuPlayersFromKeys(postRosterKeys));
+  const lineupDelta = tuSum(post.starters) - tuSum(pre.starters);
+  const benchDelta = tuSum(post.bench) - tuSum(pre.bench);
+  return {
+    teamUtility: Math.round((1 - TU_BENCH_WEIGHT) * lineupDelta + TU_BENCH_WEIGHT * benchDelta),
+    lineupDelta: Math.round(lineupDelta),
+    benchDelta: Math.round(benchDelta),
+  };
+}
+
+/* Trade-level wrapper: takes the player's current full roster, plus which
+   keys are leaving and which are arriving, and reports BOTH the team
+   utility delta and the raw fundamental value delta side by side -- two
+   different, clearly separate answers to two different questions ("is
+   this fair by market value" vs "does this help my team"), matching the
+   design doc's explicit recommendation not to blend them into one number. */
+function calculateTradeImpact(currentRosterKeys, outgoingKeys, incomingKeys){
+  const postRosterKeys = currentRosterKeys
+    .filter(k => !outgoingKeys.includes(k))
+    .concat(incomingKeys);
+
+  const utility = calculateTeamUtility(currentRosterKeys, postRosterKeys);
+
+  const outgoingValue = tuSum(tuPlayersFromKeys(outgoingKeys));
+  const incomingValue = tuSum(tuPlayersFromKeys(incomingKeys));
+
+  return {
+    teamUtility: utility.teamUtility,
+    lineupDelta: utility.lineupDelta,
+    benchDelta: utility.benchDelta,
+    fundamentalValueDelta: Math.round(incomingValue - outgoingValue),
+  };
+}
+
 function findBuriedTalent(posFilter, limit){
   const results = [];
   for(const rosterId in LEAGUE_ROSTERS){
@@ -3514,11 +3661,26 @@ function renderTradeImpact(){
      it in here would quietly undo that decision, so this stays scoped to
      what the public roster/pick data already supports: net value and
      roster-spot framing, not a full backfill simulation. */
+  /* Net value + Team Utility, both computed from the same before/after
+     roster this function already builds for the position-need comparison
+     above -- no separate roster computation, per the architecture note in
+     the Team Utility engine (calculateTeamUtility only ever calls
+     playerValueByKey for a player's worth, never a second value
+     calculation of its own). Team Utility deliberately does NOT use any
+     free-agent data for the same reason the paragraph above this one
+     doesn't -- it only ever considers players already on this roster
+     (starters + bench), consistent with keeping free-agent data out of
+     the shared calculator. */
   const outValue = outgoing.reduce((s,a) => s + a.value, 0);
   const inValue = incoming.reduce((s,a) => s + a.value, 0);
   const netValue = inValue - outValue;
   const netColor = netValue >= 0 ? 'var(--green)' : 'var(--red)';
   const netSign = netValue >= 0 ? '+' : '';
+
+  const teamUtil = calculateTeamUtility(MY_ROSTER, afterRoster);
+  const tuColor = teamUtil.teamUtility >= 0 ? 'var(--green)' : 'var(--red)';
+  const tuSign = teamUtil.teamUtility >= 0 ? '+' : '';
+
   let packageNote = '';
   if(outgoing.length !== incoming.length){
     const giving = outgoing.length, getting = incoming.length;
@@ -3532,8 +3694,13 @@ function renderTradeImpact(){
   wrap.innerHTML = `
     <div class="trade-impact">
       <div class="trade-impact-title">Roster Need Impact (Side ${mySide} = You)</div>
-      <div style="font-family:'IBM Plex Mono',monospace;font-size:13px;margin-bottom:8px;">
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:13px;margin-bottom:4px;">
         Net value: <span style="color:${netColor};font-weight:600;">${netSign}${netValue.toLocaleString()}</span>
+        <span style="color:var(--text-dim);"> — is this fair by market value</span>
+      </div>
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:13px;margin-bottom:8px;">
+        Team Utility: <span style="color:${tuColor};font-weight:600;">${tuSign}${teamUtil.teamUtility.toLocaleString()}</span>
+        <span style="color:var(--text-dim);"> — does this actually help your lineup</span>
       </div>
       ${packageNote}
       ${changedLines.length ? changedLines.join('') : '<div style="color:var(--text-dim);">No change to quality depth at any position.</div>'}
