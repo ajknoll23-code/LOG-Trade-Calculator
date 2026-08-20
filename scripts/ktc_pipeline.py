@@ -128,13 +128,34 @@ def decompose_to_pairwise(rows):
     return pairs
 
 
-def bradley_terry(pairs, iterations=200, tol=1e-6):
+def bradley_terry(pairs, iterations=200, tol=1e-6, reg_games=2):
     """
     Zermelo's iterative algorithm for fitting Bradley-Terry strengths from
     a list of (winner, loser) pairs. Returns {player: strength}, normalized
     so the geometric mean of all strengths is 1.0 (an arbitrary but
     standard normalization -- what matters is relative strength between
     players, not the absolute scale).
+
+    REGULARIZATION, added 2026-08-20 after a real failure: with only 36
+    votes spread across ~90 distinct players, the comparison graph is
+    sparse and mostly disconnected -- most players appear in only 1-2
+    pairwise observations, many never compared against each other at all.
+    Unregularized Bradley-Terry MLE genuinely diverges in this situation --
+    confirmed by reproducing it with synthetic sparse data (max rating hit
+    67 million, min rating near zero, dozens of players collapsed to
+    identical tied values) -- not a coding typo, a real, well-known
+    limitation of the raw method at low/sparse sample sizes.
+
+    Fix: every real player gets `reg_games` virtual wins AND `reg_games`
+    virtual losses against a fixed anchor pseudo-player whose strength
+    never updates (always 1.0). This is standard regularized/Bayesian
+    Bradley-Terry, not a hack -- the anchor gives every player, however
+    sparse their real data, something fixed to be measured against, which
+    is exactly what prevents the runaway divergence. With reg_games=2 and
+    real vote volume eventually reaching 30+ observations per comparison
+    (the project's own trust threshold), the anchor's influence becomes
+    small relative to real data -- it matters most, and is needed most,
+    precisely when real data is thin, which is the correct behavior.
     """
     if not pairs:
         # Real edge case, not just theoretical -- hit this exact case on
@@ -145,50 +166,58 @@ def bradley_terry(pairs, iterations=200, tol=1e-6):
         # crashing the whole job with a ZeroDivisionError.
         return {}
 
-    players = set()
+    ANCHOR = '__anchor__'
+    real_players = set()
     for w, l in pairs:
-        players.add(w)
-        players.add(l)
-    players = list(players)
+        real_players.add(w)
+        real_players.add(l)
+    real_players = list(real_players)
 
     win_counts = defaultdict(lambda: defaultdict(int))
     for w, l in pairs:
         win_counts[w][l] += 1
+    # Ghost games -- see docstring. Symmetric: every real player "beats"
+    # and "loses to" the anchor the same number of times, so this has no
+    # directional bias, only a grounding effect.
+    for p in real_players:
+        win_counts[p][ANCHOR] += reg_games
+        win_counts[ANCHOR][p] += reg_games
 
-    s = {p: 1.0 for p in players}
+    all_nodes = real_players + [ANCHOR]
+    s = {p: 1.0 for p in all_nodes}
 
     for _ in range(iterations):
-        s_new = {}
-        max_delta = 0.0
-        for i in players:
+        s_new = {ANCHOR: 1.0}  # anchor's strength is fixed, never updated
+        for i in real_players:
             wins_i = sum(win_counts[i].values())
             if wins_i == 0:
-                s_new[i] = s[i] * 0.5  # decay players who never won a single pairing
+                s_new[i] = s[i] * 0.5
                 continue
             denom = 0.0
-            for j in players:
+            for j in all_nodes:
                 if j == i:
                     continue
                 n_ij = win_counts[i][j] + win_counts[j][i]
                 if n_ij == 0:
                     continue
                 denom += n_ij / (s[i] + s[j])
-            if denom > 0:
-                s_new[i] = wins_i / denom
-            else:
-                s_new[i] = s[i]
-        # normalize to geometric-mean-1 each iteration to prevent drift
-        import math
-        log_mean = sum(math.log(max(v, 1e-9)) for v in s_new.values()) / len(s_new)
-        scale = math.exp(-log_mean)
-        s_new = {k: v * scale for k, v in s_new.items()}
+            s_new[i] = wins_i / denom if denom > 0 else s[i]
 
-        max_delta = max(abs(s_new[p] - s[p]) for p in players)
+        # normalize real players to geometric-mean-1 each iteration to
+        # prevent drift -- anchor is excluded from this since its strength
+        # is fixed by definition, not something to be renormalized
+        import math
+        log_mean = sum(math.log(max(s_new[p], 1e-9)) for p in real_players) / len(real_players)
+        scale = math.exp(-log_mean)
+        for p in real_players:
+            s_new[p] *= scale
+
+        max_delta = max(abs(s_new[p] - s[p]) for p in real_players)
         s = s_new
         if max_delta < tol:
             break
 
-    return s
+    return {p: s[p] for p in real_players}
 
 
 def main():
