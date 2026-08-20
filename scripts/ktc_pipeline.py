@@ -58,11 +58,11 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # "Publish to web" step in ktc_vote_collector.gs's setup instructions.
 # Format is normally:
 # https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={GID}
-SHEET_CSV_URL = "PASTE_YOUR_PUBLISHED_SHEET_CSV_URL_HERE"
+SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTuKORGumlKJmUmBdeNWPstkj8VRjPoVkylbqHv1KqwoyziJYOUlkZUKRsSxzB3qHXmyjjLpGpH6W03/pub?output=csv"
 
 # Per Section 4 of the design doc -- caps how many of one voter's votes get
 # COUNTED per day, regardless of how many were submitted.
-MAX_VOTES_PER_VOTER_PER_DAY = 10
+MAX_VOTES_PER_VOTER_PER_DAY = 20
 
 # Per Section 6 of the design doc -- don't report a position-pair
 # comparison as a real signal until it has this many real pairwise
