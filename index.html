@@ -620,6 +620,10 @@
   <div class="section-label">Your Roster Needs</div>
   <div id="needsWrap"></div>
 
+  <div class="section-label" style="margin-top:20px;">Keep / Trade / Cut</div>
+  <div id="ktcWrap"></div>
+
+
   <details id="fullRosterDetails">
     <summary>View Full Roster</summary>
     <div id="fullRosterWrap" class="method-body"></div>
@@ -712,25 +716,36 @@
    suggesting RB's current 1.25 weight (above WR) may also be backwards —
    flagged for a separate pass, not fixed today.
 
-   DL/LB weights re-derived 2026-08-13. No KTC market exists for IDP at all
-   (never has, that's the whole reason this tool exists instead of just
-   using KTC) — so unlike QB, these can't be checked against a real trade
-   market. Best available substitute: each position's own raw scoring
-   OUTPUT under this league's actual rules, at a REPLACEMENT-LEVEL depth
-   matched to real roster demand. The original baseline depths (DL 28th,
-   LB 40th, DB 28th) were set before this league's real roster_positions
-   was ever pulled and don't reflect it — actual demand (2 dedicated slots
-   + an even 1/3 share of the 2-slot IDP_FLEX) is equal across all three,
-   ~2.67 per team, so all three should be compared at the SAME depth: 32nd
-   (12 teams × 2.67 ≈ 32). At that consistent depth: DL32 (117.5) implies
-   a weight of just 0.81x WR — DL was significantly overweighted at 1.05.
-   LB32 (169.6) implies ~1.17x WR — LB was slightly UNDERweighted at 1.10.
-   DB32 (141.3) implies ~0.97x WR — already correct at 1.00, untouched.
-   Practical effect: LB players (Roquan, Warner, etc.) get a small bump;
-   DL players (Abdul Carter, Nolan Smith, Brian Burns) come down more
-   meaningfully. This is still a proxy measure, not a real market check —
-   revisit if IDP trade-value data ever becomes available anywhere. */
-const POSITION_WEIGHT = { QB:1.30, RB:0.89, WR:1.00, TE:0.82, DL:0.81, LB:1.17, DB:1.00, K:0.35 };
+   DL/LB weights re-derived 2026-08-13, RE-DERIVED AGAIN 2026-08-19. No KTC
+   market exists for IDP at all (never has, that's the whole reason this
+   tool exists instead of just using KTC) — so unlike QB, these can't be
+   checked against a real trade market. Best available substitute: each
+   position's own raw scoring OUTPUT under this league's actual rules, at
+   a REPLACEMENT-LEVEL depth matched to real roster demand (32nd, same
+   reasoning as 2026-08-13 below).
+   The 2026-08-19 re-derivation exists because a real scoring bug was found
+   and fixed the same day: several IDP categories (QB hits, forced fumbles,
+   IDP fumble recoveries, and all three per-game bonus thresholds) weren't
+   being scored at all before, which understated every IDP player's real
+   production — DL and LB (pass-rush-heavy positions) far more than DB.
+   The 2026-08-13 weights below were computed on top of that bug, so they
+   were never really wrong given what the model knew at the time, but they
+   were built on incomplete input data. Same ratio-to-WR-baseline method,
+   same 32nd-depth definition, just run again on the corrected numbers:
+   DL32 (135.8) -> 0.94x WR (was 0.81 under the buggy scoring)
+   LB32 (182.6) -> 1.26x WR (was 1.17)
+   DB32 (156.6) -> 1.08x WR (was 1.00) — DB moved too even though the bug
+     mattered less for DB specifically, because WR's own baseline is the
+     denominator and didn't change, while DB's did shift some from the
+     bonus thresholds (10+ tackle bonus applies to DB just as much as
+     anyone).
+   Practical effect: all three IDP weights moved UP relative to WR, because
+   the missing categories were all IDP-specific — nothing about WR scoring
+   was ever wrong, so this isn't "IDP got better," it's "IDP was being
+   undercounted and now isn't." This is still a proxy measure, not a real
+   market check — revisit if IDP trade-value data ever becomes available
+   anywhere. */
+const POSITION_WEIGHT = { QB:1.30, RB:0.89, WR:1.00, TE:0.82, DL:0.94, LB:1.26, DB:1.08, K:0.35 };
 /* RB weight benchmarked 2026-08-13, real KTC Superflex data, same
    methodology as QB/TE. Flagged as a "bonus finding, not acted on" during
    the original QB pass and left unresolved for a while — this closes it
@@ -3635,9 +3650,183 @@ function renderSensitivity(){
   `;
 }
 
+/* ---------- Keep/Trade/Cut Engine ----------
+   Companion feature to the value model itself: collects real, aggregated
+   human judgment via 3-way Keep/Trade/Cut votes, the same core mechanic
+   KTC uses for skill positions, run at league scale instead of internet
+   scale. See keep-trade-cut-design.md for the full design rationale --
+   this is the client half; ktc_vote_collector.gs (write endpoint) and
+   ktc_pipeline.py (Bradley-Terry aggregation) are the other two pieces.
+
+   SELF-INTEREST GUARDRAIL: a trio never includes a player on the voter's
+   own roster (MY_ROSTER_ID / LEAGUE_ROSTERS), since league members have
+   real incentive to vote strategically about their own assets in a way
+   KTC's anonymous internet voters don't. This is enforced here, at
+   selection time, not left to the honor system.
+
+   DAILY CAP: this is a UX nicety only ("thanks, come back tomorrow"), not
+   the real enforcement boundary -- someone could clear localStorage and
+   keep voting. The REAL cap is enforced server-side in ktc_pipeline.py,
+   which only counts the first N votes per roster_id per day when building
+   the ratings, regardless of how many were actually submitted. Both layers
+   exist on purpose: this one keeps the on-page experience honest and
+   pleasant; that one is what actually protects the data. */
+
+const KTC_SUBMIT_URL = 'https://script.google.com/macros/s/AKfycbynz6A8jNOQonJhHtZW7DEx36PYTBXi_klXnacKF7I4kACPbTJIA5YFjY5ILxqpwgm8aw/exec'; // see ktc_vote_collector.gs setup instructions
+const KTC_DAILY_VOTE_LIMIT = 10; // matches MAX_VOTES_PER_VOTER_PER_DAY in ktc_pipeline.py -- keep these in sync
+const KTC_RECENT_MEMORY = 40; // how many recently-shown player keys to avoid repeating
+
+let ktcTrio = null; // [{key, pos, value}, {...}, {...}]
+let ktcAssignments = {}; // { playerKey: 'keep'|'trade'|'cut' }
+
+function ktcTodayKey(){
+  return 'ktc_votes_' + new Date().toISOString().slice(0,10); // localStorage key scoped to today's date
+}
+
+function ktcVotesToday(){
+  return parseInt(localStorage.getItem(ktcTodayKey()) || '0', 10);
+}
+
+function ktcRecentlyShown(){
+  try { return JSON.parse(localStorage.getItem('ktc_recent') || '[]'); }
+  catch(e){ return []; }
+}
+
+function ktcRememberShown(keys){
+  const recent = ktcRecentlyShown().concat(keys).slice(-KTC_RECENT_MEMORY);
+  localStorage.setItem('ktc_recent', JSON.stringify(recent));
+}
+
+/* Builds the eligible pool: every player with a real current value, minus
+   whoever is on the voter's own roster. Requires MY_ROSTER_ID to already
+   be set (same "which team is yours" flow the Roster Needs panel uses) --
+   if it isn't set yet, KTC simply doesn't render anything rather than risk
+   showing someone their own players. */
+function ktcEligiblePool(){
+  if(!MY_ROSTER_ID) return [];
+  const myPlayers = new Set(
+    (LEAGUE_ROSTERS[MY_ROSTER_ID] && LEAGUE_ROSTERS[MY_ROSTER_ID].players || []).map(p => p.key)
+  );
+  const recent = new Set(ktcRecentlyShown());
+  const pool = [];
+  for(const key in PLAYER_DB){
+    if(myPlayers.has(key)) continue;
+    if(recent.has(key)) continue;
+    const info = PLAYER_DB[key];
+    if(!info || info.pos === 'K') continue;
+    const val = playerValueByKey(key);
+    if(val && val > 0) pool.push({ key, pos: info.pos, value: val });
+  }
+  return pool;
+}
+
+/* 70% targeted (a random anchor player + two others within +/-30% of its
+   value, biased toward the anchor being IDP so most targeted trios
+   actually inform the DL/LB/DB question this feature exists for), 30%
+   fully random -- see Section 5 of the design doc for why this mix and
+   not pure random. */
+function selectKTCTrio(){
+  const pool = ktcEligiblePool();
+  if(pool.length < 3) return null;
+
+  const wantTargeted = Math.random() < 0.7;
+  if(wantTargeted){
+    const idpPool = pool.filter(p => ['DL','LB','DB'].includes(p.pos));
+    const anchorPool = idpPool.length ? idpPool : pool;
+    const anchor = anchorPool[Math.floor(Math.random()*anchorPool.length)];
+    const band = pool.filter(p => p.key !== anchor.key &&
+      p.value >= anchor.value*0.7 && p.value <= anchor.value*1.3);
+    if(band.length >= 2){
+      // shuffle band, take 2
+      for(let i=band.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [band[i],band[j]]=[band[j],band[i]]; }
+      return [anchor, band[0], band[1]];
+    }
+    // band too thin -- fall through to random
+  }
+  const shuffled = pool.slice();
+  for(let i=shuffled.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [shuffled[i],shuffled[j]]=[shuffled[j],shuffled[i]]; }
+  return shuffled.slice(0,3);
+}
+
+function ktcAssignRole(key, role){
+  // clear this role from whoever currently has it, then assign fresh --
+  // lets a misclick be corrected by just tapping a different role
+  for(const k in ktcAssignments){ if(ktcAssignments[k]===role) delete ktcAssignments[k]; }
+  ktcAssignments[key] = role;
+  renderKTC();
+}
+
+function ktcSubmit(){
+  const keep = Object.keys(ktcAssignments).find(k => ktcAssignments[k]==='keep');
+  const trade = Object.keys(ktcAssignments).find(k => ktcAssignments[k]==='trade');
+  const cut = Object.keys(ktcAssignments).find(k => ktcAssignments[k]==='cut');
+  if(!keep || !trade || !cut) return;
+
+  fetch(KTC_SUBMIT_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // see ktc_vote_collector.gs -- avoids a CORS preflight
+    body: JSON.stringify({ voterRosterId: MY_ROSTER_ID, keep, trade, cut }),
+  }).catch(() => {}); // best-effort -- a dropped vote isn't worth blocking the UI over
+
+  localStorage.setItem(ktcTodayKey(), String(ktcVotesToday()+1));
+  ktcRememberShown([keep, trade, cut]);
+  ktcAssignments = {};
+  ktcTrio = selectKTCTrio();
+  renderKTC();
+}
+
+function renderKTC(){
+  const el = document.getElementById('ktcWrap');
+  if(!el) return;
+
+  if(!MY_ROSTER_ID){
+    el.innerHTML = `<div style="color:var(--text-dim);font-size:13px;padding:8px 0;">Pick "Which team is yours?" above to start voting -- this makes sure you're never shown your own players.</div>`;
+    return;
+  }
+
+  if(ktcVotesToday() >= KTC_DAILY_VOTE_LIMIT){
+    el.innerHTML = `<div style="color:var(--text-dim);font-size:13px;padding:8px 0;">You've hit today's vote limit -- thanks for helping calibrate the model. Come back tomorrow for more.</div>`;
+    return;
+  }
+
+  if(!ktcTrio) ktcTrio = selectKTCTrio();
+  if(!ktcTrio){
+    el.innerHTML = `<div style="color:var(--text-dim);font-size:13px;padding:8px 0;">Not enough eligible players to build a round right now.</div>`;
+    return;
+  }
+
+  const roleLabel = { keep:'KEEP', trade:'TRADE', cut:'CUT' };
+  const roleColor = { keep:'var(--green)', trade:'var(--text-dim)', cut:'var(--red)' };
+
+  const cards = ktcTrio.map(p => {
+    const assigned = ktcAssignments[p.key];
+    const usedRoles = new Set(Object.values(ktcAssignments));
+    const buttons = ['keep','trade','cut'].map(role => {
+      const isThis = assigned === role;
+      const disabled = !isThis && usedRoles.has(role);
+      return `<button class="tab-btn" style="flex:1;${isThis ? `background:${roleColor[role]};color:var(--bg);border-color:${roleColor[role]};` : ''}${disabled?'opacity:0.35;pointer-events:none;':''}" onclick="ktcAssignRole('${p.key}','${role}')">${roleLabel[role]}</button>`;
+    }).join('');
+    return `
+      <div class="need-cell" style="text-align:left;padding:10px;">
+        <div style="font-weight:600;font-size:14px;">${titleCase(p.key)}</div>
+        <div style="color:var(--text-dim);font-size:11px;margin-bottom:8px;">${p.pos} &middot; value ${p.value}</div>
+        <div style="display:flex;gap:4px;">${buttons}</div>
+      </div>`;
+  }).join('');
+
+  const allAssigned = Object.keys(ktcAssignments).length === 3;
+
+  el.innerHTML = `
+    <div style="color:var(--text-dim);font-size:12px;margin-bottom:8px;">Tap KEEP on your favorite, CUT on your least favorite.</div>
+    <div style="display:flex;flex-direction:column;gap:8px;">${cards}</div>
+    <button class="tab-btn" style="width:100%;margin-top:10px;${allAssigned?'background:var(--gold);color:var(--bg);border-color:var(--gold);':'opacity:0.4;pointer-events:none;'}" onclick="ktcSubmit()">Submit Vote</button>
+  `;
+}
+
 function render(){
   document.getElementById('myTeamToggle').textContent = `Side ${state.myTeamSide} (You)`;
   renderNeedsPanel();
+  renderKTC();
   renderFullRoster();
   renderFindTargets();
   renderPositionLeaders();
