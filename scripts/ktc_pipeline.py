@@ -58,7 +58,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # "Publish to web" step in ktc_vote_collector.gs's setup instructions.
 # Format is normally:
 # https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={GID}
-SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTuKORGumlKJmUmBdeNWPstkj8VRjPoVkylbqHv1KqwoyziJYOUlkZUKRsSxzB3qHXmyjjLpGpH6W03/pub?output=csv"
+SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTuKORGumlKJmUmBdeNWPstkj8VRjPoVkylbqHv1KqwoyziJYOUlkZUKRsSxzB3qHXmyjjLpGpH6W03/pub?gid=458294959&single=true&output=csv"
 
 # Per Section 4 of the design doc -- caps how many of one voter's votes get
 # COUNTED per day, regardless of how many were submitted.
