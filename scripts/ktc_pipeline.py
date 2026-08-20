@@ -220,28 +220,27 @@ def bradley_terry(pairs, iterations=200, tol=1e-6, reg_games=2):
     return {p: s[p] for p in real_players}
 
 
-def main():
-    rows = fetch_votes()
-    rows = apply_daily_cap(rows)
-    print(f"  {len(rows)} votes counted after daily cap")
+def is_league_voter(voter_id):
+    """
+    Real league members submit their numeric Sleeper roster_id. Guest
+    voters (people outside the league, added 2026-08-20) submit an
+    'ext_xxxxxxxx' identifier instead -- see ktcGuestId() in index.html.
+    No schema change needed for this; the existing voter_roster_id column
+    already holds whichever shape of string applies.
+    """
+    return str(voter_id).isdigit()
 
+
+def build_ratings_summary(rows, pos_lookup, label):
+    """
+    Runs the full pipeline (decompose -> Bradley-Terry -> position
+    aggregation) for one set of vote rows, returning a summary dict.
+    Factored out so league-only and all-voters-combined can be computed
+    identically rather than duplicating this logic twice with a risk of
+    the two versions drifting apart.
+    """
     pairs = decompose_to_pairwise(rows)
-    print(f"  {len(pairs)} pairwise observations from those votes")
-
     strengths = bradley_terry(pairs)
-
-    # Position-level aggregation, with the honest minimum-sample gate.
-    # Needs an external pos-lookup -- reuses PLAYER_DB's shape by expecting
-    # a player_positions.json file (player_key -> pos) to sit alongside
-    # this script; that file should just be a plain export of PLAYER_DB
-    # from index.html, refreshed whenever PLAYER_DB changes.
-    pos_lookup = {}
-    pos_lookup_path = os.path.join(SCRIPT_DIR, "player_positions.json")
-    if os.path.exists(pos_lookup_path):
-        pos_lookup = json.load(open(pos_lookup_path))
-    else:
-        print("  NOTE: player_positions.json not found -- position-level "
-              "aggregation skipped, only per-player ratings will be output.")
 
     position_pairwise_count = defaultdict(int)
     for w, l in pairs:
@@ -256,35 +255,65 @@ def main():
         pos = POS_BUCKET.get(pos_lookup.get(player))
         if pos:
             position_avg_strength[pos].append(strength)
+    position_summary = {pos: round(sum(v)/len(v), 4) for pos, v in position_avg_strength.items()}
 
-    position_summary = {}
-    for pos, vals in position_avg_strength.items():
-        position_summary[pos] = round(sum(vals) / len(vals), 4)
-
-    position_pair_signal = {}
-    for (pa, pb), count in position_pairwise_count.items():
-        position_pair_signal[f"{pa}_vs_{pb}"] = {
+    position_pair_signal = {
+        f"{pa}_vs_{pb}": {
             "pairwise_observations": count,
             "enough_data": count >= MIN_PAIRWISE_FOR_SIGNAL,
         }
+        for (pa, pb), count in position_pairwise_count.items()
+    }
 
-    output = {
-        "generated_at": datetime.utcnow().isoformat(),
-        "total_votes_counted": len(rows),
-        "total_pairwise_observations": len(pairs),
+    print(f"\n=== {label}: {len(rows)} votes, {len(pairs)} pairwise observations ===")
+    for pair, info in position_pair_signal.items():
+        flag = "OK" if info["enough_data"] else "NOT ENOUGH DATA YET"
+        print(f"  {pair}: {info['pairwise_observations']} observations -- {flag}")
+
+    return {
+        "votes_counted": len(rows),
+        "pairwise_observations": len(pairs),
         "player_ratings": {k: round(v, 4) for k, v in sorted(strengths.items(), key=lambda kv: -kv[1])},
         "position_avg_rating": position_summary,
         "position_pair_sample_sizes": position_pair_signal,
     }
 
+
+def main():
+    rows = fetch_votes()
+    rows = apply_daily_cap(rows)
+    print(f"  {len(rows)} votes counted after daily cap")
+
+    league_rows = [r for r in rows if is_league_voter(r.get("voter_roster_id", ""))]
+    guest_rows = [r for r in rows if not is_league_voter(r.get("voter_roster_id", ""))]
+    print(f"  {len(league_rows)} from league members, {len(guest_rows)} from guests")
+
+    pos_lookup = {}
+    pos_lookup_path = os.path.join(SCRIPT_DIR, "player_positions.json")
+    if os.path.exists(pos_lookup_path):
+        pos_lookup = json.load(open(pos_lookup_path))
+    else:
+        print("  NOTE: player_positions.json not found -- position-level "
+              "aggregation skipped, only per-player ratings will be output.")
+
+    league_only = build_ratings_summary(league_rows, pos_lookup, "League members only")
+    all_combined = build_ratings_summary(rows, pos_lookup, "All voters (league + guests)")
+
+    output = {
+        "generated_at": datetime.utcnow().isoformat(),
+        "total_votes_counted": len(rows),
+        "league_votes": len(league_rows),
+        "guest_votes": len(guest_rows),
+        # Two separate results, never silently blended into one number --
+        # see keep-trade-cut-design.md for why guest and league opinion
+        # shouldn't be assumed equivalent. Compare the two to see whether
+        # outside dynasty opinion actually agrees with this league's.
+        "league_only": league_only,
+        "all_voters_combined": all_combined,
+    }
+
     with open(os.path.join(SCRIPT_DIR, "ktc_ratings.json"), "w") as f:
         json.dump(output, f, indent=2)
-
-    print("\n=== Position-pair sample sizes (real signal requires "
-          f"{MIN_PAIRWISE_FOR_SIGNAL}+ observations) ===")
-    for pair, info in position_pair_signal.items():
-        flag = "OK" if info["enough_data"] else "NOT ENOUGH DATA YET"
-        print(f"  {pair}: {info['pairwise_observations']} observations -- {flag}")
 
     print("\nWrote ktc_ratings.json")
 
