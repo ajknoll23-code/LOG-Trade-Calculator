@@ -288,6 +288,20 @@ def main():
     guest_rows = [r for r in rows if not is_league_voter(r.get("voter_roster_id", ""))]
     print(f"  {len(league_rows)} from league members, {len(guest_rows)} from guests")
 
+    # Real per-voter share, not a guess -- added 2026-08-20 after a real
+    # question about whether one dominant voter (even an honest one)
+    # undermines the whole point of aggregating multiple people's
+    # judgment. The self-interest guardrail protects against bias; it does
+    # nothing about sample diversity, which is a separate, real concern.
+    voter_counts = defaultdict(int)
+    for r in league_rows:
+        voter_counts[r.get("voter_roster_id", "unknown")] += 1
+    total_league = len(league_rows)
+    voter_share = {
+        voter: {"votes": count, "share_pct": round(100 * count / total_league, 1)}
+        for voter, count in sorted(voter_counts.items(), key=lambda kv: -kv[1])
+    } if total_league else {}
+
     pos_lookup = {}
     pos_lookup_path = os.path.join(SCRIPT_DIR, "player_positions.json")
     if os.path.exists(pos_lookup_path):
@@ -304,6 +318,7 @@ def main():
         "total_votes_counted": len(rows),
         "league_votes": len(league_rows),
         "guest_votes": len(guest_rows),
+        "voter_share_within_league": voter_share,
         # Two separate results, never silently blended into one number --
         # see keep-trade-cut-design.md for why guest and league opinion
         # shouldn't be assumed equivalent. Compare the two to see whether
@@ -314,6 +329,10 @@ def main():
 
     with open(os.path.join(SCRIPT_DIR, "ktc_ratings.json"), "w") as f:
         json.dump(output, f, indent=2)
+
+    print("\n=== Voter share within league votes ===")
+    for voter, info in voter_share.items():
+        print(f"  roster_id {voter}: {info['votes']} votes ({info['share_pct']}% of league total)")
 
     print("\nWrote ktc_ratings.json")
 
