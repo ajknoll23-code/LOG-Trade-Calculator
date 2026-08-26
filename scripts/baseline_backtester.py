@@ -490,6 +490,32 @@ def main():
 
     for position in POSITIONS:
         print(f"\n=== {position} ===")
+
+        # FIX (2026-08-27, per external review): if every candidate
+        # specifies the same baseline rank for this position, there is no
+        # real contest -- report that explicitly instead of letting the
+        # tie-break in summarize_folds_won() (which picks whichever dict
+        # key comes first) silently manufacture a fake "winner". This
+        # happened for real at QB (all three = 18) and LB (all three =
+        # 32) in the first real run, and reported "documented: 15/15
+        # folds won" in a way that looked like a real result but wasn't.
+        candidate_ranks_here = {name: ranks.get(position) for name, ranks in BASELINE_CANDIDATES.items()}
+        not_tested = len(set(candidate_ranks_here.values())) == 1
+
+        if not_tested:
+            only_rank = next(iter(candidate_ranks_here.values()))
+            print(f"  NOT TESTED -- all candidates specify rank {only_rank} for {position}; "
+                  f"no competing hypothesis exists to compare.")
+            md_lines.append(f"\n## {position}\n")
+            md_lines.append(f"**NOT TESTED** -- all three candidates specify the identical rank "
+                             f"({only_rank}) for {position}. No competing hypothesis was tested here; "
+                             f"this is not a backtest result and should not be read as one. Retain the "
+                             f"documented value ({only_rank}) by default.")
+            results_out["positions"][position] = {
+                "not_tested": True, "shared_rank": only_rank,
+            }
+            continue
+
         folds_primary = build_folds(points_data, PRIMARY_WINDOW)
         test1, test2_splits = run_test1_and_2(folds_primary, position)
         sanity_table = build_sanity_table(folds_primary, position)
