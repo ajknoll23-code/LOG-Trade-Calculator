@@ -5,35 +5,7 @@
 
 ## QB
 
-### Test 3 (decision criterion) -- MAE against non-circular future relative-production target
-
-| Candidate | Median MAE (4wk) | Folds won (4wk) | MAE @2wk | MAE @4wk | MAE @6wk |
-|---|---|---|---|---|---|
-| documented | 0.5574 | 15 | 0.4478 | 0.5574 | 0.5854 |
-| legacy_empirical | 0.5574 | 0 | 0.4478 | 0.5574 | 0.5854 |
-| roster_economics_informed | 0.5574 | 0 | 0.4478 | 0.5574 | 0.5854 |
-
-**Best by Test 3: documented**  |  Stable across forward-window sizes: **True** (per-window winners: {2: 'documented', 4: 'documented', 6: 'documented'})
-
-### Test 1 (diagnostic -- clamp sensitivity, NOT a winner-picker)
-
-| Candidate | Median Pearson | Median Spearman | Median floor% | Median ceiling% |
-|---|---|---|---|---|
-| documented | 0.5055 | 0.467 | 12.5 | 0.0 |
-| legacy_empirical | 0.5055 | 0.467 | 12.5 | 0.0 |
-| roster_economics_informed | 0.5055 | 0.467 | 12.5 | 0.0 |
-
-### Test 2 (diagnostic -- future-production tier-break, NOT ground truth)
-
-Median optimal split (independent of named candidates): **rank 20** across 15 folds
-
-### Real-data sanity table (cross-season fold)
-
-| Candidate | Rank | Player at rank | Baseline PPG | Eligible players | Floor% | Ceiling% |
-|---|---|---|---|---|---|---|
-| documented | 18 | Marcus Mariota | 16.45 | 69 | 31.9 | 0.0 |
-| legacy_empirical | 18 | Marcus Mariota | 16.45 | 69 | 31.9 | 0.0 |
-| roster_economics_informed | 18 | Marcus Mariota | 16.45 | 69 | 31.9 | 0.0 |
+**NOT TESTED** -- all three candidates specify the identical rank (18) for QB. No competing hypothesis was tested here; this is not a backtest result and should not be read as one. Retain the documented value (18) by default.
 
 ## RB
 
@@ -165,35 +137,7 @@ Median optimal split (independent of named candidates): **rank 16** across 15 fo
 
 ## LB
 
-### Test 3 (decision criterion) -- MAE against non-circular future relative-production target
-
-| Candidate | Median MAE (4wk) | Folds won (4wk) | MAE @2wk | MAE @4wk | MAE @6wk |
-|---|---|---|---|---|---|
-| documented | 0.1936 | 15 | 0.2208 | 0.1936 | 0.1863 |
-| legacy_empirical | 0.1936 | 0 | 0.2208 | 0.1936 | 0.1863 |
-| roster_economics_informed | 0.1936 | 0 | 0.2208 | 0.1936 | 0.1863 |
-
-**Best by Test 3: documented**  |  Stable across forward-window sizes: **True** (per-window winners: {2: 'documented', 4: 'documented', 6: 'documented'})
-
-### Test 1 (diagnostic -- clamp sensitivity, NOT a winner-picker)
-
-| Candidate | Median Pearson | Median Spearman | Median floor% | Median ceiling% |
-|---|---|---|---|---|
-| documented | 0.7398 | 0.7611 | 46.3 | 0.0 |
-| legacy_empirical | 0.7398 | 0.7611 | 46.3 | 0.0 |
-| roster_economics_informed | 0.7398 | 0.7611 | 46.3 | 0.0 |
-
-### Test 2 (diagnostic -- future-production tier-break, NOT ground truth)
-
-Median optimal split (independent of named candidates): **rank 27** across 15 folds
-
-### Real-data sanity table (cross-season fold)
-
-| Candidate | Rank | Player at rank | Baseline PPG | Eligible players | Floor% | Ceiling% |
-|---|---|---|---|---|---|---|
-| documented | 32 | Azeez Al-Shaair | 13.11 | 267 | 51.3 | 0.0 |
-| legacy_empirical | 32 | Azeez Al-Shaair | 13.11 | 267 | 51.3 | 0.0 |
-| roster_economics_informed | 32 | Azeez Al-Shaair | 13.11 | 267 | 51.3 | 0.0 |
+**NOT TESTED** -- all three candidates specify the identical rank (32) for LB. No competing hypothesis was tested here; this is not a backtest result and should not be read as one. Retain the documented value (32) by default.
 
 ## DB
 
