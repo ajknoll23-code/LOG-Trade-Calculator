@@ -136,11 +136,30 @@ def rank_within_week(week_metrics, metric_index):
     return {pid: i + 1 for i, (pid, _) in enumerate(ordered)}
 
 
-def collect_roster_status(lineup_data, season, position):
+def collect_roster_status(lineup_data, season_points, season, position):
     """
     Returns [(week, pid, status)] for every ROSTERED player (started or
     benched) at this position, week >= MIN_RANK_WEEK, from the lineup
     reconstruction's real records. status is 'started' or 'benched'.
+
+    2026-08-27 FIX -- the games-floor patch (MIN_TRAILING_GAMES) did NOT
+    resolve the anomaly (rank-1 start rate still ~60-91%, DL still
+    non-monotonic). Real cause, found by inspection: this function
+    counted a "benched" record as a meaningful observation even for
+    weeks the player was on a BYE or injured and literally could not
+    play. An elite player's trailing PPG rank stays high for as long
+    after an injury as his trailing window still includes his healthy
+    games -- so a season-ending injury in week 6 leaves him "rank 1"
+    for the rest of the season while he's correctly benched every
+    remaining week, which isn't a lineup-competition signal at all.
+    Byes have the same effect on a smaller scale. Fix: only count an
+    observation for a week the player ACTUALLY had a real recorded game
+    that week (present in season_points[pid]['weekly_points'] for that
+    exact week) -- i.e., restrict to weeks where starting him was a live
+    option, not weeks where he physically could not play. This is a
+    stricter, better-justified fix than the games-floor: that one was
+    about whether the RANK could be trusted; this one is about whether
+    the OBSERVATION means what it claims to mean.
     """
     records = lineup_data["seasons"][season]["records"]
     out = []
@@ -149,10 +168,14 @@ def collect_roster_status(lineup_data, season, position):
             continue
         if r["pos_bucket"] != position:
             continue
+        pid = r["player_id"]
+        pinfo = season_points.get(pid)
+        if not pinfo or str(r["week"]) not in pinfo.get("weekly_points", {}):
+            continue  # player didn't actually play this week (bye/injury/inactive) -- not a real lineup decision
         if r["start_type"] in ("dedicated", "flex"):
-            out.append((r["week"], r["player_id"], "started"))
+            out.append((r["week"], pid, "started"))
         elif r["start_type"] == "benched":
-            out.append((r["week"], r["player_id"], "benched"))
+            out.append((r["week"], pid, "benched"))
     return out
 
 
@@ -269,6 +292,23 @@ def run_selftest():
     assert upper is not None and lower is not None, "expected a clean zone on a synthetic hard cliff"
     assert upper <= 10 <= lower, f"expected the known cliff (rank 10) inside zone {zone}, got upper={upper} lower={lower}"
     print(f"  Synthetic hard-cliff-at-rank-10 recovered as zone {zone} -- OK")
+
+    # Targeted test of the 2026-08-27 fix: collect_roster_status must drop
+    # a "benched" observation for a week the player had no real game that
+    # week (bye/injury) -- that's not a lineup-competition signal.
+    injury_fixture = {
+        "fake1": {"pos_bucket": "DL", "weekly_points": {"1": 20.0, "2": 20.0, "3": 20.0}},  # no wk4/5 data -> injured/bye
+        "fake2": {"pos_bucket": "DL", "weekly_points": {"1": 10.0, "2": 10.0, "3": 10.0, "4": 10.0}},  # has wk4 data
+    }
+    fake_lineup = {"seasons": {"2099": {"records": [
+        {"week": 5, "pos_bucket": "DL", "player_id": "fake1", "start_type": "benched"},  # fake1 has no wk5 data -> must be dropped
+        {"week": 4, "pos_bucket": "DL", "player_id": "fake2", "start_type": "dedicated"},  # fake2 HAS wk4 data -> must be kept
+    ]}}}
+    status = collect_roster_status(fake_lineup, injury_fixture, "2099", "DL")
+    kept_pids = {pid for (_, pid, _) in status}
+    assert "fake1" not in kept_pids, "expected the bye/injury-week benched observation to be dropped"
+    assert "fake2" in kept_pids, "expected the real-game-week started observation to be kept"
+    print("  collect_roster_status correctly drops no-game-that-week observations -- OK")
     print("Self-test passed.\n")
 
 
@@ -318,7 +358,7 @@ def main():
         for season in seasons:
             season_points = points_data["seasons"][season]
             rank_by_week_metrics = build_trailing_metrics(season_points, position)
-            roster_status = collect_roster_status(lineup_data, season, position)
+            roster_status = collect_roster_status(lineup_data, season_points, season, position)
 
             curve_ppg, skipped_ppg = build_curve(roster_status, rank_by_week_metrics, 0)
             curve_cum, skipped_cum = build_curve(roster_status, rank_by_week_metrics, 1)
