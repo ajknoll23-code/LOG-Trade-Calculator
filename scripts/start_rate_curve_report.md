@@ -8,6 +8,7 @@ Trailing-PPG rank is primary; trailing-cumulative rank is the robustness check. 
 - Pooled PPG-rank zone: **(4, 37)**
 - Pooled cumulative-rank zone: **(4, 37)**
 - PPG vs. cumulative agree (within 6 ranks): **True**
+- Baseline comparison uses: **trailing_ppg**
 - Documented baseline (18): INSIDE the observed zone (rank 18 is within the real falloff range)
 - Empirical baseline (18): INSIDE the observed zone (rank 18 is within the real falloff range)
 
@@ -16,6 +17,7 @@ Trailing-PPG rank is primary; trailing-cumulative rank is the robustness check. 
 - Pooled PPG-rank zone: **(4, 37)**
 - Pooled cumulative-rank zone: **(4, 31)**
 - PPG vs. cumulative agree (within 6 ranks): **True**
+- Baseline comparison uses: **trailing_ppg**
 - Documented baseline (32): INSIDE the observed zone (rank 32 is within the real falloff range)
 - Empirical baseline (37): INSIDE the observed zone (rank 37 is within the real falloff range)
 
@@ -24,22 +26,25 @@ Trailing-PPG rank is primary; trailing-cumulative rank is the robustness check. 
 - Pooled PPG-rank zone: **(None, None)**
 - Pooled cumulative-rank zone: **(1, 43)**
 - PPG vs. cumulative agree (within 6 ranks): **False**
-- Documented baseline (36): n/a (zone not resolved)
-- Empirical baseline (43): n/a (zone not resolved)
+- Baseline comparison uses: **trailing_cumulative (PPG-rank zone unresolved)**
+- Documented baseline (36): INSIDE the observed zone (rank 36 is within the real falloff range)
+- Empirical baseline (43): INSIDE the observed zone (rank 43 is within the real falloff range)
 
 ## TE
 
 - Pooled PPG-rank zone: **(None, None)**
 - Pooled cumulative-rank zone: **(None, None)**
 - PPG vs. cumulative agree (within 6 ranks): **False**
+- Baseline comparison uses: **trailing_cumulative (PPG-rank zone unresolved)**
 - Documented baseline (15): n/a (zone not resolved)
 - Empirical baseline (16): n/a (zone not resolved)
 
 ## DL
 
-- Pooled PPG-rank zone: **(7, 52)**
+- Pooled PPG-rank zone: **(7, 55)**
 - Pooled cumulative-rank zone: **(4, 49)**
 - PPG vs. cumulative agree (within 6 ranks): **True**
+- Baseline comparison uses: **trailing_ppg**
 - Documented baseline (32): INSIDE the observed zone (rank 32 is within the real falloff range)
 - Empirical baseline (23): INSIDE the observed zone (rank 23 is within the real falloff range)
 
@@ -48,6 +53,7 @@ Trailing-PPG rank is primary; trailing-cumulative rank is the robustness check. 
 - Pooled PPG-rank zone: **(None, None)**
 - Pooled cumulative-rank zone: **(1, None)**
 - PPG vs. cumulative agree (within 6 ranks): **False**
+- Baseline comparison uses: **trailing_cumulative (PPG-rank zone unresolved)**
 - Documented baseline (32): n/a (zone not resolved)
 - Empirical baseline (32): n/a (zone not resolved)
 
@@ -56,6 +62,7 @@ Trailing-PPG rank is primary; trailing-cumulative rank is the robustness check. 
 - Pooled PPG-rank zone: **(None, None)**
 - Pooled cumulative-rank zone: **(None, None)**
 - PPG vs. cumulative agree (within 6 ranks): **False**
+- Baseline comparison uses: **trailing_cumulative (PPG-rank zone unresolved)**
 - Documented baseline (32): n/a (zone not resolved)
 - Empirical baseline (30): n/a (zone not resolved)
 
