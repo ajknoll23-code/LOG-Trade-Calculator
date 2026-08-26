@@ -30,14 +30,24 @@ Each season's own real `roster_positions` (fetched fresh, not assumed)
 is the authority on which slots were dedicated vs. flex that year.
 
 WHAT THIS DOES NOT DO YET (later steps, not this script):
-- No start-rate curves by positional rank (needs pre-week, not
-  end-of-season, player rank -- leakage risk flagged in the audit).
 - No cross-season comparison of flex market share (needs 2026 data to
   accumulate first).
 - No conclusion about whether the roster-economics hypothesis is TRUE --
-  this script only produces the real counts; interpretation is a
-  separate step once DL/WR (the unchanged "control" positions) can be
-  checked against the empirically reconstructed replacement zones.
+  this script only produces the real counts; interpretation happens in
+  start_rate_curve_analysis.py once DL/WR (the unchanged "control"
+  positions) can be checked against the empirically reconstructed
+  replacement zones.
+
+2026-08-26 UPDATE: now also captures rostered-but-not-started ("benched")
+players per team-week, from each matchup entry's `players` field (that
+week's full active roster -- taxi/IR excluded by Sleeper already, which is
+the right scope: only players actually eligible to start that week should
+count as benched). This is required by start_rate_curve_analysis.py's
+start-rate-by-rank curves (steps 5-6) -- the earlier version of this file
+only captured starters, which has no way to tell "benched" from "never
+rostered." Re-run this script to pick up bench data before running the
+curve analysis; the previously-committed historical_lineup_demand.json
+predates this change and does not have it.
 
 REQUIRES REAL INTERNET ACCESS. Written and reasoned through without the
 ability to run it end-to-end in this sandboxed environment (no network
@@ -204,9 +214,11 @@ def reconstruct_season(season, league, player_index):
             if not starters or all(s in (None, "0") for s in starters):
                 continue  # roster had no real lineup set this week
             team_name = roster_id_to_team.get(roster_id, f"Roster {roster_id}")
+            started_ids = set()
             for slot, pid in zip(starter_slots, starters):
                 if pid in (None, "0"):
                     continue
+                started_ids.add(pid)
                 pinfo = player_index.get(pid, {"name": f"Unknown ({pid})", "pos_bucket": None})
                 is_flex = slot in FLEX_ELIGIBLE
                 records.append({
@@ -219,6 +231,29 @@ def reconstruct_season(season, league, player_index):
                     "player_name": pinfo["name"],
                     "pos_bucket": pinfo["pos_bucket"],
                     "start_type": "flex" if is_flex else "dedicated",
+                })
+            # ADDED for the start-rate-curve workstream (steps 5-6): also
+            # capture rostered-but-not-started players, from the matchup
+            # entry's `players` field (that week's full active roster --
+            # taxi/IR are excluded from this by Sleeper, which is the right
+            # scope here: only players actually eligible to be started that
+            # week should count as "benched," not the whole taxi squad).
+            # slot=None distinguishes these from real starts downstream.
+            full_roster = entry.get("players") or []
+            for pid in full_roster:
+                if pid in (None, "0") or pid in started_ids:
+                    continue
+                pinfo = player_index.get(pid, {"name": f"Unknown ({pid})", "pos_bucket": None})
+                records.append({
+                    "season": season,
+                    "week": week,
+                    "roster_id": roster_id,
+                    "team_name": team_name,
+                    "slot": None,
+                    "player_id": pid,
+                    "player_name": pinfo["name"],
+                    "pos_bucket": pinfo["pos_bucket"],
+                    "start_type": "benched",
                 })
         time.sleep(0.2)  # be polite to the API
 
@@ -257,10 +292,16 @@ def summarize(season_data):
             # slot counts (exactly 1 LB, 2 DL, 2 DB every team-week) before
             # applying this fix.
             dedicated_counts[r["slot"]] = dedicated_counts.get(r["slot"], 0) + 1
-        else:
+        elif r["start_type"] == "flex":
+            # Explicit elif, not else -- "benched" records (added for the
+            # start-rate-curve workstream) must NOT fall into this branch.
+            # An `else` here would have silently counted every benched
+            # player as a flex start the moment bench capture was added.
             pb = r["pos_bucket"] or "UNKNOWN"
             key = (r["slot"], pb)
             flex_counts[key] = flex_counts.get(key, 0) + 1
+        # "benched" records are intentionally excluded from this summary --
+        # they exist for start_rate_curve_analysis.py's use, not this one.
 
     dedicated_starters_per_team_week = {
         pb: round(count / team_weeks, 3) if team_weeks else None
