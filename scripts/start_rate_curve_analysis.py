@@ -74,9 +74,12 @@ OUT_JSON = os.path.join(SCRIPT_DIR, "start_rate_curves.json")
 OUT_MD = os.path.join(SCRIPT_DIR, "start_rate_curve_report.md")
 
 POSITIONS = ["QB", "RB", "WR", "TE", "DL", "LB", "DB"]
-MIN_RANK_WEEK = 4          # weeks 1-3 excluded from rank curves (see docstring)
-BIN_WIDTH = 3               # rank bins for the start-rate curve
-MAX_RANK_REPORTED = 60      # curves beyond this are noise for a 12-team league
+MIN_RANK_WEEK = 4           # weeks 1-3 excluded from rank curves (see docstring)
+MIN_TRAILING_GAMES = 3      # a player needs >=3 real prior games before his trailing
+                             # PPG counts toward the rank universe -- see the
+                             # 2026-08-27 note below on why this was added.
+BIN_WIDTH = 3                # rank bins for the start-rate curve
+MAX_RANK_REPORTED = 60       # curves beyond this are noise for a 12-team league
 
 DOCUMENTED_BASELINE = {"QB": 18, "RB": 32, "WR": 36, "TE": 15, "DL": 32, "LB": 32, "DB": 32}
 LEGACY_EMPIRICAL_BASELINE = {"QB": 18, "RB": 37, "WR": 43, "TE": 16, "DL": 23, "LB": 32, "DB": 30}
@@ -86,9 +89,25 @@ def build_trailing_metrics(season_points, position):
     """
     Returns {week: {pid: (trailing_ppg, trailing_cumulative)}} for every
     week >= MIN_RANK_WEEK, computed strictly from weeks < that week, for
-    every player at this position with >=1 real game in that trailing
-    window. season_points is weekly_points_by_season.json's per-season
-    dict: {pid: {pos_bucket, weekly_points: {week_str: pts}}}.
+    every player at this position with >=MIN_TRAILING_GAMES real games in
+    that trailing window. season_points is weekly_points_by_season.json's
+    per-season dict: {pid: {pos_bucket, weekly_points: {week_str: pts}}}.
+
+    2026-08-27 NOTE -- why MIN_TRAILING_GAMES exists: the first real run
+    (no games-floor, just >=1 prior game) produced start-rate curves that
+    never approached 100% even at rank 1 (WR/TE/LB/DB topped out around
+    60-77%), and DL's curve was non-monotonic (rank 7-9 had a HIGHER start
+    rate than rank 1-3). Root cause: with a floor of just 1 prior game, a
+    player with a single huge fluke game (garbage-time TD, etc.) vaults to
+    a "rank 1" trailing PPG off n=1 -- a real manager correctly doesn't
+    trust that and benches him, which the curve then misreads as "rank 1
+    players get benched," when it's actually "n=1 rank-1 designations are
+    noise." Requiring 3 real trailing games before a player enters the
+    rank universe filters this out. This is the same class of problem
+    already handled elsewhere in this project via shrinkage on IDP
+    weekly-scoring variance -- a games-floor is the minimal version of
+    that same fix, appropriate to try FIRST (cheap, targeted) before
+    reaching for anything heavier.
     """
     players = {pid: p for pid, p in season_points.items() if p.get("pos_bucket") == position}
     # Determine the real max week present in the data for this season.
@@ -102,8 +121,8 @@ def build_trailing_metrics(season_points, position):
         week_metrics = {}
         for pid, p in players.items():
             prior_scores = [pts for wk, pts in p["weekly_points"].items() if int(wk) < week]
-            if not prior_scores:
-                continue  # no trailing data yet -- can't rank (e.g. rookie debut)
+            if len(prior_scores) < MIN_TRAILING_GAMES:
+                continue  # not enough trailing data yet to trust a rank -- see note above
             trailing_ppg = sum(prior_scores) / len(prior_scores)
             trailing_cum = sum(prior_scores)
             week_metrics[pid] = (trailing_ppg, trailing_cum)
@@ -352,7 +371,19 @@ def main():
         pooled_curve_cum = bin_pooled(pooled_roster_status_cum)
         pooled_zone_ppg = find_replacement_zone(pooled_curve_ppg)
         pooled_zone_cum = find_replacement_zone(pooled_curve_cum)
-        pooled_baseline_cmp = compare_to_baselines(pooled_zone_ppg, position)
+        # Prefer the PPG-rank zone (primary metric) for the baseline
+        # comparison, but fall back to the cumulative-rank zone if PPG
+        # didn't resolve -- an unresolved primary metric shouldn't discard
+        # a real, resolved robustness-check result. Recorded explicitly so
+        # it's clear which metric backs each comparison.
+        if pooled_zone_ppg != (None, None):
+            comparison_source = "trailing_ppg"
+            comparison_zone = pooled_zone_ppg
+        else:
+            comparison_source = "trailing_cumulative (PPG-rank zone unresolved)"
+            comparison_zone = pooled_zone_cum
+        pooled_baseline_cmp = compare_to_baselines(comparison_zone, position)
+        pooled_baseline_cmp["zone_source"] = comparison_source
 
         agree = (
             pooled_zone_ppg[0] is not None and pooled_zone_cum[0] is not None
@@ -378,6 +409,7 @@ def main():
         md_lines.append(f"- Pooled PPG-rank zone: **{pooled_zone_ppg}**")
         md_lines.append(f"- Pooled cumulative-rank zone: **{pooled_zone_cum}**")
         md_lines.append(f"- PPG vs. cumulative agree (within {BIN_WIDTH * 2} ranks): **{agree}**")
+        md_lines.append(f"- Baseline comparison uses: **{comparison_source}**")
         md_lines.append(f"- Documented baseline ({DOCUMENTED_BASELINE.get(position)}): {pooled_baseline_cmp['documented_vs_zone']}")
         md_lines.append(f"- Empirical baseline ({LEGACY_EMPIRICAL_BASELINE.get(position)}): {pooled_baseline_cmp['empirical_vs_zone']}")
 
