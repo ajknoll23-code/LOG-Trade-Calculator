@@ -243,12 +243,27 @@ def build_ratings_summary(rows, pos_lookup, label):
     strengths = bradley_terry(pairs)
 
     position_pairwise_count = defaultdict(int)
+    # ADDED (2026-08-27): same-position pairwise counts, tracked
+    # separately from the cross-position ones below. The original version
+    # of this function explicitly skipped same-position pairs (`pw !=
+    # pl`) because it was built to answer "is DL worth more than WR,"
+    # never "how much real within-position signal exists for QB." That
+    # second question turned out to matter for a real follow-up (testing
+    # ratio-vs-differential scarcity formulas against real market value
+    # WITHIN each offensive position) and there was no way to answer it
+    # without this -- the individual player_ratings below are informed by
+    # all pairwise data through the full Bradley-Terry graph regardless,
+    # but knowing the DIRECT same-position sample size is what tells you
+    # whether to trust a within-position comparison specifically.
+    same_position_pairwise_count = defaultdict(int)
     for w, l in pairs:
         pw = POS_BUCKET.get(pos_lookup.get(w))
         pl = POS_BUCKET.get(pos_lookup.get(l))
         if pw and pl and pw != pl:
             key = tuple(sorted([pw, pl]))
             position_pairwise_count[key] += 1
+        elif pw and pl and pw == pl:
+            same_position_pairwise_count[pw] += 1
 
     position_avg_strength = defaultdict(list)
     for player, strength in strengths.items():
@@ -264,11 +279,19 @@ def build_ratings_summary(rows, pos_lookup, label):
         }
         for (pa, pb), count in position_pairwise_count.items()
     }
+    same_position_signal = {
+        pos: {"pairwise_observations": count, "enough_data": count >= MIN_PAIRWISE_FOR_SIGNAL}
+        for pos, count in same_position_pairwise_count.items()
+    }
 
     print(f"\n=== {label}: {len(rows)} votes, {len(pairs)} pairwise observations ===")
     for pair, info in position_pair_signal.items():
         flag = "OK" if info["enough_data"] else "NOT ENOUGH DATA YET"
         print(f"  {pair}: {info['pairwise_observations']} observations -- {flag}")
+    print("  -- same-position (within-position) pairwise counts --")
+    for pos, info in sorted(same_position_signal.items(), key=lambda kv: -kv[1]["pairwise_observations"]):
+        flag = "OK" if info["enough_data"] else "NOT ENOUGH DATA YET"
+        print(f"  {pos} vs {pos}: {info['pairwise_observations']} observations -- {flag}")
 
     return {
         "votes_counted": len(rows),
@@ -276,6 +299,7 @@ def build_ratings_summary(rows, pos_lookup, label):
         "player_ratings": {k: round(v, 4) for k, v in sorted(strengths.items(), key=lambda kv: -kv[1])},
         "position_avg_rating": position_summary,
         "position_pair_sample_sizes": position_pair_signal,
+        "same_position_pairwise_sample_sizes": same_position_signal,
     }
 
 
