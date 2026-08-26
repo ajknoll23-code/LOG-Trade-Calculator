@@ -103,6 +103,76 @@ def main():
         print("not assume the current league's structure applied in prior years.")
     print()
 
+    # Show the RAW slot list for every season -- total count alone can hide
+    # or exaggerate what actually changed (e.g. bench/taxi/IR depth growing
+    # looks identical, count-wise, to a real starting-lineup change unless
+    # you can see which specific slot types moved).
+    print("=== Raw roster_positions per season ===")
+    from collections import Counter
+    counters = {}
+    for league_id, season, rp in seasons:
+        c = Counter(rp) if rp else Counter()
+        counters[season] = c
+        print(f"  Season {season}: {dict(c)}")
+    print()
+
+    # Diff each season against the one before it (chronological order --
+    # seasons list is newest-first from the previous_league_id walk).
+    print("=== Season-over-season diffs ===")
+    chrono = list(reversed(seasons))  # oldest first
+    for i in range(1, len(chrono)):
+        prev_season = chrono[i-1][1]
+        cur_season = chrono[i][1]
+        prev_c = counters[prev_season]
+        cur_c = counters[cur_season]
+        all_slot_types = set(prev_c) | set(cur_c)
+        changes = {}
+        for slot in all_slot_types:
+            before, after = prev_c.get(slot, 0), cur_c.get(slot, 0)
+            if before != after:
+                changes[slot] = (before, after)
+        if changes:
+            print(f"  {prev_season} -> {cur_season}: CHANGED")
+            for slot, (before, after) in sorted(changes.items()):
+                direction = "+" if after > before else ""
+                print(f"    {slot}: {before} -> {after} ({direction}{after-before})")
+        else:
+            print(f"  {prev_season} -> {cur_season}: no change")
+    print()
+
+    # Flag specifically whether any STARTING-lineup-relevant slot type
+    # (anything that isn't BN/bench, taxi, or IR) changed -- this is the
+    # question that actually matters for reusing prior-season lineup data.
+    NON_STARTING_SLOTS = {'BN', 'TAXI', 'IR'}
+    print("=== Starting-lineup-relevant changes only (excludes BN/TAXI/IR) ===")
+    any_starting_change = False
+    for i in range(1, len(chrono)):
+        prev_season = chrono[i-1][1]
+        cur_season = chrono[i][1]
+        prev_c = counters[prev_season]
+        cur_c = counters[cur_season]
+        all_slot_types = set(prev_c) | set(cur_c)
+        starting_changes = {}
+        for slot in all_slot_types:
+            if slot in NON_STARTING_SLOTS:
+                continue
+            before, after = prev_c.get(slot, 0), cur_c.get(slot, 0)
+            if before != after:
+                starting_changes[slot] = (before, after)
+        if starting_changes:
+            any_starting_change = True
+            print(f"  {prev_season} -> {cur_season}: REAL starting-lineup change")
+            for slot, (before, after) in sorted(starting_changes.items()):
+                print(f"    {slot}: {before} -> {after}")
+        else:
+            print(f"  {prev_season} -> {cur_season}: starting lineup unchanged (only bench/taxi/IR differ, if anything)")
+    if not any_starting_change:
+        print()
+        print("No starting-lineup slot type changed across any reachable season boundary --")
+        print("prior seasons' real lineup data can be interpreted using this year's flex-")
+        print("eligibility rules (FLEX/SUPER_FLEX/IDP_FLEX definitions in index.html).")
+    print()
+
     # Sample one week's matchups from each reachable season to confirm real data comes back
     print(f"=== Sampling week {SAMPLE_WEEK} matchups from each reachable season ===")
     for league_id, season, roster_positions in seasons:
