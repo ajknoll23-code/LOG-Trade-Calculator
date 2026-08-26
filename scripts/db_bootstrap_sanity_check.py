@@ -33,6 +33,11 @@ REQUIRES NO NETWORK ACCESS -- same two input files as the rest of this
 workstream.
 
 USAGE: python3 scripts/db_bootstrap_sanity_check.py
+OUTPUT: scripts/db_bootstrap_sanity_check_report.md (same content as
+what prints to stdout, written to a file so it can be committed and
+handed off the same way as every other output in this workstream --
+this project's workflows have no interactive terminal, so anything
+meant to be read back needs to land in a file, not just a log stream).
 """
 
 import json
@@ -45,8 +50,19 @@ from roster_economics_robustness_checks import bin_curve, crossing_rank, bootstr
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LINEUP_PATH = os.path.join(SCRIPT_DIR, "historical_lineup_demand.json")
 POINTS_PATH = os.path.join(SCRIPT_DIR, "weekly_points_by_season.json")
+OUT_PATH = os.path.join(SCRIPT_DIR, "db_bootstrap_sanity_check_report.md")
 
 POSITION = "DB"
+
+_LOG_LINES = []
+
+
+def log(msg=""):
+    """Print AND buffer, so the same content that appears in the workflow
+    log also lands in a committed file -- this project's workflows have
+    no interactive terminal to read stdout from directly."""
+    print(msg)
+    _LOG_LINES.append(msg)
 
 
 def pool_for_position(lineup_data, points_data, position):
@@ -79,7 +95,7 @@ def pool_for_position(lineup_data, points_data, position):
 
 def main():
     if not os.path.exists(LINEUP_PATH) or not os.path.exists(POINTS_PATH):
-        print(f"ERROR: need both {LINEUP_PATH} and {POINTS_PATH} to exist.")
+        log(f"ERROR: need both {LINEUP_PATH} and {POINTS_PATH} to exist.")
         sys.exit(1)
 
     with open(LINEUP_PATH) as f:
@@ -88,13 +104,13 @@ def main():
         points_data = json.load(f)
 
     roster_status, rank_by_week, all_week_keys = pool_for_position(lineup_data, points_data, POSITION)
-    print(f"DB: {len(all_week_keys)} distinct (season, week) blocks, "
+    log(f"DB: {len(all_week_keys)} distinct (season, week) blocks, "
           f"{len(roster_status)} roster observations total.\n")
 
     # ---- Check 1: full data, no resampling, direct path ----
     curve_full = bin_curve(roster_status, rank_by_week, 0, bin_width=3)
     crossing_full = crossing_rank(curve_full, 50)
-    print(f"Check 1 -- full dataset, direct bin_curve/crossing_rank path: "
+    log(f"Check 1 -- full dataset, direct bin_curve/crossing_rank path: "
           f"DB 50%-crossing = {crossing_full}  (expected: 40)")
 
     # ---- Check 2: identity "bootstrap" -- every block exactly once, run
@@ -108,23 +124,23 @@ def main():
         identity_status.extend(by_week.get(wk, []))
     curve_identity = bin_curve(identity_status, rank_by_week, 0, bin_width=3)
     crossing_identity = crossing_rank(curve_identity, 50)
-    print(f"Check 2 -- identity resample (every block exactly once) through "
+    log(f"Check 2 -- identity resample (every block exactly once) through "
           f"the same bin_curve/crossing_rank call: DB 50%-crossing = {crossing_identity}  (expected: 40)")
 
     if crossing_full != crossing_identity:
-        print("\n*** Check 1 and Check 2 DISAGREE -- this points to a real bug in the "
+        log("\n*** Check 1 and Check 2 DISAGREE -- this points to a real bug in the "
               "pooling/binning code, not just bootstrap noise. Do not close the workstream "
               "until this is resolved. ***")
     elif crossing_full != 40:
-        print(f"\n*** Both checks agree with EACH OTHER ({crossing_full}) but NOT with the "
+        log(f"\n*** Both checks agree with EACH OTHER ({crossing_full}) but NOT with the "
               f"originally reported DB40 -- something changed between runs (different data? "
               f"different code version?). Worth reconciling before closing. ***")
     else:
-        print("\nCheck 1 and Check 2 agree with each other AND with the originally reported "
+        log("\nCheck 1 and Check 2 agree with each other AND with the originally reported "
               "DB40 -- the direct/no-resampling code path is internally consistent.")
 
     # ---- Check 3: full distribution of the real bootstrap crossings ----
-    print("\nCheck 3 -- distribution of 200 real bootstrap crossings:")
+    log("\nCheck 3 -- distribution of 200 real bootstrap crossings:")
     rng_crossings = []
     # Reuse bootstrap_crossing's own resampling loop but capture every
     # individual crossing, not just the summary median/p10/p90 -- easiest
@@ -144,26 +160,30 @@ def main():
             rng_crossings.append(c)
 
     if not rng_crossings:
-        print("  No resamples resolved a crossing at all -- can't build a histogram.")
+        log("  No resamples resolved a crossing at all -- can't build a histogram.")
     else:
         rng_crossings.sort()
-        print(f"  n resolved: {len(rng_crossings)}/200")
-        print(f"  min={rng_crossings[0]}  max={rng_crossings[-1]}  "
+        log(f"  n resolved: {len(rng_crossings)}/200")
+        log(f"  min={rng_crossings[0]}  max={rng_crossings[-1]}  "
               f"median={rng_crossings[len(rng_crossings)//2]}")
         # simple text histogram, bucketed by rank-of-10
         buckets = {}
         for c in rng_crossings:
             b = (c // 10) * 10
             buckets[b] = buckets.get(b, 0) + 1
-        print("  histogram (rank bucket: count, bar):")
+        log("  histogram (rank bucket: count, bar):")
         for b in sorted(buckets):
             count = buckets[b]
-            print(f"    {b:>3}-{b+9:<3}: {count:>4}  {'#' * count}")
+            log(f"    {b:>3}-{b+9:<3}: {count:>4}  {'#' * count}")
 
     summary = bootstrap_crossing(all_week_keys, roster_status, rank_by_week, 0)
-    print(f"\nFor reference, bootstrap_crossing()'s own summary: median={summary['median']} "
+    log(f"\nFor reference, bootstrap_crossing()'s own summary: median={summary['median']} "
           f"p10={summary['p10']} p90={summary['p90']} "
           f"({summary['n_resolved']}/{summary['n_iterations']} resolved)")
+
+    with open(OUT_PATH, "w") as f:
+        f.write("# DB Bootstrap Sanity Check\n\n```\n" + "\n".join(_LOG_LINES) + "\n```\n")
+    print(f"\nWrote {OUT_PATH}")
 
 
 if __name__ == "__main__":
