@@ -241,10 +241,24 @@ def summarize(season_data):
     dedicated_counts = {}
     flex_counts = {}  # (slot, pos_bucket) -> count
     for r in records:
-        pb = r["pos_bucket"] or "UNKNOWN"
         if r["start_type"] == "dedicated":
-            dedicated_counts[pb] = dedicated_counts.get(pb, 0) + 1
+            # BUG FIX (found 2026-08-26 against real output): a dedicated
+            # slot's position is defined by the SLOT itself, not by the
+            # real player's own primary position bucket. Dual DL/LB-
+            # eligible players (real EDGE defenders -- the same class
+            # already flagged elsewhere in this project) legitimately fill
+            # a "DL" or "LB" dedicated slot depending on which one Sleeper
+            # let them occupy that week. Keying this off pos_bucket instead
+            # of slot silently misattributed ~130 real DL-slot starts to
+            # "LB" and ~19 real LB-slot starts to "DL" in the first run --
+            # caught because the resulting LB dedicated count (321) was
+            # mathematically impossible given only 1 dedicated LB slot
+            # exists per roster. Confirmed against the raw per-team-week
+            # slot counts (exactly 1 LB, 2 DL, 2 DB every team-week) before
+            # applying this fix.
+            dedicated_counts[r["slot"]] = dedicated_counts.get(r["slot"], 0) + 1
         else:
+            pb = r["pos_bucket"] or "UNKNOWN"
             key = (r["slot"], pb)
             flex_counts[key] = flex_counts.get(key, 0) + 1
 
