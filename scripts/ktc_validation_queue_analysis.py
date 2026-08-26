@@ -43,10 +43,17 @@ superseded) offense-only attempt:
   weak in that voter's eyes, worth surfacing rather than silently
   ignoring.
 
-REQUIRES NO NETWORK ACCESS -- uses the raw vote export (same xlsx/CSV
-shape as ktc_pipeline.py consumes) and prod_mult_pipeline_output.json.
+REQUIRES NETWORK ACCESS by default (fetches votes live from the same
+Google Sheet published-CSV URL ktc_pipeline.py uses -- no manual export
+needed). A local file path can still be passed explicitly for offline
+testing against a saved export, but the normal path needs no argument at
+all, matching how the aggregator already works. Also needs
+prod_mult_pipeline_output.json to already exist locally.
 
-USAGE: python3 scripts/ktc_validation_queue_analysis.py <path_to_votes_export>
+USAGE: python3 scripts/ktc_validation_queue_analysis.py
+       (fetches votes live from the Sheet)
+   or: python3 scripts/ktc_validation_queue_analysis.py <path_to_local_export>
+       (offline testing against a saved xlsx/CSV export)
 Add --selftest to sanity-check the logistic fitting and leave-one-voter-
 out logic against synthetic data with a KNOWN better formula before
 trusting real output.
@@ -58,11 +65,53 @@ import json
 import math
 import os
 import sys
+from collections import defaultdict
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 QUEUE_PATH = os.path.join(SCRIPT_DIR, "ktc_validation_queue.json")
 LINEAGE_PATH = os.path.join(SCRIPT_DIR, "prod_mult_pipeline_output.json")
 OUT_PATH = os.path.join(SCRIPT_DIR, "ktc_validation_analysis_report.md")
+
+# Same Sheet, same URL, same daily cap as ktc_pipeline.py -- kept
+# identical on purpose so both scripts see the same real vote population,
+# just processed for different questions.
+SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTuKORGumlKJmUmBdeNWPstkj8VRjPoVkylbqHv1KqwoyziJYOUlkZUKRsSxzB3qHXmyjjLpGpH6W03/pub?gid=458294959&single=true&output=csv"
+MAX_VOTES_PER_VOTER_PER_DAY = 20
+
+
+def fetch_votes_live():
+    import requests
+    print("Fetching votes live from the Sheet (same source as ktc_pipeline.py)...")
+    resp = requests.get(SHEET_CSV_URL, timeout=30)
+    resp.raise_for_status()
+    reader = csv.DictReader(io.StringIO(resp.text))
+    rows = list(reader)
+    print(f"  {len(rows)} raw vote rows fetched")
+    return rows
+
+
+def apply_daily_cap(rows):
+    """Identical logic to ktc_pipeline.py's apply_daily_cap() -- kept as
+    its own copy here rather than importing from that module, since this
+    script needs to run standalone in a workflow step without assuming
+    ktc_pipeline.py is importable from the same working directory."""
+    counts = defaultdict(int)
+    kept = []
+    dropped = 0
+    for row in rows:
+        try:
+            day = row["timestamp"][:10]
+        except (KeyError, TypeError):
+            continue
+        key = (row.get("voter_roster_id", ""), day)
+        if counts[key] >= MAX_VOTES_PER_VOTER_PER_DAY:
+            dropped += 1
+            continue
+        counts[key] += 1
+        kept.append(row)
+    if dropped:
+        print(f"  Dropped {dropped} votes exceeding the per-voter daily cap")
+    return kept
 
 
 def logistic(x):
@@ -454,18 +503,21 @@ def main():
             return
 
     args = [a for a in sys.argv[1:] if a != "--selftest"]
-    if not args:
-        print("ERROR: usage: python3 ktc_validation_queue_analysis.py <path_to_votes_export> [--selftest]")
-        sys.exit(1)
-    votes_path = args[0]
 
     if not os.path.exists(QUEUE_PATH) or not os.path.exists(LINEAGE_PATH):
         print(f"ERROR: need both {QUEUE_PATH} and {LINEAGE_PATH} to exist.")
         sys.exit(1)
 
+    if args:
+        votes_path = args[0]
+        print(f"Using local votes export: {votes_path}")
+        votes = parse_votes(votes_path)
+    else:
+        raw = fetch_votes_live()
+        votes = apply_daily_cap(raw)
+
     queue_by_triad, queue_version = load_queue()
     lineage = load_lineage()
-    votes = parse_votes(votes_path)
     print(f"Loaded {len(votes)} raw votes, {len(queue_by_triad)} frozen queue triads (version {queue_version}).")
 
     by_voter_ratio, by_voter_diff, by_triad_ratio, by_triad_diff, matched, qc = analyze(votes, queue_by_triad, lineage)
