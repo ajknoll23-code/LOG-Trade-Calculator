@@ -34,7 +34,7 @@ The previously generated candidate V1-baked `index.html` is **not** treated as f
 ### Still open
 
 - The legacy `prod_mult_pipeline.py` still does **not** reproduce the actual pre-V1 live `PROD_MULT_DATA` table and remains diagnostic only.
-- The preferred first-release V1 migration is now the validated **model-delta transport** bridge; production `index.html` has not yet been changed.
+- The preferred first-release V1 migration, **model-delta transport**, has now been applied to the controlled production `index.html` working tree and passed the final true-live deployment audit. It is ready for GitHub upload.
 - A separate historical position-lineage migration remains backlog: 46 live IDP keys have legacy production-position grouping that differs from current canonical valuation position. This is intentionally isolated from V1 rather than silently corrected in the same release.
 - Durability weighting methodology remains backlog and is deliberately unchanged for V1.
 
@@ -300,19 +300,15 @@ DB 2
 
 `scripts/prepare_idp_v1_bake.py` is preview-only by default and refuses to proceed unless current `index.html` still matches the immutable pre-V1 baseline.
 
-Current preview:
+Original Batch 3 preview (before final deployment-only threshold review):
 
 ```text
 404 live IDP candidate keys
-324 actual PROD_MULT entries would change
-80 entries remain exact holds
-LB changes 117
-DL changes 91
-DB changes 116
-565 PLAYER_DB rows parse/evaluate successfully
+324 projected PROD_MULT changes
+80 exact holds
 ```
 
-No production values were applied.
+Batch 4 final-value validation found a no-history role-floor discontinuity affecting four speculative LBs. Those four are now protected by a migration-specific exact-hold guard, producing the final approved deployment of **320 raw PROD_MULT changes / 84 exact holds**. See the Batch 4 section below.
 
 ### Historical position-lineage separation
 
@@ -376,10 +372,140 @@ idp_bake_report.md retained: NO
 - `scripts/idp_v1_prod_mult_patch_report.md`
 - `scripts/idp_v1_index_preview.patch`
 
-## Next Decision
+## ChatGPT Solo Batch 4 — IDP V1 Production Bake
 
-The next step is no longer additional model research or lineage reconstruction. Batch 3 has reduced the decision to one controlled production action:
+### Critical final-release interaction caught
 
-> **Approve or reject model-delta transport as the first V1 production migration method.**
+The first controlled apply exposed a live-value discontinuity that was invisible in raw-prod_mult-only reporting.
 
-If approved, run `prepare_idp_v1_bake.py --apply` in the controlled working tree, update the stale methodology comment above `PROD_MULT_DATA` in the same change, rerun the entire regression/final-value suite, generate the exact old-live -> final-new production report, and only then commit the resulting `index.html`.
+Four current speculative LBs had zero real 2025 games and a pre-V1 raw multiplier of exactly 0.15. The live value engine rescues that exact-floor/no-history state to the role estimate (0.22). Tiny positive V1 raw changes just above 0.15 would have disabled that rescue and caused large final-value drops.
+
+Guarded players:
+
+```text
+Jaishawn Barham
+Jake Golday
+Kaleb Elarms-Orr
+Kyle Louis
+```
+
+A migration-specific guard now holds those four raw values at 0.15 unless V1's transported multiplier actually clears their role estimate. This does not change `productionMultiplier()` globally and avoids bundling an unvalidated threshold behavior into V1.
+
+### Final approved deployment
+
+```text
+404 candidate IDP keys
+320 raw PROD_MULT changes
+84 exact holds
+4 floor-rescue discontinuity guards
+0 non-IDP final-value changes
+```
+
+Internal V1 baseline movement remains:
+
+```text
+LB +3.4%
+DL +4.4%
+DB +3.4%
+```
+
+True pre-V1 live -> final deployed Trade Desk values:
+
+```text
+LB median -0.5%   P95 +2.5%   min -6.5%   max +23.9%
+DL median +3.3%   P95 +8.2%   min -12.6%  max +13.4%
+DB median +0.2%   P95 +5.2%   min -7.1%   max +44.5%
+```
+
+Top-rank stability:
+
+```text
+Top-24 movers >=5 ranks: LB 1 / DL 4 / DB 1
+Top-36 movers >=5 ranks: LB 1 / DL 7 / DB 2
+```
+
+The DB +44.5% maximum is A.J. Haulcy, a low-value depth/rookie asset (796 -> 1150) whose positional rank moves only one spot. No top-tier compression or ceiling-clamp issue was introduced.
+
+### Final deployment tooling
+
+Created:
+
+- `docs/CHATGPT_SOLO_BATCH4_IDP_V1_PRODUCTION_BAKE.md`
+- `scripts/validate_idp_v1_final_deployment.py`
+- `scripts/idp_v1_final_deployment_validation.json`
+- `scripts/idp_v1_final_deployment_validation.md`
+
+Updated post-deployment validation so the immutable pre-V1 baseline remains the OLD side even though `index.html` is now V1.
+
+Repository regression suite expanded to **10 groups** and now hard-validates the deployed V1 table.
+
+### Batch 4 final checks
+
+```text
+Canonical history/V1 self-tests: PASS
+E.J. Speed 95.43 regression: PASS
+Floor-rescue guard self-test: PASS
+Final deployment validator: PASS
+Repo regression suite: 10/10 PASS
+Python: 45 files, 0 errors
+JSON: 41 files, 0 errors
+YAML: 20 workflows, 0 errors
+index.html JS: PASS
+free-agent-board JS: PASS
+```
+
+Relative to Batch 3, `index.html` changed only inside the production-methodology comment + `PROD_MULT_DATA` region; content before and after that region is byte-identical.
+
+## Current Production Status
+
+```text
+IDP V1 methodology: CLOSED / VALIDATED
+Model-delta migration: APPLIED / VALIDATED
+Production index.html: READY FOR GITHUB UPLOAD
+Legacy absolute prod_mult lineage: diagnostic only
+46-player position-lineage migration: BACKLOG
+Durability weighting recalibration: BACKLOG
+```
+
+## Next Step
+
+Upload the Batch 4 changed files to GitHub. Once the repository reflects this exact state, run the read-only deployed-V1 validation workflow once. If it passes, close the IDP V1 deployment workstream and move to the next independent repository improvement.
+
+## ChatGPT Solo Batch 4 File Manifest
+
+### Modified (21)
+
+- `docs/CHATGPT_SOLO_CHECKPOINT_2026-08-28.md`
+- `github-workflows/bake-idp-ensemble-v1.yml`
+- `github-workflows/idp-v1-candidate-validation.yml`
+- `index.html`
+- `scripts/idp_v1_candidate_comparison.json`
+- `scripts/idp_v1_candidate_comparison_report.md`
+- `scripts/idp_v1_index_preview.patch`
+- `scripts/idp_v1_isolated_projection_candidate.json`
+- `scripts/idp_v1_model_delta_transport_candidate.json`
+- `scripts/idp_v1_model_delta_transport_candidate.py`
+- `scripts/idp_v1_model_delta_transport_candidate_report.md`
+- `scripts/idp_v1_prod_mult_patch.json`
+- `scripts/idp_v1_prod_mult_patch_report.md`
+- `scripts/idp_v1_production_candidate.json`
+- `scripts/idp_v1_production_candidate.py`
+- `scripts/idp_v1_projection_only_candidate.json`
+- `scripts/prepare_idp_v1_bake.py`
+- `scripts/production_history_component.py`
+- `scripts/production_history_components.json`
+- `scripts/repo_regression_checks.py`
+- `scripts/validate_idp_v1_candidates.py`
+
+### Created (4)
+
+- `docs/CHATGPT_SOLO_BATCH4_IDP_V1_PRODUCTION_BAKE.md`
+- `scripts/idp_v1_final_deployment_validation.json`
+- `scripts/idp_v1_final_deployment_validation.md`
+- `scripts/validate_idp_v1_final_deployment.py`
+
+### Deleted
+
+- None.
+
+**Total Batch 4 files to add/update in GitHub: 25.**
