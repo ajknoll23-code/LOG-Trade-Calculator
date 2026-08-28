@@ -41,19 +41,31 @@ Built and run against the real 355-player cohort (354 with both totals >0):
 - **Full-swing upper bound** (Stage 2 = 100% Sleeper): median -2.51 pts, max range -9.03 to +4.43. Even at the extreme, this is a secondary lever.
 - **Honest conclusion**: Stage 2 (solo/assist allocation) has real but modest direct point leverage. Stage 1 (total tackle volume, ~1.5-1.8x real gap between sources, established earlier but NOT historically calibrated) is likely the much bigger driver of final trade-value impact and hasn't been touched by this prototype yet.
 
-Files: `ensemble_baseline_5050.json`, `ensemble_experimental_sleeper_lean.json` (in the working sandbox, not yet delivered as a repo pipeline).
+Files: `scripts/idp_ensemble_experiment.py` (real, self-tested, committed script -- superseded the earlier sandbox-only `ensemble_baseline_5050.json`/`ensemble_experimental_sleeper_lean.json` files, which are no longer the current source of truth).
 
 ## KNOWN OPEN LIMITATIONS
 - The sack-rate-based archetype proxy has a real endogeneity problem (Sleeper's own tackle count appears in both the grouping variable and the measured outcome ratio) -- the "tackle disagreement is broad, not archetype-specific" finding is directionally supported but not airtight. An independent role classifier would be needed to fully settle it, and isn't necessary for V1.
 - `weeks_with_projection_data` in the Sleeper pipeline output is known-bad metadata (shows 18 for every single row, including totally stale players) -- not blocking, but should eventually be replaced with `weeks_with_nonzero_projection_signal`.
 - Missing-source policy for the ensemble is not yet designed: a source with zero/no signal must NOT be treated as a real zero forecast and averaged in directly. Needs explicit abstention handling (use available source + stronger shrinkage), not `(value + 0) / 2`.
 
+## STAGE-1 WEIGHT SWEEP -- RUN FOR REAL, DECISIVE RESULT
+Formalized the ensemble as `scripts/idp_ensemble_experiment.py` (parameterized, self-tested, output-only, missing-source handling built in from the start). Ran the real Stage-1 sweep (FP weight 0/25/50/75/100%, Stage 2 held at the preferred 60/40 experimental scenario) against the real 355-player cohort:
+
+| Stage-1 FP weight | LB median | DL median | DB median | Largest single-player swing (0%→100%) |
+|---|---|---|---|---|
+| 0% (all Sleeper) | -22.67 | -13.80 | -19.63 | |
+| 50% (neutral) | -0.73 | -0.48 | -0.44 | |
+| 100% (all FP) | +21.51 | +13.17 | +18.60 | |
+
+**Full-range swing (0%→100%) for individual players is dramatic** -- Jordyn Brooks alone swings 76 points (LB), Benjamin Morrison ~43 points (DB), Malcolm Roach ~33 points (DL). This is roughly **10-40x the leverage of the Stage-2 sweep** (which topped out around 2.5 points median even at its own full extreme).
+
+**Conclusion: Stage 1 (total tackle volume) is decisively the dominant driver of real trade-value impact, confirmed with real numbers, not just reasoning.** Stage-1 calibration is now the clear P0 priority for this workstream -- more consequential than anything else remaining in the IDP investigation.
+
 ## NEXT ANALYTICAL STEP (when work resumes)
-1. Stage 1 (total tackle volume) sensitivity/calibration -- likely the bigger real lever, not yet tested with historical anchoring (and the review cautioned 2025 actuals are a weaker anchor here than for Stage 2, given real season-over-season volume drivers like role/injury/rookie churn).
-2. Design the missing-source/abstention policy before running any sensitivity test.
-3. Run a `prod_mult` sensitivity test comparing the new raw-category ensemble (both Scenario A and B) against the current projection blend -- median change, large movers, position-level effects.
+1. **P0: Stage-1 (total tackle volume) calibration.** Per external review, same-player 2025-vs-2026 comparisons are a weaker anchor for volume than they were for solo-share allocation (role/injury/rookie churn moves volume more). Better approach: position-level historical tackle distributions (2024-2025 actuals, ideally tackles-per-game with a games/snaps floor) compared against both sources' 2026 projected distributions (median, 25th/75th percentile, top-12/24/36 median) -- tests the broad "is FP's positional environment too rich, or is Sleeper's too lean" question directly, which better matches the real 1.5-1.8x scale gap than individual player noise would.
+2. Finalize the missing-source/abstention policy (a basic version already exists in `idp_ensemble_experiment.py` -- single-source players use their one real source directly, never halved -- but this needs to be the real, final policy, not just a placeholder).
+3. Run a `prod_mult` sensitivity test comparing the new raw-category ensemble against the current projection blend -- now well-motivated given Stage 1's proven large impact.
 4. Only after reviewing sensitivity results: decide whether anything gets baked into live values.
-5. Formalize the tackle ensemble prototype as a real, self-tested, committed pipeline script (currently exists only as sandbox analysis, not delivered to the repo).
 
 ## DO NOT
 - Bake new `prod_mult` values yet.
