@@ -509,3 +509,25 @@ Upload the Batch 4 changed files to GitHub. Once the repository reflects this ex
 - None.
 
 **Total Batch 4 files to add/update in GitHub: 25.**
+
+
+## Batch 4 CI hotfix — 2026-08-28
+
+The first GitHub run of **Validate Deployed IDP V1** failed only at the repository regression step because the workflow did not install the Python `requests` dependency before importing `dual_eligibility_pipeline.py`. The deployment-specific validator had already passed immediately beforehand with:
+
+```text
+PASS final IDP V1 deployment validation: 320 approved PROD_MULT changes deployed
+```
+
+This was a CI environment/dependency omission, not a model or deployment validation failure.
+
+Changed:
+
+```text
+github-workflows/bake-idp-ensemble-v1.yml
+github-workflows/idp-v1-candidate-validation.yml
+```
+
+Both now install `requests` after Python/Node setup, matching the existing standalone `repo-regression-checks.yml` workflow. Both workflow YAML files parse successfully after the change.
+
+Next action: upload the two workflow files and rerun **Validate Deployed IDP V1**. If the workflow then completes green, the IDP V1 projection/deployment workstream can be formally closed.
