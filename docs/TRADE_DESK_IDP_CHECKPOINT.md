@@ -32,6 +32,17 @@ Full-range median swing: **LB ≈44 pts, DB ≈38 pts, DL ≈27 pts.** Individua
 
 **What this proved**: the sweep validated the model correctly interpolates and that Stage-1 choice has massive downstream consequences. **What it did NOT prove**: which weight (or which source) is actually more accurate. Leverage ≠ accuracy.
 
+**Historical calibration attempt #1 (leaderboard-based) -- REJECTED, real methodological flaw caught before acting on it.** Built a real 2025 league-wide tackle leaderboard (n=49 LB, n=45 DB) and found FP ratio ≈0.95-0.99, Sleeper ratio ≈0.59-0.63 vs. that sample -- looked like Sleeper was ~40% too low. External review caught a real, valid problem before this got acted on: the leaderboard sample is truncated to top tackle-producers (selection bias), compared against a much broader projection cohort (apples-to-oranges).
+
+**Historical calibration attempt #2 (matched-player) -- REVERSES attempt #1.** Used the same 7 players (excluding Fred Warner's real but injury-shortened 6-game sample as a legitimate confound) already in the real projection cohort, with their own real 2025 season totals directly matched against their own real 2026 projections:
+
+| | Median ratio vs. real 2025 (n=7 matched players) |
+|---|---|
+| FantasyPros | **1.23** (runs ~23% above real recent history) |
+| Sleeper | **0.94** (close to real recent history) |
+
+**This is the opposite conclusion from attempt #1** -- once the comparison is properly aligned (same players, not a differently-selected population), Sleeper looks well-calibrated and FantasyPros looks inflated. This directly confirms the population-mismatch critique was real, not a formality. **Current status: promising but still only n=7 -- a real, matched, but small sample.** Per external review's own standard, a properly-aligned large sample (via a real "all qualifying defenders" population, not hand-collected matched players) is the next needed step before this becomes production-actionable. Do NOT average, split the difference, or treat attempts #1 and #2 as partially-each-correct -- #1 has a real, identified flaw and should be discarded, not blended with #2.
+
 **Recommended calibration approach** (raises the evidence bar given the real stakes -- do not set from one median or one season):
 1. Build real 2024 AND 2025 actual positional tackle distributions (LB/DL/DB), preferably tackles-per-game or with a minimum-participation filter so injury-shortened players don't distort the scale.
 2. Compute median, 25th/75th percentile, top-12/24/36 median for each real season, and for both sources' 2026 projected distributions.
