@@ -27,12 +27,38 @@ not run it myself (no outbound network in this sandbox). Before trusting
 the output, sanity-check a couple of well-known players (e.g. a clear #1
 projected player at a position) against what you'd expect.
 
+RAW-CATEGORY OUTPUT ADDED (2026-08-27), per external review of the
+FantasyPros API pipeline: this script always computed real per-player
+season point totals by summing score_week() across 18 real weekly
+projections, but only ever persisted the final total, never the raw
+per-category sums that fed it. That blocked a real, needed analysis --
+comparing Sleeper's and FantasyPros' raw stat-level projections
+category-by-category (solo tackles, sacks, etc.) rather than inferring
+disagreement from already-blended final point totals, which conflate
+scoring-category coverage differences with genuine forecast/role
+disagreements in a way that's hard to untangle after the fact (a real,
+concrete example -- Maxx Crosby vs. Myles Murphy -- showed exactly this
+problem: two real pass-rushers missing the identical categories, but
+showing opposite disagreement directions with FantasyPros, because their
+final-total ratio was picking up more than one real effect at once).
+Now accumulates and persists real per-category season sums (same
+summing convention as the existing point-total logic) to a SEPARATE
+output file, kept apart from the existing sleeper_2026_projections.json
+on purpose -- if a future run's values look different, this separation
+lets you tell whether Sleeper's real projections changed or something in
+this script's own logic changed, without that separation you can't tell
+the difference after the fact.
+
 USAGE: python3 sleeper_projections_pipeline.py
+Add --selftest to verify the scoring formula and the new raw-category
+accumulation logic against synthetic multi-week data before trusting
+real output.
 Requires: requests (pip install requests --break-system-packages)
 """
 
 import json
 import os
+import sys
 import time
 import requests
 
@@ -42,6 +68,23 @@ SEASON = 2026
 # using 17 here would silently drop week 18 the same way the original
 # bug did for actual stats.
 WEEKS = range(1, 19)
+
+# Every raw field score_week() actually reads, kept as one explicit list
+# so the raw-category accumulator can't silently drift out of sync with
+# the scoring formula if either one is edited later without the other.
+# Where score_week() uses a fallback (idp_sack vs sack; idp_int vs int),
+# the SAME fallback resolution is used here, accumulating one combined
+# "sack"/"int" raw total rather than two separately-named, possibly
+# double-counted fields.
+RAW_CATEGORY_FIELDS = [
+    "pass_yd", "pass_td", "pass_2pt", "pass_int",
+    "rush_att", "rush_yd", "rush_td", "rush_2pt",
+    "rec", "rec_yd", "rec_td", "rec_2pt",
+    "fum_lost", "fum_rec_td",
+    "idp_tkl_solo", "idp_tkl_ast", "idp_tkl_loss", "idp_qb_hit",
+    "idp_fum_rec", "idp_ff", "idp_safety", "blk_kick", "idp_td", "idp_pass_def",
+    "st_td", "st_ff", "st_fum_rec",
+]
 
 
 def score_week(stats):
@@ -141,7 +184,85 @@ def fetch_week_projections(week):
     return resp.json()
 
 
+def accumulate_raw_categories(running_totals, pid, stats):
+    """
+    Adds one week's raw stats into a player's running per-category season
+    sum. Uses the SAME fallback resolution as score_week() for the two
+    fields that have alternate names (idp_sack/sack, idp_int/int), storing
+    them under one canonical key each rather than two separately-tracked,
+    possibly-double-counted fields.
+    """
+    if pid not in running_totals:
+        running_totals[pid] = {f: 0.0 for f in RAW_CATEGORY_FIELDS}
+        running_totals[pid]["sack"] = 0.0
+        running_totals[pid]["int"] = 0.0
+    for field in RAW_CATEGORY_FIELDS:
+        running_totals[pid][field] += stats.get(field, 0) or 0
+    running_totals[pid]["sack"] += stats.get("idp_sack", stats.get("sack", 0)) or 0
+    running_totals[pid]["int"] += stats.get("idp_int", stats.get("int", 0)) or 0
+
+
+def run_selftest():
+    print("Running self-test: scoring formula and raw-category accumulation...")
+
+    # Real, already-established regression check: a known IDP stat line
+    # scored correctly by this exact formula (same numbers used to
+    # validate the identical score_week() in ppg_pipeline.py originally).
+    week_stats = {"idp_tkl_solo": 6, "idp_tkl_ast": 2, "idp_sack": 1, "idp_pass_def": 1}
+    pts = score_week(week_stats)
+    expected = 6*1.5 + 2*0.75 + 1*3.0 + 1*3.0  # no bonuses -- 8 tackles < 10, 1 sack < 2, 1 PD < 3
+    assert abs(pts - expected) < 0.01, f"expected {expected}, got {pts}"
+    print(f"  score_week() matches a real hand-computed IDP stat line ({pts:.2f}) -- OK")
+
+    # Raw-category accumulation, the new logic: two synthetic weeks for
+    # the same player, verify the SEASON SUM is correct, not just one
+    # week's value -- this is the actual new capability being added.
+    running = {}
+    accumulate_raw_categories(running, "test_pid", {"idp_sack": 1.5, "idp_tkl_solo": 4, "rush_yd": 20})
+    accumulate_raw_categories(running, "test_pid", {"idp_sack": 0.5, "idp_tkl_solo": 6, "rush_yd": 15})
+    assert running["test_pid"]["sack"] == 2.0, f"expected summed sacks 2.0, got {running['test_pid']['sack']}"
+    assert running["test_pid"]["idp_tkl_solo"] == 10, f"expected summed solo tackles 10, got {running['test_pid']['idp_tkl_solo']}"
+    assert running["test_pid"]["rush_yd"] == 35, f"expected summed rush yards 35, got {running['test_pid']['rush_yd']}"
+    print("  Raw-category accumulation correctly sums across multiple weeks (2.0 sacks, 10 solo tackles, "
+          "35 rush yards from 2 synthetic weeks) -- OK")
+
+    # Fallback-field resolution: idp_sack vs. sack must not double-count
+    # if a real week happens to include both keys.
+    running2 = {}
+    accumulate_raw_categories(running2, "test_pid2", {"idp_sack": 1.0})
+    accumulate_raw_categories(running2, "test_pid2", {"sack": 1.0})  # different week, different field name
+    assert running2["test_pid2"]["sack"] == 2.0, \
+        f"expected the idp_sack/sack fallback to resolve to one combined total (2.0), got {running2['test_pid2']['sack']}"
+    print("  idp_sack/sack fallback resolves to one combined raw total across DIFFERENT weeks, matching "
+          "score_week()'s own fallback logic -- OK")
+
+    # REGRESSION TEST, per external review: the test above only proved
+    # cross-week resolution. It did NOT prove the comment's actual claim
+    # -- that both real field names appearing in the SAME week's stats
+    # dict doesn't double-count. Real Sleeper data could plausibly
+    # include both keys in one response. Verify directly.
+    running3 = {}
+    accumulate_raw_categories(running3, "test_pid3", {"idp_sack": 1.0, "sack": 1.0})  # SAME week, both keys
+    assert running3["test_pid3"]["sack"] == 1.0, \
+        (f"expected idp_sack and sack in the SAME week to resolve to ONE value (1.0), matching "
+         f"score_week()'s own dict.get(a, dict.get(b)) fallback -- NOT sum to 2.0 -- got "
+         f"{running3['test_pid3']['sack']}")
+    running4 = {}
+    accumulate_raw_categories(running4, "test_pid4", {"idp_int": 1.0, "int": 1.0})
+    assert running4["test_pid4"]["int"] == 1.0, \
+        f"expected idp_int/int same-week fallback to resolve to 1.0, not double-count, got {running4['test_pid4']['int']}"
+    print("  idp_sack/sack AND idp_int/int correctly resolve to ONE value when BOTH real field names "
+          "appear in the SAME week -- OK (this specific case wasn't actually tested before, only claimed "
+          "in the comment)")
+
+    print("Self-test passed.\n")
+
+
 def main():
+    if "--selftest" in sys.argv:
+        run_selftest()
+        return
+
     player_index = fetch_player_index()
 
     # player_id -> summed projected points across all 18 weeks. Summing
@@ -151,41 +272,99 @@ def main():
     # blend are built the same way.
     season_totals = {}
     weeks_with_data = {}  # player_id -> count of weeks that had a projection at all
+    raw_category_totals = {}  # player_id -> {category: season sum}
+    # NEW, per external review: the TRUE immutable source snapshot --
+    # every real weekly response, completely unprocessed, before any
+    # scoring or aggregation touches it. Without this, "raw categories"
+    # was still a DERIVED artifact (our own accumulation/canonicalization
+    # logic already applied) -- if that logic ever changes, there'd be no
+    # way to tell whether a future difference came from Sleeper's real
+    # data changing or from this script's own code changing. This is
+    # what actually closes that gap: real evidence, not a transform of it.
+    raw_weekly_snapshot = {}  # week -> {pid: stats} exactly as fetched
 
     for week in WEEKS:
         week_data = fetch_week_projections(week)
+        raw_weekly_snapshot[str(week)] = week_data
         for pid, stats in week_data.items():
             if not stats:
                 continue
             pts = score_week(stats)
             season_totals[pid] = season_totals.get(pid, 0.0) + pts
             weeks_with_data[pid] = weeks_with_data.get(pid, 0) + 1
+            accumulate_raw_categories(raw_category_totals, pid, stats)
         time.sleep(0.3)
 
     results = []
+    raw_results = []
     for pid, total in season_totals.items():
         p = player_index.get(pid, {})
+        name = (p.get("full_name") or f"{p.get('first_name','')} {p.get('last_name','')}").strip().lower()
+        pos = p.get("position")
         results.append({
             "sleeper_id": pid,
-            "player": (p.get("full_name") or f"{p.get('first_name','')} {p.get('last_name','')}").strip().lower(),
-            "pos": p.get("position"),
+            "player": name,
+            "pos": pos,
             "team": p.get("team"),
             "sleeper_2026_proj_total": round(total, 1),
             "weeks_with_projection_data": weeks_with_data[pid],
         })
+        # NEW fields, per external review: weeks_with_projection_data (a
+        # low weeks-count is a real, direct clue that a category
+        # disagreement might be about projected availability/role rather
+        # than per-game effectiveness -- exactly the kind of context that
+        # would have helped interpret the real Crosby/Murphy disagreement
+        # sooner) and fantasy_positions (this project has a real,
+        # documented history of dual-eligibility bugs; preserving
+        # Sleeper's own original eligibility list here supports future
+        # identity resolution and archetype work without needing to
+        # re-fetch it separately later).
+        raw_results.append({
+            "sleeper_id": pid,
+            "player": name,
+            "pos": pos,
+            "team": p.get("team"),
+            "fantasy_positions": p.get("fantasy_positions"),
+            "weeks_with_projection_data": weeks_with_data[pid],
+            "raw_category_season_totals": {k: round(v, 3) for k, v in raw_category_totals.get(pid, {}).items()},
+        })
 
-    # Only keep players who actually have a name and some real projection
-    # signal -- Sleeper's projections endpoint, like stats, includes a lot
-    # of noise entries (inactive/practice-squad players with all-zero
-    # weeks) that would just be dead weight in the output.
-    results = [r for r in results if r["player"].strip() and r["sleeper_2026_proj_total"] > 0]
+    # BUG FIX, per external review: the raw/audit output used to inherit
+    # the SAME filter as the production output (sleeper_2026_proj_total
+    # > 0) -- reasonable for a production projection list, but wrong for
+    # an audit artifact, since it silently pre-filters exactly the
+    # players a future comparison might most want visibility into (e.g.
+    # a player Sleeper projects for very few points but SOME real games).
+    # The raw/audit universe should only require that real weekly data
+    # exists at all, and let downstream analysis decide relevance.
+    final_keep_pids = {r["sleeper_id"] for r in results if r["player"].strip() and r["sleeper_2026_proj_total"] > 0}
+    results = [r for r in results if r["sleeper_id"] in final_keep_pids]
     results.sort(key=lambda r: -r["sleeper_2026_proj_total"])
+
+    raw_keep_pids = {r["sleeper_id"] for r in raw_results if r["player"].strip() and r["weeks_with_projection_data"] > 0}
+    raw_results = [r for r in raw_results if r["sleeper_id"] in raw_keep_pids]
+    raw_results.sort(key=lambda r: r["player"])
 
     with open(os.path.join(SCRIPT_DIR, "sleeper_2026_projections.json"), "w") as f:
         json.dump(results, f, indent=2)
-
     print(f"\nWrote {len(results)} players with real projection data to sleeper_2026_projections.json")
-    print("Top 10 by projected total:")
+
+    with open(os.path.join(SCRIPT_DIR, "sleeper_2026_raw_categories.json"), "w") as f:
+        json.dump(raw_results, f, indent=2)
+    print(f"Wrote {len(raw_results)} players' raw per-category season totals to sleeper_2026_raw_categories.json "
+          f"(broader audit universe than the production list -- {len(raw_results) - len(results)} more players "
+          f"than sleeper_2026_projections.json, since this one isn't filtered by final point total)")
+
+    # NEW output. Note this will be a genuinely large file (18 weeks x
+    # every real player Sleeper returns data for, completely
+    # unprocessed) -- that's the honest cost of a true immutable
+    # snapshot, not a bug.
+    with open(os.path.join(SCRIPT_DIR, "sleeper_2026_raw_weekly.json"), "w") as f:
+        json.dump(raw_weekly_snapshot, f)
+    print(f"Wrote real unprocessed weekly source data (18 weeks) to sleeper_2026_raw_weekly.json -- "
+          f"this file will be large; that's expected for a true immutable snapshot, not an error.")
+
+    print("\nTop 10 by projected total:")
     for r in results[:10]:
         print(f"  {r['player']:25s} {r['pos']:3s} {r['sleeper_2026_proj_total']:6.1f}")
 
