@@ -206,6 +206,27 @@ def run_selftest():
         f"expected no milestone fields in this synthetic response (none included), got {schema.get('milestone_fields_present')}"
     print("  No false-positive milestone/IDP field detection on a response that doesn't have them -- OK")
 
+    # REGRESSION TEST, per external review of the real first run: a
+    # response that comes back 200 with real players, but for a
+    # DIFFERENT position than requested, must NOT be treated as
+    # "supported" -- this is exactly the false-positive that made
+    # DE/DT/CB/S/DEF look like working position labels last time, when
+    # they were actually all returning mismatched RB data.
+    mismatched_response = {
+        "season": "2026", "week": "0", "count": "130", "positions": "RB", "scoring": "STD",
+        "players": [
+            {"fpid": 1, "name": "Wrong Position Player", "position_id": "RB", "team_id": "TST",
+             "stats": {"rush_att": 100.0}},
+        ],
+    }
+    mismatched_schema = inspect_schema(mismatched_response)
+    envelope_matches = mismatched_schema.get("positions_field") == "DE"  # we asked for DE, response says RB
+    assert envelope_matches is False, "expected a position mismatch between request and response to be detected"
+    player_matches = mismatched_schema.get("first_player_all_fields", {}).get("position_id") == "DE"
+    assert player_matches is False, "expected the player-level position mismatch to also be detected"
+    print("  Position-mismatch detection correctly flags a response for the wrong position as "
+          "NOT supported, instead of the old false-positive behavior -- OK")
+
     print("Self-test passed.\n")
 
 
@@ -256,12 +277,32 @@ def main():
     for pos in IDP_POSITION_CANDIDATES:
         url = f"{working_base}/nfl/{SEASON}/projections?position={pos}&week=0"
         status, parsed, extra = fetch_json(url, api_key)
-        supported = status == 200 and parsed is not None and inspect_schema(parsed).get("actual_players_returned", 0) > 0
-        print(f"  {pos}: status={status}, supported={supported}")
+        schema = inspect_schema(parsed) if parsed else None
+        has_players = bool(schema and schema.get("actual_players_returned", 0) > 0)
+        # BUG FIX, per external review of the previous real run: this used
+        # to treat "got a 200 with SOME players back" as "this position is
+        # supported" -- which was wrong. The real earlier run showed
+        # DE/DT/CB/S/DEF all returning a 200 with real players, but every
+        # one of them was the SAME mismatched RB data (Jahmyr Gibbs), not
+        # real position-specific data. Now cross-checks that the response
+        # actually claims to be for the position requested (both the
+        # envelope's positions_field and the first player's own
+        # position_id) before calling it supported -- a mismatch is
+        # reported explicitly as a mismatch, not silently marked working.
+        envelope_matches = bool(schema and schema.get("positions_field") == pos)
+        player_matches = None
+        if has_players:
+            first_player = schema.get("first_player_all_fields") or {}
+            player_matches = first_player.get("position_id") == pos
+        supported = status == 200 and has_players and envelope_matches
+        print(f"  {pos}: status={status}, supported={supported}"
+              + ("" if supported else f"  (envelope_matches={envelope_matches}, player_matches={player_matches} -- likely NOT a real position label for this endpoint)"))
         report["idp_probe"][pos] = {
             "status": status,
             "supported": supported,
-            "schema": inspect_schema(parsed) if supported else None,
+            "envelope_position_matches_request": envelope_matches,
+            "first_player_position_matches_request": player_matches,
+            "schema": schema,  # kept even when NOT supported, so a mismatch is visible for inspection, not hidden
         }
         time.sleep(1)
 
