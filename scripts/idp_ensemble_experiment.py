@@ -74,12 +74,28 @@ STAGE2_BASELINE = 0.5
 STAGE2_PREFERRED_EXPERIMENTAL = 0.4  # 60% Sleeper / 40% FantasyPros
 
 
+def validate_weight(w, name):
+    """
+    BUG this exists specifically to prevent, per external review: an
+    invalid weight (out of [0,1], NaN, or bad CLI input) should be
+    rejected explicitly, not silently clamped or allowed to produce a
+    nonsensical blend.
+    """
+    if w != w:  # NaN check -- NaN is the only value that's never equal to itself
+        raise ValueError(f"{name} is NaN -- refusing to run with an invalid weight.")
+    if not (0.0 <= w <= 1.0):
+        raise ValueError(f"{name}={w} is outside the valid [0, 1] range -- refusing to silently clamp it.")
+
+
 def build_player_record(fp_p, sleeper_p, stage1_fp_weight, stage2_fp_weight):
     """
     Builds one player's ensemble record. fp_p and/or sleeper_p may be
     None (missing source) -- handled explicitly, never silently averaged
     with a fake zero.
     """
+    validate_weight(stage1_fp_weight, "stage1_fp_weight")
+    validate_weight(stage2_fp_weight, "stage2_fp_weight")
+
     fp_stats = fp_p["raw_stats_used"] if fp_p else {}
     s_stats = sleeper_p.get("raw_category_season_totals", {}) if sleeper_p else {}
 
@@ -197,6 +213,88 @@ def run_selftest():
     assert rec_neither["confidence"] == "no_data" and rec_neither["tackle_points"] is None
     print("  No data from either source correctly reports no_data with a null point value, not zero -- OK "
           "(a real absence of information should not silently look like a real zero projection)")
+
+    # 7 ADDITIONAL REGRESSION TESTS, per second-round external review,
+    # given how consequential the real Stage-1 sweep result turned out
+    # to be -- these specifically protect the sweep machinery, not the
+    # calibration question itself (which is a separate, real analysis).
+
+    # A. Interpolation correctness at 25%/50%/75%, not just the 0%/100% boundaries.
+    fp_p2 = {"fantasypros_id": 2, "raw_stats_used": {"def_tackle": 60.0, "def_assist": 40.0}}
+    sleeper_p2 = {"raw_category_season_totals": {"idp_tkl_solo": 20.0, "idp_tkl_ast": 20.0}}
+    for fp_w, expected in [(0.25, 0.25*100 + 0.75*40), (0.5, 0.5*100 + 0.5*40), (0.75, 0.75*100 + 0.25*40)]:
+        rec = build_player_record(fp_p2, sleeper_p2, fp_w, 0.5)
+        assert abs(rec["consensus_total_tackles"] - expected) < 0.01, \
+            f"interpolation at FP weight={fp_w} expected {expected}, got {rec['consensus_total_tackles']}"
+    print("  Stage-1 interpolation at 25%/50%/75% (not just the 0%/100% boundaries) is mathematically "
+          "correct -- OK")
+
+    # B. Monotonicity: if FP total > Sleeper total, increasing FP weight
+    # must never DECREASE the consensus total.
+    prev = None
+    for fp_w in (0.0, 0.25, 0.5, 0.75, 1.0):
+        rec = build_player_record(fp_p2, sleeper_p2, fp_w, 0.5)  # FP total=100 > Sleeper total=40
+        if prev is not None:
+            assert rec["consensus_total_tackles"] >= prev - 1e-9, \
+                f"expected monotonic increase, got a decrease at FP weight={fp_w}"
+        prev = rec["consensus_total_tackles"]
+    print("  Monotonicity holds: increasing FP weight never decreases the consensus total when "
+          "FP's raw total is higher -- OK")
+
+    # C. Identical-source invariance: if both sources report the exact
+    # same total, the Stage-1 weight must have zero effect.
+    fp_p3 = {"fantasypros_id": 3, "raw_stats_used": {"def_tackle": 50.0, "def_assist": 30.0}}
+    sleeper_p3 = {"raw_category_season_totals": {"idp_tkl_solo": 48.0, "idp_tkl_ast": 32.0}}  # same total (80)
+    totals = [build_player_record(fp_p3, sleeper_p3, w, 0.5)["consensus_total_tackles"]
+              for w in (0.0, 0.25, 0.5, 0.75, 1.0)]
+    assert all(abs(t - totals[0]) < 0.01 for t in totals), \
+        f"expected identical totals across all Stage-1 weights when both sources agree, got {totals}"
+    print("  Identical-source invariance: when FP and Sleeper report the same total, Stage-1 weight "
+          "choice has zero effect, as it should -- OK")
+
+    # D. Stage-2 independence: changing Stage-1 weight must not alter
+    # the raw solo-share inputs used by Stage 2 -- only the final
+    # derived counts through the intended total-tackle pathway.
+    fp_shares = []
+    for fp_w in (0.0, 0.5, 1.0):
+        rec = build_player_record(fp_p, sleeper_p, fp_w, 0.5)
+        fp_shares.append(rec["fp_solo_share"])
+    assert all(s == fp_shares[0] for s in fp_shares), \
+        "expected fp_solo_share to be unaffected by Stage-1 weight -- found unintended cross-coupling"
+    print("  Stage-2 independence: changing Stage-1 weight does not alter the raw solo-share inputs -- "
+          "no accidental cross-coupling between stages -- OK")
+
+    # E. Conservation: derived solo + derived assist must always equal
+    # the consensus total, within tolerance, across every weight combo.
+    for fp1 in (0.0, 0.3, 0.5, 0.7, 1.0):
+        for fp2 in (0.0, 0.3, 0.5, 0.7, 1.0):
+            rec = build_player_record(fp_p, sleeper_p, fp1, fp2)
+            assert abs((rec["derived_solo"] + rec["derived_assist"]) - rec["consensus_total_tackles"]) < 1e-6, \
+                f"conservation violated at stage1={fp1}, stage2={fp2}"
+    print("  Conservation holds across a real grid of weight combinations: derived solo + derived "
+          "assist always exactly equals the consensus total -- OK")
+
+    # F. Weight validation: out-of-range and NaN weights must be
+    # rejected explicitly, not silently clamped.
+    for bad_weight in (-0.1, 1.1, float("nan")):
+        try:
+            build_player_record(fp_p, sleeper_p, bad_weight, 0.5)
+            raise AssertionError(f"expected an invalid weight ({bad_weight}) to raise ValueError")
+        except ValueError:
+            pass
+    print("  Invalid weights (negative, >1, NaN) are explicitly rejected, not silently clamped -- OK")
+
+    # G. Missing-source sweep invariance: a single-source player's
+    # projection must NOT change as the Stage-1 weight sweeps, since
+    # Stage-1 blending only applies when both sources are active.
+    fp_only_totals = [build_player_record(fp_p, None, w, 0.5)["tackle_points"] for w in (0.0, 0.25, 0.5, 0.75, 1.0)]
+    assert all(abs(t - fp_only_totals[0]) < 0.01 for t in fp_only_totals), \
+        f"expected an FP-only player's projection to be invariant to Stage-1 weight, got {fp_only_totals}"
+    sleeper_only_totals = [build_player_record(None, sleeper_p, w, 0.5)["tackle_points"] for w in (0.0, 0.25, 0.5, 0.75, 1.0)]
+    assert all(abs(t - sleeper_only_totals[0]) < 0.01 for t in sleeper_only_totals), \
+        f"expected a Sleeper-only player's projection to be invariant to Stage-1 weight, got {sleeper_only_totals}"
+    print("  Missing-source sweep invariance: single-source players' projections do NOT change as the "
+          "Stage-1 weight sweeps (blending only applies when both sources are genuinely active) -- OK")
 
     print("Self-test passed.\n")
 
