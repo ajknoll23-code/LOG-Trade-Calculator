@@ -6,25 +6,25 @@
 
 - Preferred candidate method: `reproducible_old_vs_v1_model_delta_transported_to_true_live_prod_mult`
 - Live IDP keys in candidate: **404**
-- Actual PROD_MULT entries that would change: **324**
-- Exact holds / unchanged candidate entries: **80**
+- Actual PROD_MULT entries that would change: **320**
+- Exact holds / unchanged candidate entries: **84**
 - Candidate HTML parsed/evaluated successfully: **565 PLAYER_DB rows**
 
 ## Changed entries by position
 
-- LB: **117**
+- LB: **113**
 - DL: **91**
 - DB: **116**
 
 ## Changed entries by source cohort
 
-- `both`: **271**
-- `fp_only`: **12**
+- `both`: **268**
+- `fp_only`: **11**
 - `sleeper_only`: **41**
 
 ## Changed entries by status
 
-- `model_delta_transported`: **324**
+- `model_delta_transported`: **320**
 
 ## Known anchors
 
@@ -59,7 +59,6 @@
 | justin strnad | LB | 0.2820 | 0.3471 | +23.1% | both |
 | jacob rodriguez | LB | 0.2560 | 0.3150 | +23.0% | both |
 | craig woodson | DB | 0.4040 | 0.4960 | +22.8% | both |
-| jake golday | LB | 0.1500 | 0.1841 | +22.7% | both |
 | nohl williams | DB | 0.3810 | 0.2954 | -22.5% | both |
 | derrick barnes | LB | 0.3620 | 0.4392 | +21.3% | both |
 | andrew mukuba | DB | 0.3370 | 0.3965 | +17.7% | both |
@@ -67,6 +66,7 @@
 | jiayir brown | DB | 0.4340 | 0.5078 | +17.0% | both |
 | javon bullard | DB | 0.3490 | 0.4076 | +16.8% | both |
 | jaylen watson | DB | 0.5140 | 0.5986 | +16.5% | both |
+| jamel dean | DB | 0.4110 | 0.4781 | +16.3% | both |
 
 ## Safety gates passed
 

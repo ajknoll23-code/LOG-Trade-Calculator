@@ -13,6 +13,10 @@ Default behavior is preview-only:
 
 Production modification requires the explicit ``--apply`` flag. Even then the
 same immutable-baseline guard runs first. This script never commits or pushes.
+
+POST-DEPLOYMENT NOTE: once V1 is present in index.html, the immutable-baseline
+guard is expected to refuse another preview/apply. Use
+``validate_idp_v1_final_deployment.py`` to validate the deployed state instead.
 """
 
 from __future__ import annotations

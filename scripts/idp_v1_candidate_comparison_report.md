@@ -2,7 +2,7 @@
 
 ## Purpose
 
-All three candidates are passed through the **actual current `snapshot_values.py` port of `index.html`**, including role-floor rescue, age multiplier, and position weights. `index.html` itself is not modified.
+All candidates are passed through the **actual current `snapshot_values.py` port of `index.html`** for valuation logic, while the OLD side is anchored to the immutable pre-V1 `PROD_MULT_DATA` snapshot. This keeps the comparison reproducible even after V1 is deployed.
 
 ## Final value movement by position
 
@@ -34,7 +34,7 @@ All three candidates are passed through the **actual current `snapshot_values.py
 
 | Pos | N | Median | P90 | P95 | Min | Max |
 |---|---:|---:|---:|---:|---:|---:|
-| LB | 79 | -0.9% | +1.7% | +2.5% | -33.0% | +23.9% |
+| LB | 79 | -0.5% | +1.7% | +2.5% | -6.5% | +23.9% |
 | DL | 86 | +3.3% | +7.3% | +8.2% | -12.6% | +13.4% |
 | DB | 65 | +0.2% | +3.1% | +5.2% | -7.1% | +44.5% |
 
@@ -143,11 +143,7 @@ All three candidates are passed through the **actual current `snapshot_values.py
 | Player | Pos | Old value | New value | Change | Rank move | Cohort/status |
 |---|---|---:|---:|---:|---:|---|
 | aj haulcy | DB | 796 | 1150 | +44.5% | -1 | both/model_delta_transported |
-| kaleb elarmsorr | LB | 968 | 649 | -33.0% | +4 | both/model_delta_transported |
-| kyle louis | LB | 968 | 690 | -28.7% | +2 | fp_only/model_delta_transported |
-| jaishawn barham | LB | 968 | 726 | -25.0% | +3 | both/model_delta_transported |
 | jacob rodriguez | LB | 1358 | 1682 | +23.9% | -2 | both/model_delta_transported |
-| jake golday | LB | 1162 | 968 | -16.7% | +0 | both/model_delta_transported |
 | jonathan greenard | DL | 1770 | 2007 | +13.4% | -7 | both/model_delta_transported |
 | jadeveon clowney | DL | 2293 | 2003 | -12.6% | +10 | fp_only/model_delta_transported |
 | will johnson | DB | 2259 | 2535 | +12.2% | -10 | both/model_delta_transported |
@@ -157,6 +153,10 @@ All three candidates are passed through the **actual current `snapshot_values.py
 | trey hendrickson | DL | 2776 | 3029 | +9.1% | -1 | both/model_delta_transported |
 | greg rousseau | DL | 3335 | 3610 | +8.2% | -5 | both/model_delta_transported |
 | donovan ezeiruaku | DL | 2208 | 2386 | +8.1% | -6 | both/model_delta_transported |
+| derick hall | DL | 2215 | 2037 | -8.0% | +2 | fp_only/model_delta_transported |
+| josh hinesallen | DL | 3678 | 3968 | +7.9% | -2 | both/model_delta_transported |
+| boye mafe | DL | 2588 | 2789 | +7.8% | -3 | both/model_delta_transported |
+| abdul carter | DL | 2749 | 2956 | +7.5% | -1 | both/model_delta_transported |
 
 ## Engineering conclusion
 

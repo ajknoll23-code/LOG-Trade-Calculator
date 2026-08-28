@@ -20,7 +20,7 @@ Comparable old/new model cohort: **330** of **404** live IDP keys.
 
 | Pos | N | Median | P90 | P95 | Min | Max |
 |---|---:|---:|---:|---:|---:|---:|
-| LB | 164 | +0.0% | +7.2% | +23.1% | -27.3% | +49.7% |
+| LB | 164 | +0.0% | +6.5% | +23.1% | -27.3% | +49.7% |
 | DL | 108 | +2.2% | +8.6% | +12.0% | -12.7% | +14.9% |
 | DB | 132 | +0.5% | +13.2% | +17.0% | -22.5% | +42.1% |
 
@@ -28,14 +28,16 @@ Comparable old/new model cohort: **330** of **404** live IDP keys.
 
 | Cohort | N | Median | P90 | P95 |
 |---|---:|---:|---:|---:|
-| both | 273 | +2.1% | +13.4% | +22.9% |
-| fp_only | 35 | +0.0% | +0.7% | +4.1% |
+| both | 273 | +2.0% | +13.3% | +22.9% |
+| fp_only | 35 | +0.0% | +0.0% | +1.8% |
 | sleeper_only | 44 | -4.0% | -0.8% | +0.0% |
 | no_new_data | 52 | +0.0% | +0.0% | +0.0% |
 
-## Exact holds
+## Exact holds / release guards
 
 - No comparable old projection: **74** players; maximum absolute change **0.000000%**
+- Floor-rescue discontinuity guard: **4** current PLAYER_DB players held exactly at the pre-V1 raw floor: jaishawn barham, jake golday, kaleb elarmsorr, kyle louis.
+  This prevents a tiny positive raw transport delta from disabling the existing no-history role-floor rescue and causing an unvalidated large final-value drop.
 
 ## Known anchors
 
@@ -68,11 +70,11 @@ Comparable old/new model cohort: **330** of **404** live IDP keys.
 | justin strnad | LB | 0.2820 | 0.3471 | +23.1% | both |
 | jacob rodriguez | LB | 0.2560 | 0.3150 | +23.0% | both |
 | craig woodson | DB | 0.4040 | 0.4960 | +22.8% | both |
-| jake golday | LB | 0.1500 | 0.1841 | +22.7% | both |
 | derrick barnes | LB | 0.3620 | 0.4392 | +21.3% | both |
 | andrew mukuba | DB | 0.3370 | 0.3965 | +17.7% | both |
 | dru phillips | DB | 0.6750 | 0.7903 | +17.1% | both |
 | jiayir brown | DB | 0.4340 | 0.5078 | +17.0% | both |
+| javon bullard | DB | 0.3490 | 0.4076 | +16.8% | both |
 
 ## Top 20 fallers
 

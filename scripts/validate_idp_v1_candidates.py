@@ -26,6 +26,7 @@ import snapshot_values
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 INDEX = REPO_ROOT / "index.html"
+PRE_V1_BASELINE = SCRIPT_DIR / "prod_mult_pre_v1_baseline.json"
 REPORT = SCRIPT_DIR / "idp_v1_candidate_comparison_report.md"
 JSON_OUT = SCRIPT_DIR / "idp_v1_candidate_comparison.json"
 
@@ -114,8 +115,15 @@ def analyze_candidate(name, doc, old_values, old_ranks, cfg):
 
 
 def main():
+    # The comparison baseline is the immutable PRE-V1 live PROD_MULT table,
+    # not whatever happens to be deployed in index.html today. This keeps the
+    # candidate-comparison artifact reproducible after V1 itself is deployed.
     cfg=snapshot_values.load_from_html(INDEX)
-    old_values=snapshot_values.compute_all_values(cfg); old_ranks=rank_map(old_values)
+    baseline_doc=json.load(open(PRE_V1_BASELINE,encoding='utf-8'))
+    old_cfg=dict(cfg)
+    old_cfg['prod_mult']=dict(cfg['prod_mult'])
+    old_cfg['prod_mult'].update({k:float(v) for k,v in baseline_doc['values'].items()})
+    old_values=snapshot_values.compute_all_values(old_cfg); old_ranks=rank_map(old_values)
     docs={name:json.load(open(path,encoding='utf-8')) for name,path in CANDIDATES.items()}
     results={name:analyze_candidate(name,doc,old_values,old_ranks,cfg) for name,doc in docs.items()}
 
@@ -125,7 +133,7 @@ def main():
     lines=[
         '# IDP V1 Candidate Comparison Through Final Trade Desk Values','',
         '## Purpose','',
-        'All three candidates are passed through the **actual current `snapshot_values.py` port of `index.html`**, including role-floor rescue, age multiplier, and position weights. `index.html` itself is not modified.','',
+        'All candidates are passed through the **actual current `snapshot_values.py` port of `index.html`** for valuation logic, while the OLD side is anchored to the immutable pre-V1 `PROD_MULT_DATA` snapshot. This keeps the comparison reproducible even after V1 is deployed.','',
         '## Final value movement by position','',
     ]
     for name,res in results.items():

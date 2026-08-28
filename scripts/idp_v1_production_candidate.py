@@ -307,6 +307,7 @@ def build_candidate():
             "identity_method": identity_method,
             "fantasypros_id": cross.get("fantasypros_id") if cross else None,
             "history_component": history["history_component"],
+            "games_played_2025": history.get("games_played_2025"),
             "shrunk_ppg": history.get("shrunk_ppg"),
             "durability_projected_games_2026": history.get("durability_projected_games_2026"),
             "legacy_projection_fallback": old["projection"],

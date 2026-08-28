@@ -37,7 +37,7 @@ from typing import Dict, Iterable, Mapping, Optional
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SEASON_LENGTH_2025 = 17
 SEASON_LENGTH_2026 = 17
-TRACKED_POSITIONS = {"QB", "RB", "WR", "TE", "DL", "LB", "DB"}
+TRACKED_POSITIONS = ("QB", "RB", "WR", "TE", "DL", "LB", "DB")  # tuple for deterministic generated JSON ordering
 
 
 @dataclass(frozen=True)

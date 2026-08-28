@@ -20,6 +20,14 @@ replacement-baseline effect -- without importing the old model's absolute
 historical level into production. Players lacking a comparable old projection
 are held exactly unchanged rather than inventing a zero baseline.
 
+A deployment guard also preserves the live role-floor rescue for current
+PLAYER_DB players with zero real 2025 history whose pre-V1 raw multiplier was
+exactly 0.15. If a tiny transported delta would move raw PROD_MULT just above
+0.15 but still below the role estimate, the raw value is held at 0.15 so the
+existing live rescue is not accidentally disabled. This prevents an unvalidated
+threshold artifact from turning a positive raw delta into a large final-value
+drop.
+
 Never reads prod_mult_pipeline_output.json. Never edits index.html.
 """
 
@@ -33,8 +41,10 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from idp_v1_production_candidate import build_candidate as build_source_candidate
+import snapshot_values
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+INDEX_PATH = SCRIPT_DIR.parent / "index.html"
 OUTPUT_PATH = SCRIPT_DIR / "idp_v1_model_delta_transport_candidate.json"
 REPORT_PATH = SCRIPT_DIR / "idp_v1_model_delta_transport_candidate_report.md"
 
@@ -63,6 +73,16 @@ def summarize(vals):
 
 def build_candidate():
     source=build_source_candidate(); src=source['players']
+    # Migration-specific safety guard: the live value engine rescues a player
+    # with zero real 2025 history from the literal 0.15 raw floor to the
+    # player's role estimate. A tiny transported delta such as 0.150 -> 0.151
+    # would otherwise TURN THAT RESCUE OFF and create a large final-value drop
+    # even though the raw model delta was positive. That discontinuity was not
+    # part of the V1 validation cohort (no-history rows were excluded there).
+    # Preserve the pre-V1 floor rescue unless V1's transported raw multiplier
+    # actually clears the role estimate. This is release attribution, not a
+    # recalibration of productionMultiplier() itself.
+    valuation_cfg = snapshot_values.load_from_html(INDEX_PATH)
     comparable={}
     holds=Counter()
     for key,r in src.items():
@@ -93,13 +113,27 @@ def build_candidate():
     for key,r in src.items():
         live=float(r['old_live_prod_mult']); pos=r['pos']
         if key not in comparable:
-            candidate=live; delta_raw_pm=0.0; status='exact_hold_no_comparable_old_projection'
+            candidate=live; unguarded_candidate=candidate; delta_raw_pm=0.0; status='exact_hold_no_comparable_old_projection'
         else:
             old_ratio=comparable[key]['old_combined']/old_baselines[pos]
             new_ratio=comparable[key]['new_combined']/new_baselines[pos]
             delta_raw_pm=.75*(new_ratio-old_ratio)
             candidate=round(clamp(live+delta_raw_pm),4)
             status='model_delta_transported'
+
+            info = valuation_cfg['player_db'].get(key)
+            role_estimate = valuation_cfg['role_mult'].get(info['role'], 1.0) if info else None
+            if (
+                live <= FLOOR
+                and r.get('games_played_2025') == 0
+                and role_estimate is not None
+                and FLOOR < candidate <= role_estimate
+            ):
+                unguarded_candidate = candidate
+                candidate = live
+                status = 'exact_hold_floor_rescue_discontinuity_guard'
+            else:
+                unguarded_candidate = candidate
         status_counts[status]+=1
         rec={**r,
             'old_model_combined':comparable.get(key,{}).get('old_combined'),
@@ -109,6 +143,7 @@ def build_candidate():
             'old_model_ratio':(comparable[key]['old_combined']/old_baselines[pos]) if key in comparable else None,
             'new_model_ratio':(comparable[key]['new_combined']/new_baselines[pos]) if key in comparable else None,
             'delta_raw_prod_mult':delta_raw_pm,
+            'unguarded_candidate_prod_mult':unguarded_candidate,
             'candidate_prod_mult':candidate,
             'pct_change':(candidate/live-1)*100 if live else None,
             'update_status':status,
@@ -155,9 +190,12 @@ def build_report(c):
     for cohort in ('both','fp_only','sleeper_only','no_new_data'):
         s=summarize(by_source.get(cohort,[]))
         if s['n']: lines.append(f"| {cohort} | {s['n']} | {s['median']:+.1f}% | {s['p90']:+.1f}% | {s['p95']:+.1f}% |")
-    lines += ['', '## Exact holds','']
+    lines += ['', '## Exact holds / release guards','']
     vals=by_status.get('exact_hold_no_comparable_old_projection',[])
     lines.append(f"- No comparable old projection: **{len(vals)}** players; maximum absolute change **{max([abs(x) for x in vals],default=0):.6f}%**")
+    guarded=[r['key'] for r in rows if r['update_status']=='exact_hold_floor_rescue_discontinuity_guard']
+    lines.append(f"- Floor-rescue discontinuity guard: **{len(guarded)}** current PLAYER_DB players held exactly at the pre-V1 raw floor: {', '.join(guarded) if guarded else 'none'}.")
+    lines.append("  This prevents a tiny positive raw transport delta from disabling the existing no-history role-floor rescue and causing an unvalidated large final-value drop.")
     lines += ['', '## Known anchors','', '| Player | Pos | Old | Candidate | Change | Cohort | Status |','|---|---|---:|---:|---:|---|---|']
     for k in anchors:
         r=c['players'].get(k)
@@ -176,9 +214,17 @@ def build_report(c):
 
 def run_selftest():
     c=build_candidate()
+    floor_guarded=[]
     for r in c['players'].values():
         if r['update_status']=='exact_hold_no_comparable_old_projection':
             assert r['candidate_prod_mult']==r['old_live_prod_mult'],r['key']
+        if r['update_status']=='exact_hold_floor_rescue_discontinuity_guard':
+            floor_guarded.append(r['key'])
+            assert r['old_live_prod_mult'] == FLOOR, r['key']
+            assert r['candidate_prod_mult'] == FLOOR, r['key']
+            assert r['unguarded_candidate_prod_mult'] > FLOOR, r['key']
+    expected={'jaishawn barham','jake golday','kaleb elarmsorr','kyle louis'}
+    assert set(floor_guarded)==expected, (floor_guarded, expected)
     print('idp_v1_model_delta_transport_candidate self-test passed.')
 
 

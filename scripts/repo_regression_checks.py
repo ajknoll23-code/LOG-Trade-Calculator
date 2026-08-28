@@ -31,6 +31,7 @@ import team_field_refresh_pipeline
 import idp_v1_projection
 import production_history_component
 import idp_v1_model_delta_transport_candidate
+import validate_idp_v1_final_deployment
 from generate_player_positions import parse_player_positions, build_player_position_lookup
 
 
@@ -383,14 +384,36 @@ def check_preferred_bake_preview_invariants():
         assert abs(float(e["new"]) - float(candidate["players"][key]["candidate_prod_mult"])) < 1e-12, key
         assert e["pos"] in {"LB", "DL", "DB"}, key
 
+    floor_guarded = {
+        key for key, r in candidate["players"].items()
+        if r.get("update_status") == "exact_hold_floor_rescue_discontinuity_guard"
+    }
+    assert floor_guarded == {"jaishawn barham", "jake golday", "kaleb elarmsorr", "kyle louis"}, floor_guarded
+
     for key, r in candidate["players"].items():
         if r["candidate_prod_mult"] == r["old_live_prod_mult"]:
             assert key not in seen, f"exact hold unexpectedly present in bake patch: {key}"
 
-    assert len(entries) == 324, f"unexpected preferred-bake change count: {len(entries)}"
+    assert len(entries) == 320, f"unexpected preferred-bake change count: {len(entries)}"
     print(
         f"PASS preferred V1 bake-preview invariants: {len(entries)} changed PROD_MULT entries, "
-        f"{len(candidate['players'])-len(entries)} exact holds"
+        f"{len(candidate['players'])-len(entries)} exact holds (including {len(floor_guarded)} floor-rescue guards)"
+    )
+
+
+def check_deployed_idp_v1_invariants():
+    result = validate_idp_v1_final_deployment.validate_deployment()
+    assert result["status"] == "PASS"
+    assert result["actual_changed_entry_count"] == 320, result["actual_changed_entry_count"]
+    assert result["approved_changed_entry_count"] == 320
+    assert result["non_idp_final_value_changes"] == 0
+    assert result["update_status_counts"].get("exact_hold_floor_rescue_discontinuity_guard") == 4
+    assert result["position_lineage_mismatch_count"] == 46
+    print(
+        "PASS deployed IDP V1 invariants: "
+        f"{result['actual_changed_entry_count']} approved PROD_MULT changes; "
+        f"{result['exact_hold_candidate_count']} exact holds; "
+        f"{result['non_idp_final_value_changes']} offense value changes"
     )
 
 def check_index_js_syntax():
@@ -416,6 +439,7 @@ def main():
         check_idp_v1_projection_invariants,
         check_canonical_history_and_v1_bridge,
         check_preferred_bake_preview_invariants,
+        check_deployed_idp_v1_invariants,
         check_index_js_syntax,
     ]
     for check in checks:
