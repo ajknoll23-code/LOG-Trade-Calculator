@@ -33,10 +33,10 @@ The previously generated candidate V1-baked `index.html` is **not** treated as f
 
 ### Still open
 
-- A fresh run of the legacy `prod_mult_pipeline.py` does **not** reproduce the actual pre-V1 live `PROD_MULT_DATA` table.
-- Therefore the old generated JSON lineage cannot be assumed to equal the historical live production model.
-- The validated V1 projection architecture remains sound, but the production bake must not accidentally mix a V1 projection change with unrelated legacy-lineage recalibration.
-- The current `bake_idp_ensemble_v1.py` still depends on `prod_mult_pipeline_output.json`; the original repo snapshot did not contain that generated file, so the bake path is not yet clean-checkout self-contained.
+- The legacy `prod_mult_pipeline.py` still does **not** reproduce the actual pre-V1 live `PROD_MULT_DATA` table and remains diagnostic only.
+- The preferred first-release V1 migration is now the validated **model-delta transport** bridge; production `index.html` has not yet been changed.
+- A separate historical position-lineage migration remains backlog: 46 live IDP keys have legacy production-position grouping that differs from current canonical valuation position. This is intentionally isolated from V1 rather than silently corrected in the same release.
+- Durability weighting methodology remains backlog and is deliberately unchanged for V1.
 
 ## Current Validation Snapshot
 
@@ -228,16 +228,158 @@ PASS index.html JavaScript syntax
 ALL REPO REGRESSION CHECKS PASSED (7 groups)
 ```
 
-# Next Workstream
+## ChatGPT Solo Batch 3 — Canonical History + V1 Lineage Bridge
 
-**Immediate goal:** make the V1 production path deterministic and auditable without relying on stale generated lineage.
+### Closed / accomplished
 
-Planned sequence:
+- Extracted the existing history-side math into `scripts/production_history_component.py` without recalibration.
+- Generated `scripts/production_history_components.json` as the canonical history-side artifact.
+- Refactored legacy `prod_mult_pipeline.py` to call the canonical history module.
+- Proved exact legacy-refactor parity: **1125/1125 player records**, full JSON structural equality, identical baselines and prod_mult outputs.
+- Built four explicit V1 migration candidates and compared them through the actual Trade Desk value engine.
+- Rejected full canonical absolute recomputation for the first V1 release because it bundles historical lineage drift and creates excessive rank/value movement.
+- Selected **model-delta transport** as the preferred first-release bridge.
+- Built a safe preview-only production patch generator; production `index.html` remains byte-identical to Batch 2.
+- Blocked the old direct bake script from normal execution and converted legacy write workflows to read-only diagnostics.
+- Added a read-only V1 candidate validation workflow.
+- Expanded repository regression coverage from 7 to **9 groups**.
 
-1. ~~Capture an immutable canonical pre-V1 `PROD_MULT_DATA` baseline.~~ **DONE**
-2. ~~Harden projection-source activity detection beyond tackle-total-only logic.~~ **DONE**
-3. ~~Add a dedicated lineage audit explaining legacy generated-vs-live drift.~~ **DONE**
-4. **NEXT:** separate reusable history/durability computation from obsolete legacy projection blending and determine the safest baseline-normalization bridge from the historical live table.
-5. Build a clean-checkout V1 IDP candidate pipeline that does not require a pre-existing stale `prod_mult_pipeline_output.json`.
-6. Validate final candidate against the true old live baseline before touching production values.
+### Preferred model-delta transport
 
+The bridge computes an internally consistent old and V1 model on the same reproducible cohort, including each model's rank-32 replacement baseline, then transports only the resulting prod_mult delta onto the **actual pre-V1 live** value.
+
+```text
+Comparable old/new model cohort: 330 / 404 live IDP keys
+Exact holds with no defensible old comparison: 74
+
+Internal replacement-baseline movement:
+LB +3.4%
+DL +4.4%
+DB +3.4%
+```
+
+Known raw PROD_MULT anchors:
+
+```text
+Bradley Chubb      +35.8%
+Aidan Hutchinson    +6.2%
+Myles Garrett       +5.8%
+Fred Warner         -0.4%
+Roquan Smith        -1.3%
+E.J. Speed          -5.7%
+Isaiah McDuffie    -25.8%
+```
+
+These closely reproduce the shape of the earlier validated V1 sensitivity test while anchoring to the true live pre-V1 table instead of stale generated lineage.
+
+### Final-value validation through the real value engine
+
+```text
+Median final Trade Desk value movement:
+LB -0.9%
+DL +3.3%
+DB +0.2%
+
+P95 final-value movement:
+LB +2.5%
+DL +8.2%
+DB +5.2%
+
+Top-24 movers >=5 positional ranks:
+LB 1
+DL 4
+DB 1
+
+Top-36 movers >=5 positional ranks:
+LB 1
+DL 7
+DB 2
+```
+
+### Preferred bake preview
+
+`scripts/prepare_idp_v1_bake.py` is preview-only by default and refuses to proceed unless current `index.html` still matches the immutable pre-V1 baseline.
+
+Current preview:
+
+```text
+404 live IDP candidate keys
+324 actual PROD_MULT entries would change
+80 entries remain exact holds
+LB changes 117
+DL changes 91
+DB changes 116
+565 PLAYER_DB rows parse/evaluate successfully
+```
+
+No production values were applied.
+
+### Historical position-lineage separation
+
+Final review surfaced **46** live IDP keys where legacy production position differs from current canonical valuation position; 42 are primarily legacy LB -> current DL EDGE classifications.
+
+For V1 release attribution, the old-vs-new model bridge deliberately preserves the legacy production-position grouping while final player value/rank validation continues to use current `PLAYER_DB` valuation positions. The regression suite now hard-guards this 46-player mismatch cohort so it cannot change silently.
+
+This is a **separate backlog migration**, not a V1 blocker.
+
+### Final Batch 3 validation
+
+```text
+Repo regression suite: 9/9 groups PASS
+Python AST: 44 files, 0 errors
+JSON parse: 40 files, 0 errors
+YAML parse: 20 workflows, 0 errors
+index.html JavaScript: PASS
+free-agent-board.html JavaScript: PASS
+legacy history refactor parity: EXACT
+production index.html unchanged vs Batch 2: EXACT / byte-identical
+prod_mult_pipeline_output.json retained: NO
+idp_bake_report.md retained: NO
+```
+
+## ChatGPT Solo Batch 3 File Manifest
+
+### Modified
+
+- `docs/CHATGPT_SOLO_CHECKPOINT_2026-08-28.md`
+- `github-workflows/bake-idp-ensemble-v1.yml`
+- `github-workflows/prod-mult-pipeline.yml`
+- `scripts/bake_idp_ensemble_v1.py`
+- `scripts/idp_v1_live_anchored_candidate.py`
+- `scripts/idp_v1_live_anchored_report.md`
+- `scripts/prod_mult_pipeline.py`
+- `scripts/repo_regression_checks.py`
+
+### Created
+
+- `docs/CHATGPT_SOLO_BATCH3_V1_LINEAGE_BRIDGE.md`
+- `github-workflows/idp-v1-candidate-validation.yml`
+- `scripts/production_history_component.py`
+- `scripts/production_history_components.json`
+- `scripts/idp_v1_production_candidate.py`
+- `scripts/idp_v1_production_candidate.json`
+- `scripts/idp_v1_production_candidate_report.md`
+- `scripts/idp_v1_isolated_projection_candidate.py`
+- `scripts/idp_v1_isolated_projection_candidate.json`
+- `scripts/idp_v1_isolated_projection_candidate_report.md`
+- `scripts/idp_v1_projection_only_candidate.py`
+- `scripts/idp_v1_projection_only_candidate.json`
+- `scripts/idp_v1_projection_only_candidate_report.md`
+- `scripts/idp_v1_model_delta_transport_candidate.py`
+- `scripts/idp_v1_model_delta_transport_candidate.json`
+- `scripts/idp_v1_model_delta_transport_candidate_report.md`
+- `scripts/validate_idp_v1_candidates.py`
+- `scripts/idp_v1_candidate_comparison.json`
+- `scripts/idp_v1_candidate_comparison_report.md`
+- `scripts/prepare_idp_v1_bake.py`
+- `scripts/idp_v1_prod_mult_patch.json`
+- `scripts/idp_v1_prod_mult_patch_report.md`
+- `scripts/idp_v1_index_preview.patch`
+
+## Next Decision
+
+The next step is no longer additional model research or lineage reconstruction. Batch 3 has reduced the decision to one controlled production action:
+
+> **Approve or reject model-delta transport as the first V1 production migration method.**
+
+If approved, run `prepare_idp_v1_bake.py --apply` in the controlled working tree, update the stale methodology comment above `PROD_MULT_DATA` in the same change, rerun the entire regression/final-value suite, generate the exact old-live -> final-new production report, and only then commit the resulting `index.html`.
