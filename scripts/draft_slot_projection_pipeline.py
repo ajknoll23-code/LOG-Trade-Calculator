@@ -243,6 +243,7 @@ def run_selftest():
 def main():
     if "--selftest" in sys.argv:
         run_selftest()
+        return
 
     league_id = load_league_id()
     print(f"Fetching real rosters for league {league_id}...")

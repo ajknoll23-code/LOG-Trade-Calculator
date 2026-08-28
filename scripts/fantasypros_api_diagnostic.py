@@ -212,6 +212,7 @@ def run_selftest():
 def main():
     if "--selftest" in sys.argv:
         run_selftest()
+        return
 
     api_key = os.environ.get(API_KEY_ENV_VAR)
     if not api_key:

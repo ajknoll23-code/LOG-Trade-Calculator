@@ -160,6 +160,7 @@ def run_selftest():
 def main():
     if "--selftest" in sys.argv:
         run_selftest()
+        return
 
     pool = load_or_fetch_full_pool()
     print(f"Full pool size: {len(pool)} players.")

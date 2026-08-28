@@ -279,6 +279,7 @@ def run_selftest():
 def main():
     if "--selftest" in sys.argv:
         run_selftest()
+        return
 
     if not os.path.exists(LINEAGE_PATH):
         print(f"ERROR: need {LINEAGE_PATH} to exist. Run prod_mult_pipeline.py first.")
