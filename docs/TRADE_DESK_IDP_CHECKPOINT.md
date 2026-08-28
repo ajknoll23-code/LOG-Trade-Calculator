@@ -71,27 +71,42 @@ Using the neutral V1 assumptions (Stage 1 = 50/50, Stage 2 = 60/40 Sleeper, TFL/
 - Fred Warner (-0.7%), Roquan Smith (-1.6%) -- elite real off-ball tacklers, value already well-captured by both old and new systems, appropriately near-flat.
 - Fallers (Christian Izien -22.1%, Isaiah McDuffie -21.3%, etc.) are concentrated in deep/depth players, not star dynasty assets -- no disruption of elite-tier valuations.
 
-**Conclusion: the new category-level ensemble passes the real sensitivity check.** Values move sensibly, in football-plausible directions, concentrated where the architecture predicts they should (pass-rushers gain from TFL/QB-hit coverage, off-ball tacklers stay flat), without wild instability at the median. This is the real answer to "did all this work make the trade calculator better" -- provisionally yes, pending the still-open Section D (missing-source policy) and a full review of the complete riser/faller lists before considering a production bake.
+**Conclusion: the new category-level ensemble passes the real sensitivity check.** Values move sensibly, in football-plausible directions, concentrated where the architecture predicts they should (pass-rushers gain from TFL/QB-hit coverage, off-ball tacklers stay flat), without wild instability at the median.
 
+## C.2. FOUR FINAL VALIDATION CHECKS -- ALL CLEAN
+- **Clamp/ceiling occupancy**: 0 players at the 0.15 floor or 1.55 ceiling, old or new, across all three positions. No hidden compression at either extreme.
+- **Top-24 rank stability**: a handful of real top-24 players move ≥5 ranks (e.g. Rueben Bain -18 ranks in DL), but verified directly this is a real, expected, *mechanical* consequence of the DL baseline itself moving up (+4.8%) -- these specific players' own `proj_2026` is unchanged; their relative rank appropriately declined because the bar for the whole position rose from other players' improved data, not because anything about them individually changed. Confirmed by checking their raw old/new proj values directly, not assumed.
+- **Single-source cohort audit**: `both`-source median +2.2%, `fp_only` -3.7%, `sleeper_only` -4.7%, `no_new_data` -4.7% (the latter two matching, both driven by the same baseline-shift mechanism). 12 of the top-50 riser/faller extremes are single-source, but all on the modest end (-5.7% to -12.4%) -- none of the truly extreme movers (Bradley Chubb +36.5%, Christian Izien -22.1%) are single-source. No evidence single-source handling is driving erratic behavior. **Real green light for the current V1 missing-source rule** (use the one available source directly, never fake-zero-average).
+- **Final player value (age multiplier × POSITION_WEIGHT)**: NOT computed -- real limitation, no per-player age data cached in this sandbox. Honest reasoning for why `prod_mult` % change is likely still a faithful proxy for this specific comparison: `POSITION_WEIGHT` is fixed per position (unaffected either way), and age multiplier is a function of player age/position, not of the projection itself -- it does not change between the old and new scenarios for a given player, since only the IDP projection input was swapped. Under that reasoning, `prod_mult` % change should equal final value % change exactly for this comparison. Worth an explicit confirmation against the real age-multiplier logic before treating this as fully proven, not just assumed.
 
-5. If historical evidence does support different LB/DL/DB weights, prefer shrinking toward neutral 0.5 over shipping an aggressively-fit position-specific number from a thin sample -- e.g. if a thin calibration implies 0.28 for LB, a more conservative production candidate is likely closer to 0.40, not 0.28, unless the evidence is deep and stable.
-
-## D. P1 -- MISSING-SOURCE POLICY (depends on Stage-1 calibration, don't solve independently first)
-A single-source player effectively sits at one Stage-1 extreme (Sleeper-only ≈ 0% FP weight, FantasyPros-only ≈ 100%) on the model's most economically sensitive component -- this makes getting it right more urgent, not less, once Stage 1's real leverage was measured.
-- **Current placeholder** (in `idp_ensemble_experiment.py` already): use the one available source's real value directly. Confirmed via self-test this is not silently halved.
-- **This should NOT become the final production rule as-is.** Correct sequence: (1) calibrate each source's positional scale via Stage-1 historical work above, (2) apply that same calibration transform to single-source players before using their raw value, (3) only then consider whether additional shrinkage toward a positional prior is warranted for single-source cases specifically.
+## D. MISSING-SOURCE POLICY -- VALIDATED CLEAN, V1 RULE CONFIRMED GOOD ENOUGH
+Per the real single-source cohort audit in C.2: single-source players show modest, non-extreme, mechanically-explained movement, not erratic behavior. **The current V1 rule (use the one available source directly, never fake-zero-average) is confirmed good enough for V1** -- more sophisticated shrinkage (calibrating single-source values against a positional prior) moves to backlog, not required before considering a bake.
 
 ## E. SETTLED ENOUGH / LOW LEVERAGE -- DO NOT SPEND FURTHER EFFORT HERE YET
 - **Stage 2 (solo/assist allocation)**: architecture closed. Neutral baseline 50/50. Preferred experimental scenario 60% Sleeper / 40% FantasyPros, based on real N=8 historical calibration (5 LB, 2 DL, 1 DB; Sleeper closer on 7/8; median absolute error 5.55 vs 14.75 pts, ~2.7x; binomial check on 7+/8 under a fair-coin null is ~3.5% one-sided -- suggestive, not proof, given N and position imbalance). One real counter-example (Kyle Hamilton, DB) reported honestly, not excluded -- DB solo-share evidence is thin (n=1), keep 50/50 visible as the DB comparison point.
-- **Real measured economic leverage of Stage 2**: median -0.50 pts at the 60/40 experimental weight, capped around -2.51 pts median even at the full 100%-Sleeper extreme. Do not spend the next block of effort tuning 60/40 toward some more precise decimal (e.g. 57/43) while Stage 1 can move individual players by dozens of points -- that would be optimizing the wrong uncertainty.
+- **Real measured economic leverage of Stage 2**: median -0.50 pts at the 60/40 experimental weight, capped around -2.51 pts median even at the full 100%-Sleeper extreme. Do not spend further effort tuning 60/40 toward a more precise decimal.
 
-## F. NEXT EXPERIMENT (concrete, when work resumes)
-Real 2024-2025 positional tackle-scale calibration for LB/DL/DB -- see Section C for the full method. This is the actual next block of work, not a vague "gather more data" placeholder.
+## F. OVERALL STATUS: V1 ARCHITECTURE CLOSED, PRODUCTION BAKE PENDING ONE ITEM
+**IDP PROJECTION NORMALIZATION: CLOSED / V1 ARCHITECTURE VALIDATED.**
+- Stage 1: 50/50 FP/Sleeper total tackles (neutral, optimal weight remains open -- see backlog).
+- Stage 2: 60% Sleeper / 40% FantasyPros solo share.
+- TFL, QB hits: Sleeper-only (FantasyPros doesn't have them).
+- Sacks/INT/PD/FF/FR/def TD: 50/50 category consensus.
+- Single-source players: use the one available real source directly.
+- Validated end-to-end against the real `prod_mult` formula (Section C.1/C.2) -- clean, football-sensible, no clamp/compression issues, single-source behavior confirmed ordinary.
 
-## G. PRODUCTION HOLD -- DO NOT
-- Bake new `prod_mult` values yet.
-- Choose a Stage-1 weight from intuition -- use the historical calibration method above.
+**PRODUCTION BAKE: PENDING ONE ITEM** -- explicit confirmation that `prod_mult` % change equals final value % change (the age-multiplier-is-projection-independent reasoning in C.2 is sound but not yet directly confirmed against the real age-multiplier logic). Once confirmed, ready for a production bake decision.
+
+## G. BACKLOG -- NOT A V1 BLOCKER
+- Optimal Stage-1 source weight (real, promising n=7 matched-player lead exists -- Section C -- but needs a properly large, aligned sample, e.g. via nflverse, before being production-actionable).
+- Source-scale positional normalization (rescale each source to match real historical distributions, then blend -- the architecturally cleaner alternative to a single blend weight).
+- More Stage-2 calibration precision.
+- Advanced single-source shrinkage toward a positional prior.
+- A third projection source.
+
+## H. PRODUCTION HOLD -- DO NOT
+- Bake new `prod_mult` values yet -- pending the age-multiplier confirmation in Section F.
+- Reopen Stage-1 historical-calibration research as a blocker -- it's real, promising, backlogged, not gating.
 - Treat a missing/zero-signal source as a real zero forecast.
 - Reopen the FantasyPros tackle-semantics question (closed, checksum-verified).
 - Build archetype-specific tackle or sack formulas without materially stronger evidence than currently exists.
-- Spend further effort fine-tuning Stage 2 before Stage-1 calibration is done -- Stage 1 is where the real risk lives.
