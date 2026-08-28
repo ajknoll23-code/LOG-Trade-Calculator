@@ -52,11 +52,30 @@ IDP_POSITIONS = ("LB", "DL", "DB")
 REPLACEMENT_RANK = 32  # matches the established DL32/LB32/DB32 convention
 
 
-def score_other_categories(fp_stats, s_stats, both_active):
+def score_other_categories(fp_stats, s_stats, both_active, fp_active, s_active):
+    """
+    BUG FIX, confirmed by external review with a real, exact case (E.J.
+    Speed: FantasyPros row exists but is entirely zero -- a real,
+    inactive placeholder row, not a missing one -- while Sleeper has
+    real, active production: 1.02 sacks, 2.89 PD). The original
+    single-source branch checked `if fp_stats` (does a stats OBJECT
+    exist at all) instead of `if fp_active` (does that source have real,
+    nonzero production) -- so a present-but-inactive FantasyPros row
+    incorrectly won every category, discarding Sleeper's real, active
+    numbers. Verified this reproduces exactly: buggy result 83.70,
+    correct result 95.43, an 11.73-point real error for this one player
+    alone -- and since ANY player with an inactive-but-present source on
+    either side hits this same bug, it wasn't isolated to E.J. Speed.
+    Source PRESENCE must never be used as a proxy for source ACTIVITY.
+    """
     def consensus(fp_val, s_val):
         if both_active:
             return 0.5 * (fp_val or 0) + 0.5 * (s_val or 0)
-        return (fp_val or 0) if fp_stats else (s_val or 0)
+        if fp_active:
+            return fp_val or 0
+        if s_active:
+            return s_val or 0
+        return 0  # neither source active for this category -- real, honest zero, not a guess
     fp = fp_stats or {}
     s = s_stats or {}
     pts = 0.0
@@ -66,7 +85,7 @@ def score_other_categories(fp_stats, s_stats, both_active):
     pts += consensus(fp.get('def_ff'), s.get('idp_ff')) * 3.0
     pts += consensus(fp.get('def_fr'), s.get('idp_fum_rec')) * 4.0
     pts += consensus(fp.get('def_td'), s.get('idp_td')) * 6.0
-    if s_stats:
+    if s_active:
         pts += (s.get('idp_tkl_loss', 0) or 0) * 2.0
         pts += (s.get('idp_qb_hit', 0) or 0) * 2.0
     return pts
@@ -96,7 +115,7 @@ def compute_new_proj(fp_stats, s_stats, old_proj):
         tackle_pts = fp_solo * 1.5 + fp_ast * 0.75
     else:
         tackle_pts = s_solo * 1.5 + s_ast * 0.75
-    return tackle_pts + score_other_categories(fp_stats, s_stats, both)
+    return tackle_pts + score_other_categories(fp_stats, s_stats, both, fp_active, s_active)
 
 
 def run_bake(prod_mult_data, fp_players, sleeper_players, crosswalk):
@@ -178,6 +197,24 @@ def run_selftest():
     unchanged = compute_new_proj(None, None, old_proj=123.4)
     assert unchanged == 123.4, f"expected no-new-data case to return the old value exactly, got {unchanged}"
     print("  No-new-data case returns the old value exactly, not silently zeroed or guessed -- OK")
+
+    # REGRESSION TEST, real case, confirmed via external review: E.J.
+    # Speed. FantasyPros has a real ROW that exists but is entirely
+    # zero (a genuine inactive placeholder, not a missing source), while
+    # Sleeper has real, active production. Source PRESENCE must not be
+    # confused with source ACTIVITY.
+    fp_speed = {"points": 0, "def_sack": 0, "def_int": 0, "def_td": 0, "def_tackle": 0,
+                "def_assist": 0, "def_safety": 0, "def_ff": 0, "def_fr": 0, "def_pd": 0, "def_tlost": 0}
+    s_speed = {"idp_tkl_solo": 33.45, "idp_tkl_ast": 31.58, "idp_tkl_loss": 3.9, "idp_qb_hit": 1.02,
+               "sack": 1.02, "int": 0.0, "idp_pass_def": 2.89, "idp_ff": 0.0, "idp_fum_rec": 0.0, "idp_td": 0.0}
+    speed_proj = compute_new_proj(fp_speed, s_speed, old_proj=999.0)
+    assert abs(speed_proj - 95.43) < 0.1, \
+        (f"expected the real, confirmed correct E.J. Speed value (95.43, matching the 1.02 real sacks "
+         f"and 2.89 real PD from Sleeper being correctly counted since FantasyPros has zero real "
+         f"activity), got {speed_proj:.2f} -- this is exactly the class of bug external review found")
+    print(f"  E.J. Speed regression case (FantasyPros row present but entirely inactive, Sleeper "
+          f"genuinely active): correctly produces {speed_proj:.2f}, matching the real confirmed-correct "
+          f"value -- OK (this is the exact fix for the source-presence-vs-source-activity bug)")
 
     # Non-IDP pass-through: build a tiny synthetic prod_mult_data and confirm
     # QB/RB/WR/TE/K entries are completely untouched, byte-for-byte.
