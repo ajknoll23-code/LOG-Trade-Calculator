@@ -324,9 +324,25 @@ def main():
         # or 1 players back would be worse than a loud failure, since a
         # near-empty result could get committed and treated as real data.
         if len(parsed) < 20:
+            # Save the real raw HTML for debugging, per a real live failure
+            # (2026-08-27): the workflow parsed only 10/50+ QBs on its
+            # first real run. Root cause genuinely unknown -- could be
+            # real JS-loaded pagination (the raw HTML only ever contains
+            # a first "page"), or the real markup differing meaningfully
+            # from the synthetic test HTML this parser was built against
+            # (which was itself reconstructed from web_fetch's markdown
+            # rendering, never the actual raw source -- a real blind spot
+            # in how this was verified). Can't tell which without seeing
+            # the real HTML, which no tool available during development
+            # could show directly. Saving it here so a human (or a future
+            # debugging pass) can actually look, instead of guessing.
+            debug_path = os.path.join(SCRIPT_DIR, f"debug_fantasypros_{position.lower()}_raw.html")
+            with open(debug_path, "w") as f:
+                f.write(html)
             print(f"ERROR: only parsed {len(parsed)} {position} players (expected 50+). "
                   f"FantasyPros likely changed their page structure -- the parser needs "
-                  f"updating, not blind trust in this output.")
+                  f"updating, not blind trust in this output. Saved raw HTML to {debug_path} "
+                  f"for inspection.")
             sys.exit(1)
         for name, stats in parsed.items():
             trade_desk_proj = score_offense(
