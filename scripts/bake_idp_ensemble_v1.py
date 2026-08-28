@@ -2,7 +2,15 @@
 """
 scripts/bake_idp_ensemble_v1.py
 
-Dedicated production-bake script for the validated V1 IDP ensemble.
+LEGACY / DEPRECATED production-bake implementation for the validated V1 IDP ensemble.
+
+IMPORTANT 2026-08-28: this direct bake path is intentionally BLOCKED. The
+repo-level lineage audit proved that prod_mult_pipeline_output.json is not the
+true pre-V1 production baseline. The preferred V1 release candidate now uses
+``idp_v1_model_delta_transport_candidate.py`` to compute the reproducible
+old->V1 model delta and transport only that delta onto the immutable true-live
+baseline. This file is retained for historical/self-test reference only and
+will not write production outputs when invoked.
 Deliberately SEPARATE from idp_ensemble_experiment.py, which stays
 untouched and continues to serve its real purpose -- exploring
 different Stage-1/Stage-2 weight scenarios. This script implements
@@ -199,6 +207,17 @@ def main():
         run_selftest()
         return
 
+    print(
+        "BLOCKED: bake_idp_ensemble_v1.py is the retired direct-bake path. "
+        "It depended on prod_mult_pipeline_output.json, which the lineage audit "
+        "proved is not the true pre-V1 production baseline. No production bake "
+        "is approved from this script. Use idp_v1_model_delta_transport_candidate.py "
+        "and validate_idp_v1_candidates.py for the current V1 candidate workflow."
+    )
+    sys.exit(2)
+
+    # Historical implementation retained below for code archaeology only.
+    # It is intentionally unreachable so an accidental invocation cannot write.
     for path in (PROD_MULT_PATH, FP_PATH, SLEEPER_PATH, CROSSWALK_PATH):
         if not os.path.exists(path):
             print(f"ERROR: need {path} to exist.")

@@ -9,6 +9,7 @@ Run from anywhere:
 """
 
 import json
+import math
 import os
 import re
 import subprocess
@@ -28,6 +29,8 @@ import sync_sleeper
 import dual_eligibility_pipeline
 import team_field_refresh_pipeline
 import idp_v1_projection
+import production_history_component
+import idp_v1_model_delta_transport_candidate
 from generate_player_positions import parse_player_positions, build_player_position_lookup
 
 
@@ -296,6 +299,100 @@ def check_idp_v1_projection_invariants():
         f"{baseline['entry_count']} immutable pre-V1 PROD_MULT entries"
     )
 
+
+
+def check_canonical_history_and_v1_bridge():
+    production_history_component.run_selftest()
+
+    all_players = json.load(open(SCRIPT_DIR / "all_players.json"))
+    ppg_rows = json.load(open(SCRIPT_DIR / "ppg_results.json"))
+    durability = json.load(open(SCRIPT_DIR / "durability_results.json"))
+    regenerated = production_history_component.build_history_output(all_players, ppg_rows, durability)
+    stored = json.load(open(SCRIPT_DIR / "production_history_components.json"))
+    assert regenerated == stored, "production_history_components.json is stale vs canonical generator"
+    assert len(stored["players"]) == len(all_players)
+
+    bridge = idp_v1_model_delta_transport_candidate.build_candidate()
+    players = bridge["players"]
+    assert len(players) == 404, f"unexpected live IDP bridge population: {len(players)}"
+    assert bridge["comparable_player_count"] == 330, bridge["comparable_player_count"]
+    assert sum(bridge["source_cohort_counts"].values()) == len(players)
+
+    # Release-attribution guard: V1 model-delta transport intentionally keeps
+    # the legacy production-position grouping used by the historical lineage.
+    # Current valuation positions are surfaced separately so a future EDGE /
+    # hybrid position migration cannot sneak into this projection-only release.
+    position_mismatches = [
+        key for key, r in players.items()
+        if r.get("legacy_model_position") != r.get("current_valuation_position")
+    ]
+    assert len(position_mismatches) == 46, (
+        "legacy/current position mismatch cohort changed; review whether this is "
+        "a data update or an accidental position-lineage migration",
+        len(position_mismatches),
+    )
+
+    for key, r in players.items():
+        assert math.isfinite(r["candidate_prod_mult"]), key
+        assert 0.15 <= r["candidate_prod_mult"] <= 1.55, key
+        if r["update_status"] == "exact_hold_no_comparable_old_projection":
+            assert r["candidate_prod_mult"] == r["old_live_prod_mult"], key
+
+    # Stable football-sanity anchors for the current frozen source snapshot.
+    assert players["bradley chubb"]["candidate_prod_mult"] > players["bradley chubb"]["old_live_prod_mult"]
+    assert players["myles garrett"]["candidate_prod_mult"] > players["myles garrett"]["old_live_prod_mult"]
+    assert abs(players["fred warner"]["pct_change"]) < 3.0
+    assert players["isaiah mcduffie"]["candidate_prod_mult"] < players["isaiah mcduffie"]["old_live_prod_mult"]
+
+    for pos in ("LB", "DL", "DB"):
+        old_b = bridge["old_model_baseline_by_position"][pos]
+        new_b = bridge["new_model_baseline_by_position"][pos]
+        shift = abs(new_b / old_b - 1)
+        assert shift < 0.10, f"{pos} V1 model baseline shift unexpectedly large: {shift:.1%}"
+
+    print(
+        "PASS canonical history/V1 bridge invariants: "
+        f"{len(stored['players'])} history rows; {len(players)} live IDPs; "
+        f"{bridge['comparable_player_count']} comparable model-delta rows; "
+        f"{len(position_mismatches)} legacy/current position mismatches explicitly isolated"
+    )
+
+
+
+def check_preferred_bake_preview_invariants():
+    patch_path = SCRIPT_DIR / "idp_v1_prod_mult_patch.json"
+    candidate_path = SCRIPT_DIR / "idp_v1_model_delta_transport_candidate.json"
+    baseline_path = SCRIPT_DIR / "prod_mult_pre_v1_baseline.json"
+    assert patch_path.exists() and candidate_path.exists(), "preferred V1 preview artifacts missing"
+
+    patch = json.load(open(patch_path))
+    candidate = json.load(open(candidate_path))
+    baseline = json.load(open(baseline_path))["values"]
+    entries = patch.get("entries", [])
+    assert patch.get("changed_entry_count") == len(entries)
+    assert patch.get("candidate_player_count") == len(candidate["players"])
+
+    seen = set()
+    for e in entries:
+        key = e["key"]
+        assert key not in seen, f"duplicate preferred-bake patch key: {key}"
+        seen.add(key)
+        assert key in baseline, key
+        assert key in candidate["players"], key
+        assert abs(float(e["old"]) - float(baseline[key])) < 1e-12, key
+        assert abs(float(e["new"]) - float(candidate["players"][key]["candidate_prod_mult"])) < 1e-12, key
+        assert e["pos"] in {"LB", "DL", "DB"}, key
+
+    for key, r in candidate["players"].items():
+        if r["candidate_prod_mult"] == r["old_live_prod_mult"]:
+            assert key not in seen, f"exact hold unexpectedly present in bake patch: {key}"
+
+    assert len(entries) == 324, f"unexpected preferred-bake change count: {len(entries)}"
+    print(
+        f"PASS preferred V1 bake-preview invariants: {len(entries)} changed PROD_MULT entries, "
+        f"{len(candidate['players'])-len(entries)} exact holds"
+    )
+
 def check_index_js_syntax():
     text = INDEX.read_text(encoding="utf-8")
     scripts = re.findall(r"<script[^>]*>(.*?)</script>", text, re.S | re.I)
@@ -317,6 +414,8 @@ def main():
         check_team_identity,
         check_aliases_and_ktc_positions,
         check_idp_v1_projection_invariants,
+        check_canonical_history_and_v1_bridge,
+        check_preferred_bake_preview_invariants,
         check_index_js_syntax,
     ]
     for check in checks:

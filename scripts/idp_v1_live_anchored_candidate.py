@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Build a diagnostic IDP V1 candidate anchored to the actually baked live prod_mult table.
+"""SUPERSEDED historical diagnostic: live-anchored V1 candidate.
+
+This script was useful during lineage diagnosis, but it depends on
+``prod_mult_pipeline_output.json`` and is NOT part of the current production
+candidate path. The preferred reproducible bridge is now
+``idp_v1_model_delta_transport_candidate.py``. Direct execution is blocked
+unless ``--legacy-diagnostic`` is supplied explicitly.
+
 
 Why this exists
 ---------------
@@ -284,7 +291,7 @@ def build_report(candidate, low_scale, high_scale):
         "",
         "## Status",
         "",
-        "**Diagnostic candidate only. This does not edit `index.html`.**",
+        "**SUPERSEDED historical diagnostic only. This does not edit `index.html`.**",
         "",
         "The candidate anchors to the actual baked pre-V1 `prod_mult` values and applies only the V1-vs-legacy projection delta on the established 55% projection share. This avoids importing unrelated drift from the legacy history generator into the user-visible before/after comparison.",
         "",
@@ -361,7 +368,21 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", default=OUTPUT_PATH)
     parser.add_argument("--report", default=REPORT_PATH)
+    parser.add_argument(
+        "--legacy-diagnostic",
+        action="store_true",
+        help="explicitly run the superseded diagnostic that requires prod_mult_pipeline_output.json",
+    )
     args = parser.parse_args()
+
+    if not args.legacy_diagnostic:
+        print(
+            "BLOCKED: idp_v1_live_anchored_candidate.py is superseded and depends on "
+            "non-canonical prod_mult_pipeline_output.json. Use "
+            "idp_v1_model_delta_transport_candidate.py for the current V1 path. "
+            "Pass --legacy-diagnostic only for historical reproduction."
+        )
+        raise SystemExit(2)
 
     candidate = build_candidate(1.0)
     low = build_candidate(0.9)

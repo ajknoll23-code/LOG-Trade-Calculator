@@ -1,5 +1,14 @@
 """
-prod_mult_pipeline.py -- reconstructs PROD_MULT_DATA from real source inputs.
+prod_mult_pipeline.py -- LEGACY reconstruction of the historical PROD_MULT pipeline.
+
+STATUS 2026-08-28: diagnostic/reference only. A repo-level lineage audit proved
+that this generator does not reproduce the actual pre-V1 baked PROD_MULT table,
+and its 2026 projection side still uses the retired manual FantasyPros + Sleeper
+final-points blend. It remains useful for historical reconstruction and for the
+reusable history-side math, which now delegates to
+production_history_component.py, but its absolute prod_mult output is NOT the
+current production source of truth and must not be baked directly into
+index.html.
 
 WHY THIS EXISTS: PROD_MULT_DATA (baked into index.html, 847 static entries)
 has never had a callable script that produces it from raw inputs. Four
@@ -91,7 +100,7 @@ Reads the four JSON inputs from the same directory as this script.
 import json
 import os
 import re
-import statistics
+from production_history_component import derive_history_constants, compute_history_for_player
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -147,74 +156,6 @@ def load_json(fname):
         return json.load(f)
 
 
-def compute_shrinkage_k(ppg_rows):
-    """k[pos] = sigma^2_within / sigma^2_between, computed per position from
-    real weekly_points. This is the exact derivation DeepSeek's and Gemini's
-    reviews both specified, and the one ppg_pipeline.py's own 2026-08-19
-    comment says was the whole reason weekly_points was added to that
-    file's output in the first place.
-
-    sigma^2_within: pooled within-player variance of weekly scores (only
-    players with >=2 scored weeks contribute -- a single-week player gives
-    no within-player variance estimate).
-    sigma^2_between: variance of players' own true_ppg (season means)
-    within the position, using all players at that position regardless of
-    weeks played.
-    """
-    by_pos = {}
-    for r in ppg_rows:
-        by_pos.setdefault(r["pos"], []).append(r)
-
-    k_by_pos = {}
-    for pos, rows in by_pos.items():
-        # sigma^2_between: sample variance of true_ppg across all players
-        # at this position.
-        means = [r["true_ppg"] for r in rows]
-        if len(means) < 2:
-            k_by_pos[pos] = None
-            continue
-        var_between = statistics.variance(means)
-
-        # sigma^2_within: pooled sample variance of weekly_points within
-        # each player, pooled across players (sum of squared deviations
-        # from each player's own mean, divided by total degrees of freedom).
-        ss_within = 0.0
-        df_within = 0
-        for r in rows:
-            weeks = r.get("weekly_points") or []
-            if len(weeks) < 2:
-                continue
-            player_mean = sum(weeks) / len(weeks)
-            ss_within += sum((w - player_mean) ** 2 for w in weeks)
-            df_within += len(weeks) - 1
-
-        if df_within == 0 or var_between == 0:
-            k_by_pos[pos] = None
-            continue
-        var_within = ss_within / df_within
-        k_by_pos[pos] = var_within / var_between
-
-    return k_by_pos
-
-
-def compute_position_mean_ppg(ppg_rows):
-    by_pos = {}
-    for r in ppg_rows:
-        by_pos.setdefault(r["pos"], []).append(r["true_ppg"])
-    return {pos: sum(vals) / len(vals) for pos, vals in by_pos.items()}
-
-
-def compute_position_median_availability(ppg_rows):
-    """Real 2025 games-played fraction, median per position -- matches
-    durability_pipeline.py's own availability definition
-    (games_played / SEASON_MAX_GAMES)."""
-    by_pos = {}
-    for r in ppg_rows:
-        avail = min(1.0, r["games_played"] / SEASON_LENGTH_2025)
-        by_pos.setdefault(r["pos"], []).append(avail)
-    return {pos: statistics.median(vals) for pos, vals in by_pos.items()}
-
-
 def main():
     ppg_rows = load_json("ppg_results.json")
     sleeper_2026 = load_json("sleeper_2026_projections.json")
@@ -223,14 +164,14 @@ def main():
     aliases = load_aliases()
 
     # ---- Step 1: real per-position constants derived from real data ----
-    k_by_pos = compute_shrinkage_k(ppg_rows)
-    pos_mean_ppg = compute_position_mean_ppg(ppg_rows)
-    pos_median_avail = compute_position_median_availability(ppg_rows)
-
-    own_weight_by_pos = {}
-    for pos in TRACKED_POSITIONS:
-        r2 = durability.get(pos, {}).get("r_squared")
-        own_weight_by_pos[pos] = max(0.0, min(1.0, r2)) if r2 is not None else 0.0
+    # Canonicalized 2026-08-28: the history-side math now lives in
+    # production_history_component.py so the legacy generator and the new V1
+    # path cannot silently drift on shrinkage/durability calculations.
+    history_constants = derive_history_constants(ppg_rows, durability)
+    k_by_pos = history_constants.shrinkage_k_by_position
+    pos_mean_ppg = history_constants.position_mean_ppg
+    pos_median_avail = history_constants.position_median_availability_2025
+    own_weight_by_pos = history_constants.own_weight_durability_by_position
 
     # ---- Step 2: build a unified player universe, keyed by resolved name
     # (falls back to sleeper_id as a secondary check where both exist, to
@@ -294,41 +235,24 @@ def main():
         if pos not in TRACKED_POSITIONS:
             continue
 
-        n = rec["games_played_2025"] or 0
-        true_ppg = rec["true_ppg"]
-        k = k_by_pos.get(pos)
-        posmean = pos_mean_ppg.get(pos)
-
-        if true_ppg is not None and k is not None and posmean is not None:
-            shrunk_ppg = (n * true_ppg + k * posmean) / (n + k)
-            shrinkage_note = "real"
-        elif posmean is not None:
-            # No real 2025 data at all (true rookie / zero-snap player) --
-            # full shrinkage to position mean, which the shrinkage formula
-            # produces automatically at n=0 but is made explicit here for
-            # players who never appear in ppg_results.json in the first
-            # place (n implicitly 0, true_ppg unknown rather than literally
-            # zero).
-            shrunk_ppg = posmean
-            shrinkage_note = "no_2025_data_full_shrink_to_position_mean"
-        else:
-            shrunk_ppg = None
-            shrinkage_note = "no_position_mean_available"
-
-        has_own_history = rec["true_ppg"] is not None
-        own_weight = own_weight_by_pos.get(pos, 0.0) if has_own_history else 0.0
-        own_avail = min(1.0, n / SEASON_LENGTH_2025) if has_own_history else None
-        med_avail = pos_median_avail.get(pos)
-
-        if med_avail is not None:
-            if has_own_history and own_avail is not None:
-                durability_avail = own_weight * own_avail + (1 - own_weight) * med_avail
-            else:
-                durability_avail = med_avail
-            durability_games = durability_avail * SEASON_LENGTH_2026
-        else:
-            durability_avail = None
-            durability_games = None
+        history_ppg_row = None
+        if rec["true_ppg"] is not None:
+            history_ppg_row = {
+                "games_played": rec["games_played_2025"] or 0,
+                "true_ppg": rec["true_ppg"],
+            }
+        history = compute_history_for_player(pos, history_ppg_row, history_constants)
+        n = history["games_played_2025"]
+        true_ppg = history["true_ppg_2025"]
+        k = history["shrinkage_k_used"]
+        posmean = history["position_mean_ppg"]
+        shrunk_ppg = history["shrunk_ppg"]
+        shrinkage_note = history["shrinkage_note"]
+        own_weight = history["own_weight_durability"]
+        own_avail = history["own_avail_2025"]
+        med_avail = history["position_median_avail_2025"]
+        durability_avail = history["durability_projected_avail_2026"]
+        durability_games = history["durability_projected_games_2026"]
 
         sleeper_proj = rec["sleeper_2026_proj_total"]
         fp_proj = rec["fantasypros_2026_proj"]
@@ -345,12 +269,18 @@ def main():
             proj_2026 = None
             proj_source = "no_projection_available"
 
-        if shrunk_ppg is not None and durability_games is not None and proj_2026 is not None:
-            history_component = shrunk_ppg * durability_games
+        # Preserve the legacy output contract exactly: historically the
+        # generated JSON exposed history_component only when a 2026 projection
+        # also existed, even though the canonical history module can compute
+        # the history side independently. The new canonical history output is
+        # where standalone history lineage now lives.
+        raw_history_component = history["history_component"]
+        if raw_history_component is not None and proj_2026 is not None:
+            history_component = raw_history_component
             combined = 0.45 * history_component + 0.55 * proj_2026
         else:
-            combined = None
             history_component = None
+            combined = None
 
         audit[key] = {
             "player": rec["display_name"],

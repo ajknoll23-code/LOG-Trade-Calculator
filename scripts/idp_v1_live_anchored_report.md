@@ -2,7 +2,7 @@
 
 ## Status
 
-**Diagnostic candidate only. This does not edit `index.html`.**
+**SUPERSEDED historical diagnostic only. This does not edit `index.html`.**
 
 The candidate anchors to the actual baked pre-V1 `prod_mult` values and applies only the V1-vs-legacy projection delta on the established 55% projection share. This avoids importing unrelated drift from the legacy history generator into the user-visible before/after comparison.
 
