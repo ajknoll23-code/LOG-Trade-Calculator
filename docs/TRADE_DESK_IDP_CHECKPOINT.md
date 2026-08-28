@@ -48,6 +48,32 @@ Full-range median swing: **LB ≈44 pts, DB ≈38 pts, DL ≈27 pts.** Individua
 2. Compute median, 25th/75th percentile, top-12/24/36 median for each real season, and for both sources' 2026 projected distributions.
 3. Require agreement across (a) both real seasons, (b) multiple quantiles not just the median, and (c) before concluding one global calibration -- check whether LB/DL/DB actually behave differently (the sweep proved different *leverage* by position, not different *accuracy*; don't assume Case E -- distribution-shape-dependent error -- without evidence).
 4. **Key open architectural question, possibly bigger than the weight itself**: total-tackle rank agreement between sources is already fairly strong (LB Spearman ≈0.81, DL ≈0.69, DB ≈0.78) while absolute scale disagrees sharply. That pattern suggests the real fix might not be a blend weight at all -- it might be **source-specific positional rescaling** (calibrate each source's absolute scale to match real historical distributions first, then blend the rescaled values) rather than trying to make one blend weight solve both a scale problem and a trust-weighting problem simultaneously. Test this explicitly before assuming a simple weight is sufficient.
+
+**STATUS CHANGE: Stage-1 optimal-weight research moved to BACKLOG, not blocking.** Per external review: continued hand-calibration risked becoming an open-ended research project instead of actually testing whether the new architecture helps. V1 uses the defensible neutral assumption (Stage 1 = 50/50) and moves directly to the real product question below. The matched-player reversal (n=7, Section immediately above) is preserved as a real, promising lead for future validation -- not discarded, just not blocking.
+
+## C.1. REAL PROD_MULT SENSITIVITY TEST -- RUN END-TO-END, RESULT IS CLEAN AND SENSIBLE
+Using the neutral V1 assumptions (Stage 1 = 50/50, Stage 2 = 60/40 Sleeper, TFL/QB-hits = Sleeper-only, other shared categories = 50/50 consensus, single-source players use their one real source directly), computed a new `proj_2026` for all 477 real LB/DL/DB players with 2025 game history (15 players excluded -- no history_component, matching the real formula's own existing null-handling, not a new gap). Fed through the REAL `combined`/`baseline`/`ratio`/`prod_mult` formula from `prod_mult_pipeline.py`, holding `shrunk_ppg` and `durability_projected_games_2026` identical to the real existing values -- a faithful "swap just the IDP input" test, not an approximation.
+
+**Real baselines shift modestly** (LB +3.7%, DL +4.8%, DB +3.8% -- the new formula captures real value, like TFL/QB-hits, that was previously undercounted for many players, raising the whole distribution before the ratio-based system partially renormalizes it back out).
+
+**Real prod_mult % change by position:**
+| Position | N | Median | P90 | P95 | Max | Min |
+|---|---|---|---|---|---|---|
+| LB | 124 | -0.9% | +9.3% | +14.6% | +36.5% | -21.3% |
+| DL | 169 | +1.3% | +8.3% | +10.4% | +17.8% | -12.4% |
+| DB | 184 | +0.4% | +12.9% | +16.9% | +32.9% | -22.1% |
+
+**Median impact is small and reassuring -- the new ensemble does not produce chaos under neutral assumptions.** A real, meaningful tail exists (up to +36.5%), showing the ensemble is doing something real, not just noise.
+
+**Real, football-sensible spot checks:**
+- Bradley Chubb (LB, real known EDGE defender): **+36.5%, the single biggest riser** -- exactly the profile expected to benefit most from the new TFL/QB-hit coverage FantasyPros structurally lacks.
+- Aidan Hutchinson (+5.5%), Myles Garrett (+5.1%) -- elite real pass-rushers, modest sensible gains.
+- Fred Warner (-0.7%), Roquan Smith (-1.6%) -- elite real off-ball tacklers, value already well-captured by both old and new systems, appropriately near-flat.
+- Fallers (Christian Izien -22.1%, Isaiah McDuffie -21.3%, etc.) are concentrated in deep/depth players, not star dynasty assets -- no disruption of elite-tier valuations.
+
+**Conclusion: the new category-level ensemble passes the real sensitivity check.** Values move sensibly, in football-plausible directions, concentrated where the architecture predicts they should (pass-rushers gain from TFL/QB-hit coverage, off-ball tacklers stay flat), without wild instability at the median. This is the real answer to "did all this work make the trade calculator better" -- provisionally yes, pending the still-open Section D (missing-source policy) and a full review of the complete riser/faller lists before considering a production bake.
+
+
 5. If historical evidence does support different LB/DL/DB weights, prefer shrinking toward neutral 0.5 over shipping an aggressively-fit position-specific number from a thin sample -- e.g. if a thin calibration implies 0.28 for LB, a more conservative production candidate is likely closer to 0.40, not 0.28, unless the evidence is deep and stable.
 
 ## D. P1 -- MISSING-SOURCE POLICY (depends on Stage-1 calibration, don't solve independently first)
