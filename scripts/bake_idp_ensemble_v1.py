@@ -39,6 +39,8 @@ import json
 import os
 import sys
 
+from idp_v1_projection import compute_v1_projection
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROD_MULT_PATH = os.path.join(SCRIPT_DIR, "prod_mult_pipeline_output.json")
 FP_PATH = os.path.join(SCRIPT_DIR, "fantasypros_api_normalized_2026.json")
@@ -46,76 +48,18 @@ SLEEPER_PATH = os.path.join(SCRIPT_DIR, "sleeper_2026_idp_only.json")
 CROSSWALK_PATH = os.path.join(SCRIPT_DIR, "identity_crosswalk.json")
 REPORT_PATH = os.path.join(SCRIPT_DIR, "idp_bake_report.md")
 
-STAGE1_FP_WEIGHT = 0.5
-STAGE2_FP_WEIGHT = 0.4
 IDP_POSITIONS = ("LB", "DL", "DB")
 REPLACEMENT_RANK = 32  # matches the established DL32/LB32/DB32 convention
 
 
-def score_other_categories(fp_stats, s_stats, both_active, fp_active, s_active):
-    """
-    BUG FIX, confirmed by external review with a real, exact case (E.J.
-    Speed: FantasyPros row exists but is entirely zero -- a real,
-    inactive placeholder row, not a missing one -- while Sleeper has
-    real, active production: 1.02 sacks, 2.89 PD). The original
-    single-source branch checked `if fp_stats` (does a stats OBJECT
-    exist at all) instead of `if fp_active` (does that source have real,
-    nonzero production) -- so a present-but-inactive FantasyPros row
-    incorrectly won every category, discarding Sleeper's real, active
-    numbers. Verified this reproduces exactly: buggy result 83.70,
-    correct result 95.43, an 11.73-point real error for this one player
-    alone -- and since ANY player with an inactive-but-present source on
-    either side hits this same bug, it wasn't isolated to E.J. Speed.
-    Source PRESENCE must never be used as a proxy for source ACTIVITY.
-    """
-    def consensus(fp_val, s_val):
-        if both_active:
-            return 0.5 * (fp_val or 0) + 0.5 * (s_val or 0)
-        if fp_active:
-            return fp_val or 0
-        if s_active:
-            return s_val or 0
-        return 0  # neither source active for this category -- real, honest zero, not a guess
-    fp = fp_stats or {}
-    s = s_stats or {}
-    pts = 0.0
-    pts += consensus(fp.get('def_sack'), s.get('sack')) * 3.0
-    pts += consensus(fp.get('def_int'), s.get('int')) * 6.0
-    pts += consensus(fp.get('def_pd'), s.get('idp_pass_def')) * 3.0
-    pts += consensus(fp.get('def_ff'), s.get('idp_ff')) * 3.0
-    pts += consensus(fp.get('def_fr'), s.get('idp_fum_rec')) * 4.0
-    pts += consensus(fp.get('def_td'), s.get('idp_td')) * 6.0
-    if s_active:
-        pts += (s.get('idp_tkl_loss', 0) or 0) * 2.0
-        pts += (s.get('idp_qb_hit', 0) or 0) * 2.0
-    return pts
-
-
 def compute_new_proj(fp_stats, s_stats, old_proj):
-    fp_solo = (fp_stats.get('def_tackle', 0) or 0) if fp_stats else 0
-    fp_ast = (fp_stats.get('def_assist', 0) or 0) if fp_stats else 0
-    fp_total = fp_solo + fp_ast
-    s_solo = (s_stats.get('idp_tkl_solo', 0) or 0) if s_stats else 0
-    s_ast = (s_stats.get('idp_tkl_ast', 0) or 0) if s_stats else 0
-    s_total = s_solo + s_ast
-    fp_active = fp_total > 0
-    s_active = s_total > 0
+    """Compatibility wrapper around the canonical V1 projection module.
 
-    if not fp_active and not s_active:
-        return old_proj  # no new real data -- keep existing value, don't guess
-
-    both = fp_active and s_active
-    if both:
-        consensus_total = STAGE1_FP_WEIGHT * fp_total + (1 - STAGE1_FP_WEIGHT) * s_total
-        fp_share = fp_solo / fp_total
-        s_share = s_solo / s_total
-        consensus_share = STAGE2_FP_WEIGHT * fp_share + (1 - STAGE2_FP_WEIGHT) * s_share
-        tackle_pts = consensus_total * consensus_share * 1.5 + consensus_total * (1 - consensus_share) * 0.75
-    elif fp_active:
-        tackle_pts = fp_solo * 1.5 + fp_ast * 0.75
-    else:
-        tackle_pts = s_solo * 1.5 + s_ast * 0.75
-    return tackle_pts + score_other_categories(fp_stats, s_stats, both, fp_active, s_active)
+    Kept as a named function because the bake script's existing self-tests and
+    any external callers already reference it. All real projection math now
+    lives in idp_v1_projection.py so experiments/bakes cannot silently drift.
+    """
+    return compute_v1_projection(fp_stats, s_stats, old_proj)["projection"]
 
 
 def run_bake(prod_mult_data, fp_players, sleeper_players, crosswalk):

@@ -16,6 +16,7 @@ import os
 import time
 import urllib.request
 import urllib.error
+import sys
 
 BASE = "https://api.sleeper.app/v1"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -126,37 +127,31 @@ POS_BUCKET = {
     "QB": "QB", "RB": "RB", "WR": "WR", "TE": "TE",
 }
 
-# Kept in sync manually with POSITION_WEIGHT in trade-desk.html — only the
-# values that matter for picking between DL/LB/DB eligible positions need
-# to be accurate here, not the full set.
-POSITION_WEIGHT = {"QB": 1.30, "RB": 0.89, "WR": 1.00, "TE": 0.82, "DL": 0.81, "LB": 1.17, "DB": 1.00}
-
-
-def pick_best_position(fantasy_positions, fallback_raw_pos):
+def eligible_buckets(fantasy_positions):
+    """Collapse Sleeper eligibility to Trade Desk buckets while preserving
+    Sleeper's original order. The first unique bucket is the canonical
+    primary-position convention used by index.html.
     """
-    Python port of pickBestPosition() in trade-desk.html — MUST stay
-    logically identical, or free_agents.json's position bucketing silently
-    drifts from PLAYER_DB's, breaking the position-verified name-collision
-    check in the free agent board for any dual-eligible player. Found this
-    the hard way 2026-08-14: the first version of this script used only
-    the single raw `position` field, while PLAYER_DB assigns dual DL/LB
-    eligible players (a lot of real EDGE defenders) to whichever bucket
-    currently scores higher — collapsing "real data" matches from 246 down
-    to 4, almost entirely wiping out DL/LB/DB specifically, because that's
-    exactly the class of player this mismatch hits.
-    """
-    if not fantasy_positions:
-        return POS_BUCKET.get(fallback_raw_pos)
     eligible = []
-    for fp in fantasy_positions:
+    for fp in fantasy_positions or []:
         bucket = POS_BUCKET.get(fp)
         if bucket and bucket not in eligible:
             eligible.append(bucket)
+    return eligible
+
+
+def pick_best_position(fantasy_positions, fallback_raw_pos):
+    """Python port of the CURRENT pickBestPosition() rule in index.html.
+
+    For dual-eligible players, Sleeper's first-listed fantasy position wins.
+    We deliberately do NOT choose whichever eligible bucket has the highest
+    Trade Desk POSITION_WEIGHT; that retired rule silently changed valuation
+    position based on economics rather than football eligibility/primacy.
+    """
+    eligible = eligible_buckets(fantasy_positions)
     if not eligible:
         return POS_BUCKET.get(fallback_raw_pos)
-    if len(eligible) == 1:
-        return eligible[0]
-    return max(eligible, key=lambda p: POSITION_WEIGHT.get(p, 0))
+    return eligible[0]
 
 
 def compute_free_agents(pool, rostered_ids):
@@ -187,6 +182,8 @@ def compute_free_agents(pool, rostered_ids):
             "name": name,
             "pos": bucket,
             "raw_position": raw_pos,
+            "fantasy_positions": p.get("fantasy_positions") or [],
+            "eligible_buckets": eligible_buckets(p.get("fantasy_positions")),
             "team": p.get("team"),
             "age": p.get("age"),
             "status": p.get("status"),
@@ -260,7 +257,37 @@ def compute_roster_changes(data_dir, new_rosters):
     return changes
 
 
+def run_selftest():
+    # Order, not economic weight, decides the primary bucket.
+    assert pick_best_position(["DE", "LB"], "DE") == "DL"
+    assert pick_best_position(["LB", "DE"], "DE") == "LB"
+    assert pick_best_position(["CB", "S"], "CB") == "DB"
+    assert pick_best_position([], "DT") == "DL"
+
+    pool = {
+        "1": {
+            "first_name": "Dual", "last_name": "Edge", "team": "ARI",
+            "position": "DE", "fantasy_positions": ["DE", "LB"],
+            "age": 24, "status": "Active", "injury_status": None,
+        },
+        "2": {
+            "first_name": "Rostered", "last_name": "Player", "team": "BUF",
+            "position": "LB", "fantasy_positions": ["LB"],
+        },
+    }
+    rows = compute_free_agents(pool, {"2"})
+    assert len(rows) == 1
+    assert rows[0]["pos"] == "DL"
+    assert rows[0]["fantasy_positions"] == ["DE", "LB"]
+    assert rows[0]["eligible_buckets"] == ["DL", "LB"]
+    print("sync_sleeper self-test passed.")
+
+
 def main():
+    if "--selftest" in sys.argv:
+        run_selftest()
+        return
+
     os.makedirs(DATA_DIR, exist_ok=True)
     config = load_config()
     league_id = config["league_id"]

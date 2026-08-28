@@ -52,6 +52,8 @@ from datetime import datetime
 
 import requests
 
+from generate_player_positions import build_player_position_lookup
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Set this to the published-CSV URL of the "votes" tab after following the
@@ -266,10 +268,13 @@ def build_ratings_summary(rows, pos_lookup, label):
             same_position_pairwise_count[pw] += 1
 
     position_avg_strength = defaultdict(list)
+    unmapped_position_players = []
     for player, strength in strengths.items():
         pos = POS_BUCKET.get(pos_lookup.get(player))
         if pos:
             position_avg_strength[pos].append(strength)
+        else:
+            unmapped_position_players.append(player)
     position_summary = {pos: round(sum(v)/len(v), 4) for pos, v in position_avg_strength.items()}
 
     position_pair_signal = {
@@ -293,6 +298,14 @@ def build_ratings_summary(rows, pos_lookup, label):
         flag = "OK" if info["enough_data"] else "NOT ENOUGH DATA YET"
         print(f"  {pos} vs {pos}: {info['pairwise_observations']} observations -- {flag}")
 
+    if unmapped_position_players:
+        print(
+            f"  NOTE: {len(unmapped_position_players)} rated player(s) have no current canonical "
+            "position lookup and are omitted from position aggregation: "
+            + ", ".join(sorted(unmapped_position_players)[:12])
+            + (" ..." if len(unmapped_position_players) > 12 else "")
+        )
+
     return {
         "votes_counted": len(rows),
         "pairwise_observations": len(pairs),
@@ -300,6 +313,7 @@ def build_ratings_summary(rows, pos_lookup, label):
         "position_avg_rating": position_summary,
         "position_pair_sample_sizes": position_pair_signal,
         "same_position_pairwise_sample_sizes": same_position_signal,
+        "unmapped_position_players": sorted(unmapped_position_players),
     }
 
 
@@ -329,10 +343,26 @@ def main():
     pos_lookup = {}
     pos_lookup_path = os.path.join(SCRIPT_DIR, "player_positions.json")
     if os.path.exists(pos_lookup_path):
-        pos_lookup = json.load(open(pos_lookup_path))
+        with open(pos_lookup_path) as f:
+            pos_lookup = json.load(f)
+        expected_positions = build_player_position_lookup()
+        if pos_lookup != expected_positions:
+            missing = sorted(set(expected_positions) - set(pos_lookup))
+            stale = sorted(set(pos_lookup) - set(expected_positions))
+            changed = sorted(
+                k for k in set(pos_lookup) & set(expected_positions)
+                if pos_lookup[k] != expected_positions[k]
+            )
+            raise RuntimeError(
+                "player_positions.json is stale relative to canonical PLAYER_DB/alias data. "
+                "Run `python3 scripts/generate_player_positions.py` first. "
+                f"missing={len(missing)}, stale={len(stale)}, changed={len(changed)}"
+            )
     else:
-        print("  NOTE: player_positions.json not found -- position-level "
-              "aggregation skipped, only per-player ratings will be output.")
+        raise RuntimeError(
+            "player_positions.json not found. Run "
+            "`python3 scripts/generate_player_positions.py` before KTC aggregation."
+        )
 
     league_only = build_ratings_summary(league_rows, pos_lookup, "League members only")
     all_combined = build_ratings_summary(rows, pos_lookup, "All voters (league + guests)")

@@ -42,7 +42,10 @@ Add --selftest to sanity-check the name-normalization and pool-parsing
 logic against synthetic data before trusting real output.
 
 OUTPUT: scripts/player_team_refresh.json
-  {generated_at, source: "sleeper_live_pool", n_players, teams: {name: team}}
+  {generated_at, source, n_players, teams_by_sleeper_id, teams, name_collisions}
+
+`teams_by_sleeper_id` is canonical. `teams` is a collision-safe normalized-name
+fallback retained for the current manual bake workflow.
 """
 
 import json
@@ -115,15 +118,18 @@ def load_or_fetch_full_pool():
     return pool
 
 
-def extract_team_lookup(pool):
-    """Returns {normalized_name: team_abbr} for every player with a real
-    current team. Players with no current team (free agents, retired,
-    practice-squad-only) are simply omitted -- their PLAYER_DB entry
-    keeps whatever it already had (the existing fallback), which is
-    correct: this script asserts positive fresh facts, it doesn't assert
-    "definitely no team" for anyone."""
-    lookup = {}
+def extract_team_maps(pool):
+    """Build collision-safe team mappings from Sleeper's stable player IDs.
+
+    Primary output is `teams_by_sleeper_id`; names are only a convenience
+    fallback. A normalized name is included in `teams_by_name` ONLY when all
+    active rows carrying that name agree on one team. Ambiguous names are
+    emitted separately in `name_collisions` and are never silently overwritten.
+    """
+    teams_by_sleeper_id = {}
+    name_rows = {}
     skipped_no_team = 0
+
     for pid, p in pool.items():
         team = p.get("team")
         if not team:
@@ -134,28 +140,53 @@ def extract_team_lookup(pool):
         name = (first + " " + last).strip() or p.get("full_name")
         if not name:
             continue
-        lookup[normalize_name(name)] = team
-    print(f"  {len(lookup)} players with a real current team, {skipped_no_team} without one (skipped, not zeroed out).")
-    return lookup
+        key = normalize_name(name)
+        teams_by_sleeper_id[str(pid)] = team
+        name_rows.setdefault(key, []).append({
+            "sleeper_id": str(pid),
+            "team": team,
+            "position": p.get("position"),
+            "fantasy_positions": p.get("fantasy_positions") or [],
+        })
 
+    teams_by_name = {}
+    name_collisions = {}
+    for key, rows in name_rows.items():
+        distinct_teams = sorted({r["team"] for r in rows})
+        if len(rows) == 1 or len(distinct_teams) == 1:
+            # Same-name duplicate rows that all assert the same team are safe
+            # as a team fallback even though identity is still ID-based.
+            teams_by_name[key] = distinct_teams[0]
+        else:
+            name_collisions[key] = rows
+
+    print(
+        f"  {len(teams_by_sleeper_id)} active Sleeper-ID team rows, "
+        f"{len(teams_by_name)} collision-safe name fallbacks, "
+        f"{len(name_collisions)} ambiguous names, "
+        f"{skipped_no_team} without a current team."
+    )
+    return teams_by_sleeper_id, teams_by_name, name_collisions
 
 def run_selftest():
     print("Running self-test on synthetic data...")
 
     synthetic_pool = {
-        "1": {"first_name": "Josh", "last_name": "Allen", "team": "BUF"},
-        "2": {"first_name": "Free", "last_name": "Agent", "team": None},
-        "3": {"first_name": "D'Andre", "last_name": "Swift-Jones", "team": "CHI"},  # tests apostrophe/hyphen normalization
+        "1": {"first_name": "Josh", "last_name": "Allen", "team": "BUF", "position": "QB"},
+        "2": {"first_name": "Free", "last_name": "Agent", "team": None, "position": "WR"},
+        "3": {"first_name": "D'Andre", "last_name": "Swift-Jones", "team": "CHI", "position": "RB"},
+        # Real failure mode: two different active people share the same name.
+        "4": {"first_name": "Byron", "last_name": "Murphy", "team": "MIN", "position": "CB"},
+        "5": {"first_name": "Byron", "last_name": "Murphy", "team": "SEA", "position": "DT"},
     }
-    lookup = extract_team_lookup(synthetic_pool)
-    assert lookup.get("josh allen") == "BUF", f"expected josh allen -> BUF, got {lookup.get('josh allen')}"
-    assert "free agent" not in lookup, "expected a player with no team to be omitted, not zeroed out"
-    assert lookup.get("dandre swiftjones") == "CHI", \
-        f"expected apostrophe/hyphen-stripped normalization to match index.html's convention, got {lookup}"
-    print("  Team extraction and name normalization behave correctly on synthetic data -- OK")
-
+    by_id, by_name, collisions = extract_team_maps(synthetic_pool)
+    assert by_id["1"] == "BUF"
+    assert "2" not in by_id
+    assert by_name.get("dandre swiftjones") == "CHI"
+    assert "byron murphy" not in by_name, "ambiguous name must never be silently overwritten"
+    assert len(collisions["byron murphy"]) == 2
+    print("  Stable-ID mapping and collision-safe name fallback -- OK")
     print("Self-test passed.\n")
-
 
 def main():
     if "--selftest" in sys.argv:
@@ -165,13 +196,17 @@ def main():
     pool = load_or_fetch_full_pool()
     print(f"Full pool size: {len(pool)} players.")
 
-    lookup = extract_team_lookup(pool)
+    teams_by_id, teams_by_name, name_collisions = extract_team_maps(pool)
 
     output = {
         "generated_at": time.time(),
         "source": "sleeper_live_pool",
-        "n_players": len(lookup),
-        "teams": dict(sorted(lookup.items())),
+        "n_players": len(teams_by_id),
+        "teams_by_sleeper_id": dict(sorted(teams_by_id.items())),
+        # Backward-compatible key for the current manual bake workflow, but
+        # now collision-safe rather than last-write-wins.
+        "teams": dict(sorted(teams_by_name.items())),
+        "name_collisions": dict(sorted(name_collisions.items())),
     }
     with open(OUT_PATH, "w") as f:
         json.dump(output, f, indent=2)
