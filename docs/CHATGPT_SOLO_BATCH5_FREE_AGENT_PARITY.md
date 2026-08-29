@@ -259,3 +259,47 @@ FREE-AGENT PRODUCTION LINEAGE / IDP V1 EXTENSION: OPEN
 Reason: **385 currently displayed free agents still derive their production multiplier from the separate `FA_PROD_MULT_DATA` table.** Batch 5 ensures those values are routed into the canonical valuation engine correctly, but it does not claim that the off-roster production table itself has been regenerated under the newly deployed IDP V1 category methodology.
 
 That should be the next independent modeling/data workstream, not silently bundled into frontend parity.
+
+---
+
+## 9. Post-deployment CI stabilization — frozen release vs rolling derived state
+
+The first GitHub runs exposed an important boundary that was not explicit enough in the original Batch 5 regression design.
+
+The manual repo regression workflow is now allowed to normalize only **rolling deterministic derived artifacts** inside the validation runner:
+
+```text
+free-agent-board.html
+scripts/player_positions.json
+data/free_agents.json
+```
+
+It explicitly does **not** regenerate the already-deployed IDP V1 release lineage. Those files are release evidence and are now SHA256-protected by `scripts/idp_v1_release_manifest.json`:
+
+```text
+scripts/production_history_components.json
+scripts/idp_v1_model_delta_transport_candidate.json
+scripts/idp_v1_prod_mult_patch.json
+scripts/prod_mult_pre_v1_baseline.json
+```
+
+Why this matters: source snapshots such as `ppg_results.json` may legitimately be refreshed after deployment. A current source refresh should be surfaced as release-lineage drift, but it must not retroactively rewrite the approved production bake. Regression therefore:
+
+1. hard-fails if a frozen release artifact itself changes;
+2. reports current source/code drift from the release snapshot as INFO;
+3. validates the frozen candidate/patch and deployed `index.html` as the actual release contract.
+
+Fault testing confirmed:
+
+```text
+current PPG snapshot differs from release -> regression stays GREEN and reports drift
+frozen release artifact tampered          -> regression fails hard
+rolling derived files stale               -> manual workflow repairs in runner, then validates
+index.html                                 -> never modified by repair
+```
+
+Active workflow marker:
+
+```text
+TRADE_DESK_REPO_REGRESSION_WORKFLOW=2026-08-29-v3-release-freeze-aware
+```

@@ -758,13 +758,80 @@ The open production-lineage item is intentionally separate: 385 displayed player
 **Total Batch 5 GitHub files to add/update: 13.**
 
 
-## 2026-08-29 — Batch 5 active-workflow path correction
+---
 
-A deployed GitHub run proved the intended self-healing regression workflow was not executing. The log still showed the older `regression` sequence (`free-agent parity -> generate_player_positions.py -> repo_regression_checks.py`) and never executed `refresh_repo_derived_state.py --write`.
+## Batch 5 CI Stabilization — Release-Freeze-Aware Regression (2026-08-29)
 
-Root cause: the project export represents workflows under `github-workflows/`, but GitHub Actions only executes workflow definitions from `.github/workflows/`. The active copy is now explicitly shipped at `.github/workflows/repo-regression-checks.yml`, with a mirrored `github-workflows/repo-regression-checks.yml` retained only for project/export parity.
+### Why the third GitHub run failed
 
-The active workflow now emits marker:
-`TRADE_DESK_REPO_REGRESSION_WORKFLOW=2026-08-29-v2-active-path-self-heal`
+The active `.github/workflows/repo-regression-checks.yml` finally ran the intended self-healing path successfully. It refreshed the rolling derived artifacts (`free-agent-board.html`, `scripts/player_positions.json`, and `data/free_agents.json`) and all free-agent parity checks passed. The next failure was:
 
-Manual runs normalize deterministic derived artifacts in the runner before strict checks. Pull-request runs remain strict/read-only. The normalization is forbidden from changing `index.html`; a final `git diff --exit-code -- index.html` enforces this.
+```text
+AssertionError: production_history_components.json is stale vs canonical generator
+```
+
+This exposed a modeling/release-boundary mistake in the regression suite rather than a free-agent-board defect. `scripts/production_history_components.json` is part of the already-deployed IDP V1 release lineage. It must remain frozen with the approved candidate/patch/baseline. Meanwhile, upstream historical source snapshots such as `ppg_results.json` can legitimately refresh later. General repo maintenance must not silently regenerate a deployed model release because an upstream source file changed.
+
+### Final architecture
+
+Rolling derived artifacts that may self-heal inside a manual validation runner:
+
+```text
+free-agent-board.html
+scripts/player_positions.json
+data/free_agents.json
+```
+
+Frozen IDP V1 release artifacts that must never be rewritten by general repo maintenance:
+
+```text
+scripts/production_history_components.json
+scripts/idp_v1_model_delta_transport_candidate.json
+scripts/idp_v1_prod_mult_patch.json
+scripts/prod_mult_pre_v1_baseline.json
+```
+
+A new `scripts/idp_v1_release_manifest.json` SHA256-protects those frozen release artifacts and records the source/code hashes used when the release was created. If current source/code snapshots later differ, regression reports the drift as INFO while continuing to validate the frozen deployed release. If the frozen release artifact itself changes, regression fails hard.
+
+### Fault tests completed
+
+```text
+Normal clean repo:                                  PASS 11/11
+Historical PPG source intentionally changed:        PASS 11/11 + INFO release drift
+Frozen production_history artifact tampered:        FAIL as designed via release hash guard
+Rolling derived artifacts repaired in runner:       PASS
+IDP V1 deployed patch validation:                   PASS (320 approved changes)
+index.html modified by maintenance:                  NO
+```
+
+### CI marker
+
+The active workflow now prints:
+
+```text
+TRADE_DESK_REPO_REGRESSION_WORKFLOW=2026-08-29-v3-release-freeze-aware
+```
+
+### Files changed/created in this stabilization patch
+
+Modified:
+- `.github/workflows/repo-regression-checks.yml`
+- `github-workflows/repo-regression-checks.yml`
+- `scripts/repo_regression_checks.py`
+- `scripts/refresh_repo_derived_state.py`
+- `docs/CHATGPT_SOLO_CHECKPOINT_2026-08-28.md`
+- `docs/CHATGPT_SOLO_BATCH5_FREE_AGENT_PARITY.md`
+
+Created:
+- `scripts/idp_v1_release_manifest.json`
+
+### Model impact
+
+None.
+
+```text
+index.html: unchanged
+PROD_MULT: unchanged
+IDP V1 weights: unchanged
+free-agent valuation formula: unchanged from Batch 5
+```
