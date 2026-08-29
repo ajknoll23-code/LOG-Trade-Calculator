@@ -52,7 +52,7 @@ def load_aliases(ppg_pipeline_path):
 
 def main():
     index_html = os.path.join(REPO_ROOT, "index.html")     # repo root
-    ppg_pipeline = os.path.join(SCRIPT_DIR, "ppg_pipeline.py")  # same folder (scripts/)
+    ppg_pipeline = os.path.join(os.path.dirname(SCRIPT_DIR), "ppg_pipeline.py")  # same folder (scripts/)
 
     baked = load_prod_mult_keys(index_html)
     aliases = load_aliases(ppg_pipeline)
