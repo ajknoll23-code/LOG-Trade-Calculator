@@ -5,7 +5,7 @@ These checks focus on the drift/correctness problems fixed in the 2026-08-28
 repo audit. They require no network access.
 
 Run from anywhere:
-    python3 scripts/repo_regression_checks.py
+    python3 scripts/validation/repo_regression_checks.py
 """
 
 import hashlib
@@ -137,7 +137,6 @@ def _extract_balanced_statement(text, marker, open_char="{", close_char="}"):
         elif ch == close_char:
             depth -= 1
             if depth == 0:
-                # Include trailing semicolon if present.
                 end = i + 1
                 while end < len(text) and text[end].isspace():
                     end += 1
@@ -249,11 +248,6 @@ def check_position_rules_and_free_agents():
         expected = sync_sleeper.pick_best_position(row.get("fantasy_positions"), row.get("raw_position"))
         assert row.get("pos") == expected, f"free-agent primary-position drift: {row['name']} {row.get('pos')} != {expected}"
 
-    # Clean-checkout reproducibility: committed free_agents.json must be exactly
-    # derivable from the committed Sleeper cache + committed league rosters.
-    # This catches a surprisingly common failure mode where one generated file
-    # refreshes without its dependent waiver-wire snapshot. Compare by stable
-    # Sleeper ID so source iteration order is not a false failure.
     cache_doc = json.load(open(DATA / "players_cache.json"))
     regenerated = sync_sleeper.compute_free_agents(cache_doc["players"], rostered)
     stored_by_id = {str(r["player_id"]): r for r in fa["free_agents"]}
@@ -273,8 +267,6 @@ def check_dual_eligibility_audit():
     rows = json.load(open(SCRIPT_DIR.parent / "dual_eligibility_results.json"))
     assert all("recommended_bucket" not in r for r in rows), "retired economic recommended_bucket still present"
     mismatches = [r for r in rows if r.get("current_position_is_eligible") is False]
-    # Current cache has two unique-name current-position mismatches. Surface;
-    # don't auto-correct because special cases such as two-way players exist.
     names = {r["player"] for r in mismatches}
     assert "james pearce" in names, "known stale-position audit case no longer surfaced"
     assert "travis hunter" in names, "known two-way/manual-review case no longer surfaced"
@@ -290,8 +282,6 @@ def check_team_identity():
     for name in collisions:
         assert name not in by_name, f"ambiguous name leaked into fallback team map: {name}"
 
-    # Exercise the actual live JS team-precedence helper with a deliberately
-    # wrong name fallback to prove stable-ID-resolved p.team wins.
     text = INDEX.read_text(encoding="utf-8")
     helper = _extract_function(text, "resolveSyncedTeam")
     js = (
@@ -316,8 +306,6 @@ def check_aliases_and_ktc_positions():
     for key, pos in canonical.items():
         assert stored.get(key) == pos, f"canonical KTC position missing/wrong: {key}"
 
-    # Historical vote labels that previously displaced canonical rows must now
-    # coexist as compatibility aliases rather than replacing the real key.
     expected_aliases = {
         "c schwesinger": "LB",
         "d ezeiruaku": "DL",
@@ -330,7 +318,7 @@ def check_aliases_and_ktc_positions():
     for alias, pos in expected_aliases.items():
         assert stored.get(alias) == pos, f"KTC legacy alias missing: {alias}"
 
-    ratings_path = SCRIPT_DIR / "ktc_ratings.json"
+    ratings_path = SCRIPT_DIR.parent / "ktc_ratings.json"
     unresolved = set()
     if ratings_path.exists():
         ratings = json.load(open(ratings_path))
@@ -338,16 +326,12 @@ def check_aliases_and_ktc_positions():
             for player in ratings.get(section, {}).get("player_ratings", {}):
                 if player not in stored:
                     unresolved.add(player)
-        # Any unresolved names must not be one of the known aliases we know how
-        # to resolve; they are historical/out-of-PLAYER_DB players and should
-        # be surfaced explicitly by ktc_pipeline rather than silently guessed.
         assert not (unresolved & set(expected_aliases)), unresolved
     print(
         f"PASS alias/KTC position integrity: {len(canonical)} canonical + "
         f"{len(stored)-len(canonical)} compatibility aliases; "
         f"{len(unresolved)} historical/out-of-DB rated names remain explicit"
     )
-
 
 
 def check_idp_v1_projection_invariants():
@@ -364,15 +348,10 @@ def check_idp_v1_projection_invariants():
     )
 
 
-
 def check_canonical_history_and_v1_bridge():
     production_history_component.run_selftest()
     manifest = _validate_idp_v1_release_manifest()
 
-    # The deployed V1 release artifacts are intentionally frozen. Historical
-    # source files (especially ppg_results.json) can be refreshed later by
-    # separate workflows. A source refresh is not permission to silently
-    # rewrite a production release.
     frozen_history = json.load(open(SCRIPT_DIR.parent / "production_history_components.json"))
     assert frozen_history.get("method") == "canonical_history_component_v1_preserve_legacy_math"
     assert len(frozen_history.get("players", {})) == 858
@@ -384,24 +363,18 @@ def check_canonical_history_and_v1_bridge():
     lineage_drift = _release_lineage_drift(manifest)
 
     if lineage_drift:
-        # Expected post-release behavior: current source/code snapshots may
-        # move. Keep the deployed release frozen and surface the drift clearly.
         print(
             "INFO IDP V1 release lineage snapshot differs from current repo inputs; "
             "frozen deployed artifacts intentionally preserved. Changed: "
             + ", ".join(lineage_drift)
         )
     else:
-        # If every release input/code file is still byte-identical, then the
-        # canonical generator must reproduce the frozen artifact exactly.
         assert regenerated_now == frozen_history, (
             "IDP V1 history generator no longer reproduces the frozen release "
             "despite identical release source/code snapshots"
         )
 
-    # Validate the *approved frozen release candidate*, not a newly regenerated
-    # candidate built from mutable current league/source data.
-    bridge = json.load(open(SCRIPT_DIR / "idp_v1_model_delta_transport_candidate.json"))
+    bridge = json.load(open(SCRIPT_DIR.parent / "idp_v1_model_delta_transport_candidate.json"))
     players = bridge["players"]
     assert len(players) == 404, f"unexpected frozen IDP bridge population: {len(players)}"
     assert bridge["comparable_player_count"] == 330, bridge["comparable_player_count"]
@@ -442,11 +415,10 @@ def check_canonical_history_and_v1_bridge():
     )
 
 
-
 def check_preferred_bake_preview_invariants():
-    patch_path = SCRIPT_DIR / "idp_v1_prod_mult_patch.json"
-    candidate_path = SCRIPT_DIR / "idp_v1_model_delta_transport_candidate.json"
-    baseline_path = SCRIPT_DIR / "prod_mult_pre_v1_baseline.json"
+    patch_path = SCRIPT_DIR.parent / "idp_v1_prod_mult_patch.json"
+    candidate_path = SCRIPT_DIR.parent / "idp_v1_model_delta_transport_candidate.json"
+    baseline_path = SCRIPT_DIR.parent / "prod_mult_pre_v1_baseline.json"
     assert patch_path.exists() and candidate_path.exists(), "preferred V1 preview artifacts missing"
 
     patch = json.load(open(patch_path))
@@ -498,6 +470,7 @@ def check_deployed_idp_v1_invariants():
         f"{result['exact_hold_candidate_count']} exact holds; "
         f"{result['non_idp_final_value_changes']} offense value changes"
     )
+
 
 def check_free_agent_board_parity():
     result = validate_free_agent_valuation_parity.validate()
