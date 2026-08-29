@@ -270,7 +270,7 @@ def check_position_rules_and_free_agents():
 
 
 def check_dual_eligibility_audit():
-    rows = json.load(open(SCRIPT_DIR / "dual_eligibility_results.json"))
+    rows = json.load(open(SCRIPT_DIR.parent / "dual_eligibility_results.json"))
     assert all("recommended_bucket" not in r for r in rows), "retired economic recommended_bucket still present"
     mismatches = [r for r in rows if r.get("current_position_is_eligible") is False]
     # Current cache has two unique-name current-position mismatches. Surface;
