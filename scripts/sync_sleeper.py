@@ -26,6 +26,34 @@ CONFIG_PATH = os.path.join(ROOT, "config.json")
 
 PLAYERS_CACHE_MAX_AGE_SECONDS = 20 * 60 * 60  # 20 hours
 
+# Sleeper occasionally carries obviously corrupt DOB/age rows in its global
+# player dump. Keep overrides stable-ID based and explicit rather than guessing
+# from names. Anquin Barnes Jr. (NYG, Sleeper 13869) is age 23 for the 2026
+# season; Sleeper currently reports age 3 / birth_date 2022-10-21.
+PLAYER_AGE_OVERRIDES = {
+    "13869": 23,
+}
+
+
+def safe_player_age(player_id, player):
+    """Return a plausible age, an explicit stable-ID override, or None.
+
+    None is allowed for genuinely missing age data and lets the UI use its
+    documented fallback. A non-null but implausible source age is treated as
+    corrupt rather than trusted.
+    """
+    pid = str(player_id)
+    if pid in PLAYER_AGE_OVERRIDES:
+        return PLAYER_AGE_OVERRIDES[pid]
+    age = player.get("age")
+    if age is None:
+        return None
+    try:
+        age = int(age)
+    except (TypeError, ValueError):
+        return None
+    return age if 18 <= age <= 45 else None
+
 
 def load_config():
     with open(CONFIG_PATH) as f:
@@ -97,7 +125,7 @@ def build_players_index(needed_ids, pool):
             "position": p.get("position"),
             "fantasy_positions": p.get("fantasy_positions") or [],
             "team": p.get("team"),
-            "age": p.get("age"),
+            "age": safe_player_age(pid, p),
             "status": p.get("status"),
             "injury_status": p.get("injury_status"),
         }
@@ -170,6 +198,19 @@ def compute_free_agents(pool, rostered_ids):
             continue
         if not p.get("team"):
             continue
+        # Sleeper's global dump contains legacy/duplicate rows that can still
+        # retain a team/status even when explicitly marked inactive. These are
+        # not current waiver-wire players and previously leaked names such as
+        # Dwayne Haskins, Keith Butler, and several "Duplicate Player" rows
+        # into the free-agent board.
+        if p.get("active") is False:
+            continue
+        age = safe_player_age(pid, p)
+        # Missing age is common for legitimate rookies and remains allowed; an
+        # explicitly present but impossible age is a source-data corruption.
+        # Exclude it unless a stable-ID override above has been verified.
+        if p.get("age") is not None and age is None:
+            continue
         raw_pos = p.get("position")
         bucket = pick_best_position(p.get("fantasy_positions"), raw_pos)
         if not bucket:
@@ -185,7 +226,7 @@ def compute_free_agents(pool, rostered_ids):
             "fantasy_positions": p.get("fantasy_positions") or [],
             "eligible_buckets": eligible_buckets(p.get("fantasy_positions")),
             "team": p.get("team"),
-            "age": p.get("age"),
+            "age": age,
             "status": p.get("status"),
             "injury_status": p.get("injury_status"),
         })
@@ -268,18 +309,42 @@ def run_selftest():
         "1": {
             "first_name": "Dual", "last_name": "Edge", "team": "ARI",
             "position": "DE", "fantasy_positions": ["DE", "LB"],
-            "age": 24, "status": "Active", "injury_status": None,
+            "age": 24, "status": "Active", "active": True, "injury_status": None,
         },
         "2": {
             "first_name": "Rostered", "last_name": "Player", "team": "BUF",
+            "position": "LB", "fantasy_positions": ["LB"], "active": True,
+        },
+        "3": {
+            "first_name": "Legacy", "last_name": "Ghost", "team": "SEA",
             "position": "LB", "fantasy_positions": ["LB"],
+            "age": 62, "status": "Active", "active": False,
+        },
+        "4": {
+            "first_name": "Bad", "last_name": "Age", "team": "HOU",
+            "position": "S", "fantasy_positions": ["DB"],
+            "age": 52, "status": "Active", "active": True,
+        },
+        "13869": {
+            "first_name": "Anquin", "last_name": "Barnes", "team": "NYG",
+            "position": "DT", "fantasy_positions": ["DL"],
+            "age": 3, "status": "Active", "active": True,
+        },
+        "5": {
+            "first_name": "Unknown", "last_name": "Age", "team": "GB",
+            "position": "WR", "fantasy_positions": ["WR"],
+            "age": None, "status": "Active", "active": True,
         },
     }
     rows = compute_free_agents(pool, {"2"})
-    assert len(rows) == 1
-    assert rows[0]["pos"] == "DL"
-    assert rows[0]["fantasy_positions"] == ["DE", "LB"]
-    assert rows[0]["eligible_buckets"] == ["DL", "LB"]
+    by_id = {r["player_id"]: r for r in rows}
+    assert set(by_id) == {"1", "13869", "5"}, by_id
+    assert by_id["1"]["pos"] == "DL"
+    assert by_id["1"]["fantasy_positions"] == ["DE", "LB"]
+    assert by_id["1"]["eligible_buckets"] == ["DL", "LB"]
+    assert by_id["13869"]["age"] == 23
+    assert by_id["5"]["age"] is None
+    assert safe_player_age("4", pool["4"]) is None
     print("sync_sleeper self-test passed.")
 
 

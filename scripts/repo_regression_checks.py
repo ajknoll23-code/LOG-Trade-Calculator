@@ -32,6 +32,7 @@ import idp_v1_projection
 import production_history_component
 import idp_v1_model_delta_transport_candidate
 import validate_idp_v1_final_deployment
+import validate_free_agent_valuation_parity
 from generate_player_positions import parse_player_positions, build_player_position_lookup
 
 
@@ -203,7 +204,25 @@ def check_position_rules_and_free_agents():
         assert "fantasy_positions" in row, f"missing fantasy_positions: {row['name']}"
         expected = sync_sleeper.pick_best_position(row.get("fantasy_positions"), row.get("raw_position"))
         assert row.get("pos") == expected, f"free-agent primary-position drift: {row['name']} {row.get('pos')} != {expected}"
-    print(f"PASS position/free-agent invariants: {len(seen)} free agents, 0 roster overlap")
+
+    # Clean-checkout reproducibility: committed free_agents.json must be exactly
+    # derivable from the committed Sleeper cache + committed league rosters.
+    # This catches a surprisingly common failure mode where one generated file
+    # refreshes without its dependent waiver-wire snapshot. Compare by stable
+    # Sleeper ID so source iteration order is not a false failure.
+    cache_doc = json.load(open(DATA / "players_cache.json"))
+    regenerated = sync_sleeper.compute_free_agents(cache_doc["players"], rostered)
+    stored_by_id = {str(r["player_id"]): r for r in fa["free_agents"]}
+    regenerated_by_id = {str(r["player_id"]): r for r in regenerated}
+    assert fa.get("count") == len(stored_by_id), "free_agents.json count metadata is stale"
+    assert stored_by_id == regenerated_by_id, (
+        "free_agents.json is stale relative to committed players_cache.json / "
+        "league_rosters.json; run the Sleeper sync or regenerate from the cache"
+    )
+    print(
+        f"PASS position/free-agent invariants: {len(seen)} free agents, 0 roster overlap, "
+        "committed cache regeneration exact"
+    )
 
 
 def check_dual_eligibility_audit():
@@ -416,6 +435,22 @@ def check_deployed_idp_v1_invariants():
         f"{result['non_idp_final_value_changes']} offense value changes"
     )
 
+def check_free_agent_board_parity():
+    result = validate_free_agent_valuation_parity.validate()
+    assert result["status"] == "PASS"
+    assert result["canonical_player_values_checked"] == 565
+    assert result["synthetic_cases_checked"] >= 8
+    assert result["fa_source_precedence_cases_checked"] == 1
+    assert result["roster_overlap"] == 0
+    print(
+        "PASS free-agent board valuation parity: "
+        f"{result['canonical_player_values_checked']} canonical values; "
+        f"{result['synthetic_cases_checked']} canonical synthetic branches + "
+        f"{result['fa_source_precedence_cases_checked']} FA source-precedence branch; "
+        f"{result['free_agents_rendered']} rendered free agents"
+    )
+
+
 def check_index_js_syntax():
     text = INDEX.read_text(encoding="utf-8")
     scripts = re.findall(r"<script[^>]*>(.*?)</script>", text, re.S | re.I)
@@ -440,6 +475,7 @@ def main():
         check_canonical_history_and_v1_bridge,
         check_preferred_bake_preview_invariants,
         check_deployed_idp_v1_invariants,
+        check_free_agent_board_parity,
         check_index_js_syntax,
     ]
     for check in checks:
