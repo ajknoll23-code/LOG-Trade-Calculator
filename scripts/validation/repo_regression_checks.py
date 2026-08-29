@@ -311,7 +311,7 @@ def check_aliases_and_ktc_positions():
     subprocess.run([sys.executable, str(SCRIPT_DIR / "check_no_duplicate_prod_mult_keys.py")], cwd=REPO_ROOT, check=True)
     canonical = parse_player_positions(INDEX)
     expected = build_player_position_lookup(INDEX)
-    stored = json.load(open(SCRIPT_DIR / "player_positions.json"))
+    stored = json.load(open(SCRIPT_DIR.parent / "player_positions.json"))
     assert stored == expected, "player_positions.json is stale relative to canonical PLAYER_DB/alias data"
     for key, pos in canonical.items():
         assert stored.get(key) == pos, f"canonical KTC position missing/wrong: {key}"
