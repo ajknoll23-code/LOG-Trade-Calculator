@@ -8,6 +8,7 @@ Run from anywhere:
     python3 scripts/repo_regression_checks.py
 """
 
+import hashlib
 import json
 import math
 import os
@@ -30,10 +31,53 @@ import dual_eligibility_pipeline
 import team_field_refresh_pipeline
 import idp_v1_projection
 import production_history_component
-import idp_v1_model_delta_transport_candidate
 import validate_idp_v1_final_deployment
 import validate_free_agent_valuation_parity
 from generate_player_positions import parse_player_positions, build_player_position_lookup
+
+IDP_V1_RELEASE_MANIFEST = SCRIPT_DIR / "idp_v1_release_manifest.json"
+
+
+def _sha256_file(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _validate_idp_v1_release_manifest():
+    """Protect frozen deployed-release artifacts from silent regeneration.
+
+    The 2026-08-28 IDP V1 bake is a deployed release, not a live view of
+    whatever the latest historical/projection source files happen to contain.
+    General repo maintenance may refresh those source files later. That must
+    not retroactively rewrite the approved candidate/patch/baseline lineage.
+    """
+    assert IDP_V1_RELEASE_MANIFEST.exists(), "missing frozen IDP V1 release manifest"
+    manifest = json.load(open(IDP_V1_RELEASE_MANIFEST, encoding="utf-8"))
+    assert manifest.get("status") == "deployed_validated_frozen"
+    immutable = manifest.get("immutable_release_artifacts") or {}
+    assert immutable, "IDP V1 release manifest has no immutable artifacts"
+    mismatches = []
+    for rel, expected in immutable.items():
+        path = REPO_ROOT / rel
+        if not path.exists():
+            mismatches.append((rel, "missing", expected))
+            continue
+        actual = _sha256_file(path)
+        if actual != expected:
+            mismatches.append((rel, actual, expected))
+    assert not mismatches, f"frozen IDP V1 release artifacts changed: {mismatches[:10]}"
+    return manifest
+
+
+def _release_lineage_drift(manifest):
+    """Return release source/code files whose current bytes differ from release."""
+    changed = []
+    for section in ("release_source_snapshot_sha256", "release_lineage_code_snapshot_sha256"):
+        for rel, expected in (manifest.get(section) or {}).items():
+            path = REPO_ROOT / rel
+            actual = _sha256_file(path) if path.exists() else "missing"
+            if actual != expected:
+                changed.append(rel)
+    return sorted(set(changed))
 
 
 def _extract_balanced_statement(text, marker, open_char="{", close_char="}"):
@@ -323,32 +367,52 @@ def check_idp_v1_projection_invariants():
 
 def check_canonical_history_and_v1_bridge():
     production_history_component.run_selftest()
+    manifest = _validate_idp_v1_release_manifest()
+
+    # The deployed V1 release artifacts are intentionally frozen. Historical
+    # source files (especially ppg_results.json) can be refreshed later by
+    # separate workflows. A source refresh is not permission to silently
+    # rewrite a production release.
+    frozen_history = json.load(open(SCRIPT_DIR / "production_history_components.json"))
+    assert frozen_history.get("method") == "canonical_history_component_v1_preserve_legacy_math"
+    assert len(frozen_history.get("players", {})) == 858
 
     all_players = json.load(open(SCRIPT_DIR / "all_players.json"))
     ppg_rows = json.load(open(SCRIPT_DIR / "ppg_results.json"))
     durability = json.load(open(SCRIPT_DIR / "durability_results.json"))
-    regenerated = production_history_component.build_history_output(all_players, ppg_rows, durability)
-    stored = json.load(open(SCRIPT_DIR / "production_history_components.json"))
-    assert regenerated == stored, "production_history_components.json is stale vs canonical generator"
-    assert len(stored["players"]) == len(all_players)
+    regenerated_now = production_history_component.build_history_output(all_players, ppg_rows, durability)
+    lineage_drift = _release_lineage_drift(manifest)
 
-    bridge = idp_v1_model_delta_transport_candidate.build_candidate()
+    if lineage_drift:
+        # Expected post-release behavior: current source/code snapshots may
+        # move. Keep the deployed release frozen and surface the drift clearly.
+        print(
+            "INFO IDP V1 release lineage snapshot differs from current repo inputs; "
+            "frozen deployed artifacts intentionally preserved. Changed: "
+            + ", ".join(lineage_drift)
+        )
+    else:
+        # If every release input/code file is still byte-identical, then the
+        # canonical generator must reproduce the frozen artifact exactly.
+        assert regenerated_now == frozen_history, (
+            "IDP V1 history generator no longer reproduces the frozen release "
+            "despite identical release source/code snapshots"
+        )
+
+    # Validate the *approved frozen release candidate*, not a newly regenerated
+    # candidate built from mutable current league/source data.
+    bridge = json.load(open(SCRIPT_DIR / "idp_v1_model_delta_transport_candidate.json"))
     players = bridge["players"]
-    assert len(players) == 404, f"unexpected live IDP bridge population: {len(players)}"
+    assert len(players) == 404, f"unexpected frozen IDP bridge population: {len(players)}"
     assert bridge["comparable_player_count"] == 330, bridge["comparable_player_count"]
     assert sum(bridge["source_cohort_counts"].values()) == len(players)
 
-    # Release-attribution guard: V1 model-delta transport intentionally keeps
-    # the legacy production-position grouping used by the historical lineage.
-    # Current valuation positions are surfaced separately so a future EDGE /
-    # hybrid position migration cannot sneak into this projection-only release.
     position_mismatches = [
         key for key, r in players.items()
         if r.get("legacy_model_position") != r.get("current_valuation_position")
     ]
     assert len(position_mismatches) == 46, (
-        "legacy/current position mismatch cohort changed; review whether this is "
-        "a data update or an accidental position-lineage migration",
+        "frozen release legacy/current position mismatch cohort changed",
         len(position_mismatches),
     )
 
@@ -358,7 +422,6 @@ def check_canonical_history_and_v1_bridge():
         if r["update_status"] == "exact_hold_no_comparable_old_projection":
             assert r["candidate_prod_mult"] == r["old_live_prod_mult"], key
 
-    # Stable football-sanity anchors for the current frozen source snapshot.
     assert players["bradley chubb"]["candidate_prod_mult"] > players["bradley chubb"]["old_live_prod_mult"]
     assert players["myles garrett"]["candidate_prod_mult"] > players["myles garrett"]["old_live_prod_mult"]
     assert abs(players["fred warner"]["pct_change"]) < 3.0
@@ -371,10 +434,11 @@ def check_canonical_history_and_v1_bridge():
         assert shift < 0.10, f"{pos} V1 model baseline shift unexpectedly large: {shift:.1%}"
 
     print(
-        "PASS canonical history/V1 bridge invariants: "
-        f"{len(stored['players'])} history rows; {len(players)} live IDPs; "
+        "PASS frozen IDP V1 release/history bridge invariants: "
+        f"{len(frozen_history['players'])} frozen history rows; {len(players)} release IDPs; "
         f"{bridge['comparable_player_count']} comparable model-delta rows; "
-        f"{len(position_mismatches)} legacy/current position mismatches explicitly isolated"
+        f"{len(position_mismatches)} position mismatches isolated; "
+        f"{len(lineage_drift)} current lineage files drifted since release"
     )
 
 

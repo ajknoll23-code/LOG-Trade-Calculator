@@ -9,10 +9,17 @@ Artifacts refreshed:
   * scripts/player_positions.json <- index.html + aliases + players_cache.json
   * data/free_agents.json <- players_cache.json - committed league rosters
 
+Explicitly NOT refreshed here:
+  * deployed/frozen IDP V1 release artifacts such as
+    scripts/production_history_components.json, the approved candidate, patch,
+    and pre-V1 baseline. Those are release evidence, not rolling derived state.
+    Later source refreshes are allowed to diverge without rewriting the release.
+
 The point is to make a manual GitHub Actions validation run self-contained:
 if a generated artifact is stale because files were uploaded out of order or a
-source snapshot changed, the workflow can repair and commit only these derived
-files, then run the strict regression suite in the same job.
+source snapshot changed, the workflow can repair only these derived files inside
+the validation runner, then run the strict regression suite in the same job.
+The read-only regression workflow does not push those repairs back to GitHub.
 
 Pull-request validation should use ``--check`` only; it must not silently repair
 stale files.
