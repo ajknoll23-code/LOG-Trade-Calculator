@@ -35,7 +35,7 @@ import validate_idp_v1_final_deployment
 import validate_free_agent_valuation_parity
 from generate_player_positions import parse_player_positions, build_player_position_lookup
 
-IDP_V1_RELEASE_MANIFEST = SCRIPT_DIR / "idp_v1_release_manifest.json"
+IDP_V1_RELEASE_MANIFEST = SCRIPT_DIR.parent / "idp_v1_release_manifest.json"
 
 
 def _sha256_file(path):
