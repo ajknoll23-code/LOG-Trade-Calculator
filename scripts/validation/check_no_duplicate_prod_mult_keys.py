@@ -10,17 +10,16 @@ until this check was written. This script exists so that class of bug
 cannot silently reappear -- e.g. if a future name/alias correction is added
 to PROD_MULT_DATA without removing the old key first.
 
-USAGE: python3 scripts/check_no_duplicate_prod_mult_keys.py
+USAGE: python3 scripts/validation/check_no_duplicate_prod_mult_keys.py
 Run from anywhere -- paths are resolved relative to this script's own
-location, not the current working directory. Lives in scripts/ alongside
-ppg_pipeline.py (same folder -- ALIASES is loaded from there directly).
-index.html lives one level up, at the repo root, and is located the same
-way -- relative to this script, not to wherever it's invoked from.
+location, not the current working directory. This validation script lives in
+scripts/validation/. ppg_pipeline.py lives in scripts/ and supplies the
+ALIASES table. index.html lives at the repository root.
 
 Exits non-zero (and prints every offending pair) if any abbreviated key in
 ppg_pipeline.py's ALIASES table AND its resolved full-name key are BOTH
 present in PROD_MULT_DATA at the same time. Run this before merging any
-change to PROD_MULT_DATA, or wire into CI.
+change to PROD_MULT_DATA, or keep it wired into CI.
 """
 
 import re
@@ -28,7 +27,7 @@ import sys
 import os
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))  # scripts/ -> repo root, one level up
+REPO_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
 
 
 def load_prod_mult_keys(index_html_path):
@@ -51,8 +50,8 @@ def load_aliases(ppg_pipeline_path):
 
 
 def main():
-    index_html = os.path.join(REPO_ROOT, "index.html")     # repo root
-    ppg_pipeline = os.path.join(os.path.dirname(SCRIPT_DIR), "ppg_pipeline.py")  # same folder (scripts/)
+    index_html = os.path.join(REPO_ROOT, "index.html")
+    ppg_pipeline = os.path.join(os.path.dirname(SCRIPT_DIR), "ppg_pipeline.py")
 
     baked = load_prod_mult_keys(index_html)
     aliases = load_aliases(ppg_pipeline)
