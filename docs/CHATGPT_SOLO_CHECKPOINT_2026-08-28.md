@@ -34,9 +34,10 @@ The previously generated candidate V1-baked `index.html` is **not** treated as f
 ### Still open
 
 - The legacy `prod_mult_pipeline.py` still does **not** reproduce the actual pre-V1 live `PROD_MULT_DATA` table and remains diagnostic only.
-- The preferred first-release V1 migration, **model-delta transport**, has now been applied to the controlled production `index.html` working tree and passed the final true-live deployment audit. It is ready for GitHub upload.
+- IDP V1 model-delta transport is deployed in GitHub and the final read-only deployment workflow is GREEN. The IDP V1 production workstream is closed.
 - A separate historical position-lineage migration remains backlog: 46 live IDP keys have legacy production-position grouping that differs from current canonical valuation position. This is intentionally isolated from V1 rather than silently corrected in the same release.
 - Durability weighting methodology remains backlog and is deliberately unchanged for V1.
+- Free-agent core valuation-engine parity is addressed in Batch 5; the separate off-roster `FA_PROD_MULT_DATA` production lineage remains its own open follow-up workstream.
 
 ## Current Validation Snapshot
 
@@ -460,8 +461,8 @@ Relative to Batch 3, `index.html` changed only inside the production-methodology
 
 ```text
 IDP V1 methodology: CLOSED / VALIDATED
-Model-delta migration: APPLIED / VALIDATED
-Production index.html: READY FOR GITHUB UPLOAD
+Model-delta migration: DEPLOYED / VALIDATED
+Production index.html: DEPLOYED / GITHUB VALIDATION GREEN
 Legacy absolute prod_mult lineage: diagnostic only
 46-player position-lineage migration: BACKLOG
 Durability weighting recalibration: BACKLOG
@@ -652,3 +653,107 @@ final player values: unchanged
 ### Operational change
 
 After this hotfix, `Validate Deployed IDP V1` no longer requires the user to manually run `Sync Sleeper League Data` first merely to refresh `player_positions.json`. The sync workflow still keeps the committed compatibility artifact current for normal repository use, but validation prepares its own deterministic derived copy before regression testing.
+
+---
+
+## ChatGPT Solo Batch 5 — Free-Agent Board Valuation Parity
+
+### Scope
+
+Batch 5 removes `free-agent-board.html` as a stale independent valuation implementation while preserving the current static-page deployment architecture. `index.html` remains the canonical source of truth; a deterministic sync tool copies its valuation regions into the board and CI enforces exact source + runtime parity.
+
+### New defects caught during the thorough pass
+
+1. `data/free_agents.json` contained stale/inactive/duplicate Sleeper rows and one impossible-age ghost record.
+2. Five current free agents had valid `FA_PROD_MULT_DATA`, were labeled `hasRealData=true`, but a `PLAYER_DB` metadata match suppressed the FA production multiplier during actual valuation.
+
+Both are fixed and regression-covered.
+
+### Current Batch 5 runtime state
+
+```text
+Source free agents:       2000
+Rendered after exclusions:1998
+Roster overlap:              0
+
+Production source:
+1599 speculative estimates
+ 385 FA_PROD_MULT_DATA
+  13 canonical PROD_MULT
+   1 canonical metadata / role-only
+
+Rows with actual real production: 398
+```
+
+True Batch 4 -> Batch 5 impact:
+
+```text
+Batch 4 rendered:      2019
+Batch 5 rendered:      1998
+Removed stale rows:      21
+Added:                    0
+Common rows changed:    506
+Common unchanged:      1492
+Median % change among changed common rows: ~+0.6%
+```
+
+`index.html` remains byte-for-byte identical to the deployed Batch 4 production file.
+
+### Batch 5 validation
+
+A clean copied repo was exercised using the actual CI sequence, not just one-off local scripts.
+
+```text
+Canonical board source parity: PASS
+565 canonical JS/Python values: PASS
+8 synthetic canonical branches: PASS
+1 synthetic FA source-precedence branch: PASS
+1998 live-source board rows in Node: PASS
+Committed free_agents regeneration from cache: EXACT
+Repo regression suite: 11/11 PASS
+Deployed IDP V1 validator: PASS (320 approved changes)
+Python compile: 48 / 48 PASS
+JSON parse: 43 / 43 PASS
+YAML parse: 20 / 20 PASS
+index.html JS: PASS
+free-agent-board.html JS: PASS
+Canonical sync write idempotence: BYTE-IDENTICAL
+Second regression after write: 11/11 PASS
+```
+
+### Batch 5 workstream status
+
+```text
+FREE-AGENT CORE VALUATION ENGINE PARITY: CLOSED
+FREE-AGENT CANONICAL METADATA PARITY: CLOSED
+FREE-AGENT SOURCE PRECEDENCE BUG: CLOSED
+FREE-AGENT SOURCE-DATA HYGIENE: CLOSED
+
+FREE-AGENT PRODUCTION LINEAGE / IDP V1 EXTENSION: OPEN
+```
+
+The open production-lineage item is intentionally separate: 385 displayed players use the board-specific `FA_PROD_MULT_DATA` table. Batch 5 now applies that table correctly through the canonical engine, but does not silently claim those off-roster production multipliers were rebuilt under IDP V1.
+
+### Batch 5 files
+
+#### Modified
+
+- `data/free_agents.json`
+- `docs/CHATGPT_SOLO_CHECKPOINT_2026-08-28.md`
+- `free-agent-board.html`
+- `github-workflows/repo-regression-checks.yml`
+- `scripts/repo_regression_checks.py`
+- `scripts/sync_sleeper.py`
+
+#### Created
+
+- `docs/CHATGPT_SOLO_BATCH5_FREE_AGENT_PARITY.md`
+- `scripts/audit_free_agent_board_batch5.py`
+- `scripts/free_agent_board_batch5_impact.json`
+- `scripts/free_agent_board_batch5_impact_report.md`
+- `scripts/free_agent_board_pre_batch5_snapshot.json`
+- `scripts/sync_free_agent_valuation.py`
+- `scripts/validate_free_agent_valuation_parity.py`
+
+**Total Batch 5 GitHub files to add/update: 13.**
+
