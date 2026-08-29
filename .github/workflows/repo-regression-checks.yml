@@ -1,7 +1,11 @@
 name: Repo Regression Checks
 
-# Read-only safety suite for the cross-file invariants fixed in the 2026-08-28
-# repository audit. No generated data is committed from this workflow.
+# IMPORTANT: this is the ACTIVE GitHub Actions copy. GitHub only executes
+# workflow files under .github/workflows/.
+#
+# Manual runs normalize deterministic derived artifacts inside the runner
+# before strict validation. Pull requests stay strict/read-only and fail if
+# committed generated artifacts are stale.
 on:
   workflow_dispatch: {}
   pull_request:
@@ -15,6 +19,9 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+
+      - name: Confirm workflow version
+        run: echo "TRADE_DESK_REPO_REGRESSION_WORKFLOW=2026-08-29-v3-release-freeze-aware"
 
       - uses: actions/setup-python@v5
         with:
@@ -34,15 +41,58 @@ jobs:
           python3 scripts/dual_eligibility_pipeline.py --selftest
           python3 scripts/team_field_refresh_pipeline.py --selftest
           python3 scripts/generate_player_positions.py --selftest
+          python3 scripts/sync_free_agent_valuation.py --selftest
+          python3 scripts/refresh_repo_derived_state.py --selftest
+
+      # Only rolling UI/cache artifacts are normalized. Frozen IDP V1 release
+      # artifacts are hash-protected and intentionally never regenerated here.
+      - name: Normalize deterministic derived artifacts for manual validation
+        if: github.event_name == 'workflow_dispatch'
+        run: python3 scripts/refresh_repo_derived_state.py --write
+
+      - name: Enforce deterministic derived-artifact parity
+        run: python3 scripts/refresh_repo_derived_state.py --check
 
       - name: Validate free-agent canonical valuation sync
         run: |
-          python3 scripts/sync_free_agent_valuation.py --selftest
           python3 scripts/sync_free_agent_valuation.py --check
           python3 scripts/validate_free_agent_valuation_parity.py
 
-      - name: Prepare derived player-position compatibility map
-        run: python3 scripts/generate_player_positions.py
-
       - name: Run repository regression suite
         run: python3 scripts/repo_regression_checks.py
+
+      - name: Validate deployed IDP V1
+        run: python3 scripts/validate_idp_v1_final_deployment.py
+
+      - name: Validate inline JavaScript syntax
+        run: |
+          python3 - <<'PY'
+          import re, pathlib, subprocess, tempfile, os
+          for filename in ('index.html', 'free-agent-board.html'):
+              text = pathlib.Path(filename).read_text(encoding='utf-8')
+              scripts = re.findall(r'<script(?:\s[^>]*)?>(.*?)</script>', text, re.S | re.I)
+              js = '\n'.join(scripts)
+              fd, path = tempfile.mkstemp(suffix='.js')
+              os.close(fd)
+              try:
+                  pathlib.Path(path).write_text(js, encoding='utf-8')
+                  subprocess.run(['node', '--check', path], check=True)
+              finally:
+                  pathlib.Path(path).unlink(missing_ok=True)
+              print(f'PASS {filename} inline JavaScript syntax')
+          PY
+
+      - name: Verify production index was not modified by normalization
+        run: git diff --exit-code -- index.html
+
+      - name: Report derived files normalized in runner
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          changed=$(git diff --name-only -- free-agent-board.html data/free_agents.json scripts/player_positions.json)
+          if [ -n "$changed" ]; then
+            echo "::notice::Validation normalized these deterministic derived files in the runner:"
+            echo "$changed"
+            echo "They were NOT pushed by this read-only validation workflow."
+          else
+            echo "Committed deterministic derived artifacts were already current."
+          fi
