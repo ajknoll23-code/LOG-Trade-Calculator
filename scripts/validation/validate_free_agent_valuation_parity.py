@@ -29,13 +29,13 @@ import sys
 import tempfile
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPT_DIR.parent
+REPO_ROOT = SCRIPT_DIR.parent.parent
 INDEX = REPO_ROOT / "index.html"
 BOARD = REPO_ROOT / "free-agent-board.html"
 FREE_AGENTS = REPO_ROOT / "data" / "free_agents.json"
 LEAGUE_ROSTERS = REPO_ROOT / "data" / "league_rosters.json"
 
-sys.path.insert(0, str(SCRIPT_DIR))
+sys.path.insert(0, str(SCRIPT_DIR.parent))
 import snapshot_values
 import sync_free_agent_valuation
 
