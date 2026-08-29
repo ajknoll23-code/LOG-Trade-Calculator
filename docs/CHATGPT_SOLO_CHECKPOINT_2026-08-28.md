@@ -510,24 +510,84 @@ Upload the Batch 4 changed files to GitHub. Once the repository reflects this ex
 
 **Total Batch 4 files to add/update in GitHub: 25.**
 
+---
 
-## Batch 4 CI hotfix — 2026-08-28
+## Post-Batch-4 GitHub Validation — CI Hotfixes
 
-The first GitHub run of **Validate Deployed IDP V1** failed only at the repository regression step because the workflow did not install the Python `requests` dependency before importing `dual_eligibility_pipeline.py`. The deployment-specific validator had already passed immediately beforehand with:
+### CI failure 1 — missing `requests` dependency
+
+The first GitHub run proved the deployed model itself was correct:
 
 ```text
 PASS final IDP V1 deployment validation: 320 approved PROD_MULT changes deployed
 ```
 
-This was a CI environment/dependency omission, not a model or deployment validation failure.
+The workflow then failed before the regression suite could execute because
+`scripts/dual_eligibility_pipeline.py` imports `requests`, while the clean GitHub
+runner did not have that package installed.
 
-Changed:
+Fix applied to both IDP validation workflows:
+
+- `github-workflows/bake-idp-ensemble-v1.yml`
+- `github-workflows/idp-v1-candidate-validation.yml`
+
+Both now install `requests` before Python regression execution.
+
+Status: **CLOSED — dependency installation verified in the next GitHub run.**
+
+### CI failure 2 — generated `player_positions.json` drift after Sleeper data refresh
+
+The next GitHub run again passed the deployed V1 validator:
 
 ```text
-github-workflows/bake-idp-ensemble-v1.yml
-github-workflows/idp-v1-candidate-validation.yml
+PASS final IDP V1 deployment validation: 320 approved PROD_MULT changes deployed
 ```
 
-Both now install `requests` after Python/Node setup, matching the existing standalone `repo-regression-checks.yml` workflow. Both workflow YAML files parse successfully after the change.
+It then reached the repository regression suite and failed on:
 
-Next action: upload the two workflow files and rerun **Validate Deployed IDP V1**. If the workflow then completes green, the IDP V1 projection/deployment workstream can be formally closed.
+```text
+AssertionError: player_positions.json is stale relative to canonical PLAYER_DB/alias data
+```
+
+Root cause was traced to the repository's daily Sleeper sync lifecycle, not the
+IDP V1 bake. `scripts/generate_player_positions.py` intentionally derives its
+compatibility/fallback rows from `data/players_cache.json`, but
+`github-workflows/sync.yml` refreshed/committed `data/` without regenerating or
+committing `scripts/player_positions.json`. Therefore a legitimate Sleeper cache
+refresh could leave the generated compatibility map stale immediately afterward.
+
+The GitHub log also showed live synchronized free-agent state differing from the
+local Batch-4 snapshot, which is consistent with this source/generated-artifact
+split.
+
+Fix:
+
+- `github-workflows/sync.yml`
+  - now runs `python scripts/generate_player_positions.py` immediately after
+    Sleeper roster/player sync;
+  - now stages both `data/` and `scripts/player_positions.json` in the same sync
+    commit.
+
+The strict regression invariant is intentionally retained. The correct fix is to
+keep the generated artifact atomic with its source data rather than weakening the
+check.
+
+Local failure-mode reproduction:
+
+1. Modify `data/players_cache.json` while leaving `player_positions.json` stale.
+2. Exact regression fails with the same assertion seen in GitHub.
+3. Run `python scripts/generate_player_positions.py`.
+4. Full 10-group repository regression suite passes.
+
+Status: **FIXED IN WORKFLOW — requires one manual Sleeper sync run in GitHub to
+regenerate the currently stale committed `player_positions.json`, followed by a
+rerun of `Validate Deployed IDP V1`.**
+
+### Files changed in CI hotfix 2
+
+- `github-workflows/sync.yml`
+- `docs/CHATGPT_SOLO_CHECKPOINT_2026-08-28.md`
+
+No calculator values, `PROD_MULT` entries, projection weights, position weights,
+age curves, or V1 model outputs were changed by either CI hotfix.
+
