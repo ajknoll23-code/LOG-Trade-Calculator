@@ -379,7 +379,7 @@ def check_canonical_history_and_v1_bridge():
 
     all_players = json.load(open(SCRIPT_DIR.parent / "all_players.json"))
     ppg_rows = json.load(open(SCRIPT_DIR.parent / "ppg_results.json"))
-    durability = json.load(open(SCRIPT_DIR / "durability_results.json"))
+    durability = json.load(open(SCRIPT_DIR.parent / "durability_results.json"))
     regenerated_now = production_history_component.build_history_output(all_players, ppg_rows, durability)
     lineage_drift = _release_lineage_drift(manifest)
 
