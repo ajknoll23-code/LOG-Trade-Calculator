@@ -150,7 +150,7 @@ def main():
     td_positions = load_trade_desk_positions()
     dual_eligible = analyze_player_index(player_index, td_positions)
 
-    out_path = os.path.join(SCRIPT_DIR, "dual_eligibility_results.json")
+    out_path = os.path.join(os.path.dirname(SCRIPT_DIR), "dual_eligibility_results.json")
     with open(out_path, "w") as f:
         json.dump(dual_eligible, f, indent=2)
 
