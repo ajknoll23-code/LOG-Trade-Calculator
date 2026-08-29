@@ -757,3 +757,14 @@ The open production-lineage item is intentionally separate: 385 displayed player
 
 **Total Batch 5 GitHub files to add/update: 13.**
 
+
+## 2026-08-29 — Batch 5 active-workflow path correction
+
+A deployed GitHub run proved the intended self-healing regression workflow was not executing. The log still showed the older `regression` sequence (`free-agent parity -> generate_player_positions.py -> repo_regression_checks.py`) and never executed `refresh_repo_derived_state.py --write`.
+
+Root cause: the project export represents workflows under `github-workflows/`, but GitHub Actions only executes workflow definitions from `.github/workflows/`. The active copy is now explicitly shipped at `.github/workflows/repo-regression-checks.yml`, with a mirrored `github-workflows/repo-regression-checks.yml` retained only for project/export parity.
+
+The active workflow now emits marker:
+`TRADE_DESK_REPO_REGRESSION_WORKFLOW=2026-08-29-v2-active-path-self-heal`
+
+Manual runs normalize deterministic derived artifacts in the runner before strict checks. Pull-request runs remain strict/read-only. The normalization is forbidden from changing `index.html`; a final `git diff --exit-code -- index.html` enforces this.
