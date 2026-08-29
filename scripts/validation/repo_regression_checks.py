@@ -352,7 +352,7 @@ def check_aliases_and_ktc_positions():
 
 def check_idp_v1_projection_invariants():
     idp_v1_projection.run_selftest()
-    baseline_path = SCRIPT_DIR / "prod_mult_pre_v1_baseline.json"
+    baseline_path = SCRIPT_DIR.parent / "prod_mult_pre_v1_baseline.json"
     assert baseline_path.exists(), "missing immutable pre-V1 PROD_MULT baseline snapshot"
     baseline = json.load(open(baseline_path))
     assert baseline.get("snapshot_type") == "baked_prod_mult_data"
