@@ -28,7 +28,7 @@ import sys
 import os
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.path.dirname(SCRIPT_DIR)  # scripts/ -> repo root, one level up
+REPO_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))  # scripts/ -> repo root, one level up
 
 
 def load_prod_mult_keys(index_html_path):
