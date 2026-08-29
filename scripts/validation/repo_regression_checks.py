@@ -373,7 +373,7 @@ def check_canonical_history_and_v1_bridge():
     # source files (especially ppg_results.json) can be refreshed later by
     # separate workflows. A source refresh is not permission to silently
     # rewrite a production release.
-    frozen_history = json.load(open(SCRIPT_DIR / "production_history_components.json"))
+    frozen_history = json.load(open(SCRIPT_DIR.parent / "production_history_components.json"))
     assert frozen_history.get("method") == "canonical_history_component_v1_preserve_legacy_math"
     assert len(frozen_history.get("players", {})) == 858
 
