@@ -591,3 +591,64 @@ rerun of `Validate Deployed IDP V1`.**
 No calculator values, `PROD_MULT` entries, projection weights, position weights,
 age curves, or V1 model outputs were changed by either CI hotfix.
 
+
+## Batch 4 CI Hotfix 3 — self-healing derived artifact preparation
+
+### Trigger
+
+A third `Validate Deployed IDP V1` run still failed after the `requests` dependency fix. The V1 deployment validator itself again passed all 320 approved PROD_MULT changes, but the general repository regression suite failed because committed `scripts/player_positions.json` was stale relative to the current checked-out `index.html` / `data/players_cache.json` state.
+
+### Root cause
+
+`player_positions.json` is a derived compatibility artifact. Requiring a manually sequenced Sleeper sync before every read-only validation made CI order-dependent: the validator could check out a perfectly valid production commit whose live Sleeper-derived cache had moved while the derived compatibility file had not yet been regenerated/committed.
+
+The prior Hotfix 2 remains correct: `Sync Sleeper League Data` now regenerates and commits `scripts/player_positions.json`. Hotfix 3 additionally makes validation deterministic and self-contained by regenerating this derived artifact in the runner workspace before invoking the repository regression suite.
+
+### Changes
+
+- `github-workflows/bake-idp-ensemble-v1.yml`
+  - retains `pip install requests`;
+  - now runs `python3 scripts/generate_player_positions.py` before repository regressions.
+- `github-workflows/idp-v1-candidate-validation.yml`
+  - retains `pip install requests`;
+  - now runs the same derived-artifact preparation before repository regressions.
+- `github-workflows/repo-regression-checks.yml`
+  - now regenerates `player_positions.json` before the full suite (self-test remains separate).
+- `github-workflows/sync.yml`
+  - retains Hotfix 2 behavior: regenerate and commit `scripts/player_positions.json` alongside Sleeper data.
+
+### Validation performed locally
+
+A stale `player_positions.json` was deliberately created by deleting one generated key. The old sequence failed with the exact GitHub assertion:
+
+```text
+AssertionError: player_positions.json is stale relative to canonical PLAYER_DB/alias data
+```
+
+Then the new workflow preparation step was run. Results:
+
+```text
+Wrote player_positions.json: 565 canonical PLAYER_DB positions + 2056 safe alias/Sleeper fallback lookups
+PASS final IDP V1 deployment validation: 320 approved PROD_MULT changes deployed
+ALL REPO REGRESSION CHECKS PASSED (10 groups)
+Python parse: 45 PASS
+JSON parse: 41 PASS
+YAML parse: 20 PASS
+index.html unchanged: PASS
+```
+
+### Model impact
+
+None. Hotfix 3 changes CI/workflow preparation only.
+
+```text
+PROD_MULT changes: 0
+IDP V1 weights: unchanged
+PLAYER_DB: unchanged
+index.html: unchanged
+final player values: unchanged
+```
+
+### Operational change
+
+After this hotfix, `Validate Deployed IDP V1` no longer requires the user to manually run `Sync Sleeper League Data` first merely to refresh `player_positions.json`. The sync workflow still keeps the committed compatibility artifact current for normal repository use, but validation prepares its own deterministic derived copy before regression testing.
