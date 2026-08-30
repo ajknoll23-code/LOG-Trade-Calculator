@@ -275,7 +275,7 @@ def check_dual_eligibility_audit():
 
 
 def check_team_identity():
-    refresh = json.load(open(SCRIPT_DIR.parent / "player_team_refresh.json"))
+    refresh = json.load(open(SCRIPT_DIR.parent / "artifacts" / "generated" / "player_team_refresh.json"))
     by_id = refresh["teams_by_sleeper_id"]
     by_name = refresh["teams"]
     collisions = refresh["name_collisions"]
