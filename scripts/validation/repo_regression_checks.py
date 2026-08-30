@@ -24,6 +24,7 @@ INDEX = REPO_ROOT / "index.html"
 DATA = REPO_ROOT / "data"
 
 sys.path.insert(0, str(SCRIPT_DIR.parent))
+sys.path.insert(0, str(SCRIPT_DIR.parent / "maintenance"))
 
 import snapshot_values
 import sync_sleeper
