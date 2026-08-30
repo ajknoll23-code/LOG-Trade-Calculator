@@ -17,8 +17,6 @@ occupied their places.
 Canonical implementation:
     python3 scripts/utilities/generate_player_positions.py
 
-The legacy scripts/generate_player_positions.py path remains temporarily as a
-compatibility wrapper while live callers are migrated.
 """
 
 import json
