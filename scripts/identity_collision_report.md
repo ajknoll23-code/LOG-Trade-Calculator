@@ -1,6 +1,6 @@
 # Identity Resolution Collision Report
 
-529 total FantasyPros IDP players. 469 high-confidence, 6 medium-confidence (not auto-assigned, needs review), 54 with no Sleeper candidate, 6 total requiring manual review.
+529 total FantasyPros IDP players. 468 high-confidence, 7 medium-confidence (not auto-assigned, needs review), 54 with no Sleeper candidate, 7 total requiring manual review.
 
 
 **no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Mack Wilson Sr.", "fp_team": "ARI"}
@@ -87,7 +87,7 @@
 
 **no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Walter Nolen III", "fp_team": "ARI"}
 
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Gervon Dexter Sr.", "fp_team": "CHI"}
+**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Gervon Dexter Sr.", "fp_team": "ATL"}
 
 **no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Thomas Booker IV", "fp_team": "LV"}
 
@@ -123,13 +123,15 @@
 
 **no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Ivan Pace Jr.", "fp_team": "MIN"}
 
-**team_mismatch**: {"type": "team_mismatch", "fp_name": "Terrion Arnold", "fp_team": "FA", "sleeper_team": null, "candidate_sleeper_id": "11661"}
+**team_mismatch**: {"type": "team_mismatch", "fp_name": "Terrion Arnold", "fp_team": "SEA", "sleeper_team": null, "candidate_sleeper_id": "11661"}
 
 **no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Willie Gay Jr.", "fp_team": "MIA"}
 
 **no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "James Williams Sr.", "fp_team": "TEN"}
 
 **no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Jeremiah Trotter Jr.", "fp_team": "PHI"}
+
+**team_mismatch**: {"type": "team_mismatch", "fp_name": "Channing Tindall", "fp_team": "FA", "sleeper_team": "ATL", "candidate_sleeper_id": "8272"}
 
 **no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Smael Mondon Jr.", "fp_team": "PHI"}
 
