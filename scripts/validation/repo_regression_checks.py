@@ -27,7 +27,7 @@ sys.path.insert(0, str(SCRIPT_DIR.parent))
 sys.path.insert(0, str(SCRIPT_DIR.parent / "maintenance"))
 
 import snapshot_values
-import sync_sleeper
+from sync import sync_sleeper
 import dual_eligibility_pipeline
 import team_field_refresh_pipeline
 import idp_v1_projection
