@@ -34,7 +34,7 @@ OUTPUT:
   scripts/identity_crosswalk.json -- one row per FantasyPros IDP player,
     with sleeper_id (or null), match_method, match_confidence,
     collision_flag.
-  scripts/identity_collision_report.md -- human-readable list of every
+  scripts/artifacts/reports/identity_collision_report.md -- human-readable list of every
     case that needed real judgment, for manual review.
 
 USAGE: python3 scripts/projections/resolve_fantasypros_sleeper_identity.py
@@ -53,7 +53,7 @@ SCRIPTS_DIR = os.path.dirname(SCRIPT_DIR)
 FP_PATH = os.path.join(SCRIPTS_DIR, "fantasypros_api_normalized_2026.json")
 SLEEPER_PATH = os.path.join(SCRIPTS_DIR, "sleeper_2026_idp_only.json")
 CROSSWALK_OUT_PATH = os.path.join(SCRIPTS_DIR, "identity_crosswalk.json")
-COLLISION_REPORT_PATH = os.path.join(SCRIPTS_DIR, "identity_collision_report.md")
+COLLISION_REPORT_PATH = os.path.join(SCRIPTS_DIR, "artifacts", "reports", "identity_collision_report.md")
 
 
 def normalize_name(s):
