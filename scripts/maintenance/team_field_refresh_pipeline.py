@@ -26,7 +26,7 @@ already used for PROD_MULT_DATA, ROLE_MULT, etc.
 INTENDED FLOW (matches this project's established pattern -- Claude
 performs the actual index.html edit in-session, not an autonomous
 script): run this via the matching GitHub Actions workflow, which
-commits scripts/player_team_refresh.json. Upload that file back for the
+commits scripts/artifacts/generated/player_team_refresh.json. Upload that file back for the
 PLAYER_TEAM constant to be baked in and mergeLiveRoster()/
 mergeLeagueRosters() updated to use it as the primary team source
 (existing.team remains the fallback for any player this fresh pull
@@ -41,7 +41,7 @@ USAGE: python3 scripts/maintenance/team_field_refresh_pipeline.py
 Add --selftest to sanity-check the name-normalization and pool-parsing
 logic against synthetic data before trusting real output.
 
-OUTPUT: scripts/player_team_refresh.json
+OUTPUT: scripts/artifacts/generated/player_team_refresh.json
   {generated_at, source, n_players, teams_by_sleeper_id, teams, name_collisions}
 
 `teams_by_sleeper_id` is canonical. `teams` is a collision-safe normalized-name
@@ -61,7 +61,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS_DIR = os.path.dirname(SCRIPT_DIR)
 ROOT = os.path.dirname(SCRIPTS_DIR)
 DATA_DIR = os.path.join(ROOT, "data")
-OUT_PATH = os.path.join(SCRIPTS_DIR, "player_team_refresh.json")
+OUT_PATH = os.path.join(SCRIPTS_DIR, "artifacts", "generated", "player_team_refresh.json")
 
 PLAYERS_CACHE_MAX_AGE_SECONDS = 20 * 60 * 60  # 20 hours -- same as sync_sleeper.py
 
