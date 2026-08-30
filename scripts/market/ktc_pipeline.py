@@ -57,7 +57,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS_DIR = os.path.dirname(SCRIPT_DIR)
 sys.path.insert(0, SCRIPTS_DIR)
 
-from generate_player_positions import build_player_position_lookup
+from utilities.generate_player_positions import build_player_position_lookup
 
 # Set this to the published-CSV URL of the "votes" tab after following the
 # "Publish to web" step in ktc_vote_collector.gs's setup instructions.
@@ -358,13 +358,13 @@ def main():
             )
             raise RuntimeError(
                 "player_positions.json is stale relative to canonical PLAYER_DB/alias data. "
-                "Run `python3 scripts/generate_player_positions.py` first. "
+                "Run `python3 scripts/utilities/generate_player_positions.py` first. "
                 f"missing={len(missing)}, stale={len(stale)}, changed={len(changed)}"
             )
     else:
         raise RuntimeError(
             "player_positions.json not found. Run "
-            "`python3 scripts/generate_player_positions.py` before KTC aggregation."
+            "`python3 scripts/utilities/generate_player_positions.py` before KTC aggregation."
         )
 
     league_only = build_ratings_summary(league_rows, pos_lookup, "League members only")
