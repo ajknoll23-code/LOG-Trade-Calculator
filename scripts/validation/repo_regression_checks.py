@@ -30,7 +30,7 @@ import snapshot_values
 from sync import sync_sleeper
 import dual_eligibility_pipeline
 import team_field_refresh_pipeline
-import idp_v1_projection
+from model import idp_v1_projection
 from model import production_history_component
 import validate_idp_v1_final_deployment
 import validate_free_agent_valuation_parity
