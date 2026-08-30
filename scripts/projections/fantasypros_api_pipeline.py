@@ -63,7 +63,7 @@ data before trusting real output.
 OUTPUT:
   scripts/fantasypros_api_raw_2026.json          -- immutable raw snapshot
   scripts/fantasypros_api_normalized_2026.json   -- Trade Desk-scored output
-  scripts/fantasypros_api_pipeline_report.md     -- human-readable QC summary
+  scripts/artifacts/reports/fantasypros_api_pipeline_report.md -- human-readable QC summary
 """
 
 import json
@@ -78,7 +78,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS_DIR = os.path.dirname(SCRIPT_DIR)
 RAW_OUT_PATH = os.path.join(SCRIPTS_DIR, "fantasypros_api_raw_2026.json")
 NORMALIZED_OUT_PATH = os.path.join(SCRIPTS_DIR, "fantasypros_api_normalized_2026.json")
-REPORT_OUT_PATH = os.path.join(SCRIPTS_DIR, "fantasypros_api_pipeline_report.md")
+REPORT_OUT_PATH = os.path.join(SCRIPTS_DIR, "artifacts", "reports", "fantasypros_api_pipeline_report.md")
 
 API_KEY_ENV_VAR = "FANTASYPROS_API_KEY"
 BASE_URL = "https://api.fantasypros.com/public/v2/json"  # confirmed real, via diagnostic
