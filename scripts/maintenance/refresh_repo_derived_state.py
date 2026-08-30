@@ -40,7 +40,7 @@ DATA_DIR = REPO_ROOT / "data"
 
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-import generate_player_positions
+from utilities import generate_player_positions
 import sync_free_agent_valuation
 import sync_sleeper
 
