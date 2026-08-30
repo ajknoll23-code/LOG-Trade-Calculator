@@ -13,7 +13,7 @@ to PROD_MULT_DATA without removing the old key first.
 USAGE: python3 scripts/validation/check_no_duplicate_prod_mult_keys.py
 Run from anywhere -- paths are resolved relative to this script's own
 location, not the current working directory. This validation script lives in
-scripts/validation/. ppg_pipeline.py lives in scripts/ and supplies the
+scripts/validation/. ppg_pipeline.py lives in scripts/model/ and supplies the
 ALIASES table. index.html lives at the repository root.
 
 Exits non-zero (and prints every offending pair) if any abbreviated key in
@@ -44,6 +44,8 @@ def load_aliases(ppg_pipeline_path):
     with open(ppg_pipeline_path) as f:
         src = f.read()
     m = re.search(r"ALIASES\s*=\s*\{.*?\n\}", src, re.S)
+    if not m:
+        raise RuntimeError("Could not find ALIASES in scripts/model/ppg_pipeline.py")
     namespace = {}
     exec(m.group(0), namespace)
     return namespace['ALIASES']
@@ -51,7 +53,7 @@ def load_aliases(ppg_pipeline_path):
 
 def main():
     index_html = os.path.join(REPO_ROOT, "index.html")
-    ppg_pipeline = os.path.join(os.path.dirname(SCRIPT_DIR), "ppg_pipeline.py")
+    ppg_pipeline = os.path.join(os.path.dirname(SCRIPT_DIR), "model", "ppg_pipeline.py")
 
     baked = load_prod_mult_keys(index_html)
     aliases = load_aliases(ppg_pipeline)
