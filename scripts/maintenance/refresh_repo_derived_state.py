@@ -42,7 +42,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 from utilities import generate_player_positions
 import sync_free_agent_valuation
-import sync_sleeper
+from sync import sync_sleeper
 
 INDEX = REPO_ROOT / "index.html"
 BOARD = REPO_ROOT / "free-agent-board.html"
