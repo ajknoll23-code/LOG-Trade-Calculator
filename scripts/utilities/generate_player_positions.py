@@ -28,7 +28,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 SCRIPTS_DIR = SCRIPT_DIR.parent
 REPO_ROOT = SCRIPTS_DIR.parent
 INDEX_PATH = REPO_ROOT / "index.html"
-PPG_PATH = SCRIPTS_DIR / "ppg_pipeline.py"
+PPG_PATH = SCRIPTS_DIR / "model" / "ppg_pipeline.py"
 PLAYERS_CACHE_PATH = REPO_ROOT / "data" / "players_cache.json"
 OUT_PATH = SCRIPTS_DIR / "player_positions.json"
 
@@ -68,7 +68,7 @@ def load_known_aliases(ppg_path=PPG_PATH):
     src = Path(ppg_path).read_text(encoding="utf-8")
     m = re.search(r"ALIASES\s*=\s*\{.*?\n\}", src, re.S)
     if not m:
-        raise RuntimeError("Could not find ALIASES in ppg_pipeline.py")
+        raise RuntimeError("Could not find ALIASES in scripts/model/ppg_pipeline.py")
     ns = {}
     exec(m.group(0), ns)
     aliases = dict(ns["ALIASES"])
