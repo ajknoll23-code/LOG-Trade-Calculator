@@ -37,7 +37,7 @@ LEAGUE_ROSTERS = REPO_ROOT / "data" / "league_rosters.json"
 
 sys.path.insert(0, str(SCRIPT_DIR.parent))
 import snapshot_values
-import sync_free_agent_valuation
+from sync import sync_free_agent_valuation
 
 VALID_POSITIONS = {"QB", "RB", "WR", "TE", "DL", "LB", "DB", "K"}
 VALID_ROLES = {"Elite", "Every-Down", "Starter", "Rotational", "Understudy", "Depth", "Speculative"}
