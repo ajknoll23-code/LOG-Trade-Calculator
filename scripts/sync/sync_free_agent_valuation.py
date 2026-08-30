@@ -29,7 +29,7 @@ BOARD_PATH = REPO_ROOT / "free-agent-board.html"
 
 SYNC_NOTE = """/* CANONICAL VALUATION SYNC — 2026-08-28
    The valuation engine below is generated from index.html by
-   scripts/sync_free_agent_valuation.py. Do not hand-edit POSITION_WEIGHT,
+   scripts/sync/sync_free_agent_valuation.py. Do not hand-edit POSITION_WEIGHT,
    AGE_CURVE, PROD_MULT_DATA, productionMultiplier(), ageMultiplier(),
    playerValue(), PLAYER_DB, ALIASES, or normalizeName in this file.
 
@@ -276,7 +276,7 @@ def main() -> int:
             print(
                 "FAIL free-agent valuation parity: free-agent-board.html is stale. "
                 f"Mismatched canonical regions: {stale or ['sync_note/formatting']}. "
-                "Run: python3 scripts/sync_free_agent_valuation.py --write",
+                "Run: python3 scripts/sync/sync_free_agent_valuation.py --write",
                 file=sys.stderr,
             )
             return 1
