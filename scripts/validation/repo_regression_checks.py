@@ -31,7 +31,7 @@ from sync import sync_sleeper
 import dual_eligibility_pipeline
 import team_field_refresh_pipeline
 import idp_v1_projection
-import production_history_component
+from model import production_history_component
 import validate_idp_v1_final_deployment
 import validate_free_agent_valuation_parity
 from utilities.generate_player_positions import parse_player_positions, build_player_position_lookup
