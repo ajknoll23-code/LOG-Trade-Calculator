@@ -41,7 +41,7 @@ DATA_DIR = REPO_ROOT / "data"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from utilities import generate_player_positions
-import sync_free_agent_valuation
+from sync import sync_free_agent_valuation
 from sync import sync_sleeper
 
 INDEX = REPO_ROOT / "index.html"
