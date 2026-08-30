@@ -16,9 +16,9 @@ functions for every PLAYER_DB row so formula drift is caught before a snapshot
 is trusted.
 
 Usage:
-    python3 scripts/snapshot_values.py
-    python3 scripts/snapshot_values.py path/to/index.html
-    python3 scripts/snapshot_values.py --selftest
+    python3 scripts/validation/snapshot_values.py
+    python3 scripts/validation/snapshot_values.py path/to/index.html
+    python3 scripts/validation/snapshot_values.py --selftest
 
 Output:
     scripts/value_snapshots/<YYYY-MM-DD_HHMMSS>.json
@@ -238,7 +238,7 @@ def main():
     if not Path(html_path).exists():
         print(
             f"ERROR: {html_path} not found. Run this from the repo root, "
-            "or pass the path explicitly: python3 scripts/snapshot_values.py path/to/index.html"
+            "or pass the path explicitly: python3 scripts/validation/snapshot_values.py path/to/index.html"
         )
         sys.exit(1)
 
@@ -262,7 +262,7 @@ def main():
     }
     out_path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
     print(f"Snapshot saved: {out_path} ({len(values)} players)")
-    print("Run this again after your next rebuild, then use diff_snapshots.py to compare.")
+    print("Run this again after your next rebuild, then use scripts/validation/diff_snapshots.py to compare.")
 
 
 if __name__ == "__main__":
