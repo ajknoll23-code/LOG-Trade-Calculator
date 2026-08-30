@@ -275,7 +275,7 @@ def validate() -> dict:
     assert all(parity.values()), f"canonical source regions differ: {parity}"
     assert sync_free_agent_valuation.render_synced(index_text, board_text) == board_text, (
         "free-agent-board.html would change if canonical sync ran; run "
-        "python3 scripts/sync_free_agent_valuation.py --write"
+        "python3 scripts/sync/sync_free_agent_valuation.py --write"
     )
 
     # 2) Every canonical PLAYER_DB valuation must match the canonical Python port.
