@@ -384,14 +384,14 @@ def main():
         "all_voters_combined": all_combined,
     }
 
-    with open(os.path.join(SCRIPTS_DIR, "ktc_ratings.json"), "w") as f:
+    with open(os.path.join(SCRIPTS_DIR, "artifacts", "generated", "ktc_ratings.json"), "w") as f:
         json.dump(output, f, indent=2)
 
     print("\n=== Voter share within league votes ===")
     for voter, info in voter_share.items():
         print(f"  roster_id {voter}: {info['votes']} votes ({info['share_pct']}% of league total)")
 
-    print("\nWrote ktc_ratings.json")
+    print("\nWrote scripts/artifacts/generated/ktc_ratings.json")
 
 
 if __name__ == "__main__":
