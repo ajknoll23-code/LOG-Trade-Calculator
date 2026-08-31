@@ -61,7 +61,7 @@ key-redaction safety property against synthetic and real regression
 data before trusting real output.
 
 OUTPUT:
-  scripts/fantasypros_api_raw_2026.json          -- immutable raw snapshot
+  scripts/artifacts/generated/fantasypros_api_raw_2026.json -- immutable raw snapshot
   scripts/fantasypros_api_normalized_2026.json   -- Trade Desk-scored output
   scripts/artifacts/reports/fantasypros_api_pipeline_report.md -- human-readable QC summary
 """
@@ -76,7 +76,7 @@ import urllib.error
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS_DIR = os.path.dirname(SCRIPT_DIR)
-RAW_OUT_PATH = os.path.join(SCRIPTS_DIR, "fantasypros_api_raw_2026.json")
+RAW_OUT_PATH = os.path.join(SCRIPTS_DIR, "artifacts", "generated", "fantasypros_api_raw_2026.json")
 NORMALIZED_OUT_PATH = os.path.join(SCRIPTS_DIR, "fantasypros_api_normalized_2026.json")
 REPORT_OUT_PATH = os.path.join(SCRIPTS_DIR, "artifacts", "reports", "fantasypros_api_pipeline_report.md")
 
