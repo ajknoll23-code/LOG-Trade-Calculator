@@ -9,17 +9,17 @@ Generated from a real, full-population fetch (declared_count == actual_players_r
 
 | Position | Players normalized |
 |---|---|
-| DB | 202 |
-| DL | 175 |
-| LB | 152 |
-| QB | 83 |
-| RB | 129 |
+| DB | 203 |
+| DL | 177 |
+| LB | 159 |
+| QB | 81 |
+| RB | 128 |
 | TE | 126 |
-| WR | 189 |
+| WR | 179 |
 
 ## Milestone-bonus field population check (across the REAL full population, not a 4-player sample)
 
-- Offense players checked: 527
+- Offense players checked: 514
 - Offense players with at least one nonzero milestone field: 0
   - Confirmed across the full population, not just the earlier 4-player sample: these fields are **unpopulated in this specific 2026 preseason API response.** Worded deliberately as a snapshot finding, not a permanent platform limitation -- FantasyPros could populate these in a future season, a weekly feed, or a different endpoint version.
 
@@ -35,21 +35,21 @@ Generated from a real, full-population fetch (declared_count == actual_players_r
 (A verified fact from the real response, not an assumption -- if this list contains anything unexpected, the field-coverage numbers below should be checked per-label.)
 
 
-## IDP field coverage across the real full population (n=529)
+## IDP field coverage across the real full population (n=539)
 
 Per external review: a field existing in the schema doesn't mean it's actually populated -- checked directly rather than assumed, same as the milestone check above.
 
 | Field | Nonzero players | % nonzero |
 |---|---|---|
-| def_tackle | 521 | 98.5% |
-| def_assist | 521 | 98.5% |
-| def_sack | 521 | 98.5% |
+| def_tackle | 531 | 98.5% |
+| def_assist | 531 | 98.5% |
+| def_sack | 531 | 98.5% |
 | def_tlost | 0 | 0.0%  **UNPOPULATED** |
-| def_int | 501 | 94.7% |
-| def_pd | 521 | 98.5% |
-| def_ff | 521 | 98.5% |
-| def_fr | 521 | 98.5% |
-| def_td | 519 | 98.1% |
+| def_int | 511 | 94.8% |
+| def_pd | 531 | 98.5% |
+| def_ff | 530 | 98.3% |
+| def_fr | 531 | 98.5% |
+| def_td | 523 | 97.0% |
 | def_safety | 0 | 0.0%  **UNPOPULATED** |
 
 **def_tlost (TFL) is unpopulated across the entire real IDP population.** This directly affects the archetype investigation this pipeline exists to support -- if TFL isn't real, usable data, that specific piece of the EDGE-vs-tackle-volume question stays unresolved by this source.
