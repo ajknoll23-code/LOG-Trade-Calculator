@@ -375,7 +375,7 @@ def check_canonical_history_and_v1_bridge():
             "despite identical release source/code snapshots"
         )
 
-    bridge = json.load(open(SCRIPT_DIR.parent / "idp_v1_model_delta_transport_candidate.json"))
+    bridge = json.load(open(SCRIPT_DIR.parent / "artifacts" / "releases" / "idp_v1" / "idp_v1_model_delta_transport_candidate.json"))
     players = bridge["players"]
     assert len(players) == 404, f"unexpected frozen IDP bridge population: {len(players)}"
     assert bridge["comparable_player_count"] == 330, bridge["comparable_player_count"]
@@ -418,7 +418,7 @@ def check_canonical_history_and_v1_bridge():
 
 def check_preferred_bake_preview_invariants():
     patch_path = SCRIPT_DIR.parent / "idp_v1_prod_mult_patch.json"
-    candidate_path = SCRIPT_DIR.parent / "idp_v1_model_delta_transport_candidate.json"
+    candidate_path = SCRIPT_DIR.parent / "artifacts" / "releases" / "idp_v1" / "idp_v1_model_delta_transport_candidate.json"
     baseline_path = SCRIPT_DIR.parent / "prod_mult_pre_v1_baseline.json"
     assert patch_path.exists() and candidate_path.exists(), "preferred V1 preview artifacts missing"
 
