@@ -34,8 +34,8 @@ import statistics
 from dataclasses import dataclass
 from typing import Dict, Iterable, Mapping, Optional
 
-# Keep canonical inputs/outputs in scripts/ after moving this implementation
-# into scripts/model/.
+# Keep canonical inputs in scripts/; rolling generated output belongs under
+# scripts/artifacts/generated/ so it cannot overwrite the frozen IDP V1 release.
 SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SEASON_LENGTH_2025 = 17
 SEASON_LENGTH_2026 = 17
@@ -238,7 +238,7 @@ def main():
         durability = json.load(f)
 
     out = build_history_output(all_players, ppg_rows, durability)
-    path = os.path.join(SCRIPT_DIR, "production_history_components.json")
+    path = os.path.join(SCRIPT_DIR, "artifacts", "generated", "production_history_components.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2)
         f.write("\n")
