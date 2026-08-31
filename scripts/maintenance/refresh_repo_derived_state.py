@@ -6,7 +6,7 @@ fetches the network and never edits ``index.html`` or model parameters.
 
 Artifacts refreshed:
   * free-agent-board.html canonical valuation regions <- index.html
-  * scripts/player_positions.json <- index.html + aliases + players_cache.json
+  * scripts/artifacts/generated/player_positions.json <- index.html + aliases + players_cache.json
   * data/free_agents.json <- players_cache.json - committed league rosters
 
 Explicitly NOT refreshed here:
@@ -46,7 +46,7 @@ from sync import sync_sleeper
 
 INDEX = REPO_ROOT / "index.html"
 BOARD = REPO_ROOT / "free-agent-board.html"
-POSITIONS = SCRIPTS_DIR / "player_positions.json"
+POSITIONS = SCRIPTS_DIR / "artifacts" / "generated" / "player_positions.json"
 FREE_AGENTS = DATA_DIR / "free_agents.json"
 PLAYERS_CACHE = DATA_DIR / "players_cache.json"
 LEAGUE_ROSTERS = DATA_DIR / "league_rosters.json"
