@@ -306,15 +306,15 @@ def main():
         json.dump(results, f, indent=2)
     print(f"\nWrote {len(results)} players with real projection data to sleeper_2026_projections.json")
 
-    with open(os.path.join(SCRIPTS_DIR, "sleeper_2026_raw_categories.json"), "w") as f:
+    with open(os.path.join(SCRIPTS_DIR, "artifacts", "generated", "sleeper_2026_raw_categories.json"), "w") as f:
         json.dump(raw_results, f, indent=2)
-    print(f"Wrote {len(raw_results)} players' raw per-category season totals to sleeper_2026_raw_categories.json "
+    print(f"Wrote {len(raw_results)} players' raw per-category season totals to scripts/artifacts/generated/sleeper_2026_raw_categories.json "
           f"(broader audit universe than the production list -- {len(raw_results) - len(results)} more players "
           f"than sleeper_2026_projections.json, since this one isn't filtered by final point total)")
 
-    with open(os.path.join(SCRIPTS_DIR, "sleeper_2026_raw_weekly.json"), "w") as f:
+    with open(os.path.join(SCRIPTS_DIR, "artifacts", "generated", "sleeper_2026_raw_weekly.json"), "w") as f:
         json.dump(raw_weekly_snapshot, f)
-    print(f"Wrote real unprocessed weekly source data (18 weeks) to sleeper_2026_raw_weekly.json -- "
+    print(f"Wrote real unprocessed weekly source data (18 weeks) to scripts/artifacts/generated/sleeper_2026_raw_weekly.json -- "
           f"this file will be large; that's expected for a true immutable snapshot, not an error.")
 
     print("\nTop 10 by projected total:")
