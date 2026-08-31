@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate scripts/player_positions.json from canonical Trade Desk data.
+"""Generate scripts/artifacts/generated/player_positions.json from canonical Trade Desk data.
 
 The lookup contains, in precedence order:
 1. every current PLAYER_DB canonical key -> position;
@@ -30,7 +30,7 @@ REPO_ROOT = SCRIPTS_DIR.parent
 INDEX_PATH = REPO_ROOT / "index.html"
 PPG_PATH = SCRIPTS_DIR / "model" / "ppg_pipeline.py"
 PLAYERS_CACHE_PATH = REPO_ROOT / "data" / "players_cache.json"
-OUT_PATH = SCRIPTS_DIR / "player_positions.json"
+OUT_PATH = SCRIPTS_DIR / "artifacts" / "generated" / "player_positions.json"
 
 POS_BUCKET = {
     "DE": "DL", "DT": "DL", "DL": "DL",
