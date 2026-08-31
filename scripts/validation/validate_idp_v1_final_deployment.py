@@ -21,9 +21,9 @@ import snapshot_values
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent
 INDEX = REPO_ROOT / "index.html"
-BASELINE = SCRIPT_DIR.parent / "artifacts" / "releases" / "idp_v1" / "prod_mult_pre_v1_baseline.json"
-CANDIDATE = SCRIPT_DIR.parent / "artifacts" / "releases" / "idp_v1" / "idp_v1_model_delta_transport_candidate.json"
-PATCH = SCRIPT_DIR.parent / "artifacts" / "releases" / "idp_v1" / "idp_v1_prod_mult_patch.json"
+BASELINE = REPO_ROOT / "model" / "releases" / "idp-v1" / "prod_mult_pre_v1_baseline.json"
+CANDIDATE = REPO_ROOT / "model" / "releases" / "idp-v1" / "idp_v1_model_delta_transport_candidate.json"
+PATCH = REPO_ROOT / "model" / "releases" / "idp-v1" / "idp_v1_prod_mult_patch.json"
 JSON_OUT = SCRIPT_DIR / "idp_v1_final_deployment_validation.json"
 REPORT = SCRIPT_DIR / "idp_v1_final_deployment_validation.md"
 IDP_POSITIONS = ("LB", "DL", "DB")
