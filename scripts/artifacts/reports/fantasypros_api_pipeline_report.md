@@ -12,14 +12,14 @@ Generated from a real, full-population fetch (declared_count == actual_players_r
 | DB | 203 |
 | DL | 177 |
 | LB | 159 |
-| QB | 81 |
-| RB | 128 |
-| TE | 126 |
+| QB | 79 |
+| RB | 119 |
+| TE | 117 |
 | WR | 179 |
 
 ## Milestone-bonus field population check (across the REAL full population, not a 4-player sample)
 
-- Offense players checked: 514
+- Offense players checked: 494
 - Offense players with at least one nonzero milestone field: 0
   - Confirmed across the full population, not just the earlier 4-player sample: these fields are **unpopulated in this specific 2026 preseason API response.** Worded deliberately as a snapshot finding, not a permanent platform limitation -- FantasyPros could populate these in a future season, a weekly feed, or a different endpoint version.
 
