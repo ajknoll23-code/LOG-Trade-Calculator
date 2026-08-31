@@ -319,7 +319,7 @@ def check_aliases_and_ktc_positions():
     for alias, pos in expected_aliases.items():
         assert stored.get(alias) == pos, f"KTC legacy alias missing: {alias}"
 
-    ratings_path = SCRIPT_DIR.parent / "ktc_ratings.json"
+    ratings_path = SCRIPT_DIR.parent / "artifacts" / "generated" / "ktc_ratings.json"
     unresolved = set()
     if ratings_path.exists():
         ratings = json.load(open(ratings_path))
