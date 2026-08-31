@@ -344,7 +344,7 @@ def main():
     } if total_league else {}
 
     pos_lookup = {}
-    pos_lookup_path = os.path.join(SCRIPTS_DIR, "player_positions.json")
+    pos_lookup_path = os.path.join(SCRIPTS_DIR, "artifacts", "generated", "player_positions.json")
     if os.path.exists(pos_lookup_path):
         with open(pos_lookup_path) as f:
             pos_lookup = json.load(f)
