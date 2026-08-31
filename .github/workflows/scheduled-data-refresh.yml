@@ -1,0 +1,153 @@
+name: Scheduled Data Refresh
+
+# Automated source-data maintenance.
+#
+# Tuesday = full refresh:
+#   Sleeper sync -> team refresh -> Sleeper projections -> IDP filter ->
+#   FantasyPros -> identity crosswalk -> dual eligibility -> derived state.
+#
+# Friday = light refresh:
+#   Same chain, excluding the weekly dual-eligibility audit.
+#
+# Everything runs sequentially in ONE job and is committed/pushed ONCE to
+# avoid the multi-workflow push races that can occur when independent writers
+# run at the same time.
+on:
+  schedule:
+    - cron: '0 15 * * 2'
+    - cron: '0 15 * * 5'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Refresh depth'
+        required: true
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - light
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Determine refresh mode
+        id: mode
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            mode="${{ github.event.inputs.mode }}"
+          elif [ "${{ github.event.schedule }}" = "0 15 * * 2" ]; then
+            mode="full"
+          else
+            mode="light"
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "Refresh mode: $mode"
+
+      - name: Set up Python 3.12 for Sleeper sync
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Sleeper sync self-test
+        run: python3 scripts/sync/sync_sleeper.py --selftest
+
+      - name: Refresh Sleeper league data
+        run: python3 scripts/sync/sync_sleeper.py
+
+      - name: Refresh trade history
+        run: python3 scripts/sync/sync_trade_history.py
+
+      - name: Set up Python 3.11 for refresh pipelines
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Team refresh self-test
+        run: python3 scripts/maintenance/team_field_refresh_pipeline.py --selftest
+
+      - name: Refresh player team fields
+        run: python3 scripts/maintenance/team_field_refresh_pipeline.py
+
+      - name: Player-position map self-test
+        run: python3 scripts/utilities/generate_player_positions.py --selftest
+
+      - name: Regenerate player-position map
+        run: python3 scripts/utilities/generate_player_positions.py
+
+      - name: Sleeper projections self-test
+        run: python3 scripts/projections/sleeper_projections_pipeline.py --selftest
+
+      - name: Refresh Sleeper projections
+        run: python3 scripts/projections/sleeper_projections_pipeline.py
+
+      - name: Sleeper IDP filter self-test
+        run: python3 scripts/projections/filter_sleeper_idp_only.py --selftest
+
+      - name: Refresh Sleeper IDP-only subset
+        run: python3 scripts/projections/filter_sleeper_idp_only.py
+
+      - name: FantasyPros pipeline self-test
+        run: python3 scripts/projections/fantasypros_api_pipeline.py --selftest
+
+      - name: Refresh FantasyPros projections
+        env:
+          FANTASYPROS_API_KEY: ${{ secrets.FANTASYPROS_API_KEY }}
+        run: python3 scripts/projections/fantasypros_api_pipeline.py
+
+      - name: Identity resolver self-test
+        run: python3 scripts/projections/resolve_fantasypros_sleeper_identity.py --selftest
+
+      - name: Refresh FantasyPros-Sleeper identity crosswalk
+        run: python3 scripts/projections/resolve_fantasypros_sleeper_identity.py
+
+      - name: Dual-eligibility self-test
+        if: steps.mode.outputs.mode == 'full'
+        run: python3 scripts/validation/dual_eligibility_pipeline.py --selftest
+
+      - name: Refresh dual-eligibility audit
+        if: steps.mode.outputs.mode == 'full'
+        run: python3 scripts/validation/dual_eligibility_pipeline.py
+
+      - name: Derived-state self-test
+        run: python3 scripts/maintenance/refresh_repo_derived_state.py --selftest
+
+      - name: Refresh deterministic derived state
+        run: python3 scripts/maintenance/refresh_repo_derived_state.py --write
+
+      - name: Stage refreshed data
+        run: |
+          git add             data/             free-agent-board.html             scripts/artifacts/generated/player_positions.json             scripts/artifacts/generated/player_team_refresh.json             scripts/sleeper_2026_projections.json             scripts/artifacts/generated/sleeper_2026_raw_categories.json             scripts/artifacts/generated/sleeper_2026_raw_weekly.json             scripts/sleeper_2026_idp_only.json             scripts/artifacts/generated/fantasypros_api_raw_2026.json             scripts/fantasypros_api_normalized_2026.json             scripts/artifacts/reports/fantasypros_api_pipeline_report.md             scripts/identity_crosswalk.json             scripts/artifacts/reports/identity_collision_report.md             scripts/artifacts/generated/dual_eligibility_results.json
+          git status --short
+
+      - name: Commit and push refreshed data
+        shell: bash
+        run: |
+          git config user.name "trade-desk-refresh-bot"
+          git config user.email "actions@users.noreply.github.com"
+
+          if git diff --cached --quiet; then
+            echo "No refreshed data changed; nothing to commit."
+          else
+            git commit -m "Automated data refresh (${{ steps.mode.outputs.mode }})"
+            git push origin main
+          fi
