@@ -36,8 +36,7 @@ import validate_idp_v1_final_deployment
 import validate_free_agent_valuation_parity
 from utilities.generate_player_positions import parse_player_positions, build_player_position_lookup
 
-IDP_V1_RELEASE_DIR = REPO_ROOT / "model" / "releases" / "idp-v1"
-IDP_V1_RELEASE_MANIFEST = IDP_V1_RELEASE_DIR / "idp_v1_release_manifest.json"
+IDP_V1_RELEASE_MANIFEST = SCRIPT_DIR.parent / "artifacts" / "releases" / "idp_v1" / "idp_v1_release_manifest.json"
 
 
 def _sha256_file(path):
@@ -338,7 +337,7 @@ def check_aliases_and_ktc_positions():
 
 def check_idp_v1_projection_invariants():
     idp_v1_projection.run_selftest()
-    baseline_path = IDP_V1_RELEASE_DIR / "prod_mult_pre_v1_baseline.json"
+    baseline_path = SCRIPT_DIR.parent / "artifacts" / "releases" / "idp_v1" / "prod_mult_pre_v1_baseline.json"
     assert baseline_path.exists(), "missing immutable pre-V1 PROD_MULT baseline snapshot"
     baseline = json.load(open(baseline_path))
     assert baseline.get("snapshot_type") == "baked_prod_mult_data"
@@ -354,7 +353,7 @@ def check_canonical_history_and_v1_bridge():
     production_history_component.run_selftest()
     manifest = _validate_idp_v1_release_manifest()
 
-    frozen_history = json.load(open(IDP_V1_RELEASE_DIR / "production_history_components.json"))
+    frozen_history = json.load(open(SCRIPT_DIR.parent / "artifacts" / "releases" / "idp_v1" / "production_history_components.json"))
     assert frozen_history.get("method") == "canonical_history_component_v1_preserve_legacy_math"
     assert len(frozen_history.get("players", {})) == 858
 
@@ -376,7 +375,7 @@ def check_canonical_history_and_v1_bridge():
             "despite identical release source/code snapshots"
         )
 
-    bridge = json.load(open(IDP_V1_RELEASE_DIR / "idp_v1_model_delta_transport_candidate.json"))
+    bridge = json.load(open(SCRIPT_DIR.parent / "artifacts" / "releases" / "idp_v1" / "idp_v1_model_delta_transport_candidate.json"))
     players = bridge["players"]
     assert len(players) == 404, f"unexpected frozen IDP bridge population: {len(players)}"
     assert bridge["comparable_player_count"] == 330, bridge["comparable_player_count"]
@@ -418,9 +417,9 @@ def check_canonical_history_and_v1_bridge():
 
 
 def check_preferred_bake_preview_invariants():
-    patch_path = IDP_V1_RELEASE_DIR / "idp_v1_prod_mult_patch.json"
-    candidate_path = IDP_V1_RELEASE_DIR / "idp_v1_model_delta_transport_candidate.json"
-    baseline_path = IDP_V1_RELEASE_DIR / "prod_mult_pre_v1_baseline.json"
+    patch_path = SCRIPT_DIR.parent / "artifacts" / "releases" / "idp_v1" / "idp_v1_prod_mult_patch.json"
+    candidate_path = SCRIPT_DIR.parent / "artifacts" / "releases" / "idp_v1" / "idp_v1_model_delta_transport_candidate.json"
+    baseline_path = SCRIPT_DIR.parent / "artifacts" / "releases" / "idp_v1" / "prod_mult_pre_v1_baseline.json"
     assert patch_path.exists() and candidate_path.exists(), "preferred V1 preview artifacts missing"
 
     patch = json.load(open(patch_path))
