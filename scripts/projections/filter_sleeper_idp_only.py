@@ -2,7 +2,7 @@
 """
 scripts/projections/filter_sleeper_idp_only.py
 
-Reads scripts/sleeper_2026_raw_categories.json and writes the smaller
+Reads scripts/artifacts/generated/sleeper_2026_raw_categories.json and writes the smaller
 scripts/sleeper_2026_idp_only.json convenience view.
 
 USAGE: python3 scripts/projections/filter_sleeper_idp_only.py
@@ -15,7 +15,7 @@ import sys
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS_DIR = os.path.dirname(SCRIPT_DIR)
-IN_PATH = os.path.join(SCRIPTS_DIR, "sleeper_2026_raw_categories.json")
+IN_PATH = os.path.join(SCRIPTS_DIR, "artifacts", "generated", "sleeper_2026_raw_categories.json")
 OUT_PATH = os.path.join(SCRIPTS_DIR, "sleeper_2026_idp_only.json")
 
 IDP_POSITIONS = {"LB", "OLB", "ILB", "MLB", "DL", "DE", "DT", "NT",
