@@ -11,8 +11,8 @@ Artifacts refreshed:
 
 Explicitly NOT refreshed here:
   * deployed/frozen IDP V1 release artifacts such as
-    scripts/production_history_components.json, the approved candidate, patch,
-    and pre-V1 baseline. Those are release evidence, not rolling derived state.
+    scripts/artifacts/releases/idp_v1/production_history_components.json,
+    the approved candidate, patch, and pre-V1 baseline. Those are release evidence, not rolling derived state.
     Later source refreshes are allowed to diverge without rewriting the release.
 
 The point is to make a manual GitHub Actions validation run self-contained:
