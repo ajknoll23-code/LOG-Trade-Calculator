@@ -353,7 +353,7 @@ def check_canonical_history_and_v1_bridge():
     production_history_component.run_selftest()
     manifest = _validate_idp_v1_release_manifest()
 
-    frozen_history = json.load(open(SCRIPT_DIR.parent / "production_history_components.json"))
+    frozen_history = json.load(open(SCRIPT_DIR.parent / "artifacts" / "releases" / "idp_v1" / "production_history_components.json"))
     assert frozen_history.get("method") == "canonical_history_component_v1_preserve_legacy_math"
     assert len(frozen_history.get("players", {})) == 858
 
