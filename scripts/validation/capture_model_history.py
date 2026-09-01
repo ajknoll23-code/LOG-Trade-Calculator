@@ -55,6 +55,7 @@ SLEEPER_CATEGORIES_PATH = (
 FANTASYPROS_PATH = REPO_ROOT / "scripts" / "fantasypros_api_normalized_2026.json"
 KTC_PATH = REPO_ROOT / "scripts" / "artifacts" / "generated" / "ktc_ratings.json"
 IDENTITY_CROSSWALK_PATH = REPO_ROOT / "scripts" / "identity_crosswalk.json"
+VALUE_UNCERTAINTY_PATH = REPO_ROOT / "scripts" / "artifacts" / "generated" / "value_uncertainty.json"
 
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "research" / "model-history" / "snapshots"
 
@@ -230,6 +231,42 @@ def compact_identity_crosswalk(rows: Any) -> list[dict[str, Any]]:
     ]
 
 
+
+def compact_value_uncertainty(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise RuntimeError("Value uncertainty artifact must contain a JSON object")
+    players = payload.get("players")
+    if not isinstance(players, dict) or len(players) < 500:
+        raise RuntimeError("Value uncertainty artifact has implausibly few players")
+
+    compact_players = {}
+    for key, row in players.items():
+        if not isinstance(row, dict):
+            continue
+        signals = row.get("signals") or {}
+        compact_players[str(key)] = {
+            "center_value": row.get("center_value"),
+            "range_low": row.get("range_low"),
+            "range_high": row.get("range_high"),
+            "relative_half_width": row.get("relative_half_width"),
+            "uncertainty_tier": row.get("uncertainty_tier"),
+            "projection_provider_count": signals.get("projection_provider_count"),
+            "provider_disagreement_component": signals.get("provider_disagreement_component"),
+            "history_sampling_component": signals.get("history_sampling_component"),
+            "availability_component": signals.get("availability_component"),
+            "history_games_2025": signals.get("history_games_2025"),
+        }
+
+    return {
+        "method_version": payload.get("method_version"),
+        "range_semantics": payload.get("range_semantics"),
+        "policy_sha256": payload.get("policy_sha256"),
+        "counts": payload.get("counts"),
+        "position_cohorts": payload.get("position_cohorts"),
+        "players": compact_players,
+    }
+
+
 def build_snapshot(mode: str) -> dict[str, Any]:
     required_paths = {
         "index_html": INDEX_PATH,
@@ -238,6 +275,7 @@ def build_snapshot(mode: str) -> dict[str, Any]:
         "fantasypros_normalized": FANTASYPROS_PATH,
         "ktc_ratings": KTC_PATH,
         "identity_crosswalk": IDENTITY_CROSSWALK_PATH,
+        "value_uncertainty": VALUE_UNCERTAINTY_PATH,
     }
 
     for path in required_paths.values():
@@ -253,11 +291,13 @@ def build_snapshot(mode: str) -> dict[str, Any]:
     fantasypros_raw = read_json(FANTASYPROS_PATH)
     ktc_raw = read_json(KTC_PATH)
     identity_raw = read_json(IDENTITY_CROSSWALK_PATH)
+    uncertainty_raw = read_json(VALUE_UNCERTAINTY_PATH)
 
     sleeper_projections = compact_sleeper_projection_rows(sleeper_projections_raw)
     sleeper_categories = compact_sleeper_category_rows(sleeper_categories_raw)
     fantasypros = compact_fantasypros(fantasypros_raw)
     identity_crosswalk = compact_identity_crosswalk(identity_raw)
+    value_uncertainty = compact_value_uncertainty(uncertainty_raw)
 
     source_hashes = {
         name: sha256_file(path)
@@ -325,6 +365,7 @@ def build_snapshot(mode: str) -> dict[str, Any]:
                 "row_count": len(identity_crosswalk),
                 "rows": identity_crosswalk,
             },
+            "value_uncertainty": value_uncertainty,
         },
     }
 
@@ -354,6 +395,7 @@ def validate_snapshot(snapshot: dict[str, Any]) -> None:
     fp = sources.get("fantasypros") or {}
     ktc = sources.get("ktc") or {}
     crosswalk = sources.get("identity_crosswalk") or {}
+    uncertainty = sources.get("value_uncertainty") or {}
 
     if sleeper.get("projection_player_count", 0) < 100:
         raise RuntimeError("Sleeper history capture has implausibly few projection players")
@@ -365,9 +407,14 @@ def validate_snapshot(snapshot: dict[str, Any]) -> None:
         raise RuntimeError("KTC history capture is missing total_votes_counted")
     if crosswalk.get("row_count", 0) < 100:
         raise RuntimeError("Identity history capture has implausibly few rows")
+    uncertainty_players = uncertainty.get("players")
+    if not isinstance(uncertainty_players, dict) or len(uncertainty_players) < 500:
+        raise RuntimeError("Uncertainty history capture has implausibly few players")
+    if uncertainty.get("range_semantics") != "sensitivity_envelope_v1_not_probability_interval":
+        raise RuntimeError("Uncertainty history capture has unexpected range semantics")
 
     source_hashes = snapshot.get("source_file_sha256") or {}
-    if len(source_hashes) != 6 or any(len(str(v)) != 64 for v in source_hashes.values()):
+    if len(source_hashes) != 7 or any(len(str(v)) != 64 for v in source_hashes.values()):
         raise RuntimeError("Model-history source SHA256 manifest is incomplete")
 
 
