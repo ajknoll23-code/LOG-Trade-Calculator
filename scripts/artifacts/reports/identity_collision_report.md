@@ -1,6 +1,6 @@
 # Identity Resolution Collision Report
 
-539 total FantasyPros IDP players. 472 high-confidence, 11 medium-confidence (not auto-assigned, needs review), 56 with no Sleeper candidate, 11 total requiring manual review.
+539 total FantasyPros IDP players. 471 high-confidence, 12 medium-confidence (not auto-assigned, needs review), 56 with no Sleeper candidate, 12 total requiring manual review.
 
 
 **no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Mack Wilson Sr.", "fp_team": "ARI"}
@@ -89,7 +89,7 @@
 
 **no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Jarvis Brownlee Jr.", "fp_team": "NYJ"}
 
-**team_mismatch**: {"type": "team_mismatch", "fp_name": "Dayo Odeyingbo", "fp_team": "FA", "sleeper_team": "CHI", "candidate_sleeper_id": "7649"}
+**team_mismatch**: {"type": "team_mismatch", "fp_name": "Dayo Odeyingbo", "fp_team": "FA", "sleeper_team": null, "candidate_sleeper_id": "7649"}
 
 **no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Thomas Booker IV", "fp_team": "LV"}
 
@@ -141,10 +141,12 @@
 
 **team_mismatch**: {"type": "team_mismatch", "fp_name": "Elandon Roberts", "fp_team": "FA", "sleeper_team": null, "candidate_sleeper_id": "3369"}
 
-**team_mismatch**: {"type": "team_mismatch", "fp_name": "Joe Giles-Harris", "fp_team": "FA", "sleeper_team": "CIN", "candidate_sleeper_id": "6105"}
+**team_mismatch**: {"type": "team_mismatch", "fp_name": "Joe Giles-Harris", "fp_team": "FA", "sleeper_team": null, "candidate_sleeper_id": "6105"}
 
 **team_mismatch**: {"type": "team_mismatch", "fp_name": "Troy Reeder", "fp_team": "FA", "sleeper_team": null, "candidate_sleeper_id": "6353"}
 
 **team_mismatch**: {"type": "team_mismatch", "fp_name": "Malik Harrison", "fp_team": "FA", "sleeper_team": null, "candidate_sleeper_id": "6867"}
+
+**team_mismatch**: {"type": "team_mismatch", "fp_name": "Zach Harrison", "fp_team": "FA", "sleeper_team": null, "candidate_sleeper_id": "10934"}
 
 **no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "A.J. Green III", "fp_team": "MIA"}
