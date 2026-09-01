@@ -113,7 +113,7 @@ def load_json(path: Path) -> Any:
         raise RuntimeError(f"Invalid JSON in {path.relative_to(REPO_ROOT)}: {exc}") from exc
 
 
-def build_sleeper_identity_index(rows: Any):
+def build_sleeper_identity_index(rows: Any, minimum_ids: int = 500):
     if not isinstance(rows, list):
         raise RuntimeError("Sleeper raw-category identity source must be a JSON list")
 
@@ -136,8 +136,11 @@ def build_sleeper_identity_index(rows: Any):
         by_name[name].append(compact)
         by_id[sid] = compact
 
-    if len(by_id) < 500:
-        raise RuntimeError(f"Sleeper identity source is unexpectedly small: {len(by_id)} IDs")
+    if len(by_id) < minimum_ids:
+        raise RuntimeError(
+            f"Sleeper identity source is unexpectedly small: {len(by_id)} IDs "
+            f"(minimum required: {minimum_ids})"
+        )
     return dict(by_name), by_id
 
 
@@ -449,7 +452,9 @@ def run_selftest():
         {"sleeper_id": "10917", "player": "byron young", "pos": "LB", "team": "LAR", "fantasy_positions": ["DL", "LB"]},
         {"sleeper_id": "10925", "player": "byron young", "pos": "DL", "team": "PHI", "fantasy_positions": ["DL"]},
     ]
-    syn_by_name, syn_by_id = build_sleeper_identity_index(synthetic_identity_rows)
+    syn_by_name, syn_by_id = build_sleeper_identity_index(
+        synthetic_identity_rows, minimum_ids=1
+    )
     syn_resolved, syn_unresolved = resolve_model_identities(
         synthetic_player_db, syn_by_name, syn_by_id
     )
