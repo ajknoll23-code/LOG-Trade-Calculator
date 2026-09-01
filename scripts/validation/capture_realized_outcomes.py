@@ -79,6 +79,15 @@ SCORING_FIELDS = (
     "st_td", "st_ff", "st_fum_rec",
 )
 
+# Current PLAYER_DB display keys that intentionally differ from Sleeper's
+# canonical player names. These are outcome-layer identity aliases only; they
+# do not change production valuation names or the historical PPG pipeline.
+OUTCOME_ALIASES = {
+    "michael penix jr": "michael penix",
+    "bam knight": "zonovan knight",
+    "harold perkins jr": "harold perkins",
+}
+
 
 def normalize_name(value: str) -> str:
     value = (value or "").strip().lower()
@@ -138,6 +147,7 @@ def resolve_model_identities(player_db, by_name, by_id):
 
     for model_key, info in player_db.items():
         model_pos = str(info.get("pos") or "")
+        model_team = str(info.get("team") or "").upper()
         key = normalize_name(model_key)
 
         override = ppg_pipeline.MANUAL_ID_OVERRIDES.get(key)
@@ -147,29 +157,43 @@ def resolve_model_identities(player_db, by_name, by_id):
                 **row,
                 "model_key": model_key,
                 "model_pos": model_pos,
+                "model_team": model_team,
                 "match_method": "ppg_manual_sleeper_id_override",
             }
             continue
 
+        # Prefer the model key itself, then outcome-specific aliases, then the
+        # broader historical PPG aliases. Keeping this ordered makes the audit
+        # trail deterministic and prevents an alias from overriding an exact
+        # canonical Sleeper name.
         search_names = [key]
-        alias = ppg_pipeline.ALIASES.get(key)
-        if alias:
-            alias = normalize_name(alias)
-            if alias not in search_names:
-                search_names.append(alias)
+        for alias in (OUTCOME_ALIASES.get(key), ppg_pipeline.ALIASES.get(key)):
+            if alias:
+                alias = normalize_name(alias)
+                if alias not in search_names:
+                    search_names.append(alias)
 
         chosen = None
         chosen_method = None
         reason = None
+
         for i, search_name in enumerate(search_names):
             candidates = by_name.get(search_name, [])
             if not candidates:
                 continue
+
+            name_method = (
+                "exact_name"
+                if i == 0
+                else ("outcome_alias" if OUTCOME_ALIASES.get(key) == search_name else "ppg_alias")
+            )
+
             if len(candidates) == 1:
                 chosen = candidates[0]
-                chosen_method = "exact_name" if i == 0 else "ppg_alias"
+                chosen_method = name_method
                 break
 
+            # First collision-breaker: model fantasy position.
             pos_matches = [
                 c for c in candidates
                 if model_pos in (c.get("fantasy_positions") or [])
@@ -177,14 +201,31 @@ def resolve_model_identities(player_db, by_name, by_id):
             ]
             if len(pos_matches) == 1:
                 chosen = pos_matches[0]
-                chosen_method = (
-                    "exact_name_position_disambiguated"
-                    if i == 0 else "ppg_alias_position_disambiguated"
-                )
+                chosen_method = f"{name_method}_position_disambiguated"
                 break
+
+            # Second collision-breaker: current PLAYER_DB team. This resolves
+            # legitimate same-name/same-fantasy-position cases such as:
+            #   Jaylon Jones IND vs Jaylon Jones CHI
+            #   Byron Young LAR vs Byron Young PHI
+            # without hard-coding those player IDs into this script.
+            team_pool = pos_matches if pos_matches else candidates
+            if model_team:
+                team_matches = [
+                    c for c in team_pool
+                    if str(c.get("team") or "").upper() == model_team
+                ]
+                if len(team_matches) == 1:
+                    chosen = team_matches[0]
+                    chosen_method = f"{name_method}_team_disambiguated"
+                    break
+            else:
+                team_matches = []
+
             reason = (
                 f"{len(candidates)} candidates for {search_name!r}; "
-                f"{len(pos_matches)} matched model position {model_pos!r}"
+                f"{len(pos_matches)} matched model position {model_pos!r}; "
+                f"{len(team_matches)} matched model team {model_team!r}"
             )
 
         if chosen:
@@ -192,12 +233,14 @@ def resolve_model_identities(player_db, by_name, by_id):
                 **chosen,
                 "model_key": model_key,
                 "model_pos": model_pos,
+                "model_team": model_team,
                 "match_method": chosen_method,
             }
         else:
             unresolved.append({
                 "model_key": model_key,
                 "model_pos": model_pos,
+                "model_team": model_team,
                 "reason": reason or "no Sleeper identity candidate",
             })
 
@@ -388,6 +431,35 @@ def run_selftest():
             "model_key": "test lb", "model_pos": "LB", "match_method": "synthetic",
         },
     }
+    # Identity regression: aliases + same-name/team disambiguation that were
+    # found by the first real 565-player outcome capture.
+    synthetic_player_db = {
+        "michael penix jr": {"pos": "QB", "team": "ATL"},
+        "bam knight": {"pos": "RB", "team": "ARI"},
+        "harold perkins jr": {"pos": "LB", "team": "ATL"},
+        "jaylon jones": {"pos": "DB", "team": "IND"},
+        "byron young": {"pos": "DL", "team": "LAR"},
+    }
+    synthetic_identity_rows = [
+        {"sleeper_id": "11559", "player": "michael penix", "pos": "QB", "team": "ATL", "fantasy_positions": ["QB"]},
+        {"sleeper_id": "8122", "player": "zonovan knight", "pos": "RB", "team": "ARI", "fantasy_positions": ["RB"]},
+        {"sleeper_id": "13555", "player": "harold perkins", "pos": "LB", "team": "ATL", "fantasy_positions": ["LB"]},
+        {"sleeper_id": "11052", "player": "jaylon jones", "pos": "DB", "team": "IND", "fantasy_positions": ["DB"]},
+        {"sleeper_id": "8702", "player": "jaylon jones", "pos": "CB", "team": "CHI", "fantasy_positions": ["DB"]},
+        {"sleeper_id": "10917", "player": "byron young", "pos": "LB", "team": "LAR", "fantasy_positions": ["DL", "LB"]},
+        {"sleeper_id": "10925", "player": "byron young", "pos": "DL", "team": "PHI", "fantasy_positions": ["DL"]},
+    ]
+    syn_by_name, syn_by_id = build_sleeper_identity_index(synthetic_identity_rows)
+    syn_resolved, syn_unresolved = resolve_model_identities(
+        synthetic_player_db, syn_by_name, syn_by_id
+    )
+    assert not syn_unresolved, syn_unresolved
+    assert syn_resolved["michael penix jr"]["sleeper_id"] == "11559"
+    assert syn_resolved["bam knight"]["sleeper_id"] == "8122"
+    assert syn_resolved["harold perkins jr"]["sleeper_id"] == "13555"
+    assert syn_resolved["jaylon jones"]["sleeper_id"] == "11052"
+    assert syn_resolved["byron young"]["sleeper_id"] == "10917"
+
     rows = build_week_rows({"1": offense, "2": idp, "3": {"gp": 0, "rec": 10}}, synthetic_resolved)
     assert len(rows) == 2
     by_sid = {r["sleeper_id"]: r for r in rows}
