@@ -41,15 +41,15 @@ Per external review: a field existing in the schema doesn't mean it's actually p
 
 | Field | Nonzero players | % nonzero |
 |---|---|---|
-| def_tackle | 531 | 98.5% |
-| def_assist | 531 | 98.5% |
-| def_sack | 531 | 98.5% |
+| def_tackle | 524 | 97.2% |
+| def_assist | 524 | 97.2% |
+| def_sack | 524 | 97.2% |
 | def_tlost | 0 | 0.0%  **UNPOPULATED** |
-| def_int | 511 | 94.8% |
-| def_pd | 531 | 98.5% |
-| def_ff | 530 | 98.3% |
-| def_fr | 531 | 98.5% |
-| def_td | 523 | 97.0% |
+| def_int | 505 | 93.7% |
+| def_pd | 524 | 97.2% |
+| def_ff | 523 | 97.0% |
+| def_fr | 524 | 97.2% |
+| def_td | 516 | 95.7% |
 | def_safety | 0 | 0.0%  **UNPOPULATED** |
 
 **def_tlost (TFL) is unpopulated across the entire real IDP population.** This directly affects the archetype investigation this pipeline exists to support -- if TFL isn't real, usable data, that specific piece of the EDGE-vs-tackle-volume question stays unresolved by this source.

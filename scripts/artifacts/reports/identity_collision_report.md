@@ -11,11 +11,13 @@
 
 **no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Demetrius Knight Jr.", "fp_team": "CIN"}
 
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Derwin James Jr.", "fp_team": "LAC"}
-
 **no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Dante Trader Jr.", "fp_team": "MIA"}
 
+**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Derwin James Jr.", "fp_team": "LAC"}
+
 **no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Antoine Winfield Jr.", "fp_team": "TB"}
+
+**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Kevin Winston Jr.", "fp_team": "TEN"}
 
 **no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Kevin Byard III", "fp_team": "NE"}
 
@@ -27,15 +29,17 @@
 
 **no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Ronnie Hickman Jr.", "fp_team": "CLE"}
 
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Kevin Winston Jr.", "fp_team": "TEN"}
-
 **no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Carlton Davis III", "fp_team": "NE"}
+
+**collision_resolved_by_team**: {"type": "collision_resolved_by_team", "fp_name": "Chris Johnson", "fp_team": "MIA", "resolved_sleeper_id": "13370", "total_candidates": 2, "position_compatible": true}
 
 **no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Will Anderson Jr.", "fp_team": "HOU"}
 
 **no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Mike Jackson Sr.", "fp_team": "CAR"}
 
 **no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Joey Porter Jr.", "fp_team": "PIT"}
+
+**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Billy Bowman Jr.", "fp_team": "ATL"}
 
 **collision_resolved_by_team**: {"type": "collision_resolved_by_team", "fp_name": "Byron Young", "fp_team": "LAR", "resolved_sleeper_id": "10917", "total_candidates": 2, "position_compatible": true}
 
@@ -49,13 +53,13 @@
 
 **collision_resolved_by_team**: {"type": "collision_resolved_by_team", "fp_name": "Marcus Harris", "fp_team": "TEN", "resolved_sleeper_id": "12712", "total_candidates": 2, "position_compatible": true}
 
-**collision_resolved_by_team**: {"type": "collision_resolved_by_team", "fp_name": "Chris Johnson", "fp_team": "MIA", "resolved_sleeper_id": "13370", "total_candidates": 2, "position_compatible": true}
-
 **no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Byron Murphy II", "fp_team": "SEA"}
 
 **no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Derek Stingley Jr.", "fp_team": "HOU"}
 
 **team_match_position_incompatible**: {"type": "team_match_position_incompatible", "fp_name": "Austin Booker", "fp_team": "CHI", "sleeper_id": "11760"}
+
+**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Jason Marshall Jr.", "fp_team": "MIA"}
 
 **no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Jermaine Johnson II", "fp_team": "TEN"}
 
@@ -72,10 +76,6 @@
 **collision_resolved_by_team**: {"type": "collision_resolved_by_team", "fp_name": "Myles Murphy", "fp_team": "CIN", "resolved_sleeper_id": "10875", "total_candidates": 2, "position_compatible": true}
 
 **no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Dorance Armstrong Jr.", "fp_team": "WAS"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Billy Bowman Jr.", "fp_team": "ATL"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Jason Marshall Jr.", "fp_team": "MIA"}
 
 **no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Harold Landry III", "fp_team": "NE"}
 
@@ -99,6 +99,8 @@
 
 **no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Bobby Brown III", "fp_team": "CAR"}
 
+**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Gervon Dexter Sr.", "fp_team": "ATL"}
+
 **no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Dexter Lawrence II", "fp_team": "CIN"}
 
 **team_mismatch**: {"type": "team_mismatch", "fp_name": "Tyrel Dodson", "fp_team": "FA", "sleeper_team": null, "candidate_sleeper_id": "6315"}
@@ -114,10 +116,6 @@
 **team_match_position_incompatible**: {"type": "team_match_position_incompatible", "fp_name": "Jonah Elliss", "fp_team": "DEN", "sleeper_id": "11714"}
 
 **team_match_position_incompatible**: {"type": "team_match_position_incompatible", "fp_name": "Gabe Jacas", "fp_team": "NE", "sleeper_id": "13457"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Gervon Dexter Sr.", "fp_team": "ATL"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "A.J. Green III", "fp_team": "MIA"}
 
 **no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "James Pearce Jr.", "fp_team": "ATL"}
 
@@ -149,4 +147,6 @@
 
 **team_mismatch**: {"type": "team_mismatch", "fp_name": "Malik Harrison", "fp_team": "FA", "sleeper_team": null, "candidate_sleeper_id": "6867"}
 
-**team_mismatch**: {"type": "team_mismatch", "fp_name": "Geno Stone", "fp_team": "FA", "sleeper_team": null, "candidate_sleeper_id": "6923"}
+**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "A.J. Green III", "fp_team": "MIA"}
+
+**team_mismatch**: {"type": "team_mismatch", "fp_name": "Geno Stone", "fp_team": "FA", "sleeper_team": "BUF", "candidate_sleeper_id": "6923"}
