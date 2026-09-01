@@ -88,6 +88,16 @@ OUTCOME_ALIASES = {
     "harold perkins jr": "harold perkins",
 }
 
+# Audited same-name collisions where name + fantasy position are insufficient.
+# These IDs were verified against the refreshed Sleeper pool and the intended
+# PLAYER_DB players:
+#   Jaylon Jones (IND) -> 11052
+#   Byron Young (LAR) -> 10917
+OUTCOME_ID_OVERRIDES = {
+    "jaylon jones": "11052",
+    "byron young": "10917",
+}
+
 
 def normalize_name(value: str) -> str:
     value = (value or "").strip().lower()
@@ -153,7 +163,7 @@ def resolve_model_identities(player_db, by_name, by_id):
         model_team = str(info.get("team") or "").upper()
         key = normalize_name(model_key)
 
-        override = ppg_pipeline.MANUAL_ID_OVERRIDES.get(key)
+        override = OUTCOME_ID_OVERRIDES.get(key) or ppg_pipeline.MANUAL_ID_OVERRIDES.get(key)
         if override and str(override) in by_id:
             row = by_id[str(override)]
             resolved[model_key] = {
@@ -161,7 +171,11 @@ def resolve_model_identities(player_db, by_name, by_id):
                 "model_key": model_key,
                 "model_pos": model_pos,
                 "model_team": model_team,
-                "match_method": "ppg_manual_sleeper_id_override",
+                "match_method": (
+                    "outcome_manual_sleeper_id_override"
+                    if key in OUTCOME_ID_OVERRIDES
+                    else "ppg_manual_sleeper_id_override"
+                ),
             }
             continue
 
@@ -462,6 +476,8 @@ def run_selftest():
     assert syn_resolved["michael penix jr"]["sleeper_id"] == "11559"
     assert syn_resolved["bam knight"]["sleeper_id"] == "8122"
     assert syn_resolved["harold perkins jr"]["sleeper_id"] == "13555"
+    assert OUTCOME_ID_OVERRIDES["jaylon jones"] == "11052"
+    assert OUTCOME_ID_OVERRIDES["byron young"] == "10917"
     assert syn_resolved["jaylon jones"]["sleeper_id"] == "11052"
     assert syn_resolved["byron young"]["sleeper_id"] == "10917"
 
