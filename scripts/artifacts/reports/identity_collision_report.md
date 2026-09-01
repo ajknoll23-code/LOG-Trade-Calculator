@@ -1,6 +1,6 @@
 # Identity Resolution Collision Report
 
-539 total FantasyPros IDP players. 471 high-confidence, 12 medium-confidence (not auto-assigned, needs review), 56 with no Sleeper candidate, 12 total requiring manual review.
+539 total FantasyPros IDP players. 472 high-confidence, 11 medium-confidence (not auto-assigned, needs review), 56 with no Sleeper candidate, 11 total requiring manual review.
 
 
 **no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Mack Wilson Sr.", "fp_team": "ARI"}
@@ -148,5 +148,3 @@
 **team_mismatch**: {"type": "team_mismatch", "fp_name": "Malik Harrison", "fp_team": "FA", "sleeper_team": null, "candidate_sleeper_id": "6867"}
 
 **no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "A.J. Green III", "fp_team": "MIA"}
-
-**team_mismatch**: {"type": "team_mismatch", "fp_name": "Geno Stone", "fp_team": "FA", "sleeper_team": "BUF", "candidate_sleeper_id": "6923"}
