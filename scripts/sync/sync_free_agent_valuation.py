@@ -195,6 +195,26 @@ def render_synced(index_text: str, board_text: str) -> str:
     s, e, _ = _extract_const_object(out, "PLAYER_DB")
     out = _replace_region(out, s, e, canonical_db)
 
+    # RB_CONTINUOUS_AGE_FREE_AGENT_PARITY_V1
+    # effectiveAgeMultiplier() depends on this compact DOB map. Keep it as a
+    # first-class canonical region beside PLAYER_DB. Older board copies do not
+    # have the constant yet, so insert it after PLAYER_DB on the first sync.
+    _, _, canonical_rb_birth_dates = _extract_const_object(
+        index_text, "RB_BIRTH_DATE_DATA"
+    )
+    try:
+        s, e, _ = _extract_const_object(out, "RB_BIRTH_DATE_DATA")
+    except ValueError:
+        _, db_end, _ = _extract_const_object(out, "PLAYER_DB")
+        out = (
+            out[:db_end]
+            + "\n\n"
+            + canonical_rb_birth_dates
+            + out[db_end:]
+        )
+    else:
+        out = _replace_region(out, s, e, canonical_rb_birth_dates)
+
     _, _, canonical_core = _extract_core(index_text)
     s, e, _ = _extract_core(out)
     out = _replace_region(out, s, e, canonical_core)
@@ -208,6 +228,10 @@ def parity_regions(index_text: str, board_text: str) -> dict[str, bool]:
         "core": _extract_core(index_text)[2] == _extract_core(board_text)[2],
         "player_db": _extract_const_object(index_text, "PLAYER_DB")[2]
         == _extract_const_object(board_text, "PLAYER_DB")[2],
+        "rb_birth_date_data": _extract_const_object(
+            index_text, "RB_BIRTH_DATE_DATA"
+        )[2]
+        == _extract_const_object(board_text, "RB_BIRTH_DATE_DATA")[2],
         "aliases": _extract_alias_region(index_text)[2] == _extract_alias_region(board_text)[2],
         "normalize_name": _extract_function(index_text, "normalizeName")[2]
         == _extract_function(board_text, "normalizeName")[2],

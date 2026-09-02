@@ -28,7 +28,7 @@ import json
 import math
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 
@@ -79,6 +79,17 @@ def parse_simple_numeric_object(body):
     return out
 
 
+def parse_simple_string_object(body):
+    pairs = re.findall(
+        r'(?:\'([^\']+)\'|"([^"]+)")\s*:\s*(?:\'([^\']*)\'|"([^"]*)")',
+        body,
+    )
+    out = {}
+    for key_single, key_double, value_single, value_double in pairs:
+        out[key_single or key_double] = value_single or value_double
+    return out
+
+
 def load_from_html(html_path):
     content = Path(html_path).read_text(encoding="utf-8")
 
@@ -97,6 +108,9 @@ def load_from_html(html_path):
     no_history = set(re.findall(r"'([^']+)'\s*:\s*1\b", extract_object_body(content, "NO_REAL_PRODUCTION_HISTORY")))
     position_weight = parse_simple_numeric_object(extract_object_body(content, "POSITION_WEIGHT"))
     role_mult = parse_simple_numeric_object(extract_object_body(content, "ROLE_MULT"))
+    rb_birth_date_data = parse_simple_string_object(
+        extract_object_body(content, "RB_BIRTH_DATE_DATA")
+    )
 
     age_curve_body = extract_object_body(content, "AGE_CURVE")
     age_curve_pattern = re.compile(
@@ -115,6 +129,7 @@ def load_from_html(html_path):
         "no_real_history": no_history,
         "position_weight": position_weight,
         "role_mult": role_mult,
+        "rb_birth_date_data": rb_birth_date_data,
         "age_curve": age_curve,
         "qb_post_peak_floor": extract_scalar(content, "QB_POST_PEAK_FLOOR"),
         "lb_post_peak_decay_power": extract_scalar(content, "LB_POST_PEAK_DECAY_POWER"),
@@ -178,6 +193,121 @@ def age_multiplier(pos, age, role, real_production, raw_production, cfg):
     return max(0.62, 1.0 - t * 0.38)
 
 
+def normalize_lookup_name(name):
+    s = str(name or "").strip().lower()
+    s = re.sub(r"[.'’\-]", "", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def fractional_age_from_birth_date(birth_date, fallback_age, as_of=None):
+    if not isinstance(birth_date, str):
+        return fallback_age
+    try:
+        dob = date.fromisoformat(birth_date[:10])
+    except ValueError:
+        return fallback_age
+
+    if as_of is None:
+        as_of = datetime.now(timezone.utc).date()
+
+    def birthday_in_year(year):
+        try:
+            return date(year, dob.month, dob.day)
+        except ValueError:
+            if dob.month == 2 and dob.day == 29:
+                return date(year, 2, 28)
+            raise
+
+    birthday_year = as_of.year
+    last_birthday = birthday_in_year(birthday_year)
+    if as_of < last_birthday:
+        birthday_year -= 1
+        last_birthday = birthday_in_year(birthday_year)
+
+    next_birthday = birthday_in_year(birthday_year + 1)
+    span = (next_birthday - last_birthday).days
+    if span <= 0:
+        return fallback_age
+
+    age = (birthday_year - dob.year) + (as_of - last_birthday).days / span
+    return age if 18 <= age <= 45 else fallback_age
+
+
+def rb_monotone_age_anchor(age, role, real_production, raw_production, cfg):
+    anchor = age_multiplier(
+        "RB", age, role, real_production, raw_production, cfg
+    )
+    qualifies_elite_youth = (
+        role == "Elite"
+        and isinstance(raw_production, (int, float))
+        and raw_production >= 0.65
+    )
+    if qualifies_elite_youth and age in (23, 24):
+        a23 = age_multiplier(
+            "RB", 23, role, real_production, raw_production, cfg
+        )
+        a24 = age_multiplier(
+            "RB", 24, role, real_production, raw_production, cfg
+        )
+        return (a23 + a24) / 2.0
+    return anchor
+
+
+def rb_continuous_age_multiplier(
+    age, role, real_production, raw_production, cfg
+):
+    if not isinstance(age, (int, float)) or not math.isfinite(age):
+        return age_multiplier(
+            "RB", age, role, real_production, raw_production, cfg
+        )
+
+    lo = math.floor(age)
+    hi = math.ceil(age)
+    if lo == hi:
+        return rb_monotone_age_anchor(
+            lo, role, real_production, raw_production, cfg
+        )
+
+    a0 = rb_monotone_age_anchor(
+        lo, role, real_production, raw_production, cfg
+    )
+    a1 = rb_monotone_age_anchor(
+        hi, role, real_production, raw_production, cfg
+    )
+    t = age - lo
+    return a0 + t * (a1 - a0)
+
+
+def effective_age_multiplier(
+    pos,
+    age,
+    role,
+    key,
+    real_production,
+    raw_production,
+    cfg,
+    as_of=None,
+):
+    if pos != "RB":
+        return age_multiplier(
+            pos, age, role, real_production, raw_production, cfg
+        )
+
+    norm_key = normalize_lookup_name(key)
+    birth_date = cfg["rb_birth_date_data"].get(norm_key)
+    if not birth_date:
+        return age_multiplier(
+            pos, age, role, real_production, raw_production, cfg
+        )
+
+    fractional_age = fractional_age_from_birth_date(
+        birth_date, age, as_of=as_of
+    )
+    return rb_continuous_age_multiplier(
+        fractional_age, role, real_production, raw_production, cfg
+    )
+
+
 def compute_all_values(cfg):
     results = {}
     for key, info in cfg["player_db"].items():
@@ -189,7 +319,9 @@ def compute_all_values(cfg):
             cfg["no_real_history"],
             cfg["role_mult"],
         )
-        am = age_multiplier(pos, age, role, rm, raw_rm, cfg)
+        am = effective_age_multiplier(
+            pos, age, role, key, rm, raw_rm, cfg
+        )
         pw = cfg["position_weight"].get(pos, 1.0)
         # JavaScript Math.round() rounds positive .5 ties upward; Python's
         # built-in round() uses bankers rounding. Trade Desk values are
@@ -216,6 +348,7 @@ def run_selftest(html_path="index.html"):
     assert cfg["position_weight"]["LB"] == 1.12
     assert cfg["position_weight"]["DB"] == 0.87
     assert cfg["lb_post_peak_decay_power"] == 0.5
+    assert len(cfg["rb_birth_date_data"]) >= 85
 
     # Production-floor rescue must be lineage-gated.
     test_cfg = dict(cfg)

@@ -176,16 +176,21 @@ def live_js_values():
         "const PROD_MULT = PROD_MULT_DATA;",
         _extract_const_object(text, "NO_REAL_PRODUCTION_HISTORY"),
         _extract_const_object(text, "PLAYER_DB"),
+        _extract_const_object(text, "RB_BIRTH_DATE_DATA"),
         re.search(r"function normalizeName\(s\)\{.*?\n\}", text, re.S).group(0),
         _extract_function(text, "productionMultiplier"),
         _extract_function(text, "ageMultiplier"),
+        _extract_function(text, "fractionalAgeFromBirthDate"),
+        _extract_function(text, "rbMonotoneAgeAnchor"),
+        _extract_function(text, "rbContinuousAgeMultiplier"),
+        _extract_function(text, "effectiveAgeMultiplier"),
         _extract_function(text, "playerValue"),
         r"""
 const __rows = {};
 for (const [key, info] of Object.entries(PLAYER_DB)) {
   const rm = productionMultiplier(key, info.role);
   const rawRm = Object.prototype.hasOwnProperty.call(PROD_MULT, key) ? PROD_MULT[key] : null;
-  const am = ageMultiplier(info.pos, info.age, info.role, rm, rawRm);
+  const am = effectiveAgeMultiplier(info.pos, info.age, info.role, key, rm, rawRm);
   __rows[key] = {
     value: playerValue(info.pos, info.age, info.role, key),
     prod_mult: rm,

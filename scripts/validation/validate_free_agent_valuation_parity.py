@@ -68,18 +68,23 @@ def _run_node(js: str):
 def _board_canonical_values(board_text: str):
     core = sync_free_agent_valuation._extract_core(board_text)[2]
     player_db = sync_free_agent_valuation._extract_const_object(board_text, "PLAYER_DB")[2]
+    rb_birth_dates = sync_free_agent_valuation._extract_const_object(
+        board_text, "RB_BIRTH_DATE_DATA"
+    )[2]
     normalize = sync_free_agent_valuation._extract_function(board_text, "normalizeName")[2]
+    # RB_CONTINUOUS_AGE_FREE_AGENT_PARITY_V1
     js = "\n\n".join(
         [
             core,
             player_db,
+            rb_birth_dates,
             normalize,
             r"""
 const __rows = {};
 for (const [key, info] of Object.entries(PLAYER_DB)) {
   const rm = productionMultiplier(key, info.role);
   const rawRm = Object.prototype.hasOwnProperty.call(PROD_MULT, key) ? PROD_MULT[key] : null;
-  const am = ageMultiplier(info.pos, info.age, info.role, rm, rawRm);
+  const am = effectiveAgeMultiplier(info.pos, info.age, info.role, key, rm, rawRm);
   __rows[key] = {
     value: playerValue(info.pos, info.age, info.role, key),
     prod_mult: rm,
@@ -96,7 +101,11 @@ process.stdout.write(JSON.stringify(__rows));
 def _synthetic_js_values(board_text: str):
     core = sync_free_agent_valuation._extract_core(board_text)[2]
     player_db = sync_free_agent_valuation._extract_const_object(board_text, "PLAYER_DB")[2]
+    rb_birth_dates = sync_free_agent_valuation._extract_const_object(
+        board_text, "RB_BIRTH_DATE_DATA"
+    )[2]
     normalize = sync_free_agent_valuation._extract_function(board_text, "normalizeName")[2]
+    # RB_CONTINUOUS_AGE_FREE_AGENT_PARITY_V1
     cases = [
         ("floor_with_history", "WR", 23, "Depth", 0.15, False),
         ("floor_no_history", "WR", 23, "Depth", 0.15, True),
@@ -112,6 +121,7 @@ def _synthetic_js_values(board_text: str):
         [
             core,
             player_db,
+            rb_birth_dates,
             normalize,
             f"const __cases = {js_cases};",
             r"""
@@ -124,7 +134,7 @@ for (const [label, pos, age, role, prod, noHistory] of __cases) {
   if (noHistory) NO_REAL_PRODUCTION_HISTORY[key] = 1;
   const rm = productionMultiplier(key, role);
   const rawRm = Object.prototype.hasOwnProperty.call(PROD_MULT, key) ? PROD_MULT[key] : null;
-  const am = ageMultiplier(pos, age, role, rm, rawRm);
+  const am = effectiveAgeMultiplier(pos, age, role, key, rm, rawRm);
   __out[label] = {value: playerValue(pos, age, role, key), prod_mult: rm, age_mult: am};
   delete PROD_MULT[key];
   delete NO_REAL_PRODUCTION_HISTORY[key];
@@ -259,7 +269,9 @@ def _python_synthetic_expected(cfg, cases):
         if no_history:
             nh.add(key)
         rm, raw = snapshot_values.production_multiplier(key, role, prod_map, nh, cfg["role_mult"])
-        am = snapshot_values.age_multiplier(pos, age, role, rm, raw, cfg)
+        am = snapshot_values.effective_age_multiplier(
+            pos, age, role, key, rm, raw, cfg
+        )
         pw = cfg["position_weight"].get(pos, 1.0)
         value = math.floor(100 * pw * am * rm * 55 + 0.5)
         out[label] = {"value": value, "prod_mult": rm, "age_mult": am}

@@ -20,6 +20,7 @@ import time
 import urllib.request
 import urllib.error
 import sys
+from datetime import date, datetime, timezone
 
 BASE = "https://api.sleeper.app/v1"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -57,6 +58,41 @@ def safe_player_age(player_id, player):
     except (TypeError, ValueError):
         return None
     return age if 18 <= age <= 45 else None
+
+
+def safe_player_birth_date(player_id, player, today=None):
+    # Return a validated ISO birth date or None.
+    #
+    # Sleeper birth_date is accepted only when it is parseable/plausible and
+    # consistent with the safe age signal when that signal exists. This keeps
+    # obviously corrupt DOB rows from feeding fractional-age valuation.
+    raw = player.get("birth_date")
+    if not raw:
+        return None
+    try:
+        dob = date.fromisoformat(str(raw)[:10])
+    except ValueError:
+        return None
+
+    if today is None:
+        today = datetime.now(timezone.utc).date()
+
+    calc_age = today.year - dob.year - (
+        (today.month, today.day) < (dob.month, dob.day)
+    )
+    if not 18 <= calc_age <= 45:
+        return None
+
+    safe_age = safe_player_age(player_id, player)
+    raw_age = player.get("age")
+
+    if raw_age is not None and safe_age is None:
+        return None
+
+    if safe_age is not None and abs(calc_age - safe_age) > 1:
+        return None
+
+    return dob.isoformat()
 
 
 def load_config():
@@ -130,6 +166,7 @@ def build_players_index(needed_ids, pool):
             "fantasy_positions": p.get("fantasy_positions") or [],
             "team": p.get("team"),
             "age": safe_player_age(pid, p),
+            "birth_date": safe_player_birth_date(pid, p),
             "status": p.get("status"),
             "injury_status": p.get("injury_status"),
         }
@@ -141,11 +178,11 @@ def build_players_index(needed_ids, pool):
         for pid in missing:
             if pid.isalpha() and len(pid) <= 3:
                 index[pid] = {"name": f"{pid} DEF", "position": "DEF", "fantasy_positions": ["DEF"],
-                               "team": pid, "age": None, "status": None, "injury_status": None}
+                               "team": pid, "age": None, "birth_date": None, "status": None, "injury_status": None}
             else:
                 print(f"WARNING: player_id {pid} not found in players pool")
                 index[pid] = {"name": f"Unknown ({pid})", "position": None, "fantasy_positions": [],
-                               "team": None, "age": None, "status": None, "injury_status": None}
+                               "team": None, "age": None, "birth_date": None, "status": None, "injury_status": None}
 
     return index
 
@@ -230,6 +267,7 @@ def compute_free_agents(pool, rostered_ids):
             "eligible_buckets": eligible_buckets(p.get("fantasy_positions")),
             "team": p.get("team"),
             "age": age,
+            "birth_date": safe_player_birth_date(pid, p),
             "status": p.get("status"),
             "injury_status": p.get("injury_status"),
         })
