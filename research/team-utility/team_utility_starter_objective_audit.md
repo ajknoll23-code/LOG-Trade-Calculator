@@ -34,7 +34,7 @@ Research-only audit. **No production values or Team Utility constants were chang
 | Toddy2times | 90.7% | 14/17 | 3 | 3274.5 | 3374.8 | 100.3 | 97.03% | no |
 | Moose Knuckles | 76.7% | 14/17 | 3 | 3004.6 | 3091.6 | 87.0 | 97.19% | no |
 | Landry's Hat | 92.5% | 15/17 | 2 | 3677.6 | 3751.6 | 74.0 | 98.03% | no |
-| Serious Gourmet Shit | 93.2% | 16/17 | 1 | 3300.2 | 3332.1 | 31.9 | 99.04% | no |
+| Serious Gourmet Shit | 95.1% | 16/17 | 1 | 3300.2 | 3332.1 | 31.9 | 99.04% | no |
 | Sunday Brunson  | 90.7% | 15/17 | 2 | 3228.6 | 3406.4 | n/a | n/a | no |
 | Pullham Bluecocks  | 88.1% | 14/17 | 3 | 3018.3 | 3223.3 | n/a | n/a | no |
 | Jersey Bagels | 71.4% | 15/17 | 2 | 2930.7 | 3071.6 | n/a | n/a | no |
