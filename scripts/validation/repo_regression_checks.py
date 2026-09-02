@@ -494,6 +494,42 @@ def check_free_agent_board_parity():
     )
 
 
+
+def check_team_utility_projection_runtime_invariants():
+    runtime = REPO_ROOT / "scripts" / "team_utility_projection_runtime.js"
+    builder = REPO_ROOT / "scripts" / "projections" / "build_team_utility_lineup_projections.py"
+
+    assert runtime.exists(), "missing Team Utility projection runtime"
+    subprocess.run(["node", "--check", str(runtime)], cwd=REPO_ROOT, check=True)
+    subprocess.run(["node", str(runtime), "--selftest"], cwd=REPO_ROOT, check=True)
+    subprocess.run([sys.executable, str(builder), "--check"], cwd=REPO_ROOT, check=True)
+
+    text = INDEX.read_text(encoding="utf-8")
+    assert '<script src="scripts/team_utility_projection_runtime.js"></script>' in text
+    assert "const TU_BENCH_WEIGHT = 0.15;" in text, (
+        "bench-weight calibration changed in starter-objective release"
+    )
+    snapshot_values.extract_object_body(text, "PLAYER_DB")
+
+    runtime_text = runtime.read_text(encoding="utf-8")
+    for token in (
+        "TEAM_UTILITY_PROJECTION_RUNTIME_V1",
+        "projectionByKey",
+        "starterEligible: slot !== 'taxi' && slot !== 'reserve_ir'",
+        "buildPostSlotMap",
+        "calculateTeamUtilityV1",
+        "data/my_roster.json",
+        "data/league_rosters.json",
+    ):
+        assert token in runtime_text, f"runtime missing invariant token: {token}"
+
+    print(
+        "PASS Team Utility projection-runtime invariants: artifact current; "
+        "runtime syntax/selftest green; PLAYER_DB still parseable; "
+        "TU_BENCH_WEIGHT unchanged"
+    )
+
+
 def check_index_js_syntax():
     text = INDEX.read_text(encoding="utf-8")
     scripts = re.findall(r"<script[^>]*>(.*?)</script>", text, re.S | re.I)
@@ -519,6 +555,7 @@ def main():
         check_preferred_bake_preview_invariants,
         check_deployed_idp_v1_invariants,
         check_free_agent_board_parity,
+        check_team_utility_projection_runtime_invariants,
         check_index_js_syntax,
     ]
     for check in checks:
