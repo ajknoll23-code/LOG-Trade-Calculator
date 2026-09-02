@@ -17,7 +17,7 @@
 
 - Total projected players: **1022**
 - Position counts: **{"DB": 211, "DL": 193, "LB": 147, "QB": 34, "RB": 126, "TE": 116, "WR": 195}**
-- Source counts: **{"idp_v1_both": 354, "idp_v1_fp_only": 109, "idp_v1_sleeper_only": 88, "sleeper_league_scored": 471}**
+- Source counts: **{"idp_v1_both": 356, "idp_v1_fp_only": 107, "idp_v1_sleeper_only": 88, "sleeper_league_scored": 471}**
 
 ## Current league validation
 
@@ -46,7 +46,7 @@
 
 ## Identity / provenance
 
-- FantasyPros IDs mapped to Sleeper IDs: **472**
+- FantasyPros IDs mapped to Sleeper IDs: **474**
 - Manual-review identity rows skipped: **0**
 
 The artifact is deterministic: its input file SHA-256 hashes are stored in the JSON, and no wall-clock timestamp is embedded.
