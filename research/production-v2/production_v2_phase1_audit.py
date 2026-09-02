@@ -216,6 +216,82 @@ def canonical_ppg_key(key, aliases):
     return aliases.get(norm, norm)
 
 
+def _ppg_lineage_fingerprint(row):
+    """Return the historical content that must agree for alias duplicates.
+
+    ``ppg_pipeline.py`` can legitimately emit two rows with the same canonical
+    player name when both an alias key and the canonical key exist in
+    ``all_players.json``. Those rows should resolve to the same real Sleeper ID
+    and carry the same historical stat line. The display/player key itself is
+    deliberately excluded from this fingerprint.
+    """
+    ignored = {"player"}
+    return {k: row.get(k) for k in sorted(row) if k not in ignored}
+
+
+def build_ppg_lookup(rows, aliases):
+    """Build a safe canonical-name lookup for historical PPG rows.
+
+    Stable Sleeper ID is the identity authority. Alias/canonical duplicates are
+    collapsed only when they point to the same stable ID AND their historical
+    lineage is identical. Any real disagreement hard-fails rather than silently
+    choosing a row.
+
+    IMPORTANT: this lookup is only for matching current PLAYER_DB rows to their
+    historical record. ``derive_history_constants`` still receives the original
+    raw ``ppg_rows`` so Phase 1 preserves the existing canonical history math
+    exactly and does not smuggle a history recalibration into this identity fix.
+    """
+    groups = {}
+    for row in rows:
+        raw_name = row.get("player")
+        if not raw_name:
+            continue
+        key = canonical_ppg_key(raw_name, aliases)
+        groups.setdefault(key, []).append(row)
+
+    out = {}
+    duplicate_groups = 0
+    duplicate_rows_collapsed = 0
+
+    for key, group in groups.items():
+        if len(group) == 1:
+            out[key] = group[0]
+            continue
+
+        duplicate_groups += 1
+        sleeper_ids = {str(r.get("sleeper_id")) for r in group if r.get("sleeper_id") not in (None, "")}
+        if len(sleeper_ids) != 1:
+            raise RuntimeError(
+                f"PPG results: canonical key {key!r} maps to conflicting stable Sleeper IDs: "
+                f"{sorted(sleeper_ids) if sleeper_ids else 'none'}"
+            )
+
+        fingerprints = [_ppg_lineage_fingerprint(r) for r in group]
+        first = fingerprints[0]
+        if any(fp != first for fp in fingerprints[1:]):
+            raise RuntimeError(
+                f"PPG results: alias duplicates for {key!r} share Sleeper ID "
+                f"{next(iter(sleeper_ids))} but historical lineage differs"
+            )
+
+        # Prefer the row whose stored name is already the canonical key, solely
+        # for cleaner audit display. All lineage has already been proven equal.
+        chosen = next(
+            (r for r in group if normalize_name(r.get("player")) == key),
+            group[0],
+        )
+        out[key] = chosen
+        duplicate_rows_collapsed += len(group) - 1
+
+    return out, {
+        "raw_ppg_rows": len(rows),
+        "canonical_ppg_keys": len(out),
+        "alias_duplicate_groups_collapsed": duplicate_groups,
+        "alias_duplicate_rows_collapsed": duplicate_rows_collapsed,
+    }
+
+
 def get_repo_modules():
     if str(SCRIPTS) not in sys.path:
         sys.path.insert(0, str(SCRIPTS))
@@ -415,7 +491,7 @@ def build_audit():
         raise RuntimeError("identity_crosswalk.json must be a list")
 
     aliases = load_ppg_aliases()
-    ppg_by_key = index_unique(ppg_rows, lambda r: normalize_name(r.get("player")), "PPG results")
+    ppg_by_key, ppg_lookup_stats = build_ppg_lookup(ppg_rows, aliases)
     sleeper_totals = index_unique(sleeper_total_rows, lambda r: r.get("sleeper_id"), "Sleeper totals")
     sleeper_raw = index_unique(sleeper_raw_rows, lambda r: r.get("sleeper_id"), "Sleeper raw")
     fp_by_sleeper, identity_stats = lineup_builder.build_fp_by_sleeper(fp_doc["players"], crosswalk)
@@ -668,7 +744,10 @@ def build_audit():
             str(FP_NORMALIZED.relative_to(REPO_ROOT)): sha256(FP_NORMALIZED),
             str(IDENTITY.relative_to(REPO_ROOT)): sha256(IDENTITY),
         },
-        "identity_stats": identity_stats,
+        "identity_stats": {
+            **identity_stats,
+            "ppg_lookup": ppg_lookup_stats,
+        },
         "data_quality": {
             "current_tracked_players": current_tracked,
             "phase1_candidate_players": candidate_count,
@@ -858,7 +937,38 @@ def run_selftest():
     assert normalize_name("D'Andre Swift") == "dandre swift"
     assert normalize_name("Henry To'oTo'o") == "henry tootoo"
     assert normalize_name("Amon-Ra St. Brown") == "amonra st brown"
-    assert canonical_ppg_key("a st brown", {"a st brown": "amonra st brown"}) == "amonra st brown"
+    aliases = {"a st brown": "amonra st brown"}
+    assert canonical_ppg_key("a st brown", aliases) == "amonra st brown"
+
+    # Real Phase-1 regression: ppg_pipeline can emit both an alias row and a
+    # canonical-name row for the same real player. Same stable ID + identical
+    # history must collapse safely.
+    duplicate_fixture = [
+        {
+            "player": "a st brown", "pos": "WR", "sleeper_id": "7547",
+            "games_played": 17, "true_ppg": 16.64, "weekly_points": [10.0, 20.0],
+        },
+        {
+            "player": "amonra st brown", "pos": "WR", "sleeper_id": "7547",
+            "games_played": 17, "true_ppg": 16.64, "weekly_points": [10.0, 20.0],
+        },
+    ]
+    lookup, stats = build_ppg_lookup(duplicate_fixture, aliases)
+    assert list(lookup) == ["amonra st brown"]
+    assert lookup["amonra st brown"]["sleeper_id"] == "7547"
+    assert stats["alias_duplicate_groups_collapsed"] == 1
+    assert stats["alias_duplicate_rows_collapsed"] == 1
+
+    # Same canonical name with conflicting stable IDs must remain a hard fail.
+    conflict_fixture = [
+        {"player": "a st brown", "pos": "WR", "sleeper_id": "7547", "true_ppg": 16.64},
+        {"player": "amonra st brown", "pos": "WR", "sleeper_id": "9999", "true_ppg": 16.64},
+    ]
+    try:
+        build_ppg_lookup(conflict_fixture, aliases)
+        raise AssertionError("expected conflicting stable Sleeper IDs to hard-fail")
+    except RuntimeError as exc:
+        assert "conflicting stable Sleeper IDs" in str(exc)
 
     assert clamp(-1, 0.15, 1.55) == 0.15
     assert clamp(2, 0.15, 1.55) == 1.55
