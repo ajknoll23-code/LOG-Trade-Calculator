@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Audit Team Utility's starter-selection objective.
 
-This is research-only. It does NOT change production.
+This is research-only. It does NOT change production. V2 mirrors the live
+mergeLeagueRosters() valuation universe before evaluating lineups.
 
 Questions:
 1. Does the current Team Utility objective (Fundamental Value) choose the same
@@ -37,6 +38,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 INDEX = REPO_ROOT / "index.html"
 ROSTERS = REPO_ROOT / "data" / "league_rosters.json"
 PROJECTIONS = REPO_ROOT / "scripts" / "sleeper_2026_projections.json"
+PLAYER_POSITIONS = REPO_ROOT / "scripts" / "artifacts" / "generated" / "player_positions.json"
 OUT_DIR = REPO_ROOT / "research" / "team-utility"
 OUT_JSON = OUT_DIR / "team_utility_starter_objective_audit.json"
 OUT_MD = OUT_DIR / "team_utility_starter_objective_audit.md"
@@ -68,6 +70,139 @@ def normalize_name(value: str) -> str:
     s = str(value or "").strip().lower()
     s = re.sub(r"[.'\u2019-]", "", s)
     return re.sub(r"\s+", " ", s)
+
+
+SLOT_DEFAULTS = {
+    "starters": "Starter",
+    "bench": "Rotational",
+    "taxi": "Speculative",
+    "reserve_ir": "Depth",
+}
+
+
+def parse_aliases(index_text: str) -> tuple[dict[str, str], dict[str, str]]:
+    """Parse production ALIASES and build the same reverse lookup."""
+    body = snapshot_values.extract_object_body(index_text, "ALIASES")
+    pairs = re.findall(r"'([^']+)'\s*:\s*'([^']+)'", body)
+    aliases = {alias: canonical for alias, canonical in pairs}
+    return aliases, {canonical: alias for alias, canonical in pairs}
+
+
+def resolve_existing_key(
+    key: str,
+    player_db: dict,
+    aliases: dict[str, str],
+    aliases_reverse: dict[str, str],
+) -> str:
+    """Python mirror of production resolveExistingKey()."""
+    if key in player_db:
+        return key
+    alt = aliases.get(key) or aliases_reverse.get(key)
+    if alt and alt in player_db:
+        return alt
+    return key
+
+
+def canonical_position(raw: dict, key: str, position_map: dict[str, str]) -> str | None:
+    """Resolve the same canonical position used by the live roster universe."""
+    raw_key = normalize_name(raw.get("name", ""))
+    pos = position_map.get(key) or position_map.get(raw_key)
+    if pos:
+        return pos
+
+    def collapse(pos_value):
+        if pos_value in ("DE", "DT"):
+            return "DL"
+        if pos_value in ("OLB", "ILB"):
+            return "LB"
+        if pos_value in ("CB", "S", "SS", "FS"):
+            return "DB"
+        if pos_value in ("QB", "RB", "WR", "TE", "K", "DL", "LB", "DB"):
+            return pos_value
+        return None
+
+    pos = collapse(raw.get("position"))
+    if pos:
+        return pos
+    for value in raw.get("fantasy_positions") or []:
+        pos = collapse(value)
+        if pos:
+            return pos
+    return None
+
+
+def merge_live_league_into_cfg(cfg: dict, roster_doc: dict) -> dict:
+    """Mirror valuation-relevant behavior of production mergeLeagueRosters()."""
+    index_text = INDEX.read_text(encoding="utf-8")
+    aliases, aliases_reverse = parse_aliases(index_text)
+    position_map = json.loads(PLAYER_POSITIONS.read_text(encoding="utf-8"))
+
+    merged = dict(cfg)
+    merged["player_db"] = {key: dict(info) for key, info in cfg["player_db"].items()}
+    merged["rb_birth_date_data"] = dict(cfg["rb_birth_date_data"])
+    merged["aliases"] = aliases
+    merged["aliases_reverse"] = aliases_reverse
+
+    added_keys: set[str] = set()
+    refreshed_keys: set[str] = set()
+    unresolved_positions: list[dict] = []
+
+    for roster in roster_doc.get("rosters", []):
+        for slot in ("starters", "bench", "taxi", "reserve_ir"):
+            for raw in roster.get(slot, []) or []:
+                raw_key = normalize_name(raw.get("name", ""))
+                key = resolve_existing_key(
+                    raw_key,
+                    merged["player_db"],
+                    aliases,
+                    aliases_reverse,
+                )
+                existing = merged["player_db"].get(key)
+
+                if existing and existing.get("pos"):
+                    pos = existing["pos"]
+                else:
+                    pos = canonical_position(raw, key, position_map)
+                if not pos:
+                    unresolved_positions.append({
+                        "roster_id": roster.get("roster_id"),
+                        "player_id": str(raw.get("player_id") or ""),
+                        "player": raw.get("name"),
+                        "reason": "production-parity live merge could not resolve position",
+                    })
+                    continue
+
+                raw_age = raw.get("age")
+                if isinstance(raw_age, (int, float)):
+                    age = int(raw_age)
+                elif existing and existing.get("age") is not None:
+                    age = int(existing["age"])
+                else:
+                    age = 24
+
+                role = (
+                    existing["role"]
+                    if existing and existing.get("role")
+                    else SLOT_DEFAULTS[slot]
+                )
+
+                if existing is None:
+                    added_keys.add(key)
+                else:
+                    refreshed_keys.add(key)
+
+                merged["player_db"][key] = {"pos": pos, "age": age, "role": role}
+
+                birth_date = raw.get("birth_date")
+                if pos == "RB" and isinstance(birth_date, str) and birth_date:
+                    merged["rb_birth_date_data"][normalize_name(key)] = birth_date
+
+    merged["live_merge_stats"] = {
+        "added_player_db_rows": len(added_keys),
+        "refreshed_player_db_rows": len(refreshed_keys),
+        "unresolved_positions": unresolved_positions,
+    }
+    return merged
 
 
 @dataclass(frozen=True)
@@ -166,12 +301,13 @@ def serialize_lineup(result: dict) -> list[dict]:
 
 
 def load_inputs() -> tuple[dict, dict[str, float], dict]:
-    for path in (INDEX, ROSTERS, PROJECTIONS):
+    for path in (INDEX, ROSTERS, PROJECTIONS, PLAYER_POSITIONS):
         if not path.exists():
             raise RuntimeError(f"missing required input: {path.relative_to(REPO_ROOT)}")
 
-    cfg = snapshot_values.load_from_html(INDEX)
-    fundamental_by_key = snapshot_values.compute_all_values(cfg)
+    roster_doc = json.loads(ROSTERS.read_text(encoding="utf-8"))
+    base_cfg = snapshot_values.load_from_html(INDEX)
+    cfg = merge_live_league_into_cfg(base_cfg, roster_doc)
 
     projection_rows = json.loads(PROJECTIONS.read_text(encoding="utf-8"))
     projection_by_id = {
@@ -182,7 +318,6 @@ def load_inputs() -> tuple[dict, dict[str, float], dict]:
         and r["sleeper_2026_proj_total"] > 0
     }
 
-    roster_doc = json.loads(ROSTERS.read_text(encoding="utf-8"))
     return cfg, projection_by_id, roster_doc
 
 
@@ -200,7 +335,13 @@ def build_roster_players(
     for slot in scope_slots:
         for raw in roster.get(slot, []) or []:
             pid = str(raw.get("player_id") or "")
-            key = normalize_name(raw.get("name", ""))
+            raw_key = normalize_name(raw.get("name", ""))
+            key = resolve_existing_key(
+                raw_key,
+                player_db,
+                cfg.get("aliases", {}),
+                cfg.get("aliases_reverse", {}),
+            )
             info = player_db.get(key)
             if not info:
                 unresolved.append(
@@ -435,6 +576,12 @@ def audit() -> dict:
             1 for r in team_rows if r["taxi_changes_projection_optimal_lineup"]
         ),
         "unresolved_player_records": len(all_unresolved),
+        "dynamic_player_db_rows_added": cfg.get("live_merge_stats", {}).get(
+            "added_player_db_rows", 0
+        ),
+        "live_merge_unresolved_positions": len(
+            cfg.get("live_merge_stats", {}).get("unresolved_positions", [])
+        ),
     }
 
     return {
@@ -446,6 +593,9 @@ def audit() -> dict:
         "aggregate": aggregate,
         "teams": team_rows,
         "unresolved": all_unresolved,
+        "live_merge_unresolved_positions": cfg.get("live_merge_stats", {}).get(
+            "unresolved_positions", []
+        ),
     }
 
 
@@ -476,7 +626,9 @@ def render_md(result: dict) -> str:
         f"- Taxi players selected as starters by FV objective: **{a['taxi_players_selected_as_starters_by_fundamental']}**",
         f"- Taxi players selected as starters by projection objective: **{a['taxi_players_selected_as_starters_by_projection']}**",
         f"- Teams where allowing taxi changes projection-optimal lineup: **{a['teams_where_taxi_changes_projection_optimal_lineup']}**",
-        f"- Unresolved roster records: **{a['unresolved_player_records']}**",
+        f"- Unresolved roster records after production-parity live merge: **{a['unresolved_player_records']}**",
+        f"- Runtime PLAYER_DB rows added from live league sync: **{a['dynamic_player_db_rows_added']}**",
+        f"- Live-merge position failures: **{a['live_merge_unresolved_positions']}**",
         "",
         "## Team detail",
         "",
@@ -585,6 +737,20 @@ def run_selftest() -> None:
     ]
     assert max(toy, key=lambda p: p.objective("fundamental")).player_id == "a"
     assert max(toy, key=lambda p: p.objective("projection")).player_id == "b"
+
+    aliases = {"m penix": "michael penix"}
+    reverse = {"michael penix": "m penix"}
+    test_db = {"m penix": {"pos": "QB", "age": 26, "role": "Starter"}}
+    assert resolve_existing_key("michael penix", test_db, aliases, reverse) == "m penix"
+    assert resolve_existing_key("brand new", test_db, aliases, reverse) == "brand new"
+
+    if all(path.exists() for path in (INDEX, ROSTERS, PLAYER_POSITIONS)):
+        roster_doc = json.loads(ROSTERS.read_text(encoding="utf-8"))
+        base_cfg = snapshot_values.load_from_html(INDEX)
+        merged_cfg = merge_live_league_into_cfg(base_cfg, roster_doc)
+        stats = merged_cfg["live_merge_stats"]
+        assert stats["added_player_db_rows"] >= 1
+        assert len(merged_cfg["player_db"]) >= len(base_cfg["player_db"])
 
     print("team_utility_starter_objective_audit self-test passed.")
 
