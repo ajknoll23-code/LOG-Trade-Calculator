@@ -321,17 +321,26 @@ def build_frozen_payload() -> dict[str, Any]:
 
 
 def freeze_if_needed() -> dict[str, Any]:
-    proposed = build_frozen_payload()
-
+    # IMPORTANT: preserve an existing immutable preseason freeze BEFORE
+    # rebuilding any candidate payload or evaluating the preseason date guard.
+    # Scheduled in-season runs use --freeze --write, so rebuilding first would
+    # incorrectly fail on/after season start even though the valid frozen file
+    # already exists and should simply be graded.
     if FROZEN_PATH.exists():
         existing = read_json(FROZEN_PATH)
         if existing.get("method_version") != METHOD_VERSION:
             raise RuntimeError("Existing frozen Age Curve Phase-5 method mismatch")
+        if existing.get("variant_manifest") != list(SELECTED_VARIANTS):
+            raise RuntimeError("Existing frozen Age Curve Phase-5 candidate family changed")
         print(
             "Frozen Age Curve Phase-5 candidate file already exists; "
             "preserving immutable preseason predictions."
         )
         return existing
+
+    # Only a brand-new freeze is allowed to build current candidates and pass
+    # through build_frozen_payload()'s preseason creation guardrail.
+    proposed = build_frozen_payload()
 
     FROZEN_PATH.parent.mkdir(parents=True, exist_ok=True)
     FROZEN_PATH.write_text(
