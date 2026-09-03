@@ -1,0 +1,288 @@
+name: Scheduled Data Refresh
+
+# Automated source-data maintenance.
+#
+# Tuesday = full refresh:
+#   Sleeper sync -> team refresh -> Sleeper projections -> IDP filter ->
+#   FantasyPros -> identity crosswalk -> Team Utility lineup projections ->
+#   dual eligibility -> KTC aggregation -> KTC voter-balance research audit ->
+#   separate Market Value -> realized-outcome target refresh -> derived state ->
+#   value uncertainty envelopes -> append-only historical model/evidence snapshot -> fundamental + market out-of-sample evaluators.
+#
+# Friday = light refresh:
+#   Same core projection/data chain, excluding the weekly dual-eligibility,
+#   KTC aggregation, KTC voter-balance research audit, separate Market Value
+#   refresh, and realized-outcome refresh steps, then captures another
+#   historical snapshot.
+#
+# Everything runs sequentially in ONE job and is committed/pushed ONCE to
+# avoid the multi-workflow push races that can occur when independent writers
+# run at the same time.
+on:
+  schedule:
+    - cron: '0 15 * * 2'
+    - cron: '0 15 * * 5'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Refresh depth'
+        required: true
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - light
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Determine refresh mode
+        id: mode
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            mode="${{ github.event.inputs.mode }}"
+          elif [ "${{ github.event.schedule }}" = "0 15 * * 2" ]; then
+            mode="full"
+          else
+            mode="light"
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "Refresh mode: $mode"
+
+      - name: Set up Python 3.12 for Sleeper sync
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Sleeper sync self-test
+        run: python3 scripts/sync/sync_sleeper.py --selftest
+
+      - name: Refresh Sleeper league data
+        run: python3 scripts/sync/sync_sleeper.py
+
+      - name: Refresh trade history
+        run: python3 scripts/sync/sync_trade_history.py
+
+      - name: Set up Python 3.11 for refresh pipelines
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Team refresh self-test
+        run: python3 scripts/maintenance/team_field_refresh_pipeline.py --selftest
+
+      - name: Refresh player team fields
+        run: python3 scripts/maintenance/team_field_refresh_pipeline.py
+
+      - name: Player-position map self-test
+        run: python3 scripts/utilities/generate_player_positions.py --selftest
+
+      - name: Regenerate player-position map
+        run: python3 scripts/utilities/generate_player_positions.py
+
+      - name: Sleeper projections self-test
+        run: python3 scripts/projections/sleeper_projections_pipeline.py --selftest
+
+      - name: Refresh Sleeper projections
+        run: python3 scripts/projections/sleeper_projections_pipeline.py
+
+      - name: Sleeper IDP filter self-test
+        run: python3 scripts/projections/filter_sleeper_idp_only.py --selftest
+
+      - name: Refresh Sleeper IDP-only subset
+        run: python3 scripts/projections/filter_sleeper_idp_only.py
+
+      - name: FantasyPros pipeline self-test
+        run: python3 scripts/projections/fantasypros_api_pipeline.py --selftest
+
+      - name: Refresh FantasyPros projections
+        env:
+          FANTASYPROS_API_KEY: ${{ secrets.FANTASYPROS_API_KEY }}
+        run: python3 scripts/projections/fantasypros_api_pipeline.py
+
+      - name: Identity resolver self-test
+        run: python3 scripts/projections/resolve_fantasypros_sleeper_identity.py --selftest
+
+      - name: Refresh FantasyPros-Sleeper identity crosswalk
+        run: python3 scripts/projections/resolve_fantasypros_sleeper_identity.py
+
+      - name: Team Utility lineup projection self-test
+        run: python3 scripts/projections/build_team_utility_lineup_projections.py --selftest
+
+      - name: Refresh Team Utility lineup projections
+        run: python3 scripts/projections/build_team_utility_lineup_projections.py --write
+
+      - name: Verify Team Utility lineup projection artifact
+        run: python3 scripts/projections/build_team_utility_lineup_projections.py --check
+
+      - name: Dual-eligibility self-test
+        if: steps.mode.outputs.mode == 'full'
+        run: python3 scripts/validation/dual_eligibility_pipeline.py --selftest
+
+      - name: Refresh dual-eligibility audit
+        if: steps.mode.outputs.mode == 'full'
+        run: python3 scripts/validation/dual_eligibility_pipeline.py
+
+      - name: Refresh KTC vote ratings
+        if: steps.mode.outputs.mode == 'full'
+        run: python3 scripts/market/ktc_pipeline.py
+
+      - name: KTC voter-balance analysis self-test
+        if: steps.mode.outputs.mode == 'full'
+        run: python3 scripts/market/analyze_ktc_voter_balance.py --selftest
+
+      - name: Build KTC voter-balance research analysis
+        if: steps.mode.outputs.mode == 'full'
+        run: python3 scripts/market/analyze_ktc_voter_balance.py --write
+
+      - name: Verify KTC voter-balance research analysis
+        if: steps.mode.outputs.mode == 'full'
+        run: python3 scripts/market/analyze_ktc_voter_balance.py --check
+
+      - name: Market Value self-test
+        run: python3 scripts/market/build_market_value.py --selftest
+
+      - name: Build separate league Market Value
+        if: steps.mode.outputs.mode == 'full'
+        run: python3 scripts/market/build_market_value.py --write
+
+      - name: Realized-outcome capture self-test
+        run: python3 scripts/validation/capture_realized_outcomes.py --selftest
+
+      - name: Refresh realized 2026 outcomes
+        if: steps.mode.outputs.mode == 'full'
+        run: python3 scripts/validation/capture_realized_outcomes.py
+
+      - name: Derived-state self-test
+        run: python3 scripts/maintenance/refresh_repo_derived_state.py --selftest
+
+      - name: Refresh deterministic derived state
+        run: python3 scripts/maintenance/refresh_repo_derived_state.py --write
+
+      - name: Value uncertainty self-test
+        run: python3 scripts/validation/build_value_uncertainty.py --selftest
+
+      - name: Build value uncertainty sensitivity envelopes
+        run: python3 scripts/validation/build_value_uncertainty.py --write
+
+      - name: Historical model-capture self-test
+        run: python3 scripts/validation/capture_model_history.py --selftest
+
+      - name: Historical evaluator self-test
+        run: python3 scripts/validation/evaluate_model_history.py --selftest
+
+      - name: Market-history evaluator self-test
+        run: python3 scripts/validation/evaluate_market_history.py --selftest
+
+      - name: Phase 9 prospective evaluator self-test
+        if: steps.mode.outputs.mode == 'full'
+        run: python3 research/production-v2/production_v2_phase9_prospective_evaluator.py --selftest
+
+      - name: Capture historical model and source evidence
+        run: python3 scripts/validation/capture_model_history.py --mode "${{ steps.mode.outputs.mode }}"
+
+      - name: Evaluate historical predictions against realized outcomes
+        if: steps.mode.outputs.mode == 'full'
+        run: python3 scripts/validation/evaluate_model_history.py --write
+
+      - name: Evaluate historical predictions against future league market
+        if: steps.mode.outputs.mode == 'full'
+        run: python3 scripts/validation/evaluate_market_history.py --write
+
+      - name: Evaluate Production V2 Phase 9 prospective calibration
+        if: steps.mode.outputs.mode == 'full'
+        run: python3 research/production-v2/production_v2_phase9_prospective_evaluator.py --write
+
+      - name: Verify Production V2 Phase 9 evaluation
+        if: steps.mode.outputs.mode == 'full'
+        run: python3 research/production-v2/production_v2_phase9_prospective_evaluator.py --check
+
+      - name: Stage refreshed data and history
+        run: |
+          git add data/
+          git add free-agent-board.html
+          git add scripts/artifacts/generated/player_positions.json
+          git add scripts/artifacts/generated/player_team_refresh.json
+          git add scripts/sleeper_2026_projections.json
+          git add scripts/artifacts/generated/sleeper_2026_raw_categories.json
+          git add scripts/artifacts/generated/sleeper_2026_raw_weekly.json
+          git add scripts/sleeper_2026_idp_only.json
+          git add scripts/artifacts/generated/fantasypros_api_raw_2026.json
+          git add scripts/fantasypros_api_normalized_2026.json
+          git add scripts/artifacts/reports/fantasypros_api_pipeline_report.md
+          git add scripts/identity_crosswalk.json
+          git add scripts/artifacts/reports/identity_collision_report.md
+          git add scripts/artifacts/generated/team_utility_lineup_projections.json
+          git add scripts/artifacts/reports/team_utility_lineup_projection_report.md
+          git add scripts/artifacts/generated/dual_eligibility_results.json
+          git add scripts/artifacts/generated/ktc_ratings.json
+          if [ -f scripts/artifacts/generated/ktc_voter_balance_analysis.json ]; then
+            git add scripts/artifacts/generated/ktc_voter_balance_analysis.json
+          fi
+          if [ -f scripts/artifacts/reports/ktc_voter_balance_analysis.md ]; then
+            git add scripts/artifacts/reports/ktc_voter_balance_analysis.md
+          fi
+          if [ -f scripts/artifacts/generated/market_values.json ]; then
+            git add scripts/artifacts/generated/market_values.json
+          fi
+          if [ -f scripts/artifacts/reports/market_value_report.md ]; then
+            git add scripts/artifacts/reports/market_value_report.md
+          fi
+          git add scripts/artifacts/generated/value_uncertainty.json
+          git add scripts/artifacts/reports/value_uncertainty_report.md
+          if [ -f research/model-history/outcomes/2026.json ]; then
+            git add research/model-history/outcomes/2026.json
+          fi
+          git add research/model-history/snapshots/
+          if [ -f research/model-history/evaluation/latest.json ]; then
+            git add research/model-history/evaluation/latest.json
+          fi
+          if [ -f research/model-history/evaluation/latest.md ]; then
+            git add research/model-history/evaluation/latest.md
+          fi
+          if [ -f research/model-history/evaluation/market_latest.json ]; then
+            git add research/model-history/evaluation/market_latest.json
+          fi
+          if [ -f research/model-history/evaluation/market_latest.md ]; then
+            git add research/model-history/evaluation/market_latest.md
+          fi
+          if [ -f research/production-v2/production_v2_phase9_evaluation.json ]; then
+            git add research/production-v2/production_v2_phase9_evaluation.json
+          fi
+          if [ -f research/production-v2/production_v2_phase9_evaluation.md ]; then
+            git add research/production-v2/production_v2_phase9_evaluation.md
+          fi
+          git status --short
+
+      - name: Commit and push refreshed data
+        shell: bash
+        run: |
+          git config user.name "trade-desk-refresh-bot"
+          git config user.email "actions@users.noreply.github.com"
+
+          if git diff --cached --quiet; then
+            echo "No refreshed data changed; nothing to commit."
+          else
+            git commit -m "Automated data refresh (${{ steps.mode.outputs.mode }})"
+            git push origin main
+          fi
