@@ -23,18 +23,18 @@ The Bradley–Terry rating scale is arbitrary, so V1 preserves the league-vote r
 | Player | Pos | Fundamental | Market | Δ | Market rank | Market pct. | Pos direct pairs |
 |---|---|---:|---:|---:|---:|---:|---:|
 | ty simpson | QB | 1,169 | 5,621 | +4,452 | 8.0 | 98.4% | 8 |
-| jahmyr gibbs | RB | 8,936 | 4,604 | -4,332 | 40.0 | 91.3% | 23 |
+| jahmyr gibbs | RB | 8,929 | 4,604 | -4,325 | 40.0 | 91.3% | 23 |
 | drake london | WR | 5,852 | 1,636 | -4,216 | 333.0 | 25.9% | 27 |
-| trey mcbride | TE | 5,087 | 8,936 | +3,849 | 1.0 | 100.0% | 4 |
+| trey mcbride | TE | 5,087 | 8,929 | +3,842 | 1.0 | 100.0% | 4 |
 | malik davis | RB | 808 | 4,096 | +3,288 | 63.0 | 86.2% | 23 |
 | nick bolton | LB | 5,351 | 2,101 | -3,250 | 297.0 | 33.9% | 30 |
-| devon achane | RB | 6,713 | 3,520 | -3,193 | 118.0 | 73.9% | 23 |
+| devon achane | RB | 6,707 | 3,520 | -3,187 | 118.0 | 73.9% | 23 |
 | jaylen waddle | WR | 4,576 | 1,454 | -3,122 | 340.0 | 24.3% | 27 |
 | nick emmanwori | DB | 3,465 | 6,564 | +3,099 | 3.0 | 99.6% | 37 |
 | kyle louis | LB | 968 | 3,991 | +3,023 | 69.0 | 84.8% | 30 |
 | chris olave | WR | 5,445 | 2,445 | -3,000 | 265.0 | 41.1% | 27 |
 | devin lloyd | LB | 4,363 | 1,375 | -2,988 | 351.0 | 21.9% | 30 |
-| nicholas singleton | RB | 997 | 3,984 | +2,987 | 71.0 | 84.4% | 23 |
+| nicholas singleton | RB | 998 | 3,984 | +2,986 | 71.0 | 84.4% | 23 |
 | david bailey | DL | 2,374 | 5,351 | +2,977 | 13.0 | 97.3% | 42 |
 | jake golday | LB | 1,162 | 4,122 | +2,960 | 62.0 | 86.4% | 30 |
 | jonah coleman | RB | 1,126 | 4,079 | +2,953 | 65.0 | 85.7% | 23 |

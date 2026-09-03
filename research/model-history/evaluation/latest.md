@@ -5,13 +5,13 @@ Protocol SHA256: `b6e66793b947e629d8ea238663fc4ab9e94dc7fb6c6b52495ac1207451ba0b
 
 ## Status
 
-- Snapshots seen: **10**
-- Prediction states after deduplication: **2**
+- Snapshots seen: **11**
+- Prediction states after deduplication: **3**
 - Deduplicated repeated snapshots: **8**
 - Outcome identity coverage: **100.0%**
 - Completed realized weeks available: **[]**
 - Evaluated snapshot/horizon combinations: **0**
-- Pending snapshot/horizon combinations: **6**
+- Pending snapshot/horizon combinations: **9**
 
 ## Frozen V1 leakage rules
 

@@ -3,15 +3,15 @@
 Production resolver covering QB / RB / WR / TE / DL / LB / DB.
 
 - FantasyPros tracked rows: **1034**
-- Authoritative stable-ID matches: **922**
-- Manual-review rows: **17**
+- Authoritative stable-ID matches: **923**
+- Manual-review rows: **16**
 
 ## Coverage by position
 
 | Pos | FP rows | Authoritative | Match rate | Candidate | Manual review |
 |---|---:|---:|---:|---:|---:|
 | QB | 79 | 70 | 88.6% | 73 | 3 |
-| RB | 119 | 107 | 89.9% | 107 | 1 |
+| RB | 119 | 108 | 90.8% | 108 | 0 |
 | WR | 179 | 161 | 89.9% | 162 | 1 |
 | TE | 118 | 110 | 93.2% | 113 | 3 |
 | DL | 177 | 158 | 89.3% | 160 | 2 |
@@ -21,8 +21,8 @@ Production resolver covering QB / RB / WR / TE / DL / LB / DB.
 ## Match methods
 
 - `name_collision_resolved_by_position_team`: **4**
-- `name_found_position_incompatible`: **6**
-- `name_position_team_confirmed`: **918**
+- `name_found_position_incompatible`: **5**
+- `name_position_team_confirmed`: **919**
 - `no_sleeper_name_candidate`: **95**
 - `unique_name_position_team_unavailable`: **11**
 
@@ -35,7 +35,6 @@ These remain deliberately unresolved; downstream consumers must use existing fal
 | Brady Cook | QB |  | 12538 |  | unique_name_position_team_unavailable |
 | Jake Browning | QB |  | 6111 |  | unique_name_position_team_unavailable |
 | Desmond Ridder | QB |  | 8159 |  | unique_name_position_team_unavailable |
-| Max Bredeson | RB | MIN |  |  | name_found_position_incompatible |
 | Xavier Weaver | WR |  | 11921 |  | unique_name_position_team_unavailable |
 | Justin Joly | TE |  | 13400 |  | unique_name_position_team_unavailable |
 | Jack Stoll | TE |  | 7946 |  | unique_name_position_team_unavailable |

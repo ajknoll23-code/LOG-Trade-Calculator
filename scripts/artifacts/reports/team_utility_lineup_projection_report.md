@@ -15,38 +15,38 @@
 
 ## Artifact coverage
 
-- Total projected players: **1022**
-- Position counts: **{"DB": 211, "DL": 193, "LB": 147, "QB": 34, "RB": 126, "TE": 116, "WR": 195}**
-- Source counts: **{"idp_v1_both": 356, "idp_v1_fp_only": 107, "idp_v1_sleeper_only": 88, "sleeper_league_scored": 471}**
+- Total projected players: **1094**
+- Position counts: **{"DB": 211, "DL": 193, "LB": 147, "QB": 71, "RB": 138, "TE": 127, "WR": 207}**
+- Source counts: **{"fantasypros_normalized_fallback": 72, "idp_v1_both": 356, "idp_v1_fp_only": 107, "idp_v1_sleeper_only": 88, "sleeper_league_scored": 471}**
 
 ## Current league validation
 
 - Teams checked: **12**
 - Teams with all 17 legal slots fillable: **12 / 12**
 - Teams with a projection-complete non-K starting lineup: **12 / 12**
-- Active non-K roster projection coverage: **93.26%**
+- Active non-K roster projection coverage: **95.87%**
 - Selected non-K players needing fallback: **0**
 
 ## Team detail
 
 | Team | Active non-K coverage | Legal starters | Missing projected starters |
 |---|---:|---:|---:|
-| Just Run Power | 95.0% | 17/17 | 0 |
-| Sunday Brunson  | 94.9% | 17/17 | 0 |
-| Narroway Farms M714 | 95.0% | 17/17 | 0 |
+| Just Run Power | 100.0% | 17/17 | 0 |
+| Sunday Brunson  | 97.4% | 17/17 | 0 |
+| Narroway Farms M714 | 97.5% | 17/17 | 0 |
 | Landry's Hat | 100.0% | 17/17 | 0 |
 | Pullham Bluecocks  | 97.3% | 17/17 | 0 |
 | Cock Mchorse 🐴 | 95.0% | 17/17 | 0 |
 | Jersey Bagels | 83.8% | 17/17 | 0 |
-| Apex Predators | 87.5% | 17/17 | 0 |
-| Toddy2times | 95.0% | 17/17 | 0 |
-| Moose Knuckles | 81.1% | 17/17 | 0 |
+| Apex Predators | 95.0% | 17/17 | 0 |
+| Toddy2times | 100.0% | 17/17 | 0 |
+| Moose Knuckles | 89.2% | 17/17 | 0 |
 | <respectable team name> | 94.7% | 17/17 | 0 |
 | Serious Gourmet Shit | 100.0% | 17/17 | 0 |
 
 ## Identity / provenance
 
-- FantasyPros IDs mapped to Sleeper IDs: **474**
+- FantasyPros IDs mapped to Sleeper IDs: **923**
 - Manual-review identity rows skipped: **0**
 
 The artifact is deterministic: its input file SHA-256 hashes are stored in the JSON, and no wall-clock timestamp is embedded.
