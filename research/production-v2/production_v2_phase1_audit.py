@@ -16,7 +16,8 @@ coefficient calibration begins:
 
 * history component: canonical existing 2025 shrinkage + durability module
 * offense forward projection: 50% FantasyPros / 50% Sleeper when both exist
-  (single-source fallback otherwise)
+  (single-source fallback otherwise), joined through the validated unified
+  production FantasyPros↔Sleeper stable-ID crosswalk
 * IDP forward projection: canonical validated IDP V1 category-level ensemble
 * history / forward blend: 45% / 55%
 * replacement ranks: existing legacy research ranks
@@ -64,6 +65,15 @@ IDP = {"DL", "LB", "DB"}
 HISTORY_WEIGHT = 0.45
 FORWARD_WEIGHT = 0.55
 OFFENSE_FP_WEIGHT = 0.50
+
+# Phase 1 is specifically meant to validate a two-provider offense benchmark.
+# Never allow the audit to "succeed" again if the FantasyPros side of that
+# benchmark silently disappears. This is deliberately conservative: the real
+# FantasyPros API returns a full offensive population, so at least half of the
+# current players who have a Sleeper projection should resolve to FantasyPros
+# before this lineage audit is trusted.
+MIN_OFFENSE_FP_COVERAGE_VS_SLEEPER = 0.50
+
 REPLACEMENT_RANK = {
     "QB": 18,
     "RB": 32,
@@ -292,6 +302,187 @@ def build_ppg_lookup(rows, aliases):
     }
 
 
+
+def normalize_team(value):
+    if value in (None, ""):
+        return None
+    team = str(value).strip().upper()
+    # Confirmed real provider-code difference already documented by the
+    # canonical IDP identity resolver.
+    return {"JAC": "JAX"}.get(team, team)
+
+
+def normalize_position(value):
+    if value in (None, ""):
+        return None
+    raw = str(value).strip().upper()
+    mapping = {
+        "QB": "QB",
+        "RB": "RB",
+        "WR": "WR",
+        "TE": "TE",
+        "DL": "DL",
+        "DE": "DL",
+        "DT": "DL",
+        "LB": "LB",
+        "OLB": "LB",
+        "ILB": "LB",
+        "DB": "DB",
+        "CB": "DB",
+        "S": "DB",
+        "SS": "DB",
+        "FS": "DB",
+        "EDGE": "EDGE",
+    }
+    return mapping.get(raw)
+
+
+def build_current_sleeper_identity(sleeper_total_rows, sleeper_raw_rows):
+    """Build a stable-ID identity universe from current 2026 Sleeper data.
+
+    Raw-category rows are intentionally the primary identity population because
+    they are broader than the positive-point production list. This lets rookies
+    and low/zero-projection players retain stable identity even when they had no
+    2025 PPG row.
+
+    No player is selected by projection magnitude. Identity is name + compatible
+    position, with duplicate names left unresolved unless an already-known 2025
+    stable Sleeper ID supplies the answer.
+    """
+    by_sid = {}
+
+    for label, rows in (("raw", sleeper_raw_rows), ("total", sleeper_total_rows)):
+        for row in rows:
+            sid = row.get("sleeper_id")
+            if sid in (None, ""):
+                continue
+            sid = str(sid)
+            name = normalize_name(row.get("player"))
+            pos = normalize_position(row.get("pos"))
+            positions = set()
+            if pos:
+                positions.add(pos)
+            fantasy_positions = row.get("fantasy_positions")
+            if isinstance(fantasy_positions, list):
+                for raw_pos in fantasy_positions:
+                    norm_pos = normalize_position(raw_pos)
+                    if norm_pos:
+                        positions.add(norm_pos)
+            team = normalize_team(row.get("team"))
+            if not name:
+                continue
+
+            if sid not in by_sid:
+                by_sid[sid] = {
+                    "sleeper_id": sid,
+                    "player": name,
+                    "positions": positions,
+                    "team": team,
+                    "sources": {label},
+                }
+                continue
+
+            prior = by_sid[sid]
+            prior["sources"].add(label)
+
+            # Same stable ID must never point at two different normalized names.
+            if prior["player"] != name:
+                raise RuntimeError(
+                    f"Sleeper 2026 identity: stable ID {sid} has conflicting names "
+                    f"{prior['player']!r} vs {name!r}"
+                )
+
+            # Sleeper can expose granular or dual eligibility across artifacts.
+            # Stable identity is authoritative; merge compatible position labels
+            # rather than treating DL/EDGE or LB/EDGE eligibility as a conflict.
+            prior["positions"].update(positions)
+
+            # Team is corroborating context, not the identity key. Provider/source
+            # refresh timing can move a player between teams, so preserve a conflict
+            # as None rather than guessing which row is fresher.
+            if prior["team"] and team and prior["team"] != team:
+                prior["team"] = None
+            elif not prior["team"] and team:
+                prior["team"] = team
+
+    by_name_pos = {}
+    for row in by_sid.values():
+        compatible = set(row.get("positions") or ())
+        # EDGE is intentionally compatible with both calculator DL and LB.
+        if "EDGE" in compatible:
+            compatible.update({"DL", "LB"})
+        for pos in compatible & set(TRACKED_POSITIONS):
+            by_name_pos.setdefault((row["player"], pos), []).append(row)
+
+    return {
+        "by_sid": by_sid,
+        "by_name_pos": by_name_pos,
+    }
+
+
+def resolve_current_sleeper_id(key, pos, ppg_row, aliases, sleeper_identity):
+    """Resolve the current PLAYER_DB row to a stable Sleeper ID.
+
+    Priority:
+      1. an existing 2025 PPG stable ID (already resolved by the historical
+         pipeline), provided it does not contradict current Sleeper identity;
+      2. exact canonical name + compatible current position in the broader 2026
+         Sleeper identity universe, but only when unique.
+
+    Ambiguous current-name collisions are never guessed.
+    """
+    canonical = canonical_ppg_key(key, aliases)
+    known_sid = None
+    if ppg_row and ppg_row.get("sleeper_id") not in (None, ""):
+        known_sid = str(ppg_row.get("sleeper_id"))
+
+    if known_sid:
+        current = sleeper_identity["by_sid"].get(known_sid)
+        if current:
+            if current["player"] != canonical:
+                raise RuntimeError(
+                    f"Current identity conflict for {key!r}: 2025 PPG Sleeper ID "
+                    f"{known_sid} resolves to current name {current['player']!r}, "
+                    f"expected canonical {canonical!r}"
+                )
+            # Position reclassification is explicitly allowed here. Phase 1
+            # already reports historical-vs-current position mismatches and
+            # values the player at CURRENT PLAYER_DB position.
+        return known_sid, "ppg_stable_id"
+
+    candidates = sleeper_identity["by_name_pos"].get((canonical, pos), [])
+    if len(candidates) == 1:
+        return candidates[0]["sleeper_id"], "current_2026_name_position_unique"
+    if len(candidates) == 0:
+        return None, "current_2026_no_candidate"
+    return None, "current_2026_ambiguous_name_position"
+
+
+
+def validate_offense_fp_coverage(coverage):
+    """Hard gate the exact Phase-1 failure that produced a false green run."""
+    failures = []
+    for pos in ("QB", "RB", "WR", "TE"):
+        c = coverage[pos]
+        sleeper_n = int(c.get("sleeper_projection_row", 0))
+        fp_n = int(c.get("fantasypros_projection_row", 0))
+        if sleeper_n <= 0:
+            failures.append(f"{pos}: no Sleeper projection coverage")
+            continue
+        share = fp_n / sleeper_n
+        if share < MIN_OFFENSE_FP_COVERAGE_VS_SLEEPER:
+            failures.append(
+                f"{pos}: FantasyPros coverage {fp_n}/{sleeper_n} "
+                f"({share:.1%}) is below required "
+                f"{MIN_OFFENSE_FP_COVERAGE_VS_SLEEPER:.0%}"
+            )
+    if failures:
+        raise RuntimeError(
+            "Phase-1 offense provider identity gate failed; "
+            + "; ".join(failures)
+        )
+
+
 def get_repo_modules():
     if str(SCRIPTS) not in sys.path:
         sys.path.insert(0, str(SCRIPTS))
@@ -324,7 +515,7 @@ def build_forward_projection(
     sid,
     sleeper_totals,
     sleeper_raw,
-    fp_by_sleeper,
+    fp_row,
     idp_v1_projection,
 ):
     if not sid:
@@ -338,7 +529,7 @@ def build_forward_projection(
 
     total_row = sleeper_totals.get(sid) or {}
     raw_row = sleeper_raw.get(sid) or {}
-    fp_row = fp_by_sleeper.get(sid) or {}
+    fp_row = fp_row or {}
 
     sleeper_points = finite_number(total_row.get("sleeper_2026_proj_total"))
     fp_points = finite_number(fp_row.get("trade_desk_normalized_points"))
@@ -494,7 +685,16 @@ def build_audit():
     ppg_by_key, ppg_lookup_stats = build_ppg_lookup(ppg_rows, aliases)
     sleeper_totals = index_unique(sleeper_total_rows, lambda r: r.get("sleeper_id"), "Sleeper totals")
     sleeper_raw = index_unique(sleeper_raw_rows, lambda r: r.get("sleeper_id"), "Sleeper raw")
-    fp_by_sleeper, identity_stats = lineup_builder.build_fp_by_sleeper(fp_doc["players"], crosswalk)
+
+    # Unified production crosswalk now covers QB/RB/WR/TE/DL/LB/DB.
+    # Phase 1 consumes that shared stable-ID mapping directly rather than
+    # maintaining its own FantasyPros identity logic.
+    fp_by_sleeper, unified_identity_stats = lineup_builder.build_fp_by_sleeper(
+        fp_doc["players"], crosswalk
+    )
+    current_sleeper_identity = build_current_sleeper_identity(
+        sleeper_total_rows, sleeper_raw_rows
+    )
 
     constants = history_mod.derive_history_constants(ppg_rows, durability)
 
@@ -502,6 +702,7 @@ def build_audit():
     source_counts = Counter()
     coverage = {pos: Counter() for pos in TRACKED_POSITIONS}
     flags = Counter()
+    current_sleeper_resolution_methods = Counter()
 
     for key in sorted(cfg["player_db"]):
         info = cfg["player_db"][key]
@@ -517,10 +718,18 @@ def build_audit():
         else:
             flags["missing_ppg_row"] += 1
 
-        sid = None
-        if ppg and ppg.get("sleeper_id") is not None:
-            sid = str(ppg.get("sleeper_id"))
+        sid, sid_method = resolve_current_sleeper_id(
+            key,
+            pos,
+            ppg,
+            aliases,
+            current_sleeper_identity,
+        )
+        current_sleeper_resolution_methods[sid_method] += 1
+        if sid:
             coverage[pos]["stable_sleeper_id"] += 1
+            if not ppg or ppg.get("sleeper_id") in (None, ""):
+                coverage[pos]["stable_sleeper_id_from_current_2026"] += 1
         else:
             flags["missing_stable_sleeper_id"] += 1
 
@@ -535,21 +744,25 @@ def build_audit():
             if history.get("shrinkage_note") == "real":
                 flags["zero_game_rows_treated_as_real_by_canonical_history"] += 1
 
+        # FantasyPros identity is now entirely owned by the shared production
+        # crosswalk. Phase 1 only consumes the authoritative stable-ID mapping.
+        fp_row = fp_by_sleeper.get(sid) if sid else None
+
         forward = build_forward_projection(
             pos,
             sid,
             sleeper_totals,
             sleeper_raw,
-            fp_by_sleeper,
+            fp_row,
             idp_v1_projection,
         )
         source_counts[forward["source"]] += 1
 
         if sid and sid in sleeper_totals:
             coverage[pos]["sleeper_projection_row"] += 1
-        if sid and sid in fp_by_sleeper:
+        if fp_row:
             coverage[pos]["fantasypros_projection_row"] += 1
-        if sid and sid in sleeper_totals and sid in fp_by_sleeper:
+        if sid and sid in sleeper_totals and fp_row:
             coverage[pos]["both_provider_rows"] += 1
         if forward["projection"] is not None:
             coverage[pos]["usable_forward_projection"] += 1
@@ -589,6 +802,12 @@ def build_audit():
                 "no_real_production_history": key in cfg["no_real_history"],
             },
         }
+
+    # A successful workflow must prove the intended two-provider offense
+    # benchmark actually exists through the shared unified production crosswalk.
+    # Never allow zero/near-zero FantasyPros offense coverage to return a green
+    # audit again.
+    validate_offense_fp_coverage(coverage)
 
     # Baselines are built over the same current PLAYER_DB candidate cohort.
     baselines = {}
@@ -745,8 +964,15 @@ def build_audit():
             str(IDENTITY.relative_to(REPO_ROOT)): sha256(IDENTITY),
         },
         "identity_stats": {
-            **identity_stats,
             "ppg_lookup": ppg_lookup_stats,
+            "current_sleeper_identity": {
+                "stable_ids_in_2026_identity_universe": len(current_sleeper_identity["by_sid"]),
+                "resolution_methods": dict(sorted(current_sleeper_resolution_methods.items())),
+            },
+            "fantasypros_unified_production_crosswalk": {
+                **unified_identity_stats,
+                "minimum_required_offense_coverage_vs_sleeper": MIN_OFFENSE_FP_COVERAGE_VS_SLEEPER,
+            },
         },
         "data_quality": {
             "current_tracked_players": current_tracked,
@@ -827,6 +1053,31 @@ def build_markdown(result):
             f"{c.get('sleeper_projection_row',0)} | {c.get('fantasypros_projection_row',0)} | {c.get('both_provider_rows',0)} | "
             f"{c.get('usable_forward_projection',0)} | {c.get('candidate_final_value',0)} |"
         )
+
+    identity = result.get("identity_stats") or {}
+    current_identity = identity.get("current_sleeper_identity") or {}
+    unified_identity = identity.get("fantasypros_unified_production_crosswalk") or {}
+    lines += [
+        "",
+        "## Identity join diagnostics",
+        "",
+        f"- 2026 Sleeper stable IDs in current identity universe: **{current_identity.get('stable_ids_in_2026_identity_universe', 0)}**",
+        f"- FantasyPros rows mapped by unified production crosswalk: **{unified_identity.get('mapped_sleeper_ids', 0)}**",
+        f"- Unified crosswalk manual-review rows skipped: **{unified_identity.get('manual_review_rows_skipped', 0)}**",
+        f"- Minimum required FP coverage vs Sleeper per offensive position: **{pct(unified_identity.get('minimum_required_offense_coverage_vs_sleeper'))}**",
+        "",
+        "### Current PLAYER_DB → Sleeper resolution methods",
+        "",
+    ]
+    for method, count in (current_identity.get("resolution_methods") or {}).items():
+        lines.append(f"- `{method}`: **{count}**")
+    lines += [
+        "",
+        "### Unified FantasyPros crosswalk methods used",
+        "",
+    ]
+    for method, count in (unified_identity.get("match_method_counts") or {}).items():
+        lines.append(f"- `{method}`: **{count}**")
 
     lines += [
         "",
@@ -969,6 +1220,42 @@ def run_selftest():
         raise AssertionError("expected conflicting stable Sleeper IDs to hard-fail")
     except RuntimeError as exc:
         assert "conflicting stable Sleeper IDs" in str(exc)
+
+    # A rookie/no-history player must be able to obtain stable identity from
+    # current 2026 Sleeper data rather than requiring a 2025 PPG row.
+    sleeper_identity = build_current_sleeper_identity(
+        [
+            {"sleeper_id": "100", "player": "Rookie Runner", "pos": "RB", "team": "KC",
+             "sleeper_2026_proj_total": 200.0},
+        ],
+        [
+            {"sleeper_id": "100", "player": "Rookie Runner", "pos": "RB", "team": "KC",
+             "raw_category_season_totals": {"rush_yd": 700}},
+        ],
+    )
+    sid, method = resolve_current_sleeper_id(
+        "rookie runner", "RB", None, {}, sleeper_identity
+    )
+    assert sid == "100"
+    assert method == "current_2026_name_position_unique"
+
+    # The new coverage gate must catch the exact false-green failure from the
+    # first real Phase-1 run.
+    bad_cov = {p: Counter() for p in TRACKED_POSITIONS}
+    for p in ("QB", "RB", "WR", "TE"):
+        bad_cov[p]["sleeper_projection_row"] = 10
+        bad_cov[p]["fantasypros_projection_row"] = 0
+    try:
+        validate_offense_fp_coverage(bad_cov)
+        raise AssertionError("expected zero FantasyPros offense coverage to hard-fail")
+    except RuntimeError as exc:
+        assert "offense provider identity gate failed" in str(exc)
+
+    good_cov = {p: Counter() for p in TRACKED_POSITIONS}
+    for p in ("QB", "RB", "WR", "TE"):
+        good_cov[p]["sleeper_projection_row"] = 10
+        good_cov[p]["fantasypros_projection_row"] = 8
+    validate_offense_fp_coverage(good_cov)
 
     assert clamp(-1, 0.15, 1.55) == 0.15
     assert clamp(2, 0.15, 1.55) == 1.55
