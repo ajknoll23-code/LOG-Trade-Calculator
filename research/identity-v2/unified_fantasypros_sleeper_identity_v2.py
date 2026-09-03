@@ -757,7 +757,9 @@ def main():
 
     OUTPUT_JSON.parent.mkdir(parents=True, exist_ok=True)
     OUTPUT_JSON.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    OUTPUT_MD.write_text(render_report(result) + "\n", encoding="utf-8")
+    # Normalize report EOF so `git diff --check` never sees an added blank
+    # line at EOF. Exactly one trailing newline is intentional.
+    OUTPUT_MD.write_text(render_report(result).rstrip() + "\n", encoding="utf-8")
 
     print(f"Wrote {OUTPUT_JSON.relative_to(REPO_ROOT)}")
     print(f"Wrote {OUTPUT_MD.relative_to(REPO_ROOT)}")
