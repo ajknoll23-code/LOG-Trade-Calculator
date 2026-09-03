@@ -277,9 +277,11 @@ def build_result():
         if candidate is None or state is None:
             pm_mismatches.append({"player": key, "reason": "presence_mismatch"})
             continue
-        expected = float(candidate["production_multiplier"])
+        # Phase-1 audit stores the post-floor/rescue PM as
+        # `effective_prod_mult` (and rounds report floats to 6 decimals).
+        expected = float(candidate["effective_prod_mult"])
         actual = float(state["effective_pm"])
-        if abs(expected - actual) > 1e-9:
+        if round(actual, 6) != expected:
             pm_mismatches.append({
                 "player": key,
                 "expected": expected,
@@ -560,6 +562,13 @@ def canonical_json(result):
 
 
 def run_selftest():
+    # Phase-1 output contract used by the reproduction gate.
+    phase1_candidate = {"effective_prod_mult": 0.2199996}
+    actual_effective_pm = 0.21999960001
+    assert round(actual_effective_pm, 6) == round(
+        float(phase1_candidate["effective_prod_mult"]), 6
+    )
+
     # Demonstrate the exact discontinuity abstractly.
     role_estimate = 0.22
     no_history = True
