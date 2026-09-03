@@ -1,146 +1,51 @@
-# Identity Resolution Collision Report
-
-539 total FantasyPros IDP players. 474 high-confidence, 9 medium-confidence (not auto-assigned, needs review), 56 with no Sleeper candidate, 9 total requiring manual review.
-
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Mack Wilson Sr.", "fp_team": "ARI"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Ernest Jones IV", "fp_team": "SEA"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Devin Bush Jr.", "fp_team": "CHI"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Demetrius Knight Jr.", "fp_team": "CIN"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Dante Trader Jr.", "fp_team": "MIA"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Derwin James Jr.", "fp_team": "LAC"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Antoine Winfield Jr.", "fp_team": "TB"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Kevin Winston Jr.", "fp_team": "TEN"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Kevin Byard III", "fp_team": "NE"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Jessie Bates III", "fp_team": "ATL"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "D.J. Reed Jr.", "fp_team": "DET"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "A.J. Terrell Jr.", "fp_team": "ATL"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Ronnie Hickman Jr.", "fp_team": "CLE"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Carlton Davis III", "fp_team": "NE"}
-
-**collision_resolved_by_team**: {"type": "collision_resolved_by_team", "fp_name": "Chris Johnson", "fp_team": "MIA", "resolved_sleeper_id": "13370", "total_candidates": 2, "position_compatible": true}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Will Anderson Jr.", "fp_team": "HOU"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Mike Jackson Sr.", "fp_team": "CAR"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Joey Porter Jr.", "fp_team": "PIT"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Billy Bowman Jr.", "fp_team": "ATL"}
-
-**collision_resolved_by_team**: {"type": "collision_resolved_by_team", "fp_name": "Byron Young", "fp_team": "LAR", "resolved_sleeper_id": "10917", "total_candidates": 2, "position_compatible": true}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Byron Murphy Jr.", "fp_team": "MIN"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Pat Surtain II", "fp_team": "DEN"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Isaiah Rodgers Sr.", "fp_team": "MIN"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "DJ Turner II", "fp_team": "CIN"}
-
-**collision_resolved_by_team**: {"type": "collision_resolved_by_team", "fp_name": "Marcus Harris", "fp_team": "TEN", "resolved_sleeper_id": "12712", "total_candidates": 2, "position_compatible": true}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Byron Murphy II", "fp_team": "SEA"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Derek Stingley Jr.", "fp_team": "HOU"}
-
-**team_match_position_incompatible**: {"type": "team_match_position_incompatible", "fp_name": "Austin Booker", "fp_team": "CHI", "sleeper_id": "11760"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Jason Marshall Jr.", "fp_team": "MIA"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Jermaine Johnson II", "fp_team": "TEN"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Tony Jefferson II", "fp_team": "FA"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Rueben Bain Jr.", "fp_team": "TB"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Martin Emerson Jr.", "fp_team": "NO"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "George Karlaftis III", "fp_team": "KC"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Nolan Smith Jr.", "fp_team": "PHI"}
-
-**collision_resolved_by_team**: {"type": "collision_resolved_by_team", "fp_name": "Myles Murphy", "fp_team": "CIN", "resolved_sleeper_id": "10875", "total_candidates": 2, "position_compatible": true}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Dorance Armstrong Jr.", "fp_team": "WAS"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Harold Landry III", "fp_team": "NE"}
-
-**collision_resolved_by_team**: {"type": "collision_resolved_by_team", "fp_name": "Chris Jones", "fp_team": "KC", "resolved_sleeper_id": "3558", "total_candidates": 2, "position_compatible": true}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Patrick Jones II", "fp_team": "CAR"}
-
-**team_match_position_incompatible**: {"type": "team_match_position_incompatible", "fp_name": "Jalyx Hunt", "fp_team": "PHI", "sleeper_id": "11703"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Walter Nolen III", "fp_team": "ARI"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Jarvis Brownlee Jr.", "fp_team": "NYJ"}
-
-**team_mismatch**: {"type": "team_mismatch", "fp_name": "Dayo Odeyingbo", "fp_team": "FA", "sleeper_team": null, "candidate_sleeper_id": "7649"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Thomas Booker IV", "fp_team": "LV"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Greg Newsome II", "fp_team": "NYG"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Will McDonald IV", "fp_team": "NYJ"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Bobby Brown III", "fp_team": "CAR"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Gervon Dexter Sr.", "fp_team": "ATL"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Dexter Lawrence II", "fp_team": "CIN"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Brenton Cox Jr.", "fp_team": "GB"}
-
-**collision_resolved_by_team**: {"type": "collision_resolved_by_team", "fp_name": "Elijah Ponder", "fp_team": "NE", "resolved_sleeper_id": "12978", "total_candidates": 2, "position_compatible": true}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Anthony Hill Jr.", "fp_team": "TEN"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Shavon Revel Jr.", "fp_team": "DAL"}
-
-**team_match_position_incompatible**: {"type": "team_match_position_incompatible", "fp_name": "Jonah Elliss", "fp_team": "DEN", "sleeper_id": "11714"}
-
-**team_match_position_incompatible**: {"type": "team_match_position_incompatible", "fp_name": "Gabe Jacas", "fp_team": "NE", "sleeper_id": "13457"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "James Pearce Jr.", "fp_team": "ATL"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Dante Fowler Jr.", "fp_team": "SEA"}
-
-**team_match_position_incompatible**: {"type": "team_match_position_incompatible", "fp_name": "Kendal Daniels", "fp_team": "ATL", "sleeper_id": "13482"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Ivan Pace Jr.", "fp_team": "MIN"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Willie Gay Jr.", "fp_team": "MIA"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Chris Rumph II", "fp_team": "NO"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Ronnie Harrison Jr.", "fp_team": "MIA"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "James Williams Sr.", "fp_team": "TEN"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Jeremiah Trotter Jr.", "fp_team": "PHI"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Harold Perkins Jr.", "fp_team": "ATL"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "Smael Mondon Jr.", "fp_team": "PHI"}
-
-**team_mismatch**: {"type": "team_mismatch", "fp_name": "Elandon Roberts", "fp_team": "FA", "sleeper_team": null, "candidate_sleeper_id": "3369"}
-
-**team_mismatch**: {"type": "team_mismatch", "fp_name": "Malik Harrison", "fp_team": "FA", "sleeper_team": null, "candidate_sleeper_id": "6867"}
-
-**team_mismatch**: {"type": "team_mismatch", "fp_name": "Julian Okwara", "fp_team": "FA", "sleeper_team": null, "candidate_sleeper_id": "6851"}
-
-**no_sleeper_match**: {"type": "no_sleeper_match", "fp_name": "A.J. Green III", "fp_team": "MIA"}
+# FantasyPros ↔ Sleeper Unified Identity Report
+
+Production resolver covering QB / RB / WR / TE / DL / LB / DB.
+
+- FantasyPros tracked rows: **1034**
+- Authoritative stable-ID matches: **922**
+- Manual-review rows: **17**
+
+## Coverage by position
+
+| Pos | FP rows | Authoritative | Match rate | Candidate | Manual review |
+|---|---:|---:|---:|---:|---:|
+| QB | 79 | 70 | 88.6% | 73 | 3 |
+| RB | 119 | 107 | 89.9% | 107 | 1 |
+| WR | 179 | 161 | 89.9% | 162 | 1 |
+| TE | 118 | 110 | 93.2% | 113 | 3 |
+| DL | 177 | 158 | 89.3% | 160 | 2 |
+| LB | 159 | 141 | 88.7% | 143 | 6 |
+| DB | 203 | 175 | 86.2% | 175 | 1 |
+
+## Match methods
+
+- `name_collision_resolved_by_position_team`: **4**
+- `name_found_position_incompatible`: **6**
+- `name_position_team_confirmed`: **918**
+- `no_sleeper_name_candidate`: **95**
+- `unique_name_position_team_unavailable`: **11**
+
+## Manual-review rows
+
+These remain deliberately unresolved; downstream consumers must use existing fallback behavior rather than guess identity.
+
+| Player | Pos | FP team | Candidate SID | Sleeper team | Method |
+|---|---|---|---|---|---|
+| Brady Cook | QB |  | 12538 |  | unique_name_position_team_unavailable |
+| Jake Browning | QB |  | 6111 |  | unique_name_position_team_unavailable |
+| Desmond Ridder | QB |  | 8159 |  | unique_name_position_team_unavailable |
+| Max Bredeson | RB | MIN |  |  | name_found_position_incompatible |
+| Xavier Weaver | WR |  | 11921 |  | unique_name_position_team_unavailable |
+| Justin Joly | TE |  | 13400 |  | unique_name_position_team_unavailable |
+| Jack Stoll | TE |  | 7946 |  | unique_name_position_team_unavailable |
+| Devin Culp | TE |  | 11820 | TB | unique_name_position_team_unavailable |
+| Austin Booker | LB | CHI |  |  | name_found_position_incompatible |
+| Jalyx Hunt | LB | PHI |  |  | name_found_position_incompatible |
+| Dayo Odeyingbo | DL |  | 7649 |  | unique_name_position_team_unavailable |
+| Jonah Elliss | LB | DEN |  |  | name_found_position_incompatible |
+| Gabe Jacas | LB | NE |  |  | name_found_position_incompatible |
+| Kendal Daniels | DB | ATL |  |  | name_found_position_incompatible |
+| Elandon Roberts | LB |  | 3369 |  | unique_name_position_team_unavailable |
+| Malik Harrison | LB |  | 6867 |  | unique_name_position_team_unavailable |
+| Julian Okwara | DL |  | 6851 |  | unique_name_position_team_unavailable |
