@@ -8,7 +8,7 @@ Phase 1 is deliberately a lineage/coverage/blast-radius audit, not a claim that 
 It freezes the current player-value architecture and swaps only the production input in a counterfactual reconstruction.
 
 - Current tracked players: **549**
-- Phase-1 candidate values built: **409** (74.5%)
+- Phase-1 candidate values built: **518** (94.4%)
 - Production files mutated: **0**
 - `index.html` mutated: **No**
 
@@ -25,32 +25,54 @@ It freezes the current player-value architecture and swaps only the production i
 
 | Pos | Current | PPG row | Stable Sleeper ID | Sleeper proj | FP proj | Both rows | Usable forward | Candidate |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| QB | 64 | 49 | 49 | 32 | 0 | 0 | 32 | 32 |
-| RB | 97 | 77 | 77 | 74 | 0 | 0 | 74 | 74 |
-| WR | 114 | 83 | 83 | 79 | 0 | 0 | 79 | 79 |
-| TE | 44 | 34 | 34 | 33 | 0 | 0 | 33 | 33 |
-| DL | 86 | 74 | 74 | 69 | 58 | 56 | 71 | 71 |
-| LB | 79 | 64 | 64 | 59 | 58 | 54 | 63 | 63 |
-| DB | 65 | 58 | 58 | 54 | 49 | 46 | 57 | 57 |
+| QB | 64 | 49 | 63 | 34 | 53 | 33 | 54 | 54 |
+| RB | 97 | 77 | 96 | 89 | 78 | 74 | 93 | 93 |
+| WR | 114 | 83 | 114 | 108 | 96 | 96 | 108 | 108 |
+| TE | 44 | 34 | 44 | 43 | 37 | 37 | 43 | 43 |
+| DL | 86 | 74 | 86 | 79 | 66 | 62 | 83 | 83 |
+| LB | 79 | 64 | 78 | 68 | 68 | 62 | 74 | 74 |
+| DB | 65 | 58 | 64 | 60 | 54 | 51 | 63 | 63 |
+
+## Identity join diagnostics
+
+- 2026 Sleeper stable IDs in current identity universe: **9419**
+- FantasyPros rows mapped by unified production crosswalk: **922**
+- Unified crosswalk manual-review rows skipped: **0**
+- Minimum required FP coverage vs Sleeper per offensive position: **50.0%**
+
+### Current PLAYER_DB → Sleeper resolution methods
+
+- `current_2026_ambiguous_name_position`: **1**
+- `current_2026_name_position_unique`: **106**
+- `current_2026_no_candidate`: **3**
+- `ppg_stable_id`: **439**
+
+### Unified FantasyPros crosswalk methods used
+
+- `name_collision_resolved_by_position_team`: **4**
+- `name_position_team_confirmed`: **918**
 
 ## Data-quality flags
 
-- `history_present_forward_missing`: **140**
-- `missing_forward_projection`: **140**
+- `candidate_no_history_role_rescue_applied`: **7**
+- `history_present_forward_missing`: **31**
+- `missing_forward_projection`: **31**
 - `missing_ppg_row`: **110**
-- `missing_stable_sleeper_id`: **110**
+- `missing_stable_sleeper_id`: **4**
 - `ppg_position_mismatch_vs_current_player_db`: **23**
 - `zero_game_history_records`: **110**
 
 ### Forward projection source counts
 
-- `idp_no_forward_projection`: **5**
-- `idp_v1_both`: **156**
-- `idp_v1_fp_only`: **9**
-- `idp_v1_sleeper_only`: **26**
-- `missing_stable_sleeper_id`: **110**
-- `offense_no_forward_projection`: **25**
-- `offense_sleeper_only`: **218**
+- `idp_no_forward_projection`: **8**
+- `idp_v1_both`: **175**
+- `idp_v1_fp_only`: **13**
+- `idp_v1_sleeper_only`: **32**
+- `missing_stable_sleeper_id`: **4**
+- `offense_benchmark_fp50_sleeper50`: **240**
+- `offense_fantasypros_only`: **24**
+- `offense_no_forward_projection`: **19**
+- `offense_sleeper_only`: **34**
 
 ## Phase-1 position baselines
 
@@ -58,25 +80,25 @@ These are diagnostic benchmark anchors only; Phase 2 will test whether this norm
 
 | Pos | Rank | Anchor player | Combined points | Candidate cohort |
 |---|---:|---|---:|---:|
-| QB | 18 | baker mayfield | 251.10 | 32 |
-| RB | 32 | jordan mason | 165.48 | 74 |
-| WR | 36 | dj moore | 153.47 | 79 |
-| TE | 15 | dalton schultz | 128.84 | 33 |
-| DL | 32 | ed oliver | 150.19 | 71 |
-| LB | 32 | demetrius knight | 180.37 | 63 |
-| DB | 32 | jalen pitre | 159.15 | 57 |
+| QB | 18 | jordan love | 243.89 | 54 |
+| RB | 32 | bhayshul tuten | 171.31 | 93 |
+| WR | 36 | stefon diggs | 154.51 | 108 |
+| TE | 15 | juwan johnson | 128.84 | 43 |
+| DL | 32 | ed oliver | 150.19 | 83 |
+| LB | 32 | tj edwards | 182.04 | 74 |
+| DB | 32 | jalen pitre | 159.15 | 63 |
 
 ## Current vs Phase-1 movement
 
 | Pos | N | Median FV change | P90 abs FV change | P95 abs FV change | Max abs FV change | Median abs PM delta |
 |---|---:|---:|---:|---:|---:|---:|
-| QB | 32 | -0.5% | 5.0% | 13.1% | 39.7% | 0.0150 |
-| RB | 74 | -1.3% | 19.3% | 22.0% | 28.7% | 0.0240 |
-| WR | 79 | -4.7% | 18.9% | 24.7% | 33.2% | 0.0371 |
-| TE | 33 | 0.5% | 10.8% | 16.6% | 30.5% | 0.0244 |
-| DL | 71 | -5.3% | 7.4% | 9.9% | 104.0% | 0.0356 |
-| LB | 63 | 3.9% | 12.4% | 17.6% | 29.7% | 0.0264 |
-| DB | 57 | -0.3% | 9.2% | 17.0% | 36.5% | 0.0027 |
+| QB | 54 | 0.0% | 5.2% | 14.3% | 47.8% | 0.0019 |
+| RB | 93 | -2.9% | 20.3% | 31.1% | 149.0% | 0.0298 |
+| WR | 108 | -7.2% | 31.1% | 41.9% | 132.6% | 0.0543 |
+| TE | 43 | -1.2% | 13.8% | 24.7% | 88.5% | 0.0148 |
+| DL | 83 | -5.1% | 27.5% | 53.0% | 104.4% | 0.0366 |
+| LB | 74 | 2.8% | 29.3% | 47.3% | 76.2% | 0.0206 |
+| DB | 63 | -0.3% | 17.2% | 34.7% | 93.5% | 0.0031 |
 
 ## Rank stability
 
@@ -84,13 +106,13 @@ Ranks are measured on the exact common current/candidate cohort for each positio
 
 | Pos | N | Spearman | Top-N | Top-N overlap | Max rank move |
 |---|---:|---:|---:|---:|---:|
-| QB | 32 | 0.9791 | 18 | 100.0% | 5 |
-| RB | 74 | 0.9880 | 32 | 93.8% | 11 |
-| WR | 79 | 0.9875 | 36 | 94.4% | 17 |
-| TE | 33 | 0.9883 | 15 | 93.3% | 4 |
-| DL | 71 | 0.9693 | 32 | 96.9% | 37 |
-| LB | 63 | 0.9780 | 32 | 96.9% | 15 |
-| DB | 57 | 0.9413 | 32 | 93.8% | 20 |
+| QB | 54 | 0.9959 | 18 | 100.0% | 4 |
+| RB | 93 | 0.9678 | 32 | 93.8% | 29 |
+| WR | 108 | 0.9604 | 36 | 97.2% | 36 |
+| TE | 43 | 0.9833 | 15 | 100.0% | 9 |
+| DL | 83 | 0.9713 | 32 | 96.9% | 41 |
+| LB | 74 | 0.9741 | 32 | 96.9% | 20 |
+| DB | 63 | 0.9526 | 32 | 93.8% | 20 |
 
 ## Largest absolute final-value movers
 
@@ -98,36 +120,36 @@ Large movement is a **diagnostic signal**, not evidence that Phase 1 is right. T
 
 | Player | Pos | Current | Phase 1 | Change | PM current→P1 | Rank move | Forward source | History note |
 |---|---|---:|---:|---:|---|---:|---|---|
-| kayvon thibodeaux | DL | 1182 | 2411 | 104.0% | 0.231→0.471 | +16 | idp_v1_both | real |
-| jonathan greenard | DL | 2007 | 3391 | 69.0% | 0.392→0.663 | +37 | idp_v1_both | real |
-| tua tagovailoa | QB | 2803 | 3916 | 39.7% | 0.392→0.548 | +5 | offense_sleeper_only | real |
-| jaylon carlies | DB | 1900 | 2594 | 36.5% | 0.397→0.542 | +12 | idp_v1_fp_only | real |
-| isaac teslaa | WR | 1705 | 1139 | -33.2% | 0.310→0.207 | -7 | offense_sleeper_only | real |
-| tory horton | WR | 1831 | 1273 | -30.5% | 0.381→0.268 | -7 | offense_sleeper_only | real |
-| justin jefferson | WR | 3702 | 4830 | 30.5% | 0.673→0.878 | +17 | offense_sleeper_only | real |
-| terrance ferguson | TE | 1126 | 783 | -30.5% | 0.312→0.221 | -2 | offense_sleeper_only | real |
-| troy franklin | WR | 2119 | 1482 | -30.1% | 0.438→0.311 | -3 | offense_sleeper_only | real |
-| andrew van ginkel | LB | 2528 | 3279 | 29.7% | 0.595→0.772 | +14 | idp_v1_both | real |
-| kaden elliss | LB | 2990 | 2125 | -28.9% | 0.704→0.500 | -15 | idp_v1_both | real |
-| keaton mitchell | RB | 1410 | 1815 | 28.7% | 0.288→0.371 | +4 | offense_sleeper_only | real |
-| danny stutsman | LB | 1585 | 1149 | -27.5% | 0.297→0.218 | -1 | idp_v1_fp_only | real |
-| emari demercado | RB | 804 | 588 | -26.9% | 0.205→0.150 | -11 | offense_sleeper_only | real |
-| oronde gadsden | TE | 2004 | 1505 | -24.9% | 0.533→0.410 | -3 | offense_sleeper_only | real |
-| dontayvion wicks | WR | 1375 | 1706 | 24.1% | 0.250→0.310 | +8 | offense_sleeper_only | real |
-| kimani vidal | RB | 1946 | 1490 | -23.4% | 0.398→0.305 | -2 | offense_sleeper_only | real |
-| rhamondre stevenson | RB | 2409 | 2961 | 22.9% | 0.672→0.826 | +11 | offense_sleeper_only | real |
-| shedeur sanders | QB | 1550 | 1201 | -22.5% | 0.260→0.203 | +0 | offense_sleeper_only | real |
-| travis hunter | WR | 2338 | 1818 | -22.2% | 0.481→0.379 | -2 | offense_sleeper_only | real |
-| phil mafah | RB | 1282 | 1006 | -21.5% | 0.262→0.205 | -4 | offense_sleeper_only | real |
-| malik davis | RB | 808 | 639 | -20.9% | 0.209→0.165 | -9 | offense_sleeper_only | real |
-| isaiah davis | RB | 1116 | 1347 | 20.7% | 0.228→0.275 | +6 | offense_sleeper_only | real |
-| elic ayomanor | WR | 1388 | 1112 | -19.9% | 0.292→0.235 | -5 | offense_sleeper_only | real |
-| zach charbonnet | RB | 2583 | 2081 | -19.4% | 0.555→0.447 | -5 | offense_sleeper_only | real |
-| ray davis | RB | 828 | 986 | 19.1% | 0.196→0.233 | +4 | offense_sleeper_only | real |
-| jack bech | WR | 950 | 769 | -19.1% | 0.202→0.164 | -2 | offense_sleeper_only | real |
-| jerry jeudy | WR | 2338 | 1897 | -18.9% | 0.425→0.345 | -2 | offense_sleeper_only | real |
-| isiah pacheco | RB | 1558 | 1266 | -18.7% | 0.393→0.319 | -5 | offense_sleeper_only | real |
-| cj gardnerjohnson | DB | 2445 | 2893 | 18.3% | 0.553→0.654 | +16 | idp_v1_both | real |
+| marshawn lloyd | RB | 907 | 2258 | 149.0% | 0.195→0.486 | +29 | offense_benchmark_fp50_sleeper50 | no_2025_data_full_shrink_to_position_mean |
+| caleb douglas | WR | 687 | 1598 | 132.6% | 0.177→0.388 | +36 | offense_benchmark_fp50_sleeper50 | no_2025_data_full_shrink_to_position_mean |
+| aaron donald | DL | 698 | 1427 | 104.4% | 0.220→0.450 | +5 | idp_v1_fp_only | no_2025_data_full_shrink_to_position_mean |
+| kayvon thibodeaux | DL | 1182 | 2411 | 104.0% | 0.231→0.471 | +20 | idp_v1_both | real |
+| emmanuel mcneilwarren | DB | 827 | 1600 | 93.5% | 0.220→0.410 | +0 | idp_v1_sleeper_only | no_2025_data_full_shrink_to_position_mean |
+| justin joly | TE | 486 | 916 | 88.5% | 0.162→0.292 | +7 | offense_sleeper_only | no_2025_data_full_shrink_to_position_mean |
+| malachi fields | WR | 864 | 1619 | 87.4% | 0.220→0.393 | +32 | offense_benchmark_fp50_sleeper50 | no_2025_data_full_shrink_to_position_mean |
+| kaelon black | RB | 896 | 1647 | 83.8% | 0.183→0.336 | +23 | offense_benchmark_fp50_sleeper50 | no_2025_data_full_shrink_to_position_mean |
+| zavion thomas | WR | 626 | 1133 | 81.0% | 0.162→0.283 | +11 | offense_benchmark_fp50_sleeper50 | no_2025_data_full_shrink_to_position_mean |
+| jacob rodriguez | LB | 1682 | 2964 | 76.2% | 0.315→0.541 | +20 | idp_v1_both | no_2025_data_full_shrink_to_position_mean |
+| kyle louis | LB | 968 | 1683 | 73.9% | 0.220→0.367 | +7 | idp_v1_fp_only | no_2025_data_full_shrink_to_position_mean |
+| eli stowers | TE | 578 | 986 | 70.6% | 0.165→0.275 | +9 | offense_benchmark_fp50_sleeper50 | no_2025_data_full_shrink_to_position_mean |
+| jonathan greenard | DL | 2007 | 3391 | 69.0% | 0.392→0.663 | +41 | idp_v1_both | real |
+| mike washington | RB | 842 | 1421 | 68.8% | 0.172→0.290 | +22 | offense_sleeper_only | no_2025_data_full_shrink_to_position_mean |
+| aj haulcy | DB | 1150 | 1919 | 66.9% | 0.301→0.485 | +0 | idp_v1_both | no_2025_data_full_shrink_to_position_mean |
+| dangelo ponds | DB | 670 | 1099 | 64.0% | 0.242→0.372 | +0 | idp_v1_both | no_2025_data_full_shrink_to_position_mean |
+| anthony hill | LB | 889 | 1389 | 56.2% | 0.249→0.366 | +6 | idp_v1_sleeper_only | no_2025_data_full_shrink_to_position_mean |
+| peter woods | DL | 884 | 1375 | 55.5% | 0.291→0.424 | +3 | idp_v1_both | no_2025_data_full_shrink_to_position_mean |
+| josiah trotter | LB | 924 | 1434 | 55.2% | 0.257→0.376 | +6 | idp_v1_both | no_2025_data_full_shrink_to_position_mean |
+| kayden mcdonald | DL | 643 | 984 | 53.0% | 0.220→0.319 | +1 | idp_v1_sleeper_only | no_2025_data_full_shrink_to_position_mean |
+| keldric faulk | DL | 892 | 1360 | 52.5% | 0.294→0.420 | +1 | idp_v1_both | no_2025_data_full_shrink_to_position_mean |
+| zion young | DL | 1044 | 1558 | 49.2% | 0.281→0.405 | +3 | idp_v1_fp_only | no_2025_data_full_shrink_to_position_mean |
+| jakobi lane | WR | 1055 | 1569 | 48.7% | 0.265→0.382 | +19 | offense_benchmark_fp50_sleeper50 | no_2025_data_full_shrink_to_position_mean |
+| deshaun watson | QB | 1838 | 2717 | 47.8% | 0.257→0.380 | +3 | offense_benchmark_fp50_sleeper50 | no_2025_data_full_shrink_to_position_mean |
+| deion burks | WR | 1676 | 887 | -47.1% | 0.350→0.189 | -30 | offense_sleeper_only | no_2025_data_full_shrink_to_position_mean |
+| jake golday | LB | 1162 | 1663 | 43.1% | 0.220→0.312 | +3 | idp_v1_both | no_2025_data_full_shrink_to_position_mean |
+| chris bell | WR | 1106 | 1580 | 42.9% | 0.277→0.384 | +17 | offense_benchmark_fp50_sleeper50 | no_2025_data_full_shrink_to_position_mean |
+| kaleb elarmsorr | LB | 968 | 1370 | 41.5% | 0.220→0.304 | +0 | idp_v1_both | no_2025_data_full_shrink_to_position_mean |
+| bryce lance | WR | 1037 | 1453 | 40.1% | 0.220→0.305 | +17 | offense_benchmark_fp50_sleeper50 | no_2025_data_full_shrink_to_position_mean |
+| antonio williams | WR | 1102 | 1506 | 36.7% | 0.276→0.368 | +14 | offense_benchmark_fp50_sleeper50 | no_2025_data_full_shrink_to_position_mean |
 
 ## What Phase 1 does **not** prove
 
