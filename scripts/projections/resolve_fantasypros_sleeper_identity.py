@@ -434,12 +434,12 @@ def preserve_previous_authoritative(fp, fresh, prior_sid, sleeper_by_sid):
             f"({fp['_name']}): prior Sleeper {prior_sid} now resolves to "
             f"{current['player']!r}"
         )
-    if not is_position_compatible(fp["_pos"], current):
-        raise RuntimeError(
-            f"Stable identity position contradiction for FantasyPros {fp['_fpid']} "
-            f"({fp['_name']} {fp['_pos']}): prior Sleeper {prior_sid} current "
-            f"positions={sorted(current.get('positions') or ())}"
-        )
+    # Position is mutable even when provider IDs identify the same person.
+    # Example: a TE can later be rostered/listed as an FB (normalized to RB).
+    # New identity matches still require position compatibility; this exception
+    # applies only to a previously authoritative stable FPID<->Sleeper-ID pair
+    # whose Sleeper ID still resolves to the exact same normalized person.
+    position_changed = not is_position_compatible(fp["_pos"], current)
 
     fresh_sid = fresh.get("sleeper_id")
     if fresh_sid is not None and str(fresh_sid) != prior_sid:
@@ -458,7 +458,11 @@ def preserve_previous_authoritative(fp, fresh, prior_sid, sleeper_by_sid):
     kept["sleeper_team"] = current.get("team")
     kept["sleeper_positions"] = sorted(current.get("positions") or ())
     kept["sleeper_has_projection_signal"] = bool(current.get("has_projection_signal"))
-    kept["match_method"] = "previous_authoritative_stable_id_preserved"
+    kept["match_method"] = (
+        "previous_authoritative_stable_id_preserved_position_changed"
+        if position_changed
+        else "previous_authoritative_stable_id_preserved"
+    )
     kept["match_confidence"] = "high"
     kept["requires_manual_review"] = False
     return kept
@@ -690,6 +694,54 @@ def run_production_selftest():
     sticky_by = {str(r["fantasypros_id"]): r for r in sticky}
     assert sticky_by["4"]["sleeper_id"] == "400"
     assert sticky_by["4"]["match_method"] == "previous_authoritative_stable_id_preserved"
+
+    # Legitimate position changes must preserve a previously authoritative
+    # stable identity, but must NOT make TE/RB generally compatible for new
+    # matches. This mirrors players such as Connor Heyward moving TE -> FB.
+    transition_fp = {"players": [{
+        "fantasypros_id": 5,
+        "name": "Position Change",
+        "normalized_name": "position change",
+        "source_position": "TE",
+        "team": "LV",
+    }]}
+    transition_raw = [{
+        "sleeper_id": "500",
+        "player": "position change",
+        "pos": "FB",
+        "team": "LV",
+        "fantasy_positions": ["RB"],
+        "raw_category_season_totals": {"rush_yd": 10},
+    }]
+
+    # No prior pairing: TE -> FB/RB is still incompatible and unresolved.
+    untrusted_transition = build_production_crosswalk(
+        transition_fp, [], transition_raw, refresh, []
+    )
+    assert untrusted_transition[0]["sleeper_id"] is None
+    assert untrusted_transition[0]["requires_manual_review"] is True
+    assert (
+        untrusted_transition[0]["match_method"]
+        == "name_found_position_incompatible"
+    )
+
+    # Prior authoritative stable IDs: same person survives the position change.
+    transition_previous = [{
+        "fantasypros_id": 5,
+        "name": "Position Change",
+        "fp_position": "TE",
+        "sleeper_id": "500",
+        "requires_manual_review": False,
+    }]
+    trusted_transition = build_production_crosswalk(
+        transition_fp, [], transition_raw, refresh, transition_previous
+    )
+    assert trusted_transition[0]["sleeper_id"] == "500"
+    assert trusted_transition[0]["requires_manual_review"] is False
+    assert (
+        trusted_transition[0]["match_method"]
+        == "previous_authoritative_stable_id_preserved_position_changed"
+    )
 
     # A previous stable mapping to the wrong current person must hard-fail.
     bad_previous = [{"fantasypros_id": 1, "sleeper_id": "200", "requires_manual_review": False}]
