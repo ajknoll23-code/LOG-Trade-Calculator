@@ -15,16 +15,16 @@
 
 ## Artifact coverage
 
-- Total projected players: **1101**
-- Position counts: **{"DB": 212, "DL": 195, "LB": 149, "QB": 72, "RB": 139, "TE": 127, "WR": 207}**
-- Source counts: **{"fantasypros_normalized_fallback": 72, "idp_v1_both": 355, "idp_v1_fp_only": 112, "idp_v1_sleeper_only": 89, "sleeper_league_scored": 473}**
+- Total projected players: **1119**
+- Position counts: **{"DB": 213, "DL": 196, "LB": 148, "QB": 72, "RB": 144, "TE": 132, "WR": 214}**
+- Source counts: **{"fantasypros_normalized_fallback": 90, "idp_v1_both": 356, "idp_v1_fp_only": 112, "idp_v1_no_new_data": 1, "idp_v1_sleeper_only": 88, "sleeper_league_scored": 472}**
 
 ## Current league validation
 
 - Teams checked: **12**
 - Teams with all 17 legal slots fillable: **12 / 12**
 - Teams with a projection-complete non-K starting lineup: **12 / 12**
-- Active non-K roster projection coverage: **95.64%**
+- Active non-K roster projection coverage: **95.82%**
 - Selected non-K players needing fallback: **0**
 
 ## Team detail
@@ -39,14 +39,14 @@
 | Cock Mchorse 🐴 | 95.0% | 17/17 | 0 |
 | Jersey Bagels | 83.8% | 17/17 | 0 |
 | Apex Predators | 95.0% | 17/17 | 0 |
-| Toddy2times | 97.5% | 17/17 | 0 |
+| Toddy2times | 100.0% | 17/17 | 0 |
 | Moose Knuckles | 89.2% | 17/17 | 0 |
 | <respectable team name> | 94.7% | 17/17 | 0 |
 | Serious Gourmet Shit | 100.0% | 17/17 | 0 |
 
 ## Identity / provenance
 
-- FantasyPros IDs mapped to Sleeper IDs: **928**
+- FantasyPros IDs mapped to Sleeper IDs: **957**
 - Manual-review identity rows skipped: **0**
 
 The artifact is deterministic: its input file SHA-256 hashes are stored in the JSON, and no wall-clock timestamp is embedded.
