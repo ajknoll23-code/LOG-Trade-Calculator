@@ -53,10 +53,14 @@ BACKTEST_PY = (
     / "baseline-backtester"
     / "baseline_backtester.py"
 )
+# Canonical historical weekly-points dataset is owned by the roster-economics
+# research pipeline. The reviewed baseline_backtester.py was later organized
+# into research/baseline-backtester/, but this input intentionally remained
+# under research/roster-economics/.
 POINTS_PATH = (
     REPO_ROOT
     / "research"
-    / "baseline-backtester"
+    / "roster-economics"
     / "weekly_points_by_season.json"
 )
 PRIOR_NORMALIZATION_PATH = (
