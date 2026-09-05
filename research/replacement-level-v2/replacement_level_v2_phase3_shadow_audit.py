@@ -28,6 +28,7 @@ Outputs:
 from __future__ import annotations
 
 import argparse
+from datetime import date
 import hashlib
 import json
 import math
@@ -66,7 +67,13 @@ OUTPUT_MD = (
     / "replacement_level_v2_phase3_shadow_audit.md"
 )
 
-METHOD_VERSION = "replacement-level-v2-phase3-current-board-shadow-v1"
+METHOD_VERSION = "replacement-level-v2-phase3-current-board-shadow-v2"
+
+# Production V2 Phase 1's current committed artifact was generated on
+# 2026-09-03. RB valuation uses fractional age from the wall-clock date, so
+# exact control reproduction requires evaluating every Phase-3 shadow on that
+# same date. Non-RB positions are unaffected by this date parameter.
+PHASE1_REFERENCE_DATE = date(2026, 9, 3)
 TRACKED_POSITIONS = ("QB", "RB", "WR", "TE", "DL", "LB", "DB")
 
 LEGACY_RANKS = {
@@ -221,6 +228,17 @@ def validate_inputs(phase2, production_phase1):
             f"Production V2 Phase 1 legacy ranks changed unexpectedly: {normalized}"
         )
 
+    phase1_input_sha = production_phase1.get("input_sha256") or {}
+    recorded_index_sha = phase1_input_sha.get("index.html")
+    current_index_sha = sha256(INDEX_HTML)
+    if not recorded_index_sha:
+        raise RuntimeError("Production V2 Phase 1 missing recorded index.html SHA")
+    if recorded_index_sha != current_index_sha:
+        raise RuntimeError(
+            "Current index.html no longer matches the Production V2 Phase 1 "
+            f"input snapshot: recorded={recorded_index_sha} current={current_index_sha}"
+        )
+
     positions = phase2.get("positions") or {}
     for pos in TRACKED_POSITIONS:
         rec = positions.get(pos) or {}
@@ -253,6 +271,7 @@ def candidate_final_value(key, raw_pm, cfg, snapshot_values):
         effective_pm,
         raw_pm_returned,
         cfg,
+        as_of=PHASE1_REFERENCE_DATE,
     )
     pw = cfg["position_weight"].get(pos, 1.0)
     value = math.floor(
@@ -619,6 +638,9 @@ def build_result():
         "frozen_prospective_experiments_touched": False,
         "scope": {
             "scenario_strategy": "one position at a time",
+            "phase1_reference_date_for_time_sensitive_rb_age": (
+                PHASE1_REFERENCE_DATE.isoformat()
+            ),
             "all_non_target_replacement_ranks": "legacy control",
             "position_weights": "held fixed from index.html",
             "pm_transform": {
@@ -633,6 +655,8 @@ def build_result():
         "isolation_gate": {
             "legacy_control_exactly_reproduces_production_v2_phase1": True,
             "max_fundamental_value_reproduction_delta": max_delta,
+            "phase1_reference_date": PHASE1_REFERENCE_DATE.isoformat(),
+            "index_html_sha_matches_phase1_input": True,
         },
         "positions": positions,
         "input_sha256": {
@@ -674,6 +698,8 @@ def render_md(result):
         "",
         "- Legacy-rank reconstruction reproduces Production V2 Phase 1 exactly: **Yes**",
         f"- Maximum fundamental-value reproduction delta: **{result['isolation_gate']['max_fundamental_value_reproduction_delta']}**",
+        f"- RB fractional-age reference date frozen to Phase 1: **{result['isolation_gate']['phase1_reference_date']}**",
+        "- `index.html` SHA matches the Phase 1 recorded input: **Yes**",
         "- Every scenario changes **one position's replacement rank only**.",
         "",
         "## Summary",
