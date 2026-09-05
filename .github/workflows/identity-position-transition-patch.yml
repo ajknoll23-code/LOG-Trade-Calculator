@@ -1,0 +1,168 @@
+name: Patch Stable Identity Position Transitions
+
+# One-time maintenance patch.
+# Preserves a previously authoritative FPID<->Sleeper-ID identity when the
+# same stable Sleeper ID still resolves to the same person after a legitimate
+# position change. New matches still require compatible positions.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Patch identity resolver
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("scripts/projections/resolve_fantasypros_sleeper_identity.py")
+          text = path.read_text(encoding="utf-8")
+
+          start_marker = '    if not is_position_compatible(fp["_pos"], current):\n'
+          fresh_marker = '    fresh_sid = fresh.get("sleeper_id")\n'
+
+          if start_marker not in text:
+              raise RuntimeError(
+                  "Expected stable-position hard-fail block not found. "
+                  "Refusing to patch an unexpected resolver version."
+              )
+
+          start = text.index(start_marker)
+          fresh = text.index(fresh_marker, start)
+
+          new_guard = (
+              '    # Position is mutable even when provider IDs identify the same person.\n'
+              '    # Example: a TE can later be rostered/listed as an FB (normalized to RB).\n'
+              '    # New identity matches still require position compatibility; this exception\n'
+              '    # applies only to a previously authoritative stable FPID<->Sleeper-ID pair\n'
+              '    # whose Sleeper ID still resolves to the exact same normalized person.\n'
+              '    position_changed = not is_position_compatible(fp["_pos"], current)\n'
+              '\n'
+          )
+          text = text[:start] + new_guard + text[fresh:]
+
+          old_method = (
+              '    kept["match_method"] = '
+              '"previous_authoritative_stable_id_preserved"\n'
+          )
+          new_method = (
+              '    kept["match_method"] = (\n'
+              '        "previous_authoritative_stable_id_preserved_position_changed"\n'
+              '        if position_changed\n'
+              '        else "previous_authoritative_stable_id_preserved"\n'
+              '    )\n'
+          )
+          if text.count(old_method) != 1:
+              raise RuntimeError(
+                  "Expected exactly one stable-preservation match-method line."
+              )
+          text = text.replace(old_method, new_method, 1)
+
+          insert_marker = (
+              '    # A previous stable mapping to the wrong current person must hard-fail.\n'
+          )
+          if text.count(insert_marker) != 1:
+              raise RuntimeError(
+                  "Expected exactly one stable-ID contradiction test marker."
+              )
+
+          transition_lines = [
+              '    # Legitimate position changes must preserve a previously authoritative',
+              '    # stable identity, but must NOT make TE/RB generally compatible for new',
+              '    # matches. This mirrors players such as Connor Heyward moving TE -> FB.',
+              '    transition_fp = {"players": [{',
+              '        "fantasypros_id": 5,',
+              '        "name": "Position Change",',
+              '        "normalized_name": "position change",',
+              '        "source_position": "TE",',
+              '        "team": "LV",',
+              '    }]}',
+              '    transition_raw = [{',
+              '        "sleeper_id": "500",',
+              '        "player": "position change",',
+              '        "pos": "FB",',
+              '        "team": "LV",',
+              '        "fantasy_positions": ["RB"],',
+              '        "raw_category_season_totals": {"rush_yd": 10},',
+              '    }]',
+              '',
+              '    # No prior pairing: TE -> FB/RB is still incompatible and unresolved.',
+              '    untrusted_transition = build_production_crosswalk(',
+              '        transition_fp, [], transition_raw, refresh, []',
+              '    )',
+              '    assert untrusted_transition[0]["sleeper_id"] is None',
+              '    assert untrusted_transition[0]["requires_manual_review"] is True',
+              '    assert (',
+              '        untrusted_transition[0]["match_method"]',
+              '        == "name_found_position_incompatible"',
+              '    )',
+              '',
+              '    # Prior authoritative stable IDs: same person survives the position change.',
+              '    transition_previous = [{',
+              '        "fantasypros_id": 5,',
+              '        "name": "Position Change",',
+              '        "fp_position": "TE",',
+              '        "sleeper_id": "500",',
+              '        "requires_manual_review": False,',
+              '    }]',
+              '    trusted_transition = build_production_crosswalk(',
+              '        transition_fp, [], transition_raw, refresh, transition_previous',
+              '    )',
+              '    assert trusted_transition[0]["sleeper_id"] == "500"',
+              '    assert trusted_transition[0]["requires_manual_review"] is False',
+              '    assert (',
+              '        trusted_transition[0]["match_method"]',
+              '        == "previous_authoritative_stable_id_preserved_position_changed"',
+              '    )',
+              '',
+          ]
+          transition_test = "\n".join(transition_lines) + "\n"
+
+          text = text.replace(
+              insert_marker,
+              transition_test + insert_marker,
+              1,
+          )
+
+          path.write_text(text, encoding="utf-8")
+          print(f"Patched {path}")
+          PY
+
+      - name: Compile patched resolver
+        run: python3 -m py_compile scripts/projections/resolve_fantasypros_sleeper_identity.py
+
+      - name: Run identity resolver self-test
+        run: python3 scripts/projections/resolve_fantasypros_sleeper_identity.py --selftest
+
+      - name: Show surgical diff
+        run: git diff -- scripts/projections/resolve_fantasypros_sleeper_identity.py
+
+      - name: Commit resolver patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add scripts/projections/resolve_fantasypros_sleeper_identity.py
+          git diff --staged --quiet || git commit -m "Allow stable identity across position transitions"
+          git push
