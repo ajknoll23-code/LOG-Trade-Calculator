@@ -957,7 +957,7 @@
       <div class="log-app-topbar">
         <div class="log-app-logo-slot" aria-hidden="true"></div>
         <div class="log-app-brand">
-          <div class="log-app-brand-title">Claude Dynasty Trade Calculator</div>
+          <div class="log-app-brand-title">L.O.G. DYNASTY TRADE CALCULATOR</div>
           <div class="log-app-brand-sub">League of Ordinary Gentlemen · IDP Dynasty</div>
         </div>
         <div class="log-app-context">
