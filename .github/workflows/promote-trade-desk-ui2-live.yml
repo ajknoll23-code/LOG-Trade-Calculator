@@ -1,0 +1,314 @@
+name: Promote Trade Desk UI2 Live
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Verify approved preview and current production
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EXPECTED_PREVIEW_BLOB="d50715af625fcf8306e04b62fbf0fa025c9126b2"
+          EXPECTED_INDEX_BLOB="0f587dcb9740d0986acc705b305cdaa6217c0ae9"
+
+          ACTUAL_PREVIEW_BLOB="$(git hash-object trade-desk-preview.html)"
+          ACTUAL_INDEX_BLOB="$(git hash-object index.html)"
+
+          echo "Expected preview: $EXPECTED_PREVIEW_BLOB"
+          echo "Actual preview:   $ACTUAL_PREVIEW_BLOB"
+          echo "Expected index:   $EXPECTED_INDEX_BLOB"
+          echo "Actual index:     $ACTUAL_INDEX_BLOB"
+
+          test "$ACTUAL_PREVIEW_BLOB" = "$EXPECTED_PREVIEW_BLOB"
+          test "$ACTUAL_INDEX_BLOB" = "$EXPECTED_INDEX_BLOB"
+
+      - name: Preserve pre-UI2 live rollback tag
+        shell: bash
+        env:
+          BACKUP_TAG: trade-desk-pre-ui2-live-2026-09-06
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${BACKUP_TAG}" >/dev/null 2>&1; then
+            echo "Rollback tag ${BACKUP_TAG} already exists."
+          else
+            git tag "${BACKUP_TAG}" HEAD
+            git push origin "refs/tags/${BACKUP_TAG}"
+            echo "Created ${BACKUP_TAG} -> $(git rev-parse HEAD)"
+          fi
+
+      - name: Promote approved preview to production index
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          import hashlib
+
+          index_path = Path("index.html")
+          preview_path = Path("trade-desk-preview.html")
+
+          old_prod = index_path.read_text(encoding="utf-8")
+          preview = preview_path.read_text(encoding="utf-8")
+
+          required_preview_markers = [
+              "TRADE_DESK_UI2_FULL_COPY_PREVIEW_V1",
+              "TRADE_DESK_UI21_SIMPLIFY_V1",
+              "UI21_ADD_CONTROLS_RENDER_FIX_V1",
+              "UI21_LAUNCHER_VISIBILITY_FIX_V1",
+              "+ Player",
+              "+ Draft Pick",
+          ]
+
+          missing = [
+              marker for marker in required_preview_markers
+              if marker not in preview
+          ]
+          if missing:
+              raise RuntimeError(
+                  "Approved preview is missing required UI2 markers: "
+                  + ", ".join(missing)
+              )
+
+          candidate = preview
+
+          # Remove preview-only wording from the browser tab.
+          old_title = (
+              "<title>Trade Desk UI2 Preview — "
+              "League of Ordinary Gentlemen</title>"
+          )
+          new_title = (
+              "<title>Trade Desk — "
+              "League of Ordinary Gentlemen</title>"
+          )
+
+          if old_title not in candidate:
+              raise RuntimeError("Expected preview title not found")
+
+          candidate = candidate.replace(old_title, new_title, 1)
+
+          # The preview runtime creates a small preview-only notice. Keep the
+          # approved layout/runtime byte-for-byte otherwise, but suppress that
+          # single preview label in production.
+          live_override = r'''
+          <style id="trade-desk-ui2-live-overrides">
+          /* TRADE_DESK_UI2_LIVE_V1
+             Production-only cleanup. The approved UI2 preview remains
+             unchanged in trade-desk-preview.html. */
+          .ui2-preview-notice{
+            display:none!important;
+          }
+          </style>
+          '''
+
+          live_override = "\n".join(
+              line.rstrip() for line in live_override.splitlines()
+          )
+
+          if "</head>" not in candidate:
+              raise RuntimeError("Candidate is missing closing </head>")
+
+          candidate = candidate.replace(
+              "</head>",
+              live_override + "\n</head>",
+              1,
+          )
+
+          # Safety proof: every script block from the pre-UI2 production page
+          # must still be present byte-for-byte in the promoted page. UI2 adds
+          # presentation scripts but cannot rewrite existing model/trade code.
+          prod_scripts = re.findall(
+              r"<script(?:\s[^>]*)?>.*?</script>",
+              old_prod,
+              flags=re.S | re.I,
+          )
+
+          if not prod_scripts:
+              raise RuntimeError("No script blocks found in current production")
+
+          missing_prod_scripts = [
+              i for i, block in enumerate(prod_scripts)
+              if block not in candidate
+          ]
+
+          if missing_prod_scripts:
+              raise RuntimeError(
+                  "Promotion changed existing production script blocks: "
+                  + str(missing_prod_scripts)
+              )
+
+          # Static guards for the user-approved mobile workflow.
+          required_live = [
+              "TRADE_DESK_UI2_LIVE_V1",
+              "TRADE_DESK_UI21_SIMPLIFY_V1",
+              "UI21_ADD_CONTROLS_RENDER_FIX_V1",
+              "UI21_LAUNCHER_VISIBILITY_FIX_V1",
+              ".side:not(.ui21-add-open) .add-controls > .ui21-add-launcher",
+              "display:grid!important",
+              "+ Player",
+              "+ Draft Pick",
+          ]
+
+          missing_live = [
+              token for token in required_live
+              if token not in candidate
+          ]
+
+          if missing_live:
+              raise RuntimeError(
+                  "Promoted production missing UI2 controls: "
+                  + ", ".join(missing_live)
+              )
+
+          if "Trade Desk UI2 Preview" in candidate:
+              raise RuntimeError("Preview browser title survived live promotion")
+
+          index_path.write_text(candidate, encoding="utf-8")
+
+          print(
+              f"PASS preserved {len(prod_scripts)} existing production "
+              "script blocks byte-for-byte"
+          )
+          print("PASS approved UI2 launcher controls present")
+          print("PASS preview-only notice hidden in production")
+          print(
+              "Old index SHA256: "
+              + hashlib.sha256(old_prod.encode()).hexdigest()
+          )
+          print(
+              "New index SHA256: "
+              + hashlib.sha256(candidate.encode()).hexdigest()
+          )
+          PY
+
+      - name: Validate promoted inline JavaScript
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          html = Path("index.html").read_text(encoding="utf-8")
+
+          scripts = re.findall(
+              r"<script(?:\s[^>]*)?>(.*?)</script>",
+              html,
+              flags=re.S | re.I,
+          )
+
+          if not scripts:
+              raise SystemExit("No inline scripts found in promoted index")
+
+          out = Path("/tmp/promoted-index-inline.js")
+          out.write_text("\n;\n".join(scripts), encoding="utf-8")
+          print(f"Extracted {len(scripts)} inline scripts -> {out}")
+          PY
+
+          node --check /tmp/promoted-index-inline.js
+
+      - name: Validate existing runtime self-tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check scripts/team_utility_projection_runtime.js
+          node scripts/team_utility_projection_runtime.js --selftest
+
+      - name: Verify preview remains untouched
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test "$(git hash-object trade-desk-preview.html)" = \
+            "d50715af625fcf8306e04b62fbf0fa025c9126b2"
+
+          git diff --exit-code -- trade-desk-preview.html
+
+      - name: Validate patch cleanliness
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          html = Path("index.html").read_text(encoding="utf-8")
+
+          block = re.search(
+              r'<style id="trade-desk-ui2-live-overrides">(.*?)</style>',
+              html,
+              flags=re.S,
+          )
+
+          if not block:
+              raise SystemExit("Production live-override block missing")
+
+          bad = [
+              i for i, line in enumerate(block.group(1).splitlines(), 1)
+              if line != line.rstrip()
+          ]
+
+          if bad:
+              raise SystemExit(
+                  f"Live override has trailing whitespace: {bad[:10]}"
+              )
+
+          print("PASS production-only override whitespace")
+          PY
+
+          git status --short
+          git diff --stat
+
+      - name: Commit UI2 to production
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add index.html
+
+          CHANGED="$(git diff --cached --name-only)"
+          echo "Staged:"
+          printf '%s\n' "$CHANGED"
+
+          test "$CHANGED" = "index.html"
+
+          if git diff --cached --quiet; then
+            echo "No production UI change to commit."
+            exit 0
+          fi
+
+          git commit -m "Promote Trade Desk UI2 to production"
+          git push origin HEAD:main
