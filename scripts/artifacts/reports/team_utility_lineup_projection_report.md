@@ -24,7 +24,7 @@
 - Teams checked: **12**
 - Teams with all 17 legal slots fillable: **12 / 12**
 - Teams with a projection-complete non-K starting lineup: **12 / 12**
-- Active non-K roster projection coverage: **95.82%**
+- Active non-K roster projection coverage: **96.04%**
 - Selected non-K players needing fallback: **0**
 
 ## Team detail
@@ -40,7 +40,7 @@
 | Jersey Bagels | 83.8% | 17/17 | 0 |
 | Apex Predators | 95.0% | 17/17 | 0 |
 | Toddy2times | 100.0% | 17/17 | 0 |
-| Moose Knuckles | 89.2% | 17/17 | 0 |
+| Moose Knuckles | 91.7% | 17/17 | 0 |
 | <respectable team name> | 94.7% | 17/17 | 0 |
 | Serious Gourmet Shit | 100.0% | 17/17 | 0 |
 
