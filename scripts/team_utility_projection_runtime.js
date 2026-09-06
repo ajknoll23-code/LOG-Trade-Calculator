@@ -628,3 +628,482 @@
     installBrowserGuard();
   }
 })(typeof window !== 'undefined' ? window : globalThis);
+/* LOG_APP_HEADER_NAV_V1
+ * Presentation-only shell for the Trade Desk.
+ * - Does not modify valuation/model constants.
+ * - Does not alter PLAYER_DB, PROD_MULT_DATA, ROLE_MULT, AGE_CURVE,
+ *   POSITION_WEIGHT, trade math, or Team Utility accounting.
+ * - index.html remains untouched; remove this IIFE to restore the prior UI.
+ */
+(function installLogAppHeaderNavV1() {
+  'use strict';
+
+  const MARKER = 'LOG_APP_HEADER_NAV_V1';
+
+  // Node/self-test execution has no DOM. Keep the presentation layer inert.
+  if (typeof document === 'undefined') return;
+
+  function init() {
+    const root = document.documentElement;
+    if (!root || root.dataset.logAppHeaderNavV1 === '1') return;
+
+    const wrap = document.querySelector('.wrap');
+    const pageHeader = wrap && wrap.querySelector('header');
+    if (!wrap || !pageHeader || !document.head || !document.body) return;
+
+    root.dataset.logAppHeaderNavV1 = '1';
+
+    const style = document.createElement('style');
+    style.id = 'log-app-header-nav-v1-styles';
+    style.textContent = `
+      :root{
+        --log-app-deep:#091B2C;
+        --log-app-bar:rgba(9,27,44,.965);
+        --log-app-hover:rgba(255,255,255,.055);
+      }
+
+      html{scroll-behavior:smooth}
+
+      .log-app-shell{
+        position:sticky;
+        top:0;
+        z-index:1000;
+        width:100%;
+        background:var(--log-app-bar);
+        border-bottom:1px solid var(--line);
+        box-shadow:0 8px 30px rgba(0,0,0,.18);
+        -webkit-backdrop-filter:blur(18px);
+        backdrop-filter:blur(18px);
+      }
+      .log-app-topbar,
+      .log-app-nav-inner{
+        width:min(1180px, calc(100% - 32px));
+        margin:0 auto;
+      }
+      .log-app-topbar{
+        min-height:66px;
+        display:flex;
+        align-items:center;
+        gap:13px;
+        padding:9px 0 8px;
+      }
+      .log-app-logo{
+        width:44px;
+        height:44px;
+        object-fit:contain;
+        flex:0 0 auto;
+        filter:drop-shadow(0 4px 12px rgba(235,98,97,.20));
+      }
+      .log-app-brand{
+        min-width:0;
+        display:flex;
+        flex-direction:column;
+        gap:2px;
+      }
+      .log-app-brand-title{
+        font-family:'Anton',sans-serif;
+        font-size:17px;
+        line-height:1.05;
+        text-transform:uppercase;
+        letter-spacing:.035em;
+        color:var(--text);
+        white-space:nowrap;
+      }
+      .log-app-brand-sub{
+        font-family:'IBM Plex Mono',monospace;
+        font-size:9.5px;
+        line-height:1.25;
+        letter-spacing:.075em;
+        text-transform:uppercase;
+        color:var(--text-muted);
+        white-space:nowrap;
+        overflow:hidden;
+        text-overflow:ellipsis;
+        max-width:420px;
+      }
+      .log-app-context{
+        margin-left:auto;
+        display:flex;
+        align-items:center;
+        justify-content:flex-end;
+        gap:14px;
+        min-width:0;
+      }
+      .log-app-league{
+        text-align:right;
+        min-width:0;
+      }
+      .log-app-league-label{
+        font-family:'IBM Plex Mono',monospace;
+        font-size:8px;
+        letter-spacing:.12em;
+        text-transform:uppercase;
+        color:var(--text-dim);
+        margin-bottom:2px;
+      }
+      .log-app-league-name{
+        font-size:11px;
+        font-weight:700;
+        color:var(--text-muted);
+        white-space:nowrap;
+      }
+      .log-app-status{
+        display:flex;
+        align-items:center;
+        gap:7px;
+        min-height:27px;
+        padding:0 9px;
+        border:1px solid var(--line-strong);
+        border-radius:999px;
+        background:rgba(255,255,255,.025);
+        font-family:'IBM Plex Mono',monospace;
+        font-size:8.5px;
+        font-weight:600;
+        letter-spacing:.08em;
+        color:var(--text-muted);
+        white-space:nowrap;
+      }
+      .log-app-status-dot{
+        width:7px;
+        height:7px;
+        border-radius:50%;
+        flex:0 0 auto;
+        background:var(--amber);
+        box-shadow:0 0 8px rgba(232,184,75,.42);
+      }
+      .log-app-status.is-live{
+        color:var(--green);
+        border-color:rgba(63,203,124,.25);
+        background:rgba(63,203,124,.06);
+      }
+      .log-app-status.is-live .log-app-status-dot{
+        background:var(--green);
+        box-shadow:0 0 8px rgba(63,203,124,.62);
+      }
+      .log-app-status.is-fail{
+        color:var(--red);
+        border-color:rgba(255,138,76,.30);
+        background:rgba(255,138,76,.06);
+      }
+      .log-app-status.is-fail .log-app-status-dot{
+        background:var(--red);
+        box-shadow:0 0 8px rgba(255,138,76,.55);
+      }
+      .log-app-sync{
+        font-family:'IBM Plex Mono',monospace;
+        font-size:8.5px;
+        line-height:1.2;
+        color:var(--text-dim);
+        white-space:nowrap;
+      }
+
+      .log-app-nav{
+        border-top:1px solid rgba(201,206,210,.07);
+        background:rgba(4,14,24,.12);
+      }
+      .log-app-nav-inner{
+        min-height:42px;
+        display:flex;
+        align-items:stretch;
+        gap:3px;
+      }
+      .log-app-nav-item{
+        position:relative;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        gap:7px;
+        min-width:0;
+        padding:0 14px;
+        border:0;
+        border-radius:0;
+        background:transparent;
+        color:var(--text-muted);
+        text-decoration:none;
+        font-family:'Inter',sans-serif;
+        font-size:11.5px;
+        font-weight:700;
+        cursor:pointer;
+        white-space:nowrap;
+        transition:background .15s ease,color .15s ease;
+      }
+      .log-app-nav-item:hover{
+        background:var(--log-app-hover);
+        color:var(--text);
+      }
+      .log-app-nav-item.is-active{
+        color:var(--text);
+        background:rgba(235,98,97,.065);
+      }
+      .log-app-nav-item.is-active::after{
+        content:'';
+        position:absolute;
+        left:11px;
+        right:11px;
+        bottom:0;
+        height:2px;
+        border-radius:2px 2px 0 0;
+        background:var(--gold);
+        box-shadow:0 0 10px rgba(235,98,97,.32);
+      }
+      .log-app-nav-icon{
+        font-family:'IBM Plex Mono',monospace;
+        font-size:9px;
+        color:var(--text-dim);
+      }
+      .log-app-nav-item.is-active .log-app-nav-icon{
+        color:var(--gold);
+      }
+
+      /* The old logo is moved into the app shell. The original page header
+         remains the page-level "Trade Desk" title/context block. */
+      .log-page-header{
+        padding-top:18px !important;
+        padding-bottom:18px !important;
+        margin-bottom:18px !important;
+      }
+      .log-page-header > .league-logo{
+        display:none !important;
+      }
+      .log-page-header > .eyebrow{
+        margin-bottom:6px !important;
+        color:var(--text-dim) !important;
+        font-size:9.5px !important;
+      }
+      .log-page-header > h1{
+        font-size:31px !important;
+        margin-bottom:7px !important;
+        text-shadow:none !important;
+      }
+      .log-page-header > p{
+        max-width:62ch !important;
+        line-height:1.5 !important;
+      }
+
+      @media (max-width:760px){
+        .log-app-topbar,
+        .log-app-nav-inner{
+          width:min(100% - 22px, 1180px);
+        }
+        .log-app-topbar{
+          min-height:58px;
+          gap:10px;
+          padding:7px 0;
+        }
+        .log-app-logo{
+          width:38px;
+          height:38px;
+        }
+        .log-app-brand-title{
+          font-size:14px;
+        }
+        .log-app-brand-sub{
+          max-width:48vw;
+          font-size:8px;
+        }
+        .log-app-league,
+        .log-app-sync{
+          display:none;
+        }
+        .log-app-context{
+          gap:8px;
+        }
+        .log-app-status{
+          padding:0 8px;
+          min-height:25px;
+          font-size:7.5px;
+        }
+        .log-app-nav-inner{
+          min-height:40px;
+          overflow-x:auto;
+          scrollbar-width:none;
+        }
+        .log-app-nav-inner::-webkit-scrollbar{display:none}
+        .log-app-nav-item{
+          flex:1 0 auto;
+          padding:0 11px;
+          font-size:10.5px;
+        }
+        .log-page-header{
+          padding-top:14px !important;
+        }
+        .log-page-header > h1{
+          font-size:28px !important;
+        }
+      }
+
+      @media (max-width:430px){
+        .log-app-brand-sub{
+          max-width:42vw;
+        }
+        .log-app-status{
+          padding:0 7px;
+        }
+        .log-app-status-text{
+          max-width:58px;
+          overflow:hidden;
+          text-overflow:ellipsis;
+        }
+      }
+    `;
+    document.head.appendChild(style);
+
+    const existingLogo = pageHeader.querySelector('.league-logo');
+
+    const shell = document.createElement('div');
+    shell.className = 'log-app-shell';
+    shell.setAttribute('data-ui-marker', MARKER);
+    shell.innerHTML = `
+      <div class="log-app-topbar">
+        <div class="log-app-logo-slot" aria-hidden="true"></div>
+        <div class="log-app-brand">
+          <div class="log-app-brand-title">Claude Dynasty Trade Calculator</div>
+          <div class="log-app-brand-sub">League of Ordinary Gentlemen · IDP Dynasty</div>
+        </div>
+        <div class="log-app-context">
+          <div class="log-app-league">
+            <div class="log-app-league-label">Current League</div>
+            <div class="log-app-league-name">League of Ordinary Gentlemen</div>
+          </div>
+          <div class="log-app-status" id="logAppModelStatus" role="status" aria-live="polite">
+            <span class="log-app-status-dot"></span>
+            <span class="log-app-status-text">SYNCING</span>
+          </div>
+          <div class="log-app-sync" id="logAppLastSync">Last sync: —</div>
+        </div>
+      </div>
+      <div class="log-app-nav">
+        <nav class="log-app-nav-inner" aria-label="Primary">
+          <button class="log-app-nav-item is-active" id="logNavTradeDesk" type="button" aria-current="page">
+            <span class="log-app-nav-icon">◆</span>
+            <span>Trade Desk</span>
+          </button>
+          <button class="log-app-nav-item" id="logNavMyTeam" type="button">
+            <span class="log-app-nav-icon">▦</span>
+            <span>My Team</span>
+          </button>
+          <a class="log-app-nav-item" id="logNavFreeAgents" href="free-agent-board.html">
+            <span class="log-app-nav-icon">＋</span>
+            <span>Free Agents</span>
+          </a>
+        </nav>
+      </div>
+    `;
+
+    if (existingLogo) {
+      const clone = existingLogo.cloneNode(true);
+      clone.className = 'log-app-logo';
+      clone.removeAttribute('style');
+      const slot = shell.querySelector('.log-app-logo-slot');
+      if (slot) slot.replaceWith(clone);
+    }
+
+    document.body.insertBefore(shell, wrap);
+    pageHeader.classList.add('log-page-header');
+
+    const navTrade = shell.querySelector('#logNavTradeDesk');
+    const navTeam = shell.querySelector('#logNavMyTeam');
+    const navFreeAgents = shell.querySelector('#logNavFreeAgents');
+
+    function setActive(active) {
+      for (const item of [navTrade, navTeam, navFreeAgents]) {
+        if (!item) continue;
+        item.classList.toggle('is-active', item === active);
+        if (item === active) item.setAttribute('aria-current', 'page');
+        else item.removeAttribute('aria-current');
+      }
+    }
+
+    if (navTrade) {
+      navTrade.addEventListener('click', function () {
+        setActive(navTrade);
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      });
+    }
+
+    if (navTeam) {
+      navTeam.addEventListener('click', function () {
+        setActive(navTeam);
+
+        const fullRoster = document.getElementById('fullRosterDetails');
+        if (fullRoster) fullRoster.open = true;
+
+        const target =
+          document.getElementById('needsWrap') ||
+          fullRoster ||
+          pageHeader;
+
+        if (target && typeof target.scrollIntoView === 'function') {
+          target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+      });
+    }
+
+    // Mirror the real roster/league sync state in the global badge.
+    const globalStatus = shell.querySelector('#logAppModelStatus');
+    const globalStatusText = shell.querySelector('.log-app-status-text');
+    const sourceStatuses = [
+      document.getElementById('liveStatus'),
+      document.getElementById('leagueSyncStatus')
+    ].filter(Boolean);
+
+    function updateGlobalStatus() {
+      if (!globalStatus || !globalStatusText) return;
+
+      const dots = sourceStatuses
+        .map(el => el.querySelector('.live-dot'))
+        .filter(Boolean);
+
+      const anyFail = dots.some(dot => dot.classList.contains('fail'));
+      const allLive = dots.length > 0 && dots.every(dot => dot.classList.contains('ok'));
+
+      globalStatus.classList.toggle('is-live', allLive && !anyFail);
+      globalStatus.classList.toggle('is-fail', anyFail);
+
+      globalStatusText.textContent = anyFail
+        ? 'SYNC ISSUE'
+        : (allLive ? 'LIVE MODEL' : 'SYNCING');
+    }
+
+    updateGlobalStatus();
+
+    if (typeof MutationObserver !== 'undefined') {
+      const observer = new MutationObserver(updateGlobalStatus);
+      for (const el of sourceStatuses) {
+        observer.observe(el, {
+          attributes: true,
+          childList: true,
+          subtree: true,
+          characterData: true
+        });
+      }
+    }
+
+    // Last-sync time is display-only and comes from the already-committed
+    // Sleeper timestamp artifact. A fetch failure simply leaves the dash.
+    const syncLabel = shell.querySelector('#logAppLastSync');
+    if (syncLabel && typeof fetch === 'function') {
+      fetch('data/last_synced.json', { cache: 'no-store' })
+        .then(resp => resp.ok ? resp.json() : null)
+        .then(doc => {
+          if (!doc) return;
+          const raw = doc.synced_at_readable;
+          if (raw) {
+            syncLabel.textContent = 'Last sync: ' + String(raw).replace(' UTC', 'Z');
+            return;
+          }
+          const epoch = Number(doc.synced_at);
+          if (Number.isFinite(epoch)) {
+            syncLabel.textContent = 'Last sync: ' + new Date(epoch * 1000).toLocaleString();
+          }
+        })
+        .catch(() => {});
+    }
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init, { once: true });
+  } else {
+    init();
+  }
+})();
