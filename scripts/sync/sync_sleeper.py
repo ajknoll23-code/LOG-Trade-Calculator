@@ -146,9 +146,10 @@ def load_or_fetch_full_pool():
 
 def build_players_index(needed_ids, pool):
     """
-    Return {player_id: {name, position, team, age}} for exactly the IDs we
-    need (every player who appears in any roster, taxi, or reserve slot this
-    run), given an already-loaded full player pool.
+    Return the canonical live metadata needed for rostered players, including
+    Sleeper's actual NFL depth-chart signal. These fields are passed through
+    unchanged so browser/runtime logic can distinguish QB1/QB2/QB3 without
+    inferring NFL role from fantasy starter/bench/taxi placement.
     """
     index = {}
     missing = []
@@ -169,6 +170,8 @@ def build_players_index(needed_ids, pool):
             "birth_date": safe_player_birth_date(pid, p),
             "status": p.get("status"),
             "injury_status": p.get("injury_status"),
+            "depth_chart_order": p.get("depth_chart_order"),
+            "years_exp": p.get("years_exp"),
         }
 
     if missing:
@@ -177,12 +180,32 @@ def build_players_index(needed_ids, pool):
         # players dump the same way. Handle those, log anything else.
         for pid in missing:
             if pid.isalpha() and len(pid) <= 3:
-                index[pid] = {"name": f"{pid} DEF", "position": "DEF", "fantasy_positions": ["DEF"],
-                               "team": pid, "age": None, "birth_date": None, "status": None, "injury_status": None}
+                index[pid] = {
+                    "name": f"{pid} DEF",
+                    "position": "DEF",
+                    "fantasy_positions": ["DEF"],
+                    "team": pid,
+                    "age": None,
+                    "birth_date": None,
+                    "status": None,
+                    "injury_status": None,
+                    "depth_chart_order": None,
+                    "years_exp": None,
+                }
             else:
                 print(f"WARNING: player_id {pid} not found in players pool")
-                index[pid] = {"name": f"Unknown ({pid})", "position": None, "fantasy_positions": [],
-                               "team": None, "age": None, "birth_date": None, "status": None, "injury_status": None}
+                index[pid] = {
+                    "name": f"Unknown ({pid})",
+                    "position": None,
+                    "fantasy_positions": [],
+                    "team": None,
+                    "age": None,
+                    "birth_date": None,
+                    "status": None,
+                    "injury_status": None,
+                    "depth_chart_order": None,
+                    "years_exp": None,
+                }
 
     return index
 
@@ -270,6 +293,8 @@ def compute_free_agents(pool, rostered_ids):
             "birth_date": safe_player_birth_date(pid, p),
             "status": p.get("status"),
             "injury_status": p.get("injury_status"),
+            "depth_chart_order": p.get("depth_chart_order"),
+            "years_exp": p.get("years_exp"),
         })
     return free_agents
 
@@ -349,6 +374,7 @@ def run_selftest():
             "first_name": "Dual", "last_name": "Edge", "team": "ARI",
             "position": "DE", "fantasy_positions": ["DE", "LB"],
             "age": 24, "status": "Active", "active": True, "injury_status": None,
+            "depth_chart_order": 2, "years_exp": 1,
         },
         "2": {
             "first_name": "Rostered", "last_name": "Player", "team": "BUF",
@@ -375,12 +401,34 @@ def run_selftest():
             "age": None, "status": "Active", "active": True,
         },
     }
+
+    # Critical upstream invariant for the runtime valuation guard:
+    # roster serialization must preserve the real Sleeper depth-chart signal.
+    indexed = build_players_index({"1"}, pool)
+    assert indexed["1"]["depth_chart_order"] == 2
+    assert indexed["1"]["years_exp"] == 1
+    resolved = resolve_roster(
+        {
+            "roster_id": 1,
+            "owner_id": "owner",
+            "players": ["1"],
+            "starters": [],
+            "taxi": [],
+            "reserve": [],
+        },
+        indexed,
+    )
+    assert resolved["bench"][0]["depth_chart_order"] == 2
+    assert resolved["bench"][0]["years_exp"] == 1
+
     rows = compute_free_agents(pool, {"2"})
     by_id = {r["player_id"]: r for r in rows}
     assert set(by_id) == {"1", "13869", "5"}, by_id
     assert by_id["1"]["pos"] == "DL"
     assert by_id["1"]["fantasy_positions"] == ["DE", "LB"]
     assert by_id["1"]["eligible_buckets"] == ["DL", "LB"]
+    assert by_id["1"]["depth_chart_order"] == 2
+    assert by_id["1"]["years_exp"] == 1
     assert by_id["13869"]["age"] == 23
     assert by_id["5"]["age"] is None
     assert safe_player_age("4", pool["4"]) is None
