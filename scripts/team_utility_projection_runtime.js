@@ -88,7 +88,6 @@
       }
     }
 
-    // Keep known fallback taxi metadata if a future source snapshot omits it.
     for (const [key, slot] of Object.entries(fallbackPersonalSlots)) {
       if (!slotMap[key]) slotMap[key] = slot;
     }
@@ -149,7 +148,6 @@
   }
 
   function lineupCompare(a, b) {
-    // The canonical projection artifact intentionally omits kickers.
     if (a.pos === 'K' && b.pos === 'K') {
       return b.value - a.value;
     }
@@ -162,12 +160,10 @@
       return diff !== 0 ? diff : (b.value - a.value);
     }
 
-    // Missing projection is unknown, never interpreted as zero.
     if (aHasProjection !== bHasProjection) {
       return aHasProjection ? -1 : 1;
     }
 
-    // Safe fallback reproduces the prior FV starter ordering.
     return b.value - a.value;
   }
 
@@ -238,8 +234,6 @@
     const out = Object.create(null);
 
     for (const key of postRosterKeys || []) {
-      // Existing assets retain their current roster state.
-      // Incoming trade assets default to active bench and are startable.
       out[key] = (
         preSet.has(key) &&
         preSlotByKey &&
@@ -269,8 +263,6 @@
     const lineupDelta = sumValue(post.starters) - sumValue(pre.starters);
     const benchDelta = sumValue(post.bench) - sumValue(pre.bench);
 
-    // The existing production constant remains authoritative. 0.15 is only
-    // the defensive fallback if the constant is unavailable.
     const benchWeight = (
       typeof TU_BENCH_WEIGHT !== 'undefined' &&
       Number.isFinite(Number(TU_BENCH_WEIGHT))
@@ -349,8 +341,6 @@
   }
 
   function installBrowserRuntime() {
-    // Existing UI calls the global function by name. Override only that public
-    // entry point; all static player/value code stays untouched.
     global.calculateTeamUtility = calculateTeamUtilityV1;
     loadRuntimeData();
   }
@@ -442,5 +432,199 @@
     selftest();
   } else if (typeof window !== 'undefined' && global === window) {
     installBrowserRuntime();
+  }
+})(typeof window !== 'undefined' ? window : globalThis);
+
+/* Runtime-only player valuation integrity guard V1 — 2026-09-05
+ *
+ * A player first discovered through the live Sleeper roster merge must never
+ * receive a Fundamental Value boost merely because a dynasty manager placed
+ * him in a fantasy starter/bench slot. The inline legacy merge maps fantasy
+ * starter/bench/taxi to Starter/Rotational/Speculative for previously unknown
+ * players; this guard corrects that runtime-only path without changing any
+ * baked PLAYER_DB, PROD_MULT, age curve, position weight, or frozen research
+ * coefficient.
+ *
+ * Canonical/model-covered players remain on the existing valuation path.
+ * Runtime-only players with no PROD_MULT fail conservatively at the canonical
+ * 0.15 production floor until the normal model pipeline bakes real evidence.
+ */
+(function (global) {
+  'use strict';
+
+  const MARKER = 'RUNTIME_ONLY_PLAYER_VALUE_GUARD_V1';
+  const MISSING_MODEL_FLOOR = 0.15;
+
+  function fallbackKey(name) {
+    return String(name || '')
+      .toLowerCase()
+      .replace(/[.'’\-]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function keyFor(name) {
+    let key = typeof normalizeName === 'function'
+      ? normalizeName(name)
+      : fallbackKey(name);
+    if (typeof resolveExistingKey === 'function') key = resolveExistingKey(key);
+    return key;
+  }
+
+  function hasCanonicalProduction(key) {
+    return typeof PROD_MULT !== 'undefined' &&
+      Object.prototype.hasOwnProperty.call(PROD_MULT, key);
+  }
+
+  function hasNoHistoryMarker(key) {
+    return typeof NO_REAL_PRODUCTION_HISTORY !== 'undefined' &&
+      Object.prototype.hasOwnProperty.call(NO_REAL_PRODUCTION_HISTORY, key);
+  }
+
+  function runtimeRoleFromDepth(pos, depthChartOrder) {
+    const depth = Number(depthChartOrder);
+    if (pos === 'QB') {
+      if (depth === 1) return 'Starter';
+      if (depth === 2) return 'Understudy';
+      if (Number.isFinite(depth) && depth >= 3) return 'Speculative';
+    }
+    return 'Speculative';
+  }
+
+  function guardedProductionValue(isRuntimeOnly, hasProduction, originalValue) {
+    return isRuntimeOnly && !hasProduction ? MISSING_MODEL_FLOOR : originalValue;
+  }
+
+  function applyRuntimeMetadata(raw, beforeKeys) {
+    if (!raw || typeof PLAYER_DB === 'undefined') return;
+    const key = keyFor(raw.name);
+    if (!key) return;
+    const info = PLAYER_DB[key];
+    if (!info) return;
+
+    const wasNew = beforeKeys && !beforeKeys.has(key);
+    if (!wasNew && !info.runtimeSyncedOnly) return;
+
+    info.runtimeSyncedOnly = true;
+    info.depth_chart_order = raw.depth_chart_order ?? info.depth_chart_order ?? null;
+    info.years_exp = raw.years_exp ?? info.years_exp ?? null;
+    info.role = runtimeRoleFromDepth(info.pos, info.depth_chart_order);
+  }
+
+  function applyPersonalPayload(data, beforeKeys) {
+    for (const slot of ['starters', 'bench', 'taxi', 'reserve_ir']) {
+      for (const raw of (data && data[slot]) || []) {
+        applyRuntimeMetadata(raw, beforeKeys);
+      }
+    }
+  }
+
+  function applyLeaguePayload(data, beforeKeys) {
+    for (const roster of (data && data.rosters) || []) {
+      for (const slot of ['starters', 'bench', 'taxi', 'reserve_ir']) {
+        for (const raw of roster[slot] || []) {
+          applyRuntimeMetadata(raw, beforeKeys);
+        }
+      }
+    }
+  }
+
+  function recoverAlreadyMergedRuntimeQBs() {
+    if (typeof PLAYER_DB === 'undefined') return;
+    for (const [key, info] of Object.entries(PLAYER_DB)) {
+      if (!info || info.pos !== 'QB' || info.currentlyRostered !== true) continue;
+      if (hasCanonicalProduction(key) || hasNoHistoryMarker(key)) continue;
+      if (info.pts2025 !== undefined || info.proj2026 !== undefined) continue;
+      info.runtimeSyncedOnly = true;
+      info.role = runtimeRoleFromDepth(info.pos, info.depth_chart_order);
+    }
+  }
+
+  function installBrowserGuard() {
+    if (
+      typeof PLAYER_DB === 'undefined' ||
+      typeof global.productionMultiplier !== 'function'
+    ) {
+      console.warn(`${MARKER}: valuation globals unavailable; guard not installed`);
+      return;
+    }
+
+    const originalProductionMultiplier = global.productionMultiplier;
+    global.productionMultiplier = function runtimeGuardedProductionMultiplier(name, role) {
+      const key = keyFor(name);
+      const info = PLAYER_DB[key];
+      const originalValue = originalProductionMultiplier(name, role);
+      return guardedProductionValue(
+        !!(info && info.runtimeSyncedOnly),
+        hasCanonicalProduction(key),
+        originalValue
+      );
+    };
+
+    if (typeof global.mergeLiveRoster === 'function') {
+      const originalMergeLiveRoster = global.mergeLiveRoster;
+      global.mergeLiveRoster = function runtimeGuardedMergeLiveRoster(data) {
+        const beforeKeys = new Set(Object.keys(PLAYER_DB));
+        const result = originalMergeLiveRoster(data);
+        applyPersonalPayload(data, beforeKeys);
+        return result;
+      };
+    }
+
+    if (typeof global.mergeLeagueRosters === 'function') {
+      const originalMergeLeagueRosters = global.mergeLeagueRosters;
+      global.mergeLeagueRosters = function runtimeGuardedMergeLeagueRosters(data) {
+        const beforeKeys = new Set(Object.keys(PLAYER_DB));
+        const result = originalMergeLeagueRosters(data);
+        applyLeaguePayload(data, beforeKeys);
+        return result;
+      };
+    }
+
+    recoverAlreadyMergedRuntimeQBs();
+    global.TD_RUNTIME_PLAYER_VALUE_GUARD = {
+      marker: MARKER,
+      floor: MISSING_MODEL_FLOOR,
+      runtimeRoleFromDepth,
+    };
+  }
+
+  function selftest() {
+    const roles = [
+      runtimeRoleFromDepth('QB', 1),
+      runtimeRoleFromDepth('QB', 2),
+      runtimeRoleFromDepth('QB', 3),
+      runtimeRoleFromDepth('QB', null),
+      runtimeRoleFromDepth('WR', 1),
+    ];
+    const expectedRoles = ['Starter', 'Understudy', 'Speculative', 'Speculative', 'Speculative'];
+    if (JSON.stringify(roles) !== JSON.stringify(expectedRoles)) {
+      throw new Error(`runtime depth-role guard failed: ${JSON.stringify(roles)}`);
+    }
+
+    const slotInflationInputs = [1.0, 0.65, 0.57, 0.22];
+    for (const originalValue of slotInflationInputs) {
+      if (guardedProductionValue(true, false, originalValue) !== MISSING_MODEL_FLOOR) {
+        throw new Error('runtime missing-model floor depends on fantasy/role estimate');
+      }
+    }
+    if (guardedProductionValue(false, false, 0.65) !== 0.65) {
+      throw new Error('curated missing-production fallback changed');
+    }
+    if (guardedProductionValue(true, true, 0.65) !== 0.65) {
+      throw new Error('canonical production was overridden');
+    }
+
+    console.log('PASS Runtime-only player valuation guard self-test');
+  }
+
+  if (
+    typeof process !== 'undefined' &&
+    process.argv &&
+    process.argv.includes('--selftest')
+  ) {
+    selftest();
+  } else if (typeof window !== 'undefined' && global === window) {
+    installBrowserGuard();
   }
 })(typeof window !== 'undefined' ? window : globalThis);
