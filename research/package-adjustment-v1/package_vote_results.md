@@ -2,11 +2,11 @@
 
 **Status: RESEARCH ONLY — no production consumer changed.**
 
-- Counted package votes: `0`
-- Unique voters: `0`
-- Distinct challenges: `0`
-- Package choice rate: `None`
-- Display-left choice rate: `None`
+- Counted package votes: `1`
+- Unique voters: `1`
+- Distinct challenges: `1`
+- Package choice rate: `0.0`
+- Display-left choice rate: `0.0`
 
 ## By raw package / target FV ratio
 
@@ -14,7 +14,7 @@
 |---:|---:|---:|
 | 0.95 | 0 | n/a |
 | 1.05 | 0 | n/a |
-| 1.15 | 0 | n/a |
+| 1.15 | 1 | 0.0% |
 | 1.30 | 0 | n/a |
 
 ## V0 lambda fit
