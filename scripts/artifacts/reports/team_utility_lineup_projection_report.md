@@ -24,7 +24,7 @@
 - Teams checked: **12**
 - Teams with all 17 legal slots fillable: **12 / 12**
 - Teams with a projection-complete non-K starting lineup: **12 / 12**
-- Active non-K roster projection coverage: **96.0%**
+- Active non-K roster projection coverage: **95.96%**
 - Selected non-K players needing fallback: **0**
 
 ## Team detail
