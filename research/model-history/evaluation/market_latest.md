@@ -5,11 +5,11 @@ Protocol SHA256: `fe6ccf0d5b05bf15038e9239f4c7b18c1d8a40ba93f4f9db8cb01fcec6b076
 
 ## Status
 
-- Full snapshots seen: **12**
-- Weekly market states after deduplication: **1**
+- Full snapshots seen: **13**
+- Weekly market states after deduplication: **2**
 - Same-week snapshots deduplicated: **11**
-- Evaluated origin/horizon pairs: **0**
-- Pending origin/horizon pairs: **3**
+- Evaluated origin/horizon pairs: **1**
+- Pending origin/horizon pairs: **5**
 
 ## What this measures
 
@@ -17,7 +17,9 @@ This is a **market-target** backtest, not a fundamental player-quality backtest.
 
 ## Evaluated horizons
 
-No future weekly market state is mature yet. This is expected until a later full-refresh week creates the first true out-of-sample market target.
+| Origin | Future | Horizon | N | TD→future Spearman | Current market→future | Incremental Δ | Gap→change Spearman | Directional acc. |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| 2026-W36 | 2026-W37 | 1w | 453 | 0.371 | 0.999 | -0.629 | -0.108 | 0.446 |
 
 ## Interpretation guardrails
 

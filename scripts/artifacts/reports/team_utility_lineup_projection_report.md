@@ -24,7 +24,7 @@
 - Teams checked: **12**
 - Teams with all 17 legal slots fillable: **12 / 12**
 - Teams with a projection-complete non-K starting lineup: **12 / 12**
-- Active non-K roster projection coverage: **96.04%**
+- Active non-K roster projection coverage: **96.0%**
 - Selected non-K players needing fallback: **0**
 
 ## Team detail
@@ -38,10 +38,10 @@
 | Pullham Bluecocks  | 97.2% | 17/17 | 0 |
 | Cock Mchorse 🐴 | 95.0% | 17/17 | 0 |
 | Jersey Bagels | 83.8% | 17/17 | 0 |
-| Apex Predators | 95.0% | 17/17 | 0 |
+| Apex Predators | 94.6% | 17/17 | 0 |
 | Toddy2times | 100.0% | 17/17 | 0 |
 | Moose Knuckles | 91.7% | 17/17 | 0 |
-| <respectable team name> | 94.7% | 17/17 | 0 |
+| <respectable team name> | 94.6% | 17/17 | 0 |
 | Serious Gourmet Shit | 100.0% | 17/17 | 0 |
 
 ## Identity / provenance
