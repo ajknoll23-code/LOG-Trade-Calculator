@@ -1,0 +1,400 @@
+name: Install Package Preference Voting V1
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  install:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build frozen Package Preference V1 catalog
+        shell: bash
+        run: |
+          mkdir -p research/package-adjustment-v1 scripts/market
+          cat > research/package-adjustment-v1/generate_package_vote_challenges.py <<'PY'
+          #!/usr/bin/env python3
+          from __future__ import annotations
+          import bisect, hashlib, json, math, re
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          ROOT = Path(__file__).resolve().parents[2]
+          VALUES = ROOT / "scripts/artifacts/generated/value_uncertainty.json"
+          ROSTERS = ROOT / "data/league_rosters.json"
+          OUT = ROOT / "research/package-adjustment-v1/package_vote_challenges.json"
+          RATIO_TARGETS = (0.95, 1.05, 1.15, 1.30)
+          PACKAGE_SIZES = (2, 3)
+          POSITIONS = ("QB","RB","WR","TE","DL","LB","DB")
+          POS_MAP = {"QB":"QB","RB":"RB","WR":"WR","TE":"TE","K":"K","DL":"DL","DE":"DL","DT":"DL","LB":"LB","OLB":"LB","ILB":"LB","DB":"DB","CB":"DB","S":"DB","SS":"DB","FS":"DB"}
+
+          def read_json(p): return json.loads(p.read_text(encoding="utf-8"))
+          def norm_name(v):
+              s = str(v or "").strip().lower()
+              s = re.sub(r"[.'’\-]", "", s)
+              return re.sub(r"\s+", " ", s).strip()
+          def norm_pos(v): return POS_MAP.get(str(v or "").upper())
+          def finite(v):
+              try: x=float(v)
+              except (TypeError,ValueError): return None
+              return x if math.isfinite(x) else None
+          def sha256(p): return hashlib.sha256(p.read_bytes()).hexdigest()
+          def frag(vals):
+              s=sum(vals)
+              return 0.0 if s<=0 else 1.0-sum((v/s)**2 for v in vals)
+
+          def nearest_two(cands, desired, used):
+              i,j=0,len(cands)-1; best=None
+              while i<j:
+                  a,b=cands[i],cands[j]; total=a["fv"]+b["fv"]
+                  key=tuple(sorted((a["key"],b["key"])))
+                  cand=(abs(total-desired),key,[a,b],total)
+                  if key not in used and (best is None or cand[:2] < best[:2]): best=cand
+                  if total<desired: i+=1
+                  else: j-=1
+              return best
+
+          def nearest_three(cands, desired, used):
+              vals=[p["fv"] for p in cands]; n=len(cands); best=None
+              for i in range(n-2):
+                  for j in range(i+1,n-1):
+                      need=desired-cands[i]["fv"]-cands[j]["fv"]
+                      k0=bisect.bisect_left(vals,need,j+1)
+                      for k in (k0-1,k0,k0+1):
+                          if k<=j or k>=n: continue
+                          trio=[cands[i],cands[j],cands[k]]
+                          key=tuple(sorted(p["key"] for p in trio))
+                          if key in used: continue
+                          total=sum(p["fv"] for p in trio)
+                          cand=(abs(total-desired),key,trio,total)
+                          if best is None or cand[:2] < best[:2]: best=cand
+              return best
+
+          values_doc=read_json(VALUES); rosters_doc=read_json(ROSTERS)
+          vindex={}
+          for name,row in (values_doc.get("players") or {}).items():
+              fv=finite(row.get("center_value")); pos=norm_pos(row.get("pos"))
+              if fv and fv>0 and pos and pos!="K": vindex[norm_name(name)]={"fv":fv,"pos":pos}
+
+          rostered={}
+          for r in rosters_doc.get("rosters") or []:
+              for slot in ("starters","bench","taxi","reserve_ir"):
+                  for raw in r.get(slot) or []:
+                      key=norm_name(raw.get("name")); vr=vindex.get(key)
+                      if not vr: continue
+                      rostered[key]={"key":key,"name":str(raw.get("name") or key),"pos":vr["pos"],"fv":float(vr["fv"]),"team":raw.get("team"),"age":raw.get("age")}
+          players=sorted(rostered.values(),key=lambda p:(-p["fv"],p["key"]))
+          if len(players)<350: raise RuntimeError(f"too few rostered valued players: {len(players)}")
+
+          anchors=[]
+          for pos in POSITIONS: anchors += [p for p in players if p["pos"]==pos][:2]
+          used=set(); challenges=[]
+          for a in anchors:
+              target=a["fv"]
+              cands=[p for p in players if p["key"]!=a["key"] and target*0.06<=p["fv"]<=target*0.85]
+              cands.sort(key=lambda p:(p["fv"],p["key"]))
+              for size in PACKAGE_SIZES:
+                  for rt in RATIO_TARGETS:
+                      desired=target*rt
+                      found=nearest_two(cands,desired,used) if size==2 else nearest_three(cands,desired,used)
+                      if not found: continue
+                      err,key,pkg,total=found; actual=total/target
+                      if abs(actual-rt)>0.025: continue
+                      used.add(key)
+                      F=frag([p["fv"] for p in pkg]); top=max(p["fv"] for p in pkg); G=max(0.0,1.0-top/target)
+                      cid=f"pkgv1_{a['pos'].lower()}_{a['key'].replace(' ','_')}_{size}x_{int(round(rt*100)):03d}"
+                      challenges.append({
+                          "id":cid,"schema_version":1,
+                          "target":{"key":a["key"],"name":a["name"],"pos":a["pos"],"team":a.get("team"),"age":a.get("age"),"fv":round(target,3)},
+                          "package":[{"key":p["key"],"name":p["name"],"pos":p["pos"],"team":p.get("team"),"age":p.get("age"),"fv":round(p["fv"],3)} for p in pkg],
+                          "package_size":size,"target_fv":round(target,3),"package_fv":round(total,3),
+                          "raw_package_to_target_ratio":round(actual,6),"ratio_target":rt,
+                          "fragmentation":round(F,8),"best_asset_gap":round(G,8),"fg":round(F*G,8)
+                      })
+          if len(challenges)<70: raise RuntimeError(f"challenge catalog too small: {len(challenges)}")
+          by_size={}; by_pos={}; by_ratio={}
+          for c in challenges:
+              by_size[str(c["package_size"])]=by_size.get(str(c["package_size"]),0)+1
+              pos=c["target"]["pos"]; by_pos[pos]=by_pos.get(pos,0)+1
+              rt=f"{c['ratio_target']:.2f}"; by_ratio[rt]=by_ratio.get(rt,0)+1
+          doc={
+              "schema_version":1,"status":"frozen_package_preference_v1","consumer_changed":False,
+              "generated_at_utc":datetime.now(timezone.utc).isoformat(),"frozen":True,
+              "regeneration_policy":"Do not regenerate from vote outcomes; future changes require versioned V2.",
+              "display_policy":"Names/team/position/age only; FV and geometry hidden from voters.",
+              "source_sha256":{str(VALUES.relative_to(ROOT)):sha256(VALUES),str(ROSTERS.relative_to(ROOT)):sha256(ROSTERS)},
+              "design":{"ratio_targets":list(RATIO_TARGETS),"package_sizes":list(PACKAGE_SIZES),"anchors_per_position":2,"pick_assets_included":False},
+              "counts":{"challenge_count":len(challenges),"by_package_size":by_size,"by_target_position":by_pos,"by_ratio_target":by_ratio},
+              "challenges":challenges
+          }
+          OUT.write_text(json.dumps(doc,indent=2,sort_keys=True)+"\n",encoding="utf-8")
+          print(f"Wrote {OUT.relative_to(ROOT)} with {len(challenges)} frozen challenges")
+          PY
+          chmod +x research/package-adjustment-v1/generate_package_vote_challenges.py
+          python3 research/package-adjustment-v1/generate_package_vote_challenges.py
+
+      - name: Create package-vote aggregation pipeline
+        shell: bash
+        run: |
+          cat > scripts/market/package_vote_pipeline.py <<'PY'
+          #!/usr/bin/env python3
+          from __future__ import annotations
+          import csv, io, json, math, sys
+          from collections import defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+          import requests
+
+          SCRIPT_DIR=Path(__file__).resolve().parent; SCRIPTS_DIR=SCRIPT_DIR.parent; ROOT=SCRIPTS_DIR.parent
+          sys.path.insert(0,str(SCRIPT_DIR)); import ktc_pipeline
+          CHALLENGES=ROOT/"research/package-adjustment-v1/package_vote_challenges.json"
+          OUT_JSON=ROOT/"research/package-adjustment-v1/package_vote_results.json"
+          OUT_MD=ROOT/"research/package-adjustment-v1/package_vote_results.md"
+          PREFIX="__pkgv1__|"; META_PREFIX="__pkgv1_meta__|"; SCHEMA_PREFIX="__pkgv1_schema__|"
+          DAILY_CAP=10; LIFETIME_CAP=30.0
+          MIN_VOTES=80; MIN_VOTERS=6; MIN_CHALLENGES=20; MIN_EACH_CHOICE=15
+          LAMBDAS=tuple(i/200 for i in range(201)); BETAS=tuple(i/4 for i in range(1,65))
+
+          def read_json(p): return json.loads(p.read_text(encoding="utf-8"))
+          def fetch_rows():
+              r=requests.get(ktc_pipeline.SHEET_CSV_URL,timeout=30); r.raise_for_status()
+              return list(csv.DictReader(io.StringIO(r.text)))
+          def is_pkg(r): return str(r.get("keep") or "").startswith(PREFIX)
+          def parse(r):
+              parts=str(r.get("keep") or "").split("|")
+              if len(parts)!=3 or parts[0]!="__pkgv1__" or parts[2] not in {"T","P"}: return None
+              meta=str(r.get("trade") or ""); left=meta[len(META_PREFIX):] if meta.startswith(META_PREFIX) else None
+              if left not in {"T","P"}: left=None
+              if not str(r.get("cut") or "").startswith(SCHEMA_PREFIX): return None
+              return {"timestamp":r.get("timestamp") or "","voter_roster_id":str(r.get("voter_roster_id") or ""),"challenge_id":parts[1],"choice":parts[2],"left":left}
+          def cap(rows):
+              counts=defaultdict(int); kept=[]; dropped=0
+              for r in rows:
+                  day=str(r["timestamp"])[:10]; voter=r["voter_roster_id"]
+                  if not day or not voter: continue
+                  k=(voter,day)
+                  if counts[k]>=DAILY_CAP: dropped+=1; continue
+                  counts[k]+=1; kept.append(r)
+              return kept,dropped
+          def weights(rows):
+              counts=defaultdict(int)
+              for r in rows: counts[r["voter_roster_id"]]+=1
+              return {v:{"raw_votes":n,"ballot_weight":min(1.0,LIFETIME_CAP/n),"effective_votes":min(float(n),LIFETIME_CAP)} for v,n in counts.items()}
+          def logistic(z):
+              if z>=0:
+                  e=math.exp(-z); return 1/(1+e)
+              e=math.exp(z); return e/(1+e)
+          def ll(rows,catalog,wts,lam,beta):
+              total=0.0
+              for r in rows:
+                  c=catalog[r["challenge_id"]]; ratio=float(c["raw_package_to_target_ratio"]); fg=float(c["fg"])
+                  x=math.log(max(1e-9,ratio*max(1e-9,1-lam*fg))); p=min(1-1e-12,max(1e-12,logistic(beta*x)))
+                  y=1.0 if r["choice"]=="P" else 0.0; w=wts[r["voter_roster_id"]]["ballot_weight"]
+                  total += w*(y*math.log(p)+(1-y)*math.log(1-p))
+              return total
+          def fit(rows,catalog,wts):
+              best=None; profile={}
+              for lam in LAMBDAS:
+                  best_l=None
+                  for beta in BETAS:
+                      score=ll(rows,catalog,wts,lam,beta); best_l=score if best_l is None or score>best_l else best_l
+                      cand=(score,-lam,-beta,lam,beta)
+                      if best is None or cand>best: best=cand
+                  profile[f"{lam:.3f}"]=best_l
+              maxll,_,_,lam,beta=best; support=[float(k) for k,v in profile.items() if 2*(maxll-v)<=3.84]
+              return {"lambda_hat":lam,"beta_hat":beta,"weighted_log_likelihood":maxll,"lambda_profile_support_heuristic":{"semantics":"profile likelihood heuristic, not calibrated CI","low":min(support) if support else None,"high":max(support) if support else None},"boundary_lambda_flag":lam in {0.0,1.0}}
+          def summarize(rows,doc):
+              catalog={c["id"]:c for c in doc["challenges"]}; valid=[r for r in rows if r["challenge_id"] in catalog]; wts=weights(valid)
+              P=sum(r["choice"]=="P" for r in valid); T=sum(r["choice"]=="T" for r in valid); voters=len(wts); challenges=len({r["challenge_id"] for r in valid})
+              left=[r for r in valid if r["left"] in {"T","P"}]; left_rate=(100*sum(r["choice"]==r["left"] for r in left)/len(left)) if left else None
+              by_ratio={}; by_size={}
+              for rt in doc["design"]["ratio_targets"]:
+                  ids={c["id"] for c in doc["challenges"] if abs(float(c["ratio_target"])-float(rt))<1e-9}; sub=[r for r in valid if r["challenge_id"] in ids]; pv=sum(r["choice"]=="P" for r in sub)
+                  by_ratio[f"{float(rt):.2f}"]={"votes":len(sub),"package_choice_pct":round(100*pv/len(sub),2) if sub else None}
+              for size in doc["design"]["package_sizes"]:
+                  ids={c["id"] for c in doc["challenges"] if int(c["package_size"])==int(size)}; sub=[r for r in valid if r["challenge_id"] in ids]; pv=sum(r["choice"]=="P" for r in sub)
+                  by_size[str(size)]={"votes":len(sub),"package_choice_pct":round(100*pv/len(sub),2) if sub else None}
+              gates={"counted_votes":len(valid)>=MIN_VOTES,"unique_voters":voters>=MIN_VOTERS,"distinct_challenges":challenges>=MIN_CHALLENGES,"choice_mix":P>=MIN_EACH_CHOICE and T>=MIN_EACH_CHOICE}; ready=all(gates.values())
+              return {"voter_weights":wts,"raw_vote_count":len(valid),"unique_voters":voters,"distinct_challenges":challenges,"package_votes":P,"target_votes":T,"package_choice_pct":round(100*P/len(valid),2) if valid else None,"display_left_choice_pct":round(left_rate,2) if left_rate is not None else None,"by_ratio_target":by_ratio,"by_package_size":by_size,"promotion_data_gates":{"thresholds":{"counted_votes":MIN_VOTES,"unique_voters":MIN_VOTERS,"distinct_challenges":MIN_CHALLENGES,"minimum_each_choice":MIN_EACH_CHOICE},"passed":gates,"all_passed":ready},"v0_fit":fit(valid,catalog,wts) if ready else None}
+          def report(result):
+              s=result["summary"]; lines=["# Package Preference Voting V1","","**Status: RESEARCH ONLY — no production consumer changed.**","",f"- Counted package votes: `{s['raw_vote_count']}`",f"- Unique voters: `{s['unique_voters']}`",f"- Distinct challenges: `{s['distinct_challenges']}`",f"- Package choice rate: `{s['package_choice_pct']}`",f"- Display-left choice rate: `{s['display_left_choice_pct']}`","","## By raw package/target ratio","","| Ratio | Votes | Package chosen |","|---:|---:|---:|"]
+              for k,row in s["by_ratio_target"].items(): lines.append(f"| {k} | {row['votes']} | {'n/a' if row['package_choice_pct'] is None else str(row['package_choice_pct'])+'%'} |")
+              lines += ["","## V0 lambda fit",""]
+              if s["v0_fit"] is None: lines.append("Insufficient data for provisional lambda; collection continues.")
+              else:
+                  f=s["v0_fit"]; lines += [f"- lambda_hat: `{f['lambda_hat']:.3f}`",f"- beta_hat: `{f['beta_hat']:.2f}`",f"- boundary flag: `{f['boundary_lambda_flag']}`"]
+              lines += ["","## Isolation","","- Package rows are removed before normal KTC daily-cap and Bradley-Terry work.","- Package votes do not alter Market Value or the live trade verdict.",""]
+              OUT_MD.write_text("\n".join(lines),encoding="utf-8")
+          def selftest():
+              assert is_pkg({"keep":"__pkgv1__|x|P"}) and not is_pkg({"keep":"alpha"})
+              p=parse({"timestamp":"2026-09-07T00:00:00Z","voter_roster_id":"4","keep":"__pkgv1__|abc|P","trade":"__pkgv1_meta__|T","cut":"__pkgv1_schema__|1"}); assert p["challenge_id"]=="abc" and p["choice"]=="P" and p["left"]=="T"
+              xs=[{"timestamp":"2026-09-07T00:00:00Z","voter_roster_id":"4","challenge_id":str(i),"choice":"P","left":"P"} for i in range(15)]; kept,dropped=cap(xs); assert len(kept)==10 and dropped==5
+              print("Package vote pipeline self-test passed.")
+          if "--selftest" in sys.argv: selftest(); raise SystemExit(0)
+          doc=read_json(CHALLENGES)
+          if doc.get("status")!="frozen_package_preference_v1" or doc.get("frozen") is not True: raise RuntimeError("unexpected/unfrozen challenge catalog")
+          parsed=[parse(r) for r in fetch_rows() if is_pkg(r)]; parsed=[r for r in parsed if r]; counted,dropped=cap(parsed); summary=summarize(counted,doc)
+          result={"schema_version":1,"status":"research_only","consumer_changed":False,"market_value_consumer_changed":False,"generated_at_utc":datetime.now(timezone.utc).isoformat(),"transport":"existing KTC Google Sheet via reserved __pkgv1__ sentinel","package_daily_cap_per_voter":DAILY_CAP,"voter_effective_lifetime_cap":LIFETIME_CAP,"raw_package_rows":len(parsed),"daily_cap_dropped":dropped,"summary":summary}
+          OUT_JSON.write_text(json.dumps(result,indent=2,sort_keys=True)+"\n",encoding="utf-8"); report(result); print(f"Wrote {OUT_JSON.relative_to(ROOT)}")
+          PY
+          chmod +x scripts/market/package_vote_pipeline.py
+
+      - name: Isolate package rows from normal KTC aggregation
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("scripts/market/ktc_pipeline.py"); text=p.read_text(encoding="utf-8")
+          def rep(old,new,label):
+              global text
+              n=text.count(old)
+              if n!=1: raise RuntimeError(f"{label}: expected 1 match, found {n}")
+              text=text.replace(old,new,1)
+          rep("MIN_PAIRWISE_FOR_SIGNAL = 30\n\n# Research-only voter-balance policy.","MIN_PAIRWISE_FOR_SIGNAL = 30\n\n# Package Preference V1 shares transport only; remove these rows before\n# normal KTC daily-cap and Bradley-Terry processing.\nPACKAGE_VOTE_PREFIX = \"__pkgv1__|\"\n\ndef is_package_vote_row(row):\n    return str(row.get(\"keep\") or \"\").startswith(PACKAGE_VOTE_PREFIX)\n\n# Research-only voter-balance policy.","classifier")
+          rep("    rows = fetch_votes()\n    rows = apply_daily_cap(rows)\n    print(f\"  {len(rows)} votes counted after daily cap\")","    all_rows = fetch_votes()\n    package_transport_rows = [r for r in all_rows if is_package_vote_row(r)]\n    rows = [r for r in all_rows if not is_package_vote_row(r)]\n    if package_transport_rows:\n        print(f\"  Excluded {len(package_transport_rows)} Package Preference V1 row(s) before normal KTC processing\")\n    rows = apply_daily_cap(rows)\n    print(f\"  {len(rows)} votes counted after daily cap\")","main isolation")
+          rep("def run_selftest():\n    raw_pairs = [","def run_selftest():\n    assert is_package_vote_row({\"keep\": \"__pkgv1__|challenge|P\"})\n    assert not is_package_vote_row({\"keep\": \"alpha\"})\n\n    raw_pairs = [","selftest")
+          p.write_text(text,encoding="utf-8")
+          PY
+
+      - name: Add Package Preference UI
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("index.html"); text=p.read_text(encoding="utf-8")
+          def rep(old,new,label):
+              global text
+              n=text.count(old)
+              if n!=1: raise RuntimeError(f"{label}: expected 1 match, found {n}")
+              text=text.replace(old,new,1)
+
+          rep('  <div class="section-label" style="margin-top:20px;">Keep / Trade / Cut</div>\n  <div id="ktcWrap"></div>','  <div class="section-label" style="margin-top:20px;">Keep / Trade / Cut</div>\n  <div id="ktcWrap"></div>\n\n  <div class="section-label" style="margin-top:20px;">Package Preference Research</div>\n  <div id="packageVoteWrap"></div>',"UI mount")
+
+          submit="const KTC_SUBMIT_URL = 'https://script.google.com/macros/s/AKfycbynz6A8jNOQonJhHtZW7DEx36PYTBXi_klXnacKF7I4kACPbTJIA5YFjY5ILxqpwgm8aw/exec'; // see ktc_vote_collector.gs setup instructions\n"
+          package_constants=submit+'''\n/* Package Preference Voting V1 — separate research; shared transport only. */\nconst PACKAGE_VOTE_CHALLENGES_URL = 'https://raw.githubusercontent.com/ajknoll23-code/LOG-Trade-Calculator/refs/heads/main/research/package-adjustment-v1/package_vote_challenges.json';\nconst PACKAGE_VOTE_DAILY_LIMIT = 10;\nconst PACKAGE_VOTE_RECENT_MEMORY = 20;\nlet PACKAGE_VOTE_CHALLENGES = null;\nlet PACKAGE_VOTE_STATUS = 'idle';\nlet packageVoteCurrent = null;\n'''
+          rep(submit,package_constants,"constants")
+
+          code=r'''\nfunction packageVoteTodayKey(){ return 'package_votes_v1_' + new Date().toISOString().slice(0,10); }\nfunction packageVotesToday(){ return parseInt(localStorage.getItem(packageVoteTodayKey()) || '0', 10); }\nfunction packageVoteRecent(){ try { return JSON.parse(localStorage.getItem('package_vote_recent_v1') || '[]'); } catch(e){ return []; } }\nfunction packageVoteRemember(id){ localStorage.setItem('package_vote_recent_v1', JSON.stringify(packageVoteRecent().concat([id]).slice(-PACKAGE_VOTE_RECENT_MEMORY))); }\nfunction packageVoteOwnPlayers(){\n  if(!(state.teamConfirmed && MY_ROSTER_ID)) return new Set();\n  const team=LEAGUE_ROSTERS[MY_ROSTER_ID];\n  return new Set((team && team.players || []).map(p=>p.key));\n}\nfunction packageVoteEligibleChallenges(){\n  if(!PACKAGE_VOTE_CHALLENGES) return [];\n  const own=packageVoteOwnPlayers(), recent=new Set(packageVoteRecent());\n  return PACKAGE_VOTE_CHALLENGES.filter(c=>!recent.has(c.id) && ![c.target.key].concat(c.package.map(p=>p.key)).some(k=>own.has(k)));\n}\nfunction packageVoteSelectChallenge(){\n  let pool=packageVoteEligibleChallenges();\n  if(!pool.length && PACKAGE_VOTE_CHALLENGES){ localStorage.removeItem('package_vote_recent_v1'); pool=packageVoteEligibleChallenges(); }\n  if(!pool.length) return null;\n  const challenge=pool[Math.floor(Math.random()*pool.length)];\n  return {challenge,left:Math.random()<0.5?'T':'P'};\n}\nfunction packageVoteEnsureLoaded(){\n  if(PACKAGE_VOTE_STATUS==='loading'||PACKAGE_VOTE_STATUS==='ready') return;\n  PACKAGE_VOTE_STATUS='loading';\n  fetch(PACKAGE_VOTE_CHALLENGES_URL).then(r=>{if(!r.ok) throw new Error('HTTP '+r.status); return r.json();}).then(doc=>{\n    if(doc.status!=='frozen_package_preference_v1'||doc.frozen!==true||!Array.isArray(doc.challenges)||doc.challenges.length<70) throw new Error('unexpected package challenge catalog');\n    PACKAGE_VOTE_CHALLENGES=doc.challenges; PACKAGE_VOTE_STATUS='ready'; packageVoteCurrent=null; renderPackageVote();\n  }).catch(err=>{console.warn('Package Preference V1 load failed:',err); PACKAGE_VOTE_CHALLENGES=null; PACKAGE_VOTE_STATUS='failed'; renderPackageVote();});\n}\nfunction packageVoteAssetCard(p){\n  const age=(typeof p.age==='number')?` &middot; ${p.age} y.o.`:''; const team=p.team?` &middot; ${ktcTeamLabel(p.team)}`:'';\n  return `<div class="need-cell" style="text-align:left;padding:10px;"><div style="font-weight:600;font-size:14px;">${escapeHtml(p.name)}</div><div style="color:var(--text-dim);font-size:11px;">${escapeHtml(p.pos)}${team}${age}</div></div>`;\n}\nfunction packageVoteSubmit(displaySide){\n  if(!packageVoteCurrent||packageVotesToday()>=PACKAGE_VOTE_DAILY_LIMIT) return;\n  const left=packageVoteCurrent.left, choice=displaySide==='L'?left:(left==='T'?'P':'T'), id=packageVoteCurrent.challenge.id, voter=ktcCurrentVoterId();\n  if(!voter) return;\n  fetch(KTC_SUBMIT_URL,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify({voterRosterId:voter,keep:`__pkgv1__|${id}|${choice}`,trade:`__pkgv1_meta__|${left}`,cut:'__pkgv1_schema__|1'})}).catch(()=>{});\n  localStorage.setItem(packageVoteTodayKey(),String(packageVotesToday()+1)); packageVoteRemember(id); packageVoteCurrent=packageVoteSelectChallenge(); renderPackageVote();\n}\nfunction renderPackageVote(){\n  const el=document.getElementById('packageVoteWrap'); if(!el) return;\n  if(!(state.teamConfirmed&&MY_ROSTER_ID)&&!ktcIsGuestMode()){ el.innerHTML='<div style="color:var(--text-dim);font-size:13px;padding:8px 0;">Pick "Which team is yours?" above or enter guest voting mode in Keep / Trade / Cut first.</div>'; return; }\n  if(packageVotesToday()>=PACKAGE_VOTE_DAILY_LIMIT){ el.innerHTML=`<div style="color:var(--text-dim);font-size:13px;padding:8px 0;">You've completed today's ${PACKAGE_VOTE_DAILY_LIMIT} package research votes — thank you.</div>`; return; }\n  if(PACKAGE_VOTE_STATUS==='idle'){ packageVoteEnsureLoaded(); el.innerHTML='<div style="color:var(--text-dim);font-size:13px;padding:8px 0;">Loading frozen package comparisons…</div>'; return; }\n  if(PACKAGE_VOTE_STATUS==='loading'){ el.innerHTML='<div style="color:var(--text-dim);font-size:13px;padding:8px 0;">Loading frozen package comparisons…</div>'; return; }\n  if(PACKAGE_VOTE_STATUS==='failed'){ el.innerHTML='<div style="color:var(--text-dim);font-size:13px;padding:8px 0;">Package research is temporarily unavailable. Normal KTC voting is unaffected.</div>'; return; }\n  if(!packageVoteCurrent) packageVoteCurrent=packageVoteSelectChallenge();\n  if(!packageVoteCurrent){ el.innerHTML='<div style="color:var(--text-dim);font-size:13px;padding:8px 0;">No eligible package comparison is available right now.</div>'; return; }\n  const c=packageVoteCurrent.challenge,targetHTML=packageVoteAssetCard(c.target),packageHTML=c.package.map(packageVoteAssetCard).join(''),leftIsTarget=packageVoteCurrent.left==='T';\n  const leftHTML=leftIsTarget?targetHTML:packageHTML,rightHTML=leftIsTarget?packageHTML:targetHTML;\n  el.innerHTML=`<div style="border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:10px;font-size:12px;color:var(--text-dim);"><b style="color:var(--text);">Research question:</b> Which side would you rather have in a dynasty trade? Values are intentionally hidden.</div><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;align-items:stretch;"><div><div style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--gold);margin-bottom:5px;text-align:center;">SIDE A</div><div style="display:flex;flex-direction:column;gap:6px;">${leftHTML}</div><button class="tab-btn" style="width:100%;margin-top:8px;" onclick="packageVoteSubmit('L')">Choose Side A</button></div><div><div style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--violet);margin-bottom:5px;text-align:center;">SIDE B</div><div style="display:flex;flex-direction:column;gap:6px;">${rightHTML}</div><button class="tab-btn" style="width:100%;margin-top:8px;" onclick="packageVoteSubmit('R')">Choose Side B</button></div></div><div style="color:var(--text-dim);font-size:10px;margin-top:8px;text-align:center;">${packageVotesToday()} / ${PACKAGE_VOTE_DAILY_LIMIT} package votes today · display sides randomized</div>`;\n}\n\n'''
+          marker="function render(){\n"
+          if text.count(marker)!=1: raise RuntimeError(f"render marker count {text.count(marker)}")
+          text=text.replace(marker,code+marker,1)
+          rep("  renderKTC();\n  renderFullRoster();","  renderKTC();\n  renderPackageVote();\n  renderFullRoster();","render call")
+          p.write_text(text,encoding="utf-8")
+          PY
+
+      - name: Add persistent package-vote aggregation workflow
+        shell: bash
+        run: |
+          cat > .github/workflows/package-vote-aggregation.yml <<'YML'
+          name: Package Vote Aggregation
+          on:
+            workflow_dispatch:
+            schedule:
+              - cron: '23 11 * * *'
+          permissions:
+            contents: write
+          concurrency:
+            group: trade-desk-data-writes
+            cancel-in-progress: false
+          jobs:
+            aggregate:
+              runs-on: ubuntu-latest
+              timeout-minutes: 15
+              steps:
+                - uses: actions/checkout@v4
+                  with:
+                    ref: main
+                    fetch-depth: 0
+                - uses: actions/setup-python@v5
+                  with:
+                    python-version: '3.11'
+                - name: Aggregate package votes
+                  run: |
+                    pip install requests
+                    python3 scripts/market/package_vote_pipeline.py --selftest
+                    python3 scripts/market/package_vote_pipeline.py
+                - name: Commit research results
+                  run: |
+                    git config user.name "trade-desk-research-bot"
+                    git config user.email "actions@users.noreply.github.com"
+                    git add research/package-adjustment-v1/package_vote_results.json research/package-adjustment-v1/package_vote_results.md
+                    if git diff --cached --quiet; then exit 0; fi
+                    git commit -m "Update package preference vote research"
+                    git push origin main
+          YML
+
+      - name: Run self-tests and initial aggregation
+        shell: bash
+        run: |
+          pip install requests
+          python3 scripts/market/ktc_pipeline.py --selftest
+          python3 scripts/market/package_vote_pipeline.py --selftest
+          python3 scripts/market/package_vote_pipeline.py
+
+      - name: Verify contracts
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          c=json.loads(Path("research/package-adjustment-v1/package_vote_challenges.json").read_text())
+          assert c["status"]=="frozen_package_preference_v1" and c["frozen"] is True and c["counts"]["challenge_count"]>=70
+          assert c["design"]["pick_assets_included"] is False
+          idx=Path("index.html").read_text(); assert "packageVoteWrap" in idx and "__pkgv1__|${id}|${choice}" in idx and "Values are intentionally hidden" in idx
+          ktc=Path("scripts/market/ktc_pipeline.py").read_text(); assert 'PACKAGE_VOTE_PREFIX = "__pkgv1__|"' in ktc and "rows = [r for r in all_rows if not is_package_vote_row(r)]" in ktc
+          r=json.loads(Path("research/package-adjustment-v1/package_vote_results.json").read_text()); assert r["status"]=="research_only" and r["consumer_changed"] is False and r["market_value_consumer_changed"] is False
+          v0=json.loads(Path("research/package-adjustment-v0/package_adjustment_v0.json").read_text()); assert v0["production_formula_enabled"] is False
+          print("Package Preference V1 contracts verified.")
+          PY
+
+      - name: JavaScript syntax check
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          html=Path("index.html").read_text(encoding="utf-8")
+          scripts=re.findall(r"<script(?:\s[^>]*)?>(.*?)</script>",html,flags=re.S|re.I)
+          if not scripts: raise RuntimeError("No inline scripts found")
+          Path("/tmp/trade-desk-inline.js").write_text("\n".join(scripts),encoding="utf-8")
+          PY
+          node --check /tmp/trade-desk-inline.js
+
+      - name: Run repo regression checks
+        shell: bash
+        run: |
+          python3 scripts/validation/repo_regression_checks.py
+
+      - name: Remove one-time installer
+        shell: bash
+        run: rm -f .github/workflows/install-package-preference-voting-v1.yml
+
+      - name: Commit and push
+        shell: bash
+        run: |
+          git config user.name "trade-desk-research-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add index.html scripts/market/ktc_pipeline.py scripts/market/package_vote_pipeline.py research/package-adjustment-v1/ .github/workflows/package-vote-aggregation.yml
+          git add -u .github/workflows/install-package-preference-voting-v1.yml
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "Add Package Preference Voting V1 research"
+          git push origin main
