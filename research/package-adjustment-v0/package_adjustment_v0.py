@@ -1,0 +1,535 @@
+#!/usr/bin/env python3
+"""
+Package Adjustment V0 — research/shadow model only.
+
+Structural model:
+    S = sum(side asset Fundamental Values)
+    H = sum((v_i / S)^2)
+    F = 1 - H
+    G = max(0, 1 - top_this / top_other)
+    discount_rate = lambda * F * G
+    effective_value = S * (1 - discount_rate)
+
+V0 deliberately excludes:
+- elite-percentile multiplier E(p)
+- draft-pick liquidity modifiers
+- roster-slot/displacement cost
+- Market Value
+- Team Utility
+- any production trade-verdict consumer
+
+Roster effects belong to Team Utility. V0 asks only whether a side is
+fragmented relative to a materially better best asset on the other side.
+
+Lambda is NOT calibrated here. We report a sensitivity grid only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import math
+import statistics
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+BENCH_SCRIPT = (
+    ROOT
+    / "research"
+    / "team-utility-bench-weight-v1"
+    / "team_utility_bench_weight_sensitivity.py"
+)
+BENCH_RESULT = (
+    ROOT
+    / "research"
+    / "team-utility-bench-weight-v1"
+    / "bench_weight_sensitivity.json"
+)
+
+OUT_JSON = ROOT / "research" / "package-adjustment-v0" / "package_adjustment_v0.json"
+OUT_MD = ROOT / "research" / "package-adjustment-v0" / "package_adjustment_v0.md"
+
+LAMBDA_GRID = (0.00, 0.10, 0.25, 0.50, 0.75, 1.00)
+
+
+def percentile(values, q):
+    xs = sorted(float(x) for x in values)
+    if not xs:
+        return None
+    if len(xs) == 1:
+        return xs[0]
+    idx = (len(xs) - 1) * q
+    lo = int(math.floor(idx))
+    hi = int(math.ceil(idx))
+    if lo == hi:
+        return xs[lo]
+    frac = idx - lo
+    return xs[lo] * (1 - frac) + xs[hi] * frac
+
+
+def finite_positive_values(values):
+    out = []
+    for value in values:
+        try:
+            x = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(x) and x > 0:
+            out.append(x)
+    return out
+
+
+def geometry(side_values, other_values):
+    side = finite_positive_values(side_values)
+    other = finite_positive_values(other_values)
+
+    if not side:
+        return {
+            "raw_sum": 0.0,
+            "asset_count": 0,
+            "top_asset": 0.0,
+            "hhi": 0.0,
+            "fragmentation": 0.0,
+            "best_asset_gap": 0.0,
+            "fg": 0.0,
+        }
+
+    raw_sum = sum(side)
+    top = max(side)
+    hhi = sum((v / raw_sum) ** 2 for v in side)
+    fragmentation = max(0.0, min(1.0, 1.0 - hhi))
+
+    other_top = max(other) if other else 0.0
+    if other_top <= 0:
+        gap = 0.0
+    else:
+        gap = max(0.0, 1.0 - top / other_top)
+
+    fg = fragmentation * gap
+    return {
+        "raw_sum": raw_sum,
+        "asset_count": len(side),
+        "top_asset": top,
+        "other_top_asset": other_top,
+        "hhi": hhi,
+        "fragmentation": fragmentation,
+        "best_asset_gap": gap,
+        "fg": fg,
+    }
+
+
+def evaluate_side(side_values, other_values, lam):
+    g = geometry(side_values, other_values)
+    discount_rate = max(0.0, min(1.0, float(lam) * g["fg"]))
+    discount_points = g["raw_sum"] * discount_rate
+    effective = g["raw_sum"] - discount_points
+    return {
+        **g,
+        "lambda": float(lam),
+        "discount_rate": discount_rate,
+        "discount_points": discount_points,
+        "effective_value": effective,
+    }
+
+
+def evaluate_trade(side_a, side_b, lam):
+    a = evaluate_side(side_a, side_b, lam)
+    b = evaluate_side(side_b, side_a, lam)
+    return {
+        "side_a": a,
+        "side_b": b,
+        "effective_delta_a_minus_b": a["effective_value"] - b["effective_value"],
+    }
+
+
+def load_bench_module():
+    if not BENCH_SCRIPT.exists():
+        raise RuntimeError(
+            "missing prerequisite bench-weight research script: "
+            f"{BENCH_SCRIPT.relative_to(ROOT)}"
+        )
+    spec = importlib.util.spec_from_file_location("bench_weight_v1", BENCH_SCRIPT)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("could not load bench-weight research module")
+    mod = importlib.util.module_from_spec(spec)
+    # Python 3.11 dataclasses resolve type metadata through
+    # sys.modules[cls.__module__] while the module is executing.
+    # Register the dynamically-loaded module before exec_module().
+    import sys
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def regenerate_current_scenarios():
+    mod = load_bench_module()
+    deployed_weight, active_limit = mod.parse_deployed_constants()
+    value_index, _ = mod.build_value_index()
+    projection_index, _ = mod.build_projection_index()
+    rosters, missing_fv, coverage = mod.build_rosters(
+        value_index,
+        projection_index,
+    )
+    scenarios, target_floor = mod.generate_scenarios(rosters, active_limit)
+    if len(scenarios) < 100:
+        raise RuntimeError(f"too few prerequisite scenarios: {len(scenarios)}")
+    return {
+        "scenarios": scenarios,
+        "deployed_bench_weight": deployed_weight,
+        "active_roster_limit": active_limit,
+        "team_count": len(rosters),
+        "active_fv_coverage_pct": coverage,
+        "missing_fv": missing_fv,
+        "target_floor": target_floor,
+    }
+
+
+def structural_rows(scenarios):
+    rows = []
+    for s in scenarios:
+        target = float(s["target"]["fv"])
+        pieces = [float(p["fv"]) for p in s["package"]]
+        geom = geometry(pieces, [target])
+
+        row = {
+            "type": s["type"],
+            "target_player": s["target"]["player"],
+            "target_fv": target,
+            "package_players": [p["player"] for p in s["package"]],
+            "package_values": pieces,
+            "package_raw_fv": sum(pieces),
+            "raw_ratio": sum(pieces) / target if target else None,
+            "fragmentation": geom["fragmentation"],
+            "best_asset_gap": geom["best_asset_gap"],
+            "fg": geom["fg"],
+        }
+
+        for lam in LAMBDA_GRID:
+            result = evaluate_side(pieces, [target], lam)
+            row[f"discount_pct_lambda_{lam:.2f}"] = 100.0 * result["discount_rate"]
+            row[f"effective_ratio_lambda_{lam:.2f}"] = (
+                result["effective_value"] / target if target else None
+            )
+
+        # If raw package already trails target, no positive lambda is
+        # required to make the target side larger. If package leads,
+        # solve S*(1-lambda*FG)=target for lambda.
+        if sum(pieces) <= target or geom["fg"] <= 0:
+            required = 0.0 if sum(pieces) <= target else None
+        else:
+            required = (1.0 - target / sum(pieces)) / geom["fg"]
+        row["lambda_required_to_offset_raw_surplus"] = required
+        rows.append(row)
+    return rows
+
+
+def summarize_rows(rows):
+    by_type = {}
+    for kind in sorted({r["type"] for r in rows}):
+        subset = [r for r in rows if r["type"] == kind]
+        fg = [r["fg"] for r in subset]
+        frag = [r["fragmentation"] for r in subset]
+        gap = [r["best_asset_gap"] for r in subset]
+        required = [
+            r["lambda_required_to_offset_raw_surplus"]
+            for r in subset
+            if r["lambda_required_to_offset_raw_surplus"] is not None
+            and r["lambda_required_to_offset_raw_surplus"] > 0
+            and math.isfinite(r["lambda_required_to_offset_raw_surplus"])
+        ]
+
+        grid = {}
+        for lam in LAMBDA_GRID:
+            discounts = [r[f"discount_pct_lambda_{lam:.2f}"] for r in subset]
+            eff_ratios = [r[f"effective_ratio_lambda_{lam:.2f}"] for r in subset]
+            grid[f"{lam:.2f}"] = {
+                "median_discount_pct": round(statistics.median(discounts), 3),
+                "p10_discount_pct": round(percentile(discounts, 0.10), 3),
+                "p90_discount_pct": round(percentile(discounts, 0.90), 3),
+                "median_effective_package_to_target_ratio": round(
+                    statistics.median(eff_ratios), 5
+                ),
+                "package_effective_below_target_pct": round(
+                    100.0 * sum(1 for x in eff_ratios if x < 1.0) / len(eff_ratios),
+                    2,
+                ),
+            }
+
+        by_type[kind] = {
+            "count": len(subset),
+            "median_fragmentation": round(statistics.median(frag), 5),
+            "median_best_asset_gap": round(statistics.median(gap), 5),
+            "median_fg": round(statistics.median(fg), 5),
+            "fg_p10": round(percentile(fg, 0.10), 5),
+            "fg_p90": round(percentile(fg, 0.90), 5),
+            "raw_surplus_scenarios_with_solvable_lambda": len(required),
+            "lambda_required_to_offset_raw_surplus": {
+                "p10": round(percentile(required, 0.10), 4) if required else None,
+                "median": round(percentile(required, 0.50), 4) if required else None,
+                "p90": round(percentile(required, 0.90), 4) if required else None,
+            },
+            "lambda_grid": grid,
+        }
+    return by_type
+
+
+def torture_tests():
+    tests = {}
+
+    # 1-for-1 must never trigger fragmentation.
+    r = evaluate_trade([8000], [8000], 1.0)
+    assert r["side_a"]["discount_rate"] == 0
+    assert r["side_b"]["discount_rate"] == 0
+    tests["one_for_one_null"] = "PASS"
+
+    # Balanced 2-for-2 with equal top assets: G=0 on both sides.
+    r = evaluate_trade([4000, 4000], [4000, 4000], 1.0)
+    assert r["side_a"]["discount_rate"] == 0
+    assert r["side_b"]["discount_rate"] == 0
+    tests["balanced_two_for_two_null"] = "PASS"
+
+    # Equal raw sum: weaker fragmented package should be discounted.
+    r = evaluate_trade([8000], [4000, 2500, 1500], 1.0)
+    assert r["side_a"]["discount_rate"] == 0
+    assert r["side_b"]["discount_rate"] > 0
+    assert r["side_b"]["effective_value"] < 8000
+    tests["elite_vs_fragmented_equal_raw_sum"] = "PASS"
+
+    # Eight equal scrubs should be penalized more than 3-piece package.
+    three = evaluate_side([4000, 2500, 1500], [8000], 1.0)
+    eight = evaluate_side([1000] * 8, [8000], 1.0)
+    assert eight["discount_rate"] > three["discount_rate"]
+    tests["extreme_fragmentation_monotonic"] = "PASS"
+
+    # Near-elite + secondary should be penalized less than middling package.
+    near = evaluate_side([7000, 1000], [8000], 1.0)
+    mid = evaluate_side([4000, 2500, 1500], [8000], 1.0)
+    assert near["discount_rate"] < mid["discount_rate"]
+    tests["best_asset_gap_monotonic"] = "PASS"
+
+    # Adding a 1-point throw-in must not materially change the penalty.
+    base = evaluate_side([6000, 2000], [8000], 1.0)
+    padded = evaluate_side([6000, 1999, 1], [8000], 1.0)
+    assert abs(base["discount_rate"] - padded["discount_rate"]) < 0.001
+    tests["tiny_asset_padding_resistance"] = "PASS"
+
+    # Zero-valued padding is ignored entirely.
+    zero = evaluate_side([6000, 2000, 0], [8000], 1.0)
+    assert abs(base["discount_rate"] - zero["discount_rate"]) < 1e-12
+    tests["zero_asset_padding_null"] = "PASS"
+
+    # Scale invariance: package percentage geometry must not depend on units.
+    small = evaluate_side([4000, 2500, 1500], [8000], 0.5)
+    large = evaluate_side([40000, 25000, 15000], [80000], 0.5)
+    assert abs(small["discount_rate"] - large["discount_rate"]) < 1e-12
+    tests["scale_invariance"] = "PASS"
+
+    # More fragmentation at same sum/top should increase discount.
+    two = evaluate_side([5000, 3000], [8000], 1.0)
+    split = evaluate_side([5000, 1500, 1500], [8000], 1.0)
+    assert split["discount_rate"] > two["discount_rate"]
+    tests["secondary_split_monotonic"] = "PASS"
+
+    # If the package itself owns the best asset, G=0 and no V0 tax.
+    owns_best = evaluate_side([9000, 1000], [8000], 1.0)
+    assert owns_best["discount_rate"] == 0
+    tests["package_with_best_asset_not_taxed"] = "PASS"
+
+    # Swapping sides swaps the outputs.
+    ab = evaluate_trade([8000], [4000, 2500, 1500], 0.5)
+    ba = evaluate_trade([4000, 2500, 1500], [8000], 0.5)
+    assert abs(ab["side_a"]["effective_value"] - ba["side_b"]["effective_value"]) < 1e-12
+    assert abs(ab["side_b"]["effective_value"] - ba["side_a"]["effective_value"]) < 1e-12
+    tests["side_swap_symmetry"] = "PASS"
+
+    return tests
+
+
+def write_report(result):
+    lines = [
+        "# Package Adjustment V0 Research",
+        "",
+        "**Status: RESEARCH ONLY — no production consumer changed.**",
+        "",
+        "## V0 formula",
+        "",
+        "`S = sum(Fundamental Values on the side)`",
+        "",
+        "`H = Σ(vᵢ / S)²`",
+        "",
+        "`F = 1 - H`",
+        "",
+        "`G = max(0, 1 - top_asset_this_side / top_asset_other_side)`",
+        "",
+        "`discount_rate = λ × F × G`",
+        "",
+        "`effective_package_value = S × (1 - discount_rate)`",
+        "",
+        "V0 uses Fundamental Value only. It does not use Market Value, "
+        "Team Utility, roster slots, a pick-liquidity modifier, or an "
+        "elite-percentile multiplier.",
+        "",
+        "## Why this is still shadow-only",
+        "",
+        "`λ` is not calibrated. The grid below is sensitivity analysis, "
+        "not a recommendation. Production promotion requires package-voting "
+        "or prospective revealed-preference labels.",
+        "",
+        "## Current scenario universe",
+        "",
+        f"- Teams: `{result['inputs']['team_count']}`",
+        f"- Active FV coverage: `{result['inputs']['active_fv_coverage_pct']:.2f}%`",
+        f"- Raw-balanced stud-for-depth scenarios: `{result['scenario_count']}`",
+        f"- Deployed Team Utility bench weight: `{result['inputs']['deployed_bench_weight']:.2f}` (unchanged)",
+        f"- Active roster limit: `{result['inputs']['active_roster_limit']}`",
+        "",
+    ]
+
+    for kind, summary in result["scenario_summary"].items():
+        lines += [
+            f"## {kind.replace('_', '-')} package geometry",
+            "",
+            f"- Scenarios: `{summary['count']}`",
+            f"- Median fragmentation F: `{summary['median_fragmentation']:.3f}`",
+            f"- Median best-asset gap G: `{summary['median_best_asset_gap']:.3f}`",
+            f"- Median F×G: `{summary['median_fg']:.3f}`",
+            "",
+            "| λ | Median discount | P10–P90 discount | Effective package below target |",
+            "|---:|---:|---:|---:|",
+        ]
+        for lam in LAMBDA_GRID:
+            row = summary["lambda_grid"][f"{lam:.2f}"]
+            lines.append(
+                f"| {lam:.2f} | {row['median_discount_pct']:.1f}% | "
+                f"{row['p10_discount_pct']:.1f}%–{row['p90_discount_pct']:.1f}% | "
+                f"{row['package_effective_below_target_pct']:.1f}% |"
+            )
+        req = summary["lambda_required_to_offset_raw_surplus"]
+        lines += [
+            "",
+            "For scenarios where the raw package is worth more than the "
+            "target, the λ needed merely to erase that raw surplus is:",
+            "",
+            f"- P10: `{req['p10']}`",
+            f"- Median: `{req['median']}`",
+            f"- P90: `{req['p90']}`",
+            "",
+        ]
+
+    lines += [
+        "## Torture tests",
+        "",
+    ]
+    for name, status in result["torture_tests"].items():
+        lines.append(f"- `{name}`: **{status}**")
+
+    lines += [
+        "",
+        "## Explicitly excluded from V0",
+        "",
+        "- Elite-percentile multiplier `E(p)`",
+        "- Pick liquidity or future-pick modifier",
+        "- Market Value",
+        "- Roster displacement/cuts (Team Utility owns that)",
+        "- Position-specific package coefficients",
+        "- Production trade verdicts",
+        "",
+        "## Production impact",
+        "",
+        "- Fundamental Value changed: **NO**",
+        "- Market Value changed: **NO**",
+        "- Team Utility changed: **NO**",
+        "- Live trade verdict changed: **NO**",
+        "- Package Adjustment consumer enabled: **NO**",
+        "",
+    ]
+    OUT_MD.write_text("\n".join(lines), encoding="utf-8")
+
+
+def run_selftest():
+    tests = torture_tests()
+    assert len(tests) >= 10
+    print("Package Adjustment V0 self-test passed.")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--selftest", action="store_true")
+    parser.add_argument("--write", action="store_true")
+    args = parser.parse_args()
+
+    if args.selftest:
+        run_selftest()
+        return
+
+    if not BENCH_RESULT.exists():
+        raise RuntimeError(
+            "missing prerequisite bench-weight result; run Team Utility "
+            "bench-weight sensitivity first"
+        )
+    bench_doc = json.loads(BENCH_RESULT.read_text(encoding="utf-8"))
+    if bench_doc.get("status") != "research_only":
+        raise RuntimeError("unexpected prerequisite bench-weight artifact status")
+    if bench_doc.get("bench_weight_changed") is not False:
+        raise RuntimeError("bench-weight prerequisite unexpectedly changed production")
+
+    inputs = regenerate_current_scenarios()
+    scenarios = inputs.pop("scenarios")
+    rows = structural_rows(scenarios)
+    summary = summarize_rows(rows)
+    tests = torture_tests()
+
+    result = {
+        "schema_version": 1,
+        "status": "research_only",
+        "consumer_changed": False,
+        "production_formula_enabled": False,
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "method": "package_adjustment_v0_lambda_times_fragmentation_times_best_asset_gap",
+        "formula": {
+            "raw_sum": "S = sum(v_i)",
+            "hhi": "H = sum((v_i/S)^2)",
+            "fragmentation": "F = 1 - H",
+            "best_asset_gap": "G = max(0, 1 - top_this/top_other)",
+            "discount_rate": "lambda * F * G",
+            "effective_value": "S * (1 - lambda*F*G)",
+        },
+        "value_lens": "Fundamental Value only",
+        "lambda_status": "uncalibrated_sensitivity_grid_only",
+        "lambda_grid": list(LAMBDA_GRID),
+        "excluded_v0": [
+            "elite_percentile_multiplier",
+            "pick_liquidity_modifier",
+            "market_value",
+            "roster_slot_cost",
+            "team_utility",
+            "position_specific_coefficients",
+        ],
+        "inputs": inputs,
+        "scenario_count": len(rows),
+        "scenario_summary": summary,
+        "torture_tests": tests,
+        "audit_sample": rows[:100],
+        "promotion_gate": (
+            "No production use until lambda is externally calibrated "
+            "with package-preference or prospective revealed-preference "
+            "labels and improves out-of-sample over raw FV + fixed Team Utility."
+        ),
+    }
+
+    if args.write:
+        OUT_JSON.write_text(
+            json.dumps(result, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        write_report(result)
+        print(f"Wrote {OUT_JSON.relative_to(ROOT)}")
+        print(f"Wrote {OUT_MD.relative_to(ROOT)}")
+    else:
+        print(json.dumps(result, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()
