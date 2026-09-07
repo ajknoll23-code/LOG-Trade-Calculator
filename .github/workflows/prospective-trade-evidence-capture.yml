@@ -1,0 +1,107 @@
+name: Prospective Trade Evidence Capture
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Daily, intentionally after the Tue/Fri 15:00 UTC scheduled data refresh
+    # window so those days capture the newly-refreshed model state.
+    - cron: '30 16 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Prospective capture self-test
+        run: python3 scripts/validation/capture_prospective_trade_evidence.py --selftest
+
+      - name: Capture current pre-trade evidence and evaluate new trades
+        run: python3 scripts/validation/capture_prospective_trade_evidence.py --write
+
+      - name: Verify anti-hindsight contract
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          base = Path("research/package-adjustment-v1/prospective")
+          evidence = json.loads((base / "trade_evidence.json").read_text())
+
+          assert evidence["status"] == "research_only_prospective_trade_evidence"
+          assert evidence["consumer_changed"] is False
+
+          method = evidence["methodology"]
+          assert method["all_completed_current_league_trades"] is True
+          assert method["player_only_trades_included"] is True
+          assert method["requires_snapshot_strictly_before_trade"] is True
+          assert method["post_trade_values_never_substituted"] is True
+          assert method["future_pick_default_tier_without_signal"] == "mid"
+
+          snapshots = sorted((base / "snapshots").glob("*_trade-evidence.json"))
+          assert snapshots
+
+          indexed = []
+          for p in snapshots:
+              d = json.loads(p.read_text())
+              indexed.append((d["captured_epoch_ms"], str(p)))
+
+          for trade in evidence["trades"].values():
+              if not trade.get("eligible_for_numeric_package_research"):
+                  continue
+
+              txn_ms = trade["created_epoch_ms"]
+              snap_file = trade["pretrade_snapshot"]["file"]
+              matches = [ms for ms, path in indexed if path == snap_file]
+              assert matches, f"missing referenced snapshot: {snap_file}"
+              assert matches[0] < txn_ms, (
+                  f"anti-hindsight violation: snapshot {matches[0]} "
+                  f"is not before trade {txn_ms}"
+              )
+
+          # Package Adjustment remains shadow-only.
+          v0 = json.loads(
+              Path("research/package-adjustment-v0/package_adjustment_v0.json").read_text()
+          )
+          assert v0["production_formula_enabled"] is False
+
+          print("Prospective trade evidence contract verified.")
+          PY
+
+      - name: Commit changed prospective evidence
+        shell: bash
+        run: |
+          git config user.name "trade-desk-research-bot"
+          git config user.email "actions@users.noreply.github.com"
+
+          git add research/package-adjustment-v1/prospective/
+
+          if git diff --cached --quiet; then
+            echo "No prospective evidence changes."
+            exit 0
+          fi
+
+          git commit -m "Capture prospective package trade evidence"
+
+          # Serialize safely with other repository data writers.
+          git pull --rebase origin main
+          git push origin main
