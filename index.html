@@ -8888,6 +8888,30 @@ const TU_BENCH_WEIGHT = 0.15; // unvalidated guess, flagged as such in the
   // the same way the Hutchinson/Moehrig gut-check caught the position
   // weights. Not derived from anything; a starting point, not an answer.
 
+/* Legal active-roster constraint.
+   2026 Sleeper settings = 17 starters + 24 bench = 41 active roster
+   spots. Taxi and reserve/IR are separate pools and are deliberately
+   excluded from active-roster Team Utility.
+
+   This is a roster-specific constraint, NOT a package-value penalty.
+   It prevents 1-for-many trades from receiving free extra bench slots. */
+const TU_ACTIVE_ROSTER_LIMIT = 41;
+
+function tuActiveRosterKeys(){
+  const team = LEAGUE_ROSTERS && LEAGUE_ROSTERS[MY_ROSTER_ID];
+  if(team && Array.isArray(team.players)){
+    const active = team.players
+      .filter(p => p.slot === 'starters' || p.slot === 'bench')
+      .map(p => p.key);
+    if(active.length) return active;
+  }
+
+  /* Fallback/live personal sync ordering is starters -> bench -> taxi,
+     so the first 41 keys are the active roster when league-wide slot
+     metadata is temporarily unavailable. */
+  return MY_ROSTER.slice(0, Math.min(TU_ACTIVE_ROSTER_LIMIT, MY_ROSTER.length));
+}
+
 /* Greedy lineup fill: dedicated slots first (each takes the highest-value
    remaining eligible player), then flex slots (each round takes the
    single highest-value remaining player eligible for any still-open flex
@@ -8937,6 +8961,36 @@ function tuOptimizeLineup(players){
   return { starters, bench: remaining };
 }
 
+/* Joint legal-roster optimizer for the current Team Utility objective.
+
+   First optimize the best possible starting lineup from the complete
+   post-trade pool. Those starters must be retained. Because every
+   remaining player receives the same positive bench coefficient
+   (TU_BENCH_WEIGHT), the exact utility-maximizing legal roster is then
+   completed by keeping the highest-Fundamental-Value remaining bench
+   players until the active-roster limit is reached.
+
+   Any remaining players are the implied cuts. This avoids a heuristic
+   "drop the lowest raw player first" pass while remaining equivalent to
+   joint optimization under the deployed V1 utility formula. */
+function tuOptimizeLegalRoster(players, rosterLimit = TU_ACTIVE_ROSTER_LIMIT){
+  const unconstrained = tuOptimizeLineup(players);
+  const starters = unconstrained.starters.slice();
+  const benchCapacity = Math.max(0, rosterLimit - starters.length);
+  const sortedBench = unconstrained.bench.slice().sort((a,b) => b.value - a.value);
+  const bench = sortedBench.slice(0, benchCapacity);
+  const cuts = sortedBench.slice(benchCapacity);
+
+  return {
+    starters,
+    bench,
+    cuts,
+    rosterLimit,
+    rosterSize: starters.length + bench.length,
+    overflow: cuts.length,
+  };
+}
+
 function tuSum(list){
   return list.reduce((s,p) => s + p.value, 0);
 }
@@ -8948,7 +9002,7 @@ function tuSum(list){
    choice. */
 function tuPlayersFromKeys(keys){
   const out = [];
-  for(const key of keys){
+  for(const key of [...new Set(keys)]){
     const info = PLAYER_DB[key];
     if(!info) continue;
     const val = playerValueByKey(key);
@@ -8964,14 +9018,18 @@ function tuPlayersFromKeys(keys){
    separate "marginal value" shortcut -- pre and post lineups are each
    independently optimized from scratch. */
 function calculateTeamUtility(preRosterKeys, postRosterKeys){
-  const pre = tuOptimizeLineup(tuPlayersFromKeys(preRosterKeys));
-  const post = tuOptimizeLineup(tuPlayersFromKeys(postRosterKeys));
+  const pre = tuOptimizeLegalRoster(tuPlayersFromKeys(preRosterKeys));
+  const post = tuOptimizeLegalRoster(tuPlayersFromKeys(postRosterKeys));
   const lineupDelta = tuSum(post.starters) - tuSum(pre.starters);
   const benchDelta = tuSum(post.bench) - tuSum(pre.bench);
   return {
     teamUtility: Math.round((1 - TU_BENCH_WEIGHT) * lineupDelta + TU_BENCH_WEIGHT * benchDelta),
     lineupDelta: Math.round(lineupDelta),
     benchDelta: Math.round(benchDelta),
+    postCuts: post.cuts.map(p => p.key),
+    preCuts: pre.cuts.map(p => p.key),
+    postRosterSize: post.rosterSize,
+    rosterLimit: post.rosterLimit,
   };
 }
 
@@ -8996,6 +9054,9 @@ function calculateTradeImpact(currentRosterKeys, outgoingKeys, incomingKeys){
     lineupDelta: utility.lineupDelta,
     benchDelta: utility.benchDelta,
     fundamentalValueDelta: Math.round(incomingValue - outgoingValue),
+    postCuts: utility.postCuts,
+    postRosterSize: utility.postRosterSize,
+    rosterLimit: utility.rosterLimit,
   };
 }
 
@@ -9927,7 +9988,17 @@ function renderTradeImpact(){
   const netColor = netValue >= 0 ? 'var(--green)' : 'var(--red)';
   const netSign = netValue >= 0 ? '+' : '';
 
-  const teamUtil = calculateTeamUtility(MY_ROSTER, afterRoster);
+  /* Team Utility uses the ACTIVE roster only. Taxi and IR remain separate
+   pools and cannot silently become free active bench depth. */
+  const tuBeforeRoster = tuActiveRosterKeys();
+  const tuOutKeys = outgoing
+    .map(a => normalizeName(a.name))
+    .filter(k => tuBeforeRoster.includes(k));
+  const tuIncomingKeys = incoming.map(a => normalizeName(a.name));
+  const tuAfterPool = tuBeforeRoster
+    .filter(k => !tuOutKeys.includes(k))
+    .concat(tuIncomingKeys);
+  const teamUtil = calculateTeamUtility(tuBeforeRoster, tuAfterPool);
   const tuColor = teamUtil.teamUtility >= 0 ? 'var(--green)' : 'var(--red)';
   const tuSign = teamUtil.teamUtility >= 0 ? '+' : '';
 
@@ -9938,9 +10009,15 @@ function renderTradeImpact(){
   if(outgoing.length !== incoming.length){
     const giving = outgoing.length, getting = incoming.length;
     if(giving > getting){
-      packageNote = `<div style="color:var(--text-dim);margin-top:4px;">Consolidation: giving up ${giving} players for ${getting} — frees up ${giving-getting} roster spot${giving-getting>1?'s':''}, no replacement assumed.</div>`;
+      packageNote = `<div style="color:var(--text-dim);margin-top:4px;">Consolidation: giving up ${giving} players for ${getting} — frees up ${giving-getting} active roster spot${giving-getting>1?'s':''}.</div>`;
     } else {
-      packageNote = `<div style="color:var(--text-dim);margin-top:4px;">Expansion: receiving ${getting} players for ${giving} — uses ${getting-giving} additional roster spot${getting-giving>1?'s':''}.</div>`;
+      const projectedCuts = (teamUtil.postCuts || []).map(titleCase);
+      const extraSlots = getting - giving;
+      if(projectedCuts.length){
+        packageNote = `<div style="color:var(--text-dim);margin-top:4px;">Expansion: receiving ${getting} players for ${giving}. Legal-roster optimizer projects ${projectedCuts.length} cut${projectedCuts.length>1?'s':''}: <span style="color:var(--amber);">${projectedCuts.map(escapeHtml).join(', ')}</span>.</div>`;
+      } else {
+        packageNote = `<div style="color:var(--text-dim);margin-top:4px;">Expansion: receiving ${getting} players for ${giving} — uses ${extraSlots} additional active roster spot${extraSlots>1?'s':''}; no cut required at current occupancy.</div>`;
+      }
     }
   }
 
