@@ -12,14 +12,14 @@ Generated from a real, full-population fetch (declared_count == actual_players_r
 | DB | 202 |
 | DL | 178 |
 | LB | 159 |
-| QB | 79 |
+| QB | 80 |
 | RB | 132 |
-| TE | 129 |
+| TE | 130 |
 | WR | 203 |
 
 ## Milestone-bonus field population check (across the REAL full population, not a 4-player sample)
 
-- Offense players checked: 543
+- Offense players checked: 545
 - Offense players with at least one nonzero milestone field: 0
   - Confirmed across the full population, not just the earlier 4-player sample: these fields are **unpopulated in this specific 2026 preseason API response.** Worded deliberately as a snapshot finding, not a permanent platform limitation -- FantasyPros could populate these in a future season, a weekly feed, or a different endpoint version.
 
@@ -41,15 +41,15 @@ Per external review: a field existing in the schema doesn't mean it's actually p
 
 | Field | Nonzero players | % nonzero |
 |---|---|---|
-| def_tackle | 529 | 98.1% |
-| def_assist | 529 | 98.1% |
-| def_sack | 529 | 98.1% |
+| def_tackle | 528 | 98.0% |
+| def_assist | 528 | 98.0% |
+| def_sack | 528 | 98.0% |
 | def_tlost | 0 | 0.0%  **UNPOPULATED** |
-| def_int | 510 | 94.6% |
-| def_pd | 529 | 98.1% |
-| def_ff | 529 | 98.1% |
-| def_fr | 529 | 98.1% |
-| def_td | 523 | 97.0% |
+| def_int | 509 | 94.4% |
+| def_pd | 528 | 98.0% |
+| def_ff | 528 | 98.0% |
+| def_fr | 528 | 98.0% |
+| def_td | 522 | 96.8% |
 | def_safety | 0 | 0.0%  **UNPOPULATED** |
 
 **def_tlost (TFL) is unpopulated across the entire real IDP population.** This directly affects the archetype investigation this pipeline exists to support -- if TFL isn't real, usable data, that specific piece of the EDGE-vs-tackle-volume question stays unresolved by this source.

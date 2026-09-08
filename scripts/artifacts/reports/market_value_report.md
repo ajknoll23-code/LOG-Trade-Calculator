@@ -28,8 +28,8 @@ The Bradley–Terry rating scale is arbitrary, so V1 preserves the league-vote r
 | ty simpson | QB | 1,169 | 5,227 | +4,058 | 15.0 | 97.0% | 11 |
 | nick bolton | LB | 5,351 | 1,382 | -3,969 | 368.0 | 21.6% | 39 |
 | bhayshul tuten | RB | 3,157 | 6,679 | +3,522 | 2.0 | 99.8% | 26 |
-| david bailey | DL | 2,374 | 5,852 | +3,478 | 5.0 | 99.1% | 55 |
-| brian burns | DL | 5,623 | 2,305 | -3,318 | 287.0 | 38.9% | 55 |
+| david bailey | DL | 2,374 | 5,852 | +3,478 | 5.0 | 99.1% | 56 |
+| brian burns | DL | 5,623 | 2,305 | -3,318 | 287.0 | 38.9% | 56 |
 | dorian williams | LB | 2,297 | 5,493 | +3,196 | 10.0 | 98.1% | 39 |
 | malik davis | RB | 807 | 3,984 | +3,177 | 75.0 | 84.2% | 26 |
 | devon achane | RB | 6,679 | 3,625 | -3,054 | 108.0 | 77.1% | 26 |
@@ -46,12 +46,12 @@ The Bradley–Terry rating scale is arbitrary, so V1 preserves the league-vote r
 | jameson williams | WR | 4,829 | 2,026 | -2,803 | 315.0 | 32.9% | 33 |
 | fernando mendoza | QB | 2,150 | 4,952 | +2,802 | 23.0 | 95.3% | 11 |
 | cj allen | LB | 2,021 | 4,810 | +2,789 | 30.0 | 93.8% | 39 |
-| austin booker | DL | 3,431 | 670 | -2,761 | 462.0 | 1.5% | 55 |
+| austin booker | DL | 3,431 | 670 | -2,761 | 462.0 | 1.5% | 56 |
 | cyrus allen | WR | 1,037 | 3,791 | +2,754 | 91.0 | 80.8% | 33 |
 | devin singletary | RB | 687 | 3,374 | +2,687 | 141.5 | 70.0% | 26 |
 | tj hockenson | TE | 2,305 | 4,975 | +2,670 | 21.0 | 95.7% | 6 |
 | xavier watts | DB | 3,416 | 780 | -2,636 | 451.0 | 3.8% | 48 |
-| montez sweat | DL | 3,948 | 1,315 | -2,633 | 371.0 | 20.9% | 55 |
+| montez sweat | DL | 3,948 | 1,315 | -2,633 | 371.0 | 20.9% | 56 |
 
 ## Guardrails
 
