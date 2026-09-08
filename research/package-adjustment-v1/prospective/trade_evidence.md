@@ -2,7 +2,7 @@
 
 **Status: RESEARCH ONLY — no production consumer changed.**
 
-- Captured evidence snapshots: `2`
+- Captured evidence snapshots: `3`
 - Current-league completed trades logged: `15`
 - Numerically eligible trades: `0`
 - Excluded trades: `15`
