@@ -11,47 +11,47 @@ Policy SHA256: `7d3b6723effd6e3bb7a055e9173cfd5426c7a4457ea924b9e52f3b4de39080cf
 The Bradley–Terry rating scale is arbitrary, so V1 preserves the league-vote ranking and maps that ranking onto the point-value distribution of the exact same covered players. The point number is therefore a comparable market-equivalent scale, while the ordering itself comes from league votes.
 
 - Fundamental model players: **565**
-- Market-covered players: **463** (82.0%)
-- League votes: **414**
-- League pairwise observations: **1242**
-- Guest votes excluded: **20**
-- Dominant voter share: **63.0%**
+- Market-covered players: **469** (83.0%)
+- League votes: **449**
+- League pairwise observations: **1347**
+- Guest votes excluded: **204**
+- Dominant voter share: **62.6%**
 - Dominant voter majority flag: **YES**
 
 ## Largest current Fundamental ↔ Market disagreements
 
 | Player | Pos | Fundamental | Market | Δ | Market rank | Market pct. | Pos direct pairs |
 |---|---|---:|---:|---:|---:|---:|---:|
-| jahmyr gibbs | RB | 8,902 | 4,604 | -4,298 | 42.0 | 91.1% | 25 |
-| ty simpson | QB | 1,169 | 5,401 | +4,232 | 13.0 | 97.4% | 8 |
-| nick bolton | LB | 5,351 | 1,150 | -4,201 | 385.0 | 16.9% | 33 |
-| david bailey | DL | 2,374 | 6,564 | +4,190 | 3.0 | 99.6% | 50 |
-| drake london | WR | 5,852 | 1,696 | -4,156 | 338.0 | 27.1% | 31 |
-| trey mcbride | TE | 5,087 | 8,902 | +3,815 | 1.0 | 100.0% | 5 |
-| bhayshul tuten | RB | 3,157 | 6,684 | +3,527 | 2.0 | 99.8% | 25 |
-| devon achane | RB | 6,684 | 3,453 | -3,231 | 129.0 | 72.3% | 25 |
-| malik davis | RB | 807 | 3,991 | +3,184 | 72.0 | 84.6% | 25 |
-| dorian williams | LB | 2,297 | 5,445 | +3,148 | 12.0 | 97.6% | 33 |
-| devin lloyd | LB | 4,363 | 1,303 | -3,060 | 369.0 | 20.3% | 33 |
-| jaylen waddle | WR | 4,576 | 1,556 | -3,020 | 347.0 | 25.1% | 31 |
-| kyle louis | LB | 968 | 3,968 | +3,000 | 78.0 | 83.3% | 33 |
-| jake golday | LB | 1,162 | 4,156 | +2,994 | 63.0 | 86.6% | 33 |
-| chris olave | WR | 5,445 | 2,456 | -2,989 | 268.0 | 42.2% | 31 |
-| nicholas singleton | RB | 1,000 | 3,984 | +2,984 | 74.0 | 84.2% | 25 |
-| max klare | TE | 780 | 3,739 | +2,959 | 98.0 | 79.0% | 5 |
-| jonah coleman | RB | 1,126 | 4,050 | +2,924 | 71.0 | 84.8% | 25 |
-| zach ertz | TE | 805 | 3,711 | +2,906 | 100.0 | 78.6% | 5 |
-| dj giddens | RB | 734 | 3,618 | +2,884 | 109.0 | 76.6% | 25 |
-| brian burns | DL | 5,623 | 2,794 | -2,829 | 217.0 | 53.2% | 50 |
-| cyrus allen | WR | 1,037 | 3,859 | +2,822 | 85.5 | 81.7% | 31 |
-| trevon moehrig | DB | 3,636 | 827 | -2,809 | 435.0 | 6.1% | 45 |
-| tj hockenson | TE | 2,305 | 5,086 | +2,781 | 19.0 | 96.1% | 5 |
-| rueben bain | DL | 2,026 | 4,796 | +2,770 | 30.0 | 93.7% | 50 |
-| austin booker | DL | 3,431 | 668 | -2,763 | 457.0 | 1.3% | 50 |
-| jameson williams | WR | 4,829 | 2,079 | -2,750 | 307.0 | 33.8% | 31 |
-| devin singletary | RB | 687 | 3,416 | +2,729 | 135.0 | 71.0% | 25 |
-| kaelon black | RB | 896 | 3,611 | +2,715 | 110.0 | 76.4% | 25 |
-| kyle hamilton | DB | 3,791 | 1,077 | -2,714 | 395.5 | 14.6% | 45 |
+| tucker kraft | TE | 3,739 | 8,895 | +5,156 | 1.0 | 100.0% | 6 |
+| drake london | WR | 5,852 | 1,502 | -4,350 | 354.0 | 24.6% | 33 |
+| jahmyr gibbs | RB | 8,895 | 4,576 | -4,319 | 46.0 | 90.4% | 26 |
+| ty simpson | QB | 1,169 | 5,227 | +4,058 | 15.0 | 97.0% | 11 |
+| nick bolton | LB | 5,351 | 1,382 | -3,969 | 368.0 | 21.6% | 39 |
+| bhayshul tuten | RB | 3,157 | 6,679 | +3,522 | 2.0 | 99.8% | 26 |
+| david bailey | DL | 2,374 | 5,852 | +3,478 | 5.0 | 99.1% | 55 |
+| brian burns | DL | 5,623 | 2,305 | -3,318 | 287.0 | 38.9% | 55 |
+| dorian williams | LB | 2,297 | 5,493 | +3,196 | 10.0 | 98.1% | 39 |
+| malik davis | RB | 807 | 3,984 | +3,177 | 75.0 | 84.2% | 26 |
+| devon achane | RB | 6,679 | 3,625 | -3,054 | 108.0 | 77.1% | 26 |
+| nicholas singleton | RB | 1,001 | 3,968 | +2,967 | 79.0 | 83.3% | 26 |
+| jaylen waddle | WR | 4,576 | 1,636 | -2,940 | 347.0 | 26.1% | 33 |
+| devin lloyd | LB | 4,363 | 1,425 | -2,938 | 362.0 | 22.9% | 39 |
+| kyle louis | LB | 968 | 3,894 | +2,926 | 84.0 | 82.3% | 39 |
+| max klare | TE | 780 | 3,636 | +2,856 | 106.0 | 77.6% | 6 |
+| trevon moehrig | DB | 3,636 | 783 | -2,853 | 448.0 | 4.5% | 48 |
+| jonah coleman | RB | 1,126 | 3,974 | +2,848 | 77.0 | 83.8% | 26 |
+| zach ertz | TE | 805 | 3,625 | +2,820 | 109.0 | 76.9% | 6 |
+| jake golday | LB | 1,162 | 3,974 | +2,812 | 78.0 | 83.5% | 39 |
+| dj giddens | RB | 734 | 3,539 | +2,805 | 120.0 | 74.6% | 26 |
+| jameson williams | WR | 4,829 | 2,026 | -2,803 | 315.0 | 32.9% | 33 |
+| fernando mendoza | QB | 2,150 | 4,952 | +2,802 | 23.0 | 95.3% | 11 |
+| cj allen | LB | 2,021 | 4,810 | +2,789 | 30.0 | 93.8% | 39 |
+| austin booker | DL | 3,431 | 670 | -2,761 | 462.0 | 1.5% | 55 |
+| cyrus allen | WR | 1,037 | 3,791 | +2,754 | 91.0 | 80.8% | 33 |
+| devin singletary | RB | 687 | 3,374 | +2,687 | 141.5 | 70.0% | 26 |
+| tj hockenson | TE | 2,305 | 4,975 | +2,670 | 21.0 | 95.7% | 6 |
+| xavier watts | DB | 3,416 | 780 | -2,636 | 451.0 | 3.8% | 48 |
+| montez sweat | DL | 3,948 | 1,315 | -2,633 | 371.0 | 20.9% | 55 |
 
 ## Guardrails
 
