@@ -67,12 +67,13 @@ SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTuKORGumlKJmUm
 MAX_VOTES_PER_VOTER_PER_DAY = 20
 MIN_PAIRWISE_FOR_SIGNAL = 30
 
-# Package Preference Voting V1 shares transport only. Remove its
-# reserved rows before normal KTC daily-cap and Bradley-Terry work.
-PACKAGE_VOTE_PREFIX = "__pkgv1__|"
+# Package Preference Voting V1/V2 shares transport only. Remove both
+# reserved row families before normal KTC daily-cap and Bradley-Terry work.
+PACKAGE_VOTE_PREFIXES = ("__pkgv1__|", "__pkgv2__|")
 
 def is_package_vote_row(row):
-    return str(row.get("keep") or "").startswith(PACKAGE_VOTE_PREFIX)
+    keep = str(row.get("keep") or "")
+    return any(keep.startswith(prefix) for prefix in PACKAGE_VOTE_PREFIXES)
 
 # Research-only voter-balance policy.
 #
