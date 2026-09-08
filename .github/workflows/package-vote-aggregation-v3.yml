@@ -1,0 +1,171 @@
+name: Package Vote Aggregation
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 11 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  aggregate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install research dependencies
+        run: pip install requests numpy
+
+      - name: Aggregate Package Preference V3 votes
+        shell: bash
+        run: |
+          python3 scripts/market/package_vote_v3_pipeline.py --selftest
+          python3 scripts/market/package_vote_v3_pipeline.py
+
+      - name: Run Package Vote Indifference Diagnostics V3
+        shell: bash
+        run: |
+          python3 scripts/market/package_vote_v3_fit_diagnostics.py --selftest
+          python3 - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+
+          results = json.loads(
+              Path("research/package-adjustment-v3/package_vote_v3_results.json").read_text()
+          )
+          gates = results["summary"]["diagnostic_data_gates"]["all_passed"]
+
+          if gates:
+              subprocess.run(
+                  ["python3", "scripts/market/package_vote_v3_fit_diagnostics.py"],
+                  check=True,
+              )
+          else:
+              s = results["summary"]
+              print("V3 diagnostic collection gates not all passed; diagnostics skipped.")
+              print("Votes:", s["raw_vote_count"])
+              print("Voters:", s["unique_voters"])
+              print("Challenges:", s["distinct_challenges"])
+              print("Targets:", s["distinct_targets"])
+              print("By ratio:", s["by_ratio_target"])
+              print("By size:", s["by_package_size"])
+          PY
+
+      - name: Verify frozen V1 and V2 plus active V3 contract
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          # V1 remains historical research evidence.
+          v1 = json.loads(
+              Path("research/package-adjustment-v1/package_vote_results.json").read_text()
+          )
+          assert v1["status"] == "research_only"
+          assert v1["consumer_changed"] is False
+          assert v1["market_value_consumer_changed"] is False
+
+          # V2 catalog/results remain frozen historical research evidence.
+          v2_catalog = json.loads(
+              Path("research/package-adjustment-v2/package_vote_challenges_v2.json").read_text()
+          )
+          assert v2_catalog["status"] == "frozen_package_preference_v2"
+          assert v2_catalog["frozen"] is True
+          assert v2_catalog["consumer_changed"] is False
+
+          v2 = json.loads(
+              Path("research/package-adjustment-v2/package_vote_v2_results.json").read_text()
+          )
+          assert v2["status"] == "research_only"
+          assert v2["consumer_changed"] is False
+          assert v2["market_value_consumer_changed"] is False
+          assert v2["fundamental_value_consumer_changed"] is False
+          assert v2["team_utility_consumer_changed"] is False
+
+          # V3 is the only active package-vote experiment.
+          v3_catalog = json.loads(
+              Path("research/package-adjustment-v3/package_vote_challenges_v3.json").read_text()
+          )
+          assert v3_catalog["status"] == "frozen_package_preference_v3"
+          assert v3_catalog["frozen"] is True
+          assert v3_catalog["consumer_changed"] is False
+          assert v3_catalog["production_formula_enabled"] is False
+          assert len(v3_catalog["challenges"]) >= 140
+
+          v3 = json.loads(
+              Path("research/package-adjustment-v3/package_vote_v3_results.json").read_text()
+          )
+          assert v3["status"] == "research_only"
+          assert v3["consumer_changed"] is False
+          assert v3["market_value_consumer_changed"] is False
+          assert v3["fundamental_value_consumer_changed"] is False
+          assert v3["team_utility_consumer_changed"] is False
+          assert v3["production_formula_enabled"] is False
+
+          index = Path("index.html").read_text()
+          assert "package-adjustment-v3/package_vote_challenges_v3.json" in index
+          assert "__pkgv3__|${id}|${choice}" in index
+          assert "__pkgv3_meta__|${left}" in index
+          assert "__pkgv3_schema__|3" in index
+          assert "package_votes_v3_" in index
+          assert "package_vote_recent_v3" in index
+
+          ktc = Path("scripts/market/ktc_pipeline.py").read_text()
+          assert '"__pkgv1__|"' in ktc
+          assert '"__pkgv2__|"' in ktc
+          assert '"__pkgv3__|"' in ktc
+          assert "PACKAGE_VOTE_PREFIXES" in ktc
+          assert "rows = [r for r in all_rows if not is_package_vote_row(r)]" in ktc
+
+          v3_diag = Path(
+              "research/package-adjustment-v3/package_vote_v3_fit_diagnostics.json"
+          )
+          if v3_diag.exists():
+              diag = json.loads(v3_diag.read_text())
+              assert diag["status"] == "research_only"
+              assert diag["production_consumer_changed"] is False
+              assert diag["diagnostics"]["conclusion"]["production_promotion_allowed"] is False
+
+          print("Package voting V1/V2 frozen + V3 active research-only contract verified.")
+          PY
+
+      - name: Commit changed V3 research results
+        shell: bash
+        run: |
+          git config user.name "trade-desk-research-bot"
+          git config user.email "actions@users.noreply.github.com"
+
+          git add research/package-adjustment-v3/package_vote_v3_results.json
+          git add research/package-adjustment-v3/package_vote_v3_results.md
+
+          if [ -f research/package-adjustment-v3/package_vote_v3_fit_diagnostics.json ]; then
+            git add research/package-adjustment-v3/package_vote_v3_fit_diagnostics.json
+            git add research/package-adjustment-v3/package_vote_v3_fit_diagnostics.md
+          fi
+
+          if git diff --cached --quiet; then
+            echo "No V3 package-vote result changes."
+            exit 0
+          fi
+
+          git commit -m "Update Package Voting V3 research"
+          git pull --rebase origin main
+          git push origin main
