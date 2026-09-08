@@ -24,7 +24,7 @@ PREFIX = "__pkgv3__|"
 META_PREFIX = "__pkgv3_meta__|"
 SCHEMA_MARKER = "__pkgv3_schema__|3"
 
-MAX_VOTES_PER_VOTER_PER_DAY = 10
+MAX_VOTES_PER_VOTER_PER_DAY = 20
 VOTER_EFFECTIVE_LIFETIME_CAP = 30.0
 
 # V3 requires more observations than V2 because it is estimating an actual
@@ -298,9 +298,9 @@ def selftest():
         "challenge_id": f"x{i}",
         "choice": "P",
         "left_canonical_side": "P",
-    } for i in range(15)]
+    } for i in range(25)]
     capped, dropped = apply_daily_cap(rows)
-    assert len(capped) == 10 and dropped == 5
+    assert len(capped) == 20 and dropped == 5
     print("Package Preference V3 pipeline self-test passed.")
 
 def main():
