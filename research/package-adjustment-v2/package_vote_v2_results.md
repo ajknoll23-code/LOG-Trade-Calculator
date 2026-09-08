@@ -4,33 +4,33 @@
 
 V2 is a frozen matched-secondary-split design: each matched pair compares `[A, B]` against `[A, C, D]` around the same target and raw FV ratio.
 
-- Counted package votes: `110`
-- Unique voters: `11`
-- Distinct challenges: `92`
-- Package choice rate: `18.18`
-- Display-left choice rate: `48.18`
-- Matched pairs with both sizes observed: `21` / `84`
+- Counted package votes: `120`
+- Unique voters: `12`
+- Distinct challenges: `96`
+- Package choice rate: `19.17`
+- Display-left choice rate: `50.0`
+- Matched pairs with both sizes observed: `23` / `84`
 
 ## By package size
 
 | Size | Votes | Package chosen |
 |---:|---:|---:|
-| 2 | 52 | 21.1% |
-| 3 | 58 | 15.5% |
+| 2 | 56 | 23.2% |
+| 3 | 64 | 15.6% |
 
 ## By raw package / target FV ratio
 
 | Ratio | Votes | Package chosen |
 |---:|---:|---:|
-| 0.95 | 22 | 13.6% |
-| 1.05 | 30 | 10.0% |
-| 1.15 | 23 | 30.4% |
-| 1.30 | 35 | 20.0% |
+| 0.95 | 25 | 20.0% |
+| 1.05 | 33 | 9.1% |
+| 1.15 | 25 | 32.0% |
+| 1.30 | 37 | 18.9% |
 
 ## Diagnostic gates
 
-- All passed: `False`
-- counted_votes: `False`
+- All passed: `True`
+- counted_votes: `True`
 - unique_voters: `True`
 - distinct_challenges: `True`
 - matched_pairs_with_both_sizes: `True`
