@@ -67,9 +67,9 @@ SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTuKORGumlKJmUm
 MAX_VOTES_PER_VOTER_PER_DAY = 20
 MIN_PAIRWISE_FOR_SIGNAL = 30
 
-# Package Preference Voting V1/V2 shares transport only. Remove both
+# Package Preference Voting V1/V2/V3 shares transport only. Remove all
 # reserved row families before normal KTC daily-cap and Bradley-Terry work.
-PACKAGE_VOTE_PREFIXES = ("__pkgv1__|", "__pkgv2__|")
+PACKAGE_VOTE_PREFIXES = ("__pkgv1__|", "__pkgv2__|", "__pkgv3__|")
 
 def is_package_vote_row(row):
     keep = str(row.get("keep") or "")
@@ -514,6 +514,8 @@ def build_voter_balanced_summary(rows, pos_lookup, label):
 
 def run_selftest():
     assert is_package_vote_row({"keep": "__pkgv1__|challenge|P"})
+    assert is_package_vote_row({"keep": "__pkgv2__|challenge|P"})
+    assert is_package_vote_row({"keep": "__pkgv3__|challenge|P"})
     assert not is_package_vote_row({"keep": "alpha"})
 
     raw_pairs = [
@@ -580,7 +582,7 @@ def main():
     package_transport_rows = [r for r in all_rows if is_package_vote_row(r)]
     rows = [r for r in all_rows if not is_package_vote_row(r)]
     if package_transport_rows:
-        print(f"  Excluded {len(package_transport_rows)} Package Preference V1 row(s) before normal KTC processing")
+        print(f"  Excluded {len(package_transport_rows)} Package Preference reserved row(s) before normal KTC processing")
     rows = apply_daily_cap(rows)
     print(f"  {len(rows)} votes counted after daily cap")
 
