@@ -4,34 +4,34 @@
 
 V3 estimates how much raw FV a multi-player package must contain before voters are indifferent to the concentrated target asset.
 
-- Counted V3 votes: `0`
-- Unique V3 voters: `0`
-- Distinct challenges: `0`
-- Distinct targets: `0`
-- Overall package choice rate: `None`
-- Display-left choice rate: `None`
+- Counted V3 votes: `140`
+- Unique V3 voters: `7`
+- Distinct challenges: `106`
+- Distinct targets: `20`
+- Overall package choice rate: `35.71`
+- Display-left choice rate: `54.29`
 
 ## By raw package / target FV ratio
 
 | Ratio | Votes | Package chosen |
 |---:|---:|---:|
-| 1.10 | 0 | n/a |
-| 1.25 | 0 | n/a |
-| 1.40 | 0 | n/a |
-| 1.60 | 0 | n/a |
-| 1.85 | 0 | n/a |
+| 1.10 | 25 | 12.0% |
+| 1.25 | 32 | 15.6% |
+| 1.40 | 33 | 57.6% |
+| 1.60 | 27 | 48.1% |
+| 1.85 | 23 | 43.5% |
 
 ## By package size
 
 | Size | Votes | Package chosen |
 |---:|---:|---:|
-| 2 | 0 | n/a |
-| 3 | 0 | n/a |
+| 2 | 69 | 47.8% |
+| 3 | 71 | 23.9% |
 
 ## Indifference bracketing
 
-- Lowest tested ratio `1.1` package choice: `None`
-- Highest tested ratio `1.85` package choice: `None`
+- Lowest tested ratio `1.1` package choice: `12.0`
+- Highest tested ratio `1.85` package choice: `43.48`
 - 50% empirically bracketed by tested endpoints: `False`
 
 ## Diagnostic gates
@@ -39,11 +39,11 @@ V3 estimates how much raw FV a multi-player package must contain before voters a
 - All passed: `False`
 - counted_votes: `False`
 - unique_voters: `False`
-- distinct_challenges: `False`
-- distinct_targets: `False`
-- choice_mix: `False`
-- ratio_bucket_coverage: `False`
-- package_size_coverage: `False`
+- distinct_challenges: `True`
+- distinct_targets: `True`
+- choice_mix: `True`
+- ratio_bucket_coverage: `True`
+- package_size_coverage: `True`
 
 ## V2 reuse policy
 
