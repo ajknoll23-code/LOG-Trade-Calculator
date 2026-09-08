@@ -17,7 +17,7 @@
 
 - Total projected players: **1121**
 - Position counts: **{"DB": 213, "DL": 196, "LB": 148, "QB": 73, "RB": 144, "TE": 133, "WR": 214}**
-- Source counts: **{"fantasypros_normalized_fallback": 92, "idp_v1_both": 355, "idp_v1_fp_only": 112, "idp_v1_no_new_data": 1, "idp_v1_sleeper_only": 89, "sleeper_league_scored": 472}**
+- Source counts: **{"fantasypros_normalized_fallback": 91, "idp_v1_both": 355, "idp_v1_fp_only": 112, "idp_v1_no_new_data": 1, "idp_v1_sleeper_only": 89, "sleeper_league_scored": 473}**
 
 ## Current league validation
 
