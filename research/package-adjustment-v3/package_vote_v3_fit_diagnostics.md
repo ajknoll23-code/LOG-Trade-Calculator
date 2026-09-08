@@ -23,9 +23,9 @@ Warnings:
 | Model | AIC | coefficients |
 |---|---:|---|
 | ratio_only | 350.74 | `{'intercept': -2.2232468298850585, 'log_ratio': 4.0344879900834165}` |
-| ratio_plus_size | 320.03 | `{'intercept': -1.9684406936779266, 'log_ratio': 5.223728159590618, 'size3': -1.626234191226245}` |
-| ratio_plus_size_target | 312.67 | `{'intercept': -2.086366505458346, 'log_ratio': 5.355384261425635, 'size3': -1.6518156519336034, 'target_z': -0.45091449120106347}` |
-| ratio_plus_size_target_interaction | 302.33 | `{'intercept': -2.5363231594378175, 'log_ratio': 6.357941590549705, 'size3': -1.6608832646892213, 'target_z': -1.7832832051717844, 'ratio_x_target_z': 3.548467125829478}` |
+| ratio_plus_size | 320.03 | `{'intercept': -1.9684406936779268, 'log_ratio': 5.223728159590619, 'size3': -1.6262341912262448}` |
+| ratio_plus_size_target | 312.67 | `{'intercept': -2.0863665054583453, 'log_ratio': 5.355384261425634, 'size3': -1.6518156519336027, 'target_z': -0.45091449120106347}` |
+| ratio_plus_size_target_interaction | 302.33 | `{'intercept': -2.536323159437818, 'log_ratio': 6.357941590549706, 'size3': -1.6608832646892215, 'target_z': -1.7832832051717842, 'ratio_x_target_z': 3.5484671258294775}` |
 
 ## Estimated 50% package-choice ratios
 
@@ -73,15 +73,15 @@ These are shadow estimates, not live adjustments.
 - raw-ratio coefficient positive: `100.0%`
 - 3-player coefficient negative: `100.0%`
 - median-target 2-player indifference median: `1.4584583093308687`
-- median-target 2-player 5–95%: `1.3860363517404264`–`1.522997233937055`
+- median-target 2-player 5–95%: `1.3860363517404262`–`1.522997233937055`
 - median-target 3-player indifference median: `1.99599166389899`
-- median-target 3-player 5–95%: `1.8571891810959702`–`2.1950050326235524`
+- median-target 3-player 5–95%: `1.85718918109597`–`2.1950050326235524`
 
 ## Target fixed-effects sensitivity
 
 - Target count: `20`
-- log-ratio coefficient: `9.382980626509054`
-- size3 coefficient: `-2.751437479454109`
+- log-ratio coefficient: `9.382980626509053`
+- size3 coefficient: `-2.751437479454108`
 
 ## V2 + V3 pooled sensitivity
 
