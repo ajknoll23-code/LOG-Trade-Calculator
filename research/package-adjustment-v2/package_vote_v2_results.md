@@ -4,28 +4,28 @@
 
 V2 is a frozen matched-secondary-split design: each matched pair compares `[A, B]` against `[A, C, D]` around the same target and raw FV ratio.
 
-- Counted package votes: `0`
-- Unique voters: `0`
-- Distinct challenges: `0`
-- Package choice rate: `None`
-- Display-left choice rate: `None`
+- Counted package votes: `10`
+- Unique voters: `1`
+- Distinct challenges: `10`
+- Package choice rate: `20.0`
+- Display-left choice rate: `40.0`
 - Matched pairs with both sizes observed: `0` / `84`
 
 ## By package size
 
 | Size | Votes | Package chosen |
 |---:|---:|---:|
-| 2 | 0 | n/a |
-| 3 | 0 | n/a |
+| 2 | 4 | 0.0% |
+| 3 | 6 | 33.3% |
 
 ## By raw package / target FV ratio
 
 | Ratio | Votes | Package chosen |
 |---:|---:|---:|
-| 0.95 | 0 | n/a |
-| 1.05 | 0 | n/a |
-| 1.15 | 0 | n/a |
-| 1.30 | 0 | n/a |
+| 0.95 | 4 | 0.0% |
+| 1.05 | 3 | 33.3% |
+| 1.15 | 2 | 50.0% |
+| 1.30 | 1 | 0.0% |
 
 ## Diagnostic gates
 
