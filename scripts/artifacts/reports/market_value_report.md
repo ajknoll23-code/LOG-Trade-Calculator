@@ -14,7 +14,7 @@ The Bradley–Terry rating scale is arbitrary, so V1 preserves the league-vote r
 - Market-covered players: **469** (83.0%)
 - League votes: **449**
 - League pairwise observations: **1347**
-- Guest votes excluded: **284**
+- Guest votes excluded: **344**
 - Dominant voter share: **62.6%**
 - Dominant voter majority flag: **YES**
 
