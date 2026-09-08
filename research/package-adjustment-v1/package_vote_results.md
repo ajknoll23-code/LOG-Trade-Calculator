@@ -2,20 +2,20 @@
 
 **Status: RESEARCH ONLY — no production consumer changed.**
 
-- Counted package votes: `17`
-- Unique voters: `2`
-- Distinct challenges: `17`
-- Package choice rate: `23.53`
-- Display-left choice rate: `52.94`
+- Counted package votes: `27`
+- Unique voters: `3`
+- Distinct challenges: `23`
+- Package choice rate: `33.33`
+- Display-left choice rate: `40.74`
 
 ## By raw package / target FV ratio
 
 | Ratio | Votes | Package chosen |
 |---:|---:|---:|
-| 0.95 | 3 | 0.0% |
-| 1.05 | 5 | 60.0% |
-| 1.15 | 5 | 0.0% |
-| 1.30 | 4 | 25.0% |
+| 0.95 | 5 | 20.0% |
+| 1.05 | 6 | 50.0% |
+| 1.15 | 8 | 25.0% |
+| 1.30 | 8 | 37.5% |
 
 ## V0 lambda fit
 
