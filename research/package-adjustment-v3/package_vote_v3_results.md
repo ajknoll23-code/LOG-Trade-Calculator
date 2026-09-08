@@ -4,41 +4,41 @@
 
 V3 estimates how much raw FV a multi-player package must contain before voters are indifferent to the concentrated target asset.
 
-- Counted V3 votes: `240`
-- Unique V3 voters: `12`
-- Distinct challenges: `145`
+- Counted V3 votes: `300`
+- Unique V3 voters: `15`
+- Distinct challenges: `162`
 - Distinct targets: `20`
-- Overall package choice rate: `32.5`
-- Display-left choice rate: `51.67`
+- Overall package choice rate: `32.0`
+- Display-left choice rate: `51.33`
 
 ## By raw package / target FV ratio
 
 | Ratio | Votes | Package chosen |
 |---:|---:|---:|
-| 1.10 | 47 | 8.5% |
-| 1.25 | 54 | 14.8% |
-| 1.40 | 53 | 49.1% |
-| 1.60 | 47 | 46.8% |
-| 1.85 | 39 | 46.1% |
+| 1.10 | 54 | 9.3% |
+| 1.25 | 66 | 13.6% |
+| 1.40 | 66 | 43.9% |
+| 1.60 | 63 | 47.6% |
+| 1.85 | 51 | 45.1% |
 
 ## By package size
 
 | Size | Votes | Package chosen |
 |---:|---:|---:|
-| 2 | 121 | 43.8% |
-| 3 | 119 | 21.0% |
+| 2 | 155 | 43.9% |
+| 3 | 145 | 19.3% |
 
 ## Indifference bracketing
 
-- Lowest tested ratio `1.1` package choice: `8.51`
-- Highest tested ratio `1.85` package choice: `46.15`
+- Lowest tested ratio `1.1` package choice: `9.26`
+- Highest tested ratio `1.85` package choice: `45.1`
 - 50% empirically bracketed by tested endpoints: `False`
 
 ## Diagnostic gates
 
-- All passed: `False`
+- All passed: `True`
 - counted_votes: `True`
-- unique_voters: `False`
+- unique_voters: `True`
 - distinct_challenges: `True`
 - distinct_targets: `True`
 - choice_mix: `True`
