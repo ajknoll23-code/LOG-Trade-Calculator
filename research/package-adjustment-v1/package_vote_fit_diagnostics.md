@@ -34,9 +34,9 @@ Warnings:
 
 | Model | coefficients | AIC |
 |---|---|---:|
-| Ratio only | `{'intercept': -0.8419281263011649, 'log_ratio': 0.3676437812271519}` | 111.74 |
-| Ratio + FG | `{'intercept': -1.052704874056841, 'log_ratio': 0.5943167549035249, 'fg': 1.0446301936779}` | 113.67 |
-| Ratio + FG + size3 | `{'intercept': -1.2074337754575653, 'log_ratio': 1.1409375706934533, 'fg': 3.355114091404098, 'size3': -0.6743744209974838}` | 113.94 |
+| Ratio only | `{'intercept': -0.8419281263011646, 'log_ratio': 0.3676437812271505}` | 111.74 |
+| Ratio + FG | `{'intercept': -1.0527048740568425, 'log_ratio': 0.5943167549035268, 'fg': 1.044630193677907}` | 113.67 |
+| Ratio + FG + size3 | `{'intercept': -1.207433775457566, 'log_ratio': 1.140937570693454, 'fg': 3.3551140914041007, 'size3': -0.674374420997484}` | 113.94 |
 
 - FG likelihood-ratio heuristic: stat `0.073`, p `0.7874`.
 - Weighted corr(FG, size3): `0.3637686082936667`
@@ -47,21 +47,21 @@ Warnings:
 - Reps: `400` (seed `20260908`)
 - lambda median: `0.0`; 5–95%: `0.0`–`1.0`
 - lambda boundary rate: `95.0%`
-- FG coefficient median: `3.464490251987157`; negative in `33.2%` of reps
-- size3 coefficient median: `-0.7350006978085699`; negative in `85.8%` of reps
+- FG coefficient median: `3.4644902519871614`; negative in `33.2%` of reps
+- size3 coefficient median: `-0.73500069780857`; negative in `85.8%` of reps
 
 ## Leave-one-voter-out stability
 
 - lambda median: `0.0`; 5–95%: `0.0`–`0.6099999999999997`
-- FG coefficient median: `3.64926000928711`
+- FG coefficient median: `3.6492600092871106`
 - size3 coefficient median: `-0.668186816928878`
 
 ## Residuals by package size
 
 | Size | Votes | Observed package % | Predicted % | Residual pp |
 |---|---:|---:|---:|---:|
-| 2 | 44 | 36.4 | 36.4 | -0.0 |
-| 3 | 43 | 25.6 | 25.6 | -0.0 |
+| 2 | 44 | 36.4 | 36.4 | +0.0 |
+| 3 | 43 | 25.6 | 25.6 | +0.0 |
 
 ## Residuals by raw ratio target
 
