@@ -1,6 +1,6 @@
 # Package Adjustment Audit-Clean Plan
 
-Status: IN PROGRESS
+Status: COMPLETE
 
 The live Package Adjustment stays controlled-live while each audit gate is
 hardened and independently verified.
@@ -43,8 +43,15 @@ hardened and independently verified.
   - Permanent coverage protects V1.5 formula/scope, frozen release lineage, and OOS monitor alignment.
   - Live-JS cases cover supported size2/size3, tiny padding, K exclusion, IDP parity, and unsupported shapes.
   - Repo Regression Checks now runs Package Adjustment automatically on PRs, manual runs, and after Scheduled Data Refresh.
-- [ ] Step 8 — Obsolete/duplicate workflow cleanup
-- [ ] Step 9 — Final adversarial audit and production sign-off
+- [x] Step 8 — Obsolete/duplicate workflow cleanup
+  - Removed duplicate scheduled Shadow V1 aggregation and obsolete one-time activation/install/audit workflows.
+  - Retained only the active V1.5 OOS monitor, prospective evidence capture, current V4/post-launch vote aggregation, and permanent repo regression workflow.
+  - No Package Adjustment formula or consumer behavior changed during cleanup.
+- [x] Step 9 — Final adversarial audit and production sign-off
+  - Permanent 13-group repo regression suite and an independent 16-case live-JS boundary/adversarial suite passed.
+  - Frozen V1.4/V1.5 release lineage, pre-launch evidence freeze, exact-live monitor hash, scope guards, and consumer isolation were re-verified.
+  - Production remains controlled-live at revision v1.5; no formula value changed.
+  - Prospective OOS maturity remains a monitoring gate and is not overstated as calibration validation until its evidence thresholds pass.
 
 ## Step 1 invariant
 
