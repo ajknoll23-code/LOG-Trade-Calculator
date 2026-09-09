@@ -34,6 +34,10 @@ hardened and independently verified.
   - V3/V4 aggregators partition before daily caps and report post-launch-only evidence.
   - Historical Shadow V2 cannot be rebuilt from post-launch vote results.
 - [ ] Step 6 — Unsupported-shape UI + scope guards + IDP consistency
+  - Live scope/UI hardening installed: unsupported shapes now explain why Package Adjustment was not applied.
+  - Package Adjustment is explicitly limited to QB/RB/WR/TE/DL/LB/DB, the frozen V3/V4 evidence-supported positions.
+  - K is fail-closed; DL/LB/DB use the same evidence-bounded Package Adjustment rules as offense.
+  - Pending before this gate closes: re-freeze/re-align the exact-live Step 4 OOS monitor to production revision V1.5.
 - [ ] Step 7 — Permanent Package Adjustment repo regression suite
 - [ ] Step 8 — Obsolete/duplicate workflow cleanup
 - [ ] Step 9 — Final adversarial audit and production sign-off

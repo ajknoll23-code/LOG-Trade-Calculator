@@ -9799,6 +9799,7 @@ function sideTotal(side){
 const PACKAGE_ADJUSTMENT_PRODUCTION_V1 = Object.freeze({
   enabled: true,
   meaningfulPieceMinTargetShare: 0.06,
+  supportedPlayerPositions: Object.freeze(["QB","RB","WR","TE","DL","LB","DB"]),
   size3Multiplier: 2.0512371846911357,
   size3CompositionEnvelope: Object.freeze({
     policy: 'frozen-v4-rectangular-empirical-hull-fail-closed',
@@ -9842,20 +9843,62 @@ function packageAdjustmentSize2Multiplier(targetFv){
   return null;
 }
 
-function packageAdjustmentForTrade(){
-  if(!PACKAGE_ADJUSTMENT_PRODUCTION_V1.enabled) return null;
+function packageAdjustmentAssessment(){
+  if(!PACKAGE_ADJUSTMENT_PRODUCTION_V1.enabled){
+    return {status:'not_applicable', reason:'disabled'};
+  }
+
   const aAssets = state.A || [];
   const bAssets = state.B || [];
-  if(!aAssets.length || !bAssets.length) return null;
-  if([...aAssets, ...bAssets].some(a => a.type !== 'player')) return null;
+
+  if(!aAssets.length || !bAssets.length){
+    return {status:'not_applicable', reason:'incomplete_trade'};
+  }
+
+  const allAssets = [...aAssets, ...bAssets];
+
+  if(allAssets.some(a => a.type !== 'player')){
+    return {
+      status:'unsupported',
+      reason:'player_only_scope',
+      message:'Package Adjustment is calibrated only for player-only consolidation trades.',
+    };
+  }
+
+  const supportedPositions = PACKAGE_ADJUSTMENT_PRODUCTION_V1.supportedPlayerPositions;
+  const unsupportedPositions = [...new Set(
+    allAssets
+      .map(a => String((a && a.pos) || '').toUpperCase())
+      .filter(pos => !supportedPositions.includes(pos))
+  )];
+
+  if(unsupportedPositions.length){
+    return {
+      status:'unsupported',
+      reason:'unsupported_position',
+      unsupportedPositions,
+      message:
+        `Package Adjustment is not calibrated for ${unsupportedPositions.join(', ')}. ` +
+        `Supported positions are ${supportedPositions.join(', ')}.`,
+    };
+  }
 
   let targetSide = null, packageSide = null;
+
   if(aAssets.length === 1 && bAssets.length >= 2){
-    targetSide = 'A'; packageSide = 'B';
+    targetSide = 'A';
+    packageSide = 'B';
   } else if(bAssets.length === 1 && aAssets.length >= 2){
-    targetSide = 'B'; packageSide = 'A';
+    targetSide = 'B';
+    packageSide = 'A';
+  } else if(aAssets.length === 1 && bAssets.length === 1){
+    return {status:'not_applicable', reason:'one_for_one'};
   } else {
-    return null;
+    return {
+      status:'unsupported',
+      reason:'multi_vs_multi',
+      message:'Package Adjustment is calibrated only for one player versus a consolidation package.',
+    };
   }
 
   const targetAsset = state[targetSide][0];
@@ -9863,19 +9906,54 @@ function packageAdjustmentForTrade(){
   const targetFv = Number(targetAsset && targetAsset.value);
   const packageValues = packageAssets.map(a => Number(a.value));
 
-  if(!(targetFv > 0) || packageValues.some(v => !Number.isFinite(v) || v <= 0)) return null;
-  if(packageValues.some(v => v >= targetFv)) return null;
+  if(!(targetFv > 0) || packageValues.some(v => !Number.isFinite(v) || v <= 0)){
+    return {
+      status:'unsupported',
+      reason:'invalid_player_value',
+      message:'Package Adjustment could not evaluate this package because a player value is unavailable.',
+    };
+  }
+
+  if(packageValues.some(v => v >= targetFv)){
+    return {
+      status:'unsupported',
+      reason:'package_piece_at_or_above_target',
+      message:'Package Adjustment is calibrated only when every package player is individually below the target player.',
+    };
+  }
 
   const meaningfulCutoff =
     targetFv * PACKAGE_ADJUSTMENT_PRODUCTION_V1.meaningfulPieceMinTargetShare;
   const meaningful = packageValues.filter(v => v >= meaningfulCutoff);
-  if(meaningful.length < 2 || meaningful.length > 3) return null;
+
+  if(meaningful.length < 2){
+    return {
+      status:'not_applicable',
+      reason:'effective_one_for_one_after_tiny_filter',
+    };
+  }
+
+  if(meaningful.length > 3){
+    return {
+      status:'unsupported',
+      reason:'more_than_three_meaningful_players',
+      meaningfulCount: meaningful.length,
+      message:'Package Adjustment is calibrated only for packages with two or three meaningful players.',
+    };
+  }
 
   const rawPackageFv = packageValues.reduce((s,v) => s + v, 0);
   const meaningfulPackageFv = meaningful.reduce((s,v) => s + v, 0);
   const tinyPackageFv = rawPackageFv - meaningfulPackageFv;
   const size2Multiplier = packageAdjustmentSize2Multiplier(targetFv);
-  if(!(size2Multiplier >= 1)) return null;
+
+  if(!(size2Multiplier >= 1)){
+    return {
+      status:'unsupported',
+      reason:'size2_multiplier_unavailable',
+      message:'Package Adjustment could not resolve the live two-player target curve.',
+    };
+  }
 
   let multiplier = size2Multiplier;
   let premiumTier = '2-player';
@@ -9886,14 +9964,6 @@ function packageAdjustmentForTrade(){
   let smallestMeaningfulPackageShare = null;
 
   if(meaningful.length === 2){
-    /*
-      EVIDENCE-BOUNDED V3 SIZE2 COMPOSITION RULE:
-      V3 tested two-player packages around a fixed 51/49 composition.
-      Sort the two MEANINGFUL pieces and normalize over meaningfulPackageFv.
-      Tiny sub-6%-of-target pieces stay outside composition classification
-      while retaining full raw FV, matching the existing meaningful-piece
-      framework. Unsupported size2 composition fails closed.
-    */
     const orderedMeaningful = [...meaningful].sort((a,b) => b - a);
     largestMeaningfulPackageShare = orderedMeaningful[0] / meaningfulPackageFv;
     smallestMeaningfulPackageShare = orderedMeaningful[1] / meaningfulPackageFv;
@@ -9906,19 +9976,19 @@ function packageAdjustmentForTrade(){
       smallestMeaningfulPackageShare >= envelope.smallestMin - compositionEpsilon &&
       smallestMeaningfulPackageShare <= envelope.smallestMax + compositionEpsilon;
 
-    if(!compositionSupported) return null;
+    if(!compositionSupported){
+      return {
+        status:'unsupported',
+        reason:'size2_composition_outside_frozen_v3_envelope',
+        meaningfulCount: 2,
+        largestMeaningfulPackageShare,
+        smallestMeaningfulPackageShare,
+        message:'This two-player package is outside the frozen V3 51/49 composition envelope.',
+      };
+    }
   }
+
   if(meaningful.length === 3){
-    /*
-      EVIDENCE-BOUNDED V4 COMPOSITION RULE:
-      V4 tested 3-player consolidation only around its fixed 45/33/22
-      composition. Step 2 therefore uses the exact rectangular empirical hull
-      of the 100 frozen V4 challenges. The three MEANINGFUL pieces are sorted
-      by FV and normalized only over meaningfulPackageFv, preserving Step 1
-      tiny-padding invariance. A 3-meaningful-player shape outside this hull is
-      unsupported and fails closed: it receives no Package Adjustment rather
-      than silently falling back to the 2-player multiplier.
-    */
     const orderedMeaningful = [...meaningful].sort((a,b) => b - a);
     largestMeaningfulPackageShare = orderedMeaningful[0] / meaningfulPackageFv;
     middleMeaningfulPackageShare = orderedMeaningful[1] / meaningfulPackageFv;
@@ -9935,7 +10005,18 @@ function packageAdjustmentForTrade(){
       smallestMeaningfulPackageShare <= envelope.smallestMax + compositionEpsilon;
 
     materialThird = compositionSupported;
-    if(!compositionSupported) return null;
+
+    if(!compositionSupported){
+      return {
+        status:'unsupported',
+        reason:'size3_composition_outside_frozen_v4_envelope',
+        meaningfulCount: 3,
+        largestMeaningfulPackageShare,
+        middleMeaningfulPackageShare,
+        smallestMeaningfulPackageShare,
+        message:'This three-player package is outside the frozen V4 45/33/22 composition envelope.',
+      };
+    }
 
     multiplier = PACKAGE_ADJUSTMENT_PRODUCTION_V1.size3Multiplier;
     premiumTier = '3-player';
@@ -9944,7 +10025,7 @@ function packageAdjustmentForTrade(){
   const tradeEquivalentTargetFv = targetFv * multiplier;
   const adjustment = Math.max(0, tradeEquivalentTargetFv - targetFv);
 
-  return {
+  const packageAdjustment = {
     targetSide, packageSide, targetAsset, targetFv, rawPackageFv,
     meaningfulPackageFv, tinyPackageFv,
     meaningfulCount: meaningful.length, multiplier, premiumTier,
@@ -9953,6 +10034,19 @@ function packageAdjustmentForTrade(){
     smallestMeaningfulPackageShare,
     adjustment, tradeEquivalentTargetFv,
   };
+
+  return {
+    status:'applied',
+    reason:null,
+    packageAdjustment,
+  };
+}
+
+function packageAdjustmentForTrade(){
+  const assessment = packageAdjustmentAssessment();
+  return assessment.status === 'applied'
+    ? assessment.packageAdjustment
+    : null;
 }
 
 function tradeVerdictTotals(){
@@ -9968,8 +10062,32 @@ function tradeVerdictTotals(){
 function renderPackageAdjustment(){
   const wrap = document.getElementById('packageAdjustmentWrap');
   if(!wrap) return;
-  const pkg = packageAdjustmentForTrade();
-  if(!pkg){ wrap.innerHTML = ''; return; }
+  const assessment = packageAdjustmentAssessment();
+
+  if(assessment.status === 'not_applicable'){
+    wrap.innerHTML = '';
+    return;
+  }
+
+  if(assessment.status === 'unsupported'){
+    const detail = escapeHtml(
+      assessment.message || 'This trade shape is outside the calibrated Package Adjustment scope.'
+    );
+    wrap.innerHTML = `
+      <div class="trade-impact" style="margin-top:10px;border-color:var(--line-strong);">
+        <div class="trade-impact-title">Package Adjustment · Not Applied</div>
+        <div style="font-size:12.5px;color:var(--text-muted);margin-top:4px;">
+          ${detail}
+        </div>
+        <div style="font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:var(--text-dim);margin-top:6px;">
+          Raw Fundamental Value and the normal trade verdict still apply. No unsupported consolidation premium was added.
+        </div>
+      </div>
+    `;
+    return;
+  }
+
+  const pkg = assessment.packageAdjustment;
 
   const adj = Math.round(pkg.adjustment);
   const eq = Math.round(pkg.tradeEquivalentTargetFv);
