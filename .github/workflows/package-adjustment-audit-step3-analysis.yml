@@ -1,0 +1,500 @@
+name: Package Adjustment Audit Step 3 Analysis
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Analyze frozen V3 two-player composition
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from datetime import datetime, timezone
+          from collections import defaultdict
+          import hashlib
+          import json
+          import math
+
+          ROOT = Path(".")
+          INDEX = ROOT / "index.html"
+          V3 = ROOT / "research/package-adjustment-v3/package_vote_challenges_v3.json"
+          V4 = ROOT / "research/package-adjustment-v4/package_vote_challenges_v4.json"
+          OUT_JSON = ROOT / "research/package-adjustment-production-candidate-v1/audit_step3_v3_size2_composition_analysis.json"
+          OUT_MD = ROOT / "research/package-adjustment-production-candidate-v1/audit_step3_v3_size2_composition_analysis.md"
+
+          for p in (INDEX, V3, V4):
+              if not p.exists():
+                  raise RuntimeError(f"Required file missing: {p}")
+
+          def sha256(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          protected_before = {
+              "index.html": sha256(INDEX),
+              "v3_catalog": sha256(V3),
+              "v4_catalog": sha256(V4),
+          }
+
+          doc = json.loads(V3.read_text(encoding="utf-8"))
+
+          if doc.get("schema_version") != 3:
+              raise RuntimeError(f"Unexpected V3 schema: {doc.get('schema_version')}")
+          if doc.get("status") != "frozen_package_preference_v3":
+              raise RuntimeError(f"Unexpected V3 status: {doc.get('status')}")
+          if doc.get("frozen") is not True:
+              raise RuntimeError("V3 catalog is not frozen")
+          if doc.get("production_formula_enabled") is not False:
+              raise RuntimeError("V3 evidence catalog unexpectedly claims production enabled")
+
+          challenges = doc.get("challenges") or []
+          if len(challenges) != 200:
+              raise RuntimeError(f"Expected 200 total V3 challenges, found {len(challenges)}")
+
+          size2 = [c for c in challenges if int(c.get("package_size", -1)) == 2]
+          size3 = [c for c in challenges if int(c.get("package_size", -1)) == 3]
+          if len(size2) != 100 or len(size3) != 100:
+              raise RuntimeError(
+                  f"Expected V3 size split 100/100, found size2={len(size2)}, size3={len(size3)}"
+              )
+
+          design = doc.get("design") or {}
+          component_weights = design.get("component_weights") or {}
+          intended2 = component_weights.get("2")
+          if intended2 != [0.51, 0.49]:
+              raise RuntimeError(f"Unexpected V3 intended 2-player weights: {intended2}")
+
+          expected_ratios = {1.10, 1.25, 1.40, 1.60, 1.85}
+          actual_ratios = {float(c["ratio_target"]) for c in size2}
+          if actual_ratios != expected_ratios:
+              raise RuntimeError(
+                  f"Unexpected V3 size2 ratio targets: {sorted(actual_ratios)}"
+              )
+
+          def finite(x):
+              try:
+                  v = float(x)
+              except (TypeError, ValueError):
+                  return None
+              return v if math.isfinite(v) else None
+
+          rows = []
+          for c in size2:
+              pkg = c.get("package") or []
+              if len(pkg) != 2:
+                  raise RuntimeError(f"{c.get('id')}: size2 challenge does not contain 2 package players")
+
+              target_fv = finite(c.get("target_fv"))
+              if not target_fv or target_fv <= 0:
+                  raise RuntimeError(f"{c.get('id')}: invalid target FV")
+
+              vals = []
+              for p in pkg:
+                  fv = finite(p.get("fv"))
+                  if fv is None or fv <= 0:
+                      raise RuntimeError(f"{c.get('id')}: invalid package FV")
+                  if fv >= target_fv:
+                      raise RuntimeError(f"{c.get('id')}: package piece is not below target")
+                  if fv < 0.06 * target_fv:
+                      raise RuntimeError(f"{c.get('id')}: package piece is below meaningful threshold")
+                  vals.append(fv)
+
+              vals.sort(reverse=True)
+              total = sum(vals)
+              largest_share = vals[0] / total
+              smallest_share = vals[1] / total
+              if abs((largest_share + smallest_share) - 1.0) > 1e-12:
+                  raise RuntimeError(f"{c.get('id')}: package shares do not sum to 1")
+
+              row = {
+                  "id": c.get("id"),
+                  "ratio_target": float(c.get("ratio_target")),
+                  "raw_package_to_target_ratio": float(c.get("raw_package_to_target_ratio")),
+                  "target_fv": target_fv,
+                  "target_position": (c.get("target") or {}).get("pos"),
+                  "target_tier": c.get("target_tier"),
+                  "largest_package_share": largest_share,
+                  "smallest_package_share": smallest_share,
+                  "largest_to_target": vals[0] / target_fv,
+                  "smallest_to_target": vals[1] / target_fv,
+                  "largest_nominal_abs_error": abs(largest_share - 0.51),
+                  "smallest_nominal_abs_error": abs(smallest_share - 0.49),
+                  "split_gap": largest_share - smallest_share,
+              }
+              rows.append(row)
+
+          if len(rows) != 100:
+              raise RuntimeError(f"Expected 100 analyzable size2 rows, got {len(rows)}")
+
+          def percentile(values, p):
+              xs = sorted(float(x) for x in values)
+              if not xs:
+                  return None
+              if len(xs) == 1:
+                  return xs[0]
+              pos = (len(xs) - 1) * float(p)
+              lo = int(math.floor(pos))
+              hi = int(math.ceil(pos))
+              if lo == hi:
+                  return xs[lo]
+              frac = pos - lo
+              return xs[lo] * (1.0 - frac) + xs[hi] * frac
+
+          def stats(values):
+              xs = [float(x) for x in values]
+              return {
+                  "n": len(xs),
+                  "min": min(xs),
+                  "p05": percentile(xs, 0.05),
+                  "p25": percentile(xs, 0.25),
+                  "median": percentile(xs, 0.50),
+                  "mean": sum(xs) / len(xs),
+                  "p75": percentile(xs, 0.75),
+                  "p95": percentile(xs, 0.95),
+                  "max": max(xs),
+              }
+
+          metrics = [
+              "largest_package_share",
+              "smallest_package_share",
+              "largest_to_target",
+              "smallest_to_target",
+              "largest_nominal_abs_error",
+              "smallest_nominal_abs_error",
+              "split_gap",
+              "raw_package_to_target_ratio",
+              "target_fv",
+          ]
+
+          overall = {m: stats([r[m] for r in rows]) for m in metrics}
+
+          def grouped(key):
+              groups = defaultdict(list)
+              for r in rows:
+                  groups[str(r[key])].append(r)
+              out = {}
+              for group, members in sorted(groups.items()):
+                  out[group] = {
+                      "count": len(members),
+                      "metrics": {
+                          m: stats([x[m] for x in members])
+                          for m in (
+                              "largest_package_share",
+                              "smallest_package_share",
+                              "largest_to_target",
+                              "smallest_to_target",
+                              "split_gap",
+                          )
+                      },
+                  }
+              return out
+
+          by_ratio = grouped("ratio_target")
+          by_tier = grouped("target_tier")
+          by_position = grouped("target_position")
+
+          # Add target-FV terciles to test whether construction spread changes
+          # materially with target value.
+          sorted_by_target = sorted(rows, key=lambda r: (r["target_fv"], r["id"]))
+          unique_targets = sorted({r["target_fv"] for r in rows})
+          if len(unique_targets) != 20:
+              raise RuntimeError(f"Expected 20 unique V3 targets, found {len(unique_targets)}")
+
+          t1 = unique_targets[len(unique_targets) // 3 - 1]
+          t2 = unique_targets[(2 * len(unique_targets)) // 3 - 1]
+          for r in rows:
+              if r["target_fv"] <= t1:
+                  r["target_fv_band"] = "low"
+              elif r["target_fv"] <= t2:
+                  r["target_fv_band"] = "mid"
+              else:
+                  r["target_fv_band"] = "high"
+          by_target_fv_band = grouped("target_fv_band")
+
+          boundary_rows = {}
+          for metric in (
+              "largest_package_share",
+              "smallest_package_share",
+              "largest_to_target",
+              "smallest_to_target",
+              "split_gap",
+          ):
+              boundary_rows[metric] = {
+                  "min": min(rows, key=lambda r: (r[metric], r["id"])),
+                  "max": max(rows, key=lambda r: (r[metric], r["id"])),
+              }
+
+          empirical_envelope = {
+              "largest_package_share": {
+                  "min": overall["largest_package_share"]["min"],
+                  "max": overall["largest_package_share"]["max"],
+              },
+              "smallest_package_share": {
+                  "min": overall["smallest_package_share"]["min"],
+                  "max": overall["smallest_package_share"]["max"],
+              },
+          }
+
+          current_live_observation = {
+              "size2_composition_guard_present": False,
+              "note": (
+                  "Current production uses the V3 target-sensitive size2 multiplier "
+                  "once exactly two meaningful lesser players qualify, with no "
+                  "evidence-bounded 51/49 composition envelope."
+              ),
+          }
+
+          index_text = INDEX.read_text(encoding="utf-8")
+          if "size2CompositionEnvelope" in index_text:
+              current_live_observation["size2_composition_guard_present"] = True
+              raise RuntimeError(
+                  "A size2 composition envelope already exists in production; "
+                  "Step 3 analysis assumptions are stale"
+              )
+
+          result = {
+              "schema_version": 1,
+              "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+              "status": "package_adjustment_audit_step3_v3_size2_composition_analysis",
+              "source": {
+                  "v3_catalog": str(V3),
+                  "v3_total_challenges": len(challenges),
+                  "v3_size2_challenges": len(size2),
+                  "v3_unique_targets": len(unique_targets),
+                  "intended_size2_package_shares": intended2,
+              },
+              "experimental_interpretation": (
+                  "V3 varied ratio target and package size while holding intended "
+                  "2-player composition at approximately 51/49. Observed composition "
+                  "spread is construction noise around that fixed design, not direct "
+                  "preference evidence for arbitrary 2-player splits."
+              ),
+              "overall": overall,
+              "empirical_envelope": empirical_envelope,
+              "boundary_rows": boundary_rows,
+              "by_ratio_target": by_ratio,
+              "by_target_tier": by_tier,
+              "by_target_position": by_position,
+              "by_target_fv_band": by_target_fv_band,
+              "current_live_observation": current_live_observation,
+              "rows": rows,
+              "protected_sha256_before": protected_before,
+          }
+
+          OUT_JSON.parent.mkdir(parents=True, exist_ok=True)
+          OUT_JSON.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+          def pct(v):
+              return f"{100.0 * float(v):.3f}%"
+
+          def group_table(groups):
+              lines = [
+                  "| Group | N | Largest package share | Smallest package share | Largest / target FV | Smallest / target FV |",
+                  "|---|---:|---:|---:|---:|---:|",
+              ]
+              for group, data in groups.items():
+                  m = data["metrics"]
+                  lines.append(
+                      f"| {group} | {data['count']} | "
+                      f"{pct(m['largest_package_share']['median'])} | "
+                      f"{pct(m['smallest_package_share']['median'])} | "
+                      f"{pct(m['largest_to_target']['median'])} | "
+                      f"{pct(m['smallest_to_target']['median'])} |"
+                  )
+              return lines
+
+          md = []
+          md.append("# Package Adjustment Audit Step 3 — Frozen V3 Two-Player Composition Analysis")
+          md.append("")
+          md.append(f"Generated: {result['generated_at_utc']}")
+          md.append("")
+          md.append("## Scope")
+          md.append("")
+          md.append(
+              "Read-only analysis of the 100 frozen V3 two-player challenges. "
+              "No production formula, FV, MV, Team Utility, pick value, or UI code "
+              "is changed by this workflow."
+          )
+          md.append("")
+          md.append("## Experimental interpretation")
+          md.append("")
+          md.append(
+              "V3 varied package/target ratio and package size while holding intended "
+              "two-player composition at approximately **51/49**. The observed "
+              "composition spread is construction noise around a fixed design, not "
+              "evidence that arbitrary two-player splits were tested."
+          )
+          md.append("")
+          md.append("## Overall empirical composition")
+          md.append("")
+          md.append(
+              "- Largest piece / meaningful package FV: "
+              f"**{pct(overall['largest_package_share']['min'])} – "
+              f"{pct(overall['largest_package_share']['max'])} "
+              f"(median {pct(overall['largest_package_share']['median'])}, "
+              f"p05–p95 {pct(overall['largest_package_share']['p05'])} – "
+              f"{pct(overall['largest_package_share']['p95'])})**"
+          )
+          md.append(
+              "- Smallest piece / meaningful package FV: "
+              f"**{pct(overall['smallest_package_share']['min'])} – "
+              f"{pct(overall['smallest_package_share']['max'])} "
+              f"(median {pct(overall['smallest_package_share']['median'])}, "
+              f"p05–p95 {pct(overall['smallest_package_share']['p05'])} – "
+              f"{pct(overall['smallest_package_share']['p95'])})**"
+          )
+          md.append(
+              "- Largest piece / target FV: "
+              f"**{pct(overall['largest_to_target']['min'])} – "
+              f"{pct(overall['largest_to_target']['max'])}**"
+          )
+          md.append(
+              "- Smallest piece / target FV: "
+              f"**{pct(overall['smallest_to_target']['min'])} – "
+              f"{pct(overall['smallest_to_target']['max'])}**"
+          )
+          md.append(
+              "- Two-player split gap (largest minus smallest): "
+              f"**{pct(overall['split_gap']['min'])} – "
+              f"{pct(overall['split_gap']['max'])}**"
+          )
+          md.append("")
+          md.append("## Current production comparison")
+          md.append("")
+          md.append(
+              "Production currently has **no two-player composition guard**. "
+              "Once exactly two meaningful lesser players qualify, the V3 "
+              "target-sensitive multiplier can apply regardless of how unevenly "
+              "those two players divide meaningful package FV."
+          )
+          md.append("")
+          md.append("## Rectangular empirical envelope")
+          md.append("")
+          md.append(
+              "- Largest package share: "
+              f"**{pct(empirical_envelope['largest_package_share']['min'])} – "
+              f"{pct(empirical_envelope['largest_package_share']['max'])}**"
+          )
+          md.append(
+              "- Smallest package share: "
+              f"**{pct(empirical_envelope['smallest_package_share']['min'])} – "
+              f"{pct(empirical_envelope['smallest_package_share']['max'])}**"
+          )
+          md.append("")
+          md.append("## Grouped checks — ratio target")
+          md.append("")
+          md.extend(group_table(by_ratio))
+          md.append("")
+          md.append("## Grouped checks — target tier")
+          md.append("")
+          md.extend(group_table(by_tier))
+          md.append("")
+          md.append("## Grouped checks — target position")
+          md.append("")
+          md.extend(group_table(by_position))
+          md.append("")
+          md.append("## Grouped checks — target FV band")
+          md.append("")
+          md.extend(group_table(by_target_fv_band))
+          md.append("")
+          md.append("## Audit conclusion from this gate")
+          md.append("")
+          md.append(
+              "This report intentionally does **not** select or deploy a new "
+              "two-player production policy. The next audit action should inspect "
+              "the exact frozen V3 composition support and choose the safest "
+              "evidence-bounded size2 rule before production is patched."
+          )
+          md.append("")
+
+          OUT_MD.write_text("\n".join(md), encoding="utf-8")
+
+          protected_after = {
+              "index.html": sha256(INDEX),
+              "v3_catalog": sha256(V3),
+              "v4_catalog": sha256(V4),
+          }
+          if protected_after != protected_before:
+              raise RuntimeError(
+                  "Protected production/evidence files changed during read-only Step 3 analysis"
+              )
+
+          # Store post-check hashes in the JSON only after verifying equality.
+          result["protected_sha256_after"] = protected_after
+          result["protected_files_unchanged"] = True
+          OUT_JSON.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+          print("Step 3 V3 size2 composition analysis complete.")
+          print("Rows analyzed:", len(rows))
+          print(
+              "Largest package share range:",
+              overall["largest_package_share"]["min"],
+              "to",
+              overall["largest_package_share"]["max"],
+          )
+          print(
+              "Smallest package share range:",
+              overall["smallest_package_share"]["min"],
+              "to",
+              overall["smallest_package_share"]["max"],
+          )
+          PY
+
+      - name: Validate read-only scope
+        run: |
+          git diff --exit-code -- \
+            index.html \
+            research/package-adjustment-v3/package_vote_challenges_v3.json \
+            research/package-adjustment-v4/package_vote_challenges_v4.json
+
+      - name: Validate generated JSON
+        run: |
+          python -m json.tool \
+            research/package-adjustment-production-candidate-v1/audit_step3_v3_size2_composition_analysis.json \
+            >/dev/null
+
+      - name: Show Step 3 analysis
+        run: |
+          cat research/package-adjustment-production-candidate-v1/audit_step3_v3_size2_composition_analysis.md
+          echo
+          git diff --check
+          git status --short
+
+      - name: Commit Step 3 analysis artifacts
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            research/package-adjustment-production-candidate-v1/audit_step3_v3_size2_composition_analysis.json \
+            research/package-adjustment-production-candidate-v1/audit_step3_v3_size2_composition_analysis.md
+
+          if git diff --cached --quiet; then
+            echo "No Step 3 analysis changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Analyze frozen V3 two-player composition"
+          git pull --rebase origin main
+          git push origin HEAD:main
