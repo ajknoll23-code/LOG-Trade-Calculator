@@ -23,7 +23,11 @@ hardened and independently verified.
     composition envelope observed across all 100 frozen V3 size2 challenges.
   - Unsupported 2-meaningful-player compositions fail closed.
   - The V3 target-sensitive size2 multiplier curve itself is unchanged.
-- [ ] Step 4 — Exact-live prospective/OOS monitoring + release manifest
+- [x] Step 4 — Exact-live prospective/OOS monitoring + release manifest
+  - The exact live V1.4 formula is frozen in an immutable release manifest.
+  - Only trades strictly after the Step 4 release cutoff can enter OOS evidence.
+  - OOS evaluation requires anti-hindsight pre-trade FV snapshots no older than 48h.
+  - Evidence-maturity gates trigger review only and never auto-change production.
 - [ ] Step 5 — Freeze pre-launch V3/V4 evidence / separate post-launch votes
 - [ ] Step 6 — Unsupported-shape UI + scope guards + IDP consistency
 - [ ] Step 7 — Permanent Package Adjustment repo regression suite
