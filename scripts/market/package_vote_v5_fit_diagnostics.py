@@ -157,12 +157,25 @@ def indifference_from_curve(ratios, probs):
     raise RuntimeError("50% crossing should have been found after endpoint bracketing")
 
 
-def build_cell_masses(rows, catalog, row_weight_multiplier=None):
-    """Aggregate package/total effective mass by composition x ratio."""
+def build_cell_masses(
+    rows,
+    catalog,
+    row_weight_multiplier=None,
+    voter_weights_override=None,
+):
+    # Aggregate package/total effective mass by composition x ratio.
+    # voter_weights_override is used by the voter-cluster bootstrap so each
+    # voter's weight is frozen from the original capped sample before clusters
+    # are resampled. Resampling multiplicity then scales the whole cluster
+    # without re-applying the lifetime cap inside each bootstrap draw.
     if row_weight_multiplier is None:
         row_weight_multiplier = lambda row: 1.0
 
-    voter_weights = pipe.voter_weights(rows)
+    voter_weights = (
+        voter_weights_override
+        if voter_weights_override is not None
+        else pipe.voter_weights(rows)
+    )
     cells = defaultdict(lambda: defaultdict(lambda: {
         "raw_votes": 0,
         "raw_package_votes": 0,
@@ -312,9 +325,12 @@ def cluster_bootstrap(rows, catalog, catalog_doc, draws=BOOTSTRAP_DRAWS):
             for label in COMPOSITIONS
         }
 
-    by_voter = defaultdict(list)
-    for row in rows:
-        by_voter[row["voter_roster_id"]].append(row)
+    # Freeze each voter's capped ballot weight from the ORIGINAL sample.
+    # A cluster bootstrap samples voters with replacement; if voter A is drawn
+    # twice, A's whole originally weighted cluster must contribute twice.
+    # Recomputing the lifetime cap after duplicating rows would partially erase
+    # that multiplicity and artificially narrow bootstrap uncertainty.
+    original_voter_weights = pipe.voter_weights(rows)
 
     rng = random.Random(BOOTSTRAP_SEED)
     sampled_ratios = {label: [] for label in COMPOSITIONS}
@@ -326,15 +342,14 @@ def cluster_bootstrap(rows, catalog, catalog_doc, draws=BOOTSTRAP_DRAWS):
         for voter in picks:
             multiplicity[voter] += 1
 
-        sampled_rows = []
-        for voter, mult in multiplicity.items():
-            # Preserve each selected voter's capped ballot cluster. Repeating
-            # the cluster by multiplicity is the standard nonparametric
-            # cluster-bootstrap resample.
-            for row in by_voter[voter]:
-                sampled_rows.extend([row] * mult)
-
-        cells = build_cell_masses(sampled_rows, catalog)
+        cells = build_cell_masses(
+            rows,
+            catalog,
+            row_weight_multiplier=lambda row: multiplicity.get(
+                row["voter_roster_id"], 0
+            ),
+            voter_weights_override=original_voter_weights,
+        )
         analyses = analyze_cells(cells, catalog_doc)
 
         for label in COMPOSITIONS:
@@ -456,7 +471,39 @@ def selftest():
     assert unbracketed["bracketed"] is False
     assert unbracketed["reason"] == "package_still_below_50_at_highest_tested_ratio"
 
-    print("Package Preference V5 diagnostics self-test passed.")
+    # Bootstrap weighting regression: voter A has 40 counted ballots, so the
+    # original lifetime-cap weight is 30/40 = 0.75. If A is selected twice in
+    # a cluster-bootstrap draw, its effective mass must be 60, not re-capped
+    # back to 30 after duplication.
+    fake_catalog = {
+        f"x{i}": {
+            "id": f"x{i}",
+            "composition_target": {"label": "50/50"},
+            "ratio_target": 1.4,
+            "target": {"key": "t"},
+        }
+        for i in range(40)
+    }
+    fake_rows = [{
+        "voter_roster_id": "A",
+        "challenge_id": f"x{i}",
+        "choice": "P",
+    } for i in range(40)]
+    original_weights = pipe.voter_weights(fake_rows)
+    assert abs(original_weights["A"]["ballot_weight"] - 0.75) < 1e-12
+    doubled = build_cell_masses(
+        fake_rows,
+        fake_catalog,
+        row_weight_multiplier=lambda row: 2.0,
+        voter_weights_override=original_weights,
+    )
+    assert abs(doubled["50/50"][1.4]["total_mass"] - 60.0) < 1e-12
+    assert abs(doubled["50/50"][1.4]["package_mass"] - 60.0) < 1e-12
+
+    print(
+        "Package Preference V5 diagnostics self-test passed, including "
+        "original-weight-preserving voter-cluster bootstrap multiplicity."
+    )
 
 
 def main():

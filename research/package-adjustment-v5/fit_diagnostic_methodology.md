@@ -8,7 +8,7 @@ The primary analysis is deliberately nonparametric. Within each composition band
 
 No extrapolation beyond the tested ratio range is permitted. If a composition band never crosses 50% inside its tested range, that band remains empirically unresolved rather than receiving an invented multiplier.
 
-Uncertainty is measured with a nonparametric voter-cluster bootstrap. A future production review requires all preregistered V5 data gates to pass, each composition band's point estimate to be bracketed within tested ratios, and at least 80% of voter-cluster bootstrap draws to remain bracketed for every composition band.
+Uncertainty is measured with a nonparametric voter-cluster bootstrap. Each voter's lifetime-capped ballot weight is frozen from the original counted sample before resampling; bootstrap multiplicity then scales that entire voter cluster without re-applying the cap inside the draw. A future production review requires all preregistered V5 data gates to pass, each composition band's point estimate to be bracketed within tested ratios, and at least 80% of voter-cluster bootstrap draws to remain bracketed for every composition band.
 
 Even when those conditions pass, the diagnostic script cannot change production. A separate reviewed hardening step is required.
 
