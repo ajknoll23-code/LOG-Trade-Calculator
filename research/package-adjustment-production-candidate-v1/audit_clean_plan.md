@@ -28,7 +28,11 @@ hardened and independently verified.
   - Only trades strictly after the Step 4 release cutoff can enter OOS evidence.
   - OOS evaluation requires anti-hindsight pre-trade FV snapshots no older than 48h.
   - Evidence-maturity gates trigger review only and never auto-change production.
-- [ ] Step 5 — Freeze pre-launch V3/V4 evidence / separate post-launch votes
+- [x] Step 5 — Freeze pre-launch V3/V4 evidence / separate post-launch votes
+  - The 300-vote V3 and 300-vote V4 calibration datasets are frozen byte-for-byte.
+  - Production launch time is the hard pre-launch/post-launch vote boundary.
+  - V3/V4 aggregators partition before daily caps and report post-launch-only evidence.
+  - Historical Shadow V2 cannot be rebuilt from post-launch vote results.
 - [ ] Step 6 — Unsupported-shape UI + scope guards + IDP consistency
 - [ ] Step 7 — Permanent Package Adjustment repo regression suite
 - [ ] Step 8 — Obsolete/duplicate workflow cleanup

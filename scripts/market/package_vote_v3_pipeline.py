@@ -15,6 +15,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT = SCRIPT_DIR.parents[1]
 sys.path.insert(0, str(SCRIPT_DIR))
 import ktc_pipeline
+import package_vote_phase
 
 CHALLENGES = ROOT / "research" / "package-adjustment-v3" / "package_vote_challenges_v3.json"
 OUT_JSON = ROOT / "research" / "package-adjustment-v3" / "package_vote_v3_results.json"
@@ -314,6 +315,9 @@ def main():
 
     raw = [parse_row(r) for r in fetch_rows() if is_package_v3_row(r)]
     raw = [r for r in raw if r is not None]
+    phase = package_vote_phase.partition_rows(raw, 'v3')
+    source_raw_package_rows = len(raw)
+    raw = phase['postlaunch_rows']
     capped, dropped = apply_daily_cap(raw)
     summary = summarize(capped, doc)
 
@@ -329,6 +333,14 @@ def main():
         "transport": "existing KTC Google Sheet via reserved __pkgv3__ rows",
         "package_daily_cap_per_voter": MAX_VOTES_PER_VOTER_PER_DAY,
         "voter_effective_lifetime_cap": VOTER_EFFECTIVE_LIFETIME_CAP,
+        "vote_phase": phase["vote_phase"],
+        "prelaunch_evidence_excluded": phase["vote_phase"] == "postlaunch_only",
+        "prelaunch_cutoff_utc": phase["prelaunch_cutoff_utc"],
+        "prelaunch_cutoff_epoch_ms": phase["prelaunch_cutoff_epoch_ms"],
+        "canonical_prelaunch_snapshot": phase["canonical_prelaunch_snapshot"],
+        "source_raw_package_rows": source_raw_package_rows,
+        "prelaunch_rows_excluded": phase["prelaunch_rows_excluded"],
+        "invalid_timestamp_rows_excluded": phase["invalid_timestamp_rows_excluded"],
         "raw_package_rows": len(raw),
         "daily_cap_dropped": dropped,
         "summary": summary,

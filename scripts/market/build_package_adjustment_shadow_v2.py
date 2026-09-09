@@ -19,6 +19,7 @@ V4_CHALLENGES = ROOT / "research" / "package-adjustment-v4" / "package_vote_chal
 OUT_DIR = ROOT / "research" / "package-adjustment-shadow-v2"
 OUT_JSON = OUT_DIR / "package_adjustment_shadow_v2.json"
 OUT_MD = OUT_DIR / "package_adjustment_shadow_v2.md"
+PRELAUNCH_VOTE_FREEZE = ROOT / "research/package-adjustment-production-candidate-v1/prelaunch-vote-freeze/manifest.json"
 
 MIN_MEANINGFUL_PIECE_TO_TARGET = 0.06
 
@@ -468,6 +469,17 @@ def selftest():
 def main():
     if "--selftest" in sys.argv:
         selftest()
+        return
+    if PRELAUNCH_VOTE_FREEZE.exists():
+        freeze = read_json(PRELAUNCH_VOTE_FREEZE)
+        if freeze.get('status') != 'package_adjustment_prelaunch_vote_evidence_freeze':
+            raise RuntimeError('Unexpected pre-launch vote freeze status')
+        if freeze.get('frozen') is not True:
+            raise RuntimeError('Pre-launch vote freeze is not frozen')
+        print(
+            'Pre-launch Package Adjustment calibration is frozen; '
+            'Shadow V2 rebuild from post-launch vote evidence is disabled.'
+        )
         return
     payload = build_payload()
     OUT_DIR.mkdir(parents=True, exist_ok=True)
