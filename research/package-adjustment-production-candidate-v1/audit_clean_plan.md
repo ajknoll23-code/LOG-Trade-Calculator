@@ -18,7 +18,11 @@ hardened and independently verified.
     inheriting the 2-player multiplier.
   - Step 1 tiny-padding invariance remains intact because composition is
     normalized over meaningful package FV only.
-- [ ] Step 3 — Evidence-bounded 2-player composition policy
+- [x] Step 3 — Evidence-bounded 2-player composition policy
+  - 2-player Package Adjustment is limited to the exact empirical 51/49
+    composition envelope observed across all 100 frozen V3 size2 challenges.
+  - Unsupported 2-meaningful-player compositions fail closed.
+  - The V3 target-sensitive size2 multiplier curve itself is unchanged.
 - [ ] Step 4 — Exact-live prospective/OOS monitoring + release manifest
 - [ ] Step 5 — Freeze pre-launch V3/V4 evidence / separate post-launch votes
 - [ ] Step 6 — Unsupported-shape UI + scope guards + IDP consistency
