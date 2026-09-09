@@ -11,7 +11,13 @@ hardened and independently verified.
   - Three meaningful package pieces plus sub-6%-of-target throw-ins retain the
     same premium tier and target-side adjustment.
   - A fourth meaningful piece remains unsupported.
-- [ ] Step 2 — Evidence-bounded 3-player composition policy
+- [x] Step 2 — Evidence-bounded 3-player composition policy
+  - 3-player Package Adjustment is limited to the exact rectangular empirical
+    composition hull observed across all 100 frozen V4 challenges.
+  - Unsupported 3-meaningful-player compositions fail closed instead of
+    inheriting the 2-player multiplier.
+  - Step 1 tiny-padding invariance remains intact because composition is
+    normalized over meaningful package FV only.
 - [ ] Step 3 — Evidence-bounded 2-player composition policy
 - [ ] Step 4 — Exact-live prospective/OOS monitoring + release manifest
 - [ ] Step 5 — Freeze pre-launch V3/V4 evidence / separate post-launch votes
