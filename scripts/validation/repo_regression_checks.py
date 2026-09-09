@@ -8,6 +8,7 @@ Run from anywhere:
     python3 scripts/validation/repo_regression_checks.py
 """
 
+import ast
 import hashlib
 import json
 import math
@@ -305,6 +306,34 @@ def check_team_identity():
 
 
 def check_aliases_and_ktc_positions():
+    # Package-research rows share the KTC Sheet transport but must never enter
+    # normal Keep/Trade/Cut Bradley-Terry fitting. Keep this exact reserved
+    # prefix family under permanent repo regression as new research versions
+    # are introduced.
+    ktc_path = SCRIPT_DIR.parent / "market" / "ktc_pipeline.py"
+    ktc_tree = ast.parse(ktc_path.read_text(encoding="utf-8"))
+    package_prefixes = None
+    for node in ktc_tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "PACKAGE_VOTE_PREFIXES":
+                    package_prefixes = ast.literal_eval(node.value)
+                    break
+        if package_prefixes is not None:
+            break
+
+    expected_package_prefixes = (
+        "__pkgv1__|",
+        "__pkgv2__|",
+        "__pkgv3__|",
+        "__pkgv4__|",
+        "__pkgv5__|",
+    )
+    assert package_prefixes == expected_package_prefixes, (
+        "KTC/package-vote transport isolation drift: "
+        f"{package_prefixes} != {expected_package_prefixes}"
+    )
+
     subprocess.run([sys.executable, str(SCRIPT_DIR / "check_no_duplicate_prod_mult_keys.py")], cwd=REPO_ROOT, check=True)
     canonical = parse_player_positions(INDEX)
     expected = build_player_position_lookup(INDEX)
