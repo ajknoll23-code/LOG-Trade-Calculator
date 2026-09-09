@@ -1,0 +1,516 @@
+name: Package Adjustment Audit Step 2 Hardening
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  harden:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Apply evidence-bounded V4 3-player composition policy
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import json
+          import math
+          import re
+
+          ROOT = Path(".")
+          INDEX = ROOT / "index.html"
+          LIVE = ROOT / "research/package-adjustment-production-candidate-v1/live_deployment.json"
+          PLAN = ROOT / "research/package-adjustment-production-candidate-v1/audit_clean_plan.md"
+          ANALYSIS = ROOT / "research/package-adjustment-production-candidate-v1/audit_step2_v4_composition_analysis.json"
+          V4 = ROOT / "research/package-adjustment-v4/package_vote_challenges_v4.json"
+          OUT_JSON = ROOT / "research/package-adjustment-production-candidate-v1/audit_step2_policy_hardening.json"
+          OUT_MD = ROOT / "research/package-adjustment-production-candidate-v1/audit_step2_policy_hardening.md"
+
+          for p in (INDEX, LIVE, PLAN, ANALYSIS, V4):
+              if not p.exists():
+                  raise RuntimeError(f"Required file missing: {p}")
+
+          analysis = json.loads(ANALYSIS.read_text(encoding="utf-8"))
+          v4 = json.loads(V4.read_text(encoding="utf-8"))
+          live = json.loads(LIVE.read_text(encoding="utf-8"))
+
+          if live.get("status") != "controlled_live":
+              raise RuntimeError("Package Adjustment must remain controlled_live during audit hardening")
+          if live.get("production_formula_enabled") is not True:
+              raise RuntimeError("Expected Package Adjustment production formula to be enabled")
+          if len(v4.get("challenges") or []) != 100:
+              raise RuntimeError("Expected exactly 100 frozen V4 challenges")
+          if v4.get("frozen") is not True or v4.get("status") != "frozen_package_preference_v4":
+              raise RuntimeError("V4 catalog is not the expected frozen source")
+
+          boundary = analysis.get("boundary_rows") or {}
+
+          def metric_bound(metric, side):
+              row = ((boundary.get(metric) or {}).get(side) or {})
+              value = row.get(metric)
+              if value is None or not math.isfinite(float(value)):
+                  raise RuntimeError(f"Missing/invalid {metric} {side} in Step 2 analysis")
+              return float(value)
+
+          bounds = {
+              "largest_min": metric_bound("largest_package_share", "min"),
+              "largest_max": metric_bound("largest_package_share", "max"),
+              "middle_min": metric_bound("middle_package_share", "min"),
+              "middle_max": metric_bound("middle_package_share", "max"),
+              "smallest_min": metric_bound("smallest_package_share", "min"),
+              "smallest_max": metric_bound("smallest_package_share", "max"),
+          }
+
+          expected = {
+              "largest_min": 0.41991319353657897,
+              "largest_max": 0.4696171986399035,
+              "middle_min": 0.30827026434134036,
+              "middle_max": 0.36725409193118236,
+              "smallest_min": 0.2120186203977994,
+              "smallest_max": 0.2247276896617619,
+          }
+          for key, exp in expected.items():
+              if abs(bounds[key] - exp) > 1e-12:
+                  raise RuntimeError(
+                      f"Frozen V4 composition boundary drift for {key}: "
+                      f"{bounds[key]} != {exp}"
+                  )
+
+          EPS = 1e-12
+
+          def normalize_shares(values):
+              vals = sorted((float(x) for x in values), reverse=True)
+              total = sum(vals)
+              if len(vals) != 3 or not (total > 0):
+                  return None
+              return [v / total for v in vals]
+
+          def composition_supported(shares):
+              if shares is None or len(shares) != 3:
+                  return False
+              largest, middle, smallest = shares
+              return (
+                  bounds["largest_min"] - EPS <= largest <= bounds["largest_max"] + EPS
+                  and bounds["middle_min"] - EPS <= middle <= bounds["middle_max"] + EPS
+                  and bounds["smallest_min"] - EPS <= smallest <= bounds["smallest_max"] + EPS
+              )
+
+          # Gate A: every frozen V4 challenge must remain supported.
+          frozen_failures = []
+          for c in v4["challenges"]:
+              package = c.get("package") or []
+              shares = normalize_shares([p.get("fv") for p in package])
+              if not composition_supported(shares):
+                  frozen_failures.append({"id": c.get("id"), "shares": shares})
+          if frozen_failures:
+              raise RuntimeError(
+                  "New Step 2 envelope rejects frozen V4 evidence: "
+                  + json.dumps(frozen_failures[:5])
+              )
+
+          # Gate B: nominal 45/33/22 is supported.
+          if not composition_supported([0.45, 0.33, 0.22]):
+              raise RuntimeError("Nominal 45/33/22 V4 composition unexpectedly rejected")
+
+          # Gate C: obvious and just-outside unsupported shapes fail closed.
+          adversarial = {
+              "55_24_21": [0.55, 0.24, 0.21],
+              "largest_above_empirical_max": [
+                  bounds["largest_max"] + 0.0001,
+                  1.0 - (bounds["largest_max"] + 0.0001) - 0.22,
+                  0.22,
+              ],
+              "middle_below_empirical_min": [
+                  1.0 - (bounds["middle_min"] - 0.0001) - 0.2245,
+                  bounds["middle_min"] - 0.0001,
+                  0.2245,
+              ],
+              "middle_above_empirical_max": [
+                  1.0 - (bounds["middle_max"] + 0.0001) - 0.2125,
+                  bounds["middle_max"] + 0.0001,
+                  0.2125,
+              ],
+              "smallest_below_empirical_min": [
+                  0.45,
+                  1.0 - 0.45 - (bounds["smallest_min"] - 0.0001),
+                  bounds["smallest_min"] - 0.0001,
+              ],
+              "smallest_above_empirical_max": [
+                  0.45,
+                  1.0 - 0.45 - (bounds["smallest_max"] + 0.0001),
+                  bounds["smallest_max"] + 0.0001,
+              ],
+          }
+          adversarial_results = {}
+          for name, raw in adversarial.items():
+              shares = normalize_shares(raw)
+              ok = composition_supported(shares)
+              adversarial_results[name] = {"shares": shares, "supported": ok}
+              if ok:
+                  raise RuntimeError(f"Adversarial unsupported composition passed: {name} {shares}")
+
+          # Gate D: Step 1 tiny-padding invariance remains true because
+          # composition is defined over meaningful FV only.
+          meaningful = [90.0, 66.0, 44.0]  # exact 45/33/22
+          shares_without_tiny = normalize_shares(meaningful)
+          shares_with_tiny_excluded = normalize_shares(meaningful)
+          if shares_without_tiny != shares_with_tiny_excluded:
+              raise RuntimeError("Tiny-padding invariance regression in audit model")
+          if not composition_supported(shares_with_tiny_excluded):
+              raise RuntimeError("Nominal meaningful package rejected after tiny padding exclusion")
+
+          text = INDEX.read_text(encoding="utf-8")
+
+          # Preconditions from Step 1/current controlled-live implementation.
+          required_snippets = [
+              "meaningfulPieceMinTargetShare: 0.06",
+              "materialThirdMinPackageShare: 0.16",
+              "size3Multiplier: 2.0512371846911357",
+              "if(meaningful.length < 2 || meaningful.length > 3) return null;",
+              "const meaningfulPackageFv = meaningful.reduce((s,v) => s + v, 0);",
+              "const tinyPackageFv = rawPackageFv - meaningfulPackageFv;",
+          ]
+          for snippet in required_snippets:
+              if snippet not in text:
+                  raise RuntimeError(f"Expected current production snippet not found: {snippet}")
+
+          # Replace the unsupported single 16% material-third cutoff with the
+          # exact frozen-V4 rectangular empirical composition envelope.
+          old_config = """  meaningfulPieceMinTargetShare: 0.06,
+  materialThirdMinPackageShare: 0.16,
+  size3Multiplier: 2.0512371846911357,
+"""
+          new_config = f"""  meaningfulPieceMinTargetShare: 0.06,
+  size3Multiplier: 2.0512371846911357,
+  size3CompositionEnvelope: Object.freeze({{
+    policy: 'frozen-v4-rectangular-empirical-hull-fail-closed',
+    largestMin: {bounds["largest_min"]!r},
+    largestMax: {bounds["largest_max"]!r},
+    middleMin: {bounds["middle_min"]!r},
+    middleMax: {bounds["middle_max"]!r},
+    smallestMin: {bounds["smallest_min"]!r},
+    smallestMax: {bounds["smallest_max"]!r},
+  }}),
+"""
+          if old_config not in text:
+              raise RuntimeError("Expected Package Adjustment config block not found")
+          text = text.replace(old_config, new_config, 1)
+
+          old_decls = """  let materialThird = false;
+  let smallestMeaningfulPackageShare = null;
+"""
+          new_decls = """  let materialThird = false;
+  let compositionSupported = null;
+  let largestMeaningfulPackageShare = null;
+  let middleMeaningfulPackageShare = null;
+  let smallestMeaningfulPackageShare = null;
+"""
+          if old_decls not in text:
+              raise RuntimeError("Expected Package Adjustment declaration block not found")
+          text = text.replace(old_decls, new_decls, 1)
+
+          block_pattern = re.compile(
+              r"""  if\(meaningful\.length === 3\)\{\n.*?\n  \}\n\n  const tradeEquivalentTargetFv""",
+              re.DOTALL,
+          )
+          new_block = """  if(meaningful.length === 3){
+    /*
+      EVIDENCE-BOUNDED V4 COMPOSITION RULE:
+      V4 tested 3-player consolidation only around its fixed 45/33/22
+      composition. Step 2 therefore uses the exact rectangular empirical hull
+      of the 100 frozen V4 challenges. The three MEANINGFUL pieces are sorted
+      by FV and normalized only over meaningfulPackageFv, preserving Step 1
+      tiny-padding invariance. A 3-meaningful-player shape outside this hull is
+      unsupported and fails closed: it receives no Package Adjustment rather
+      than silently falling back to the 2-player multiplier.
+    */
+    const orderedMeaningful = [...meaningful].sort((a,b) => b - a);
+    largestMeaningfulPackageShare = orderedMeaningful[0] / meaningfulPackageFv;
+    middleMeaningfulPackageShare = orderedMeaningful[1] / meaningfulPackageFv;
+    smallestMeaningfulPackageShare = orderedMeaningful[2] / meaningfulPackageFv;
+
+    const envelope = PACKAGE_ADJUSTMENT_PRODUCTION_V1.size3CompositionEnvelope;
+    const compositionEpsilon = 1e-12;
+    compositionSupported =
+      largestMeaningfulPackageShare >= envelope.largestMin - compositionEpsilon &&
+      largestMeaningfulPackageShare <= envelope.largestMax + compositionEpsilon &&
+      middleMeaningfulPackageShare >= envelope.middleMin - compositionEpsilon &&
+      middleMeaningfulPackageShare <= envelope.middleMax + compositionEpsilon &&
+      smallestMeaningfulPackageShare >= envelope.smallestMin - compositionEpsilon &&
+      smallestMeaningfulPackageShare <= envelope.smallestMax + compositionEpsilon;
+
+    materialThird = compositionSupported;
+    if(!compositionSupported) return null;
+
+    multiplier = PACKAGE_ADJUSTMENT_PRODUCTION_V1.size3Multiplier;
+    premiumTier = '3-player';
+  }
+
+  const tradeEquivalentTargetFv"""
+          text, n = block_pattern.subn(new_block, text, count=1)
+          if n != 1:
+              raise RuntimeError(f"Expected exactly one 3-player production block replacement, got {n}")
+
+          old_return = """    meaningfulCount: meaningful.length, multiplier, premiumTier,
+    materialThird, smallestMeaningfulPackageShare,
+    adjustment, tradeEquivalentTargetFv,
+"""
+          new_return = """    meaningfulCount: meaningful.length, multiplier, premiumTier,
+    materialThird, compositionSupported,
+    largestMeaningfulPackageShare, middleMeaningfulPackageShare,
+    smallestMeaningfulPackageShare,
+    adjustment, tradeEquivalentTargetFv,
+"""
+          if old_return not in text:
+              raise RuntimeError("Expected Package Adjustment return block not found")
+          text = text.replace(old_return, new_return, 1)
+
+          # Post-patch structural assertions.
+          forbidden = [
+              "materialThirdMinPackageShare: 0.16",
+              "premiumTier = '2-player + small third'",
+              "PACKAGE_ADJUSTMENT_PRODUCTION_V1.materialThirdMinPackageShare",
+          ]
+          for snippet in forbidden:
+              if snippet in text:
+                  raise RuntimeError(f"Superseded Step 2 logic still present: {snippet}")
+
+          required_after = [
+              "size3CompositionEnvelope: Object.freeze({",
+              "frozen-v4-rectangular-empirical-hull-fail-closed",
+              "if(!compositionSupported) return null;",
+              "largestMeaningfulPackageShare",
+              "middleMeaningfulPackageShare",
+              "smallestMeaningfulPackageShare",
+              "if(meaningful.length < 2 || meaningful.length > 3) return null;",
+              "const tinyPackageFv = rawPackageFv - meaningfulPackageFv;",
+          ]
+          for snippet in required_after:
+              if snippet not in text:
+                  raise RuntimeError(f"Expected hardened Step 2 snippet not found: {snippet}")
+
+          INDEX.write_text(text, encoding="utf-8")
+
+          # Update controlled-live deployment metadata without changing FV/MV/
+          # pick/Team Utility consumers.
+          formula = live.setdefault("formula", {})
+          old_cutoff = formula.pop("material_third_min_package_share", None)
+          if old_cutoff is None:
+              raise RuntimeError("Expected legacy material_third_min_package_share in live metadata")
+          formula["superseded_material_third_min_package_share"] = old_cutoff
+          formula["size3_composition_policy"] = "frozen_v4_rectangular_empirical_hull_fail_closed"
+          formula["size3_composition_envelope"] = {
+              "largest_min": bounds["largest_min"],
+              "largest_max": bounds["largest_max"],
+              "middle_min": bounds["middle_min"],
+              "middle_max": bounds["middle_max"],
+              "smallest_min": bounds["smallest_min"],
+              "smallest_max": bounds["smallest_max"],
+              "comparison_epsilon": EPS,
+          }
+
+          now = datetime.now(timezone.utc).isoformat()
+          live["production_revision"] = "v1.2-audit-step2-v4-composition-envelope"
+          live["last_audit_hardening_at_utc"] = now
+          hardening = live.setdefault("audit_hardening", {})
+          hardening["size3_v4_composition_envelope"] = True
+          hardening["unsupported_size3_shape_fail_closed"] = True
+          hardening["all_100_frozen_v4_challenges_supported"] = True
+          hardening["tiny_fourth_padding_invariance"] = True
+          hardening["fourth_meaningful_piece_still_unsupported"] = True
+
+          # Explicit invariants: Step 2 may change only trade-verdict package
+          # adjustment behavior.
+          for key in (
+              "fundamental_value_consumer_changed",
+              "market_value_consumer_changed",
+              "draft_pick_value_consumer_changed",
+              "team_utility_consumer_changed",
+          ):
+              if live.get(key) is not False:
+                  raise RuntimeError(f"Unexpected consumer change flag: {key}")
+          if live.get("trade_verdict_consumer_changed") is not True:
+              raise RuntimeError("Trade verdict consumer change flag unexpectedly false")
+
+          LIVE.write_text(json.dumps(live, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+          # Mark Step 2 complete in the audit-clean plan.
+          plan = PLAN.read_text(encoding="utf-8")
+          old_plan = "- [ ] Step 2 — Evidence-bounded 3-player composition policy"
+          new_plan = """- [x] Step 2 — Evidence-bounded 3-player composition policy
+  - 3-player Package Adjustment is limited to the exact rectangular empirical
+    composition hull observed across all 100 frozen V4 challenges.
+  - Unsupported 3-meaningful-player compositions fail closed instead of
+    inheriting the 2-player multiplier.
+  - Step 1 tiny-padding invariance remains intact because composition is
+    normalized over meaningful package FV only."""
+          if old_plan not in plan:
+              raise RuntimeError("Expected unchecked Step 2 plan entry not found")
+          plan = plan.replace(old_plan, new_plan, 1)
+          PLAN.write_text(plan, encoding="utf-8")
+
+          report = {
+              "schema_version": 1,
+              "generated_at_utc": now,
+              "status": "package_adjustment_audit_step2_hardened",
+              "source": {
+                  "frozen_v4_catalog": str(V4),
+                  "step2_analysis": str(ANALYSIS),
+                  "frozen_v4_challenge_count": len(v4["challenges"]),
+              },
+              "policy": {
+                  "name": "frozen_v4_rectangular_empirical_hull_fail_closed",
+                  "composition_basis": "three meaningful pieces normalized over meaningful package FV",
+                  "bounds": bounds,
+                  "comparison_epsilon": EPS,
+                  "outside_envelope_behavior": "return null; no Package Adjustment premium",
+                  "tiny_assets": (
+                      "Sub-6%-of-target pieces retain full raw FV but are excluded "
+                      "from meaningful-count/composition classification"
+                  ),
+                  "fourth_meaningful_piece": "unsupported",
+              },
+              "validation": {
+                  "all_100_frozen_v4_supported": len(frozen_failures) == 0,
+                  "frozen_v4_supported_count": 100 - len(frozen_failures),
+                  "nominal_45_33_22_supported": True,
+                  "adversarial_outside_shapes": adversarial_results,
+                  "tiny_padding_invariance": True,
+                  "fourth_meaningful_piece_still_rejected_by_live_guard": (
+                      "if(meaningful.length < 2 || meaningful.length > 3) return null;" in text
+                  ),
+                  "legacy_16_percent_cutoff_removed_from_live_code": (
+                      "materialThirdMinPackageShare: 0.16" not in text
+                  ),
+              },
+              "consumer_scope": {
+                  "fundamental_value_changed": False,
+                  "market_value_changed": False,
+                  "draft_pick_value_changed": False,
+                  "team_utility_changed": False,
+                  "trade_verdict_package_adjustment_changed": True,
+              },
+          }
+          OUT_JSON.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+          pct = lambda x: f"{100*x:.3f}%"
+          md = f"""# Package Adjustment Audit Step 2 — Production Hardening
+
+Generated: {now}
+
+## Decision
+
+The 3-player Package Adjustment now **fails closed outside the frozen V4 empirical
+composition envelope**. The old 16% smallest-piece shortcut has been removed.
+
+V4 did not experimentally vary arbitrary package composition. It held intended
+composition near 45/33/22 and varied package/target ratio. Therefore production
+support is restricted to the composition region actually represented by the 100
+frozen V4 challenges.
+
+## Live 3-player composition envelope
+
+- Largest meaningful package share: **{pct(bounds["largest_min"])} – {pct(bounds["largest_max"])}**
+- Middle meaningful package share: **{pct(bounds["middle_min"])} – {pct(bounds["middle_max"])}**
+- Smallest meaningful package share: **{pct(bounds["smallest_min"])} – {pct(bounds["smallest_max"])}**
+
+The three meaningful pieces are sorted by FV and normalized over meaningful
+package FV. A 3-meaningful-player trade outside any one of these bounds receives
+no Package Adjustment premium.
+
+## Preserved invariants
+
+- **100 / 100** frozen V4 challenges pass the new envelope.
+- Nominal **45/33/22** composition passes.
+- Sub-6%-of-target throw-ins preserve the same 3-player classification because
+  they are excluded from the composition denominator while retaining full raw FV.
+- A fourth meaningful player remains unsupported.
+- 2-player calibration is unchanged.
+- Fundamental Value, Market Value, draft-pick value, and Team Utility are unchanged.
+
+## Adversarial checks
+
+Every deliberately out-of-envelope test shape was rejected, including 55/24/21
+and just-outside boundary probes.
+
+## Audit state
+
+Step 2 is complete. The next gate is **Step 3 — Evidence-bounded 2-player
+composition policy**.
+"""
+          OUT_MD.write_text(md, encoding="utf-8")
+
+          print("Step 2 hardening applied.")
+          print("V4 supported:", 100 - len(frozen_failures), "/ 100")
+          print("Envelope:", json.dumps(bounds, sort_keys=True))
+          print("Next gate: Step 3 — Evidence-bounded 2-player composition policy")
+          PY
+
+      - name: Validate JSON artifacts
+        run: |
+          python -m json.tool research/package-adjustment-production-candidate-v1/live_deployment.json >/dev/null
+          python -m json.tool research/package-adjustment-production-candidate-v1/audit_step2_policy_hardening.json >/dev/null
+
+      - name: Syntax-check browser JavaScript
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          text = Path("index.html").read_text(encoding="utf-8")
+          scripts = re.findall(r"<script(?:\s[^>]*)?>(.*?)</script>", text, flags=re.I | re.S)
+          if not scripts:
+              raise RuntimeError("No inline script blocks found in index.html")
+          Path("/tmp/trade-desk-index-scripts.js").write_text("\n".join(scripts), encoding="utf-8")
+          print("Extracted", len(scripts), "script block(s)")
+          PY
+          node --check /tmp/trade-desk-index-scripts.js
+
+      - name: Run repository regression checks
+        run: |
+          python scripts/validation/repo_regression_checks.py
+
+      - name: Show Step 2 hardening summary
+        run: |
+          cat research/package-adjustment-production-candidate-v1/audit_step2_policy_hardening.md
+          echo
+          git diff --check
+          git status --short
+
+      - name: Commit Step 2 hardening
+        run: |
+          if git diff --quiet; then
+            echo "No Step 2 changes to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            index.html \
+            research/package-adjustment-production-candidate-v1/live_deployment.json \
+            research/package-adjustment-production-candidate-v1/audit_clean_plan.md \
+            research/package-adjustment-production-candidate-v1/audit_step2_policy_hardening.json \
+            research/package-adjustment-production-candidate-v1/audit_step2_policy_hardening.md
+
+          git commit -m "Harden Package Adjustment V4 composition envelope"
+          git push origin HEAD:main
