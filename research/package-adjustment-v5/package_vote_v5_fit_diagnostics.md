@@ -2,7 +2,7 @@
 
 **RESEARCH ONLY — no automatic production change is allowed.**
 
-- Generated: `2026-09-09T05:08:29.309537+00:00`
+- Generated: `2026-09-09T05:25:46.894338+00:00`
 - Status: `waiting_for_maturity`
 - Production revision remains: `v1.5-audit-step6-scope-ui-idp`
 - Counted V5 votes: `0`
