@@ -2,11 +2,11 @@
 
 **RESEARCH ONLY — no automatic production change is allowed.**
 
-- Generated: `2026-09-09T05:25:46.894338+00:00`
+- Generated: `2026-09-09T09:52:54.219247+00:00`
 - Status: `waiting_for_maturity`
 - Production revision remains: `v1.5-audit-step6-scope-ui-idp`
-- Counted V5 votes: `0`
-- Unique V5 voters: `0`
+- Counted V5 votes: `160`
+- Unique V5 voters: `8`
 - Diagnostic data gates passed: `False`
 
 ## Waiting for evidence
