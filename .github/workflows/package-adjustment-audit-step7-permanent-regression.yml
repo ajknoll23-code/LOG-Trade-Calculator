@@ -1,0 +1,275 @@
+name: Package Adjustment Audit Step 7 Permanent Regression
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  install:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install permanent Package Adjustment regression
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import json
+
+          ROOT = Path(".")
+          VALIDATOR = ROOT / "scripts/validation/check_package_adjustment_live.py"
+          REGRESSION = ROOT / "scripts/validation/repo_regression_checks.py"
+          LIVE = ROOT / "research/package-adjustment-production-candidate-v1/live_deployment.json"
+          PLAN = ROOT / "research/package-adjustment-production-candidate-v1/audit_clean_plan.md"
+          OUT_JSON = ROOT / "research/package-adjustment-production-candidate-v1/audit_step7_permanent_regression.json"
+          OUT_MD = ROOT / "research/package-adjustment-production-candidate-v1/audit_step7_permanent_regression.md"
+
+          validator_text = '#!/usr/bin/env python3\n"""Permanent regression checks for the controlled-live Package Adjustment.\n\nThis validator protects the exact V1.5 live contract:\n- frozen V3/V4 evidence-bounded formula\n- supported-position scope\n- tiny-padding invariance\n- unsupported-shape fail-closed behavior\n- K exclusion and IDP parity\n- frozen release/evidence lineage\n- exact-live OOS monitor alignment\n\nIt intentionally does not use network access.\n"""\n\nfrom __future__ import annotations\n\nimport hashlib\nimport json\nimport os\nimport re\nimport subprocess\nimport tempfile\nfrom pathlib import Path\n\nSCRIPT_DIR = Path(__file__).resolve().parent\nREPO_ROOT = SCRIPT_DIR.parent.parent\n\nINDEX = REPO_ROOT / "index.html"\nLIVE = REPO_ROOT / "research/package-adjustment-production-candidate-v1/live_deployment.json"\nPLAN = REPO_ROOT / "research/package-adjustment-production-candidate-v1/audit_clean_plan.md"\nSTEP6 = REPO_ROOT / "research/package-adjustment-production-candidate-v1/audit_step6_policy_hardening.json"\nPRELAUNCH_FREEZE = REPO_ROOT / "research/package-adjustment-production-candidate-v1/prelaunch-vote-freeze/manifest.json"\nV1_4_MANIFEST = REPO_ROOT / "research/package-adjustment-production-candidate-v1/prospective/release_manifest.json"\nV1_5_MANIFEST = REPO_ROOT / "research/package-adjustment-production-candidate-v1/prospective/release_manifest_v1_5.json"\nOOS_VALIDATION = REPO_ROOT / "research/package-adjustment-production-candidate-v1/prospective/exact_live_oos_validation.json"\nV3 = REPO_ROOT / "research/package-adjustment-v3/package_vote_challenges_v3.json"\nV4 = REPO_ROOT / "research/package-adjustment-v4/package_vote_challenges_v4.json"\nMONITOR_WORKFLOW = REPO_ROOT / ".github/workflows/package-adjustment-audit-step4-exact-live-oos.yml"\n\nEXPECTED_POSITIONS = ["QB", "RB", "WR", "TE", "DL", "LB", "DB"]\nEPS = 1e-12\n\n\ndef _read_json(path: Path):\n    return json.loads(path.read_text(encoding="utf-8"))\n\n\ndef _sha256(path: Path) -> str:\n    return hashlib.sha256(path.read_bytes()).hexdigest()\n\n\ndef _canonical_hash(obj) -> str:\n    payload = json.dumps(\n        obj,\n        sort_keys=True,\n        separators=(",", ":"),\n        ensure_ascii=True,\n    ).encode("utf-8")\n    return hashlib.sha256(payload).hexdigest()\n\n\ndef _extract_number(text: str, pattern: str, label: str) -> float:\n    m = re.search(pattern, text, flags=re.S)\n    assert m, f"could not extract {label} from live index"\n    return float(m.group(1))\n\n\ndef _extract_envelope(text: str, object_name: str, fields):\n    m = re.search(\n        rf"{re.escape(object_name)}:\\s*Object\\.freeze\\(\\{{(.*?)\\}}\\),",\n        text,\n        flags=re.S,\n    )\n    assert m, f"could not extract {object_name}"\n    body = m.group(1)\n    out = {}\n    for field in fields:\n        fm = re.search(rf"\\b{re.escape(field)}:\\s*([0-9.eE+-]+)", body)\n        assert fm, f"could not extract {object_name}.{field}"\n        out[field] = float(fm.group(1))\n    pm = re.search(r"\\bpolicy:\\s*\'([^\']+)\'", body)\n    assert pm, f"could not extract {object_name}.policy"\n    out["policy"] = pm.group(1)\n    return out\n\n\ndef _extract_exact_formula(index_text: str):\n    meaningful = _extract_number(\n        index_text,\n        r"meaningfulPieceMinTargetShare:\\s*([0-9.eE+-]+)",\n        "meaningfulPieceMinTargetShare",\n    )\n    size3_multiplier = _extract_number(\n        index_text,\n        r"size3Multiplier:\\s*([0-9.eE+-]+)",\n        "size3Multiplier",\n    )\n\n    pm = re.search(\n        r"supportedPlayerPositions:\\s*Object\\.freeze\\(\\[(.*?)\\]\\),",\n        index_text,\n        flags=re.S,\n    )\n    assert pm, "could not extract supportedPlayerPositions"\n    positions = re.findall(r"[\'\\"]([A-Z]+)[\'\\"]", pm.group(1))\n    assert positions == EXPECTED_POSITIONS, (\n        f"live Package Adjustment position scope drift: {positions}"\n    )\n\n    size2_env = _extract_envelope(\n        index_text,\n        "size2CompositionEnvelope",\n        ("largestMin", "largestMax", "smallestMin", "smallestMax"),\n    )\n    size3_env = _extract_envelope(\n        index_text,\n        "size3CompositionEnvelope",\n        (\n            "largestMin", "largestMax",\n            "middleMin", "middleMax",\n            "smallestMin", "smallestMax",\n        ),\n    )\n\n    rm = re.search(\n        r"size2ReferencePoints:\\s*Object\\.freeze\\(\\[(.*?)\\]\\),",\n        index_text,\n        flags=re.S,\n    )\n    assert rm, "could not extract size2ReferencePoints"\n    refs = [\n        {"target_fv": float(target), "ratio": float(ratio)}\n        for target, ratio in re.findall(\n            r"targetFv:\\s*([0-9.eE+-]+)\\s*,\\s*ratio:\\s*([0-9.eE+-]+)",\n            rm.group(1),\n        )\n    ]\n    assert len(refs) == 4, f"expected 4 size2 reference points, found {len(refs)}"\n    refs.sort(key=lambda r: r["target_fv"])\n\n    required_tokens = (\n        "function packageAdjustmentAssessment(){",\n        "allAssets.some(a => a.type !== \'player\')",\n        "PACKAGE_ADJUSTMENT_PRODUCTION_V1.supportedPlayerPositions",\n        ".filter(pos => !supportedPositions.includes(pos))",\n        "reason:\'unsupported_position\'",\n        "if(aAssets.length === 1 && bAssets.length >= 2){",\n        "else if(bAssets.length === 1 && aAssets.length >= 2){",\n        "packageValues.some(v => v >= targetFv)",\n        "if(meaningful.length > 3){",\n        "PACKAGE_ADJUSTMENT_PRODUCTION_V1.size2CompositionEnvelope",\n        "PACKAGE_ADJUSTMENT_PRODUCTION_V1.size3CompositionEnvelope",\n        "const rawPackageFv = packageValues.reduce((s,v) => s + v, 0);",\n        "const meaningfulPackageFv = meaningful.reduce((s,v) => s + v, 0);",\n        "function packageAdjustmentForTrade(){",\n        "Package Adjustment · Not Applied",\n        "Raw Fundamental Value and the normal trade verdict still apply.",\n    )\n    missing = [token for token in required_tokens if token not in index_text]\n    assert not missing, f"Package Adjustment live/UI contract markers missing: {missing}"\n\n    return {\n        "meaningful_piece_min_target_share": meaningful,\n        "size2": {\n            "source": "V3 ratio_plus_size_target",\n            "reference_points": refs,\n            "composition_policy": size2_env["policy"],\n            "composition_envelope": {\n                "largest_min": size2_env["largestMin"],\n                "largest_max": size2_env["largestMax"],\n                "smallest_min": size2_env["smallestMin"],\n                "smallest_max": size2_env["smallestMax"],\n                "comparison_epsilon": EPS,\n            },\n        },\n        "size3": {\n            "source": "V4 ratio_only",\n            "multiplier": size3_multiplier,\n            "composition_policy": size3_env["policy"],\n            "composition_envelope": {\n                "largest_min": size3_env["largestMin"],\n                "largest_max": size3_env["largestMax"],\n                "middle_min": size3_env["middleMin"],\n                "middle_max": size3_env["middleMax"],\n                "smallest_min": size3_env["smallestMin"],\n                "smallest_max": size3_env["smallestMax"],\n                "comparison_epsilon": EPS,\n            },\n        },\n        "scope_contract": {\n            "player_only": True,\n            "supported_player_positions": positions,\n            "position_scope_policy": (\n                "frozen_v3_v4_target_and_package_position_intersection_fail_closed"\n            ),\n            "one_for_package_only": True,\n            "package_piece_must_be_below_target": True,\n            "meaningful_package_sizes": [2, 3],\n            "tiny_pieces_count_in_raw_package_fv": True,\n            "tiny_pieces_excluded_from_composition": True,\n            "unsupported_composition_fails_closed": True,\n        },\n    }\n\n\ndef _extract_balanced_statement(\n    text: str,\n    marker: str,\n    open_char: str = "{",\n    close_char: str = "}",\n):\n    start = text.find(marker)\n    assert start >= 0, f"missing JS marker: {marker}"\n    open_idx = text.find(open_char, start)\n    assert open_idx >= 0, f"missing opening {open_char}: {marker}"\n\n    depth = 0\n    quote = None\n    escaped = False\n    line_comment = False\n    block_comment = False\n    i = open_idx\n\n    while i < len(text):\n        ch = text[i]\n        nxt = text[i + 1] if i + 1 < len(text) else ""\n\n        if line_comment:\n            if ch == "\\n":\n                line_comment = False\n            i += 1\n            continue\n\n        if block_comment:\n            if ch == "*" and nxt == "/":\n                block_comment = False\n                i += 2\n                continue\n            i += 1\n            continue\n\n        if quote:\n            if escaped:\n                escaped = False\n            elif ch == "\\\\":\n                escaped = True\n            elif ch == quote:\n                quote = None\n            i += 1\n            continue\n\n        if ch == "/" and nxt == "/":\n            line_comment = True\n            i += 2\n            continue\n        if ch == "/" and nxt == "*":\n            block_comment = True\n            i += 2\n            continue\n        if ch in ("\'", \'"\', "`"):\n            quote = ch\n            i += 1\n            continue\n\n        if ch == open_char:\n            depth += 1\n        elif ch == close_char:\n            depth -= 1\n            if depth == 0:\n                end = i + 1\n                while end < len(text) and text[end].isspace():\n                    end += 1\n                if end < len(text) and text[end] == ";":\n                    end += 1\n                return text[start:end]\n        i += 1\n\n    raise AssertionError(f"unbalanced JS statement: {marker}")\n\n\ndef _extract_function(text: str, name: str):\n    return _extract_balanced_statement(text, f"function {name}(")\n\n\ndef _extract_const_object(text: str, name: str):\n    return _extract_balanced_statement(text, f"const {name} =")\n\n\ndef _run_live_js_behavior_tests(index_text: str):\n    parts = [\n        _extract_const_object(index_text, "PACKAGE_ADJUSTMENT_PRODUCTION_V1"),\n        _extract_function(index_text, "packageAdjustmentSize2Multiplier"),\n        _extract_function(index_text, "packageAdjustmentAssessment"),\n        _extract_function(index_text, "packageAdjustmentForTrade"),\n        _extract_function(index_text, "sideTotal"),\n        _extract_function(index_text, "tradeVerdictTotals"),\n    ]\n\n    harness = r"""\nlet state = {A:[], B:[]};\n\nfunction player(pos, value, name=\'P\'){\n  return {type:\'player\', pos, value, name};\n}\nfunction pick(value=1000){\n  return {type:\'pick\', value, name:\'Pick\'};\n}\nfunction assess(a,b){\n  state = {A:a, B:b};\n  return packageAdjustmentAssessment();\n}\nfunction check(cond, msg){\n  if(!cond) throw new Error(msg);\n}\nfunction close(a,b,msg){\n  if(Math.abs(Number(a)-Number(b)) > 1e-9){\n    throw new Error(`${msg}: ${a} != ${b}`);\n  }\n}\n\nlet r, base, padded, totals;\n\n// Supported V3 size2 — offense.\nr = assess(\n  [player(\'QB\',5000,\'Target\')],\n  [player(\'RB\',2550),player(\'WR\',2450)]\n);\ncheck(r.status === \'applied\', \'51/49 offense size2 must apply\');\ncheck(r.packageAdjustment.meaningfulCount === 2, \'size2 meaningful count\');\ncheck(r.packageAdjustment.compositionSupported === true, \'size2 composition flag\');\n\nbase = r.packageAdjustment;\ntotals = tradeVerdictTotals();\nclose(totals.A, 5000 + base.adjustment, \'target side must receive adjustment\');\nclose(totals.B, 5000, \'package side must remain raw FV\');\n\n// Direction symmetry.\nr = assess(\n  [player(\'RB\',2550),player(\'WR\',2450)],\n  [player(\'QB\',5000,\'Target\')]\n);\ncheck(r.status === \'applied\', \'reverse-side 51/49 must apply\');\ntotals = tradeVerdictTotals();\nclose(totals.A, 5000, \'reverse package side raw FV\');\nclose(totals.B, 5000 + r.packageAdjustment.adjustment, \'reverse target adjusted\');\n\n// IDP parity.\nr = assess(\n  [player(\'DL\',5000,\'IDP Target\')],\n  [player(\'LB\',2550),player(\'DB\',2450)]\n);\ncheck(r.status === \'applied\', \'DL/LB/DB must use same size2 rules\');\n\n// Supported V4 size3.\nr = assess(\n  [player(\'QB\',5000,\'Target\')],\n  [player(\'RB\',2250),player(\'LB\',1650),player(\'DB\',1100)]\n);\ncheck(r.status === \'applied\', \'45/33/22 size3 must apply\');\ncheck(r.packageAdjustment.meaningfulCount === 3, \'size3 meaningful count\');\ncheck(r.packageAdjustment.premiumTier === \'3-player\', \'size3 tier\');\n\n// Tiny padding on size2: full raw FV, no composition dilution.\nr = assess(\n  [player(\'QB\',5000,\'Target\')],\n  [player(\'RB\',2550),player(\'WR\',2450)]\n);\nbase = r.packageAdjustment;\nr = assess(\n  [player(\'QB\',5000,\'Target\')],\n  [player(\'RB\',2550),player(\'WR\',2450),player(\'DB\',200)]\n);\ncheck(r.status === \'applied\', \'tiny-padded size2 must still apply\');\npadded = r.packageAdjustment;\ncheck(padded.meaningfulCount === 2, \'tiny piece excluded from size\');\nclose(padded.rawPackageFv, 5200, \'tiny piece retained in raw package FV\');\nclose(padded.meaningfulPackageFv, 5000, \'meaningful FV unchanged\');\nclose(padded.tinyPackageFv, 200, \'tiny FV tracked\');\nclose(padded.adjustment, base.adjustment, \'tiny padding cannot change target premium\');\n\n// Tiny fourth on supported size3.\nr = assess(\n  [player(\'QB\',5000,\'Target\')],\n  [player(\'RB\',2250),player(\'LB\',1650),player(\'DB\',1100)]\n);\nbase = r.packageAdjustment;\nr = assess(\n  [player(\'QB\',5000,\'Target\')],\n  [player(\'RB\',2250),player(\'LB\',1650),player(\'DB\',1100),player(\'TE\',200)]\n);\ncheck(r.status === \'applied\', \'tiny fourth must preserve size3 treatment\');\ncheck(r.packageAdjustment.meaningfulCount === 3, \'tiny fourth excluded from size3 classification\');\nclose(r.packageAdjustment.adjustment, base.adjustment, \'tiny fourth cannot change size3 premium\');\n\n// Unsupported composition / size.\nr = assess(\n  [player(\'QB\',5000,\'Target\')],\n  [player(\'RB\',3000),player(\'WR\',2000)]\n);\ncheck(r.status === \'unsupported\', \'60/40 size2 must fail closed\');\ncheck(r.reason === \'size2_composition_outside_frozen_v3_envelope\', \'60/40 reason\');\n\nr = assess(\n  [player(\'QB\',5000,\'Target\')],\n  [player(\'RB\',2750),player(\'WR\',1200),player(\'TE\',1050)]\n);\ncheck(r.status === \'unsupported\', \'55/24/21 size3 must fail closed\');\ncheck(r.reason === \'size3_composition_outside_frozen_v4_envelope\', \'55/24/21 reason\');\n\nr = assess(\n  [player(\'QB\',5000,\'Target\')],\n  [player(\'RB\',1300),player(\'WR\',1250),player(\'TE\',1250),player(\'LB\',1200)]\n);\ncheck(r.status === \'unsupported\', \'4 meaningful players must fail closed\');\ncheck(r.reason === \'more_than_three_meaningful_players\', \'4 meaningful reason\');\n\n// Scope guards.\nr = assess(\n  [player(\'K\',5000,\'K Target\')],\n  [player(\'RB\',2550),player(\'WR\',2450)]\n);\ncheck(r.status === \'unsupported\', \'K target must fail closed\');\ncheck(r.reason === \'unsupported_position\', \'K target reason\');\n\nr = assess(\n  [player(\'QB\',5000,\'Target\')],\n  [player(\'K\',2550),player(\'WR\',2450)]\n);\ncheck(r.status === \'unsupported\', \'K package player must fail closed\');\ncheck(r.reason === \'unsupported_position\', \'K package reason\');\n\nr = assess(\n  [player(\'QB\',5000,\'Target\')],\n  [player(\'RB\',2550),pick(2450)]\n);\ncheck(r.status === \'unsupported\', \'pick-containing package must be unsupported\');\ncheck(r.reason === \'player_only_scope\', \'pick scope reason\');\n\nr = assess(\n  [player(\'QB\',2500),player(\'RB\',2400)],\n  [player(\'WR\',2500),player(\'TE\',2400)]\n);\ncheck(r.status === \'unsupported\', \'multi-v-multi must be unsupported\');\ncheck(r.reason === \'multi_vs_multi\', \'multi-v-multi reason\');\n\nr = assess(\n  [player(\'QB\',5000,\'Target\')],\n  [player(\'RB\',5000),player(\'WR\',1000)]\n);\ncheck(r.status === \'unsupported\', \'package asset >= target must fail closed\');\ncheck(r.reason === \'package_piece_at_or_above_target\', \'target-equal reason\');\n\n// True/effective 1-for-1 are quiet, not warnings.\nr = assess([player(\'QB\',5000)], [player(\'RB\',2500)]);\ncheck(r.status === \'not_applicable\', \'1-for-1 must remain not applicable\');\ncheck(r.reason === \'one_for_one\', \'1-for-1 reason\');\n\nr = assess(\n  [player(\'QB\',5000)],\n  [player(\'RB\',2500),player(\'DB\',200)]\n);\ncheck(r.status === \'not_applicable\', \'effective 1-for-1 must remain not applicable\');\ncheck(r.reason === \'effective_one_for_one_after_tiny_filter\', \'effective 1-for-1 reason\');\n\nprocess.stdout.write(JSON.stringify({status:\'PASS\', cases:15}));\n"""\n\n    js = "\\n\\n".join(parts) + "\\n" + harness\n    with tempfile.NamedTemporaryFile(\n        "w",\n        suffix=".js",\n        delete=False,\n        encoding="utf-8",\n    ) as fh:\n        fh.write(js)\n        tmp = fh.name\n\n    try:\n        proc = subprocess.run(\n            ["node", tmp],\n            capture_output=True,\n            text=True,\n            check=True,\n        )\n        return json.loads(proc.stdout)\n    finally:\n        os.unlink(tmp)\n\n\ndef _validate_frozen_lineage(v1_5, prelaunch):\n    assert v1_5.get("frozen") is True\n    assert v1_5.get("status") == "exact_live_oos_release_manifest"\n    assert v1_5.get("release_id") == (\n        "package-adjustment-exact-live-v1.5-step6-realignment"\n    )\n    assert v1_5.get("production_revision_at_release") == (\n        "v1.5-audit-step6-scope-ui-idp"\n    )\n\n    v1_4 = _read_json(V1_4_MANIFEST)\n    assert v1_4.get("frozen") is True\n    assert v1_4.get("release_id") == "package-adjustment-exact-live-v1.4-step4"\n    assert _sha256(V1_4_MANIFEST) == v1_5.get("previous_release_manifest_sha256")\n    assert v1_5.get("supersedes_for_active_monitoring") == v1_4["release_id"]\n\n    hashes = v1_5["release_artifact_sha256"]\n    assert _sha256(V3) == hashes["v3_frozen_catalog"]\n    assert _sha256(V4) == hashes["v4_frozen_catalog"]\n    assert _sha256(STEP6) == hashes["step6_hardening"]\n    assert _sha256(MONITOR_WORKFLOW) == hashes["monitor_workflow"]\n\n    assert prelaunch.get("frozen") is True\n    assert prelaunch.get("status") == "package_adjustment_prelaunch_vote_evidence_freeze"\n\n    for key, row in (prelaunch.get("frozen_files") or {}).items():\n        snap = REPO_ROOT / row["snapshot_path"]\n        assert snap.exists(), f"missing frozen prelaunch snapshot: {key}"\n        assert _sha256(snap) == row["sha256"], (\n            f"frozen prelaunch snapshot drift: {key}"\n        )\n\n    # Source challenge catalogs themselves remain frozen and match the\n    # byte-for-byte snapshots that calibrated production.\n    for key, source in (\n        ("v3_challenges", V3),\n        ("v4_challenges", V4),\n    ):\n        row = prelaunch["frozen_files"][key]\n        assert _sha256(source) == row["sha256"], (\n            f"frozen calibration catalog drift: {key}"\n        )\n\n\ndef validate():\n    required = (\n        INDEX, LIVE, PLAN, STEP6, PRELAUNCH_FREEZE,\n        V1_4_MANIFEST, V1_5_MANIFEST, OOS_VALIDATION,\n        V3, V4, MONITOR_WORKFLOW,\n    )\n    for path in required:\n        assert path.exists(), f"missing Package Adjustment regression artifact: {path}"\n\n    index_text = INDEX.read_text(encoding="utf-8")\n    live = _read_json(LIVE)\n    step6 = _read_json(STEP6)\n    prelaunch = _read_json(PRELAUNCH_FREEZE)\n    v1_5 = _read_json(V1_5_MANIFEST)\n    oos = _read_json(OOS_VALIDATION)\n\n    assert live.get("status") == "controlled_live"\n    assert live.get("production_formula_enabled") is True\n    assert live.get("production_revision") == v1_5["production_revision_at_release"]\n    assert live.get("exact_live_prospective_monitoring") is True\n    assert live.get("monitoring_release_id") == v1_5["release_id"]\n\n    # Only the trade verdict is allowed to consume Package Adjustment.\n    assert live.get("fundamental_value_consumer_changed") is False\n    assert live.get("market_value_consumer_changed") is False\n    assert live.get("draft_pick_value_consumer_changed") is False\n    assert live.get("team_utility_consumer_changed") is False\n    assert live.get("trade_verdict_consumer_changed") is True\n\n    hardening = live.get("audit_hardening") or {}\n    required_true_flags = (\n        "size2_tiny_padding_invariance",\n        "tiny_fourth_padding_invariance",\n        "fourth_meaningful_piece_still_unsupported",\n        "size2_v3_composition_envelope",\n        "size3_v4_composition_envelope",\n        "unsupported_size2_shape_fail_closed",\n        "unsupported_size3_shape_fail_closed",\n        "evidence_bounded_position_scope_guard",\n        "kicker_package_adjustment_excluded",\n        "idp_uses_same_package_adjustment_rules_as_offense",\n        "unsupported_scope_ui_reason",\n        "one_for_one_remains_quiet_not_applicable",\n        "exact_live_monitor_revision_aligned",\n        "exact_live_prospective_monitoring",\n        "step6_gate_complete",\n        "permanent_package_adjustment_regression_suite",\n        "step7_gate_complete",\n    )\n    missing_flags = [k for k in required_true_flags if hardening.get(k) is not True]\n    assert not missing_flags, f"Package Adjustment hardening flag drift: {missing_flags}"\n    assert hardening.get("step6_monitor_realign_required") is False\n\n    exact = _extract_exact_formula(index_text)\n    assert exact == v1_5["exact_live_formula"], (\n        "live Package Adjustment formula/scope differs from frozen V1.5 release"\n    )\n    assert _canonical_hash(exact) == v1_5["exact_live_formula_sha256"], (\n        "live Package Adjustment formula fingerprint drift"\n    )\n\n    lf = live["formula"]\n    assert lf["supported_player_positions"] == EXPECTED_POSITIONS\n    assert lf["position_scope_policy"] == exact["scope_contract"]["position_scope_policy"]\n    assert abs(\n        float(lf["meaningful_piece_min_target_share"])\n        - exact["meaningful_piece_min_target_share"]\n    ) <= EPS\n    assert abs(float(lf["size3_multiplier"]) - exact["size3"]["multiplier"]) <= EPS\n\n    assert step6.get("kicker_excluded") is True\n    assert step6.get("idp_same_rules_as_offense") is True\n    assert step6.get("supported_player_positions") == EXPECTED_POSITIONS\n\n    _validate_frozen_lineage(v1_5, prelaunch)\n\n    assert oos.get("status") == "controlled_live_exact_formula_prospective_oos_monitoring"\n    assert oos.get("release", {}).get("release_id") == v1_5["release_id"]\n    assert oos.get("release", {}).get("exact_live_formula_sha256") == (\n        v1_5["exact_live_formula_sha256"]\n    )\n    assert oos.get("methodology", {}).get("supported_player_positions") == (\n        EXPECTED_POSITIONS\n    )\n    assert oos.get("methodology", {}).get("unsupported_positions_fail_closed") is True\n    assert oos.get("automatic_production_change_allowed") is False\n    assert oos.get("consumer_changed") is False\n\n    plan = PLAN.read_text(encoding="utf-8")\n    assert "- [x] Step 6 — Unsupported-shape UI + scope guards + IDP consistency" in plan\n    assert "- [x] Step 7 — Permanent Package Adjustment repo regression suite" in plan\n\n    js_result = _run_live_js_behavior_tests(index_text)\n    assert js_result["status"] == "PASS"\n    assert js_result["cases"] == 15\n\n    result = {\n        "status": "PASS",\n        "production_revision": live["production_revision"],\n        "release_id": v1_5["release_id"],\n        "exact_live_formula_sha256": v1_5["exact_live_formula_sha256"],\n        "supported_positions": EXPECTED_POSITIONS,\n        "synthetic_cases_checked": js_result["cases"],\n        "frozen_prelaunch_files_checked": len(prelaunch["frozen_files"]),\n        "v1_4_release_preserved": True,\n        "v1_5_release_frozen": True,\n        "oos_monitor_revision_aligned": True,\n    }\n\n    print(\n        "PASS Package Adjustment permanent invariants: "\n        f"{result[\'synthetic_cases_checked\']} live-JS cases; "\n        f"{len(EXPECTED_POSITIONS)} supported positions; "\n        f"{result[\'frozen_prelaunch_files_checked\']} frozen prelaunch files; "\n        "V1.5 formula/monitor aligned"\n    )\n    return result\n\n\nif __name__ == "__main__":\n    validate()\n'
+
+          if VALIDATOR.exists():
+              raise RuntimeError("Permanent Package Adjustment validator already exists")
+
+          reg = REGRESSION.read_text(encoding="utf-8")
+          if "import check_package_adjustment_live" in reg:
+              raise RuntimeError("Package Adjustment validator is already wired into repo regression")
+
+          import_marker = "import validate_free_agent_valuation_parity\n"
+          if import_marker not in reg:
+              raise RuntimeError("repo_regression_checks.py import marker not found")
+          reg = reg.replace(
+              import_marker,
+              import_marker + "import check_package_adjustment_live\n",
+              1,
+          )
+
+          list_marker = "        check_team_utility_projection_runtime_invariants,\n        check_index_js_syntax,\n"
+          if list_marker not in reg:
+              raise RuntimeError("repo regression check-list marker not found")
+          reg = reg.replace(
+              list_marker,
+              "        check_team_utility_projection_runtime_invariants,\n"
+              "        check_package_adjustment_live.validate,\n"
+              "        check_index_js_syntax,\n",
+              1,
+          )
+
+          VALIDATOR.write_text(validator_text, encoding="utf-8")
+          REGRESSION.write_text(reg, encoding="utf-8")
+
+          live = json.loads(LIVE.read_text(encoding="utf-8"))
+          formula_before = json.dumps(
+              live.get("formula"),
+              sort_keys=True,
+              separators=(",", ":"),
+          )
+          if live.get("production_revision") != "v1.5-audit-step6-scope-ui-idp":
+              raise RuntimeError("Unexpected production revision before Step 7")
+          if live.get("exact_live_prospective_monitoring") is not True:
+              raise RuntimeError("Exact-live monitoring is not active before Step 7")
+
+          now = datetime.now(timezone.utc).isoformat()
+          hardening = live.setdefault("audit_hardening", {})
+          hardening["permanent_package_adjustment_regression_suite"] = True
+          hardening["package_adjustment_hooked_into_repo_regression_checks"] = True
+          hardening["step7_gate_complete"] = True
+          live["last_audit_hardening_at_utc"] = now
+
+          formula_after = json.dumps(
+              live.get("formula"),
+              sort_keys=True,
+              separators=(",", ":"),
+          )
+          if formula_after != formula_before:
+              raise RuntimeError("Step 7 attempted to change live Package Adjustment formula")
+
+          LIVE.write_text(
+              json.dumps(live, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          plan = PLAN.read_text(encoding="utf-8")
+          old = "- [ ] Step 7 — Permanent Package Adjustment repo regression suite"
+          new = "\n".join([
+              "- [x] Step 7 — Permanent Package Adjustment repo regression suite",
+              "  - Dedicated live Package Adjustment validator is wired into repo_regression_checks.py.",
+              "  - Permanent coverage protects V1.5 formula/scope, frozen release lineage, and OOS monitor alignment.",
+              "  - Live-JS cases cover supported size2/size3, tiny padding, K exclusion, IDP parity, and unsupported shapes.",
+              "  - Repo Regression Checks now runs Package Adjustment automatically on PRs, manual runs, and after Scheduled Data Refresh.",
+          ])
+          if old not in plan:
+              raise RuntimeError("Expected unchecked Step 7 plan entry not found")
+          PLAN.write_text(plan.replace(old, new, 1), encoding="utf-8")
+
+          result = {
+              "schema_version": 1,
+              "status": "package_adjustment_audit_step7_permanent_regression",
+              "generated_at_utc": now,
+              "production_revision": live["production_revision"],
+              "production_formula_changed": False,
+              "permanent_validator": str(VALIDATOR),
+              "repo_regression_hook": "check_package_adjustment_live.validate",
+              "repo_regression_group_count_after": 13,
+              "coverage": {
+                  "exact_v1_5_formula_and_scope_fingerprint": True,
+                  "frozen_v1_4_and_v1_5_release_lineage": True,
+                  "frozen_prelaunch_vote_evidence": True,
+                  "active_oos_monitor_alignment": True,
+                  "supported_size2_and_size3": True,
+                  "tiny_padding_invariance": True,
+                  "fourth_meaningful_piece_fail_closed": True,
+                  "unsupported_composition_fail_closed": True,
+                  "kicker_fail_closed": True,
+                  "idp_same_rules_as_offense": True,
+                  "pick_and_multi_vs_multi_fail_closed": True,
+                  "package_asset_at_or_above_target_fail_closed": True,
+                  "one_for_one_not_applicable": True,
+                  "target_side_adjustment_only": True,
+              },
+          }
+          OUT_JSON.write_text(
+              json.dumps(result, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          OUT_MD.write_text(
+              "\n".join([
+                  "# Package Adjustment Step 7 — Permanent Regression Suite",
+                  "",
+                  f"Generated: {now}",
+                  "",
+                  "## Installed",
+                  "",
+                  "- `scripts/validation/check_package_adjustment_live.py` is the permanent Package Adjustment validator.",
+                  "- It is wired directly into `scripts/validation/repo_regression_checks.py` as regression group #13.",
+                  "- The existing `Repo Regression Checks` workflow therefore runs Package Adjustment checks automatically.",
+                  "",
+                  "## Permanent coverage",
+                  "",
+                  "- Exact V1.5 formula + position-scope fingerprint against the frozen V1.5 release manifest.",
+                  "- V1.4 release preservation and V1.5 release lineage.",
+                  "- Frozen pre-launch V3/V4 evidence snapshots and challenge catalogs.",
+                  "- Exact-live OOS monitor hash/release alignment.",
+                  "- QB/RB/WR/TE/DL/LB/DB scope and K exclusion.",
+                  "- Offense/IDP parity.",
+                  "- V3 51/49 size2 and V4 45/33/22 size3 support.",
+                  "- Tiny-padding invariance for both size2 and size3.",
+                  "- Unsupported 60/40 size2, 55/24/21 size3, fourth meaningful piece, picks, multi-v-multi, and target-equal package pieces.",
+                  "- True/effective 1-for-1 remain not-applicable.",
+                  "- Package Adjustment changes only the trade-verdict consumer.",
+                  "",
+                  "## Production",
+                  "",
+                  "No Package Adjustment formula value changed in Step 7.",
+                  "",
+                  "Step 7 is complete. Next: **Step 8 — Obsolete/duplicate workflow cleanup**.",
+                  "",
+              ]),
+              encoding="utf-8",
+          )
+
+          print("Step 7 permanent Package Adjustment regression suite installed.")
+          print("Repo regression groups after install: 13")
+          print("Live Package Adjustment formula changed: False")
+          PY
+
+      - name: Validate Python syntax
+        run: |
+          python -m py_compile scripts/validation/check_package_adjustment_live.py
+          python -m py_compile scripts/validation/repo_regression_checks.py
+
+      - name: Run Package Adjustment validator directly
+        run: |
+          python scripts/validation/check_package_adjustment_live.py
+
+      - name: Install repo regression dependency
+        run: |
+          python -m pip install --disable-pip-version-check requests
+
+      - name: Run full repository regression suite
+        run: |
+          python scripts/validation/repo_regression_checks.py
+
+      - name: Verify permanent regression hook
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          text = Path("scripts/validation/repo_regression_checks.py").read_text(encoding="utf-8")
+          assert "import check_package_adjustment_live" in text
+          assert "check_package_adjustment_live.validate," in text
+
+          start = text.index("    checks = [")
+          end = text.index("    ]", start)
+          checks_body = text[start:end]
+          groups = [line for line in checks_body.splitlines() if line.strip().endswith(",")]
+          assert len(groups) == 13, f"Expected 13 regression groups, found {len(groups)}"
+
+          print("Permanent Package Adjustment hook verified.")
+          print("Repo regression groups:", len(groups))
+          PY
+
+      - name: Protect live formula and frozen releases
+        run: |
+          git diff --exit-code -- \
+            index.html \
+            research/package-adjustment-production-candidate-v1/prospective/release_manifest.json \
+            research/package-adjustment-production-candidate-v1/prospective/release_manifest_v1_5.json \
+            research/package-adjustment-production-candidate-v1/prelaunch-vote-freeze/manifest.json \
+            research/package-adjustment-v3/package_vote_challenges_v3.json \
+            research/package-adjustment-v4/package_vote_challenges_v4.json \
+            .github/workflows/package-adjustment-audit-step4-exact-live-oos.yml
+
+      - name: Validate Step 7 artifacts
+        run: |
+          python -m json.tool \
+            research/package-adjustment-production-candidate-v1/audit_step7_permanent_regression.json \
+            >/dev/null
+          cat research/package-adjustment-production-candidate-v1/audit_step7_permanent_regression.md
+          echo
+          git diff --check
+          git status --short
+
+      - name: Commit Step 7 permanent regression
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            scripts/validation/check_package_adjustment_live.py \
+            scripts/validation/repo_regression_checks.py \
+            research/package-adjustment-production-candidate-v1/live_deployment.json \
+            research/package-adjustment-production-candidate-v1/audit_clean_plan.md \
+            research/package-adjustment-production-candidate-v1/audit_step7_permanent_regression.json \
+            research/package-adjustment-production-candidate-v1/audit_step7_permanent_regression.md
+
+          if git diff --cached --quiet; then
+            echo "No Step 7 changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Add permanent Package Adjustment regression suite"
+          git pull --rebase origin main
+          git push origin HEAD:main
