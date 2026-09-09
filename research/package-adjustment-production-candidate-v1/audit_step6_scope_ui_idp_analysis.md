@@ -1,6 +1,6 @@
 # Package Adjustment Audit Step 6 — Scope, UI, and IDP Analysis
 
-Generated: 2026-09-09T00:51:12.315596+00:00
+Generated: 2026-09-09T02:03:17.315070+00:00
 
 ## Current live behavior
 
@@ -8,7 +8,7 @@ Generated: 2026-09-09T00:51:12.315596+00:00
 - The trade verdict correctly falls back to raw side totals when Package Adjustment returns null.
 - **The UI is silent when that happens**, so users cannot distinguish an unsupported
   package from a trade where Package Adjustment is simply not applicable.
-- Explicit position guard present in Package Adjustment: **True**
+- Explicit evidence-bounded position guard present in Package Adjustment: **False**
 
 ## Frozen evidence position coverage
 
@@ -28,8 +28,8 @@ Generated: 2026-09-09T00:51:12.315596+00:00
 
 - K appears in frozen V3/V4 evidence: **False**
 - K is exposed by current UI/runtime position lists: **True**
-- Current Package Adjustment has a position guard that blocks K: **True**
-- Uncalibrated K scope leak detected: **False**
+- Current Package Adjustment explicitly blocks K by position: **False**
+- Uncalibrated K scope leak detected: **True**
 
 ## Unsupported-shape UX
 
