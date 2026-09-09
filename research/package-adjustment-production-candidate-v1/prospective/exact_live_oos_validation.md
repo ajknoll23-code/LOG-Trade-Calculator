@@ -1,13 +1,13 @@
-# Package Adjustment Step 4 — Exact-Live Prospective/OOS Monitor
+# Package Adjustment — Exact-Live Prospective/OOS Monitor (V1.5)
 
-Generated: 2026-09-09T00:32:10.133746+00:00
+Generated: 2026-09-09T03:08:16.458569+00:00
 
 ## Release
 
-- Release ID: **package-adjustment-exact-live-v1.4-step4**
-- OOS cutoff: **2026-09-09T00:32:10.136000+00:00**
-- Production revision at release: **v1.4-audit-step4-exact-live-oos-monitoring**
-- Exact-live formula SHA256: `e752b522a36eb515dcc8523bce54173cf9a22f5b4ad9d3e6f8021475dd54ce9c`
+- Release ID: **package-adjustment-exact-live-v1.5-step6-realignment**
+- OOS cutoff: **2026-09-09T03:08:16.458000+00:00**
+- Production revision at release: **v1.5-audit-step6-scope-ui-idp**
+- Exact-live formula SHA256: `209bc5bcf75b67d0ae4feeb811bf3b763e13395005fb859d61439fc84004337b`
 
 Only trades strictly after the release cutoff can enter the OOS sample.
 The evaluator uses the exact live V3 size2 curve, V3 51/49 composition
@@ -21,7 +21,7 @@ meaningful-piece threshold, tiny-padding behavior, and fail-closed scope.
 - Distinct concentrated targets: **0**
 - Size2 OOS trades: **0**
 - Size3 OOS trades: **0**
-- Evidence stream age: **3.78 hours**
+- Evidence stream age: **6.38 hours**
 
 ## Evidence maturity gates
 
@@ -36,5 +36,5 @@ another human review. They do **not** authorize an automatic formula change.
 
 ## Audit state
 
-Step 4 monitoring is installed and the release manifest is frozen.
-The next audit gate is **Step 5 — Freeze pre-launch V3/V4 evidence / separate post-launch votes**.
+Exact-live monitoring is revision-aligned to production V1.5 and its release manifest is frozen.
+Step 6 is complete. The next audit gate is **Step 7 — Permanent Package Adjustment repo regression suite**.
