@@ -1,0 +1,320 @@
+name: Package Adjustment V5 Diagnostics Bootstrap Fix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  fix-bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install regression dependency
+        run: pip install requests
+
+      - name: Baseline production regressions
+        run: |
+          python3 scripts/validation/check_package_adjustment_live.py
+          python3 scripts/validation/repo_regression_checks.py
+
+      - name: Fix voter-cluster bootstrap weighting
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          script = Path("scripts/market/package_vote_v5_fit_diagnostics.py")
+          method = Path("research/package-adjustment-v5/fit_diagnostic_methodology.md")
+
+          text = script.read_text(encoding="utf-8")
+
+          old_sig = """def build_cell_masses(rows, catalog, row_weight_multiplier=None):
+              \"\"\"Aggregate package/total effective mass by composition x ratio.\"\"\"
+              if row_weight_multiplier is None:
+                  row_weight_multiplier = lambda row: 1.0
+
+              voter_weights = pipe.voter_weights(rows)
+          """
+          new_sig = """def build_cell_masses(
+              rows,
+              catalog,
+              row_weight_multiplier=None,
+              voter_weights_override=None,
+          ):
+              # Aggregate package/total effective mass by composition x ratio.
+              # voter_weights_override is used by the voter-cluster bootstrap so each
+              # voter's weight is frozen from the original capped sample before clusters
+              # are resampled. Resampling multiplicity then scales the whole cluster
+              # without re-applying the lifetime cap inside each bootstrap draw.
+              if row_weight_multiplier is None:
+                  row_weight_multiplier = lambda row: 1.0
+
+              voter_weights = (
+                  voter_weights_override
+                  if voter_weights_override is not None
+                  else pipe.voter_weights(rows)
+              )
+          """
+          if text.count(old_sig) != 1:
+              raise RuntimeError("Expected build_cell_masses signature block exactly once")
+          text = text.replace(old_sig, new_sig, 1)
+
+          old_boot = """    by_voter = defaultdict(list)
+              for row in rows:
+                  by_voter[row["voter_roster_id"]].append(row)
+
+              rng = random.Random(BOOTSTRAP_SEED)
+              sampled_ratios = {label: [] for label in COMPOSITIONS}
+              bracketed_counts = CounterCompat()
+
+              for _ in range(draws):
+                  picks = [rng.choice(voters) for _ in voters]
+                  multiplicity = defaultdict(int)
+                  for voter in picks:
+                      multiplicity[voter] += 1
+
+                  sampled_rows = []
+                  for voter, mult in multiplicity.items():
+                      # Preserve each selected voter's capped ballot cluster. Repeating
+                      # the cluster by multiplicity is the standard nonparametric
+                      # cluster-bootstrap resample.
+                      for row in by_voter[voter]:
+                          sampled_rows.extend([row] * mult)
+
+                  cells = build_cell_masses(sampled_rows, catalog)
+                  analyses = analyze_cells(cells, catalog_doc)
+          """
+          new_boot = """    # Freeze each voter's capped ballot weight from the ORIGINAL sample.
+              # A cluster bootstrap samples voters with replacement; if voter A is drawn
+              # twice, A's whole originally weighted cluster must contribute twice.
+              # Recomputing the lifetime cap after duplicating rows would partially erase
+              # that multiplicity and artificially narrow bootstrap uncertainty.
+              original_voter_weights = pipe.voter_weights(rows)
+
+              rng = random.Random(BOOTSTRAP_SEED)
+              sampled_ratios = {label: [] for label in COMPOSITIONS}
+              bracketed_counts = CounterCompat()
+
+              for _ in range(draws):
+                  picks = [rng.choice(voters) for _ in voters]
+                  multiplicity = defaultdict(int)
+                  for voter in picks:
+                      multiplicity[voter] += 1
+
+                  cells = build_cell_masses(
+                      rows,
+                      catalog,
+                      row_weight_multiplier=lambda row: multiplicity.get(
+                          row["voter_roster_id"], 0
+                      ),
+                      voter_weights_override=original_voter_weights,
+                  )
+                  analyses = analyze_cells(cells, catalog_doc)
+          """
+          if text.count(old_boot) != 1:
+              raise RuntimeError("Expected old cluster bootstrap block exactly once")
+          text = text.replace(old_boot, new_boot, 1)
+
+          old_selftest_tail = """    unbracketed = indifference_from_curve(
+                  [1.1, 1.2, 1.3],
+                  [0.1, 0.2, 0.3],
+              )
+              assert unbracketed["bracketed"] is False
+              assert unbracketed["reason"] == "package_still_below_50_at_highest_tested_ratio"
+
+              print("Package Preference V5 diagnostics self-test passed.")
+          """
+          new_selftest_tail = """    unbracketed = indifference_from_curve(
+                  [1.1, 1.2, 1.3],
+                  [0.1, 0.2, 0.3],
+              )
+              assert unbracketed["bracketed"] is False
+              assert unbracketed["reason"] == "package_still_below_50_at_highest_tested_ratio"
+
+              # Bootstrap weighting regression: voter A has 40 counted ballots, so the
+              # original lifetime-cap weight is 30/40 = 0.75. If A is selected twice in
+              # a cluster-bootstrap draw, its effective mass must be 60, not re-capped
+              # back to 30 after duplication.
+              fake_catalog = {
+                  f"x{i}": {
+                      "id": f"x{i}",
+                      "composition_target": {"label": "50/50"},
+                      "ratio_target": 1.4,
+                      "target": {"key": "t"},
+                  }
+                  for i in range(40)
+              }
+              fake_rows = [{
+                  "voter_roster_id": "A",
+                  "challenge_id": f"x{i}",
+                  "choice": "P",
+              } for i in range(40)]
+              original_weights = pipe.voter_weights(fake_rows)
+              assert abs(original_weights["A"]["ballot_weight"] - 0.75) < 1e-12
+              doubled = build_cell_masses(
+                  fake_rows,
+                  fake_catalog,
+                  row_weight_multiplier=lambda row: 2.0,
+                  voter_weights_override=original_weights,
+              )
+              assert abs(doubled["50/50"][1.4]["total_mass"] - 60.0) < 1e-12
+              assert abs(doubled["50/50"][1.4]["package_mass"] - 60.0) < 1e-12
+
+              print(
+                  "Package Preference V5 diagnostics self-test passed, including "
+                  "original-weight-preserving voter-cluster bootstrap multiplicity."
+              )
+          """
+          if text.count(old_selftest_tail) != 1:
+              raise RuntimeError("Expected V5 selftest tail exactly once")
+          text = text.replace(old_selftest_tail, new_selftest_tail, 1)
+
+          script.write_text(text, encoding="utf-8")
+
+          mtext = method.read_text(encoding="utf-8")
+          old_method = (
+              "Uncertainty is measured with a nonparametric voter-cluster bootstrap. "
+              "A future production review requires all preregistered V5 data gates to pass, "
+              "each composition band's point estimate to be bracketed within tested ratios, "
+              "and at least 80% of voter-cluster bootstrap draws to remain bracketed for every composition band."
+          )
+          new_method = (
+              "Uncertainty is measured with a nonparametric voter-cluster bootstrap. "
+              "Each voter's lifetime-capped ballot weight is frozen from the original counted sample before resampling; "
+              "bootstrap multiplicity then scales that entire voter cluster without re-applying the cap inside the draw. "
+              "A future production review requires all preregistered V5 data gates to pass, "
+              "each composition band's point estimate to be bracketed within tested ratios, "
+              "and at least 80% of voter-cluster bootstrap draws to remain bracketed for every composition band."
+          )
+          if mtext.count(old_method) != 1:
+              raise RuntimeError("Expected methodology bootstrap paragraph exactly once")
+          mtext = mtext.replace(old_method, new_method, 1)
+          method.write_text(mtext, encoding="utf-8")
+
+          print("Fixed V5 voter-cluster bootstrap weighting.")
+          print("Added regression self-test for duplicated capped-voter cluster mass.")
+
+          PY
+
+      - name: Run corrected V5 diagnostics self-test
+        run: python3 scripts/market/package_vote_v5_fit_diagnostics.py --selftest
+
+      - name: Verify bootstrap implementation contract
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          text = Path(
+              "scripts/market/package_vote_v5_fit_diagnostics.py"
+          ).read_text(encoding="utf-8")
+
+          required = [
+              "voter_weights_override=None",
+              "original_voter_weights = pipe.voter_weights(rows)",
+              "voter_weights_override=original_voter_weights",
+              "multiplicity.get(",
+              '["total_mass"] - 60.0',
+          ]
+          for token in required:
+              assert token in text, token
+
+          forbidden = [
+              "sampled_rows.extend([row] * mult)",
+              "cells = build_cell_masses(sampled_rows, catalog)",
+          ]
+          for token in forbidden:
+              assert token not in text, token
+
+          print("PASS corrected voter-cluster bootstrap contract.")
+          PY
+
+      - name: Protect production frozen evidence and current V5 results
+        shell: bash
+        run: |
+          git diff --exit-code -- index.html
+          git diff --exit-code -- research/package-adjustment-v3
+          git diff --exit-code -- research/package-adjustment-v4
+          git diff --exit-code -- research/package-adjustment-v5/package_vote_challenges_v5.json
+          git diff --exit-code -- research/package-adjustment-v5/release_manifest.json
+          git diff --exit-code -- research/package-adjustment-v5/package_vote_v5_results.json
+          git diff --exit-code -- research/package-adjustment-v5/package_vote_v5_results.md
+          git diff --exit-code -- research/package-adjustment-v5/package_vote_v5_fit_diagnostics.json
+          git diff --exit-code -- research/package-adjustment-v5/package_vote_v5_fit_diagnostics.md
+          git diff --exit-code -- research/package-adjustment-production-candidate-v1
+          git diff --exit-code -- scripts/market/ktc_pipeline.py
+          git diff --exit-code -- scripts/market/package_vote_v5_pipeline.py
+          git diff --exit-code -- scripts/validation
+          git diff --exit-code -- .github/workflows
+
+      - name: Re-run production regressions
+        run: |
+          python3 scripts/validation/check_package_adjustment_live.py
+          python3 scripts/validation/repo_regression_checks.py
+
+      - name: Verify only diagnostic method code changed
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import subprocess
+
+          allowed = {
+              "scripts/market/package_vote_v5_fit_diagnostics.py",
+              "research/package-adjustment-v5/fit_diagnostic_methodology.md",
+          }
+          rows = subprocess.check_output(
+              ["git", "status", "--porcelain=v1"], text=True
+          ).splitlines()
+          paths = set()
+          for row in rows:
+              if not row.strip():
+                  continue
+              p = row[3:]
+              if " -> " in p:
+                  p = p.split(" -> ", 1)[1]
+              paths.add(p)
+
+          assert paths == allowed, f"Unexpected bootstrap-fix changes: {sorted(paths)}"
+          print("V5 bootstrap-fix change set verified.")
+          PY
+
+      - name: Validate Python and whitespace
+        run: |
+          python3 -m py_compile scripts/market/package_vote_v5_fit_diagnostics.py
+          git diff --check
+
+      - name: Commit corrected V5 diagnostics
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add scripts/market/package_vote_v5_fit_diagnostics.py
+          git add research/package-adjustment-v5/fit_diagnostic_methodology.md
+
+          git commit -m "Fix V5 voter-cluster bootstrap weighting"
+          git pull --rebase origin main
+          git push origin main
