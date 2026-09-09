@@ -1,0 +1,480 @@
+name: Package Adjustment Audit Step 6 Analysis
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Audit unsupported-shape UI, scope guards, and IDP consistency
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from datetime import datetime, timezone
+          from collections import Counter
+          import hashlib
+          import json
+          import re
+
+          ROOT = Path(".")
+          INDEX = ROOT / "index.html"
+          LIVE = ROOT / "research/package-adjustment-production-candidate-v1/live_deployment.json"
+          PLAN = ROOT / "research/package-adjustment-production-candidate-v1/audit_clean_plan.md"
+          RELEASE = ROOT / "research/package-adjustment-production-candidate-v1/prospective/release_manifest.json"
+          FREEZE = ROOT / "research/package-adjustment-production-candidate-v1/prelaunch-vote-freeze/manifest.json"
+          V3 = ROOT / "research/package-adjustment-v3/package_vote_challenges_v3.json"
+          V4 = ROOT / "research/package-adjustment-v4/package_vote_challenges_v4.json"
+
+          OUT_JSON = ROOT / "research/package-adjustment-production-candidate-v1/audit_step6_scope_ui_idp_analysis.json"
+          OUT_MD = ROOT / "research/package-adjustment-production-candidate-v1/audit_step6_scope_ui_idp_analysis.md"
+
+          for p in (INDEX, LIVE, PLAN, RELEASE, FREEZE, V3, V4):
+              if not p.exists():
+                  raise RuntimeError(f"Required file missing: {p}")
+
+          def read_json(path):
+              return json.loads(path.read_text(encoding="utf-8"))
+
+          def sha256(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          def extract_function(text, name):
+              marker = f"function {name}("
+              start = text.find(marker)
+              if start < 0:
+                  raise RuntimeError(f"Function not found: {name}")
+              brace = text.find("{", start)
+              if brace < 0:
+                  raise RuntimeError(f"Opening brace not found: {name}")
+              depth = 0
+              quote = None
+              escape = False
+              i = brace
+              while i < len(text):
+                  ch = text[i]
+                  if quote:
+                      if escape:
+                          escape = False
+                      elif ch == "\\":
+                          escape = True
+                      elif ch == quote:
+                          quote = None
+                  else:
+                      if ch in ("'", '"', "`"):
+                          quote = ch
+                      elif ch == "{":
+                          depth += 1
+                      elif ch == "}":
+                          depth -= 1
+                          if depth == 0:
+                              return text[start:i+1]
+                  i += 1
+              raise RuntimeError(f"Unclosed function: {name}")
+
+          index_text = INDEX.read_text(encoding="utf-8")
+          live = read_json(LIVE)
+          release = read_json(RELEASE)
+          freeze = read_json(FREEZE)
+          v3 = read_json(V3)
+          v4 = read_json(V4)
+
+          if live.get("status") != "controlled_live":
+              raise RuntimeError("Package Adjustment is not controlled_live")
+          if live.get("production_formula_enabled") is not True:
+              raise RuntimeError("Package Adjustment production formula is not enabled")
+          if release.get("frozen") is not True:
+              raise RuntimeError("Step 4 release manifest is not frozen")
+          if freeze.get("frozen") is not True:
+              raise RuntimeError("Step 5 vote freeze is not frozen")
+          if v3.get("frozen") is not True or v4.get("frozen") is not True:
+              raise RuntimeError("Frozen V3/V4 evidence expected")
+
+          protected_before = {
+              "index_html": sha256(INDEX),
+              "live_deployment": sha256(LIVE),
+              "release_manifest": sha256(RELEASE),
+              "vote_freeze_manifest": sha256(FREEZE),
+              "v3_catalog": sha256(V3),
+              "v4_catalog": sha256(V4),
+          }
+
+          package_fn = extract_function(index_text, "packageAdjustmentForTrade")
+          render_fn = extract_function(index_text, "renderPackageAdjustment")
+          verdict_fn = extract_function(index_text, "tradeVerdictTotals")
+
+          required_scope_markers = {
+              "player_only": "some(a => a.type !== 'player')" in package_fn,
+              "single_target_vs_package": (
+                  "aAssets.length === 1 && bAssets.length >= 2" in package_fn
+                  and "bAssets.length === 1 && aAssets.length >= 2" in package_fn
+              ),
+              "package_piece_below_target": "packageValues.some(v => v >= targetFv)" in package_fn,
+              "meaningful_size_2_or_3_only": "meaningful.length < 2 || meaningful.length > 3" in package_fn,
+              "size2_composition_guard": "size2CompositionEnvelope" in package_fn,
+              "size3_composition_guard": "size3CompositionEnvelope" in package_fn,
+              "unsupported_composition_fail_closed": package_fn.count("if(!compositionSupported) return null;") >= 2,
+          }
+          if not all(required_scope_markers.values()):
+              raise RuntimeError(
+                  "Current Package Adjustment scope contract differs from expected: "
+                  + json.dumps(required_scope_markers, sort_keys=True)
+              )
+
+          # Current scope function does not read position at all.
+          position_tokens = [
+              ".pos", "position", "targetAsset.pos", "packageAssets", "allowedPositions",
+              "supportedPositions",
+          ]
+          position_specific_markers = [
+              token for token in position_tokens
+              if token in package_fn and token not in {"packageAssets"}
+          ]
+          position_guard_present = bool(position_specific_markers)
+
+          # Current unsupported behavior is silent in UI.
+          silent_ui = (
+              "if(!pkg){ wrap.innerHTML = ''; return; }" in render_fn
+          )
+          verdict_preserves_raw_when_null = (
+              "if(!pkg) return { A: rawA, B: rawB, packageAdjustment: null };" in verdict_fn
+          )
+
+          if not silent_ui:
+              raise RuntimeError(
+                  "Unsupported UI is no longer silent; Step 6 analysis assumptions are stale"
+              )
+          if not verdict_preserves_raw_when_null:
+              raise RuntimeError(
+                  "Trade verdict null-adjustment behavior differs from expected"
+              )
+
+          def evidence_positions(doc):
+              target = Counter()
+              package = Counter()
+              for ch in doc.get("challenges") or []:
+                  tpos = str((ch.get("target") or {}).get("pos") or "").strip().upper()
+                  if tpos:
+                      target[tpos] += 1
+                  for p in ch.get("package") or []:
+                      pos = str(p.get("pos") or "").strip().upper()
+                      if pos:
+                          package[pos] += 1
+              return target, package
+
+          v3_target, v3_package = evidence_positions(v3)
+          v4_target, v4_package = evidence_positions(v4)
+
+          target_union = set(v3_target) | set(v4_target)
+          package_union = set(v3_package) | set(v4_package)
+          evidence_supported_positions = sorted(target_union & package_union)
+          evidence_seen_anywhere = sorted(target_union | package_union)
+
+          if not {"DL", "LB", "DB"}.issubset(set(evidence_supported_positions)):
+              raise RuntimeError(
+                  "Expected IDP positions DL/LB/DB to be supported by frozen evidence"
+              )
+
+          # Detect positions exposed by current UI/runtime.
+          ui_position_sets = []
+          for match in re.finditer(
+              r"\[(?:\s*'[^']+'\s*,?)+\]",
+              index_text
+          ):
+              raw = match.group(0)
+              vals = re.findall(r"'([A-Z_]+)'", raw)
+              if {"QB", "RB", "WR", "TE"}.issubset(vals):
+                  ui_position_sets.append(vals)
+
+          ui_positions = sorted({
+              p for vals in ui_position_sets for p in vals
+              if p in {"QB","RB","WR","TE","DL","LB","DB","K"}
+          })
+
+          positions_exposed_but_not_evidence_supported = sorted(
+              set(ui_positions) - set(evidence_supported_positions)
+          )
+          evidence_supported_but_not_exposed = sorted(
+              set(evidence_supported_positions) - set(ui_positions)
+          )
+
+          # K is a particularly important scope check because it is a player
+          # and therefore passes the current type-only guard.
+          kicker_evidence = {
+              "v3_target": v3_target.get("K", 0),
+              "v3_package": v3_package.get("K", 0),
+              "v4_target": v4_target.get("K", 0),
+              "v4_package": v4_package.get("K", 0),
+          }
+          kicker_in_frozen_evidence = any(kicker_evidence.values())
+          kicker_exposed_in_ui = "K" in ui_positions
+          kicker_currently_blocked_by_package_adjustment = position_guard_present
+          kicker_scope_leak = (
+              kicker_exposed_in_ui
+              and not kicker_in_frozen_evidence
+              and not kicker_currently_blocked_by_package_adjustment
+          )
+
+          # Enumerate current silent reasons from source contract.
+          silent_scope_cases = [
+              {
+                  "case": "pick_or_nonplayer_asset_present",
+                  "current_behavior": "Package Adjustment returns null; UI renders no explanation",
+                  "recommended_ui_class": "unsupported",
+              },
+              {
+                  "case": "multi_vs_multi",
+                  "current_behavior": "Package Adjustment returns null; UI renders no explanation",
+                  "recommended_ui_class": "unsupported",
+              },
+              {
+                  "case": "package_piece_at_or_above_target_fv",
+                  "current_behavior": "Package Adjustment returns null; UI renders no explanation",
+                  "recommended_ui_class": "unsupported",
+              },
+              {
+                  "case": "more_than_3_meaningful_package_players",
+                  "current_behavior": "Package Adjustment returns null; UI renders no explanation",
+                  "recommended_ui_class": "unsupported",
+              },
+              {
+                  "case": "size2_composition_outside_frozen_v3_envelope",
+                  "current_behavior": "Package Adjustment returns null; UI renders no explanation",
+                  "recommended_ui_class": "unsupported",
+              },
+              {
+                  "case": "size3_composition_outside_frozen_v4_envelope",
+                  "current_behavior": "Package Adjustment returns null; UI renders no explanation",
+                  "recommended_ui_class": "unsupported",
+              },
+              {
+                  "case": "one_for_one",
+                  "current_behavior": "Package Adjustment returns null; UI renders no explanation",
+                  "recommended_ui_class": "not_applicable",
+              },
+              {
+                  "case": "effective_one_for_one_after_tiny_piece_filter",
+                  "current_behavior": "Package Adjustment returns null; UI renders no explanation",
+                  "recommended_ui_class": "not_applicable",
+              },
+          ]
+
+          recommendation = {
+              "ui": (
+                  "Add an explicit Package Adjustment scope assessment. Show a compact "
+                  "neutral note for unsupported 1-v-package shapes, while keeping true "
+                  "1-for-1 trades quiet/not-applicable. The note must say raw FV and "
+                  "the normal trade verdict still apply."
+              ),
+              "scope_guard": (
+                  "Limit Package Adjustment players to positions directly supported by "
+                  "the frozen V3/V4 evidence. This prevents player-type-only leakage "
+                  "into uncalibrated positions such as K."
+              ),
+              "idp": (
+                  "Keep DL/LB/DB fully eligible under the same shape/composition rules "
+                  "as offensive positions. Frozen evidence includes IDP on both target "
+                  "and package sides, so no separate IDP multiplier or penalty is justified."
+              ),
+              "implementation_style": (
+                  "Use one shared assessment/classification path so UI reasons and the "
+                  "trade-verdict adjustment cannot drift apart."
+              ),
+          }
+
+          result = {
+              "schema_version": 1,
+              "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+              "status": "package_adjustment_audit_step6_scope_ui_idp_analysis",
+              "production_changed": False,
+              "current_scope_contract": required_scope_markers,
+              "current_position_guard_present": position_guard_present,
+              "current_position_specific_markers": position_specific_markers,
+              "current_unsupported_ui_is_silent": silent_ui,
+              "trade_verdict_preserves_raw_totals_when_adjustment_null": verdict_preserves_raw_when_null,
+              "frozen_evidence_positions": {
+                  "v3_target_counts": dict(sorted(v3_target.items())),
+                  "v3_package_counts": dict(sorted(v3_package.items())),
+                  "v4_target_counts": dict(sorted(v4_target.items())),
+                  "v4_package_counts": dict(sorted(v4_package.items())),
+                  "supported_on_both_target_and_package_sides": evidence_supported_positions,
+                  "seen_anywhere": evidence_seen_anywhere,
+              },
+              "ui_positions_detected": ui_positions,
+              "positions_exposed_but_not_evidence_supported": positions_exposed_but_not_evidence_supported,
+              "evidence_supported_but_not_exposed": evidence_supported_but_not_exposed,
+              "idp_consistency": {
+                  "idp_positions": ["DL", "LB", "DB"],
+                  "all_idp_positions_supported_by_frozen_evidence": True,
+                  "current_live_logic_position_agnostic": not position_guard_present,
+                  "separate_idp_multiplier_supported_by_evidence": False,
+                  "recommended": "same Package Adjustment rules for offense and IDP",
+              },
+              "kicker_scope": {
+                  "evidence_counts": kicker_evidence,
+                  "in_frozen_evidence": kicker_in_frozen_evidence,
+                  "exposed_in_current_ui": kicker_exposed_in_ui,
+                  "currently_blocked_by_package_adjustment": kicker_currently_blocked_by_package_adjustment,
+                  "scope_leak": kicker_scope_leak,
+              },
+              "silent_scope_cases": silent_scope_cases,
+              "recommendation": recommendation,
+              "protected_sha256_before": protected_before,
+          }
+
+          OUT_JSON.parent.mkdir(parents=True, exist_ok=True)
+          OUT_JSON.write_text(
+              json.dumps(result, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          def counts_line(counter):
+              return ", ".join(f"{k}={v}" for k, v in sorted(counter.items()))
+
+          md = [
+              "# Package Adjustment Audit Step 6 — Scope, UI, and IDP Analysis",
+              "",
+              f"Generated: {result['generated_at_utc']}",
+              "",
+              "## Current live behavior",
+              "",
+              "- Unsupported Package Adjustment shapes currently fail closed in the calculation.",
+              "- The trade verdict correctly falls back to raw side totals when Package Adjustment returns null.",
+              "- **The UI is silent when that happens**, so users cannot distinguish an unsupported",
+              "  package from a trade where Package Adjustment is simply not applicable.",
+              f"- Explicit position guard present in Package Adjustment: **{position_guard_present}**",
+              "",
+              "## Frozen evidence position coverage",
+              "",
+              f"- V3 targets: `{counts_line(v3_target)}`",
+              f"- V3 package players: `{counts_line(v3_package)}`",
+              f"- V4 targets: `{counts_line(v4_target)}`",
+              f"- V4 package players: `{counts_line(v4_package)}`",
+              f"- Positions represented on both target and package sides: **{', '.join(evidence_supported_positions)}**",
+              "",
+              "### IDP",
+              "",
+              "- **DL, LB, and DB are all represented in frozen evidence.**",
+              "- The frozen experiments do not support a separate IDP-specific Package Adjustment multiplier.",
+              "- Recommended policy: apply the exact same shape/composition rules to offense and IDP.",
+              "",
+              "### Kicker scope",
+              "",
+              f"- K appears in frozen V3/V4 evidence: **{kicker_in_frozen_evidence}**",
+              f"- K is exposed by current UI/runtime position lists: **{kicker_exposed_in_ui}**",
+              f"- Current Package Adjustment has a position guard that blocks K: **{kicker_currently_blocked_by_package_adjustment}**",
+              f"- Uncalibrated K scope leak detected: **{kicker_scope_leak}**",
+              "",
+              "## Unsupported-shape UX",
+              "",
+              "| Case | Current behavior | Recommended UI |",
+              "|---|---|---|",
+          ]
+          for row in silent_scope_cases:
+              md.append(
+                  f"| {row['case']} | {row['current_behavior']} | {row['recommended_ui_class']} |"
+              )
+
+          md += [
+              "",
+              "## Recommended Step 6 hardening",
+              "",
+              "1. Introduce one shared Package Adjustment assessment/classification path.",
+              "2. Use that same result for both the trade-verdict adjustment and the UI reason.",
+              "3. Fail closed for positions absent from frozen V3/V4 evidence.",
+              "4. Keep QB/RB/WR/TE/DL/LB/DB on the same evidence-bounded rules.",
+              "5. Show a compact unsupported-scope note for 1-v-package shapes that fail calibration scope.",
+              "6. Keep ordinary 1-for-1 trades as not-applicable rather than warning users.",
+              "7. Explicitly state that unsupported Package Adjustment does not alter raw FV.",
+              "",
+              "No production file was modified by this analysis.",
+              "",
+          ]
+
+          OUT_MD.write_text("\n".join(md), encoding="utf-8")
+
+          protected_after = {
+              "index_html": sha256(INDEX),
+              "live_deployment": sha256(LIVE),
+              "release_manifest": sha256(RELEASE),
+              "vote_freeze_manifest": sha256(FREEZE),
+              "v3_catalog": sha256(V3),
+              "v4_catalog": sha256(V4),
+          }
+          if protected_after != protected_before:
+              raise RuntimeError("Protected live/evidence files changed during Step 6 analysis")
+
+          result["protected_sha256_after"] = protected_after
+          result["protected_files_unchanged"] = True
+          OUT_JSON.write_text(
+              json.dumps(result, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          print("Step 6 scope/UI/IDP analysis complete.")
+          print("Evidence-supported positions:", evidence_supported_positions)
+          print("UI positions:", ui_positions)
+          print("K scope leak:", kicker_scope_leak)
+          print("Unsupported UI silent:", silent_ui)
+          PY
+
+      - name: Validate read-only scope
+        run: |
+          git diff --exit-code -- \
+            index.html \
+            research/package-adjustment-production-candidate-v1/live_deployment.json \
+            research/package-adjustment-production-candidate-v1/prospective/release_manifest.json \
+            research/package-adjustment-production-candidate-v1/prelaunch-vote-freeze/manifest.json \
+            research/package-adjustment-v3/package_vote_challenges_v3.json \
+            research/package-adjustment-v4/package_vote_challenges_v4.json
+
+      - name: Validate analysis JSON
+        run: |
+          python -m json.tool \
+            research/package-adjustment-production-candidate-v1/audit_step6_scope_ui_idp_analysis.json \
+            >/dev/null
+
+      - name: Show Step 6 analysis
+        run: |
+          cat research/package-adjustment-production-candidate-v1/audit_step6_scope_ui_idp_analysis.md
+          echo
+          git diff --check
+          git status --short
+
+      - name: Commit Step 6 analysis artifacts
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            research/package-adjustment-production-candidate-v1/audit_step6_scope_ui_idp_analysis.json \
+            research/package-adjustment-production-candidate-v1/audit_step6_scope_ui_idp_analysis.md
+
+          if git diff --cached --quiet; then
+            echo "No Step 6 analysis changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Audit Package Adjustment scope UI and IDP"
+          git pull --rebase origin main
+          git push origin HEAD:main
