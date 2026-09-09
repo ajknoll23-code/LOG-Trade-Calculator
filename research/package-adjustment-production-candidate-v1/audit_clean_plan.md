@@ -38,7 +38,11 @@ hardened and independently verified.
   - Package Adjustment is explicitly limited to QB/RB/WR/TE/DL/LB/DB; K fails closed.
   - DL/LB/DB use the same evidence-bounded Package Adjustment rules as offense.
   - Exact-live prospective/OOS monitoring is re-frozen and revision-aligned to production V1.5.
-- [ ] Step 7 — Permanent Package Adjustment repo regression suite
+- [x] Step 7 — Permanent Package Adjustment repo regression suite
+  - Dedicated live Package Adjustment validator is wired into repo_regression_checks.py.
+  - Permanent coverage protects V1.5 formula/scope, frozen release lineage, and OOS monitor alignment.
+  - Live-JS cases cover supported size2/size3, tiny padding, K exclusion, IDP parity, and unsupported shapes.
+  - Repo Regression Checks now runs Package Adjustment automatically on PRs, manual runs, and after Scheduled Data Refresh.
 - [ ] Step 8 — Obsolete/duplicate workflow cleanup
 - [ ] Step 9 — Final adversarial audit and production sign-off
 

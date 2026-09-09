@@ -34,6 +34,7 @@ from model import idp_v1_projection
 from model import production_history_component
 import validate_idp_v1_final_deployment
 import validate_free_agent_valuation_parity
+import check_package_adjustment_live
 from utilities.generate_player_positions import parse_player_positions, build_player_position_lookup
 
 IDP_V1_RELEASE_MANIFEST = REPO_ROOT / "model" / "releases" / "idp-v1" / "idp_v1_release_manifest.json"
@@ -556,6 +557,7 @@ def main():
         check_deployed_idp_v1_invariants,
         check_free_agent_board_parity,
         check_team_utility_projection_runtime_invariants,
+        check_package_adjustment_live.validate,
         check_index_js_syntax,
     ]
     for check in checks:
