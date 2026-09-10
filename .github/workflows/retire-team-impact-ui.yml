@@ -1,0 +1,243 @@
+name: Retire Team Impact UI
+
+# One-time UI-only cleanup. Keeps Team Impact logic intact but removes its Build Trade presentation.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  retire-team-impact:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Python dependencies
+        run: pip install requests
+
+      - name: Verify current production baseline
+        run: |
+          python3 scripts/validation/package_adjustment_v1_6_ui_redesign.py --check
+          python3 scripts/validation/check_package_adjustment_live.py
+
+      - name: Retire Team Impact from Build Trade
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+
+          INDEX = Path("index.html")
+          EXPECTED_GIT_BLOB = "ca5917fa27e77991943f49b68baf9bc5217caf45"
+          MARKER = "TEAM_IMPACT_UI_RETIRED_V1"
+
+          def git_blob_sha(data: bytes) -> str:
+              header = f"blob {len(data)}\0".encode("ascii")
+              return hashlib.sha1(header + data).hexdigest()
+
+          data = INDEX.read_bytes()
+          text = data.decode("utf-8")
+
+          if MARKER in text:
+              print("Team Impact UI is already retired; no patch needed.")
+          else:
+              actual = git_blob_sha(data)
+              if actual != EXPECTED_GIT_BLOB:
+                  raise RuntimeError(
+                      f"index.html source drifted: expected git blob {EXPECTED_GIT_BLOB}, got {actual}"
+                  )
+
+              old = """    const impact = document.getElementById('tradeImpactWrap');
+              const impactShell = impact && (impact.closest('.ui21-team-impact') || impact);
+              appendIf(buildPane, impactShell);
+          """
+              new = """    /* TEAM_IMPACT_UI_RETIRED_V1
+                 Retired from Build Trade presentation only. Keep the underlying
+                 renderTradeImpact()/team-utility code intact for possible Team Research reuse. */
+              const impact = document.getElementById('tradeImpactWrap');
+              const impactShell = impact && (impact.closest('.ui21-team-impact') || impact);
+              if (impactShell) {
+                impactShell.classList.add('td-retired-team-impact');
+                impactShell.hidden = true;
+                impactShell.setAttribute('aria-hidden', 'true');
+              }
+          """
+
+              if text.count(old) != 1:
+                  raise RuntimeError(
+                      f"Expected exactly one Build Trade Team Impact placement block; found {text.count(old)}"
+                  )
+
+              text = text.replace(old, new, 1)
+
+              css = """<style id="team-impact-ui-retired-style">
+          /* TEAM_IMPACT_UI_RETIRED_V1_CSS — presentation only. */
+          .td-retired-team-impact,
+          .ui21-team-impact[hidden]{
+            display:none!important;
+          }
+          </style>
+          """
+              if text.count("</head>") != 1:
+                  raise RuntimeError("Expected exactly one </head> anchor")
+              text = text.replace("</head>", css + "</head>", 1)
+
+              INDEX.write_text(text, encoding="utf-8")
+              print("Retired Team Impact from the Build Trade UI.")
+
+          final = INDEX.read_text(encoding="utf-8")
+
+          required = [
+              "TEAM_IMPACT_UI_RETIRED_V1",
+              "TEAM_IMPACT_UI_RETIRED_V1_CSS",
+              "impactShell.classList.add('td-retired-team-impact')",
+              "impactShell.hidden = true",
+              "function renderTradeImpact(){",
+              "tradeImpactWrap",
+              "TRADE_DESK_NAV_REORG_V1",
+              "PACKAGE_ADJUSTMENT_V1_6_UI_REDESIGN",
+              "Build Trade",
+              "Market Research",
+              "Team Research",
+          ]
+          missing = [token for token in required if token not in final]
+          if missing:
+              raise RuntimeError(f"Post-patch required marker/source missing: {missing}")
+
+          if "appendIf(buildPane, impactShell);" in final:
+              raise RuntimeError("Team Impact is still being appended into Build Trade.")
+
+          print("Team Impact UI retirement static validation PASS.")
+          print("Underlying renderTradeImpact() logic preserved.")
+          PY
+
+      - name: Validate inline JavaScript syntax
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import re
+          import subprocess
+          import tempfile
+          from pathlib import Path
+
+          html = Path('index.html').read_text(encoding='utf-8')
+          scripts = []
+          for match in re.finditer(r'<script\b([^>]*)>(.*?)</script>', html, flags=re.S | re.I):
+              attrs, body = match.group(1), match.group(2)
+              if re.search(r'\bsrc\s*=', attrs, flags=re.I):
+                  continue
+              if body.strip():
+                  scripts.append(body)
+
+          if not scripts:
+              raise RuntimeError('No inline scripts found')
+
+          with tempfile.TemporaryDirectory(prefix='retire-team-impact-js-') as td:
+              for idx, script in enumerate(scripts):
+                  path = Path(td) / f'inline-{idx}.js'
+                  path.write_text(script, encoding='utf-8')
+                  proc = subprocess.run(
+                      ['node', '--check', str(path)],
+                      capture_output=True,
+                      text=True,
+                  )
+                  if proc.returncode != 0:
+                      raise RuntimeError(
+                          f'Inline script {idx} failed syntax check:\n{proc.stderr or proc.stdout}'
+                      )
+
+          print(f'JavaScript syntax PASS ({len(scripts)} inline scripts).')
+          PY
+
+      - name: Revalidate Package Adjustment and repository
+        run: |
+          python3 scripts/validation/package_adjustment_v1_6_ui_redesign.py --check
+          python3 scripts/validation/check_package_adjustment_live.py
+          python3 scripts/validation/repo_regression_checks.py
+
+      - name: Guard changed-file scope
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import subprocess
+
+          allowed = {'index.html'}
+          out = subprocess.check_output(
+              ['git', 'status', '--porcelain=v1', '--untracked-files=all'],
+              text=True,
+          )
+          changed = set()
+          for line in out.splitlines():
+              if not line.strip():
+                  continue
+              path = line[3:]
+              if ' -> ' in path:
+                  path = path.split(' -> ', 1)[1]
+              changed.add(path)
+
+          unexpected = sorted(changed - allowed)
+          if unexpected:
+              raise RuntimeError(f'Unexpected changed files: {unexpected}')
+
+          print('Changed-file scope PASS:', sorted(changed))
+          PY
+
+          git diff --quiet -- .github/workflows || {
+            echo "::error::A workflow file changed during the run."
+            exit 1
+          }
+
+      - name: Ensure remote main did not move
+        shell: bash
+        run: |
+          git fetch origin main
+          local_sha="$(git rev-parse HEAD)"
+          remote_sha="$(git rev-parse origin/main)"
+          if [ "$local_sha" != "$remote_sha" ]; then
+            echo "::error::origin/main moved during validation. Refusing to push."
+            echo "Validated base: $local_sha"
+            echo "Current origin/main: $remote_sha"
+            exit 1
+          fi
+
+      - name: Commit UI retirement
+        shell: bash
+        run: |
+          if git diff --quiet -- index.html; then
+            echo "Team Impact UI is already retired; nothing to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.html
+
+          staged="$(git diff --cached --name-only)"
+          if [ "$staged" != "index.html" ]; then
+            echo "::error::Unexpected staged files: $staged"
+            exit 1
+          fi
+
+          git commit -m "Retire Team Impact from Build Trade"
+          git push origin HEAD:main
