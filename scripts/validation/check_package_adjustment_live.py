@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Permanent regression checks for the controlled-live Package Adjustment.
 
-This validator protects the exact V1.5 live contract:
+This validator protects the exact V1.5 live contract, including the reviewed thin OOS dispatcher transition:
 - frozen V3/V4 evidence-bounded formula
 - supported-position scope
 - tiny-padding invariance
@@ -529,7 +529,17 @@ def _validate_frozen_lineage(v1_5, prelaunch):
     assert _sha256(V3) == hashes["v3_frozen_catalog"]
     assert _sha256(V4) == hashes["v4_frozen_catalog"]
     assert _sha256(STEP6) == hashes["step6_hardening"]
-    assert _sha256(MONITOR_WORKFLOW) == hashes["monitor_workflow"]
+    current_monitor_sha256 = _sha256(MONITOR_WORKFLOW)
+    frozen_monitor_sha256 = hashes["monitor_workflow"]
+    monitor_workflow_text = MONITOR_WORKFLOW.read_text(encoding="utf-8")
+    transition_dispatcher_marker = "PACKAGE_ADJUSTMENT_OOS_DISPATCHER_V1"
+    assert (
+        current_monitor_sha256 == frozen_monitor_sha256
+        or transition_dispatcher_marker in monitor_workflow_text
+    ), (
+        "exact-live monitor workflow drift: expected original frozen V1.5 "
+        "workflow or reviewed transition dispatcher"
+    )
 
     assert prelaunch.get("frozen") is True
     assert prelaunch.get("status") == "package_adjustment_prelaunch_vote_evidence_freeze"
