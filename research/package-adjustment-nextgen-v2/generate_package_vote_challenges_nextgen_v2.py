@@ -77,6 +77,7 @@ FRAG_MIN_SUPPORTED_SCALES = 2
 HOLDOUT_TARGET_REPS = 4
 HOLDOUT_MIN_REPS = 2
 MAX_GOAL_CANDIDATES = 90
+FRAG_MAX_GOAL_CANDIDATES = 220
 MIN_ROSTERED_PLAYERS = 350
 APPEARANCE_PENALTY = 0.00035
 
@@ -355,6 +356,147 @@ def scale_plan(feasible_pairs):
             raise RuntimeError(f"too few unique goal totals for scale {label}: {len(unique)}")
         plans[label] = {"anchor_total_fv": float(anchor), "candidate_goal_totals": unique}
     return plans
+
+
+def component_value_window(total_goal, intended_share):
+    """Outer FV window implied by the frozen total/share tolerances.
+
+    This is intentionally only a feasibility prefilter. Exact side-total,
+    component-share, and pair-total tolerances are still enforced by the
+    existing joint constructor and validator.
+    """
+    share = float(intended_share)
+    low_share = max(0.0, share - MAX_COMPONENT_SHARE_ERROR)
+    high_share = share + MAX_COMPONENT_SHARE_ERROR
+    low_total = float(total_goal) * (1.0 - MAX_SIDE_TARGET_ERROR)
+    high_total = float(total_goal) * (1.0 + MAX_SIDE_TARGET_ERROR)
+    return low_total * low_share, high_total * high_share
+
+
+def component_window_matching_exists(players, total_goal, shares_a, shares_b):
+    """Check whether all intended components can use distinct real players.
+
+    The fragmentation family needs up to seven distinct players in one
+    comparison. Core 80/20 scale anchors can be too low for 10% or 5% pieces
+    even though an 80/20 pair itself is feasible. This matching check filters
+    candidate totals using the actual FV grid before defining the
+    fragmentation-specific scale bands.
+    """
+    components = [float(s) for s in shares_a] + [float(s) for s in shares_b]
+    candidate_keys = []
+    for share in components:
+        lo, hi = component_value_window(total_goal, share)
+        desired = float(total_goal) * share
+        candidates = [
+            (abs(float(player["fv"]) - desired), player["key"])
+            for player in players
+            if lo - 1e-12 <= float(player["fv"]) <= hi + 1e-12
+        ]
+        candidates.sort()
+        if not candidates:
+            return False
+        candidate_keys.append([key for _err, key in candidates])
+
+    # Standard augmenting-path bipartite matching. Components are processed
+    # from sparsest to densest so impossible low-value windows fail quickly.
+    order = sorted(range(len(components)), key=lambda i: (len(candidate_keys[i]), i))
+    player_to_component = {}
+
+    def augment(component_index, seen):
+        for key in candidate_keys[component_index]:
+            if key in seen:
+                continue
+            seen.add(key)
+            previous = player_to_component.get(key)
+            if previous is None or augment(previous, seen):
+                player_to_component[key] = component_index
+                return True
+        return False
+
+    for component_index in order:
+        if not augment(component_index, set()):
+            return False
+    return True
+
+
+def fragmentation_scale_plans(players, feasible_pairs):
+    """Derive scale bands from totals feasible for each fragmentation design.
+
+    The core scale plan is intentionally based on feasible 80/20 *two-player*
+    packages. Reusing those same quartiles for 80/10/10 or 80/5/5/5/5 can
+    create structurally impossible low/mid cells because the required 10%/5%
+    assets fall below the actual rostered FV grid. That is a scale-design
+    mismatch, not evidence that the fragmentation experiment should be
+    dropped or that its 2.5% tolerances should be loosened.
+
+    Each comparison therefore gets its own deterministic low/mid/high scale
+    bands, still derived from the same frozen real-player 80/20 totals, after
+    filtering for enough distinct real players in every component window.
+    Exact construction tolerances remain unchanged downstream.
+    """
+    output = {}
+    diagnostics = {}
+
+    for comparison_label, shares_a, shares_b in FRAGMENTATION_COMPARISONS:
+        feasible_totals = []
+        seen = set()
+        for row in feasible_pairs:
+            total = float(row["total_fv"])
+            code = round(total, 3)
+            if code in seen:
+                continue
+            seen.add(code)
+            if component_window_matching_exists(players, total, shares_a, shares_b):
+                feasible_totals.append(total)
+
+        feasible_totals.sort()
+        if len(feasible_totals) < 12:
+            min_fv = min(float(p["fv"]) for p in players)
+            max_fv = max(float(p["fv"]) for p in players)
+            raise RuntimeError(
+                "fragmentation design has too few component-feasible real-player totals: "
+                f"{comparison_label}; feasible_unique_totals={len(feasible_totals)}; "
+                f"eligible_fv_range=({min_fv:.3f}, {max_fv:.3f}); "
+                "tolerances were not loosened"
+            )
+
+        anchors = {
+            scale_label: nearest_rank(feasible_totals, q)
+            for scale_label, q in SCALE_QUANTILES
+        }
+        if not (anchors["low"] < anchors["mid"] < anchors["high"]):
+            raise RuntimeError(
+                f"fragmentation scale anchors are not strictly increasing for "
+                f"{comparison_label}: {anchors}"
+            )
+
+        plans = {}
+        for scale_label, _q in SCALE_QUANTILES:
+            anchor = anchors[scale_label]
+            ranked = sorted(
+                feasible_totals,
+                key=lambda total: (abs(float(total) - anchor), float(total)),
+            )
+            goals = ranked[:FRAG_MAX_GOAL_CANDIDATES]
+            if len(goals) < 12:
+                raise RuntimeError(
+                    f"fragmentation scale {comparison_label}/{scale_label} has too few "
+                    f"candidate goals: {len(goals)}"
+                )
+            plans[scale_label] = {
+                "anchor_total_fv": float(anchor),
+                "candidate_goal_totals": [float(x) for x in goals],
+            }
+
+        output[comparison_label] = plans
+        diagnostics[comparison_label] = {
+            "component_feasible_unique_total_count": len(feasible_totals),
+            "min_component_feasible_total_fv": float(feasible_totals[0]),
+            "max_component_feasible_total_fv": float(feasible_totals[-1]),
+            "scale_anchors": {k: float(v) for k, v in anchors.items()},
+        }
+
+    return output, diagnostics
 
 
 def nearest_candidate_pool(players, desired, excluded, appearance_counts):
@@ -641,7 +783,7 @@ def add_cell(challenges, skipped, players, appearance_counts, used_signatures,
     return built
 
 
-def generate_challenges(players, plans):
+def generate_challenges(players, plans, fragmentation_plans):
     challenges = []
     skipped = []
     appearance_counts = Counter()
@@ -668,10 +810,14 @@ def generate_challenges(players, plans):
             )
             cell_counts[("core_concentration_2v2", scale_label, cell_id)] = count
 
-    # Fragmentation/filler identifying cells. Kept fit-eligible for M2 fitting/diagnosis.
-    for scale_label, _ in SCALE_QUANTILES:
-        info = {"label": scale_label, **plans[scale_label]}
-        for label, shares_a, shares_b in FRAGMENTATION_COMPARISONS:
+    # Fragmentation/filler identifying cells. These use comparison-specific
+    # feasible scale bands because 10%/5% pieces can be impossible at the core
+    # 80/20 quartile totals even though the core comparison itself is feasible.
+    # Scientific construction tolerances remain exactly the same.
+    for label, shares_a, shares_b in FRAGMENTATION_COMPARISONS:
+        comparison_plans = fragmentation_plans[label]
+        for scale_label, _ in SCALE_QUANTILES:
+            info = {"label": scale_label, **comparison_plans[scale_label]}
             cell_id = f"frag_{label}"
             count = add_cell(
                 challenges, skipped, players, appearance_counts, used_signatures, info,
@@ -818,8 +964,9 @@ def counter_to_dict(counter):
 
 
 def build_catalog_document(root: Path, players, unresolved, pos_counts, v_ref,
-                           feasible_pairs, plans, challenges, skipped, appearance_counts,
-                           cell_counts, head, committed_at, frozen_before):
+                           feasible_pairs, plans, fragmentation_plans, fragmentation_diagnostics,
+                           challenges, skipped, appearance_counts, cell_counts, head,
+                           committed_at, frozen_before):
     values_doc = read_json(VALUES)
     family_counts = Counter(c["family"] for c in challenges)
     split_counts = Counter(c["split"] for c in challenges)
@@ -894,6 +1041,14 @@ def build_catalog_document(root: Path, players, unresolved, pos_counts, v_ref,
             "max_component_share_error": MAX_COMPONENT_SHARE_ERROR,
             "scale_quantiles": {label: q for label, q in SCALE_QUANTILES},
             "scale_anchors": {label: round(plans[label]["anchor_total_fv"], 3) for label, _ in SCALE_QUANTILES},
+            "fragmentation_scale_basis": "comparison-specific feasible real-player totals under frozen component windows",
+            "fragmentation_scale_anchors": {
+                comparison: {
+                    scale: round(info["anchor_total_fv"], 3)
+                    for scale, info in comparison_plans.items()
+                }
+                for comparison, comparison_plans in fragmentation_plans.items()
+            },
             "core_profiles": {label: list(shares) for label, shares in CORE_PROFILES},
             "fragmentation_comparisons": [
                 {"label": label, "side_a": list(a), "side_b": list(b)}
@@ -915,6 +1070,7 @@ def build_catalog_document(root: Path, players, unresolved, pos_counts, v_ref,
             "position_counts_in_universe": counter_to_dict(pos_counts),
             "unresolved_roster_entries": len(unresolved),
             "feasible_80_20_pair_count": len(feasible_pairs),
+            "fragmentation_scale_diagnostics": fragmentation_diagnostics,
             "cell_counts": cells,
             "skipped_or_underfilled_cells": skipped,
             "max_asset_appearance_count": max(appearance_counts.values()) if appearance_counts else 0,
@@ -1025,13 +1181,18 @@ def run_generation(force=False, dry_run=False):
     v_ref = nearest_rank([p["fv"] for p in players], 0.95)
     feasible_pairs = enumerate_feasible_8020_pairs(players)
     plans = scale_plan(feasible_pairs)
-    challenges, skipped, appearance_counts, cell_counts = generate_challenges(players, plans)
+    fragmentation_plans, fragmentation_diagnostics = fragmentation_scale_plans(
+        players, feasible_pairs
+    )
+    challenges, skipped, appearance_counts, cell_counts = generate_challenges(
+        players, plans, fragmentation_plans
+    )
     validate_fv_lookup(challenges, players)
 
     catalog = build_catalog_document(
         ROOT, players, unresolved, pos_counts, v_ref, feasible_pairs, plans,
-        challenges, skipped, appearance_counts, cell_counts, head, committed_at,
-        frozen_before,
+        fragmentation_plans, fragmentation_diagnostics, challenges, skipped,
+        appearance_counts, cell_counts, head, committed_at, frozen_before,
     )
     json_text = json.dumps(catalog, indent=2, sort_keys=True) + "\n"
     md_text = design_markdown(catalog)
@@ -1043,6 +1204,14 @@ def run_generation(force=False, dry_run=False):
             "challenge_count": len(challenges),
             "v_ref": v_ref,
             "scale_anchors": {k: round(v["anchor_total_fv"], 3) for k, v in plans.items()},
+            "fragmentation_scale_anchors": {
+                comparison: {
+                    scale: round(info["anchor_total_fv"], 3)
+                    for scale, info in comparison_plans.items()
+                }
+                for comparison, comparison_plans in fragmentation_plans.items()
+            },
+            "fragmentation_scale_diagnostics": fragmentation_diagnostics,
             "family_counts": counter_to_dict(Counter(c["family"] for c in challenges)),
             "split_counts": counter_to_dict(Counter(c["split"] for c in challenges)),
             "skipped_or_underfilled_cells": len(skipped),
@@ -1170,7 +1339,8 @@ def selftest():
     assert v_ref > 0
     pairs = enumerate_feasible_8020_pairs(players)
     plans = scale_plan(pairs)
-    challenges, skipped, appearances, cells = generate_challenges(players, plans)
+    frag_plans, frag_diagnostics = fragmentation_scale_plans(players, pairs)
+    challenges, skipped, appearances, cells = generate_challenges(players, plans, frag_plans)
     validate_challenges(challenges, cells)
     validate_fv_lookup(challenges, players)
 
@@ -1192,6 +1362,22 @@ def selftest():
         for c in challenges
     )
     assert max(appearances.values()) > 0
+    assert set(frag_plans) == {label for label, _a, _b in FRAGMENTATION_COMPARISONS}
+    for comparison, comparison_plans in frag_plans.items():
+        anchors = [comparison_plans[label]["anchor_total_fv"] for label, _q in SCALE_QUANTILES]
+        assert anchors[0] < anchors[1] < anchors[2], comparison
+        assert frag_diagnostics[comparison]["component_feasible_unique_total_count"] >= 12
+
+    # Regression for the live-data failure mode: a rostered-value floor can
+    # make global core low/mid anchors invalid for 10%/5% filler pieces. The
+    # fragmentation planner must derive its own feasible anchors instead of
+    # weakening the 2.5% construction tolerances.
+    floored_players = [p for p in synthetic_players(560) if float(p["fv"]) >= 700.0]
+    floored_pairs = enumerate_feasible_8020_pairs(floored_players)
+    floored_core = scale_plan(floored_pairs)
+    floored_frag, floored_diag = fragmentation_scale_plans(floored_players, floored_pairs)
+    assert floored_frag["80_20_vs_80_10_10"]["low"]["anchor_total_fv"] >= floored_core["low"]["anchor_total_fv"]
+    assert floored_diag["80_20_vs_80_05x4"]["component_feasible_unique_total_count"] >= 12
 
     # Differential identity from the preregistered model definition.
     raw_a, raw_b = 8041.0, 7411.0
