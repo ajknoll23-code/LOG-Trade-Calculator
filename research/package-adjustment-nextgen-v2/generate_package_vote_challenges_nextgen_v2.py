@@ -429,9 +429,9 @@ def fragmentation_scale_plans(players, feasible_pairs):
     mismatch, not evidence that the fragmentation experiment should be
     dropped or that its 2.5% tolerances should be loosened.
 
-    Each comparison therefore gets its own deterministic low/mid/high scale
-    bands, still derived from the same frozen real-player 80/20 totals, after
-    filtering for enough distinct real players in every component window.
+    Each fragmentation comparison contains an 80/20 side, so it is appropriate
+    to start from the frozen real-player totals where an 80/20 pair is feasible,
+    then keep only totals that can also support all components on both sides.
     Exact construction tolerances remain unchanged downstream.
     """
     output = {}
@@ -497,6 +497,108 @@ def fragmentation_scale_plans(players, feasible_pairs):
         }
 
     return output, diagnostics
+
+
+def structural_holdout_scale_plan(players, core_plans):
+    """Build one shared, component-feasible 3v3 scale plan.
+
+    Holdout B is supposed to test unseen *topology*. To avoid confounding that
+    test with arbitrary scale shifts, both 3v3 comparison profiles share the
+    same low/mid/high total-FV bands. The bands are built from real-player
+    implied totals that can support every required component in every 3v3
+    comparison, then each band is anchored as close as possible to the
+    corresponding core 2v2 scale anchor.
+
+    Crucially, a 3v3 total does not have to be an 80/20 two-player-feasible
+    total. The 80/20 core plan contributes only the absolute-scale reference
+    anchors; component feasibility is evaluated natively for the 3v3 designs.
+    All frozen 2.5% construction tolerances remain unchanged.
+    """
+    # A real player at FV v occupying share s implies a plausible side total
+    # around v/s. The union gives a deterministic comparison-native search grid.
+    component_shares = sorted({
+        float(share)
+        for _label, shares_a, shares_b in HOLDOUT_3V3_COMPARISONS
+        for share in (shares_a + shares_b)
+        if float(share) > 0
+    })
+    candidate_totals = set()
+    for player in players:
+        fv = float(player["fv"])
+        for share in component_shares:
+            candidate_totals.add(round(fv / share, 3))
+
+    # Keep only totals that can assign six distinct real players for *every*
+    # preregistered 3v3 holdout comparison under the outer component windows.
+    feasible_totals = []
+    for total in sorted(candidate_totals):
+        if all(
+            component_window_matching_exists(players, total, shares_a, shares_b)
+            for _label, shares_a, shares_b in HOLDOUT_3V3_COMPARISONS
+        ):
+            feasible_totals.append(float(total))
+
+    if len(feasible_totals) < 12:
+        min_fv = min(float(p["fv"]) for p in players)
+        max_fv = max(float(p["fv"]) for p in players)
+        raise RuntimeError(
+            "shared structural 3v3 holdout has too few component-feasible "
+            f"real-player totals: feasible_unique_totals={len(feasible_totals)}; "
+            f"native_candidate_totals={len(candidate_totals)}; "
+            f"eligible_fv_range=({min_fv:.3f}, {max_fv:.3f}); "
+            "tolerances were not loosened"
+        )
+
+    # Keep topology holdout scales aligned to the core experiment as closely as
+    # the real-player FV grid permits. No outcome data are involved.
+    anchors = {}
+    core_targets = {}
+    for scale_label, _q in SCALE_QUANTILES:
+        target = float(core_plans[scale_label]["anchor_total_fv"])
+        core_targets[scale_label] = target
+        anchors[scale_label] = min(
+            feasible_totals,
+            key=lambda total: (abs(float(total) - target), float(total)),
+        )
+
+    if not (anchors["low"] < anchors["mid"] < anchors["high"]):
+        raise RuntimeError(
+            "shared structural 3v3 anchors are not strictly increasing after "
+            f"alignment to core scales: core_targets={core_targets}; anchors={anchors}"
+        )
+
+    plans = {}
+    for scale_label, _q in SCALE_QUANTILES:
+        anchor = float(anchors[scale_label])
+        ranked = sorted(
+            feasible_totals,
+            key=lambda total: (abs(float(total) - anchor), float(total)),
+        )
+        goals = ranked[:FRAG_MAX_GOAL_CANDIDATES]
+        if len(goals) < 12:
+            raise RuntimeError(
+                f"shared structural holdout scale {scale_label} has too few "
+                f"candidate goals: {len(goals)}"
+            )
+        plans[scale_label] = {
+            "anchor_total_fv": anchor,
+            "candidate_goal_totals": [float(x) for x in goals],
+        }
+
+    diagnostics = {
+        "shared_across_comparisons": True,
+        "native_candidate_total_count": len(candidate_totals),
+        "component_feasible_unique_total_count": len(feasible_totals),
+        "min_component_feasible_total_fv": float(feasible_totals[0]),
+        "max_component_feasible_total_fv": float(feasible_totals[-1]),
+        "core_anchor_targets": {k: float(v) for k, v in core_targets.items()},
+        "scale_anchors": {k: float(v) for k, v in anchors.items()},
+        "absolute_anchor_offsets": {
+            scale: abs(float(anchors[scale]) - float(core_targets[scale]))
+            for scale, _q in SCALE_QUANTILES
+        },
+    }
+    return plans, diagnostics
 
 
 def nearest_candidate_pool(players, desired, excluded, appearance_counts):
@@ -783,7 +885,7 @@ def add_cell(challenges, skipped, players, appearance_counts, used_signatures,
     return built
 
 
-def generate_challenges(players, plans, fragmentation_plans):
+def generate_challenges(players, plans, fragmentation_plans, holdout_plans):
     challenges = []
     skipped = []
     appearance_counts = Counter()
@@ -832,9 +934,11 @@ def generate_challenges(players, plans, fragmentation_plans):
             )
             cell_counts[("fragmentation_filler", scale_label, cell_id)] = count
 
-    # Entire 3v3 topology is withheld from fitting.
+    # Entire 3v3 topology is withheld from fitting. Both comparison profiles
+    # use one shared component-feasible scale plan so topology, not arbitrary
+    # absolute scale, remains the main held-out dimension.
     for scale_label, _ in SCALE_QUANTILES:
-        info = {"label": scale_label, **plans[scale_label]}
+        info = {"label": scale_label, **holdout_plans[scale_label]}
         for label, shares_a, shares_b in HOLDOUT_3V3_COMPARISONS:
             cell_id = f"holdout_{label}"
             count = add_cell(
@@ -931,11 +1035,22 @@ def validate_challenges(challenges, cell_counts):
             )
 
     # Structural 3v3 holdout must exist in every scale/profile cell.
-    for scale_label, _ in SCALE_QUANTILES:
-        for label, _a, _b in HOLDOUT_3V3_COMPARISONS:
+    for label, _a, _b in HOLDOUT_3V3_COMPARISONS:
+        scale_coverage = {}
+        for scale_label, _ in SCALE_QUANTILES:
             key = ("structural_topology_3v3", scale_label, f"holdout_{label}")
-            if cell_counts.get(key, 0) < HOLDOUT_MIN_REPS:
-                raise RuntimeError(f"3v3 holdout cell below minimum coverage: {key}")
+            scale_coverage[scale_label] = int(cell_counts.get(key, 0))
+        below = {
+            scale: count
+            for scale, count in scale_coverage.items()
+            if count < HOLDOUT_MIN_REPS
+        }
+        if below:
+            raise RuntimeError(
+                "3v3 holdout comparison below minimum coverage: "
+                f"{label}; counts={scale_coverage}; "
+                f"need >= {HOLDOUT_MIN_REPS} reps in every scale"
+            )
 
     # Entire high core scale must be withheld; all 3v3 rows must be withheld.
     for c in challenges:
@@ -965,8 +1080,8 @@ def counter_to_dict(counter):
 
 def build_catalog_document(root: Path, players, unresolved, pos_counts, v_ref,
                            feasible_pairs, plans, fragmentation_plans, fragmentation_diagnostics,
-                           challenges, skipped, appearance_counts, cell_counts, head,
-                           committed_at, frozen_before):
+                           holdout_plans, holdout_diagnostics, challenges, skipped,
+                           appearance_counts, cell_counts, head, committed_at, frozen_before):
     values_doc = read_json(VALUES)
     family_counts = Counter(c["family"] for c in challenges)
     split_counts = Counter(c["split"] for c in challenges)
@@ -1049,6 +1164,11 @@ def build_catalog_document(root: Path, players, unresolved, pos_counts, v_ref,
                 }
                 for comparison, comparison_plans in fragmentation_plans.items()
             },
+            "structural_holdout_scale_basis": "shared 3v3 component-feasible totals aligned to core 2v2 absolute-scale anchors",
+            "structural_holdout_scale_anchors": {
+                scale: round(info["anchor_total_fv"], 3)
+                for scale, info in holdout_plans.items()
+            },
             "core_profiles": {label: list(shares) for label, shares in CORE_PROFILES},
             "fragmentation_comparisons": [
                 {"label": label, "side_a": list(a), "side_b": list(b)}
@@ -1071,6 +1191,7 @@ def build_catalog_document(root: Path, players, unresolved, pos_counts, v_ref,
             "unresolved_roster_entries": len(unresolved),
             "feasible_80_20_pair_count": len(feasible_pairs),
             "fragmentation_scale_diagnostics": fragmentation_diagnostics,
+            "structural_holdout_scale_diagnostics": holdout_diagnostics,
             "cell_counts": cells,
             "skipped_or_underfilled_cells": skipped,
             "max_asset_appearance_count": max(appearance_counts.values()) if appearance_counts else 0,
@@ -1184,15 +1305,17 @@ def run_generation(force=False, dry_run=False):
     fragmentation_plans, fragmentation_diagnostics = fragmentation_scale_plans(
         players, feasible_pairs
     )
+    holdout_plans, holdout_diagnostics = structural_holdout_scale_plan(players, plans)
     challenges, skipped, appearance_counts, cell_counts = generate_challenges(
-        players, plans, fragmentation_plans
+        players, plans, fragmentation_plans, holdout_plans
     )
     validate_fv_lookup(challenges, players)
 
     catalog = build_catalog_document(
         ROOT, players, unresolved, pos_counts, v_ref, feasible_pairs, plans,
-        fragmentation_plans, fragmentation_diagnostics, challenges, skipped,
-        appearance_counts, cell_counts, head, committed_at, frozen_before,
+        fragmentation_plans, fragmentation_diagnostics, holdout_plans,
+        holdout_diagnostics, challenges, skipped, appearance_counts, cell_counts,
+        head, committed_at, frozen_before,
     )
     json_text = json.dumps(catalog, indent=2, sort_keys=True) + "\n"
     md_text = design_markdown(catalog)
@@ -1212,6 +1335,11 @@ def run_generation(force=False, dry_run=False):
                 for comparison, comparison_plans in fragmentation_plans.items()
             },
             "fragmentation_scale_diagnostics": fragmentation_diagnostics,
+            "structural_holdout_scale_anchors": {
+                scale: round(info["anchor_total_fv"], 3)
+                for scale, info in holdout_plans.items()
+            },
+            "structural_holdout_scale_diagnostics": holdout_diagnostics,
             "family_counts": counter_to_dict(Counter(c["family"] for c in challenges)),
             "split_counts": counter_to_dict(Counter(c["split"] for c in challenges)),
             "skipped_or_underfilled_cells": len(skipped),
@@ -1340,7 +1468,10 @@ def selftest():
     pairs = enumerate_feasible_8020_pairs(players)
     plans = scale_plan(pairs)
     frag_plans, frag_diagnostics = fragmentation_scale_plans(players, pairs)
-    challenges, skipped, appearances, cells = generate_challenges(players, plans, frag_plans)
+    holdout_plans, holdout_diagnostics = structural_holdout_scale_plan(players, plans)
+    challenges, skipped, appearances, cells = generate_challenges(
+        players, plans, frag_plans, holdout_plans
+    )
     validate_challenges(challenges, cells)
     validate_fv_lookup(challenges, players)
 
@@ -1367,6 +1498,13 @@ def selftest():
         anchors = [comparison_plans[label]["anchor_total_fv"] for label, _q in SCALE_QUANTILES]
         assert anchors[0] < anchors[1] < anchors[2], comparison
         assert frag_diagnostics[comparison]["component_feasible_unique_total_count"] >= 12
+    assert set(holdout_plans) == {label for label, _q in SCALE_QUANTILES}
+    holdout_anchor_values = [
+        holdout_plans[label]["anchor_total_fv"] for label, _q in SCALE_QUANTILES
+    ]
+    assert holdout_anchor_values[0] < holdout_anchor_values[1] < holdout_anchor_values[2]
+    assert holdout_diagnostics["shared_across_comparisons"] is True
+    assert holdout_diagnostics["component_feasible_unique_total_count"] >= 12
 
     # Regression for the live-data failure mode: a rostered-value floor can
     # make global core low/mid anchors invalid for 10%/5% filler pieces. The
@@ -1376,8 +1514,31 @@ def selftest():
     floored_pairs = enumerate_feasible_8020_pairs(floored_players)
     floored_core = scale_plan(floored_pairs)
     floored_frag, floored_diag = fragmentation_scale_plans(floored_players, floored_pairs)
+    floored_holdout, floored_holdout_diag = structural_holdout_scale_plan(
+        floored_players, floored_core
+    )
     assert floored_frag["80_20_vs_80_10_10"]["low"]["anchor_total_fv"] >= floored_core["low"]["anchor_total_fv"]
     assert floored_diag["80_20_vs_80_05x4"]["component_feasible_unique_total_count"] >= 12
+    floored_holdout_anchors = [
+        floored_holdout[label]["anchor_total_fv"] for label, _q in SCALE_QUANTILES
+    ]
+    assert floored_holdout_anchors[0] < floored_holdout_anchors[1] < floored_holdout_anchors[2]
+    assert floored_holdout_diag["component_feasible_unique_total_count"] >= 12
+    assert floored_holdout_diag["native_candidate_total_count"] >= 12
+
+    # Regression for the stronger 3v3 fix: the planner consumes only the
+    # player grid plus external scale targets. It must not require a 3v3 total
+    # itself to appear in the feasible 80/20-pair list.
+    stub_core = {
+        "low": {"anchor_total_fv": 9000.0},
+        "mid": {"anchor_total_fv": 12000.0},
+        "high": {"anchor_total_fv": 16000.0},
+    }
+    native_holdout, native_diag = structural_holdout_scale_plan(floored_players, stub_core)
+    native_anchors = [native_holdout[label]["anchor_total_fv"] for label, _q in SCALE_QUANTILES]
+    assert native_anchors[0] < native_anchors[1] < native_anchors[2]
+    assert native_diag["shared_across_comparisons"] is True
+    assert native_diag["component_feasible_unique_total_count"] >= 12
 
     # Differential identity from the preregistered model definition.
     raw_a, raw_b = 8041.0, 7411.0
