@@ -1,0 +1,430 @@
+name: Package Adjustment NextGen V2 Diversity Regenerate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: package-adjustment-nextgen-v2-diversity-regenerate
+  cancel-in-progress: false
+
+jobs:
+  patch-and-regenerate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install regression-check dependency
+        run: python3 -m pip install requests
+
+      - name: Verify reviewed starting state
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SPEC="research/package-adjustment-nextgen-v2/package_adjustment_nextgen_v2_research_spec.md"
+          GEN="research/package-adjustment-nextgen-v2/generate_package_vote_challenges_nextgen_v2.py"
+          CAT="research/package-adjustment-nextgen-v2/package_vote_challenges_nextgen_v2.json"
+          DESIGN="research/package-adjustment-nextgen-v2/challenge_catalog_design.md"
+
+          test -f "$SPEC"
+          test -f "$GEN"
+          test -f "$CAT"
+          test -f "$DESIGN"
+          test -z "$(git status --porcelain=v1)"
+
+          SPEC_SHA="$(sha256sum "$SPEC" | awk '{print $1}')"
+          GEN_SHA="$(sha256sum "$GEN" | awk '{print $1}')"
+
+          test "$SPEC_SHA" = "e07734799c1b8da6a335fd8c568ccdbc7fb813562b8680073aa99613f36cb2fc"
+          test "$GEN_SHA" = "d94ebd0d2f2779da788a1fe96853c10dcff625511e3e3ed1a2614e530c8304ab"
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path("research/package-adjustment-nextgen-v2/package_vote_challenges_nextgen_v2.json")
+          doc = json.loads(path.read_text(encoding="utf-8"))
+          assert doc["status"] == "generated_research_catalog_unreleased"
+          assert doc["research_only"] is True
+          assert doc["frozen"] is False
+          assert doc["production_formula_enabled"] is False
+          assert doc["automatic_production_change_allowed"] is False
+          assert doc["generator_sha256"] == "d94ebd0d2f2779da788a1fe96853c10dcff625511e3e3ed1a2614e530c8304ab"
+          assert doc["research_spec"]["sha256"] == "e07734799c1b8da6a335fd8c568ccdbc7fb813562b8680073aa99613f36cb2fc"
+          print("PASS: existing catalog is unreleased/unfrozen and tied to the reviewed generator/spec.")
+          PY
+
+      - name: Verify production Package Adjustment before patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/validation/check_package_adjustment_live.py
+
+      - name: Record baseline catalog diversity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from collections import Counter
+          from pathlib import Path
+
+          path = Path("research/package-adjustment-nextgen-v2/package_vote_challenges_nextgen_v2.json")
+          doc = json.loads(path.read_text(encoding="utf-8"))
+          challenges = doc["challenges"]
+
+          appearances = Counter()
+          side_counts = Counter()
+          for challenge in challenges:
+              for side_name in ("side_a", "side_b"):
+                  keys = tuple(sorted(asset["key"] for asset in challenge[side_name]["assets"]))
+                  appearances.update(keys)
+                  side_counts[(
+                      challenge["family"],
+                      challenge["cell_id"],
+                      challenge["scale_label"],
+                      keys,
+                  )] += 1
+
+          slots = sum(appearances.values())
+          hhi = sum((count / slots) ** 2 for count in appearances.values()) if slots else 0.0
+          exact_side_reuse = sum(max(0, count - 1) for count in side_counts.values())
+          baseline = {
+              "unique_assets_used": len(appearances),
+              "total_asset_slots": slots,
+              "max_asset_appearance_count": max(appearances.values()) if appearances else 0,
+              "appearance_hhi": hhi,
+              "exact_side_reuse_count_same_cell_scale": exact_side_reuse,
+          }
+          Path("/tmp/pkgnv2_old_diversity.json").write_text(
+              json.dumps(baseline, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          print("Baseline diversity:")
+          print(json.dumps(baseline, indent=2, sort_keys=True))
+          assert baseline["max_asset_appearance_count"] == 21
+          assert baseline["exact_side_reuse_count_same_cell_scale"] > 0
+          PY
+
+      - name: Patch generator diversity logic
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("research/package-adjustment-nextgen-v2/generate_package_vote_challenges_nextgen_v2.py")
+          text = path.read_text(encoding="utf-8")
+
+          def replace_once(old, new, label):
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected exactly one source match, found {count}")
+              text = text.replace(old, new, 1)
+
+          replace_once(
+              'APPEARANCE_PENALTY = 0.00035\n',
+              'APPEARANCE_PENALTY = 0.00035\nDIVERSITY_RANK_VERSION = 2\n',
+              'diversity rank version',
+          )
+
+          replace_once(
+              '''        score = (\n            total_error,\n            max_share_error,\n            sum(share_errors),\n            running,\n            key_tuple,\n        )\n        valid.append((score, assets))\n''',
+              '''        # Once a side is inside every frozen construction tolerance, prefer\n        # player diversity before microscopic numerical improvements. This reduces\n        # player-specific preference confounding without weakening any tolerance.\n        reuse_counts = [appearance_counts[p["key"]] for p in assets]\n        score = (\n            max(reuse_counts, default=0),\n            sum(reuse_counts),\n            total_error,\n            max_share_error,\n            sum(share_errors),\n            running,\n            key_tuple,\n        )\n        valid.append((score, assets))\n''',
+              'side candidate diversity ranking',
+          )
+
+          replace_once(
+              '''            a_keys = tuple(sorted(keys_a))\n            b_keys = tuple(sorted(keys_b))\n            signature = (family, cell_id, tuple(sorted((a_keys, b_keys))))\n            if signature in used_signatures:\n                continue\n\n            reuse = sum(appearance_counts[k] for k in keys_a | keys_b)\n            rank = (\n                pair_gap,\n                max(err_a, err_b),\n                max(share_err_a, share_err_b),\n                err_a + err_b,\n                share_err_a + share_err_b,\n                APPEARANCE_PENALTY * reuse,\n                tuple(sorted((a_keys, b_keys))),\n            )\n''',
+              '''            a_keys = tuple(sorted(keys_a))\n            b_keys = tuple(sorted(keys_b))\n            side_signature_a = ("side", family, cell_id, scale_label, a_keys)\n            side_signature_b = ("side", family, cell_id, scale_label, b_keys)\n            if side_signature_a in used_signatures or side_signature_b in used_signatures:\n                continue\n\n            signature = (family, cell_id, tuple(sorted((a_keys, b_keys))))\n            if signature in used_signatures:\n                continue\n\n            reuse_counts = [appearance_counts[k] for k in keys_a | keys_b]\n            rank = (\n                max(reuse_counts, default=0),\n                sum(reuse_counts),\n                pair_gap,\n                max(err_a, err_b),\n                max(share_err_a, share_err_b),\n                err_a + err_b,\n                share_err_a + share_err_b,\n                tuple(sorted((a_keys, b_keys))),\n            )\n''',
+              'joint challenge diversity ranking',
+          )
+
+          replace_once(
+              '''        signature = challenge_signature(candidate)\n        used_signatures.add(signature)\n        challenges.append(candidate)\n        for side in ("side_a", "side_b"):\n            for asset in candidate[side]["assets"]:\n                appearance_counts[asset["key"]] += 1\n''',
+              '''        signature = challenge_signature(candidate)\n        used_signatures.add(signature)\n        for side in ("side_a", "side_b"):\n            side_keys = tuple(sorted(asset["key"] for asset in candidate[side]["assets"]))\n            used_signatures.add(("side", family, cell_id, scale_label, side_keys))\n        challenges.append(candidate)\n        for side in ("side_a", "side_b"):\n            for asset in candidate[side]["assets"]:\n                appearance_counts[asset["key"]] += 1\n''',
+              'side signature registration',
+          )
+
+          replace_once(
+              '''    signatures = [challenge_signature(c) for c in challenges]\n    if len(signatures) != len(set(signatures)):\n        raise RuntimeError("duplicate NextGen challenge signatures")\n\n    for c in challenges:\n''',
+              '''    signatures = [challenge_signature(c) for c in challenges]\n    if len(signatures) != len(set(signatures)):\n        raise RuntimeError("duplicate NextGen challenge signatures")\n\n    side_signatures = set()\n    for c in challenges:\n        for side_name in ("side_a", "side_b"):\n            side_keys = tuple(sorted(a["key"] for a in c[side_name]["assets"]))\n            side_signature = (c["family"], c["cell_id"], c["scale_label"], side_keys)\n            if side_signature in side_signatures:\n                raise RuntimeError(\n                    f"{c['id']}: exact side package reused within the same cell/scale"\n                )\n            side_signatures.add(side_signature)\n\n    for c in challenges:\n''',
+              'exact side reuse validator',
+          )
+
+          replace_once(
+              '''def counter_to_dict(counter):\n    return {str(k): int(v) for k, v in sorted(counter.items(), key=lambda kv: str(kv[0]))}\n\n\ndef build_catalog_document(root: Path, players, unresolved, pos_counts, v_ref,\n''',
+              '''def counter_to_dict(counter):\n    return {str(k): int(v) for k, v in sorted(counter.items(), key=lambda kv: str(kv[0]))}\n\n\ndef build_diversity_diagnostics(challenges, players, appearance_counts):\n    player_lookup = {p["key"]: p for p in players}\n    side_counts = Counter()\n    for challenge in challenges:\n        for side_name in ("side_a", "side_b"):\n            side_keys = tuple(sorted(a["key"] for a in challenge[side_name]["assets"]))\n            side_counts[(\n                challenge["family"],\n                challenge["cell_id"],\n                challenge["scale_label"],\n                side_keys,\n            )] += 1\n\n    total_slots = sum(int(v) for v in appearance_counts.values())\n    appearance_hhi = (\n        sum((float(v) / total_slots) ** 2 for v in appearance_counts.values())\n        if total_slots else 0.0\n    )\n    ranked = sorted(appearance_counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))\n    top_reused = []\n    for key, count in ranked[:12]:\n        player = player_lookup.get(key, {})\n        top_reused.append({\n            "key": key,\n            "name": player.get("name"),\n            "pos": player.get("pos"),\n            "fv": round(float(player["fv"]), 3) if player.get("fv") is not None else None,\n            "appearance_count": int(count),\n        })\n\n    return {\n        "rank_version": DIVERSITY_RANK_VERSION,\n        "unique_assets_used": len(appearance_counts),\n        "eligible_asset_coverage_pct": round(\n            100.0 * len(appearance_counts) / len(players), 4\n        ) if players else 0.0,\n        "total_asset_slots": total_slots,\n        "max_asset_appearance_count": max(appearance_counts.values()) if appearance_counts else 0,\n        "appearance_count_histogram": counter_to_dict(Counter(appearance_counts.values())),\n        "appearance_hhi": round(appearance_hhi, 10),\n        "exact_side_reuse_count_same_cell_scale": sum(\n            max(0, int(count) - 1) for count in side_counts.values()\n        ),\n        "top_reused_assets": top_reused,\n    }\n\n\ndef build_catalog_document(root: Path, players, unresolved, pos_counts, v_ref,\n''',
+              'diversity diagnostics helper',
+          )
+
+          replace_once(
+              '''    family_counts = Counter(c["family"] for c in challenges)\n    split_counts = Counter(c["split"] for c in challenges)\n    scale_counts = Counter(c["scale_label"] for c in challenges)\n\n    cells = []\n''',
+              '''    family_counts = Counter(c["family"] for c in challenges)\n    split_counts = Counter(c["split"] for c in challenges)\n    scale_counts = Counter(c["scale_label"] for c in challenges)\n    diversity = build_diversity_diagnostics(challenges, players, appearance_counts)\n\n    cells = []\n''',
+              'catalog diversity construction',
+          )
+
+          replace_once(
+              '''            "skipped_or_underfilled_cells": skipped,\n            "max_asset_appearance_count": max(appearance_counts.values()) if appearance_counts else 0,\n''',
+              '''            "skipped_or_underfilled_cells": skipped,\n            "max_asset_appearance_count": diversity["max_asset_appearance_count"],\n            "diversity": diversity,\n''',
+              'catalog diversity fields',
+          )
+
+          replace_once(
+              '''        f"- Feasible real-player 80/20 pairs used for scale derivation: `{d['feasible_80_20_pair_count']}`",\n        f"- Pick cells active: `{catalog['pick_cells']['active']}`",\n''',
+              '''        f"- Feasible real-player 80/20 pairs used for scale derivation: `{d['feasible_80_20_pair_count']}`",\n        f"- Unique assets used: `{d['diversity']['unique_assets_used']}`",\n        f"- Maximum appearances by one asset: `{d['diversity']['max_asset_appearance_count']}`",\n        f"- Exact side reuses within the same cell/scale: `{d['diversity']['exact_side_reuse_count_same_cell_scale']}`",\n        f"- Pick cells active: `{catalog['pick_cells']['active']}`",\n''',
+              'design markdown diversity summary',
+          )
+
+          replace_once(
+              '''            "split_counts": counter_to_dict(Counter(c["split"] for c in challenges)),\n            "skipped_or_underfilled_cells": len(skipped),\n''',
+              '''            "split_counts": counter_to_dict(Counter(c["split"] for c in challenges)),\n            "skipped_or_underfilled_cells": len(skipped),\n            "diversity": catalog["catalog_diagnostics"]["diversity"],\n''',
+              'dry-run diversity output',
+          )
+
+          replace_once(
+              '''    assert max(appearances.values()) > 0\n    assert set(frag_plans) == {label for label, _a, _b in FRAGMENTATION_COMPARISONS}\n''',
+              '''    assert max(appearances.values()) > 0\n    diversity = build_diversity_diagnostics(challenges, players, appearances)\n    assert diversity["rank_version"] == DIVERSITY_RANK_VERSION\n    assert diversity["unique_assets_used"] > 0\n    assert diversity["exact_side_reuse_count_same_cell_scale"] == 0\n    assert set(frag_plans) == {label for label, _a, _b in FRAGMENTATION_COMPARISONS}\n''',
+              'self-test diversity assertions',
+          )
+
+          path.write_text(text, encoding="utf-8")
+          print("PASS: generator diversity patch applied with exact-source guards.")
+          PY
+
+      - name: Prove patch touched only generator
+        shell: bash
+        run: |
+          set -euo pipefail
+          ACTUAL="$(git status --porcelain=v1 | sed 's/^...//' | sort)"
+          EXPECTED="research/package-adjustment-nextgen-v2/generate_package_vote_challenges_nextgen_v2.py"
+          test "$ACTUAL" = "$EXPECTED"
+          echo "PASS: only generator changed before regeneration."
+
+      - name: Run patched generator self-test
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 python3 \
+            research/package-adjustment-nextgen-v2/generate_package_vote_challenges_nextgen_v2.py \
+            --selftest
+
+      - name: Verify production remains unchanged after source patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/validation/check_package_adjustment_live.py
+
+      - name: Commit reviewed generator patch locally
+        shell: bash
+        run: |
+          set -euo pipefail
+          GEN="research/package-adjustment-nextgen-v2/generate_package_vote_challenges_nextgen_v2.py"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -- "$GEN"
+          STAGED="$(git diff --cached --name-only)"
+          test "$STAGED" = "$GEN"
+          git commit -m "Harden NextGen V2 catalog diversity"
+
+          test -z "$(git status --porcelain=v1)"
+          echo "Patched generator commit: $(git rev-parse HEAD)"
+          echo "Patched generator SHA-256: $(sha256sum "$GEN" | awk '{print $1}')"
+
+      - name: Run patched live-data dry run
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 python3 \
+            research/package-adjustment-nextgen-v2/generate_package_vote_challenges_nextgen_v2.py \
+            --dry-run
+          test -z "$(git status --porcelain=v1)"
+          echo "PASS: patched generator builds the live catalog without writing repo files."
+
+      - name: Regenerate unreleased catalog with patched generator
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 python3 \
+            research/package-adjustment-nextgen-v2/generate_package_vote_challenges_nextgen_v2.py \
+            --force
+
+      - name: Validate regenerated catalog and diversity improvement
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from collections import Counter
+          from pathlib import Path
+
+          root = Path("research/package-adjustment-nextgen-v2")
+          cat = root / "package_vote_challenges_nextgen_v2.json"
+          design = root / "challenge_catalog_design.md"
+          gen = root / "generate_package_vote_challenges_nextgen_v2.py"
+
+          doc = json.loads(cat.read_text(encoding="utf-8"))
+          old = json.loads(Path("/tmp/pkgnv2_old_diversity.json").read_text(encoding="utf-8"))
+
+          assert doc["schema_version"] == 1
+          assert doc["status"] == "generated_research_catalog_unreleased"
+          assert doc["research_only"] is True
+          assert doc["frozen"] is False
+          assert doc["production_formula_enabled"] is False
+          assert doc["automatic_production_change_allowed"] is False
+          assert doc["production_revision_at_generation"] == "v1.6-v5-size2-composition-overlay"
+          assert doc["exact_live_formula_sha256_at_generation"] == "9a1a52f3393a701fe8463fcf2179d1342debb925da1109ce73276b8b2b8cbbc7"
+          assert doc["generator_commit_sha"] == __import__("subprocess").check_output(
+              ["git", "rev-parse", "HEAD"], text=True
+          ).strip()
+          assert doc["generator_sha256"] == __import__("hashlib").sha256(gen.read_bytes()).hexdigest()
+          assert doc["pick_cells"]["active"] is False
+
+          challenges = doc["challenges"]
+          assert len(challenges) == 144
+          assert Counter(c["family"] for c in challenges) == {
+              "core_concentration_2v2": 90,
+              "fragmentation_filler": 30,
+              "structural_topology_3v3": 24,
+          }
+          assert Counter(c["split"] for c in challenges) == {
+              "train": 90,
+              "structural_scale_holdout": 30,
+              "structural_topology_holdout": 24,
+          }
+          assert not doc["catalog_diagnostics"]["skipped_or_underfilled_cells"]
+          assert all(c["fit_eligible"] is False for c in challenges if c["split"] != "train")
+          assert all(c["values_hidden_from_voter"] is True for c in challenges)
+
+          div = doc["catalog_diagnostics"]["diversity"]
+          assert div["rank_version"] == 2
+          assert div["exact_side_reuse_count_same_cell_scale"] == 0
+          assert div["max_asset_appearance_count"] < old["max_asset_appearance_count"], (old, div)
+          assert div["unique_assets_used"] >= old["unique_assets_used"], (old, div)
+          assert div["appearance_hhi"] < old["appearance_hhi"], (old, div)
+
+          # Independently recompute the hard exact-side-reuse invariant.
+          seen = set()
+          for challenge in challenges:
+              for side_name in ("side_a", "side_b"):
+                  sig = (
+                      challenge["family"],
+                      challenge["cell_id"],
+                      challenge["scale_label"],
+                      tuple(sorted(a["key"] for a in challenge[side_name]["assets"])),
+                  )
+                  assert sig not in seen, (challenge["id"], side_name, sig)
+                  seen.add(sig)
+
+          design_text = design.read_text(encoding="utf-8")
+          assert "GENERATED / UNRELEASED" in design_text
+          assert "Production V1.6 is unchanged" in design_text
+          assert "Exact side reuses within the same cell/scale: `0`" in design_text
+
+          print("PASS: regenerated catalog contract and diversity improvement validated.")
+          print("Old diversity:", json.dumps(old, sort_keys=True))
+          print("New diversity:", json.dumps({
+              "unique_assets_used": div["unique_assets_used"],
+              "total_asset_slots": div["total_asset_slots"],
+              "max_asset_appearance_count": div["max_asset_appearance_count"],
+              "appearance_hhi": div["appearance_hhi"],
+              "exact_side_reuse_count_same_cell_scale": div["exact_side_reuse_count_same_cell_scale"],
+          }, sort_keys=True))
+          print("Top reused assets:")
+          for row in div["top_reused_assets"]:
+              print(row)
+          PY
+
+      - name: Prove only regenerated outputs changed after generator commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import subprocess
+
+          expected = {
+              "research/package-adjustment-nextgen-v2/package_vote_challenges_nextgen_v2.json",
+              "research/package-adjustment-nextgen-v2/challenge_catalog_design.md",
+          }
+          out = subprocess.check_output(["git", "status", "--porcelain=v1"], text=True)
+          actual = set()
+          for line in out.splitlines():
+              if not line:
+                  continue
+              path = line[3:]
+              if " -> " in path:
+                  path = path.split(" -> ", 1)[1]
+              actual.add(path)
+          if actual != expected:
+              raise SystemExit(f"Unexpected changes: expected={sorted(expected)} actual={sorted(actual)}")
+          print("PASS: only catalog/design changed after the generator commit.")
+          PY
+
+      - name: Run repository regression checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/validation/repo_regression_checks.py
+
+      - name: Re-verify production Package Adjustment after regeneration
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/validation/check_package_adjustment_live.py
+
+      - name: Recheck exact changed-file boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import subprocess
+
+          expected = {
+              "research/package-adjustment-nextgen-v2/package_vote_challenges_nextgen_v2.json",
+              "research/package-adjustment-nextgen-v2/challenge_catalog_design.md",
+          }
+          out = subprocess.check_output(["git", "status", "--porcelain=v1"], text=True)
+          actual = {line[3:] for line in out.splitlines() if line}
+          if actual != expected:
+              raise SystemExit(
+                  f"Regression checks changed unexpected files. expected={sorted(expected)} actual={sorted(actual)}"
+              )
+          print("PASS: regression checks introduced no additional repository changes.")
+          PY
+
+      - name: Commit regenerated unreleased catalog and push both commits
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git add -- \
+            research/package-adjustment-nextgen-v2/package_vote_challenges_nextgen_v2.json \
+            research/package-adjustment-nextgen-v2/challenge_catalog_design.md
+
+          STAGED="$(git diff --cached --name-only)"
+          EXPECTED="$(printf '%s\n' \
+            'research/package-adjustment-nextgen-v2/challenge_catalog_design.md' \
+            'research/package-adjustment-nextgen-v2/package_vote_challenges_nextgen_v2.json')"
+          test "$STAGED" = "$EXPECTED"
+
+          git commit -m "Regenerate NextGen V2 catalog with diversity controls"
+          git push origin HEAD:main
+
+          echo "PASS: pushed generator diversity patch and regenerated unreleased research catalog."
