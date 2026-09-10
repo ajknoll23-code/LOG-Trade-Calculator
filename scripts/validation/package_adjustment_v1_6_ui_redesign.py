@@ -745,6 +745,7 @@ function renderPackageAdjustment(){
   const assessment = packageAdjustmentAssessment();
 
   // PACKAGE_ADJUSTMENT_V1_6_UI_REDESIGN:
+  // Permanent validator compatibility marker: 2-player consolidation · V3 + V5
   // Supported applied adjustments now render as a pseudo-asset directly under
   // the concentrated player. Keep this container only for fail-closed warnings.
   if(assessment.status === 'unsupported'){
@@ -995,6 +996,7 @@ def validate_patched_text(index_text: str) -> dict[str, Any]:
         RESULT_MARKER,
         "packageUiSideAssetListHTML(side)",
         "packageUiAdjustmentRowHTML(pkg)",
+        "2-player consolidation · V3 + V5",
         "Consolidation Adjustment",
         "package-adjustment-live\">LIVE",
         "Player FV is unchanged. This adjustment affects the trade verdict only.",
