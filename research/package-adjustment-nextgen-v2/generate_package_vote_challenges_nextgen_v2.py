@@ -66,8 +66,9 @@ MAX_SIDE_TARGET_ERROR = 0.025
 MAX_PAIR_TOTAL_GAP = 0.025
 MAX_COMPONENT_SHARE_ERROR = 0.025
 FEASIBLE_8020_SHARE_ERROR = 0.025
-NEAREST_POOL = 36
-BEAM_WIDTH = 120
+NEAREST_POOL = 48
+BEAM_WIDTH = 180
+SIDE_CANDIDATE_LIMIT = 24
 CORE_TARGET_REPS = 6
 CORE_MIN_REPS = 4
 FRAG_TARGET_REPS = 5
@@ -368,7 +369,16 @@ def nearest_candidate_pool(players, desired, excluded, appearance_counts):
     return rows[:NEAREST_POOL]
 
 
-def construct_side(players, total_goal, intended_shares, excluded, appearance_counts):
+def construct_side_candidates(players, total_goal, intended_shares, excluded,
+                              appearance_counts, limit=SIDE_CANDIDATE_LIMIT):
+    """Return multiple high-quality valid side constructions.
+
+    Phase-1 originally returned only the single best side before attempting to
+    build the opposite side. On sparse real-player FV grids that can consume a
+    scarce near-target asset and make a jointly feasible comparison appear
+    impossible. Returning several candidates lets the trade constructor solve
+    the two sides jointly without relaxing any preregistered tolerance.
+    """
     shares = tuple(sorted((float(s) for s in intended_shares), reverse=True))
     if not shares or abs(sum(shares) - 1.0) > 1e-9:
         raise ValueError(f"invalid intended shares: {intended_shares}")
@@ -387,13 +397,19 @@ def construct_side(players, total_goal, intended_shares, excluded, appearance_co
                 score = running + component_error + APPEARANCE_PENALTY * reuse
                 expanded.append((score, keys + (player["key"],), chosen + (player,)))
         if not expanded:
-            return None
+            return []
         expanded.sort(key=lambda row: (row[0], row[1]))
         states = expanded[:BEAM_WIDTH]
 
     valid = []
+    seen = set()
     for running, keys, chosen in states:
         assets = sorted(chosen, key=lambda p: (-float(p["fv"]), p["key"]))
+        key_tuple = tuple(p["key"] for p in assets)
+        if key_tuple in seen:
+            continue
+        seen.add(key_tuple)
+
         actual_total = sum(float(p["fv"]) for p in assets)
         total_error = abs(actual_total - total_goal) / total_goal
         actual_shares = canonical_actual_shares(assets)
@@ -408,14 +424,19 @@ def construct_side(players, total_goal, intended_shares, excluded, appearance_co
             max_share_error,
             sum(share_errors),
             running,
-            tuple(p["key"] for p in assets),
+            key_tuple,
         )
         valid.append((score, assets))
 
-    if not valid:
-        return None
     valid.sort(key=lambda row: row[0])
-    return valid[0][1]
+    return [assets for _score, assets in valid[:int(limit)]]
+
+
+def construct_side(players, total_goal, intended_shares, excluded, appearance_counts):
+    candidates = construct_side_candidates(
+        players, total_goal, intended_shares, excluded, appearance_counts, limit=1
+    )
+    return candidates[0] if candidates else None
 
 
 def asset_record(player):
@@ -485,27 +506,78 @@ def try_build_challenge(players, appearance_counts, used_signatures, *, family,
                         cell_id, scale_label, scale_anchor, total_goal,
                         shares_a, shares_b, split, fit_eligible, treatment,
                         rep_index):
-    assets_a = construct_side(players, total_goal, shares_a, set(), appearance_counts)
-    if assets_a is None:
-        return None
-    keys_a = {p["key"] for p in assets_a}
-    assets_b = construct_side(players, total_goal, shares_b, keys_a, appearance_counts)
-    if assets_b is None:
+    """Jointly construct both sides instead of greedily locking Side A first.
+
+    This preserves the same 2.5% total/share tolerances while avoiding a false
+    "unconstructible" result when the first greedy side consumes a scarce
+    player needed for the opposing profile. It is especially important for
+    80/20 vs 80/10/10 fragmentation cells on a sparse real-player FV grid.
+    """
+    candidates_a = construct_side_candidates(
+        players, total_goal, shares_a, set(), appearance_counts
+    )
+    candidates_b = construct_side_candidates(
+        players, total_goal, shares_b, set(), appearance_counts
+    )
+    if not candidates_a or not candidates_b:
         return None
 
-    total_a = sum(float(p["fv"]) for p in assets_a)
-    total_b = sum(float(p["fv"]) for p in assets_b)
-    mean_total = (total_a + total_b) / 2.0
-    if mean_total <= 0:
+    ranked_pairs = []
+    for assets_a in candidates_a:
+        keys_a = {p["key"] for p in assets_a}
+        total_a = sum(float(p["fv"]) for p in assets_a)
+        shares_actual_a = canonical_actual_shares(assets_a)
+        intended_a = tuple(sorted((float(s) for s in shares_a), reverse=True))
+        err_a = abs(total_a - total_goal) / total_goal
+        share_err_a = max(abs(a - b) for a, b in zip(shares_actual_a, intended_a))
+
+        for assets_b in candidates_b:
+            keys_b = {p["key"] for p in assets_b}
+            if keys_a & keys_b:
+                continue
+
+            total_b = sum(float(p["fv"]) for p in assets_b)
+            mean_total = (total_a + total_b) / 2.0
+            if mean_total <= 0:
+                continue
+            pair_gap = abs(total_a - total_b) / mean_total
+            if pair_gap > MAX_PAIR_TOTAL_GAP + 1e-12:
+                continue
+
+            shares_actual_b = canonical_actual_shares(assets_b)
+            intended_b = tuple(sorted((float(s) for s in shares_b), reverse=True))
+            err_b = abs(total_b - total_goal) / total_goal
+            share_err_b = max(abs(a - b) for a, b in zip(shares_actual_b, intended_b))
+
+            a_keys = tuple(sorted(keys_a))
+            b_keys = tuple(sorted(keys_b))
+            signature = (family, cell_id, tuple(sorted((a_keys, b_keys))))
+            if signature in used_signatures:
+                continue
+
+            reuse = sum(appearance_counts[k] for k in keys_a | keys_b)
+            rank = (
+                pair_gap,
+                max(err_a, err_b),
+                max(share_err_a, share_err_b),
+                err_a + err_b,
+                share_err_a + share_err_b,
+                APPEARANCE_PENALTY * reuse,
+                tuple(sorted((a_keys, b_keys))),
+            )
+            ranked_pairs.append((rank, assets_a, assets_b, signature))
+
+    if not ranked_pairs:
         return None
-    if abs(total_a - total_b) / mean_total > MAX_PAIR_TOTAL_GAP + 1e-12:
-        return None
+
+    ranked_pairs.sort(key=lambda row: row[0])
+    _rank, assets_a, assets_b, _signature = ranked_pairs[0]
 
     challenge_id = (
         f"pkgnv2_{family}_{scale_label}_{cell_id}_r{rep_index:02d}"
         .replace("/", "_")
     )
-    challenge = make_challenge(
+    return make_challenge(
         challenge_id=challenge_id,
         family=family,
         cell_id=cell_id,
@@ -520,10 +592,6 @@ def try_build_challenge(players, appearance_counts, used_signatures, *, family,
         fit_eligible=fit_eligible,
         treatment=treatment,
     )
-    signature = challenge_signature(challenge)
-    if signature in used_signatures:
-        return None
-    return challenge
 
 
 def add_cell(challenges, skipped, players, appearance_counts, used_signatures,
@@ -701,12 +769,20 @@ def validate_challenges(challenges, cell_counts):
     # Each fragmentation comparison must be supported in at least two scales.
     for label, _a, _b in FRAGMENTATION_COMPARISONS:
         supported = 0
+        scale_coverage = {}
         for scale_label, _ in SCALE_QUANTILES:
             key = ("fragmentation_filler", scale_label, f"frag_{label}")
-            if cell_counts.get(key, 0) >= FRAG_MIN_REPS_PER_SUPPORTED_CELL:
+            count = int(cell_counts.get(key, 0))
+            scale_coverage[scale_label] = count
+            if count >= FRAG_MIN_REPS_PER_SUPPORTED_CELL:
                 supported += 1
         if supported < FRAG_MIN_SUPPORTED_SCALES:
-            raise RuntimeError(f"fragmentation comparison lacks scale coverage: {label}")
+            raise RuntimeError(
+                "fragmentation comparison lacks scale coverage: "
+                f"{label}; counts={scale_coverage}; "
+                f"need >= {FRAG_MIN_REPS_PER_SUPPORTED_CELL} reps in "
+                f">= {FRAG_MIN_SUPPORTED_SCALES} scales"
+            )
 
     # Structural 3v3 holdout must exist in every scale/profile cell.
     for scale_label, _ in SCALE_QUANTILES:
@@ -1053,6 +1129,41 @@ def selftest():
     assert len(mini_unresolved) == 1 and mini_unresolved[0]["name"] == "Test Kicker"
     assert {p["match_method"] for p in mini_players} == {"sleeper_id", "normalized_name"}
     assert all(p["pos"] != "K" for p in mini_players)
+
+    # Sparse-grid regression: jointly choose disjoint sides instead of greedily
+    # consuming the only useful near-80% asset on the first side.
+    sparse = [
+        {"key":"t1","name":"Top 1","pos":"WR","fv":8000.0,"team":"A","age":24,"player_id":"t1","match_method":"sleeper_id"},
+        {"key":"t2","name":"Top 2","pos":"WR","fv":7920.0,"team":"B","age":24,"player_id":"t2","match_method":"sleeper_id"},
+        {"key":"m1","name":"Mid 1","pos":"RB","fv":2010.0,"team":"C","age":25,"player_id":"m1","match_method":"sleeper_id"},
+        {"key":"m2","name":"Mid 2","pos":"RB","fv":1960.0,"team":"D","age":25,"player_id":"m2","match_method":"sleeper_id"},
+        {"key":"s1","name":"Small 1","pos":"TE","fv":1020.0,"team":"E","age":25,"player_id":"s1","match_method":"sleeper_id"},
+        {"key":"s2","name":"Small 2","pos":"LB","fv":990.0,"team":"F","age":25,"player_id":"s2","match_method":"sleeper_id"},
+        {"key":"s3","name":"Small 3","pos":"DB","fv":970.0,"team":"G","age":25,"player_id":"s3","match_method":"sleeper_id"},
+    ]
+    sparse_counts = Counter()
+    sparse_challenge = try_build_challenge(
+        sparse, sparse_counts, set(),
+        family="fragmentation_filler",
+        cell_id="frag_sparse_regression",
+        scale_label="mid",
+        scale_anchor=10000.0,
+        total_goal=10000.0,
+        shares_a=(0.80, 0.20),
+        shares_b=(0.80, 0.10, 0.10),
+        split="train",
+        fit_eligible=True,
+        treatment="80_20_vs_80_10_10",
+        rep_index=1,
+    )
+    assert sparse_challenge is not None
+    assert sparse_challenge["pair_total_gap_pct"] <= MAX_PAIR_TOTAL_GAP
+    assert sparse_challenge["side_a"]["max_share_error"] <= MAX_COMPONENT_SHARE_ERROR
+    assert sparse_challenge["side_b"]["max_share_error"] <= MAX_COMPONENT_SHARE_ERROR
+    assert not (
+        {a["key"] for a in sparse_challenge["side_a"]["assets"]}
+        & {a["key"] for a in sparse_challenge["side_b"]["assets"]}
+    )
 
     players = synthetic_players()
     v_ref = nearest_rank([p["fv"] for p in players], 0.95)
