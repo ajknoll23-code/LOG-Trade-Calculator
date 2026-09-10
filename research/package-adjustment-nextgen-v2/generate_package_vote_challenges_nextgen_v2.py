@@ -80,6 +80,7 @@ MAX_GOAL_CANDIDATES = 90
 FRAG_MAX_GOAL_CANDIDATES = 220
 MIN_ROSTERED_PLAYERS = 350
 APPEARANCE_PENALTY = 0.00035
+DIVERSITY_RANK_VERSION = 3
 
 
 def read_json(path: Path):
@@ -799,14 +800,25 @@ def try_build_challenge(players, appearance_counts, used_signatures, *, family,
             if signature in used_signatures:
                 continue
 
-            reuse = sum(appearance_counts[k] for k in keys_a | keys_b)
+            # Exact side reuse is a strong diversity penalty, not a hard ban.
+            # This preserves full cell coverage on sparse real-player grids while
+            # still preferring novel sides whenever a valid alternative exists.
+            side_signature_a = ("side", family, cell_id, scale_label, a_keys)
+            side_signature_b = ("side", family, cell_id, scale_label, b_keys)
+            side_reuse = (
+                int(side_signature_a in used_signatures)
+                + int(side_signature_b in used_signatures)
+            )
+            reuse_counts = [appearance_counts[k] for k in keys_a | keys_b]
             rank = (
+                side_reuse,
+                max(reuse_counts, default=0),
+                sum(reuse_counts),
                 pair_gap,
                 max(err_a, err_b),
                 max(share_err_a, share_err_b),
                 err_a + err_b,
                 share_err_a + share_err_b,
-                APPEARANCE_PENALTY * reuse,
                 tuple(sorted((a_keys, b_keys))),
             )
             ranked_pairs.append((rank, assets_a, assets_b, signature))
@@ -867,6 +879,9 @@ def add_cell(challenges, skipped, players, appearance_counts, used_signatures,
             continue
         signature = challenge_signature(candidate)
         used_signatures.add(signature)
+        for side in ("side_a", "side_b"):
+            side_keys = tuple(sorted(asset["key"] for asset in candidate[side]["assets"]))
+            used_signatures.add(("side", family, cell_id, scale_label, side_keys))
         challenges.append(candidate)
         for side in ("side_a", "side_b"):
             for asset in candidate[side]["assets"]:
@@ -1078,6 +1093,58 @@ def counter_to_dict(counter):
     return {str(k): int(v) for k, v in sorted(counter.items(), key=lambda kv: str(kv[0]))}
 
 
+def build_diversity_diagnostics(challenges, players, appearance_counts):
+    player_lookup = {p["key"]: p for p in players}
+    side_counts = Counter()
+    for challenge in challenges:
+        for side_name in ("side_a", "side_b"):
+            side_keys = tuple(sorted(a["key"] for a in challenge[side_name]["assets"]))
+            side_counts[(
+                challenge["family"],
+                challenge["cell_id"],
+                challenge["scale_label"],
+                side_keys,
+            )] += 1
+
+    total_slots = sum(int(v) for v in appearance_counts.values())
+    appearance_hhi = (
+        sum((float(v) / total_slots) ** 2 for v in appearance_counts.values())
+        if total_slots else 0.0
+    )
+    ranked = sorted(appearance_counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))
+    top_reused = []
+    for key, count in ranked[:12]:
+        player = player_lookup.get(key, {})
+        top_reused.append({
+            "key": key,
+            "name": player.get("name"),
+            "pos": player.get("pos"),
+            "fv": round(float(player["fv"]), 3) if player.get("fv") is not None else None,
+            "appearance_count": int(count),
+        })
+
+    repeat_counts = [int(count) for count in side_counts.values()]
+    return {
+        "rank_version": DIVERSITY_RANK_VERSION,
+        "unique_assets_used": len(appearance_counts),
+        "eligible_asset_coverage_pct": round(
+            100.0 * len(appearance_counts) / len(players), 4
+        ) if players else 0.0,
+        "total_asset_slots": total_slots,
+        "max_asset_appearance_count": max(appearance_counts.values()) if appearance_counts else 0,
+        "appearance_count_histogram": counter_to_dict(Counter(appearance_counts.values())),
+        "appearance_hhi": round(appearance_hhi, 10),
+        "exact_side_reuse_count_same_cell_scale": sum(
+            max(0, count - 1) for count in repeat_counts
+        ),
+        "max_exact_side_repeat_count_same_cell_scale": max(repeat_counts, default=0),
+        "repeated_side_package_count_same_cell_scale": sum(
+            1 for count in repeat_counts if count > 1
+        ),
+        "top_reused_assets": top_reused,
+    }
+
+
 def build_catalog_document(root: Path, players, unresolved, pos_counts, v_ref,
                            feasible_pairs, plans, fragmentation_plans, fragmentation_diagnostics,
                            holdout_plans, holdout_diagnostics, challenges, skipped,
@@ -1086,6 +1153,7 @@ def build_catalog_document(root: Path, players, unresolved, pos_counts, v_ref,
     family_counts = Counter(c["family"] for c in challenges)
     split_counts = Counter(c["split"] for c in challenges)
     scale_counts = Counter(c["scale_label"] for c in challenges)
+    diversity = build_diversity_diagnostics(challenges, players, appearance_counts)
 
     cells = []
     for (family, scale, cell_id), count in sorted(cell_counts.items()):
@@ -1194,7 +1262,8 @@ def build_catalog_document(root: Path, players, unresolved, pos_counts, v_ref,
             "structural_holdout_scale_diagnostics": holdout_diagnostics,
             "cell_counts": cells,
             "skipped_or_underfilled_cells": skipped,
-            "max_asset_appearance_count": max(appearance_counts.values()) if appearance_counts else 0,
+            "max_asset_appearance_count": diversity["max_asset_appearance_count"],
+            "diversity": diversity,
         },
         "challenges": challenges,
     }
@@ -1226,6 +1295,9 @@ def design_markdown(catalog):
         "",
         f"- Challenges: `{d['challenge_count']}`",
         f"- Feasible real-player 80/20 pairs used for scale derivation: `{d['feasible_80_20_pair_count']}`",
+        f"- Unique assets used: `{d['diversity']['unique_assets_used']}`",
+        f"- Maximum appearances by one asset: `{d['diversity']['max_asset_appearance_count']}`",
+        f"- Exact side reuses within the same cell/scale: `{d['diversity']['exact_side_reuse_count_same_cell_scale']}`",
         f"- Pick cells active: `{catalog['pick_cells']['active']}`",
         "- Core high-value scale is reserved from fitting.",
         "- All 3v3 structural-topology challenges are reserved from fitting.",
@@ -1343,6 +1415,7 @@ def run_generation(force=False, dry_run=False):
             "family_counts": counter_to_dict(Counter(c["family"] for c in challenges)),
             "split_counts": counter_to_dict(Counter(c["split"] for c in challenges)),
             "skipped_or_underfilled_cells": len(skipped),
+            "diversity": catalog["catalog_diagnostics"]["diversity"],
         }, indent=2, sort_keys=True))
         return
 
@@ -1493,6 +1566,10 @@ def selftest():
         for c in challenges
     )
     assert max(appearances.values()) > 0
+    diversity = build_diversity_diagnostics(challenges, players, appearances)
+    assert diversity["rank_version"] == DIVERSITY_RANK_VERSION
+    assert diversity["unique_assets_used"] > 0
+    assert diversity["max_exact_side_repeat_count_same_cell_scale"] >= 0
     assert set(frag_plans) == {label for label, _a, _b in FRAGMENTATION_COMPARISONS}
     for comparison, comparison_plans in frag_plans.items():
         anchors = [comparison_plans[label]["anchor_total_fv"] for label, _q in SCALE_QUANTILES]
