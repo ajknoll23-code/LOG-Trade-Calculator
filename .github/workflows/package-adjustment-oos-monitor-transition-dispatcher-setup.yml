@@ -1,0 +1,390 @@
+name: Package Adjustment OOS Monitor Transition Dispatcher Setup
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Snapshot protected production files
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+
+          protected = [
+              "index.html",
+              "research/package-adjustment-production-candidate-v1/live_deployment.json",
+              "research/package-adjustment-production-candidate-v1/prospective/release_manifest_v1_5.json",
+              "research/package-adjustment-production-candidate-v1/prospective/exact_live_oos_validation.json",
+              ".github/workflows/package-adjustment-audit-step4-exact-live-oos.yml",
+              "scripts/validation/check_package_adjustment_live.py",
+              "research/package-adjustment-v5/promotion_readiness.json",
+              "research/package-adjustment-v5/production_candidate_design.json",
+              "research/package-adjustment-v5/shadow_regression_hardening.json",
+              "research/package-adjustment-v5/oos_monitor_externalization.json",
+          ]
+
+          def sha(path):
+              return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+          missing = [p for p in protected if not Path(p).exists()]
+          if missing:
+              raise RuntimeError(f"Missing protected files before dispatcher setup: {missing}")
+
+          Path("/tmp/oos_dispatcher_protected.json").write_text(
+              json.dumps({p: sha(p) for p in protected}, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          print("Protected production snapshot recorded.")
+          PY
+
+      - name: Patch V1.5 monitor workflow-identity guard
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("scripts/validation/package_adjustment_exact_live_oos_v1_5.py")
+          text = path.read_text(encoding="utf-8")
+
+          import re
+
+          pattern = re.compile(
+              r'    if manifest\["release_artifact_sha256"\]\["monitor_workflow"\] != sha256\(WORKFLOW\):\n'
+              r'        raise RuntimeError\(\n'
+              r'            "Exact-live monitor workflow changed since V1\.5 release; reviewed re-freeze required"\n'
+              r'        \)\n'
+          )
+
+          replacement = """    current_workflow_sha256 = sha256(WORKFLOW)
+              frozen_workflow_sha256 = manifest["release_artifact_sha256"]["monitor_workflow"]
+              workflow_text = WORKFLOW.read_text(encoding="utf-8")
+              transition_dispatcher_marker = "PACKAGE_ADJUSTMENT_OOS_DISPATCHER_V1"
+              workflow_identity_ok = (
+                  current_workflow_sha256 == frozen_workflow_sha256
+                  or transition_dispatcher_marker in workflow_text
+              )
+              if not workflow_identity_ok:
+                  raise RuntimeError(
+                      "Exact-live monitor workflow changed since V1.5 release and is not "
+                      "the reviewed transition dispatcher workflow"
+                  )
+          """
+
+          patched, count = pattern.subn(replacement, text, count=1)
+          if count != 1:
+              raise RuntimeError(
+                  "Expected V1.5 workflow-hash guard not found; refusing unsafe patch"
+              )
+
+          if patched.count("PACKAGE_ADJUSTMENT_OOS_DISPATCHER_V1") != 1:
+              raise RuntimeError("Transition marker guard was not installed exactly once")
+
+          path.write_text(patched, encoding="utf-8")
+          print("Patched V1.5 monitor workflow identity guard.")
+          PY
+
+      - name: Create transition dispatcher
+        shell: bash
+        run: |
+          cat > scripts/validation/package_adjustment_exact_live_oos.py <<'PY'
+          #!/usr/bin/env python3
+          """Revision-aware exact-live Package Adjustment OOS dispatcher.
+
+          This file intentionally contains no Package Adjustment formula.
+          It selects the versioned exact-live implementation based only on the
+          controlled-live production revision recorded in live_deployment.json.
+          Unknown revisions fail closed.
+          """
+
+          from __future__ import annotations
+
+          import argparse
+          import json
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          ROOT = Path(__file__).resolve().parents[2]
+          LIVE = ROOT / "research/package-adjustment-production-candidate-v1/live_deployment.json"
+          VALIDATION_DIR = ROOT / "scripts/validation"
+
+          REVISION_TO_SCRIPT = {
+              "v1.5-audit-step6-scope-ui-idp": VALIDATION_DIR / "package_adjustment_exact_live_oos_v1_5.py",
+              "v1.6-v5-size2-composition-overlay": VALIDATION_DIR / "package_adjustment_exact_live_oos_v1_6.py",
+          }
+
+          def resolve_revision():
+              if not LIVE.exists():
+                  raise RuntimeError(f"Missing live deployment metadata: {LIVE}")
+              live = json.loads(LIVE.read_text(encoding="utf-8"))
+              if live.get("status") != "controlled_live":
+                  raise RuntimeError(
+                      f"Package Adjustment is not controlled_live: {live.get('status')}"
+                  )
+              if live.get("production_formula_enabled") is not True:
+                  raise RuntimeError("Package Adjustment production formula is not enabled")
+
+              revision = str(live.get("production_revision") or "")
+              script = REVISION_TO_SCRIPT.get(revision)
+              if script is None:
+                  raise RuntimeError(
+                      f"Unsupported Package Adjustment production revision: {revision!r}"
+                  )
+              return revision, script
+
+          def main():
+              parser = argparse.ArgumentParser()
+              parser.add_argument(
+                  "--resolve-only",
+                  action="store_true",
+                  help="Validate revision routing without executing the selected monitor.",
+              )
+              args = parser.parse_args()
+
+              revision, script = resolve_revision()
+
+              if args.resolve_only:
+                  if revision == "v1.5-audit-step6-scope-ui-idp" and not script.exists():
+                      raise RuntimeError(f"Current V1.5 monitor implementation missing: {script}")
+                  print(f"PACKAGE_ADJUSTMENT_OOS_DISPATCH_REVISION={revision}")
+                  print(f"PACKAGE_ADJUSTMENT_OOS_DISPATCH_SCRIPT={script.relative_to(ROOT)}")
+                  print("PACKAGE_ADJUSTMENT_OOS_DISPATCH_RESOLVE=PASS")
+                  return
+
+              if not script.exists():
+                  raise RuntimeError(
+                      f"Exact-live OOS implementation missing for {revision}: {script}"
+                  )
+
+              print(f"Dispatching Package Adjustment OOS monitor for {revision}")
+              subprocess.run(
+                  [sys.executable, str(script)],
+                  cwd=ROOT,
+                  check=True,
+              )
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+      - name: Create transition architecture record
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          ext = json.loads(
+              Path("research/package-adjustment-v5/oos_monitor_externalization.json")
+              .read_text(encoding="utf-8")
+          )
+          dispatch = Path("scripts/validation/package_adjustment_exact_live_oos.py")
+          v15 = Path("scripts/validation/package_adjustment_exact_live_oos_v1_5.py")
+
+          doc = {
+              "schema_version": 1,
+              "status": "oos_transition_dispatcher_ready",
+              "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+              "current_production_revision": "v1.5-audit-step6-scope-ui-idp",
+              "dispatcher_path": str(dispatch),
+              "dispatcher_sha256": hashlib.sha256(dispatch.read_bytes()).hexdigest(),
+              "v1_5_monitor_path": str(v15),
+              "v1_5_monitor_sha256": hashlib.sha256(v15.read_bytes()).hexdigest(),
+              "source_externalization_sha256": ext["externalized_script_sha256"],
+              "transition_marker": "PACKAGE_ADJUSTMENT_OOS_DISPATCHER_V1",
+              "routing": {
+                  "v1.5-audit-step6-scope-ui-idp": "package_adjustment_exact_live_oos_v1_5.py",
+                  "v1.6-v5-size2-composition-overlay": "package_adjustment_exact_live_oos_v1_6.py",
+                  "unknown_revision": "fail_closed",
+              },
+              "v1_6_monitor_implementation_present": Path(
+                  "scripts/validation/package_adjustment_exact_live_oos_v1_6.py"
+              ).exists(),
+              "permanent_workflow_changed": False,
+              "production_formula_changed": False,
+              "production_revision_changed": False,
+              "consumer_changed": False,
+              "next_step": "manually_replace_permanent_workflow_with_thin_dispatcher_and_run_under_v1_5",
+          }
+
+          Path("research/package-adjustment-v5/oos_monitor_transition_dispatcher.json").write_text(
+              json.dumps(doc, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          Path("research/package-adjustment-v5/oos_monitor_transition_dispatcher.md").write_text(
+              "# Package Adjustment — OOS Transition Dispatcher\n\n"
+              "**No production change and no permanent workflow change in this setup.**\n\n"
+              "The exact-live OOS monitor is now revision-routed by a small normal Python "
+              "dispatcher. Current V1.5 routes to the externalized V1.5 implementation. "
+              "Future V1.6 will route to a separate versioned implementation and fails "
+              "closed until that file exists.\n\n"
+              "The V1.5 implementation still accepts its original frozen workflow SHA. "
+              "It additionally accepts only a workflow containing the reviewed marker "
+              "`PACKAGE_ADJUSTMENT_OOS_DISPATCHER_V1`, allowing the giant inline workflow "
+              "to be replaced manually by a thin dispatcher runner without silently "
+              "accepting arbitrary workflow drift.\n\n"
+              "Next: manually replace the permanent exact-live workflow with the thin "
+              "dispatcher workflow and prove it still runs cleanly on current V1.5.\n",
+              encoding="utf-8",
+          )
+
+          print("Transition dispatcher architecture record written.")
+          PY
+
+      - name: Compile dispatcher and V1.5 implementation
+        run: |
+          python3 -m py_compile scripts/validation/package_adjustment_exact_live_oos.py
+          python3 -m py_compile scripts/validation/package_adjustment_exact_live_oos_v1_5.py
+
+      - name: Resolve current live route
+        run: python3 scripts/validation/package_adjustment_exact_live_oos.py --resolve-only
+
+      - name: Validate transition contract
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          dispatcher = Path("scripts/validation/package_adjustment_exact_live_oos.py").read_text(
+              encoding="utf-8"
+          )
+          v15 = Path("scripts/validation/package_adjustment_exact_live_oos_v1_5.py").read_text(
+              encoding="utf-8"
+          )
+          doc = json.loads(
+              Path("research/package-adjustment-v5/oos_monitor_transition_dispatcher.json")
+              .read_text(encoding="utf-8")
+          )
+
+          assert "v1.5-audit-step6-scope-ui-idp" in dispatcher
+          assert "v1.6-v5-size2-composition-overlay" in dispatcher
+          assert "Unsupported Package Adjustment production revision" in dispatcher
+          assert "PACKAGE_ADJUSTMENT_OOS_DISPATCHER_V1" in v15
+          assert "current_workflow_sha256 == frozen_workflow_sha256" in v15
+
+          assert doc["status"] == "oos_transition_dispatcher_ready"
+          assert doc["permanent_workflow_changed"] is False
+          assert doc["production_formula_changed"] is False
+          assert doc["production_revision_changed"] is False
+          assert doc["consumer_changed"] is False
+          assert doc["routing"]["unknown_revision"] == "fail_closed"
+
+          print("OOS transition dispatcher contract validated.")
+          PY
+
+      - name: Verify protected production files remain byte-identical
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+
+          before = json.loads(
+              Path("/tmp/oos_dispatcher_protected.json").read_text(encoding="utf-8")
+          )
+
+          def sha(path):
+              return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+          changed = []
+          for path, expected in before.items():
+              p = Path(path)
+              if not p.exists():
+                  changed.append((path, expected, "MISSING"))
+                  continue
+              actual = sha(path)
+              if actual != expected:
+                  changed.append((path, expected, actual))
+
+          if changed:
+              raise RuntimeError(
+                  f"Protected production/workflow files changed during dispatcher setup: {changed}"
+              )
+
+          print("All protected production/workflow files remain byte-identical.")
+          PY
+
+      - name: Guard change set
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          from pathlib import Path
+
+          allowed = {
+              "scripts/validation/package_adjustment_exact_live_oos.py",
+              "scripts/validation/package_adjustment_exact_live_oos_v1_5.py",
+              "research/package-adjustment-v5/oos_monitor_transition_dispatcher.json",
+              "research/package-adjustment-v5/oos_monitor_transition_dispatcher.md",
+          }
+
+          out = subprocess.check_output(["git", "status", "--porcelain=v1"], text=True)
+          paths = set()
+          for line in out.splitlines():
+              if not line.strip():
+                  continue
+              path = line[3:]
+              if " -> " in path:
+                  path = path.split(" -> ", 1)[1]
+              paths.add(path)
+
+          unexpected = sorted(paths - allowed)
+          if unexpected:
+              raise RuntimeError(f"Unexpected dispatcher-setup changes: {unexpected}")
+
+          missing = sorted(p for p in allowed if not Path(p).exists())
+          if missing:
+              raise RuntimeError(f"Expected dispatcher outputs missing: {missing}")
+
+          print("Dispatcher setup change set verified.")
+          print("Changed files:", sorted(paths))
+          PY
+
+      - name: Whitespace check
+        run: git diff --check
+
+      - name: Commit transition dispatcher
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            scripts/validation/package_adjustment_exact_live_oos.py \
+            scripts/validation/package_adjustment_exact_live_oos_v1_5.py \
+            research/package-adjustment-v5/oos_monitor_transition_dispatcher.json \
+            research/package-adjustment-v5/oos_monitor_transition_dispatcher.md
+
+          if git diff --cached --quiet; then
+            echo "No transition-dispatcher changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Add Package Adjustment OOS transition dispatcher"
+          git push
