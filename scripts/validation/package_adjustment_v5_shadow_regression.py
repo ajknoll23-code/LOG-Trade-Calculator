@@ -1,0 +1,937 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import math
+import statistics
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+MARKET_DIR = ROOT / "scripts" / "market"
+sys.path.insert(0, str(MARKET_DIR))
+
+import package_vote_v5_production_candidate_design as cand
+
+CANDIDATE_PATH = ROOT / "research/package-adjustment-v5/production_candidate_design.json"
+HARDENING_PATH = ROOT / "research/package-adjustment-v5/evidence_hardening.json"
+CATALOG_PATH = ROOT / "research/package-adjustment-v5/package_vote_challenges_v5.json"
+INDEX_PATH = ROOT / "index.html"
+OUT_JSON = ROOT / "research/package-adjustment-v5/shadow_regression_hardening.json"
+OUT_MD = ROOT / "research/package-adjustment-v5/shadow_regression_hardening.md"
+
+SIZE3_MULTIPLIER = 2.0512371846911357
+SIZE3_ENVELOPE = {
+    "largest_min": 0.41991319353657897,
+    "largest_max": 0.4696171986399035,
+    "middle_min": 0.30827026434134036,
+    "middle_max": 0.36725409193118236,
+    "smallest_min": 0.2120186203977994,
+    "smallest_max": 0.2247276896617619,
+}
+EPS = 1e-12
+
+def read_json(path: Path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+def sha256_file(path: Path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def canonical_candidate_hash(doc):
+    payload = copy.deepcopy(doc)
+    stored = payload.pop("candidate_spec_sha256", None)
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return stored, hashlib.sha256(encoded).hexdigest()
+
+def live_size2_composition_supported(largest, smallest):
+    return (
+        largest >= cand.V3_LARGEST_MIN - EPS
+        and largest <= cand.V3_LARGEST_MAX + EPS
+        and smallest >= cand.V3_SMALLEST_MIN - EPS
+        and smallest <= cand.V3_SMALLEST_MAX + EPS
+    )
+
+def size3_composition_supported(values):
+    ordered = sorted((float(v) for v in values), reverse=True)
+    total = sum(ordered)
+    if total <= 0 or len(ordered) != 3:
+        return False, (None, None, None)
+    largest, middle, smallest = [v / total for v in ordered]
+    e = SIZE3_ENVELOPE
+    ok = (
+        largest >= e["largest_min"] - EPS
+        and largest <= e["largest_max"] + EPS
+        and middle >= e["middle_min"] - EPS
+        and middle <= e["middle_max"] + EPS
+        and smallest >= e["smallest_min"] - EPS
+        and smallest <= e["smallest_max"] + EPS
+    )
+    return ok, (largest, middle, smallest)
+
+def evaluate(
+    mode,
+    target_fv,
+    package_values,
+    *,
+    target_pos="WR",
+    package_positions=None,
+    contains_pick=False,
+    target_player_count=1,
+):
+    if mode not in {"live", "candidate"}:
+        raise ValueError(mode)
+
+    try:
+        target = float(target_fv)
+        values = [float(v) for v in package_values]
+    except (TypeError, ValueError):
+        return {"status": "unsupported", "reason": "invalid_numeric_input"}
+
+    if not (target > 0) or any(not math.isfinite(v) or v < 0 for v in values):
+        return {"status": "unsupported", "reason": "invalid_numeric_input"}
+
+    if target_player_count != 1:
+        return {"status": "unsupported", "reason": "multi_vs_multi_unsupported"}
+
+    if contains_pick:
+        return {"status": "unsupported", "reason": "draft_picks_unsupported"}
+
+    if package_positions is None:
+        package_positions = ["WR"] * len(values)
+
+    positions = [str(target_pos)] + [str(p) for p in package_positions]
+    if any(p not in cand.SUPPORTED_POSITIONS for p in positions):
+        return {"status": "unsupported", "reason": "unsupported_position"}
+
+    if len(values) < 2:
+        return {"status": "not_applicable", "reason": "one_for_one"}
+
+    if any(v >= target for v in values):
+        return {
+            "status": "unsupported",
+            "reason": "package_piece_at_or_above_target",
+        }
+
+    cutoff = target * 0.06
+    meaningful = [v for v in values if v >= cutoff]
+
+    if len(meaningful) < 2:
+        return {
+            "status": "not_applicable",
+            "reason": "effective_one_for_one_after_tiny_filter",
+        }
+
+    if len(meaningful) > 3:
+        return {
+            "status": "unsupported",
+            "reason": "more_than_three_meaningful_players",
+            "meaningful_count": len(meaningful),
+        }
+
+    raw_package_fv = sum(values)
+    meaningful_package_fv = sum(meaningful)
+    tiny_package_fv = raw_package_fv - meaningful_package_fv
+    base = cand.live_size2_multiplier(target)
+    if base is None:
+        return {"status": "unsupported", "reason": "size2_multiplier_unavailable"}
+
+    if len(meaningful) == 2:
+        ordered = sorted(meaningful, reverse=True)
+        largest = ordered[0] / meaningful_package_fv
+        smallest = ordered[1] / meaningful_package_fv
+
+        live_supported = live_size2_composition_supported(largest, smallest)
+        if mode == "live":
+            if not live_supported:
+                return {
+                    "status": "unsupported",
+                    "reason": "size2_composition_outside_frozen_v3_envelope",
+                    "meaningful_count": 2,
+                    "largest_share": largest,
+                    "smallest_share": smallest,
+                    "raw_package_fv": raw_package_fv,
+                    "meaningful_package_fv": meaningful_package_fv,
+                    "tiny_package_fv": tiny_package_fv,
+                }
+            factor = 1.0
+        else:
+            factor = cand.candidate_composition_factor(
+                largest,
+                CANDIDATE_FACTOR_55,
+                CANDIDATE_FACTOR_60,
+            )
+            if factor is None:
+                return {
+                    "status": "unsupported",
+                    "reason": "size2_composition_outside_candidate_envelope",
+                    "meaningful_count": 2,
+                    "largest_share": largest,
+                    "smallest_share": smallest,
+                    "raw_package_fv": raw_package_fv,
+                    "meaningful_package_fv": meaningful_package_fv,
+                    "tiny_package_fv": tiny_package_fv,
+                }
+
+        multiplier = base * factor
+        return {
+            "status": "applied",
+            "reason": "size2_package_adjustment",
+            "meaningful_count": 2,
+            "largest_share": largest,
+            "smallest_share": smallest,
+            "composition_factor": factor,
+            "multiplier": multiplier,
+            "raw_package_fv": raw_package_fv,
+            "meaningful_package_fv": meaningful_package_fv,
+            "tiny_package_fv": tiny_package_fv,
+            "trade_equivalent_target_fv": target * multiplier,
+        }
+
+    # Three meaningful players remain exact frozen V4 behavior in
+    # both controlled-live and the V5 candidate.
+    ok, shares = size3_composition_supported(meaningful)
+    if not ok:
+        return {
+            "status": "unsupported",
+            "reason": "size3_composition_outside_frozen_v4_envelope",
+            "meaningful_count": 3,
+            "largest_share": shares[0],
+            "middle_share": shares[1],
+            "smallest_share": shares[2],
+            "raw_package_fv": raw_package_fv,
+            "meaningful_package_fv": meaningful_package_fv,
+            "tiny_package_fv": tiny_package_fv,
+        }
+
+    return {
+        "status": "applied",
+        "reason": "size3_package_adjustment",
+        "meaningful_count": 3,
+        "largest_share": shares[0],
+        "middle_share": shares[1],
+        "smallest_share": shares[2],
+        "composition_factor": 1.0,
+        "multiplier": SIZE3_MULTIPLIER,
+        "raw_package_fv": raw_package_fv,
+        "meaningful_package_fv": meaningful_package_fv,
+        "tiny_package_fv": tiny_package_fv,
+        "trade_equivalent_target_fv": target * SIZE3_MULTIPLIER,
+    }
+
+def same_applied_semantics(a, b):
+    keys = (
+        "status",
+        "meaningful_count",
+        "multiplier",
+        "raw_package_fv",
+        "meaningful_package_fv",
+        "tiny_package_fv",
+        "trade_equivalent_target_fv",
+    )
+    for key in keys:
+        if key not in a and key not in b:
+            continue
+        av = a.get(key)
+        bv = b.get(key)
+        if isinstance(av, (float, int)) or isinstance(bv, (float, int)):
+            if av is None or bv is None or abs(float(av) - float(bv)) > 1e-9:
+                return False
+        elif av != bv:
+            return False
+    return True
+
+def verdict(raw_package_fv, effective_target_fv):
+    delta = float(raw_package_fv) - float(effective_target_fv)
+    if abs(delta) <= 1e-9:
+        return "even"
+    return "package" if delta > 0 else "target"
+
+def assert_index_contract():
+    text = INDEX_PATH.read_text(encoding="utf-8")
+    required_literals = (
+        'meaningfulPieceMinTargetShare: 0.06',
+        'supportedPlayerPositions: Object.freeze(["QB","RB","WR","TE","DL","LB","DB"])',
+        'size3Multiplier: 2.0512371846911357',
+        'largestMin: 0.41991319353657897',
+        'largestMax: 0.4696171986399035',
+        'middleMin: 0.30827026434134036',
+        'middleMax: 0.36725409193118236',
+        'smallestMin: 0.2120186203977994',
+        'smallestMax: 0.2247276896617619',
+        'largestMin: 0.5044104156375697',
+        'largestMax: 0.5230278884462152',
+        'smallestMin: 0.4769721115537849',
+        'smallestMax: 0.49558958436243034',
+        'Object.freeze({ targetFv: 4269.25, ratio: 1.4007986955507035 })',
+        'Object.freeze({ targetFv: 5049.5, ratio: 1.485881276187134 })',
+        'Object.freeze({ targetFv: 5558.25, ratio: 1.5368431747111482 })',
+        'Object.freeze({ targetFv: 6078.700000000002, ratio: 1.5859349498155657 })',
+        "reason:'package_piece_at_or_above_target'",
+        "reason:'effective_one_for_one_after_tiny_filter'",
+        "reason:'more_than_three_meaningful_players'",
+        "reason:'size2_composition_outside_frozen_v3_envelope'",
+        "reason:'size3_composition_outside_frozen_v4_envelope'",
+    )
+    missing = [literal for literal in required_literals if literal not in text]
+    if missing:
+        raise RuntimeError(
+            "Live index contract no longer contains expected V1.5 semantics: "
+            + repr(missing)
+        )
+    return len(required_literals)
+
+def adversarial_cases():
+    t = 1000.0
+    lo = cand.V3_LARGEST_MIN
+    hi = cand.V3_LARGEST_MAX
+    cases = []
+
+    def pair_from_share(share, total=1000.0):
+        return [total * share, total * (1.0 - share)]
+
+    def add(name, values, expected_live, expected_candidate, **kwargs):
+        live = evaluate("live", t, values, **kwargs)
+        candidate = evaluate("candidate", t, values, **kwargs)
+        if live["status"] != expected_live:
+            raise AssertionError(
+                f"{name}: live status {live['status']} != {expected_live}: {live}"
+            )
+        if candidate["status"] != expected_candidate:
+            raise AssertionError(
+                f"{name}: candidate status {candidate['status']} != {expected_candidate}: {candidate}"
+            )
+        cases.append({
+            "name": name,
+            "live_status": live["status"],
+            "candidate_status": candidate["status"],
+            "candidate_reason": candidate.get("reason"),
+        })
+        return live, candidate
+
+    add(
+        "exact_50_50_legacy_lower_gap_preserved",
+        pair_from_share(0.5),
+        "unsupported",
+        "unsupported",
+    )
+    add(
+        "just_below_v3_lower_bound",
+        pair_from_share(lo - 1e-6),
+        "unsupported",
+        "unsupported",
+    )
+    live, candidate = add(
+        "exact_v3_lower_bound",
+        pair_from_share(lo),
+        "applied",
+        "applied",
+    )
+    assert same_applied_semantics(live, candidate)
+
+    live, candidate = add(
+        "exact_v3_upper_bound",
+        pair_from_share(hi),
+        "applied",
+        "applied",
+    )
+    assert same_applied_semantics(live, candidate)
+
+    add(
+        "just_above_v3_upper_bound_new_support",
+        pair_from_share(hi + 1e-6),
+        "unsupported",
+        "applied",
+    )
+    add("55_45_anchor", pair_from_share(0.55), "unsupported", "applied")
+    add("56_44_interior", pair_from_share(0.56), "unsupported", "applied")
+    add("60_40_ceiling", pair_from_share(0.60), "unsupported", "applied")
+    add(
+        "just_above_60_40_fail_closed",
+        pair_from_share(0.600001),
+        "unsupported",
+        "unsupported",
+    )
+    add("65_35_fail_closed", pair_from_share(0.65), "unsupported", "unsupported")
+
+    live, candidate = add(
+        "tiny_third_below_six_percent",
+        [510.0, 490.0, 59.0],
+        "applied",
+        "applied",
+    )
+    assert same_applied_semantics(live, candidate)
+    assert abs(candidate["tiny_package_fv"] - 59.0) < 1e-12
+    assert abs(candidate["raw_package_fv"] - 1059.0) < 1e-12
+
+    live, candidate = add(
+        "two_meaningful_plus_two_tiny_full_raw_fv",
+        [510.0, 490.0, 59.0, 40.0],
+        "applied",
+        "applied",
+    )
+    assert same_applied_semantics(live, candidate)
+    assert abs(candidate["tiny_package_fv"] - 99.0) < 1e-12
+    assert abs(candidate["raw_package_fv"] - 1099.0) < 1e-12
+
+    add(
+        "exact_six_percent_becomes_meaningful",
+        [510.0, 490.0, 60.0],
+        "unsupported",
+        "unsupported",
+    )
+
+    live, candidate = add(
+        "frozen_v4_exact_shape",
+        [450.0, 330.0, 220.0],
+        "applied",
+        "applied",
+    )
+    assert same_applied_semantics(live, candidate)
+    assert abs(candidate["multiplier"] - SIZE3_MULTIPLIER) < 1e-12
+
+    live, candidate = add(
+        "frozen_v4_with_tiny_fourth",
+        [450.0, 330.0, 220.0, 59.0],
+        "applied",
+        "applied",
+    )
+    assert same_applied_semantics(live, candidate)
+    assert abs(candidate["tiny_package_fv"] - 59.0) < 1e-12
+
+    add(
+        "outside_v4_shape",
+        [470.0, 330.0, 200.0],
+        "unsupported",
+        "unsupported",
+    )
+    add(
+        "four_meaningful_players",
+        [400.0, 300.0, 200.0, 100.0],
+        "unsupported",
+        "unsupported",
+    )
+    add(
+        "package_piece_equal_target",
+        [1000.0, 200.0],
+        "unsupported",
+        "unsupported",
+    )
+    add(
+        "effective_one_for_one_after_tiny_filter",
+        [900.0, 59.0],
+        "not_applicable",
+        "not_applicable",
+    )
+    add(
+        "one_for_one",
+        [500.0],
+        "not_applicable",
+        "not_applicable",
+    )
+    add(
+        "unsupported_package_position_k",
+        [510.0, 490.0],
+        "unsupported",
+        "unsupported",
+        package_positions=["WR", "K"],
+    )
+    add(
+        "unsupported_target_position_k",
+        [510.0, 490.0],
+        "unsupported",
+        "unsupported",
+        target_pos="K",
+    )
+    add(
+        "draft_pick_present",
+        [510.0, 490.0],
+        "unsupported",
+        "unsupported",
+        contains_pick=True,
+    )
+    add(
+        "multi_vs_multi",
+        [510.0, 490.0],
+        "unsupported",
+        "unsupported",
+        target_player_count=2,
+    )
+
+    # Original motivating case.
+    ref_live = evaluate("live", 5896.0, [4153.0, 3258.0])
+    ref_candidate = evaluate("candidate", 5896.0, [4153.0, 3258.0])
+    assert ref_live["status"] == "unsupported"
+    assert ref_candidate["status"] == "applied"
+    assert abs(
+        ref_candidate["multiplier"]
+        - CANDIDATE_SPEC["reference_use_case_56_44"]["candidate_multiplier"]
+    ) < 1e-8
+    cases.append({
+        "name": "reference_pickens_56_44",
+        "live_status": ref_live["status"],
+        "candidate_status": ref_candidate["status"],
+        "candidate_multiplier": round(ref_candidate["multiplier"], 9),
+        "candidate_trade_equivalent_target_fv": round(
+            ref_candidate["trade_equivalent_target_fv"], 3
+        ),
+    })
+
+    return cases
+
+def dense_sweep():
+    target_fvs = (
+        2500.0,
+        3500.0,
+        4269.25,
+        4500.0,
+        5049.5,
+        5300.0,
+        5558.25,
+        5896.0,
+        6078.700000000002,
+        6500.0,
+        8000.0,
+        10000.0,
+    )
+    raw_ratios = (1.05, 1.25, 1.45, 1.60)
+    shares = [0.5 + i * 0.00025 for i in range(1001)]
+
+    total = 0
+    existing_applied = 0
+    existing_applied_changed = 0
+    newly_supported = 0
+    illegal_new_support = 0
+    new_support_above_60 = 0
+    candidate_factor_below_one = 0
+    candidate_applied = 0
+    raw_to_candidate_verdict_flips = 0
+    new_support_factors = []
+
+    for target in target_fvs:
+        for raw_ratio in raw_ratios:
+            total_package = target * raw_ratio
+            for share in shares:
+                total += 1
+                values = [
+                    total_package * share,
+                    total_package * (1.0 - share),
+                ]
+                live = evaluate("live", target, values)
+                candidate = evaluate("candidate", target, values)
+
+                if live["status"] == "applied":
+                    existing_applied += 1
+                    if candidate["status"] != "applied" or not same_applied_semantics(
+                        live, candidate
+                    ):
+                        existing_applied_changed += 1
+
+                if candidate["status"] == "applied":
+                    candidate_applied += 1
+                    factor = float(candidate["composition_factor"])
+                    if factor < 1.0 - 1e-12:
+                        candidate_factor_below_one += 1
+
+                if live["status"] != "applied" and candidate["status"] == "applied":
+                    newly_supported += 1
+                    share_actual = float(candidate["largest_share"])
+                    factor = float(candidate["composition_factor"])
+                    new_support_factors.append(factor)
+
+                    if not (
+                        share_actual > cand.V3_LARGEST_MAX - 1e-12
+                        and share_actual <= cand.EXPANSION_MAX_LARGEST_SHARE + 1e-12
+                    ):
+                        illegal_new_support += 1
+
+                    if share_actual > 0.60 + 1e-12:
+                        new_support_above_60 += 1
+
+                    raw_verdict = verdict(
+                        candidate["raw_package_fv"],
+                        target,
+                    )
+                    candidate_verdict = verdict(
+                        candidate["raw_package_fv"],
+                        candidate["trade_equivalent_target_fv"],
+                    )
+                    if raw_verdict != candidate_verdict:
+                        raw_to_candidate_verdict_flips += 1
+
+    if existing_applied_changed:
+        raise RuntimeError(
+            f"Candidate changed {existing_applied_changed} existing V1.5 applied cases"
+        )
+    if illegal_new_support:
+        raise RuntimeError(
+            f"Candidate created {illegal_new_support} newly-supported cases outside allowed expansion"
+        )
+    if new_support_above_60:
+        raise RuntimeError(
+            f"Candidate created {new_support_above_60} applied cases above 60/40"
+        )
+    if candidate_factor_below_one:
+        raise RuntimeError(
+            f"Candidate reduced the live V1.5 premium in {candidate_factor_below_one} cases"
+        )
+    if newly_supported <= 0:
+        raise RuntimeError("Dense sweep found no V5 expansion cases")
+
+    return {
+        "cases": total,
+        "target_fv_points": len(target_fvs),
+        "raw_ratio_points": len(raw_ratios),
+        "composition_share_points": len(shares),
+        "existing_v1_5_applied_cases": existing_applied,
+        "existing_v1_5_applied_cases_changed": existing_applied_changed,
+        "candidate_applied_cases": candidate_applied,
+        "newly_supported_v5_cases": newly_supported,
+        "illegal_new_support_cases": illegal_new_support,
+        "new_support_above_60_40_cases": new_support_above_60,
+        "candidate_factor_below_1_cases": candidate_factor_below_one,
+        "raw_to_candidate_verdict_flips_in_new_support": raw_to_candidate_verdict_flips,
+        "new_support_factor_min": round(min(new_support_factors), 9),
+        "new_support_factor_max": round(max(new_support_factors), 9),
+        "new_support_factor_median": round(statistics.median(new_support_factors), 9),
+    }
+
+def shape_audit():
+    shares = [
+        cand.V3_LARGEST_MAX
+        + (cand.EXPANSION_MAX_LARGEST_SHARE - cand.V3_LARGEST_MAX) * i / 10000.0
+        for i in range(10001)
+    ]
+    factors = [
+        cand.candidate_composition_factor(
+            s, CANDIDATE_FACTOR_55, CANDIDATE_FACTOR_60
+        )
+        for s in shares
+    ]
+    if any(f is None for f in factors):
+        raise RuntimeError("Candidate has a hole inside its supported composition interval")
+    if min(factors) < 1.0 - 1e-12:
+        raise RuntimeError("Candidate composition factor falls below 1.0")
+
+    peak_idx = max(range(len(factors)), key=lambda i: factors[i])
+    peak_share = shares[peak_idx]
+    peak_factor = factors[peak_idx]
+
+    # Candidate engineering intentionally connects three evidence
+    # anchors: V3 boundary -> 55/45 -> 60/40. It must have exactly
+    # the expected single peak and no oscillatory behavior.
+    pre = factors[: peak_idx + 1]
+    post = factors[peak_idx:]
+    pre_bad = sum(b < a - 1e-12 for a, b in zip(pre, pre[1:]))
+    post_bad = sum(b > a + 1e-12 for a, b in zip(post, post[1:]))
+    if pre_bad or post_bad:
+        raise RuntimeError(
+            f"Candidate factor shape oscillates unexpectedly: pre={pre_bad}, post={post_bad}"
+        )
+
+    if abs(peak_share - 0.55) > 2e-5:
+        raise RuntimeError(f"Candidate peak moved away from 55/45 anchor: {peak_share}")
+
+    # Verify the candidate threshold itself never requires either
+    # package piece to equal/exceed the target, across the live
+    # target-FV curve and expansion region.
+    max_largest_piece_to_target = 0.0
+    max_case = None
+    target_points = [
+        1000.0 + (12000.0 - 1000.0) * i / 250.0
+        for i in range(251)
+    ]
+    for target in target_points:
+        base = cand.live_size2_multiplier(target)
+        for s, f in zip(shares, factors):
+            ratio = base * f
+            piece_to_target = s * ratio
+            if piece_to_target > max_largest_piece_to_target:
+                max_largest_piece_to_target = piece_to_target
+                max_case = (target, s, f, ratio)
+    if max_largest_piece_to_target >= 1.0 - 1e-12:
+        raise RuntimeError(
+            "Candidate indifference threshold violates package-piece-below-target rule: "
+            f"{max_largest_piece_to_target} at {max_case}"
+        )
+
+    return {
+        "supported_interval_largest_share": [
+            cand.V3_LARGEST_MIN,
+            cand.EXPANSION_MAX_LARGEST_SHARE,
+        ],
+        "v5_expansion_interval_largest_share": [
+            cand.V3_LARGEST_MAX,
+            cand.EXPANSION_MAX_LARGEST_SHARE,
+        ],
+        "factor_floor": round(min(factors), 9),
+        "factor_peak": round(peak_factor, 9),
+        "factor_peak_largest_share": round(peak_share, 9),
+        "factor_at_60_40": round(factors[-1], 9),
+        "shape": "single_peak_at_55_45_then_declines_to_live_baseline_at_60_40",
+        "unexpected_pre_peak_decreases": pre_bad,
+        "unexpected_post_peak_increases": post_bad,
+        "max_candidate_threshold_largest_piece_to_target": round(
+            max_largest_piece_to_target, 9
+        ),
+        "threshold_piece_rule_safe": True,
+    }
+
+def catalog_audit():
+    doc = read_json(CATALOG_PATH)
+    by_label = {}
+    for label in ("50/50", "55/45", "60/40", "65/35", "70/30", "75/25"):
+        rows = [
+            c for c in doc["challenges"]
+            if c["composition_target"]["label"] == label
+        ]
+        supported = 0
+        unsupported = 0
+        actual_shares = []
+        for row in rows:
+            values = [float(p["fv"]) for p in row["package"]]
+            share = max(values) / sum(values)
+            actual_shares.append(share)
+            factor = cand.candidate_composition_factor(
+                share, CANDIDATE_FACTOR_55, CANDIDATE_FACTOR_60
+            )
+            if factor is None:
+                unsupported += 1
+            else:
+                supported += 1
+
+        by_label[label] = {
+            "challenges": len(rows),
+            "actual_largest_share_min": round(min(actual_shares), 9),
+            "actual_largest_share_max": round(max(actual_shares), 9),
+            "candidate_composition_supported": supported,
+            "candidate_composition_unsupported": unsupported,
+        }
+
+    if by_label["55/45"]["candidate_composition_supported"] != by_label["55/45"]["challenges"]:
+        raise RuntimeError("Candidate does not cover every hardened 55/45 challenge shape")
+    if by_label["65/35"]["candidate_composition_supported"] != 0:
+        raise RuntimeError("Candidate unexpectedly covers nominal 65/35 evidence")
+    if by_label["70/30"]["candidate_composition_supported"] != 0:
+        raise RuntimeError("Candidate unexpectedly covers nominal 70/30 evidence")
+    if by_label["75/25"]["candidate_composition_supported"] != 0:
+        raise RuntimeError("Candidate unexpectedly covers nominal 75/25 evidence")
+
+    return by_label
+
+def selftest():
+    global CANDIDATE_SPEC, CANDIDATE_FACTOR_55, CANDIDATE_FACTOR_60
+    CANDIDATE_SPEC = read_json(CANDIDATE_PATH)
+    CANDIDATE_FACTOR_55 = float(
+        CANDIDATE_SPEC["multiplier_policy"]["candidate_factor_55_45"]
+    )
+    CANDIDATE_FACTOR_60 = float(
+        CANDIDATE_SPEC["multiplier_policy"]["candidate_factor_60_40"]
+    )
+
+    # Minimal parity smoke tests.
+    live = evaluate("live", 1000.0, [510.0, 490.0])
+    candidate = evaluate("candidate", 1000.0, [510.0, 490.0])
+    assert live["status"] == candidate["status"] == "applied"
+    assert same_applied_semantics(live, candidate)
+
+    live = evaluate("live", 1000.0, [550.0, 450.0])
+    candidate = evaluate("candidate", 1000.0, [550.0, 450.0])
+    assert live["status"] == "unsupported"
+    assert candidate["status"] == "applied"
+    assert candidate["composition_factor"] > 1.0
+
+    assert evaluate("candidate", 1000.0, [600.001, 399.999])["status"] == "unsupported"
+
+    v4a = evaluate("live", 1000.0, [450.0, 330.0, 220.0])
+    v4b = evaluate("candidate", 1000.0, [450.0, 330.0, 220.0])
+    assert same_applied_semantics(v4a, v4b)
+
+    print("Package Adjustment V5 shadow regression self-test passed.")
+
+def main():
+    global CANDIDATE_SPEC, CANDIDATE_FACTOR_55, CANDIDATE_FACTOR_60
+
+    if "--selftest" in sys.argv:
+        selftest()
+        return
+
+    CANDIDATE_SPEC = read_json(CANDIDATE_PATH)
+    HARDENING = read_json(HARDENING_PATH)
+
+    if CANDIDATE_SPEC.get("status") != "shadow_candidate_design_complete":
+        raise RuntimeError("Unexpected V5 candidate status")
+    if CANDIDATE_SPEC.get("research_only") is not True:
+        raise RuntimeError("Candidate is not research-only")
+    if CANDIDATE_SPEC.get("production_formula_changed") is not False:
+        raise RuntimeError("Production already changed unexpectedly")
+    if CANDIDATE_SPEC.get("production_candidate_implemented") is not False:
+        raise RuntimeError("Candidate unexpectedly marked implemented")
+    if CANDIDATE_SPEC.get("production_promotion_allowed") is not False:
+        raise RuntimeError("Candidate unexpectedly permits production promotion")
+
+    if (
+        CANDIDATE_SPEC["source_evidence_fingerprint_sha256"]
+        != HARDENING["evidence_freeze"]["evidence_fingerprint_sha256"]
+    ):
+        raise RuntimeError("Candidate evidence fingerprint drift")
+
+    stored_hash, recomputed_hash = canonical_candidate_hash(CANDIDATE_SPEC)
+    if stored_hash != recomputed_hash:
+        raise RuntimeError(
+            f"Candidate spec hash mismatch: {stored_hash} != {recomputed_hash}"
+        )
+
+    CANDIDATE_FACTOR_55 = float(
+        CANDIDATE_SPEC["multiplier_policy"]["candidate_factor_55_45"]
+    )
+    CANDIDATE_FACTOR_60 = float(
+        CANDIDATE_SPEC["multiplier_policy"]["candidate_factor_60_40"]
+    )
+
+    if CANDIDATE_FACTOR_55 < 1.0 or CANDIDATE_FACTOR_60 < 1.0:
+        raise RuntimeError("Candidate factor floor violated")
+
+    index_contract_assertions = assert_index_contract()
+    adversarial = adversarial_cases()
+    sweep = dense_sweep()
+    shape = shape_audit()
+    catalog = catalog_audit()
+
+    ref = evaluate("candidate", 5896.0, [4153.0, 3258.0])
+    ref_raw = verdict(ref["raw_package_fv"], 5896.0)
+    ref_shadow = verdict(
+        ref["raw_package_fv"],
+        ref["trade_equivalent_target_fv"],
+    )
+
+    doc = {
+        "schema_version": 1,
+        "status": "shadow_regression_hardening_complete",
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "candidate_id": CANDIDATE_SPEC["candidate_id"],
+        "candidate_spec_sha256": stored_hash,
+        "source_evidence_fingerprint_sha256": CANDIDATE_SPEC[
+            "source_evidence_fingerprint_sha256"
+        ],
+        "source_counted_votes": CANDIDATE_SPEC["source_counted_votes"],
+        "research_only": True,
+        "production_revision": CANDIDATE_SPEC["production_revision"],
+        "production_formula_changed": False,
+        "production_candidate_implemented": False,
+        "production_promotion_allowed": False,
+        "automatic_production_change_allowed": False,
+        "fundamental_value_consumer_changed": False,
+        "market_value_consumer_changed": False,
+        "draft_pick_value_consumer_changed": False,
+        "team_utility_consumer_changed": False,
+        "trade_verdict_consumer_changed": False,
+        "validation": {
+            "candidate_spec_hash_verified": True,
+            "candidate_evidence_fingerprint_verified": True,
+            "live_index_contract_assertions": index_contract_assertions,
+            "adversarial_cases_passed": len(adversarial),
+            "dense_sweep": sweep,
+            "composition_shape_audit": shape,
+            "frozen_v5_catalog_shadow_coverage": catalog,
+        },
+        "adversarial_cases": adversarial,
+        "reference_use_case_56_44": {
+            "target_fv": 5896.0,
+            "package_fv": 7411.0,
+            "largest_meaningful_package_share": round(
+                ref["largest_share"], 9
+            ),
+            "candidate_composition_factor": round(
+                ref["composition_factor"], 9
+            ),
+            "candidate_multiplier": round(ref["multiplier"], 9),
+            "candidate_trade_equivalent_target_fv": round(
+                ref["trade_equivalent_target_fv"], 3
+            ),
+            "raw_verdict_without_package_adjustment": ref_raw,
+            "shadow_candidate_verdict": ref_shadow,
+        },
+        "conclusion": {
+            "shadow_regression_passed": True,
+            "candidate_ready_for_human_promotion_review": True,
+            "production_change_recommended": False,
+            "production_review_required": True,
+            "live_change_performed": False,
+            "shape_review_note": (
+                "Candidate composition factor intentionally peaks at 55/45 "
+                "and returns to the live V1.5 baseline at 60/40 because those "
+                "are the hardened evidence anchors."
+            ),
+            "next_step": "human_review_before_any_controlled_live_promotion",
+        },
+    }
+
+    OUT_JSON.write_text(
+        json.dumps(doc, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    lines = [
+        "# Package Adjustment V5 — Shadow Regression Hardening",
+        "",
+        "**SHADOW ONLY — controlled-live V1.5 is unchanged.**",
+        "",
+        f"- Candidate: `{doc['candidate_id']}`",
+        f"- Frozen evidence: `{doc['source_counted_votes']}` votes",
+        f"- Candidate spec SHA-256: `{doc['candidate_spec_sha256']}`",
+        f"- Adversarial cases passed: `{len(adversarial)}`",
+        f"- Dense numeric sweep cases: `{sweep['cases']}`",
+        f"- Existing V1.5 applied cases changed: `{sweep['existing_v1_5_applied_cases_changed']}`",
+        f"- Illegal new support cases: `{sweep['illegal_new_support_cases']}`",
+        f"- New support above 60/40: `{sweep['new_support_above_60_40_cases']}`",
+        f"- Candidate factors below 1.0: `{sweep['candidate_factor_below_1_cases']}`",
+        "",
+        "## Candidate shape",
+        "",
+        f"- Factor floor: `{shape['factor_floor']:.6f}x`",
+        f"- Factor peak: `{shape['factor_peak']:.6f}x` at largest share `{shape['factor_peak_largest_share']:.4f}`",
+        f"- Factor at 60/40: `{shape['factor_at_60_40']:.6f}x`",
+        f"- Threshold largest-piece maximum: `{shape['max_candidate_threshold_largest_piece_to_target']:.6f}x` target FV",
+        "- Shape is intentionally single-peaked at 55/45 and returns to the existing live baseline at 60/40.",
+        "",
+        "## Scope regression",
+        "",
+        "- Frozen V3 core behavior is byte/semantics protected.",
+        "- Frozen V4 3-player behavior is unchanged.",
+        "- Tiny sub-6% throw-ins stay excluded from composition classification but retain full raw FV.",
+        "- Package pieces at or above target FV remain unsupported.",
+        "- Picks, K, multi-v-multi, and 4+ meaningful-player packages remain fail closed.",
+        "- No candidate support exists above 60/40.",
+        "",
+        "## 56/44 motivating case",
+        "",
+        f"- Candidate factor: `{ref['composition_factor']:.3f}x`",
+        f"- Candidate multiplier: `{ref['multiplier']:.3f}x`",
+        f"- Trade-equivalent target FV: `{ref['trade_equivalent_target_fv']:,.0f}`",
+        f"- Raw verdict: `{ref_raw}` side",
+        f"- Shadow candidate verdict: `{ref_shadow}` side",
+        "",
+        "## Result",
+        "",
+        "**Shadow regression passed. Candidate is ready for human promotion review, not automatic production promotion.**",
+        "",
+        "No production formula or consumer was modified by this hardening pass.",
+        "",
+    ]
+    OUT_MD.write_text("\n".join(lines), encoding="utf-8")
+
+    print("V5 shadow regression hardening complete.")
+    print("Adversarial cases:", len(adversarial))
+    print("Dense sweep cases:", sweep["cases"])
+    print("Newly supported cases:", sweep["newly_supported_v5_cases"])
+    print("Existing live cases changed:", sweep["existing_v1_5_applied_cases_changed"])
+    print("Candidate ready for human promotion review: True")
+    print("Production remains unchanged.")
+
+if __name__ == "__main__":
+    main()
