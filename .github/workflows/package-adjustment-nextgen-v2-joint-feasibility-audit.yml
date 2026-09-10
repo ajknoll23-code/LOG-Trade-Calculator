@@ -1,0 +1,410 @@
+name: Package Adjustment NextGen V2 Joint Feasibility Audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: package-adjustment-nextgen-v2-joint-feasibility-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install validation dependency
+        run: python3 -m pip install requests
+
+      - name: Verify reviewed starting state
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          GEN="research/package-adjustment-nextgen-v2/generate_package_vote_challenges_nextgen_v2.py"
+          CAT="research/package-adjustment-nextgen-v2/package_vote_challenges_nextgen_v2.json"
+          SPEC="research/package-adjustment-nextgen-v2/package_adjustment_nextgen_v2_research_spec.md"
+
+          test -f "$GEN"
+          test -f "$CAT"
+          test -f "$SPEC"
+          test -z "$(git status --porcelain=v1)"
+
+          GEN_SHA="$(sha256sum "$GEN" | awk '{print $1}')"
+          SPEC_SHA="$(sha256sum "$SPEC" | awk '{print $1}')"
+
+          test "$GEN_SHA" = "e2fee705d959b363a1844635f8dd0dba87f2b316644f97952028d653507158ee"
+          test "$SPEC_SHA" = "e07734799c1b8da6a335fd8c568ccdbc7fb813562b8680073aa99613f36cb2fc"
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          cat = json.loads(Path(
+              "research/package-adjustment-nextgen-v2/package_vote_challenges_nextgen_v2.json"
+          ).read_text(encoding="utf-8"))
+
+          assert cat["status"] == "generated_research_catalog_unreleased"
+          assert cat["research_only"] is True
+          assert cat["frozen"] is False
+          assert cat["production_formula_enabled"] is False
+          assert cat["automatic_production_change_allowed"] is False
+          assert cat["generator_sha256"] == "e2fee705d959b363a1844635f8dd0dba87f2b316644f97952028d653507158ee"
+          assert cat["research_spec"]["sha256"] == "e07734799c1b8da6a335fd8c568ccdbc7fb813562b8680073aa99613f36cb2fc"
+          assert cat["catalog_diagnostics"]["challenge_count"] == 144
+          print("PASS: reviewed unreleased catalog/generator/spec starting state.")
+          PY
+
+      - name: Verify production Package Adjustment before audit
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/validation/check_package_adjustment_live.py
+
+      - name: Map exact joint feasibility and test true scale strata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import importlib.util
+          import json
+          from collections import Counter, defaultdict
+          from pathlib import Path
+
+          ROOT = Path.cwd()
+          GEN_PATH = ROOT / "research/package-adjustment-nextgen-v2/generate_package_vote_challenges_nextgen_v2.py"
+          CAT_PATH = ROOT / "research/package-adjustment-nextgen-v2/package_vote_challenges_nextgen_v2.json"
+          REPORT_PATH = Path("/tmp/package-adjustment-nextgen-v2-joint-feasibility-audit.json")
+
+          spec = importlib.util.spec_from_file_location("pkgnv2_generator", GEN_PATH)
+          g = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(g)
+
+          catalog = json.loads(CAT_PATH.read_text(encoding="utf-8"))
+          values_doc = g.read_json(g.VALUES)
+          rosters_doc = g.read_json(g.ROSTERS)
+          players, unresolved, pos_counts = g.build_player_universe(values_doc, rosters_doc)
+          feasible_pairs = g.enumerate_feasible_8020_pairs(players)
+
+          target_label = "80_20_vs_80_05x4"
+          match = [
+              row for row in g.FRAGMENTATION_COMPARISONS
+              if row[0] == target_label
+          ]
+          assert len(match) == 1
+          comparison_label, shares_a, shares_b = match[0]
+
+          # Reproduce the current component-window support exactly.
+          component_totals = []
+          seen = set()
+          for row in feasible_pairs:
+              total = float(row["total_fv"])
+              code = round(total, 3)
+              if code in seen:
+                  continue
+              seen.add(code)
+              if g.component_window_matching_exists(players, total, shares_a, shares_b):
+                  component_totals.append(total)
+          component_totals.sort()
+
+          assert len(component_totals) == 335
+
+          current_anchors = {
+              k: float(v)
+              for k, v in catalog["catalog_diagnostics"]["fragmentation_scale_diagnostics"][
+                  target_label
+              ]["scale_anchors"].items()
+          }
+          old_low_mid = (current_anchors["low"] + current_anchors["mid"]) / 2.0
+          old_mid_high = (current_anchors["mid"] + current_anchors["high"]) / 2.0
+
+          # A target is called "joint constructible" only if the real generator
+          # can produce an entire valid trade at that target with empty reuse
+          # history. Candidate limits are increased only to diagnose search
+          # truncation; all scientific 2.5% tolerances remain untouched.
+          limits = [24, 48, 96, 180]
+          original_limit = int(g.SIDE_CANDIDATE_LIMIT)
+          joint_rows = []
+
+          for idx, total in enumerate(component_totals, 1):
+              resolved_limit = None
+              candidate = None
+
+              for limit in limits:
+                  g.SIDE_CANDIDATE_LIMIT = limit
+                  candidate = g.try_build_challenge(
+                      players,
+                      Counter(),
+                      set(),
+                      family="fragmentation_filler",
+                      cell_id=f"frag_{comparison_label}",
+                      scale_label="support_map",
+                      scale_anchor=total,
+                      total_goal=total,
+                      shares_a=shares_a,
+                      shares_b=shares_b,
+                      split="train",
+                      fit_eligible=True,
+                      treatment=f"{g.profile_label(shares_a)}_vs_{g.profile_label(shares_b)}",
+                      rep_index=1,
+                  )
+                  if candidate is not None:
+                      resolved_limit = limit
+                      break
+
+              if candidate is not None:
+                  joint_rows.append({
+                      "total_fv": float(total),
+                      "minimum_tested_side_candidate_limit": int(resolved_limit),
+                      "pair_total_gap_pct": float(candidate["pair_total_gap_pct"]),
+                      "side_a_raw_fv": float(candidate["side_a"]["raw_fv"]),
+                      "side_b_raw_fv": float(candidate["side_b"]["raw_fv"]),
+                      "side_a_names": [a["name"] for a in candidate["side_a"]["assets"]],
+                      "side_b_names": [a["name"] for a in candidate["side_b"]["assets"]],
+                  })
+
+              if idx % 50 == 0 or idx == len(component_totals):
+                  print(
+                      f"support-map progress: {idx}/{len(component_totals)} "
+                      f"component totals tested; {len(joint_rows)} joint-constructible"
+                  )
+
+          g.SIDE_CANDIDATE_LIMIT = original_limit
+
+          joint_totals = [row["total_fv"] for row in joint_rows]
+          joint_totals.sort()
+
+          if len(joint_totals) < 15:
+              raise RuntimeError(
+                  "fewer than 15 fully joint-constructible targets exist for "
+                  f"{target_label}: {len(joint_totals)}"
+              )
+
+          # Show how much of the old low/mid/high component-feasible support was
+          # actually joint constructible.
+          old_band_joint_counts = {
+              "low": sum(x <= old_low_mid for x in joint_totals),
+              "mid": sum(old_low_mid < x <= old_mid_high for x in joint_totals),
+              "high": sum(x > old_mid_high for x in joint_totals),
+          }
+
+          # Derive new deterministic scale anchors from the true joint support
+          # using the same nearest-rank scale quantiles already preregistered.
+          joint_anchors = {
+              label: float(g.nearest_rank(joint_totals, q))
+              for label, q in g.SCALE_QUANTILES
+          }
+          if not (joint_anchors["low"] < joint_anchors["mid"] < joint_anchors["high"]):
+              raise RuntimeError(f"joint-support anchors not strictly increasing: {joint_anchors}")
+
+          joint_low_mid = (joint_anchors["low"] + joint_anchors["mid"]) / 2.0
+          joint_mid_high = (joint_anchors["mid"] + joint_anchors["high"]) / 2.0
+
+          joint_bands = {
+              "low": [x for x in joint_totals if x <= joint_low_mid],
+              "mid": [x for x in joint_totals if joint_low_mid < x <= joint_mid_high],
+              "high": [x for x in joint_totals if x > joint_mid_high],
+          }
+
+          band_summary = {}
+          for scale, vals in joint_bands.items():
+              band_summary[scale] = {
+                  "joint_target_count": len(vals),
+                  "min_total_fv": min(vals) if vals else None,
+                  "max_total_fv": max(vals) if vals else None,
+                  "anchor_total_fv": joint_anchors[scale],
+              }
+
+          # Simulate the complete 15-row 80/5x4 family sequentially using
+          # non-overlapping true-support bands. This mirrors catalog generation:
+          # one shared appearance history and one shared whole-challenge history.
+          family_attempts = []
+          chosen_attempt = None
+
+          for limit in limits:
+              g.SIDE_CANDIDATE_LIMIT = limit
+              sim_challenges = []
+              sim_skipped = []
+              appearances = Counter()
+              used_signatures = set()
+              cell_counts = {}
+              scale_results = {}
+
+              for scale_label, _q in g.SCALE_QUANTILES:
+                  anchor = joint_anchors[scale_label]
+                  goals = sorted(
+                      joint_bands[scale_label],
+                      key=lambda x: (abs(float(x) - anchor), float(x)),
+                  )
+                  info = {
+                      "label": scale_label,
+                      "anchor_total_fv": anchor,
+                      "candidate_goal_totals": [float(x) for x in goals],
+                  }
+
+                  before = len(sim_challenges)
+                  built = g.add_cell(
+                      sim_challenges,
+                      sim_skipped,
+                      players,
+                      appearances,
+                      used_signatures,
+                      info,
+                      family="fragmentation_filler",
+                      cell_id=f"frag_{comparison_label}",
+                      shares_a=shares_a,
+                      shares_b=shares_b,
+                      target_reps=g.FRAG_TARGET_REPS,
+                      split="train",
+                      fit_eligible=True,
+                      treatment=f"{g.profile_label(shares_a)}_vs_{g.profile_label(shares_b)}",
+                  )
+                  rows = sim_challenges[before:]
+                  goals_used = [float(c["goal_total_fv"]) for c in rows]
+                  scale_results[scale_label] = {
+                      "built_reps": int(built),
+                      "used_goal_totals": goals_used,
+                      "max_anchor_drift_pct": (
+                          max(abs(x - anchor) / anchor for x in goals_used)
+                          if goals_used else None
+                      ),
+                  }
+                  cell_counts[scale_label] = int(built)
+
+              # Cross-scale exact side reuse diagnostic, with scale intentionally
+              # omitted from the signature.
+              side_scales = defaultdict(set)
+              side_occurrence_count = Counter()
+              for c in sim_challenges:
+                  for side_name in ("side_a", "side_b"):
+                      keys = tuple(sorted(a["key"] for a in c[side_name]["assets"]))
+                      sig = (c["cell_id"], keys)
+                      side_scales[sig].add(c["scale_label"])
+                      side_occurrence_count[sig] += 1
+
+              cross_scale_repeat_sigs = [
+                  sig for sig, scales in side_scales.items()
+                  if len(scales) > 1
+              ]
+              diversity = g.build_diversity_diagnostics(
+                  sim_challenges, players, appearances
+              )
+
+              attempt = {
+                  "side_candidate_limit": int(limit),
+                  "total_rows_built": len(sim_challenges),
+                  "scale_results": scale_results,
+                  "skipped_or_underfilled_cells": sim_skipped,
+                  "cross_scale_exact_side_repeat_signature_count": len(
+                      cross_scale_repeat_sigs
+                  ),
+                  "diversity": diversity,
+              }
+              family_attempts.append(attempt)
+
+              if all(cell_counts.get(scale, 0) == g.FRAG_TARGET_REPS
+                     for scale, _q in g.SCALE_QUANTILES):
+                  chosen_attempt = attempt
+                  break
+
+          g.SIDE_CANDIDATE_LIMIT = original_limit
+
+          # Distribution of how much search width is needed just to establish
+          # single-trade constructibility across the true support.
+          limit_histogram = Counter(
+              row["minimum_tested_side_candidate_limit"] for row in joint_rows
+          )
+
+          report = {
+              "status": "audit_complete",
+              "mutates_repository": False,
+              "scientific_tolerances_changed": False,
+              "comparison": comparison_label,
+              "component_window_support": {
+                  "target_count": len(component_totals),
+                  "min_total_fv": min(component_totals),
+                  "max_total_fv": max(component_totals),
+                  "current_scale_anchors": current_anchors,
+                  "current_band_boundaries": {
+                      "low_mid_midpoint": old_low_mid,
+                      "mid_high_midpoint": old_mid_high,
+                  },
+              },
+              "joint_trade_support": {
+                  "target_count": len(joint_totals),
+                  "min_total_fv": min(joint_totals),
+                  "max_total_fv": max(joint_totals),
+                  "old_band_joint_target_counts": old_band_joint_counts,
+                  "minimum_candidate_limit_histogram": {
+                      str(k): int(v) for k, v in sorted(limit_histogram.items())
+                  },
+                  "derived_scale_anchors": joint_anchors,
+                  "derived_band_boundaries": {
+                      "low_mid_midpoint": joint_low_mid,
+                      "mid_high_midpoint": joint_mid_high,
+                  },
+                  "derived_band_summary": band_summary,
+                  "sample_lowest_joint_targets": joint_rows[:10],
+                  "sample_highest_joint_targets": joint_rows[-10:],
+              },
+              "three_scale_family_simulation": {
+                  "all_three_scales_support_5_reps": chosen_attempt is not None,
+                  "minimum_tested_side_candidate_limit_for_full_15_rows": (
+                      chosen_attempt["side_candidate_limit"]
+                      if chosen_attempt is not None else None
+                  ),
+                  "chosen_attempt": chosen_attempt,
+                  "attempts": family_attempts,
+              },
+          }
+
+          REPORT_PATH.write_text(
+              json.dumps(report, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          print("=== NEXTGEN V2 JOINT FEASIBILITY AUDIT ===")
+          print(json.dumps(report, indent=2, sort_keys=True))
+          print("=== END JOINT FEASIBILITY AUDIT ===")
+
+          assert catalog["frozen"] is False
+          assert catalog["research_only"] is True
+          assert catalog["production_formula_enabled"] is False
+          assert REPORT_PATH.is_file()
+          PY
+
+      - name: Upload joint-feasibility audit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-adjustment-nextgen-v2-joint-feasibility-audit
+          path: /tmp/package-adjustment-nextgen-v2-joint-feasibility-audit.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Prove audit wrote nothing to repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1)"
+          git diff --exit-code
+          git diff --cached --exit-code
+          echo "PASS: joint-feasibility audit made no repository changes."
+
+      - name: Revalidate production Package Adjustment after audit
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/validation/check_package_adjustment_live.py
