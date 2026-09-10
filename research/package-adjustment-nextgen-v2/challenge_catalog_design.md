@@ -4,8 +4,8 @@
 
 ## Frozen inputs
 
-- Generator commit: `52f3f40b0913006a338c25a2b43d6fa67e0e96e7`
-- Generator SHA-256: `d94ebd0d2f2779da788a1fe96853c10dcff625511e3e3ed1a2614e530c8304ab`
+- Generator commit: `f51228305b6088e3723047b646f41d8fb546a9b8`
+- Generator SHA-256: `e2fee705d959b363a1844635f8dd0dba87f2b316644f97952028d653507158ee`
 - Research spec SHA-256: `e07734799c1b8da6a335fd8c568ccdbc7fb813562b8680073aa99613f36cb2fc`
 - Player FV SHA-256: `a12a0fed97a95f8bbd3b33d56d1f8151de228a344af98982e6fb01b9a610012d`
 - League rosters SHA-256: `0d49ee988dc07afa7b0e34daa7d5e7a62cc9e263dca637dc760e27994bc9c716`
@@ -20,6 +20,9 @@
 
 - Challenges: `144`
 - Feasible real-player 80/20 pairs used for scale derivation: `11498`
+- Unique assets used: `241`
+- Maximum appearances by one asset: `18`
+- Exact side reuses within the same cell/scale: `7`
 - Pick cells active: `False`
 - Core high-value scale is reserved from fitting.
 - All 3v3 structural-topology challenges are reserved from fitting.
