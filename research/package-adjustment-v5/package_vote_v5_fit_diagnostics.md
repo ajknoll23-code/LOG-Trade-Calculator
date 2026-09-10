@@ -2,7 +2,7 @@
 
 **RESEARCH ONLY — no automatic production change is allowed.**
 
-- Generated: `2026-09-09T23:00:39.095089+00:00`
+- Generated: `2026-09-10T15:00:24.476413+00:00`
 - Status: `research_diagnostics_complete`
 - Production revision remains: `v1.5-audit-step6-scope-ui-idp`
 - Counted V5 votes: `600`
