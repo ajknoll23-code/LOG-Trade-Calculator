@@ -1,0 +1,596 @@
+name: Package Adjustment NextGen V2 Freeze Readiness Audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: package-adjustment-nextgen-v2-freeze-readiness-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Verify reviewed research state
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          GEN="research/package-adjustment-nextgen-v2/generate_package_vote_challenges_nextgen_v2.py"
+          SPEC="research/package-adjustment-nextgen-v2/package_adjustment_nextgen_v2_research_spec.md"
+          CAT="research/package-adjustment-nextgen-v2/package_vote_challenges_nextgen_v2.json"
+
+          test -f "$GEN"
+          test -f "$SPEC"
+          test -f "$CAT"
+          test -z "$(git status --porcelain=v1)"
+
+          # Exact Git blob guards for the human-reviewed post-correction state.
+          test "$(git hash-object "$GEN")" = "a6f58a1db8945547f5e6a7ab2a3d822265e630d2"
+          test "$(git hash-object "$SPEC")" = "f92d1490772763de8f8cc9db35c7e0f9f49eda33"
+          test "$(git hash-object "$CAT")" = "dcf6e7799af5db28a4fdc467867ea860c7f4d46f"
+
+          echo "PASS: exact reviewed generator/spec/catalog blobs confirmed."
+
+      - name: Verify production baseline before audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/validation/check_package_adjustment_live.py
+
+      - name: Build freeze-readiness diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import csv
+          import hashlib
+          import json
+          import math
+          from collections import Counter, defaultdict
+          from pathlib import Path
+
+          ROOT = Path.cwd()
+          CAT = ROOT / "research/package-adjustment-nextgen-v2/package_vote_challenges_nextgen_v2.json"
+          GEN = ROOT / "research/package-adjustment-nextgen-v2/generate_package_vote_challenges_nextgen_v2.py"
+          SPEC = ROOT / "research/package-adjustment-nextgen-v2/package_adjustment_nextgen_v2_research_spec.md"
+
+          OUT_JSON = Path("/tmp/package-adjustment-nextgen-v2-freeze-readiness-audit.json")
+          OUT_MD = Path("/tmp/package-adjustment-nextgen-v2-freeze-readiness-audit.md")
+          OUT_CSV = Path("/tmp/package-adjustment-nextgen-v2-matchup-review.csv")
+
+          cat = json.loads(CAT.read_text(encoding="utf-8"))
+          challenges = cat["challenges"]
+          diag = cat["catalog_diagnostics"]
+
+          def sha256(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          # ------------------------------------------------------------------
+          # Hard catalog-state / isolation invariants.
+          # ------------------------------------------------------------------
+          assert cat["status"] == "generated_research_catalog_unreleased"
+          assert cat["research_only"] is True
+          assert cat["frozen"] is False
+          assert cat["production_formula_enabled"] is False
+          assert cat["automatic_production_change_allowed"] is False
+          assert cat["production_revision_at_generation"] == "v1.6-v5-size2-composition-overlay"
+          assert cat["exact_live_formula_sha256_at_generation"] == "9a1a52f3393a701fe8463fcf2179d1342debb925da1109ce73276b8b2b8cbbc7"
+          assert cat["generator_sha256"] == sha256(GEN)
+          assert cat["research_spec"]["sha256"] == sha256(SPEC)
+
+          assert len(challenges) == 129
+          assert diag["challenge_count"] == 129
+          assert diag["family_counts"] == {
+              "core_concentration_2v2": 90,
+              "fragmentation_filler": 15,
+              "structural_topology_3v3": 24,
+          }
+          assert diag["split_counts"] == {
+              "train": 75,
+              "structural_scale_holdout": 30,
+              "structural_topology_holdout": 24,
+          }
+          assert diag["scale_counts"] == {"low": 43, "mid": 43, "high": 43}
+          assert diag["skipped_or_underfilled_cells"] == []
+
+          active_frag = cat["design"]["fragmentation_comparisons"]
+          deferred_frag = cat["design"]["deferred_fragmentation_comparisons"]
+          assert [r["label"] for r in active_frag] == ["80_20_vs_80_10_10"]
+          assert len(deferred_frag) == 1
+          assert deferred_frag[0]["label"] == "80_20_vs_80_05x4"
+          assert deferred_frag[0]["status"] == "deferred_pre_freeze"
+
+          assert not any(
+              c["cell_id"] == "frag_80_20_vs_80_05x4"
+              or c["treatment"] == "80_20_vs_80_05x4"
+              for c in challenges
+          )
+
+          # ------------------------------------------------------------------
+          # Row-level validity and exact tolerance maxima.
+          # ------------------------------------------------------------------
+          ids = [c["id"] for c in challenges]
+          assert len(ids) == len(set(ids))
+
+          max_pair_gap = 0.0
+          max_side_target_error = 0.0
+          max_share_error = 0.0
+          duplicate_asset_rows = []
+          nonpositive_fv_rows = []
+          kicker_rows = []
+
+          for c in challenges:
+              max_pair_gap = max(max_pair_gap, float(c["pair_total_gap_pct"]))
+              assert c["values_hidden_from_voter"] is True
+
+              all_keys = []
+              for side_name in ("side_a", "side_b"):
+                  side = c[side_name]
+                  max_side_target_error = max(
+                      max_side_target_error, float(side["target_total_error_pct"])
+                  )
+                  max_share_error = max(
+                      max_share_error, float(side["max_share_error"])
+                  )
+                  keys = [str(a["key"]) for a in side["assets"]]
+                  all_keys.extend(keys)
+
+                  for a in side["assets"]:
+                      if float(a["fv"]) <= 0:
+                          nonpositive_fv_rows.append((c["id"], a["name"]))
+                      if str(a["pos"]).upper() == "K":
+                          kicker_rows.append((c["id"], a["name"]))
+
+              if len(all_keys) != len(set(all_keys)):
+                  duplicate_asset_rows.append(c["id"])
+
+              if c["split"] != "train":
+                  assert c["fit_eligible"] is False
+
+          assert max_pair_gap <= 0.025 + 1e-12
+          assert max_side_target_error <= 0.025 + 1e-12
+          assert max_share_error <= 0.025 + 1e-12
+          assert not duplicate_asset_rows
+          assert not nonpositive_fv_rows
+          assert not kicker_rows
+
+          # ------------------------------------------------------------------
+          # Exact package reuse diagnostics — intentionally broader than the
+          # generator's same-cell/same-scale diagnostic.
+          # ------------------------------------------------------------------
+          side_occurrences = defaultdict(list)
+
+          def side_sig(side):
+              return tuple(sorted(str(a["key"]) for a in side["assets"]))
+
+          challenge_sigs = Counter()
+
+          for c in challenges:
+              sa = side_sig(c["side_a"])
+              sb = side_sig(c["side_b"])
+              canonical_challenge = tuple(sorted((sa, sb)))
+              challenge_sigs[canonical_challenge] += 1
+
+              for side_name, sig in (("side_a", sa), ("side_b", sb)):
+                  side_occurrences[sig].append({
+                      "challenge_id": c["id"],
+                      "family": c["family"],
+                      "cell_id": c["cell_id"],
+                      "scale_label": c["scale_label"],
+                      "treatment": c["treatment"],
+                      "side": side_name,
+                      "raw_fv": float(c[side_name]["raw_fv"]),
+                      "names": [a["name"] for a in c[side_name]["assets"]],
+                  })
+
+          exact_challenge_duplicate_count = sum(
+              max(0, n - 1) for n in challenge_sigs.values()
+          )
+          assert exact_challenge_duplicate_count == 0
+
+          repeated_side_signatures = {
+              sig: occ for sig, occ in side_occurrences.items() if len(occ) > 1
+          }
+
+          repeat_class_counts = Counter()
+          repeat_details = []
+          cross_scale_same_cell = []
+          cross_family = []
+
+          for sig, occs in sorted(
+              repeated_side_signatures.items(),
+              key=lambda item: (-len(item[1]), item[0]),
+          ):
+              cells = {o["cell_id"] for o in occs}
+              scales = {o["scale_label"] for o in occs}
+              families = {o["family"] for o in occs}
+
+              if len(families) > 1:
+                  cls = "cross_family"
+                  cross_family.append((sig, occs))
+              elif len(cells) > 1:
+                  cls = "cross_cell_same_family"
+              elif len(scales) > 1:
+                  cls = "cross_scale_same_cell"
+                  cross_scale_same_cell.append((sig, occs))
+              else:
+                  cls = "same_cell_same_scale"
+
+              repeat_class_counts[cls] += 1
+              repeat_details.append({
+                  "asset_keys": list(sig),
+                  "appearance_count": len(occs),
+                  "classification": cls,
+                  "occurrences": occs,
+              })
+
+          # Same exact package must never represent two absolute scales in the
+          # same experimental cell. This closes the prior diagnostic blind spot.
+          assert not cross_scale_same_cell
+
+          # Same-cell/same-scale repeat remains prohibited by generator diagnostics.
+          assert repeat_class_counts["same_cell_same_scale"] == 0
+
+          # ------------------------------------------------------------------
+          # Player exposure by family/cell/scale and top-asset exposure.
+          # ------------------------------------------------------------------
+          global_player = Counter()
+          family_player = defaultdict(Counter)
+          cell_player = defaultdict(Counter)
+          cell_scale_player = defaultdict(Counter)
+          top_asset_family = defaultdict(Counter)
+
+          for c in challenges:
+              for side_name in ("side_a", "side_b"):
+                  assets = c[side_name]["assets"]
+                  for a in assets:
+                      key = str(a["key"])
+                      global_player[key] += 1
+                      family_player[c["family"]][key] += 1
+                      cell_player[c["cell_id"]][key] += 1
+                      cell_scale_player[(c["cell_id"], c["scale_label"])][key] += 1
+
+                  top = max(
+                      assets,
+                      key=lambda a: (float(a["fv"]), str(a["key"])),
+                  )
+                  top_asset_family[c["family"]][str(top["key"])] += 1
+
+          player_meta = {}
+          for c in challenges:
+              for side_name in ("side_a", "side_b"):
+                  for a in c[side_name]["assets"]:
+                      player_meta[str(a["key"])] = {
+                          "name": a["name"], "pos": a["pos"], "fv": float(a["fv"])
+                      }
+
+          def exposure_summary(counter, denominator_rows=None):
+              if not counter:
+                  return {
+                      "unique_assets": 0,
+                      "max_appearance": 0,
+                      "top": [],
+                  }
+              top = []
+              for key, count in counter.most_common(12):
+                  row = dict(player_meta[key])
+                  row.update({"key": key, "appearance_count": int(count)})
+                  if denominator_rows:
+                      row["appearance_share_of_rows"] = count / denominator_rows
+                  top.append(row)
+              return {
+                  "unique_assets": len(counter),
+                  "max_appearance": max(counter.values()),
+                  "top": top,
+              }
+
+          family_rows = Counter(c["family"] for c in challenges)
+          cell_rows = Counter(c["cell_id"] for c in challenges)
+          cell_scale_rows = Counter((c["cell_id"], c["scale_label"]) for c in challenges)
+
+          family_exposure = {
+              fam: exposure_summary(counter, family_rows[fam])
+              for fam, counter in family_player.items()
+          }
+          cell_exposure = {
+              cell: exposure_summary(counter, cell_rows[cell])
+              for cell, counter in cell_player.items()
+          }
+          cell_scale_exposure = {
+              f"{cell}|{scale}": exposure_summary(
+                  counter, cell_scale_rows[(cell, scale)]
+              )
+              for (cell, scale), counter in cell_scale_player.items()
+          }
+
+          # Surviving fragmentation has already been human-reviewed; retain a
+          # hard anti-confounding ceiling: no player in more than 4 of 15 rows.
+          frag_summary = family_exposure["fragmentation_filler"]
+          assert frag_summary["max_appearance"] <= 4
+
+          # ------------------------------------------------------------------
+          # Scale integrity: summarize actual goals vs declared anchors, and
+          # prove non-overlap within every cell that has all three scale labels.
+          # ------------------------------------------------------------------
+          scale_groups = defaultdict(list)
+          for c in challenges:
+              scale_groups[(c["family"], c["cell_id"], c["scale_label"])].append(c)
+
+          scale_summary = []
+          by_cell_scale = defaultdict(dict)
+
+          for (family, cell, scale), rows in sorted(scale_groups.items()):
+              anchors = {float(r["scale_anchor_total_fv"]) for r in rows}
+              assert len(anchors) == 1
+              anchor = next(iter(anchors))
+              goals = [float(r["goal_total_fv"]) for r in rows]
+              drifts = [abs(g - anchor) / anchor for g in goals]
+              item = {
+                  "family": family,
+                  "cell_id": cell,
+                  "scale_label": scale,
+                  "row_count": len(rows),
+                  "anchor_total_fv": anchor,
+                  "goal_min": min(goals),
+                  "goal_max": max(goals),
+                  "mean_anchor_drift_pct": sum(drifts) / len(drifts),
+                  "max_anchor_drift_pct": max(drifts),
+              }
+              scale_summary.append(item)
+              by_cell_scale[(family, cell)][scale] = item
+
+          scale_nonoverlap = []
+          for (family, cell), scales in sorted(by_cell_scale.items()):
+              if set(scales) != {"low", "mid", "high"}:
+                  continue
+              low = scales["low"]
+              mid = scales["mid"]
+              high = scales["high"]
+              a_low = low["anchor_total_fv"]
+              a_mid = mid["anchor_total_fv"]
+              a_high = high["anchor_total_fv"]
+              assert a_low < a_mid < a_high
+
+              b1 = (a_low + a_mid) / 2.0
+              b2 = (a_mid + a_high) / 2.0
+
+              ok = (
+                  low["goal_max"] <= b1
+                  and mid["goal_min"] > b1
+                  and mid["goal_max"] <= b2
+                  and high["goal_min"] > b2
+              )
+              scale_nonoverlap.append({
+                  "family": family,
+                  "cell_id": cell,
+                  "low_mid_boundary": b1,
+                  "mid_high_boundary": b2,
+                  "nonoverlap_pass": ok,
+              })
+              assert ok, (family, cell, scales)
+
+          # ------------------------------------------------------------------
+          # Matchup-review CSV for literal human inspection.
+          # ------------------------------------------------------------------
+          with OUT_CSV.open("w", encoding="utf-8", newline="") as f:
+              writer = csv.DictWriter(
+                  f,
+                  fieldnames=[
+                      "id", "family", "cell_id", "scale_label", "split",
+                      "fit_eligible", "goal_total_fv", "scale_anchor_total_fv",
+                      "pair_total_gap_pct",
+                      "side_a_raw_fv", "side_a_assets",
+                      "side_b_raw_fv", "side_b_assets",
+                  ],
+              )
+              writer.writeheader()
+              for c in challenges:
+                  writer.writerow({
+                      "id": c["id"],
+                      "family": c["family"],
+                      "cell_id": c["cell_id"],
+                      "scale_label": c["scale_label"],
+                      "split": c["split"],
+                      "fit_eligible": c["fit_eligible"],
+                      "goal_total_fv": c["goal_total_fv"],
+                      "scale_anchor_total_fv": c["scale_anchor_total_fv"],
+                      "pair_total_gap_pct": c["pair_total_gap_pct"],
+                      "side_a_raw_fv": c["side_a"]["raw_fv"],
+                      "side_a_assets": " + ".join(
+                          f'{a["name"]} ({a["fv"]:.0f})'
+                          for a in c["side_a"]["assets"]
+                      ),
+                      "side_b_raw_fv": c["side_b"]["raw_fv"],
+                      "side_b_assets": " + ".join(
+                          f'{a["name"]} ({a["fv"]:.0f})'
+                          for a in c["side_b"]["assets"]
+                      ),
+                  })
+
+          # Global top exposure rows.
+          global_top = []
+          for key, count in global_player.most_common(20):
+              row = dict(player_meta[key])
+              row.update({
+                  "key": key,
+                  "appearance_count": int(count),
+                  "appearance_share_of_129_rows": count / 129.0,
+              })
+              global_top.append(row)
+
+          report = {
+              "status": "freeze_readiness_audit_complete",
+              "mutates_repository": False,
+              "production_change_authorized": False,
+              "catalog": {
+                  "challenge_count": len(challenges),
+                  "generator_sha256": sha256(GEN),
+                  "spec_sha256": sha256(SPEC),
+                  "catalog_sha256": sha256(CAT),
+                  "family_counts": dict(sorted(diag["family_counts"].items())),
+                  "split_counts": dict(sorted(diag["split_counts"].items())),
+                  "scale_counts": dict(sorted(diag["scale_counts"].items())),
+                  "deferred_fragmentation": deferred_frag,
+              },
+              "tolerance_maxima": {
+                  "max_pair_total_gap_pct": max_pair_gap,
+                  "max_side_target_error_pct": max_side_target_error,
+                  "max_component_share_error": max_share_error,
+              },
+              "exact_reuse": {
+                  "exact_whole_challenge_duplicate_count": exact_challenge_duplicate_count,
+                  "repeated_side_signature_count_global": len(repeated_side_signatures),
+                  "repeat_class_signature_counts": dict(sorted(repeat_class_counts.items())),
+                  "max_global_exact_side_package_occurrences": max(
+                      (len(v) for v in repeated_side_signatures.values()), default=1
+                  ),
+                  "details": repeat_details,
+              },
+              "exposure": {
+                  "global_unique_assets": len(global_player),
+                  "global_max_appearance": max(global_player.values(), default=0),
+                  "global_top": global_top,
+                  "by_family": family_exposure,
+                  "by_cell": cell_exposure,
+                  "by_cell_scale": cell_scale_exposure,
+              },
+              "scale_integrity": {
+                  "groups": scale_summary,
+                  "cell_nonoverlap_checks": scale_nonoverlap,
+              },
+              "hard_gates": {
+                  "catalog_unreleased_unfrozen": True,
+                  "production_formula_unchanged": True,
+                  "unsupported_80_05x4_absent": True,
+                  "unique_challenge_ids": True,
+                  "zero_whole_challenge_duplicates": True,
+                  "zero_same_cell_same_scale_side_reuse": True,
+                  "zero_cross_scale_same_cell_side_reuse": True,
+                  "all_scale_cells_nonoverlapping": True,
+                  "surviving_fragmentation_max_player_appearance_lte_4": True,
+                  "all_tolerances_preserved": True,
+                  "values_hidden_from_voter": True,
+                  "nontrain_rows_fit_ineligible": True,
+              },
+          }
+
+          OUT_JSON.write_text(
+              json.dumps(report, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          lines = [
+              "# Package Adjustment NextGen V2 — Freeze Readiness Audit",
+              "",
+              "**READ-ONLY. No production or research files were modified.**",
+              "",
+              f"- Challenges: **{len(challenges)}**",
+              f"- Families: **{dict(diag['family_counts'])}**",
+              f"- Splits: **{dict(diag['split_counts'])}**",
+              f"- Global unique assets: **{len(global_player)}**",
+              f"- Global max player appearance: **{max(global_player.values(), default=0)}**",
+              f"- Surviving fragmentation unique assets: **{frag_summary['unique_assets']}**",
+              f"- Surviving fragmentation max appearance: **{frag_summary['max_appearance']} / 15**",
+              f"- Global repeated exact side signatures: **{len(repeated_side_signatures)}**",
+              f"- Cross-scale exact side signatures within same cell: **{repeat_class_counts['cross_scale_same_cell']}**",
+              f"- Cross-cell exact side signatures within same family: **{repeat_class_counts['cross_cell_same_family']}**",
+              f"- Cross-family exact side signatures: **{repeat_class_counts['cross_family']}**",
+              f"- Same-cell/same-scale exact side signatures: **{repeat_class_counts['same_cell_same_scale']}**",
+              f"- Exact whole-challenge duplicates: **{exact_challenge_duplicate_count}**",
+              "",
+              "## Hard gates",
+              "",
+          ]
+          for key, value in report["hard_gates"].items():
+              lines.append(f"- {key}: **{'PASS' if value else 'FAIL'}**")
+
+          lines.extend([
+              "",
+              "## Top global player exposure",
+              "",
+          ])
+          for row in global_top[:12]:
+              lines.append(
+                  f"- {row['name']} ({row['pos']}, FV {row['fv']:.0f}): "
+                  f"**{row['appearance_count']}** appearances"
+              )
+
+          if repeat_details:
+              lines.extend([
+                  "",
+                  "## Exact side-package repeats requiring human context review",
+                  "",
+              ])
+              for item in repeat_details[:30]:
+                  first = item["occurrences"][0]
+                  names = " + ".join(first["names"])
+                  where = "; ".join(
+                      f"{o['cell_id']}/{o['scale_label']}/{o['challenge_id']}"
+                      for o in item["occurrences"]
+                  )
+                  lines.append(
+                      f"- **{item['classification']}** ×{item['appearance_count']}: "
+                      f"{names} — {where}"
+                  )
+
+          OUT_MD.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+          print("=== FREEZE READINESS SUMMARY ===")
+          print(f"challenge_count={len(challenges)}")
+          print(f"global_unique_assets={len(global_player)}")
+          print(f"global_max_appearance={max(global_player.values(), default=0)}")
+          print(f"fragmentation_unique_assets={frag_summary['unique_assets']}")
+          print(f"fragmentation_max_appearance={frag_summary['max_appearance']}")
+          print(f"repeated_side_signature_count_global={len(repeated_side_signatures)}")
+          print("repeat_class_signature_counts=" + json.dumps(
+              dict(sorted(repeat_class_counts.items())), sort_keys=True
+          ))
+          print(f"exact_whole_challenge_duplicate_count={exact_challenge_duplicate_count}")
+          print("tolerance_maxima=" + json.dumps(report["tolerance_maxima"], sort_keys=True))
+          print("ALL HARD FREEZE-READINESS AUDIT GATES PASSED")
+          print("=== END FREEZE READINESS SUMMARY ===")
+          PY
+
+      - name: Upload freeze-readiness artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-adjustment-nextgen-v2-freeze-readiness-audit
+          path: |
+            /tmp/package-adjustment-nextgen-v2-freeze-readiness-audit.json
+            /tmp/package-adjustment-nextgen-v2-freeze-readiness-audit.md
+            /tmp/package-adjustment-nextgen-v2-matchup-review.csv
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Prove repository remains untouched
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1)"
+          git diff --exit-code
+          git diff --cached --exit-code
+          echo "PASS: freeze-readiness audit wrote nothing to repository."
+
+      - name: Revalidate production Package Adjustment after audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/validation/check_package_adjustment_live.py
