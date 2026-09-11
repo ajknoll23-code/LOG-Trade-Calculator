@@ -47,6 +47,12 @@ TEAM_ALIASES = {
     "JAC": "JAX",  # confirmed provider difference in the existing IDP resolver
 }
 
+# Provider display names can legitimately add or drop a generational
+# suffix while the stable provider IDs continue to identify the same
+# person. This tolerance is used ONLY for a previously-authoritative
+# FPID<->Sleeper-ID pair; new identity discovery remains strict.
+GENERATIONAL_SUFFIXES = frozenset({"jr", "sr", "ii", "iii", "iv", "v"})
+
 POSITION_MAP = {
     "QB": "QB",
     "RB": "RB",
@@ -92,6 +98,36 @@ def normalize_name(value) -> str:
     s = str(value or "").strip().lower()
     s = re.sub(r"[.'’\-]", "", s)
     return re.sub(r"\s+", " ", s).strip()
+
+
+def split_generational_suffix(value):
+    # Return (base_name, suffix) after ordinary name normalization.
+    name = normalize_name(value)
+    parts = name.split()
+    if parts and parts[-1] in GENERATIONAL_SUFFIXES:
+        return " ".join(parts[:-1]), parts[-1]
+    return name, None
+
+
+def stable_authoritative_name_equivalent(prior_name, current_name) -> bool:
+    # Narrow equivalence for an already-authoritative stable ID pair.
+    # Exact names remain valid. A recognized generational suffix may
+    # exist on only one provider. If both supply suffixes, they must
+    # agree, so Sr/Jr or II/III still hard-fail.
+    prior = normalize_name(prior_name)
+    current = normalize_name(current_name)
+    if prior == current:
+        return True
+
+    prior_base, prior_suffix = split_generational_suffix(prior)
+    current_base, current_suffix = split_generational_suffix(current)
+    if prior_base != current_base:
+        return False
+
+    if prior_suffix and current_suffix:
+        return prior_suffix == current_suffix
+
+    return bool(prior_suffix or current_suffix)
 
 
 def normalize_team(value):
@@ -428,7 +464,7 @@ def preserve_previous_authoritative(fp, fresh, prior_sid, sleeper_by_sid):
         # Do not preserve an ID that vanished from the current Sleeper universe.
         return fresh
 
-    if current["player"] != fp["_name"]:
+    if not stable_authoritative_name_equivalent(fp["_name"], current["player"]):
         raise RuntimeError(
             f"Stable identity contradiction for FantasyPros {fp['_fpid']} "
             f"({fp['_name']}): prior Sleeper {prior_sid} now resolves to "
@@ -741,6 +777,70 @@ def run_production_selftest():
     assert (
         trusted_transition[0]["match_method"]
         == "previous_authoritative_stable_id_preserved_position_changed"
+    )
+
+    # Provider-only generational suffix changes are allowed ONLY because
+    # this is an already-authoritative stable FPID<->Sleeper-ID pair.
+    suffix_fp = {"players": [{
+        "fantasypros_id": 25263,
+        "name": "Tyrique Stevenson Sr.",
+        "normalized_name": "tyrique stevenson sr",
+        "source_position": "DB",
+        "team": "CHI",
+    }]}
+    suffix_raw = [{
+        "sleeper_id": "10897",
+        "player": "tyrique stevenson",
+        "pos": "CB",
+        "team": "CHI",
+        "fantasy_positions": ["DB"],
+        "raw_category_season_totals": {"idp_tkl_solo": 50},
+    }]
+    suffix_previous = [{
+        "fantasypros_id": 25263,
+        "name": "Tyrique Stevenson Sr.",
+        "fp_position": "DB",
+        "sleeper_id": "10897",
+        "requires_manual_review": False,
+    }]
+    suffix_rows = build_production_crosswalk(
+        suffix_fp, [], suffix_raw, refresh, suffix_previous
+    )
+    assert suffix_rows[0]["sleeper_id"] == "10897"
+    assert suffix_rows[0]["requires_manual_review"] is False
+
+    # The tolerance is symmetric if the suffix appears on Sleeper.
+    assert stable_authoritative_name_equivalent(
+        "Tyrique Stevenson", "Tyrique Stevenson Sr."
+    )
+    assert stable_authoritative_name_equivalent(
+        "Tyrique Stevenson Sr.", "Tyrique Stevenson"
+    )
+
+    # Conflicting generational suffixes remain contradictions.
+    assert not stable_authoritative_name_equivalent(
+        "Example Player Sr.", "Example Player Jr."
+    )
+    assert not stable_authoritative_name_equivalent(
+        "Example Player II", "Example Player III"
+    )
+
+    # Unrelated names remain contradictions.
+    assert not stable_authoritative_name_equivalent(
+        "Tyrique Stevenson Sr.", "Tyrique Smith"
+    )
+
+    # New identity matching remains strict: without prior authority,
+    # suffix mismatch must not manufacture a fresh match.
+    untrusted_suffix = build_production_crosswalk(
+        suffix_fp, [], suffix_raw, refresh, []
+    )
+    assert untrusted_suffix[0]["sleeper_id"] is None
+    assert untrusted_suffix[0]["candidate_sleeper_id"] is None
+    assert untrusted_suffix[0]["name_candidate_count"] == 0
+    assert (
+        untrusted_suffix[0]["match_method"]
+        == "no_sleeper_name_candidate"
     )
 
     # A previous stable mapping to the wrong current person must hard-fail.
