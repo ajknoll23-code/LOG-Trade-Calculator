@@ -52,7 +52,18 @@ CORE_PROFILES = (
 FLAT_PROFILE = (0.50, 0.50)
 FRAGMENTATION_COMPARISONS = (
     ("80_20_vs_80_10_10", (0.80, 0.20), (0.80, 0.10, 0.10)),
-    ("80_20_vs_80_05x4", (0.80, 0.20), (0.80, 0.05, 0.05, 0.05, 0.05)),
+)
+DEFERRED_FRAGMENTATION_COMPARISONS = (
+    {
+        "label": "80_20_vs_80_05x4",
+        "side_a": (0.80, 0.20),
+        "side_b": (0.80, 0.05, 0.05, 0.05, 0.05),
+        "status": "deferred_pre_freeze",
+        "reason": (
+            "frozen player universe forces unavoidable player-identity "
+            "confounding; see research spec section 17.1"
+        ),
+    },
 )
 HOLDOUT_3V3_COMPARISONS = (
     ("60_25_15_vs_34_33_33", (0.60, 0.25, 0.15), (0.34, 0.33, 0.33)),
@@ -1242,6 +1253,16 @@ def build_catalog_document(root: Path, players, unresolved, pos_counts, v_ref,
                 {"label": label, "side_a": list(a), "side_b": list(b)}
                 for label, a, b in FRAGMENTATION_COMPARISONS
             ],
+            "deferred_fragmentation_comparisons": [
+                {
+                    "label": row["label"],
+                    "side_a": list(row["side_a"]),
+                    "side_b": list(row["side_b"]),
+                    "status": row["status"],
+                    "reason": row["reason"],
+                }
+                for row in DEFERRED_FRAGMENTATION_COMPARISONS
+            ],
             "structural_holdout_comparisons": [
                 {"label": label, "side_a": list(a), "side_b": list(b)}
                 for label, a, b in HOLDOUT_3V3_COMPARISONS
@@ -1272,6 +1293,10 @@ def build_catalog_document(root: Path, players, unresolved, pos_counts, v_ref,
 def design_markdown(catalog):
     d = catalog["catalog_diagnostics"]
     vref = catalog["v_ref"]
+    deferred_labels = ", ".join(
+        row["label"]
+        for row in catalog["design"]["deferred_fragmentation_comparisons"]
+    )
     lines = [
         "# Package Adjustment NextGen V2 — Generated Challenge Catalog Design",
         "",
@@ -1299,6 +1324,7 @@ def design_markdown(catalog):
         f"- Maximum appearances by one asset: `{d['diversity']['max_asset_appearance_count']}`",
         f"- Exact side reuses within the same cell/scale: `{d['diversity']['exact_side_reuse_count_same_cell_scale']}`",
         f"- Pick cells active: `{catalog['pick_cells']['active']}`",
+        f"- Deferred fragmentation comparisons: `{deferred_labels or 'none'}`",
         "- Core high-value scale is reserved from fitting.",
         "- All 3v3 structural-topology challenges are reserved from fitting.",
         "- FV values must remain hidden from voters when activated.",
@@ -1571,6 +1597,8 @@ def selftest():
     assert diversity["unique_assets_used"] > 0
     assert diversity["max_exact_side_repeat_count_same_cell_scale"] >= 0
     assert set(frag_plans) == {label for label, _a, _b in FRAGMENTATION_COMPARISONS}
+    assert {label for label, _a, _b in FRAGMENTATION_COMPARISONS} == {"80_20_vs_80_10_10"}
+    assert {row["label"] for row in DEFERRED_FRAGMENTATION_COMPARISONS} == {"80_20_vs_80_05x4"}
     for comparison, comparison_plans in frag_plans.items():
         anchors = [comparison_plans[label]["anchor_total_fv"] for label, _q in SCALE_QUANTILES]
         assert anchors[0] < anchors[1] < anchors[2], comparison
@@ -1595,7 +1623,9 @@ def selftest():
         floored_players, floored_core
     )
     assert floored_frag["80_20_vs_80_10_10"]["low"]["anchor_total_fv"] >= floored_core["low"]["anchor_total_fv"]
-    assert floored_diag["80_20_vs_80_05x4"]["component_feasible_unique_total_count"] >= 12
+    assert set(floored_frag) == {"80_20_vs_80_10_10"}
+    assert set(floored_diag) == {"80_20_vs_80_10_10"}
+    assert floored_diag["80_20_vs_80_10_10"]["component_feasible_unique_total_count"] >= 12
     floored_holdout_anchors = [
         floored_holdout[label]["anchor_total_fv"] for label, _q in SCALE_QUANTILES
     ]

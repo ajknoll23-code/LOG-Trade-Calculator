@@ -671,6 +671,26 @@ Therefore, a preference against extra pieces does **not automatically prove rost
 
 M4 earns an explicit roster term only if observed preferences show a stable residual piece-count effect beyond M2's prediction.
 
+## 17.1 Pre-freeze frozen-snapshot support decision
+
+No NextGen V2 voting had been activated and no NextGen V2 votes had been collected when this decision was made. The generated catalog was still unreleased and `frozen: false`.
+
+Three read-only audits were run against the same frozen player-FV and league-roster snapshot. The preregistered construction tolerances were not changed.
+
+1. **Scale-integrity audit.** For `80/20 vs 80/5/5/5/5`, the original non-overlapping low and middle bands produced zero complete valid ballots even when the side-candidate search limit was increased from 24 to 48 to 96. The high band produced five ballots at the normal limit of 24. The `80/20 vs 80/10/10` comparison produced five ballots in all three bands at the normal limit.
+2. **Joint-feasibility audit.** Of 335 component-window-feasible candidate totals for `80/20 vs 80/5/5/5/5`, only 73 were fully joint-trade constructible. All 73 were between 10,231 and 11,109 FV. Nearest-rank 25th/50th/75th percentile anchors on that true support were 10,757 / 10,891 / 11,000, a low-to-high span of only 243 FV (about 2.26%). A full 15-ballot simulation across those narrow strata used Jahmyr Gibbs in 15/15 ballots and Bijan Robinson in 15/15 ballots.
+3. **Diversity-capacity audit.** At a side-candidate limit of 96, the valid candidate universe contained 463 unique full-trade signatures. Bijan Robinson appeared in 463/463. Exact mixed-integer optimization selecting five ballots proved that the minimum possible maximum player appearance was 5/5 even when exact side-package reuse was forbidden.
+
+This is a frozen-input support limitation, not evidence about voter preference.
+
+Therefore, for this frozen first-wave catalog:
+
+- `80/20 vs 80/10/10` remains active at low / middle / high scale.
+- `80/20 vs 80/5/5/5/5` is **deferred and inactive**. It is excluded from the voting catalog and from model fitting.
+- the deferred comparison may be reconsidered only under a newly frozen asset universe (including verified production pick FV if later available) and a new preregistered support/diversity audit;
+- the 2.5% side-total, component-share, and pair-total tolerances remain unchanged;
+- no vote outcomes were consulted, so this is a pre-freeze design correction rather than outcome-contingent experiment editing.
+
 ---
 
 # 18. Low-value filler stress family
