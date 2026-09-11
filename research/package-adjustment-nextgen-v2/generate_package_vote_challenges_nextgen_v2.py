@@ -1598,6 +1598,18 @@ def write_if_safe(path: Path, content: str, force: bool):
     return "written"
 
 
+def assert_catalog_document_mutable(document):
+    if document.get("frozen") is True:
+        raise RuntimeError(
+            "refusing to regenerate frozen NextGen V2 challenge catalog"
+        )
+
+
+def assert_catalog_not_frozen_for_generation():
+    if OUT.is_file():
+        assert_catalog_document_mutable(read_json(OUT))
+
+
 def snapshot_protected_files():
     paths = [SPEC, VALUES, ROSTERS, PROMOTION, *HISTORICAL_FROZEN]
     workflow_dir = ROOT / ".github" / "workflows"
@@ -1622,6 +1634,8 @@ def assert_snapshot_unchanged(before):
 
 def run_generation(force=False, dry_run=False):
     assert_required_files(ROOT)
+    if not dry_run:
+        assert_catalog_not_frozen_for_generation()
     assert_production_baseline()
     frozen_before = assert_historical_frozen()
     assert_transport_namespace_unused(ROOT)
@@ -1905,6 +1919,14 @@ def selftest():
     e_flat = (5000.0 ** p + 5000.0 ** p) ** (1.0 / p)
     assert e_conc > e_flat
     assert e_conc < 10000.0 and e_flat < 10000.0
+
+    assert_catalog_document_mutable({"frozen": False})
+    try:
+        assert_catalog_document_mutable({"frozen": True})
+    except RuntimeError as exc:
+        assert "refusing to regenerate frozen" in str(exc)
+    else:
+        raise AssertionError("frozen-catalog overwrite lock did not fail closed")
 
     print("Package Adjustment NextGen V2 generator self-test passed.")
     print(f"Synthetic challenges: {len(challenges)}")

@@ -1,6 +1,6 @@
 # Package Adjustment NextGen V2 — Research Specification and Preregistered Experiment
 
-**Status: DRAFT FOR HUMAN REVIEW — RESEARCH ONLY. NO PRODUCTION FORMULA CHANGE IS AUTHORIZED BY THIS DOCUMENT.**
+**Status: CHALLENGE CATALOG FROZEN / UNRELEASED — RESEARCH ONLY. VOTING IS NOT ACTIVATED AND NO PRODUCTION FORMULA CHANGE IS AUTHORIZED BY THIS DOCUMENT.**
 
 **Proposed repository directory:** `research/package-adjustment-nextgen-v2/`
 
@@ -869,6 +869,28 @@ The maturity plan must specify:
 - what constitutes an unresolved cell/family
 
 The maturity gate cannot be changed after seeing NextGen vote outcomes without creating a new preregistered revision.
+
+---
+
+## 23.1 Challenge-catalog freeze declaration
+
+The reviewed first-wave NextGen V2 challenge catalog is frozen before voting.
+
+Freeze scope:
+
+- the exact 129 challenge records are immutable research evidence;
+- the canonical challenge-array SHA-256 is recorded in the catalog freeze manifest;
+- future generator mutation attempts must fail closed when the on-disk catalog is marked
+  `frozen: true`;
+- the catalog remains unreleased until the preregistered power / precision and maturity
+  plan is committed;
+- browser voting is not activated by the freeze;
+- the reserved voting transport remains inactive;
+- production V1.6 remains unchanged; and
+- no model fit or voter outcome is used to define this freeze.
+
+Any future challenge-catalog revision requires a new explicit preregistered revision and
+may not silently replace this frozen evidence.
 
 ---
 
