@@ -4,9 +4,9 @@
 
 ## Frozen inputs
 
-- Generator commit: `4c82367576aefba3b5d083f05e37470f145299f7`
-- Generator SHA-256: `5dfee7f78e45d696d8b59213a84b421a1a4abc662999cd13850f853105d4bd83`
-- Research spec SHA-256: `878d14ad0ac6d5b4d2ca21de34a3b69d6504bdb9e4666c473e05e071da34a9ab`
+- Generator commit: `ff3bb6c7289d203c58d11e2fa0e843fa96d8eb5b`
+- Generator SHA-256: `730c46071c21df2014b352190dc01a0cb345756f0089695cc3d32ec6fbd3bc4d`
+- Research spec SHA-256: `2346305cb3de0c777541426557380d50fcad6d2a6667fb4e11af3e293a55e20e`
 - Player FV SHA-256: `a12a0fed97a95f8bbd3b33d56d1f8151de228a344af98982e6fb01b9a610012d`
 - League rosters SHA-256: `0d49ee988dc07afa7b0e34daa7d5e7a62cc9e263dca637dc760e27994bc9c716`
 - Controlled-live formula SHA-256: `9a1a52f3393a701fe8463fcf2179d1342debb925da1109ce73276b8b2b8cbbc7`
@@ -23,6 +23,10 @@
 - Unique assets used: `238`
 - Maximum appearances by one asset: `11`
 - Exact side reuses within the same cell/scale: `0`
+- Exact side reuses across scales within one cell: `0`
+- Cross-cell exact side signatures within one family: `31`
+- Core cross-cell reused signatures with non-50/50 shares: `0`
+- Maximum selected-goal drift from its scale anchor: `0.0028465999`
 - Pick cells active: `False`
 - Deferred fragmentation comparisons: `80_20_vs_80_05x4`
 - Core high-value scale is reserved from fitting.
