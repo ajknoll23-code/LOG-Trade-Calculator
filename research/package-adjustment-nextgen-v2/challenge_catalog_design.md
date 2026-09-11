@@ -1,12 +1,12 @@
 # Package Adjustment NextGen V2 — Generated Challenge Catalog Design
 
-**Status: GENERATED / UNRELEASED — RESEARCH ONLY. Production V1.6 is unchanged.**
+**Status: FROZEN / UNRELEASED — RESEARCH ONLY. Voting is not activated. Production V1.6 is unchanged.**
 
 ## Frozen inputs
 
-- Generator commit: `ff3bb6c7289d203c58d11e2fa0e843fa96d8eb5b`
-- Generator SHA-256: `730c46071c21df2014b352190dc01a0cb345756f0089695cc3d32ec6fbd3bc4d`
-- Research spec SHA-256: `2346305cb3de0c777541426557380d50fcad6d2a6667fb4e11af3e293a55e20e`
+- Generator commit: `36d5316db035a61541b40324f8f7b228014fd04a`
+- Generator SHA-256: `12528caf59207fdc99490f61d0899754add47f2f5b90a438e9672327a998e66b`
+- Research spec SHA-256: `6338697485a02ac1e93aeff55834e292fd0e8fba05302bfa21d88784aa8e1d8d`
 - Player FV SHA-256: `a12a0fed97a95f8bbd3b33d56d1f8151de228a344af98982e6fb01b9a610012d`
 - League rosters SHA-256: `0d49ee988dc07afa7b0e34daa7d5e7a62cc9e263dca637dc760e27994bc9c716`
 - Controlled-live formula SHA-256: `9a1a52f3393a701fe8463fcf2179d1342debb925da1109ce73276b8b2b8cbbc7`
@@ -45,6 +45,16 @@
 - structural_scale_holdout: `30`
 - structural_topology_holdout: `24`
 - train: `75`
+
+## Freeze
+
+- Frozen challenge count: `129`
+- Canonical challenge-payload SHA-256: `fa52f72f6f4bdeaf1a5a935bde0fb5d0ec0fc85cc2b0d58236c2101d47d4f5ab`
+- Freeze-lock generator commit: `36d5316db035a61541b40324f8f7b228014fd04a`
+- Freeze manifest: `research/package-adjustment-nextgen-v2/catalog_freeze_manifest.json`
+- Voting activated: `False`
+- Production change authorized: `False`
+- The next preregistered prerequisite is the power / precision and evidence-maturity plan.
 
 ## Isolation
 
