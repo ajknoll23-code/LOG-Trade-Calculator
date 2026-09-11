@@ -2,19 +2,19 @@
 
 Production resolver covering QB / RB / WR / TE / DL / LB / DB.
 
-- FantasyPros tracked rows: **1084**
+- FantasyPros tracked rows: **1083**
 - Authoritative stable-ID matches: **962**
-- Manual-review rows: **24**
+- Manual-review rows: **23**
 
 ## Coverage by position
 
 | Pos | FP rows | Authoritative | Match rate | Candidate | Manual review |
 |---|---:|---:|---:|---:|---:|
 | QB | 80 | 72 | 90.0% | 74 | 2 |
-| RB | 132 | 118 | 89.4% | 121 | 3 |
+| RB | 132 | 119 | 90.2% | 121 | 2 |
 | WR | 203 | 175 | 86.2% | 184 | 9 |
 | TE | 130 | 120 | 92.3% | 125 | 5 |
-| DL | 178 | 160 | 89.9% | 160 | 0 |
+| DL | 177 | 159 | 89.8% | 159 | 0 |
 | LB | 159 | 143 | 89.9% | 144 | 4 |
 | DB | 202 | 174 | 86.1% | 174 | 1 |
 
@@ -22,11 +22,11 @@ Production resolver covering QB / RB / WR / TE / DL / LB / DB.
 
 - `name_collision_resolved_by_position_team`: **4**
 - `name_found_position_incompatible`: **4**
-- `name_position_team_confirmed`: **953**
+- `name_position_team_confirmed`: **950**
 - `no_sleeper_name_candidate`: **98**
-- `previous_authoritative_stable_id_preserved`: **4**
+- `previous_authoritative_stable_id_preserved`: **7**
 - `previous_authoritative_stable_id_preserved_position_changed`: **1**
-- `unique_name_position_team_unavailable`: **20**
+- `unique_name_position_team_unavailable`: **19**
 
 ## Manual-review rows
 
@@ -36,7 +36,6 @@ These remain deliberately unresolved; downstream consumers must use existing fal
 |---|---|---|---|---|---|
 | Jake Browning | QB |  | 6111 |  | unique_name_position_team_unavailable |
 | Desmond Ridder | QB |  | 8159 |  | unique_name_position_team_unavailable |
-| Jarquez Hunter | RB |  | 11569 |  | unique_name_position_team_unavailable |
 | Terrell Jennings | RB |  | 12412 |  | unique_name_position_team_unavailable |
 | Eric Gray | RB |  | 10223 |  | unique_name_position_team_unavailable |
 | Brandin Cooks | WR |  | 2197 |  | unique_name_position_team_unavailable |

@@ -5,9 +5,9 @@ Protocol SHA256: `fe6ccf0d5b05bf15038e9239f4c7b18c1d8a40ba93f4f9db8cb01fcec6b076
 
 ## Status
 
-- Full snapshots seen: **16**
+- Full snapshots seen: **17**
 - Weekly market states after deduplication: **2**
-- Same-week snapshots deduplicated: **14**
+- Same-week snapshots deduplicated: **15**
 - Evaluated origin/horizon pairs: **1**
 - Pending origin/horizon pairs: **5**
 
@@ -19,7 +19,7 @@ This is a **market-target** backtest, not a fundamental player-quality backtest.
 
 | Origin | Future | Horizon | N | TD→future Spearman | Current market→future | Incremental Δ | Gap→change Spearman | Directional acc. |
 |---|---|---|---:|---:|---:|---:|---:|---:|
-| 2026-W36 | 2026-W37 | 1w | 453 | 0.380 | 0.961 | -0.581 | 0.162 | 0.571 |
+| 2026-W36 | 2026-W37 | 1w | 453 | 0.382 | 0.955 | -0.573 | 0.173 | 0.560 |
 
 ## Interpretation guardrails
 

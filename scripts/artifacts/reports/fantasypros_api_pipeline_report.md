@@ -10,7 +10,7 @@ Generated from a real, full-population fetch (declared_count == actual_players_r
 | Position | Players normalized |
 |---|---|
 | DB | 202 |
-| DL | 178 |
+| DL | 177 |
 | LB | 159 |
 | QB | 80 |
 | RB | 132 |
@@ -35,21 +35,21 @@ Generated from a real, full-population fetch (declared_count == actual_players_r
 (A verified fact from the real response, not an assumption -- if this list contains anything unexpected, the field-coverage numbers below should be checked per-label.)
 
 
-## IDP field coverage across the real full population (n=539)
+## IDP field coverage across the real full population (n=538)
 
 Per external review: a field existing in the schema doesn't mean it's actually populated -- checked directly rather than assumed, same as the milestone check above.
 
 | Field | Nonzero players | % nonzero |
 |---|---|---|
-| def_tackle | 528 | 98.0% |
-| def_assist | 528 | 98.0% |
-| def_sack | 528 | 98.0% |
+| def_tackle | 527 | 98.0% |
+| def_assist | 527 | 98.0% |
+| def_sack | 527 | 98.0% |
 | def_tlost | 0 | 0.0%  **UNPOPULATED** |
-| def_int | 509 | 94.4% |
-| def_pd | 528 | 98.0% |
-| def_ff | 528 | 98.0% |
-| def_fr | 528 | 98.0% |
-| def_td | 522 | 96.8% |
+| def_int | 508 | 94.4% |
+| def_pd | 527 | 98.0% |
+| def_ff | 527 | 98.0% |
+| def_fr | 527 | 98.0% |
+| def_td | 521 | 96.8% |
 | def_safety | 0 | 0.0%  **UNPOPULATED** |
 
 **def_tlost (TFL) is unpopulated across the entire real IDP population.** This directly affects the archetype investigation this pipeline exists to support -- if TFL isn't real, usable data, that specific piece of the EDGE-vs-tackle-volume question stays unresolved by this source.
