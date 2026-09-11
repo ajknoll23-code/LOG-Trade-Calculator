@@ -693,6 +693,32 @@ Therefore, for this frozen first-wave catalog:
 
 ---
 
+## 17.2 Permanent pre-freeze scale and package-reuse guardrails
+
+Before the first catalog freeze, the generator was hardened to make the scale-integrity
+failure class itself impossible to pass silently. This hardening was performed while the
+catalog remained unreleased and `frozen: false`, before any NextGen V2 voter exposure or
+vote outcomes.
+
+The generator must now:
+
+- derive midpoint boundaries from each cell's declared low / middle / high scale anchors
+  and reject any selected challenge goal that falls outside its declared scale band;
+- record per-cell/per-scale goal ranges and mean/max goal-to-anchor drift;
+- reject exact side-package reuse within the same cell and scale;
+- reject exact side-package reuse across different scales within the same experimental
+  cell;
+- report exact side-package reuse across cells and across families; and
+- for the core concentration ladder, allow a repeated exact package across different core
+  treatment cells only when every occurrence is the common 50/50 comparator. A manipulated
+  concentration package may not be reused across core treatment cells.
+
+The reviewed 129-row catalog passed these rules before freeze. The existing 2.5% side
+target, component-share, and pair-total tolerances remain unchanged. These guardrails do
+not alter the production Package Adjustment formula and do not use voter outcomes.
+
+---
+
 # 18. Low-value filler stress family
 
 A separate stress family progressively adds very low-value pieces.

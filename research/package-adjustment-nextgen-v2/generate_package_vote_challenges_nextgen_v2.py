@@ -7,7 +7,7 @@ import json
 import math
 import re
 import subprocess
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Iterable
 
@@ -1104,6 +1104,232 @@ def counter_to_dict(counter):
     return {str(k): int(v) for k, v in sorted(counter.items(), key=lambda kv: str(kv[0]))}
 
 
+def build_scale_reuse_integrity(challenges, core_plans, fragmentation_plans, holdout_plans):
+    scale_labels = [label for label, _q in SCALE_QUANTILES]
+    if scale_labels != ["low", "mid", "high"]:
+        raise RuntimeError(f"unexpected scale ordering: {scale_labels}")
+
+    def plan_for_cell(family, cell_id):
+        if family == "core_concentration_2v2":
+            return core_plans
+        if family == "fragmentation_filler":
+            prefix = "frag_"
+            if not cell_id.startswith(prefix):
+                raise RuntimeError(f"unexpected fragmentation cell id: {cell_id}")
+            comparison = cell_id[len(prefix):]
+            if comparison not in fragmentation_plans:
+                raise RuntimeError(
+                    f"missing fragmentation scale plan for {comparison}"
+                )
+            return fragmentation_plans[comparison]
+        if family == "structural_topology_3v3":
+            return holdout_plans
+        raise RuntimeError(f"unknown challenge family: {family}")
+
+    cell_rows = defaultdict(lambda: defaultdict(list))
+    side_occurrences = defaultdict(list)
+
+    for challenge in challenges:
+        family = challenge["family"]
+        cell_id = challenge["cell_id"]
+        scale = challenge["scale_label"]
+        plan = plan_for_cell(family, cell_id)
+
+        expected_anchor = float(plan[scale]["anchor_total_fv"])
+        recorded_anchor = float(challenge["scale_anchor_total_fv"])
+        if abs(expected_anchor - recorded_anchor) > 0.001:
+            raise RuntimeError(
+                f"{challenge['id']}: scale anchor mismatch; "
+                f"expected={expected_anchor}, recorded={recorded_anchor}"
+            )
+
+        cell_rows[(family, cell_id)][scale].append(challenge)
+
+        for side_name in ("side_a", "side_b"):
+            side = challenge[side_name]
+            signature = tuple(
+                sorted(str(asset["key"]) for asset in side["assets"])
+            )
+            side_occurrences[signature].append({
+                "family": family,
+                "cell_id": cell_id,
+                "scale_label": scale,
+                "challenge_id": challenge["id"],
+                "side": side_name,
+                "intended_shares": tuple(
+                    round(float(x), 8) for x in side["intended_shares"]
+                ),
+            })
+
+    scale_groups = []
+    for (family, cell_id), rows_by_scale in sorted(cell_rows.items()):
+        plan = plan_for_cell(family, cell_id)
+        anchors = {
+            scale: float(plan[scale]["anchor_total_fv"])
+            for scale in scale_labels
+        }
+        if not (anchors["low"] < anchors["mid"] < anchors["high"]):
+            raise RuntimeError(
+                f"{family}/{cell_id}: non-increasing scale anchors {anchors}"
+            )
+
+        low_mid = (anchors["low"] + anchors["mid"]) / 2.0
+        mid_high = (anchors["mid"] + anchors["high"]) / 2.0
+
+        for scale in scale_labels:
+            rows = rows_by_scale.get(scale, [])
+            if not rows:
+                scale_groups.append({
+                    "family": family,
+                    "cell_id": cell_id,
+                    "scale_label": scale,
+                    "row_count": 0,
+                    "anchor_total_fv": round(anchors[scale], 6),
+                    "goal_min": None,
+                    "goal_max": None,
+                    "mean_anchor_drift_pct": None,
+                    "max_anchor_drift_pct": None,
+                })
+                continue
+
+            goals = [float(row["goal_total_fv"]) for row in rows]
+            if scale == "low":
+                outside = [g for g in goals if g > low_mid + 1e-9]
+            elif scale == "mid":
+                outside = [
+                    g for g in goals
+                    if not (g > low_mid + 1e-9 and g <= mid_high + 1e-9)
+                ]
+            else:
+                outside = [g for g in goals if g <= mid_high + 1e-9]
+
+            if outside:
+                raise RuntimeError(
+                    f"{family}/{cell_id}/{scale}: goals outside declared "
+                    f"scale band; goals={goals}; boundaries="
+                    f"({low_mid}, {mid_high})"
+                )
+
+            drifts = [
+                abs(goal - anchors[scale]) / anchors[scale]
+                for goal in goals
+            ]
+            scale_groups.append({
+                "family": family,
+                "cell_id": cell_id,
+                "scale_label": scale,
+                "row_count": len(rows),
+                "anchor_total_fv": round(anchors[scale], 6),
+                "goal_min": round(min(goals), 6),
+                "goal_max": round(max(goals), 6),
+                "mean_anchor_drift_pct": round(
+                    sum(drifts) / len(drifts), 10
+                ),
+                "max_anchor_drift_pct": round(max(drifts), 10),
+            })
+
+    repeated = {
+        signature: occs
+        for signature, occs in side_occurrences.items()
+        if len(occs) > 1
+    }
+
+    same_cell_same_scale = 0
+    cross_scale_same_cell = 0
+    cross_cell_same_family = 0
+    cross_family = 0
+    core_cross_cell_nonflat = []
+
+    for signature, occs in repeated.items():
+        families = {o["family"] for o in occs}
+        if len(families) > 1:
+            cross_family += 1
+
+        family_cells = defaultdict(set)
+        cell_scales = defaultdict(set)
+        cell_scale_counts = Counter()
+
+        for o in occs:
+            family_cells[o["family"]].add(o["cell_id"])
+            cell_scales[(o["family"], o["cell_id"])].add(o["scale_label"])
+            cell_scale_counts[
+                (o["family"], o["cell_id"], o["scale_label"])
+            ] += 1
+
+        if any(n > 1 for n in cell_scale_counts.values()):
+            same_cell_same_scale += 1
+
+        if any(len(scales) > 1 for scales in cell_scales.values()):
+            cross_scale_same_cell += 1
+
+        if any(len(cells) > 1 for cells in family_cells.values()):
+            cross_cell_same_family += 1
+
+        if (
+            len(families) == 1
+            and families == {"core_concentration_2v2"}
+            and len(family_cells["core_concentration_2v2"]) > 1
+        ):
+            nonflat = [
+                o for o in occs
+                if o["intended_shares"] != tuple(FLAT_PROFILE)
+            ]
+            if nonflat:
+                core_cross_cell_nonflat.append({
+                    "asset_keys": list(signature),
+                    "occurrences": occs,
+                })
+
+    if same_cell_same_scale:
+        raise RuntimeError(
+            "exact side package reused within the same cell/scale: "
+            f"{same_cell_same_scale} signatures"
+        )
+    if cross_scale_same_cell:
+        raise RuntimeError(
+            "exact side package reused across scales in the same cell: "
+            f"{cross_scale_same_cell} signatures"
+        )
+    if core_cross_cell_nonflat:
+        raise RuntimeError(
+            "core cross-cell exact side reuse includes a manipulated "
+            f"non-50/50 package: {core_cross_cell_nonflat[:3]}"
+        )
+
+    max_anchor_drift = max(
+        (
+            row["max_anchor_drift_pct"]
+            for row in scale_groups
+            if row["max_anchor_drift_pct"] is not None
+        ),
+        default=0.0,
+    )
+
+    return {
+        "scale_band_rule": (
+            "midpoint boundaries between declared low/mid/high anchors; "
+            "every selected goal must remain inside its declared band"
+        ),
+        "all_selected_goals_inside_declared_scale_band": True,
+        "max_goal_to_anchor_drift_pct": round(max_anchor_drift, 10),
+        "scale_groups": scale_groups,
+        "exact_side_reuse": {
+            "repeated_signature_count_global": len(repeated),
+            "same_cell_same_scale_signature_count": same_cell_same_scale,
+            "cross_scale_same_cell_signature_count": cross_scale_same_cell,
+            "cross_cell_same_family_signature_count": cross_cell_same_family,
+            "cross_family_signature_count": cross_family,
+            "core_cross_cell_nonflat_signature_count": len(
+                core_cross_cell_nonflat
+            ),
+            "max_global_signature_occurrences": max(
+                (len(occs) for occs in repeated.values()),
+                default=1,
+            ),
+        },
+    }
+
+
 def build_diversity_diagnostics(challenges, players, appearance_counts):
     player_lookup = {p["key"]: p for p in players}
     side_counts = Counter()
@@ -1165,6 +1391,9 @@ def build_catalog_document(root: Path, players, unresolved, pos_counts, v_ref,
     split_counts = Counter(c["split"] for c in challenges)
     scale_counts = Counter(c["scale_label"] for c in challenges)
     diversity = build_diversity_diagnostics(challenges, players, appearance_counts)
+    integrity = build_scale_reuse_integrity(
+        challenges, plans, fragmentation_plans, holdout_plans
+    )
 
     cells = []
     for (family, scale, cell_id), count in sorted(cell_counts.items()):
@@ -1285,6 +1514,7 @@ def build_catalog_document(root: Path, players, unresolved, pos_counts, v_ref,
             "skipped_or_underfilled_cells": skipped,
             "max_asset_appearance_count": diversity["max_asset_appearance_count"],
             "diversity": diversity,
+            "scale_reuse_integrity": integrity,
         },
         "challenges": challenges,
     }
@@ -1323,6 +1553,10 @@ def design_markdown(catalog):
         f"- Unique assets used: `{d['diversity']['unique_assets_used']}`",
         f"- Maximum appearances by one asset: `{d['diversity']['max_asset_appearance_count']}`",
         f"- Exact side reuses within the same cell/scale: `{d['diversity']['exact_side_reuse_count_same_cell_scale']}`",
+        f"- Exact side reuses across scales within one cell: `{d['scale_reuse_integrity']['exact_side_reuse']['cross_scale_same_cell_signature_count']}`",
+        f"- Cross-cell exact side signatures within one family: `{d['scale_reuse_integrity']['exact_side_reuse']['cross_cell_same_family_signature_count']}`",
+        f"- Core cross-cell reused signatures with non-50/50 shares: `{d['scale_reuse_integrity']['exact_side_reuse']['core_cross_cell_nonflat_signature_count']}`",
+        f"- Maximum selected-goal drift from its scale anchor: `{d['scale_reuse_integrity']['max_goal_to_anchor_drift_pct']}`",
         f"- Pick cells active: `{catalog['pick_cells']['active']}`",
         f"- Deferred fragmentation comparisons: `{deferred_labels or 'none'}`",
         "- Core high-value scale is reserved from fitting.",
@@ -1455,6 +1689,9 @@ def run_generation(force=False, dry_run=False):
         raise RuntimeError("written catalog does not round-trip exactly")
     validate_challenges(loaded["challenges"], cell_counts)
     validate_fv_lookup(loaded["challenges"], players)
+    build_scale_reuse_integrity(
+        loaded["challenges"], plans, fragmentation_plans, holdout_plans
+    )
 
     print(f"NextGen V2 catalog {out_status}: {OUT.relative_to(ROOT)}")
     print(f"NextGen V2 design {md_status}: {OUT_MD.relative_to(ROOT)}")
@@ -1596,6 +1833,13 @@ def selftest():
     assert diversity["rank_version"] == DIVERSITY_RANK_VERSION
     assert diversity["unique_assets_used"] > 0
     assert diversity["max_exact_side_repeat_count_same_cell_scale"] >= 0
+    integrity = build_scale_reuse_integrity(
+        challenges, plans, frag_plans, holdout_plans
+    )
+    assert integrity["all_selected_goals_inside_declared_scale_band"] is True
+    assert integrity["exact_side_reuse"]["same_cell_same_scale_signature_count"] == 0
+    assert integrity["exact_side_reuse"]["cross_scale_same_cell_signature_count"] == 0
+    assert integrity["exact_side_reuse"]["core_cross_cell_nonflat_signature_count"] == 0
     assert set(frag_plans) == {label for label, _a, _b in FRAGMENTATION_COMPARISONS}
     assert {label for label, _a, _b in FRAGMENTATION_COMPARISONS} == {"80_20_vs_80_10_10"}
     assert {row["label"] for row in DEFERRED_FRAGMENTATION_COMPARISONS} == {"80_20_vs_80_05x4"}
