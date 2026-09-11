@@ -44,7 +44,7 @@ These remain deliberately unresolved; downstream consumers must use existing fal
 | Malik Heath | WR |  | 11210 | ATL | unique_name_position_team_unavailable |
 | Xavier Weaver | WR |  | 11921 |  | unique_name_position_team_unavailable |
 | Ja'Corey Brooks | WR |  | 12532 |  | unique_name_position_team_unavailable |
-| Xavier Gipson | WR |  | 11306 |  | unique_name_position_team_unavailable |
+| Xavier Gipson | WR |  | 11306 | PHI | unique_name_position_team_unavailable |
 | Malik Turner | WR |  | 5781 |  | unique_name_position_team_unavailable |
 | Tejhaun Palmer | WR |  | 11802 |  | unique_name_position_team_unavailable |
 | Tanner Conner | TE |  | 8849 |  | unique_name_position_team_unavailable |
