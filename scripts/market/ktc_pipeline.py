@@ -67,9 +67,10 @@ SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTuKORGumlKJmUm
 MAX_VOTES_PER_VOTER_PER_DAY = 20
 MIN_PAIRWISE_FOR_SIGNAL = 30
 
-# Package Preference Voting V1-V5 plus NextGen V2 share transport only. Remove all
-# reserved row families before normal KTC daily-cap and Bradley-Terry work.
-PACKAGE_VOTE_PREFIXES = ("__pkgv1__|", "__pkgv2__|", "__pkgv3__|", "__pkgv4__|", "__pkgv5__|", "__pkgnv2__|")
+# Package Preference Voting V1-V5 plus NextGen V2 first-wave and prospective V1
+# share transport only. Remove all reserved row families before normal KTC
+# daily-cap and Bradley-Terry work.
+PACKAGE_VOTE_PREFIXES = ("__pkgv1__|", "__pkgv2__|", "__pkgv3__|", "__pkgv4__|", "__pkgv5__|", "__pkgnv2__|", "__pkgnv2p1__|")
 
 def is_package_vote_row(row):
     keep = str(row.get("keep") or "")

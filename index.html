@@ -11227,12 +11227,13 @@ function renderSensitivity(){
 
 const KTC_SUBMIT_URL = 'https://script.google.com/macros/s/AKfycbynz6A8jNOQonJhHtZW7DEx36PYTBXi_klXnacKF7I4kACPbTJIA5YFjY5ILxqpwgm8aw/exec'; // see ktc_vote_collector.gs setup instructions
 
-/* Package Adjustment NextGen V2: frozen multi-v-multi research catalog.
-Research-only data collection. Production Package Adjustment is unchanged. */
-const PACKAGE_VOTE_CHALLENGES_URL = 'https://raw.githubusercontent.com/ajknoll23-code/LOG-Trade-Calculator/main/research/package-adjustment-nextgen-v2/package_vote_challenges_nextgen_v2.json';
+/* Package Adjustment NextGen V2 Prospective V1: frozen time-holdout catalog.
+Research-only prospective validation. Production Package Adjustment remains V1.6. */
+const PACKAGE_VOTE_CHALLENGES_URL = 'https://raw.githubusercontent.com/ajknoll23-code/LOG-Trade-Calculator/8a606392bd2ce68cdec4c27abfab0d0bf4137b51/research/package-adjustment-nextgen-v2/package_vote_challenges_prospective_v1.json';
+const PACKAGE_VOTE_CATALOG_SHA256 = '2af809a194e79d847fe9438366f8b379b907e86d99945d7a6a5fab3e4428a36e';
 const PACKAGE_VOTE_DAILY_LIMIT = 20;
 const PACKAGE_VOTE_RECENT_MEMORY = 20;
-const PACKAGE_VOTE_VALID_AFTER_UTC = '2026-09-11T15:22:18.334044+00:00';
+const PACKAGE_VOTE_VALID_AFTER_UTC = '2026-09-12T05:01:14.788516+00:00';
 const PACKAGE_VOTE_FAMILY_WEIGHTS = Object.freeze({
 core_concentration_2v2: 0.625,
 fragmentation_filler: 0.125,
@@ -11242,450 +11243,8 @@ let PACKAGE_VOTE_CHALLENGES = null;
 let PACKAGE_VOTE_STATUS = 'idle';
 let packageVoteCurrent = null;
 
-/* Real, static NFL team abbreviation -> nickname map -- all 32 teams, not
-   sourced from any pipeline since this is fixed, well-known real-world
-   fact rather than something that needs fetching. 'JAX' included alongside
-   'JAC' since both abbreviations show up across different real data
-   sources this project pulls from. */
-const NFL_TEAM_NICKNAME = {
-  ARI:'Cardinals', ATL:'Falcons', BAL:'Ravens', BUF:'Bills',
-  CAR:'Panthers', CHI:'Bears', CIN:'Bengals', CLE:'Browns',
-  DAL:'Cowboys', DEN:'Broncos', DET:'Lions', GB:'Packers',
-  HOU:'Texans', IND:'Colts', JAC:'Jaguars', JAX:'Jaguars',
-  KC:'Chiefs', LAC:'Chargers', LAR:'Rams', LV:'Raiders',
-  MIA:'Dolphins', MIN:'Vikings', NE:'Patriots', NO:'Saints',
-  NYG:'Giants', NYJ:'Jets', PHI:'Eagles', PIT:'Steelers',
-  SEA:'Seahawks', SF:'49ers', TB:'Buccaneers', TEN:'Titans',
-  WAS:'Commanders', WSH:'Commanders',
-};
-function ktcTeamLabel(abbr){
-  if(!abbr) return '';
-  if(abbr === 'FA') return 'Free Agent';
-  const nickname = NFL_TEAM_NICKNAME[abbr];
-  return nickname ? `${abbr} ${nickname}` : abbr; // falls back to bare abbreviation rather than hiding it if somehow unmapped
-}
-const KTC_DAILY_VOTE_LIMIT = 20; // matches MAX_VOTES_PER_VOTER_PER_DAY in ktc_pipeline.py -- keep these in sync
-const KTC_RECENT_MEMORY = 40; // how many recently-shown player keys to avoid repeating
-const KTC_MIN_MODEL_VALUE = 1250; // normal voting only; frozen validation queue is intentionally exempt
-
-let ktcTrio = null; // [{key, pos, value}, {...}, {...}]
-let ktcAssignments = {}; // { playerKey: 'keep'|'trade'|'cut' }
-
-function ktcTodayKey(){
-  return 'ktc_votes_' + new Date().toISOString().slice(0,10); // localStorage key scoped to today's date
-}
-
-/* Guest voter identity -- for people outside the league (e.g. dynasty-savvy
-   friends) who have no roster to select and therefore nothing for the
-   self-interest guardrail to protect. Generated once per browser, reused
-   after that, so the daily cap and Bradley-Terry aggregation can treat a
-   guest exactly like a league voter's roster_id -- just a different kind
-   of stable identifier. Prefixed 'ext_' so ktc_pipeline.py can tell real
-   league votes (numeric roster_id) apart from guest votes (this) without
-   needing any new schema -- the existing voter_roster_id column just
-   holds a different shape of string. */
-function ktcGuestId(){
-  let id = localStorage.getItem('ktc_guest_id');
-  if(!id){
-    id = 'ext_' + Math.random().toString(36).slice(2, 10);
-    localStorage.setItem('ktc_guest_id', id);
-  }
-  return id;
-}
-
-function ktcIsGuestMode(){
-  return !state.teamConfirmed && localStorage.getItem('ktc_guest_mode') === '1';
-}
-
-function ktcStartGuestMode(){
-  localStorage.setItem('ktc_guest_mode', '1');
-  ktcGuestId(); // ensure an ID exists right away
-  renderKTC();
-  renderPackageVote();
-}
-
-function ktcExitGuestMode(){
-  localStorage.removeItem('ktc_guest_mode');
-  renderKTC();
-  renderPackageVote();
-}
-
-function ktcCurrentVoterId(){
-  return (state.teamConfirmed && MY_ROSTER_ID) || (ktcIsGuestMode() ? ktcGuestId() : null);
-}
-
-function ktcVotesToday(){
-  return parseInt(localStorage.getItem(ktcTodayKey()) || '0', 10);
-}
-
-function ktcRecentlyShown(){
-  try { return JSON.parse(localStorage.getItem('ktc_recent') || '[]'); }
-  catch(e){ return []; }
-}
-
-function ktcRememberShown(keys){
-  const recent = ktcRecentlyShown().concat(keys).slice(-KTC_RECENT_MEMORY);
-  localStorage.setItem('ktc_recent', JSON.stringify(recent));
-}
-
-/* Builds the eligible pool for NORMAL KTC voting: every player with a real
-   current value, currently rostered by someone in the actual league, minus
-   whoever is on the voter's own roster. Requires MY_ROSTER_ID to already
-   be set (same "which team is yours" flow the Roster Needs panel uses) --
-   if it isn't set yet, KTC simply doesn't render anything rather than risk
-   showing someone their own players.
-
-   ROSTERED-ONLY FILTER ADDED (2026-08-26, per ChatGPT review): previously
-   pulled from the entire player database with no rostered check at all --
-   since PLAYER_DB entries are never deleted (only updated), a player
-   dropped by whoever had him just sat there forever, still fully eligible
-   to appear in a vote. Deliberately does NOT also require real production
-   data (a separate option considered and rejected, per the same review):
-   a genuinely rostered rookie/developmental/injured player with zero 2025
-   production is exactly the kind of asset human market judgment on real
-   value is most useful for -- excluding him would defeat KTC's actual
-   purpose, not just filter noise. This is EXCLUSIVE to normal voting; the
-   validation queue below uses its own separate, deliberately looser
-   eligibility check (ktcValidationEligible()) so tightening ordinary
-   sampling can't silently shrink or invalidate the pre-registered V1
-   validation experiment already collecting real votes. */
-function ktcEligiblePool(){
-  if(!(state.teamConfirmed && MY_ROSTER_ID) && !ktcIsGuestMode()) return [];
-  // Guests have no roster, so nothing to exclude -- an empty Set is a
-  // correct no-op filter here, not a workaround.
-  const myPlayers = new Set(
-    (state.teamConfirmed && MY_ROSTER_ID) ? (LEAGUE_ROSTERS[MY_ROSTER_ID] && LEAGUE_ROSTERS[MY_ROSTER_ID].players || []).map(p => p.key) : []
-  );
-  const recent = new Set(ktcRecentlyShown());
-  const pool = [];
-  for(const key in PLAYER_DB){
-    if(myPlayers.has(key)) continue;
-    if(recent.has(key)) continue;
-    const info = PLAYER_DB[key];
-    if(!info || info.pos === 'K') continue;
-    if(info.currentlyRostered !== true) continue;
-    const val = playerValueByKey(key);
-    if(val && val >= KTC_MIN_MODEL_VALUE) pool.push({ key, pos: info.pos, value: val, team: info.team || null, age: info.age ?? null, pts2025: info.pts2025 ?? null, proj2026: info.proj2026 ?? null });
-  }
-  return pool;
-}
-
-/* Deliberately looser eligibility check, used ONLY for validation-queue
-   (V1) triad matching -- NOT the strict ktcEligiblePool() above. The 37
-   frozen triads were hand-selected specifically because two candidate
-   formulas disagree, and decoys were deliberately chosen to be clearly-
-   worse players, which skews toward exactly the kind of low-value player
-   the normal-voting rostered-only filter now excludes. Requiring the same
-   strict rules here would silently shrink or invalidate triads mid-
-   collection -- the exact "accidentally mutating the pre-registered
-   experiment" risk flagged in review. Only checks what's actually needed
-   for a vote to make sense at all: the player still resolves to something
-   real, isn't on the voter's own roster, and hasn't been shown to them
-   too recently. Does NOT require currentlyRostered or real production. */
-function ktcValidationEligible(key, myPlayers, recent){
-  if(myPlayers.has(key)) return false;
-  if(recent.has(key)) return false;
-  const info = PLAYER_DB[key];
-  return !!info;
-}
-
-/* Frozen, offense-only (QB/RB/WR/TE) triads deliberately selected because
-   the ratio scarcity formula (combined/baseline, the live formula) and
-   the differential formula (combined-baseline, the alternative under
-   validation) disagree on which of two players is more valuable. Each
-   entry's third player ("decoy") is someone both formulas agree is
-   clearly worse than the other two, so the real informative choice stays
-   concentrated in keep-vs-trade between "a" and "b".
-
-   WHY THIS EXISTS: passive random voting was empirically shown (2026-08-26)
-   to produce ZERO usable ratio-vs-differential disagreements across 39
-   real all-offense pairwise observations -- the two formulas essentially
-   never flip ordering on real production data by chance. Targeted
-   selection was the only viable path per the methodology review that
-   session. All-offense-only by construction: this validation needs data
-   untouched by the DL/LB/DB POSITION_WEIGHT vote calibration, so no
-   player here is ever DL/LB/DB.
-
-   FROZEN, NOT ADAPTIVE: generated once from a prod_mult_pipeline_output.json
-   snapshot via ktc_validation_queue_generator.py. Must NOT be regenerated
-   based on how people vote -- only when the underlying production data
-   itself refreshes. Regenerating in response to vote outcomes would make
-   the test adaptive to its own results.
-
-   NO SEPARATE PROVENANCE TAGGING NEEDED: a real vote's 3 players matching
-   one of these ~37 specific triads (regardless of order) is astronomically
-   unlikely by chance, so validation-queue votes can be identified
-   retroactively by set-membership against this exact list -- no backend
-   schema change required. */
-const KTC_VALIDATION_QUEUE = [
-  {id:"vq1_001",a:"jake tonges",b:"deshaun watson",decoy:"jordan james"},
-  {id:"vq1_002",a:"ko kieft",b:"michael penix jr",decoy:"mitchell trubisky"},
-  {id:"vq1_003",a:"shedeur sanders",b:"elijah arroyo",decoy:"mason rudolph"},
-  {id:"vq1_004",a:"tua tagovailoa",b:"mo aliecox",decoy:"jaleel mclaughlin"},
-  {id:"vq1_005",a:"nicholas singleton",b:"jack velling",decoy:"isaac guerendo"},
-  {id:"vq1_006",a:"demond claiborne",b:"ian thomas",decoy:"emanuel wilson"},
-  {id:"vq1_007",a:"shane zylstra",b:"braylon smith",decoy:"jarquez hunter"},
-  {id:"vq1_008",a:"brian robinson",b:"brevin jordan",decoy:"malik davis"},
-  {id:"vq1_009",a:"seth mcgowan",b:"kylen granson",decoy:"trey benson"},
-  {id:"vq1_010",a:"nate adkins",b:"ollie gordon ii",decoy:"kalel mullings"},
-  {id:"vq1_011",a:"jam miller",b:"cameron latu",decoy:"audric estime"},
-  {id:"vq1_012",a:"rasheen ali",b:"ben yurosek",decoy:"sean tucker"},
-  {id:"vq1_013",a:"jeremy mcnichols",b:"robert tonyan",decoy:"jahdae walker"},
-  {id:"vq1_014",a:"justice hill",b:"feleipe franks",decoy:"cedric tillman"},
-  {id:"vq1_015",a:"quintin morris",b:"lequint allen jr",decoy:"braelon allen"},
-  {id:"vq1_016",a:"trevor etienne",b:"max bredeson",decoy:"damien martinez"},
-  {id:"vq1_017",a:"jawhar jordan",b:"luke farrell",decoy:"trebor pena"},
-  {id:"vq1_018",a:"dylan sampson",b:"tip reiman",decoy:"dareke young"},
-  {id:"vq1_019",a:"adam randall",b:"charlie woerner",decoy:"dylan laube"},
-  {id:"vq1_020",a:"emmett johnson",b:"mitchell evans",decoy:"xavier weaver"},
-  {id:"vq1_021",a:"will shipley",b:"tyler conklin",decoy:"kene nwangwu"},
-  {id:"vq1_022",a:"kimani vidal",b:"max klare",decoy:"xavier smith"},
-  {id:"vq1_023",a:"isiah pacheco",b:"brevyn spannford",decoy:"jordan whittington"},
-  {id:"vq1_024",a:"kaytron allen",b:"chris manhertz",decoy:"deejay dallas"},
-  {id:"vq1_025",a:"james conner",b:"josh cuevas",decoy:"luke mccaffrey"},
-  {id:"vq1_026",a:"jaylen wright",b:"jeremy ruckert",decoy:"tylan wallace"},
-  {id:"vq1_027",a:"samaje perine",b:"seydou traore",decoy:"kameron johnson"},
-  {id:"vq1_028",a:"mike washington",b:"davis allen",decoy:"kendrick bourne"},
-  {id:"vq1_029",a:"fernando mendoza",b:"oscar delp",decoy:"ashton dulin"},
-  {id:"vq1_030",a:"kaelon black",b:"connor heyward",decoy:"noah thomas"},
-  {id:"vq1_031",a:"tyler badie",b:"jack stoll",decoy:"bam knight"},
-  {id:"vq1_032",a:"ty chandler",b:"josh whyle",decoy:"tank bigsby"},
-  {id:"vq1_033",a:"keaton mitchell",b:"stone smartt",decoy:"isaiah davis"},
-  {id:"vq1_034",a:"marshawn lloyd",b:"jaren kanak",decoy:"liljordan humphrey"},
-  {id:"vq1_035",a:"tyler allgeier",b:"tanner koziol",decoy:"tre harris"},
-  {id:"vq1_036",a:"jaydn ott",b:"blake whiteheart",decoy:"jaydon blue"},
-  {id:"vq1_037",a:"lucas krull",b:"donovan edwards",decoy:"emari demercado"}
-];
-
-/* Simple, manually-maintained invalidation list, per ChatGPT review
-   (2026-08-26): a material real-world event AFTER the queue was frozen
-   (season-ending injury, retirement, NFL roster cut, a major role-
-   changing transaction) can invalidate a triad more seriously than
-   roster status in THIS league ever could -- a voter correctly reacting
-   to a real ACL tear isn't giving evidence about ratio vs differential,
-   they're reacting to the world having changed since the formula values
-   were frozen. Deliberately based ONLY on external real-world events,
-   NEVER on vote results -- populating this because of how people voted
-   would break the non-adaptive design the whole queue depends on. Starts
-   empty; add a queue_id here by hand if something real happens to a
-   player in the queue during the ~3-week V1 collection window. */
-const KTC_VALIDATION_INVALIDATED = [];
-
-/* V1 FROZEN (2026-08-26) -- set to false, not removed. See the full
-   rationale in the comment directly above selectKTCTrio() below: a real
-   feasibility audit found essentially no ratio-vs-differential
-   disagreement (0.005%) among currently-rostered offense players, so
-   continuing to collect V1 votes wouldn't answer a meaningful question.
-   Flip back to true only after a deliberate, documented V2 decision --
-   never as a quick toggle. */
-const KTC_VALIDATION_QUEUE_ACTIVE = false;
-
-/* 15% frozen validation queue (see KTC_VALIDATION_QUEUE above), then 70%
-   targeted (a random anchor player + two others within +/-30% of its
-   value, biased toward the anchor being IDP so most targeted trios
-   actually inform the DL/LB/DB question this feature exists for), 30%
-   fully random -- see Section 5 of the design doc for why this mix and
-   not pure random. */
-/* V1 FROZEN (2026-08-26), per a real feasibility audit, not a silent
-   design change: a rostered-only re-check of the ratio-vs-differential
-   disagreement rate that motivated this whole queue found only 2 real
-   disagreement pairs among 295 rostered offense players (43,365 possible
-   pairs) -- a 0.005% rate, versus 1.2% across the full offense player
-   universe. Combined with the earlier finding that 33 of 37 frozen V1
-   triads have a primary disagreement player nobody in the league
-   currently rosters, the conclusion (per external review) is that ratio
-   and differential essentially never disagree among players this league
-   actually trades -- the mathematical difference between the two
-   formulas is real, but concentrated almost entirely in the deep/fringe
-   tier where it has little practical trade-value consequence. Per that
-   same review's explicit guidance: continuing to collect V1 votes for
-   the sake of finishing a pre-registered 3-week window, once an
-   outcome-independent audit shows the design can't answer a meaningful
-   question, wastes real votes rather than protecting the experiment's
-   integrity -- so the sampling probability below is set to 0, freezing
-   collection. NOT deleted, NOT rewritten: the queue, the pre-
-   registration document, and any votes already collected through it are
-   all preserved as-is for the historical record and as exploratory
-   evidence, per that same guidance. If a future V2 or a different
-   validation approach is ever built, it should select for relevance/
-   representativeness as well as formula disagreement, not disagreement
-   alone -- see the closing analysis for the full reasoning. */
-function selectKTCTrio(){
-  const pool = ktcEligiblePool();
-
-  if(KTC_VALIDATION_QUEUE_ACTIVE && KTC_VALIDATION_QUEUE.length && Math.random() < 0.15){
-    // Uses ktcValidationEligible(), NOT the strict `pool` above -- see that
-    // function's comment. Built independently of ktcEligiblePool() so the
-    // 2026-08-26 rostered-only tightening of normal voting can't silently
-    // shrink or invalidate V1 triads mid-collection.
-    const myPlayers = new Set(
-      (state.teamConfirmed && MY_ROSTER_ID) ? (LEAGUE_ROSTERS[MY_ROSTER_ID] && LEAGUE_ROSTERS[MY_ROSTER_ID].players || []).map(p => p.key) : []
-    );
-    const recent = new Set(ktcRecentlyShown());
-    const shuffledQueue = KTC_VALIDATION_QUEUE.slice();
-    for(let i=shuffledQueue.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [shuffledQueue[i],shuffledQueue[j]]=[shuffledQueue[j],shuffledQueue[i]]; }
-    for(const entry of shuffledQueue){
-      if(KTC_VALIDATION_INVALIDATED.includes(entry.id)) continue;
-      if(ktcValidationEligible(entry.a, myPlayers, recent) &&
-         ktcValidationEligible(entry.b, myPlayers, recent) &&
-         ktcValidationEligible(entry.decoy, myPlayers, recent)){
-        // Built directly from PLAYER_DB, not from `pool` -- a validation
-        // player may not be in the strict rostered-only pool anymore.
-        const toCard = k => {
-          const info = PLAYER_DB[k];
-          return { key: k, pos: info.pos, value: playerValueByKey(k), team: info.team || null, age: info.age ?? null };
-        };
-        const trio = [toCard(entry.a), toCard(entry.b), toCard(entry.decoy)];
-        // shuffle display order so the decoy isn't always in the same
-        // position -- a predictable slot would itself be a subtle tell
-        for(let i=trio.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [trio[i],trio[j]]=[trio[j],trio[i]]; }
-        return trio;
-      }
-    }
-    // no queue entry currently has all 3 players eligible for this voter
-    // (own roster / recently shown / unresolvable) -- fall through to
-    // normal sampling
-  }
-
-  if(pool.length < 3) return null;
-
-  const wantTargeted = Math.random() < 0.7;
-  if(wantTargeted){
-    const idpPool = pool.filter(p => ['DL','LB','DB'].includes(p.pos));
-    const anchorPool = idpPool.length ? idpPool : pool;
-    const anchor = anchorPool[Math.floor(Math.random()*anchorPool.length)];
-    const band = pool.filter(p => p.key !== anchor.key &&
-      p.value >= anchor.value*0.7 && p.value <= anchor.value*1.3);
-    if(band.length >= 2){
-      // shuffle band, take 2
-      for(let i=band.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [band[i],band[j]]=[band[j],band[i]]; }
-      return [anchor, band[0], band[1]];
-    }
-    // band too thin -- fall through to random
-  }
-  const shuffled = pool.slice();
-  for(let i=shuffled.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [shuffled[i],shuffled[j]]=[shuffled[j],shuffled[i]]; }
-  return shuffled.slice(0,3);
-}
-
-function ktcAssignRole(key, role){
-  // clear this role from whoever currently has it, then assign fresh --
-  // lets a misclick be corrected by just tapping a different role
-  for(const k in ktcAssignments){ if(ktcAssignments[k]===role) delete ktcAssignments[k]; }
-  ktcAssignments[key] = role;
-  renderKTC();
-}
-
-function ktcSubmit(){
-  const keep = Object.keys(ktcAssignments).find(k => ktcAssignments[k]==='keep');
-  const trade = Object.keys(ktcAssignments).find(k => ktcAssignments[k]==='trade');
-  const cut = Object.keys(ktcAssignments).find(k => ktcAssignments[k]==='cut');
-  if(!keep || !trade || !cut) return;
-
-  fetch(KTC_SUBMIT_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // see ktc_vote_collector.gs -- avoids a CORS preflight
-    body: JSON.stringify({ voterRosterId: ktcCurrentVoterId(), keep, trade, cut }),
-  }).catch(() => {}); // best-effort -- a dropped vote isn't worth blocking the UI over
-
-  localStorage.setItem(ktcTodayKey(), String(ktcVotesToday()+1));
-  ktcRememberShown([keep, trade, cut]);
-  ktcAssignments = {};
-  ktcTrio = selectKTCTrio();
-  renderKTC();
-}
-
-function renderKTC(){
-  const el = document.getElementById('ktcWrap');
-  if(!el) return;
-
-  if(!(state.teamConfirmed && MY_ROSTER_ID) && !ktcIsGuestMode()){
-    el.innerHTML = `
-      <div class="vote-access-card">
-        <div class="vote-access-copy">
-          <div class="vote-access-title">Ready to vote?</div>
-          <div class="vote-access-sub">League members: choose your team above so your own players stay out of the pool. Everyone else can vote as a guest.</div>
-        </div>
-        <button type="button" class="vote-guest-btn" onclick="ktcStartGuestMode()">Vote as a guest</button>
-      </div>
-    `;
-    return;
-  }
-
-  const guestNote = ktcIsGuestMode()
-    ? `<div class="vote-guest-status">
-        <div><strong>Guest mode.</strong> Vote for this league's scoring: half-PPR + 0.2 per rush attempt; IDP gives 1.5 per solo tackle, 3 per sack, 2 per QB hit and 3 per forced fumble.</div>
-        <button type="button" class="vote-switch-link" onclick="ktcExitGuestMode()">Use a league team instead</button>
-      </div>`
-    : '';
-
-  if(ktcVotesToday() >= KTC_DAILY_VOTE_LIMIT){
-    const modeLabel = ktcIsGuestMode() ? 'as a guest' : 'for your team';
-    const exitLink = ktcIsGuestMode() ? ` <span style="color:var(--gold);cursor:pointer;text-decoration:underline;" onclick="ktcExitGuestMode()">(not a guest? switch to picking your team)</span>` : '';
-    el.innerHTML = `<div style="color:var(--text-dim);font-size:13px;padding:8px 0;">You've hit today's vote limit ${modeLabel} -- thanks for helping calibrate the model. Come back tomorrow for more.${exitLink}</div>`;
-    return;
-  }
-
-  if(!ktcTrio) ktcTrio = selectKTCTrio();
-  if(!ktcTrio){
-    el.innerHTML = `<div style="color:var(--text-dim);font-size:13px;padding:8px 0;">Not enough eligible players to build a round right now.</div>`;
-    return;
-  }
-
-  /* BUG FIX (2026-08-26, external review): the vote card used to show
-     this tool's OWN live trade value, real 2025 points, and 2026
-     projection directly on every card -- meaning a voter saw the
-     calculator's own opinion of each player before choosing keep/trade/
-     cut. That's a real, live endogeneity problem, not a hypothetical
-     one: KTC votes are used as INDEPENDENT evidence (calibrating
-     POSITION_WEIGHT, and now the ratio-vs-differential validation
-     queue), but a vote isn't independent of the model if the voter can
-     see the model's own answer while casting it. Now shows only name,
-     team, position, and age -- real, neutral facts a voter needs to know
-     who they're voting on, not the model's opinion of how good he is
-     (age was added 2026-08-26 to mirror real KeepTradeCut.com's own
-     vote-card convention, which shows exactly these fields and nothing
-     value-derived). This applies to every vote, not just the validation
-     queue's, since both draw from the same card-rendering code. */
-  const roleLabel = { keep:'KEEP', trade:'TRADE', cut:'CUT' };
-  const roleColor = { keep:'var(--green)', trade:'var(--text-dim)', cut:'var(--red)' };
-
-  const cards = ktcTrio.map(p => {
-    const assigned = ktcAssignments[p.key];
-    const usedRoles = new Set(Object.values(ktcAssignments));
-    const buttons = ['keep','trade','cut'].map(role => {
-      const isThis = assigned === role;
-      // Never actually block the tap -- ktcAssignRole() already correctly
-      // steals a role from whoever currently has it. A previous version
-      // disabled (pointer-events:none) any role already taken by another
-      // player, which created a real deadlock: once two players held two
-      // different roles, swapping them was impossible, since each
-      // player's missing role was always "taken by someone else" and
-      // therefore unclickable on both sides at once. Only dim the button
-      // for a light visual cue that it's taken elsewhere -- never disable it.
-      const takenElsewhere = !isThis && usedRoles.has(role);
-      return `<button class="tab-btn" style="flex:1;${isThis ? `background:${roleColor[role]};color:var(--bg);border-color:${roleColor[role]};` : ''}${takenElsewhere?'opacity:0.5;':''}" onclick="ktcAssignRole('${p.key}','${role}')">${roleLabel[role]}</button>`;
-    }).join('');
-    return `
-      <div class="need-cell" style="text-align:left;padding:10px;">
-        <div style="font-weight:600;font-size:14px;">${titleCase(p.key)}${p.team ? ' <span style="color:var(--text-dim);font-weight:400;">('+ktcTeamLabel(p.team)+')</span>' : ''}</div>
-        <div style="color:var(--text-dim);font-size:11px;margin-bottom:8px;">${p.pos}${(typeof p.age === 'number') ? ' &middot; '+p.age+' y.o.' : ''}</div>
-        <div style="display:flex;gap:4px;">${buttons}</div>
-      </div>`;
-  }).join('');
-
-  const allAssigned = Object.keys(ktcAssignments).length === 3;
-
-  el.innerHTML = `
-    ${guestNote}
-    <div style="color:var(--text-dim);font-size:12px;margin-bottom:8px;">Tap KEEP on your favorite, CUT on your least favorite.</div>
-    <div style="display:flex;flex-direction:column;gap:8px;">${cards}</div>
-    <button class="tab-btn" style="width:100%;margin-top:10px;${allAssigned?'background:var(--gold);color:var(--bg);border-color:var(--gold);':'opacity:0.4;pointer-events:none;'}" onclick="ktcSubmit()">Submit Vote</button>
-  `;
-}
-
 function packageVoteTodayKey(){
-return 'package_votes_nextgen_v2_' + new Date().toISOString().slice(0,10);
+return 'package_votes_nextgen_v2_prospective_v1_' + new Date().toISOString().slice(0,10);
 }
 
 function packageVotesToday(){
@@ -11693,72 +11252,72 @@ return parseInt(localStorage.getItem(packageVoteTodayKey()) || '0', 10);
 }
 
 function packageVoteRecent(){
-try { return JSON.parse(localStorage.getItem('package_vote_recent_nextgen_v2') || '[]'); }
+try { return JSON.parse(localStorage.getItem('package_vote_recent_nextgen_v2_prospective_v1') || '[]'); }
 catch(e){ return []; }
 }
 
 function packageVoteRemember(id){
 const recent = packageVoteRecent().concat([id]).slice(-PACKAGE_VOTE_RECENT_MEMORY);
-localStorage.setItem('package_vote_recent_nextgen_v2', JSON.stringify(recent));
+localStorage.setItem('package_vote_recent_nextgen_v2_prospective_v1', JSON.stringify(recent));
 }
 
 /* PACKAGE_VOTE_NEXTGEN_V2_EXACT_CELL_SAMPLING_V2
-   Frozen schedule is unconditional with respect to voter roster:
+   Frozen prospective schedule is unconditional with respect to voter roster:
    family -> exact experimental cell -> challenge within that cell.
    Recent-memory is applied only AFTER the cell is selected, so it
-   cannot alter family or cell probability. Vote outcomes never
-   affect sampling. */
+   cannot alter family or cell probability. Vote outcomes and model
+   performance never affect sampling. */
 function packageVoteWeightedFamily(families){
-  let total = 0;
-  for(const family of families) total += Number(PACKAGE_VOTE_FAMILY_WEIGHTS[family] || 0);
-  if(total <= 0) return null;
-  let draw = Math.random() * total;
-  for(const family of families){
-    draw -= Number(PACKAGE_VOTE_FAMILY_WEIGHTS[family] || 0);
-    if(draw <= 0) return family;
-  }
-  return families[families.length - 1] || null;
+let total = 0;
+for(const family of families) total += Number(PACKAGE_VOTE_FAMILY_WEIGHTS[family] || 0);
+if(total <= 0) return null;
+let draw = Math.random() * total;
+for(const family of families){
+draw -= Number(PACKAGE_VOTE_FAMILY_WEIGHTS[family] || 0);
+if(draw <= 0) return family;
+}
+return families[families.length - 1] || null;
 }
 
 function packageVoteSelectChallenge(){
-  if(!PACKAGE_VOTE_CHALLENGES || !PACKAGE_VOTE_CHALLENGES.length) return null;
+if(!PACKAGE_VOTE_CHALLENGES || !PACKAGE_VOTE_CHALLENGES.length) return null;
 
-  const byFamily = new Map();
-  for(const c of PACKAGE_VOTE_CHALLENGES){
-    if(!Object.prototype.hasOwnProperty.call(PACKAGE_VOTE_FAMILY_WEIGHTS, c.family)) continue;
-    if(!byFamily.has(c.family)) byFamily.set(c.family, []);
-    byFamily.get(c.family).push(c);
-  }
+const byFamily = new Map();
+for(const c of PACKAGE_VOTE_CHALLENGES){
+if(!Object.prototype.hasOwnProperty.call(PACKAGE_VOTE_FAMILY_WEIGHTS, c.family)) continue;
+if(!byFamily.has(c.family)) byFamily.set(c.family, []);
+byFamily.get(c.family).push(c);
+}
 
-  const families = Array.from(byFamily.keys()).sort();
-  const family = packageVoteWeightedFamily(families);
-  if(!family) return null;
+const families = Array.from(byFamily.keys()).sort();
+const family = packageVoteWeightedFamily(families);
+if(!family) return null;
 
-  const familyPool = byFamily.get(family);
-  const byCell = new Map();
-  for(const c of familyPool){
-    const cellKey = `${c.family}|${c.cell_id}|${c.scale_label}|${c.split}`;
-    if(!byCell.has(cellKey)) byCell.set(cellKey, []);
-    byCell.get(cellKey).push(c);
-  }
+const familyPool = byFamily.get(family);
+const byCell = new Map();
+for(const c of familyPool){
+const cellKey = `${c.family}|${c.cell_id}|${c.scale_label}|${c.split}`;
+if(!byCell.has(cellKey)) byCell.set(cellKey, []);
+byCell.get(cellKey).push(c);
+}
 
-  const cells = Array.from(byCell.keys()).sort();
-  if(!cells.length) return null;
-  const selectedCellKey = cells[Math.floor(Math.random() * cells.length)];
-  const cellPool = byCell.get(selectedCellKey);
+const cells = Array.from(byCell.keys()).sort();
+if(!cells.length) return null;
+const selectedCellKey = cells[Math.floor(Math.random() * cells.length)];
+const cellPool = byCell.get(selectedCellKey);
 
-  const recent = new Set(packageVoteRecent());
-  let challengePool = cellPool.filter(c => !recent.has(c.id));
-  if(!challengePool.length) challengePool = cellPool;
+const recent = new Set(packageVoteRecent());
+let challengePool = cellPool.filter(c => !recent.has(c.id));
+if(!challengePool.length) challengePool = cellPool;
 
-  const challenge = challengePool[Math.floor(Math.random() * challengePool.length)];
-  return { challenge, left: Math.random() < 0.5 ? 'A' : 'B' };
+const challenge = challengePool[Math.floor(Math.random() * challengePool.length)];
+return { challenge, left: Math.random() < 0.5 ? 'A' : 'B' };
 }
 
 function packageVoteEnsureLoaded(){
 if(PACKAGE_VOTE_STATUS === 'loading' || PACKAGE_VOTE_STATUS === 'ready') return;
 PACKAGE_VOTE_STATUS = 'loading';
-fetch(PACKAGE_VOTE_CHALLENGES_URL)
+fetch(PACKAGE_VOTE_CHALLENGES_URL, {cache:'no-store'})
 .then(r => {
 if(!r.ok) throw new Error('HTTP ' + r.status);
 return r.json();
@@ -11766,25 +11325,51 @@ return r.json();
 .then(doc => {
 if(
 doc.schema_version !== 1 ||
-doc.status !== 'frozen_package_adjustment_nextgen_v2' ||
+doc.status !== 'frozen_prospective_research_catalog_v1' ||
 doc.frozen !== true ||
-doc.production_formula_enabled !== false ||
-!doc.freeze ||
-doc.freeze.canonical_challenge_payload_sha256 !== 'fa52f72f6f4bdeaf1a5a935bde0fb5d0ec0fc85cc2b0d58236c2101d47d4f5ab' ||
-doc.freeze.challenge_count !== 129 ||
+doc.catalog_id !== 'pkgnv2-prospective-catalog-v1' ||
+doc.research_only !== true ||
+doc.evaluation_only !== true ||
+doc.fit_eligible_challenges !== 0 ||
+doc.production_change_authorized !== false ||
+doc.automatic_production_promotion_allowed !== false ||
+!doc.diagnostics ||
+Number(doc.diagnostics.challenge_count) !== 129 ||
+Number(doc.diagnostics.evaluation_cell_count) !== 24 ||
+Number(doc.diagnostics.max_asset_appearance) > 11 ||
+Number(doc.diagnostics.first_wave_exact_trade_overlap_count) !== 0 ||
+!doc.scientific_isolation ||
+doc.scientific_isolation.prospective_vote_outcomes_read !== false ||
+doc.scientific_isolation.M2b_minus_M0_score_gap_computed !== false ||
 !Array.isArray(doc.challenges) ||
 doc.challenges.length !== 129 ||
-!doc.challenges.every(c => c.values_hidden_from_voter === true)
+!doc.challenges.every(c =>
+  c &&
+  c.experiment === 'package_adjustment_nextgen_v2_prospective_v1' &&
+  c.split === 'prospective_time_holdout' &&
+  c.fit_eligible === false &&
+  c.evaluation_only === true &&
+  c.model_selection_eligible === false &&
+  c.values_hidden_from_voter === true &&
+  c.side_a && Array.isArray(c.side_a.assets) && c.side_a.assets.length >= 2 &&
+  c.side_b && Array.isArray(c.side_b.assets) && c.side_b.assets.length >= 2
+)
 ){
-throw new Error('unexpected NextGen V2 frozen challenge catalog');
+throw new Error('unexpected NextGen V2 prospective frozen challenge catalog');
 }
+
+const cells = new Set(
+  doc.challenges.map(c => `${c.family}|${c.cell_id}|${c.scale_label}|${c.split}`)
+);
+if(cells.size !== 24) throw new Error('prospective_catalog_cell_count');
+
 PACKAGE_VOTE_CHALLENGES = doc.challenges;
 PACKAGE_VOTE_STATUS = 'ready';
 packageVoteCurrent = null;
 renderPackageVote();
 })
 .catch(err => {
-console.warn('Package Adjustment NextGen V2 load failed:', err);
+console.warn('Package Adjustment NextGen V2 prospective load failed:', err);
 PACKAGE_VOTE_CHALLENGES = null;
 PACKAGE_VOTE_STATUS = 'failed';
 renderPackageVote();
@@ -11815,9 +11400,9 @@ method: 'POST',
 headers: { 'Content-Type': 'text/plain;charset=utf-8' },
 body: JSON.stringify({
 voterRosterId: voter,
-keep: `__pkgnv2__|${id}|${choice}`,
-trade: `__pkgnv2_meta__|${left}`,
-cut: '__pkgnv2_schema__|1',
+keep: `__pkgnv2p1__|${id}|${choice}`,
+trade: `__pkgnv2p1_meta__|${left}`,
+cut: '__pkgnv2p1_schema__|1',
 }),
 }).catch(() => {});
 
@@ -11846,7 +11431,7 @@ return;
 
 if(Date.now() < Date.parse(PACKAGE_VOTE_VALID_AFTER_UTC)){
 el.innerHTML = `<div style="color:var(--text-dim);font-size:13px;padding:8px 0;">
-NextGen research sampling was corrected before evidence collection. Valid voting opens at ${new Date(PACKAGE_VOTE_VALID_AFTER_UTC).toLocaleString()}.
+Prospective research voting opens at ${new Date(PACKAGE_VOTE_VALID_AFTER_UTC).toLocaleString()}.
 </div>`;
 return;
 }
@@ -11860,21 +11445,21 @@ return;
 
 if(PACKAGE_VOTE_STATUS === 'idle'){
 packageVoteEnsureLoaded();
-el.innerHTML = `<div style="color:var(--text-dim);font-size:13px;padding:8px 0;">Loading frozen package comparisons...</div>`;
+el.innerHTML = `<div style="color:var(--text-dim);font-size:13px;padding:8px 0;">Loading frozen prospective package comparisons...</div>`;
 return;
 }
 if(PACKAGE_VOTE_STATUS === 'loading'){
-el.innerHTML = `<div style="color:var(--text-dim);font-size:13px;padding:8px 0;">Loading frozen package comparisons...</div>`;
+el.innerHTML = `<div style="color:var(--text-dim);font-size:13px;padding:8px 0;">Loading frozen prospective package comparisons...</div>`;
 return;
 }
 if(PACKAGE_VOTE_STATUS === 'failed'){
-el.innerHTML = `<div style="color:var(--text-dim);font-size:13px;padding:8px 0;">Package research is temporarily unavailable. Normal KTC voting is unaffected.</div>`;
+el.innerHTML = `<div style="color:var(--text-dim);font-size:13px;padding:8px 0;">Prospective package research is temporarily unavailable. Normal KTC voting is unaffected.</div>`;
 return;
 }
 
 if(!packageVoteCurrent) packageVoteCurrent = packageVoteSelectChallenge();
 if(!packageVoteCurrent){
-el.innerHTML = `<div style="color:var(--text-dim);font-size:13px;padding:8px 0;">No eligible package comparison is available right now.</div>`;
+el.innerHTML = `<div style="color:var(--text-dim);font-size:13px;padding:8px 0;">No prospective package comparison is available right now.</div>`;
 return;
 }
 
@@ -11907,7 +11492,6 @@ ${packageVotesToday()} / ${PACKAGE_VOTE_DAILY_LIMIT} package votes today &middot
 </div>
 `;
 }
-
 function render(){
   document.getElementById('myTeamToggle').textContent = `Side ${state.myTeamSide} (You)`;
   renderNeedsPanel();
