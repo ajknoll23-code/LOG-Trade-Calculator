@@ -1,0 +1,870 @@
+name: Package Adjustment NextGen V2 Freeze Prospective Catalog
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/package-adjustment-nextgen-v2-freeze-prospective-catalog.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: package-adjustment-nextgen-v2-freeze-prospective-catalog
+  cancel-in-progress: false
+
+jobs:
+  freeze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out exact trigger commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Verify exact trigger and clean tree
+        env:
+          TRIGGER_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$TRIGGER_SHA"
+          test -z "$(git status --porcelain=v1)"
+          echo "PASS: exact trigger commit checked out cleanly."
+
+      - name: Set up exact Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13.15'
+
+      - name: Install exact validation environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --upgrade pip
+          python3 -m pip install "numpy==2.5.3" "scipy==1.18.1" "requests"
+          python3 - <<'PY'
+          import platform, numpy, scipy
+          assert platform.python_version() == "3.13.15"
+          assert numpy.__version__ == "2.5.3"
+          assert scipy.__version__ == "1.18.1"
+          print("PASS: exact Python/numpy/scipy environment available.")
+          PY
+
+      - name: Guard frozen preregistration and pre-activation boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          D="research/package-adjustment-nextgen-v2"
+
+          git merge-base --is-ancestor 0c20c3eb5bce74decfbb2c0ee62e38c4f3b3d3db HEAD
+
+          test "$(sha256sum "$D/prospective_time_holdout_preregistration_v1.json" | awk '{print $1}')" = \
+            "f29be9b1e73d1d6ec1d9a365fb29a0458334d75a36be64694adfcc4eeb78bfd6"
+          test "$(sha256sum "$D/prospective_time_holdout_preregistration_v1.md" | awk '{print $1}')" = \
+            "934fdfaa767281eb4222a778d2231162a0273c4ce20e18e217a1170861176288"
+          test "$(git hash-object "$D/prospective_time_holdout_preregistration_v1_manifest.json")" = \
+            "330e268aa717712198f4398aefe08445f804a3c2"
+
+          test ! -e "$D/prospective_source_fv_snapshot_v1.json"
+          test ! -e "$D/package_vote_challenges_prospective_v1.json"
+          test ! -e "$D/prospective_catalog_design_v1.md"
+          test ! -e "$D/prospective_catalog_freeze_manifest_v1.json"
+
+          # The prospective transport must not be active yet. The preregistration
+          # and its freeze workflow may mention the reserved namespace, but live
+          # browser / transport code may not.
+          ! grep -Fq '__pkgnv2p1__|' index.html
+          ! grep -Fq '__pkgnv2p1__|' scripts/market/ktc_pipeline.py
+          ! grep -Fq '__pkgnv2p1_meta__|' index.html
+          ! grep -Fq '__pkgnv2p1_meta__|' scripts/market/ktc_pipeline.py
+
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/validation/check_package_adjustment_live.py
+          echo "PASS: preregistration frozen, prospective voting inactive, production unchanged."
+
+      - name: Build and freeze fresh prospective catalog
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import importlib.util
+          import json
+          import math
+          import subprocess
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          ROOT = Path.cwd()
+          D = ROOT / "research" / "package-adjustment-nextgen-v2"
+          PREREG = D / "prospective_time_holdout_preregistration_v1.json"
+          FIRST_WAVE = D / "package_vote_challenges_nextgen_v2.json"
+          GEN_PATH = D / "generate_package_vote_challenges_nextgen_v2.py"
+          VALUES = ROOT / "scripts" / "artifacts" / "generated" / "value_uncertainty.json"
+          ROSTERS = ROOT / "data" / "league_rosters.json"
+          PROMOTION = ROOT / "research" / "package-adjustment-v5" / "controlled_live_v1_6_promotion.json"
+          WORKFLOW = ROOT / ".github" / "workflows" / "package-adjustment-nextgen-v2-freeze-prospective-catalog.yml"
+
+          OUT_SNAPSHOT = D / "prospective_source_fv_snapshot_v1.json"
+          OUT_CATALOG = D / "package_vote_challenges_prospective_v1.json"
+          OUT_MD = D / "prospective_catalog_design_v1.md"
+          OUT_MANIFEST = D / "prospective_catalog_freeze_manifest_v1.json"
+
+          EXPECTED_PREREG_SHA = "f29be9b1e73d1d6ec1d9a365fb29a0458334d75a36be64694adfcc4eeb78bfd6"
+          EXPECTED_PREREG_COMMIT = "0c20c3eb5bce74decfbb2c0ee62e38c4f3b3d3db"
+          EXPECTED_PROD_SHA = "9a1a52f3393a701fe8463fcf2179d1342debb925da1109ce73276b8b2b8cbbc7"
+          SEED = 20260912
+          TARGET_ANCHORS = {"low": 3940.0, "mid": 4740.0, "high": 5700.0}
+          MAX_APPEARANCE = 11
+
+          def read_json(path: Path):
+              return json.loads(path.read_text(encoding="utf-8"))
+
+          def sha256(path: Path) -> str:
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          def stable_rank(*parts) -> str:
+              text = "|".join(str(x) for x in (SEED, *parts))
+              return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+          def git(*args: str) -> str:
+              proc = subprocess.run(
+                  ["git", *args], text=True, stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE, check=False,
+              )
+              if proc.returncode:
+                  raise RuntimeError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
+              return proc.stdout.strip()
+
+          assert sha256(PREREG) == EXPECTED_PREREG_SHA
+          assert subprocess.run(
+              ["git", "merge-base", "--is-ancestor", EXPECTED_PREREG_COMMIT, "HEAD"]
+          ).returncode == 0
+
+          prereg = read_json(PREREG)
+          first_wave = read_json(FIRST_WAVE)
+          promotion = read_json(PROMOTION)
+
+          assert prereg["status"] == "frozen_prospective_time_holdout_preregistration"
+          assert prereg["frozen"] is True
+          assert prereg["preregistered_before_prospective_catalog_generation"] is True
+          assert prereg["preregistered_before_prospective_voting_activation"] is True
+          assert prereg["fresh_prospective_catalog_contract"]["catalog_id"] == "pkgnv2-prospective-catalog-v1"
+          assert prereg["fresh_prospective_catalog_contract"]["challenge_count"] == 129
+          assert prereg["fresh_prospective_catalog_contract"]["evaluation_cell_count"] == 24
+          assert prereg["fresh_prospective_catalog_contract"]["generation_seed"] == SEED
+          assert prereg["fresh_prospective_catalog_contract"]["maximum_player_appearance"] == MAX_APPEARANCE
+          assert prereg["fresh_prospective_catalog_contract"]["scale_anchor_targets_raw_fv"] == TARGET_ANCHORS
+          assert prereg["fresh_prospective_catalog_contract"]["family_counts"] == {
+              "core_concentration_2v2": 90,
+              "fragmentation_filler": 15,
+              "structural_topology_3v3": 24,
+          }
+          assert prereg["fresh_prospective_catalog_contract"]["scale_counts"] == {
+              "high": 43, "low": 43, "mid": 43
+          }
+          assert prereg["fresh_prospective_catalog_contract"]["fit_eligible_challenges"] == 0
+          assert prereg["fresh_prospective_catalog_contract"]["draft_picks_allowed"] is False
+          assert prereg["fresh_prospective_catalog_contract"]["player_assets_only"] is True
+          assert prereg["fresh_prospective_catalog_contract"]["exact_trade_signature_overlap_with_first_wave_catalog_allowed"] is False
+          assert prereg["fresh_prospective_catalog_contract"]["duplicate_trade_signatures_within_prospective_catalog_allowed"] is False
+          assert prereg["fresh_prospective_catalog_contract"]["values_visible_to_voter"] is False
+          assert prereg["fresh_prospective_catalog_contract"]["all_challenges_evaluation_only"] is True
+          assert prereg["fresh_prospective_catalog_contract"]["all_challenges_multi_piece_vs_multi_piece"] is True
+          assert prereg["production_change_authorized"] is False
+          assert prereg["automatic_production_promotion_allowed"] is False
+
+          assert promotion["production_revision"] == "v1.6-v5-size2-composition-overlay"
+          assert promotion["exact_live_formula_sha256"] == EXPECTED_PROD_SHA
+          assert promotion["automatic_future_production_change_allowed"] is False
+          assert first_wave["frozen"] is True
+          assert len(first_wave["challenges"]) == 129
+
+          spec = importlib.util.spec_from_file_location("pkgnv2_generator", GEN_PATH)
+          gen = importlib.util.module_from_spec(spec)
+          assert spec and spec.loader
+          spec.loader.exec_module(gen)
+
+          values_doc = read_json(VALUES)
+          rosters_doc = read_json(ROSTERS)
+          all_players, unresolved, pos_counts = gen.build_player_universe(values_doc, rosters_doc)
+
+          # Frozen M2b domain is used only as a binary support gate. Prediction
+          # magnitudes and M2b-vs-M0 differences are never computed here.
+          m2b = prereg["frozen_prediction_models"]["M2b"]
+          v_ref = float(m2b["v_ref"])
+          inverse_domain_max = float(m2b["inverse_domain_max_normalized"])
+          domain_max_fv = v_ref * inverse_domain_max
+          players = [p for p in all_players if float(p["fv"]) / v_ref <= inverse_domain_max + 1e-12]
+          domain_excluded = [p for p in all_players if p not in players]
+          if len(players) < 350:
+              raise RuntimeError(f"too few domain-valid eligible players: {len(players)}")
+
+          snapshot_time = datetime.now(timezone.utc).isoformat()
+          snapshot = {
+              "schema_version": 1,
+              "status": "frozen_prospective_source_fv_snapshot",
+              "frozen": True,
+              "catalog_id": "pkgnv2-prospective-catalog-v1",
+              "snapshot_taken_at_utc": snapshot_time,
+              "snapshot_taken_after_preregistration_freeze": True,
+              "preregistration_freeze_commit": EXPECTED_PREREG_COMMIT,
+              "preregistration_sha256": EXPECTED_PREREG_SHA,
+              "source_files": {
+                  "value_uncertainty": {
+                      "path": VALUES.relative_to(ROOT).as_posix(),
+                      "sha256": sha256(VALUES),
+                      "source_generated_at_utc": values_doc.get("generated_at_utc"),
+                  },
+                  "league_rosters": {
+                      "path": ROSTERS.relative_to(ROOT).as_posix(),
+                      "sha256": sha256(ROSTERS),
+                  },
+              },
+              "eligibility": {
+                  "definition": "rostered positive-FV non-kicker players resolved by frozen NextGen generator eligibility logic",
+                  "eligible_before_candidate_domain_gate": len(all_players),
+                  "candidate_domain_gate_only": True,
+                  "candidate_domain_max_normalized": inverse_domain_max,
+                  "candidate_v_ref": v_ref,
+                  "candidate_domain_max_fv": domain_max_fv,
+                  "excluded_by_candidate_domain_gate": len(domain_excluded),
+                  "eligible_after_candidate_domain_gate": len(players),
+                  "position_counts_after_gate": dict(sorted(Counter(p["pos"] for p in players).items())),
+                  "unresolved_roster_entries": len(unresolved),
+              },
+              "players": [
+                  {
+                      "key": str(p["key"]),
+                      "player_id": p.get("player_id"),
+                      "name": p["name"],
+                      "pos": p["pos"],
+                      "team": p.get("team"),
+                      "age": p.get("age"),
+                      "fv": round(float(p["fv"]), 6),
+                  }
+                  for p in sorted(players, key=lambda x: str(x["key"]))
+              ],
+              "outcomes_or_model_advantage_used": False,
+              "prospective_ballots_read": False,
+          }
+          OUT_SNAPSHOT.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          snapshot_sha = sha256(OUT_SNAPSHOT)
+
+          def trade_signature(challenge):
+              side_a = tuple(sorted(str(a["key"]) for a in challenge["side_a"]["assets"]))
+              side_b = tuple(sorted(str(a["key"]) for a in challenge["side_b"]["assets"]))
+              return tuple(sorted((side_a, side_b)))
+
+          first_wave_sigs = {trade_signature(c) for c in first_wave["challenges"]}
+          if len(first_wave_sigs) != len(first_wave["challenges"]):
+              raise RuntimeError("first-wave catalog unexpectedly contains duplicate exact trade signatures")
+
+          # Deterministic, preregistered scale targets. Component-feasibility may
+          # shift a realized anchor upward/downward, but the frozen target itself
+          # never changes and outcomes never enter the calculation.
+          def plans_from_feasible(feasible_totals, *, label):
+              unique = sorted({round(float(x), 3) for x in feasible_totals})
+              if len(unique) < 30:
+                  raise RuntimeError(f"{label}: too few unique feasible totals: {len(unique)}")
+              plans = {}
+              used_anchors = set()
+              for scale in ("low", "mid", "high"):
+                  target = TARGET_ANCHORS[scale]
+                  ranked = sorted(
+                      unique,
+                      key=lambda x: (abs(float(x) - target), stable_rank(label, scale, x), float(x)),
+                  )
+                  anchor = next((float(x) for x in ranked if float(x) not in used_anchors), None)
+                  if anchor is None:
+                      raise RuntimeError(f"{label}/{scale}: no unique realized anchor")
+                  used_anchors.add(anchor)
+                  goals = sorted(
+                      unique,
+                      key=lambda x: (abs(float(x) - anchor), stable_rank(label, scale, "goal", x), float(x)),
+                  )[:220]
+                  plans[scale] = {
+                      "target_anchor_total_fv": float(target),
+                      "anchor_total_fv": float(anchor),
+                      "candidate_goal_totals": [float(x) for x in goals],
+                  }
+              anchors = [plans[x]["anchor_total_fv"] for x in ("low", "mid", "high")]
+              if not (anchors[0] < anchors[1] < anchors[2]):
+                  raise RuntimeError(f"{label}: realized anchors not increasing: {anchors}")
+              return plans
+
+          feasible_pairs = gen.enumerate_feasible_8020_pairs(players)
+          core_totals = [float(r["total_fv"]) for r in feasible_pairs]
+          core_plans = plans_from_feasible(core_totals, label="core")
+
+          frag_label, frag_a, frag_b = gen.FRAGMENTATION_COMPARISONS[0]
+          frag_totals = []
+          seen = set()
+          for row in feasible_pairs:
+              total = round(float(row["total_fv"]), 3)
+              if total in seen:
+                  continue
+              seen.add(total)
+              if gen.component_window_matching_exists(players, total, frag_a, frag_b):
+                  frag_totals.append(total)
+          frag_plans = plans_from_feasible(frag_totals, label=frag_label)
+
+          topology_shares = sorted({
+              float(s)
+              for _label, a, b in gen.HOLDOUT_3V3_COMPARISONS
+              for s in (a + b)
+              if float(s) > 0
+          })
+          topology_candidates = set()
+          for p in players:
+              for share in topology_shares:
+                  topology_candidates.add(round(float(p["fv"]) / share, 3))
+          topology_totals = [
+              total for total in sorted(topology_candidates)
+              if all(
+                  gen.component_window_matching_exists(players, total, a, b)
+                  for _label, a, b in gen.HOLDOUT_3V3_COMPARISONS
+              )
+          ]
+          topology_plans = plans_from_feasible(topology_totals, label="topology_3v3")
+
+          appearance = Counter()
+          used_trade_sigs = set(first_wave_sigs)
+          prospective_sigs = set()
+          side_occurrences = Counter()
+          challenges = []
+          cell_counts = Counter()
+
+          def prospective_try_build(*, family, cell_id, scale_label, scale_info,
+                                    shares_a, shares_b, treatment, rep_index):
+              total_goal_candidates = scale_info["candidate_goal_totals"]
+              for total_goal in total_goal_candidates:
+                  cand_a = gen.construct_side_candidates(
+                      players, total_goal, shares_a, set(), appearance,
+                      limit=gen.SIDE_CANDIDATE_LIMIT,
+                  )
+                  cand_b = gen.construct_side_candidates(
+                      players, total_goal, shares_b, set(), appearance,
+                      limit=gen.SIDE_CANDIDATE_LIMIT,
+                  )
+                  ranked = []
+                  for assets_a in cand_a:
+                      keys_a = {str(p["key"]) for p in assets_a}
+                      total_a = sum(float(p["fv"]) for p in assets_a)
+                      actual_a = gen.canonical_actual_shares(assets_a)
+                      intended_a = tuple(sorted((float(x) for x in shares_a), reverse=True))
+                      err_a = abs(total_a - total_goal) / total_goal
+                      share_err_a = max(abs(a-b) for a, b in zip(actual_a, intended_a))
+
+                      for assets_b in cand_b:
+                          keys_b = {str(p["key"]) for p in assets_b}
+                          if keys_a & keys_b:
+                              continue
+                          if any(appearance[k] >= MAX_APPEARANCE for k in keys_a | keys_b):
+                              continue
+
+                          total_b = sum(float(p["fv"]) for p in assets_b)
+                          mean_total = (total_a + total_b) / 2.0
+                          if mean_total <= 0:
+                              continue
+                          pair_gap = abs(total_a - total_b) / mean_total
+                          if pair_gap > gen.MAX_PAIR_TOTAL_GAP + 1e-12:
+                              continue
+
+                          actual_b = gen.canonical_actual_shares(assets_b)
+                          intended_b = tuple(sorted((float(x) for x in shares_b), reverse=True))
+                          err_b = abs(total_b - total_goal) / total_goal
+                          share_err_b = max(abs(a-b) for a, b in zip(actual_b, intended_b))
+
+                          side_a_sig = tuple(sorted(keys_a))
+                          side_b_sig = tuple(sorted(keys_b))
+                          trade_sig = tuple(sorted((side_a_sig, side_b_sig)))
+                          if trade_sig in used_trade_sigs:
+                              continue
+
+                          side_reuse = (
+                              side_occurrences[(family, cell_id, scale_label, side_a_sig)]
+                              + side_occurrences[(family, cell_id, scale_label, side_b_sig)]
+                          )
+                          reuse_counts = [appearance[k] for k in keys_a | keys_b]
+                          rank = (
+                              side_reuse,
+                              max(reuse_counts, default=0),
+                              sum(reuse_counts),
+                              pair_gap,
+                              max(err_a, err_b),
+                              max(share_err_a, share_err_b),
+                              err_a + err_b,
+                              share_err_a + share_err_b,
+                              stable_rank(family, cell_id, scale_label, total_goal, trade_sig),
+                              trade_sig,
+                          )
+                          ranked.append((rank, assets_a, assets_b, trade_sig, total_goal))
+
+                  if ranked:
+                      ranked.sort(key=lambda row: row[0])
+                      _rank, assets_a, assets_b, trade_sig, chosen_goal = ranked[0]
+                      challenge_id = (
+                          f"pkgnv2p1_{family}_{scale_label}_{cell_id}_r{rep_index:02d}"
+                          .replace("/", "_")
+                      )
+                      c = gen.make_challenge(
+                          challenge_id=challenge_id,
+                          family=family,
+                          cell_id=cell_id,
+                          scale_label=scale_label,
+                          scale_anchor=scale_info["anchor_total_fv"],
+                          total_goal=chosen_goal,
+                          shares_a=shares_a,
+                          shares_b=shares_b,
+                          assets_a=assets_a,
+                          assets_b=assets_b,
+                          split="prospective_time_holdout",
+                          fit_eligible=False,
+                          treatment=treatment,
+                      )
+                      c["experiment"] = "package_adjustment_nextgen_v2_prospective_v1"
+                      c["evaluation_only"] = True
+                      c["fit_eligible"] = False
+                      c["model_selection_eligible"] = False
+                      c["scale_anchor_target_raw_fv"] = TARGET_ANCHORS[scale_label]
+                      return c, trade_sig
+              return None, None
+
+          def add_cell(*, family, cell_id, scale_label, scale_info,
+                       shares_a, shares_b, reps, treatment):
+              for rep in range(1, reps + 1):
+                  c, sig = prospective_try_build(
+                      family=family, cell_id=cell_id, scale_label=scale_label,
+                      scale_info=scale_info, shares_a=shares_a, shares_b=shares_b,
+                      treatment=treatment, rep_index=rep,
+                  )
+                  if c is None:
+                      raise RuntimeError(
+                          f"underfilled prospective cell {family}/{scale_label}/{cell_id}: "
+                          f"built {rep-1}/{reps}"
+                      )
+                  used_trade_sigs.add(sig)
+                  prospective_sigs.add(sig)
+                  challenges.append(c)
+                  cell_counts[(family, scale_label, cell_id)] += 1
+                  for side_name in ("side_a", "side_b"):
+                      side_sig = tuple(sorted(str(a["key"]) for a in c[side_name]["assets"]))
+                      side_occurrences[(family, cell_id, scale_label, side_sig)] += 1
+                      for asset in c[side_name]["assets"]:
+                          appearance[str(asset["key"])] += 1
+
+          for scale in ("low", "mid", "high"):
+              info = core_plans[scale]
+              for label, shares in gen.CORE_PROFILES:
+                  add_cell(
+                      family="core_concentration_2v2",
+                      cell_id=f"core_{label}",
+                      scale_label=scale,
+                      scale_info=info,
+                      shares_a=shares,
+                      shares_b=gen.FLAT_PROFILE,
+                      reps=6,
+                      treatment=f"{gen.profile_label(shares)}_vs_{gen.profile_label(gen.FLAT_PROFILE)}",
+                  )
+
+          for scale in ("low", "mid", "high"):
+              add_cell(
+                  family="fragmentation_filler",
+                  cell_id=f"frag_{frag_label}",
+                  scale_label=scale,
+                  scale_info=frag_plans[scale],
+                  shares_a=frag_a,
+                  shares_b=frag_b,
+                  reps=5,
+                  treatment=f"{gen.profile_label(frag_a)}_vs_{gen.profile_label(frag_b)}",
+              )
+
+          for scale in ("low", "mid", "high"):
+              for label, shares_a, shares_b in gen.HOLDOUT_3V3_COMPARISONS:
+                  add_cell(
+                      family="structural_topology_3v3",
+                      cell_id=f"holdout_{label}",
+                      scale_label=scale,
+                      scale_info=topology_plans[scale],
+                      shares_a=shares_a,
+                      shares_b=shares_b,
+                      reps=4,
+                      treatment=f"{gen.profile_label(shares_a)}_vs_{gen.profile_label(shares_b)}",
+                  )
+
+          # ----------------------------- frozen-contract validation
+          assert len(challenges) == 129
+          assert len(cell_counts) == 24
+          assert all(v > 0 for v in cell_counts.values())
+          family_counts = Counter(c["family"] for c in challenges)
+          scale_counts = Counter(c["scale_label"] for c in challenges)
+          assert dict(family_counts) == {
+              "core_concentration_2v2": 90,
+              "fragmentation_filler": 15,
+              "structural_topology_3v3": 24,
+          }
+          assert dict(scale_counts) == {"low": 43, "mid": 43, "high": 43}
+          assert max(appearance.values()) <= MAX_APPEARANCE
+          assert len(prospective_sigs) == 129
+          assert not (prospective_sigs & first_wave_sigs)
+
+          ids = [c["id"] for c in challenges]
+          assert len(ids) == len(set(ids))
+          player_lookup = {str(p["key"]): p for p in players}
+          for c in challenges:
+              assert c["split"] == "prospective_time_holdout"
+              assert c["fit_eligible"] is False
+              assert c["evaluation_only"] is True
+              assert c["model_selection_eligible"] is False
+              assert c["values_hidden_from_voter"] is True
+              assert c["side_a"]["asset_count"] >= 2
+              assert c["side_b"]["asset_count"] >= 2
+              assert float(c["pair_total_gap_pct"]) <= gen.MAX_PAIR_TOTAL_GAP + 1e-8
+              for side_name in ("side_a", "side_b"):
+                  side = c[side_name]
+                  assert float(side["target_total_error_pct"]) <= gen.MAX_SIDE_TARGET_ERROR + 1e-8
+                  assert float(side["max_share_error"]) <= gen.MAX_COMPONENT_SHARE_ERROR + 1e-8
+                  keys = [str(a["key"]) for a in side["assets"]]
+                  assert len(keys) == len(set(keys))
+                  for a in side["assets"]:
+                      key = str(a["key"])
+                      assert key in player_lookup
+                      assert abs(float(a["fv"]) - float(player_lookup[key]["fv"])) <= 0.001
+                      assert float(a["fv"]) / v_ref <= inverse_domain_max + 1e-12
+              assert not (
+                  {str(a["key"]) for a in c["side_a"]["assets"]}
+                  & {str(a["key"]) for a in c["side_b"]["assets"]}
+              )
+
+          # Exact preregistered per-cell replication counts.
+          for scale in ("low", "mid", "high"):
+              for label, _shares in gen.CORE_PROFILES:
+                  assert cell_counts[("core_concentration_2v2", scale, f"core_{label}")] == 6
+              assert cell_counts[("fragmentation_filler", scale, f"frag_{frag_label}")] == 5
+              for label, _a, _b in gen.HOLDOUT_3V3_COMPARISONS:
+                  assert cell_counts[("structural_topology_3v3", scale, f"holdout_{label}")] == 4
+
+          # Production V1.6's current overlay is not active on all-multi-v-multi
+          # trades; this prospective design therefore preserves raw M0 scoring.
+          assert all(
+              c["side_a"]["asset_count"] >= 2 and c["side_b"]["asset_count"] >= 2
+              for c in challenges
+          )
+
+          def plan_summary(plan):
+              return {
+                  scale: {
+                      "target_anchor_raw_fv": TARGET_ANCHORS[scale],
+                      "realized_anchor_raw_fv": round(float(plan[scale]["anchor_total_fv"]), 6),
+                      "absolute_anchor_offset": round(
+                          abs(float(plan[scale]["anchor_total_fv"]) - TARGET_ANCHORS[scale]), 6
+                      ),
+                  }
+                  for scale in ("low", "mid", "high")
+              }
+
+          catalog = {
+              "schema_version": 1,
+              "status": "frozen_prospective_research_catalog_v1",
+              "frozen": True,
+              "catalog_id": "pkgnv2-prospective-catalog-v1",
+              "research_only": True,
+              "evaluation_only": True,
+              "fit_eligible_challenges": 0,
+              "production_change_authorized": False,
+              "automatic_production_promotion_allowed": False,
+              "generated_after_preregistration_freeze": True,
+              "generated_before_prospective_voting_activation": True,
+              "generation_seed": SEED,
+              "generated_at_utc": snapshot_time,
+              "generator": {
+                  "workflow_path": WORKFLOW.relative_to(ROOT).as_posix(),
+                  "workflow_sha256": sha256(WORKFLOW),
+                  "base_generator_path": GEN_PATH.relative_to(ROOT).as_posix(),
+                  "base_generator_sha256": sha256(GEN_PATH),
+                  "trigger_commit_sha": git("rev-parse", "HEAD"),
+              },
+              "preregistration": {
+                  "path": PREREG.relative_to(ROOT).as_posix(),
+                  "sha256": EXPECTED_PREREG_SHA,
+                  "freeze_commit": EXPECTED_PREREG_COMMIT,
+              },
+              "source_fv_snapshot": {
+                  "path": OUT_SNAPSHOT.relative_to(ROOT).as_posix(),
+                  "sha256": snapshot_sha,
+              },
+              "first_wave_exclusion": {
+                  "catalog_path": FIRST_WAVE.relative_to(ROOT).as_posix(),
+                  "catalog_sha256": sha256(FIRST_WAVE),
+                  "first_wave_trade_signature_count": len(first_wave_sigs),
+                  "prospective_trade_signature_count": len(prospective_sigs),
+                  "exact_trade_signature_overlap_count": 0,
+              },
+              "candidate_domain_gate": {
+                  "rule": prereg["fresh_prospective_catalog_contract"]["candidate_domain_gate_rule"],
+                  "v_ref": v_ref,
+                  "inverse_domain_max_normalized": inverse_domain_max,
+                  "maximum_supported_asset_fv": domain_max_fv,
+                  "prediction_magnitude_used_for_selection": False,
+                  "model_advantage_used_for_selection": False,
+              },
+              "transport_reserved_not_activated": {
+                  "vote_prefix": prereg["prospective_transport_and_sampling_contract"]["vote_prefix"],
+                  "meta_prefix": prereg["prospective_transport_and_sampling_contract"]["meta_prefix"],
+                  "schema_marker": prereg["prospective_transport_and_sampling_contract"]["schema_marker"],
+              },
+              "design": {
+                  "all_player_assets_only": True,
+                  "draft_picks_allowed": False,
+                  "all_multi_piece_vs_multi_piece": True,
+                  "values_hidden_from_voter": True,
+                  "display_side_randomization_required_at_activation": True,
+                  "maximum_player_appearance": MAX_APPEARANCE,
+                  "realized_max_player_appearance": max(appearance.values()),
+                  "scale_anchor_targets_raw_fv": TARGET_ANCHORS,
+                  "core_scale_plan": plan_summary(core_plans),
+                  "fragmentation_scale_plan": plan_summary(frag_plans),
+                  "topology_scale_plan": plan_summary(topology_plans),
+                  "construction_tolerances": {
+                      "max_side_target_error": gen.MAX_SIDE_TARGET_ERROR,
+                      "max_pair_total_gap": gen.MAX_PAIR_TOTAL_GAP,
+                      "max_component_share_error": gen.MAX_COMPONENT_SHARE_ERROR,
+                  },
+              },
+              "diagnostics": {
+                  "challenge_count": len(challenges),
+                  "evaluation_cell_count": len(cell_counts),
+                  "family_counts": dict(sorted(family_counts.items())),
+                  "scale_counts": dict(sorted(scale_counts.items())),
+                  "unique_assets_used": len(appearance),
+                  "max_asset_appearance": max(appearance.values()),
+                  "appearance_histogram": dict(sorted(Counter(appearance.values()).items())),
+                  "cell_counts": [
+                      {
+                          "family": family,
+                          "scale_label": scale,
+                          "cell_id": cell,
+                          "challenge_count": count,
+                      }
+                      for (family, scale, cell), count in sorted(cell_counts.items())
+                  ],
+                  "eligible_assets_before_domain_gate": len(all_players),
+                  "eligible_assets_after_domain_gate": len(players),
+                  "domain_excluded_assets": len(domain_excluded),
+                  "first_wave_exact_trade_overlap_count": 0,
+              },
+              "scientific_isolation": {
+                  "first_wave_vote_outcomes_read": False,
+                  "spent_structural_holdout_outcomes_read": False,
+                  "prospective_vote_outcomes_read": False,
+                  "M2b_predicted_choice_probability_computed": False,
+                  "M0_predicted_choice_probability_computed": False,
+                  "M2b_minus_M0_score_gap_computed": False,
+                  "statistical_significance_used": False,
+                  "production_modified": False,
+              },
+              "challenges": challenges,
+          }
+          OUT_CATALOG.write_text(json.dumps(catalog, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+          md = f"""# Package Adjustment NextGen V2 — Prospective Catalog V1\n\n**Status: FROZEN PROSPECTIVE RESEARCH CATALOG — NOT YET ACTIVATED.**\n\n- Preregistration freeze commit: `{EXPECTED_PREREG_COMMIT}`\n- Generation seed: `{SEED}`\n- Fresh challenges: `{len(challenges)}`\n- Evaluation cells: `{len(cell_counts)}`\n- Family counts: `{dict(sorted(family_counts.items()))}`\n- Scale counts: `{dict(sorted(scale_counts.items()))}`\n- Fresh source-FV snapshot SHA-256: `{snapshot_sha}`\n- Exact first-wave trade overlap: `0`\n- Unique assets used: `{len(appearance)}`\n- Maximum player appearances: `{max(appearance.values())}` (cap `{MAX_APPEARANCE}`)\n- Fit-eligible challenges: `0`\n- All sides contain at least two player assets.\n- Frozen M2b was used only as a mathematical support/domain gate. No prediction magnitude, M0/M2b advantage, vote outcome, holdout outcome, or significance statistic was used to select challenges.\n- Production V1.6 is unchanged.\n- Prospective voting remains inactive; activation requires the separate preregistered workflow step.\n\n## Realized scale anchors\n\n### Core 2v2\n`{json.dumps(plan_summary(core_plans), sort_keys=True)}`\n\n### Fragmentation\n`{json.dumps(plan_summary(frag_plans), sort_keys=True)}`\n\n### Structural topology 3v3\n`{json.dumps(plan_summary(topology_plans), sort_keys=True)}`\n"""
+          OUT_MD.write_text(md, encoding="utf-8")
+
+          manifest = {
+              "schema_version": 1,
+              "status": "frozen_prospective_catalog_v1_manifest",
+              "frozen": True,
+              "catalog_id": "pkgnv2-prospective-catalog-v1",
+              "generated_at_utc": snapshot_time,
+              "preregistration_freeze_commit": EXPECTED_PREREG_COMMIT,
+              "generation_seed": SEED,
+              "artifacts": {
+                  "source_fv_snapshot": {
+                      "path": OUT_SNAPSHOT.relative_to(ROOT).as_posix(),
+                      "sha256": sha256(OUT_SNAPSHOT),
+                  },
+                  "catalog": {
+                      "path": OUT_CATALOG.relative_to(ROOT).as_posix(),
+                      "sha256": sha256(OUT_CATALOG),
+                  },
+                  "design_markdown": {
+                      "path": OUT_MD.relative_to(ROOT).as_posix(),
+                      "sha256": sha256(OUT_MD),
+                  },
+              },
+              "workflow_sha256": sha256(WORKFLOW),
+              "base_generator_sha256": sha256(GEN_PATH),
+              "source_value_uncertainty_sha256": sha256(VALUES),
+              "source_rosters_sha256": sha256(ROSTERS),
+              "first_wave_catalog_sha256": sha256(FIRST_WAVE),
+              "challenge_count": 129,
+              "evaluation_cell_count": 24,
+              "family_counts": dict(sorted(family_counts.items())),
+              "scale_counts": dict(sorted(scale_counts.items())),
+              "max_asset_appearance": max(appearance.values()),
+              "first_wave_exact_trade_overlap_count": 0,
+              "fit_eligible_challenges": 0,
+              "prospective_voting_activated": False,
+              "prospective_ballots_read": False,
+              "outcomes_used_for_generation": False,
+              "model_advantage_used_for_generation": False,
+              "production_change_authorized": False,
+              "automatic_production_promotion_allowed": False,
+          }
+          OUT_MANIFEST.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+          # Re-read exact frozen bytes and verify manifest digests.
+          frozen_catalog = read_json(OUT_CATALOG)
+          frozen_manifest = read_json(OUT_MANIFEST)
+          assert frozen_catalog["frozen"] is True
+          assert frozen_catalog["diagnostics"]["challenge_count"] == 129
+          assert frozen_catalog["diagnostics"]["evaluation_cell_count"] == 24
+          assert frozen_catalog["diagnostics"]["first_wave_exact_trade_overlap_count"] == 0
+          assert frozen_catalog["scientific_isolation"]["prospective_vote_outcomes_read"] is False
+          for item in frozen_manifest["artifacts"].values():
+              assert sha256(ROOT / item["path"]) == item["sha256"]
+
+          print(json.dumps({
+              "status": "prospective_catalog_frozen",
+              "challenge_count": len(challenges),
+              "cell_count": len(cell_counts),
+              "family_counts": dict(sorted(family_counts.items())),
+              "scale_counts": dict(sorted(scale_counts.items())),
+              "unique_assets_used": len(appearance),
+              "max_asset_appearance": max(appearance.values()),
+              "first_wave_exact_trade_overlap_count": 0,
+              "source_snapshot_sha256": snapshot_sha,
+              "core_scale_plan": plan_summary(core_plans),
+              "fragmentation_scale_plan": plan_summary(frag_plans),
+              "topology_scale_plan": plan_summary(topology_plans),
+          }, indent=2, sort_keys=True))
+          PY
+
+      - name: Validate exact frozen outputs and file isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          D="research/package-adjustment-nextgen-v2"
+
+          python3 - <<'PY'
+          import hashlib, json
+          from collections import Counter
+          from pathlib import Path
+
+          d = Path("research/package-adjustment-nextgen-v2")
+          manifest = json.loads((d / "prospective_catalog_freeze_manifest_v1.json").read_text())
+          catalog = json.loads((d / "package_vote_challenges_prospective_v1.json").read_text())
+          prereg = json.loads((d / "prospective_time_holdout_preregistration_v1.json").read_text())
+          first = json.loads((d / "package_vote_challenges_nextgen_v2.json").read_text())
+
+          def sha(path):
+              return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+          def sig(c):
+              a = tuple(sorted(str(x["key"]) for x in c["side_a"]["assets"]))
+              b = tuple(sorted(str(x["key"]) for x in c["side_b"]["assets"]))
+              return tuple(sorted((a, b)))
+
+          assert manifest["status"] == "frozen_prospective_catalog_v1_manifest"
+          assert manifest["frozen"] is True
+          assert manifest["challenge_count"] == 129
+          assert manifest["evaluation_cell_count"] == 24
+          assert manifest["first_wave_exact_trade_overlap_count"] == 0
+          assert manifest["prospective_voting_activated"] is False
+          assert manifest["outcomes_used_for_generation"] is False
+          assert manifest["model_advantage_used_for_generation"] is False
+          assert manifest["production_change_authorized"] is False
+          assert manifest["automatic_production_promotion_allowed"] is False
+          for item in manifest["artifacts"].values():
+              assert sha(item["path"]) == item["sha256"]
+
+          assert catalog["status"] == "frozen_prospective_research_catalog_v1"
+          assert catalog["frozen"] is True
+          assert catalog["catalog_id"] == prereg["fresh_prospective_catalog_contract"]["catalog_id"]
+          assert len(catalog["challenges"]) == 129
+          assert Counter(x["family"] for x in catalog["challenges"]) == Counter({
+              "core_concentration_2v2": 90,
+              "fragmentation_filler": 15,
+              "structural_topology_3v3": 24,
+          })
+          assert Counter(x["scale_label"] for x in catalog["challenges"]) == Counter({
+              "low": 43, "mid": 43, "high": 43,
+          })
+          assert all(x["fit_eligible"] is False for x in catalog["challenges"])
+          assert all(x["evaluation_only"] is True for x in catalog["challenges"])
+          assert all(x["side_a"]["asset_count"] >= 2 and x["side_b"]["asset_count"] >= 2 for x in catalog["challenges"])
+          ps = {sig(x) for x in catalog["challenges"]}
+          fs = {sig(x) for x in first["challenges"]}
+          assert len(ps) == 129
+          assert not (ps & fs)
+          print("PASS: frozen prospective catalog satisfies the preregistered structural contract.")
+          PY
+
+          mapfile -t changed < <(git status --porcelain=v1 | awk '{print $2}' | sort)
+          expected=(
+            "$D/package_vote_challenges_prospective_v1.json"
+            "$D/prospective_catalog_design_v1.md"
+            "$D/prospective_catalog_freeze_manifest_v1.json"
+            "$D/prospective_source_fv_snapshot_v1.json"
+          )
+          mapfile -t expected_sorted < <(printf '%s\n' "${expected[@]}" | sort)
+          test "${#changed[@]}" -eq 4
+          test "$(printf '%s\n' "${changed[@]}")" = "$(printf '%s\n' "${expected_sorted[@]}")"
+          echo "PASS: generation changed exactly the four intended research files."
+
+      - name: Run full repository regressions before commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/validation/repo_regression_checks.py
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/validation/check_package_adjustment_live.py
+
+      - name: Commit exactly the frozen prospective catalog
+        shell: bash
+        run: |
+          set -euo pipefail
+          D="research/package-adjustment-nextgen-v2"
+          files=(
+            "$D/package_vote_challenges_prospective_v1.json"
+            "$D/prospective_catalog_design_v1.md"
+            "$D/prospective_catalog_freeze_manifest_v1.json"
+            "$D/prospective_source_fv_snapshot_v1.json"
+          )
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- "${files[@]}"
+
+          mapfile -t staged < <(git diff --cached --name-only | sort)
+          mapfile -t expected < <(printf '%s\n' "${files[@]}" | sort)
+          test "${#staged[@]}" -eq 4
+          test "$(printf '%s\n' "${staged[@]}")" = "$(printf '%s\n' "${expected[@]}")"
+
+          git commit -m "Freeze NextGen V2 prospective catalog v1"
+          git push origin HEAD:main
+
+      - name: Verify freeze commit and production boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1)"
+
+          changed="$(git diff-tree --no-commit-id --name-only -r HEAD | sort)"
+          expected="$(printf '%s\n' \
+            'research/package-adjustment-nextgen-v2/package_vote_challenges_prospective_v1.json' \
+            'research/package-adjustment-nextgen-v2/prospective_catalog_design_v1.md' \
+            'research/package-adjustment-nextgen-v2/prospective_catalog_freeze_manifest_v1.json' \
+            'research/package-adjustment-nextgen-v2/prospective_source_fv_snapshot_v1.json' | sort)"
+          test "$changed" = "$expected"
+
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/validation/check_package_adjustment_live.py
+          echo "PASS: prospective catalog frozen; voting still inactive; production V1.6 unchanged."
