@@ -1,0 +1,781 @@
+name: Package Adjustment NextGen V2 Prospective Maturity Monitor
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13.15'
+
+      - name: Install monitor dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install "requests==2.34.2"
+
+      - name: Guard frozen prospective contract
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          D="research/package-adjustment-nextgen-v2"
+          test -z "$(git status --porcelain=v1)"
+
+          # Require the completed workflow cleanup as an ancestor. This monitor
+          # was designed against the cleaned 15-workflow baseline.
+          git merge-base --is-ancestor \
+            4b52df39f3c9a02d3b114c4cdfc81dd5af411049 HEAD
+
+          # Frozen files must remain byte-identical.
+          test "$(git hash-object "$D/prospective_time_holdout_preregistration_v1.json")" = \
+            "f37b18ec24ae9fa73872069963be7d13f620e80a"
+          test "$(git hash-object "$D/package_vote_challenges_prospective_v1.json")" = \
+            "b338b18291c5058c5a2b941e1293322e2e70ea8c"
+          test "$(git hash-object "$D/prospective_voting_restart_30_daily_v1.json")" = \
+            "2b8fbc79d0c0c7da31aa0a2ce2d2c4b44c554e2b"
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import re
+          from pathlib import Path
+
+          d = Path("research/package-adjustment-nextgen-v2")
+          prereg = json.loads(
+              (d / "prospective_time_holdout_preregistration_v1.json").read_text()
+          )
+          catalog = json.loads(
+              (d / "package_vote_challenges_prospective_v1.json").read_text()
+          )
+          amendment = json.loads(
+              (d / "prospective_voting_restart_30_daily_v1.json").read_text()
+          )
+
+          assert prereg["status"] == "frozen_prospective_time_holdout_preregistration"
+          assert prereg["frozen"] is True
+          evidence = prereg["prospective_evidence_maturity_and_stopping"]
+          assert evidence["monitor_must_be_outcome_blind"] is True
+          assert evidence["prospective_effective_lifetime_cap_per_voter"] == 30.0
+          assert evidence["minimum_distinct_voters"] == 30
+          assert evidence["minimum_effective_votes_per_cell"] == 15.0
+          assert evidence["minimum_distinct_voters_per_cell"] == 10
+          assert evidence["required_cell_count"] == 24
+          assert evidence["exact_checkpoints_effective_votes"] == [900, 1000]
+          assert evidence["ballot_weight"] == (
+              "min(1,30/valid_post_daily_cap_prospective_ballot_count_for_voter)"
+          )
+
+          assert amendment["status"] == "frozen_prospective_restart_amendment_30_daily"
+          rules = amendment["superseding_evidence_rules"]
+          assert rules["daily_valid_vote_cap_per_voter"] == 30
+          assert rules["effective_lifetime_cap_per_voter"] == 30.0
+          assert rules["minimum_distinct_voters"] == 30
+          assert rules["minimum_effective_votes_per_cell"] == 15.0
+          assert rules["minimum_distinct_voters_per_cell"] == 10
+          assert rules["exact_checkpoints_effective_votes"] == [900, 1000]
+          assert rules["first_checkpoint_effective_votes"] == 900
+          assert rules["hard_cap_effective_votes"] == 1000
+          assert rules["stopping_is_coverage_only"] is True
+
+          assert amendment["timing"]["replacement_valid_ballot_start_utc"] == (
+              "2026-09-12T12:59:45.410967+00:00"
+          )
+          assert amendment["invalidated_pre_restart_evidence"]["choice_fields_inspected"] is False
+          assert amendment["invalidated_pre_restart_evidence"]["raw_rows_observed_before_restart"] == 20
+
+          assert catalog["catalog_id"] == "pkgnv2-prospective-catalog-v1"
+          assert len(catalog["challenges"]) == 129
+          assert all(c["evaluation_only"] is True for c in catalog["challenges"])
+          assert all(c["fit_eligible"] is False for c in catalog["challenges"])
+
+          # Browser must still implement the superseding 30/day contract and
+          # replacement cutoff. Unrelated UI changes are allowed.
+          html = Path("index.html").read_text(encoding="utf-8")
+          assert "const PACKAGE_VOTE_DAILY_LIMIT = 30;" in html
+          assert (
+              "const PACKAGE_VOTE_VALID_AFTER_UTC = "
+              "'2026-09-12T12:59:45.410967+00:00';"
+          ) in html
+          assert "package_votes_nextgen_v2_prospective_v1_restart30_" in html
+          assert "__pkgnv2p1__|${id}|${choice}" in html
+
+          # Normal KTC aggregation must continue excluding the prospective
+          # transport namespace.
+          ktc = Path("scripts/market/ktc_pipeline.py").read_text(encoding="utf-8")
+          assert '"__pkgnv2p1__|"' in ktc
+
+          print("PASS: frozen prospective maturity/restart contract confirmed.")
+          PY
+
+      - name: Verify production remains V1.6
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 \
+            python3 scripts/validation/check_package_adjustment_live.py
+
+      - name: Self-test outcome-blind maturity arithmetic
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from collections import Counter
+          from datetime import datetime, timedelta, timezone
+
+          LIFETIME_CAP = 30.0
+
+          def aggregate(rows):
+              counts = Counter(r["voter"] for r in rows)
+              weights = {
+                  voter: min(1.0, LIFETIME_CAP / count)
+                  for voter, count in counts.items()
+              }
+              effective = sum(weights[r["voter"]] for r in rows)
+              return counts, weights, effective
+
+          def checkpoint_prefix(rows, threshold):
+              counts = Counter()
+              running = 0
+              for idx, row in enumerate(rows):
+                  voter = row["voter"]
+                  before = min(counts[voter], int(LIFETIME_CAP))
+                  counts[voter] += 1
+                  after = min(counts[voter], int(LIFETIME_CAP))
+                  running += after - before
+                  if running == threshold:
+                      return rows[: idx + 1]
+                  if running > threshold:
+                      raise AssertionError("integer effective count skipped threshold")
+              return None
+
+          t0 = datetime(2026, 9, 12, 13, 0, tzinfo=timezone.utc)
+
+          # 30 voters x 30 rows = exact 900 effective votes.
+          rows = []
+          for voter in range(30):
+              for i in range(30):
+                  rows.append({
+                      "timestamp": t0 + timedelta(seconds=len(rows)),
+                      "voter": f"v{voter}",
+                      "cell": f"c{(voter + i) % 24}",
+                  })
+
+          _, weights, effective = aggregate(rows)
+          assert effective == 900.0
+          assert set(weights.values()) == {1.0}
+          cp900 = checkpoint_prefix(rows, 900)
+          assert cp900 is not None and len(cp900) == 900
+
+          # Extra ballots from an already-capped voter do not advance the
+          # effective checkpoint count; they uniformly downweight that voter's
+          # rows while retaining total effective contribution at 30.
+          rows2 = rows + [
+              {
+                  "timestamp": t0 + timedelta(seconds=900 + i),
+                  "voter": "v0",
+                  "cell": f"c{i % 24}",
+              }
+              for i in range(30)
+          ]
+          counts2, weights2, effective2 = aggregate(rows2)
+          assert counts2["v0"] == 60
+          assert weights2["v0"] == 0.5
+          assert effective2 == 900.0
+
+          # Four additional fresh voters x 25 rows advance to 1000 exactly.
+          rows3 = rows2[:]
+          for voter in range(30, 34):
+              for i in range(25):
+                  rows3.append({
+                      "timestamp": t0 + timedelta(seconds=len(rows3)),
+                      "voter": f"v{voter}",
+                      "cell": f"c{(voter + i) % 24}",
+                  })
+          _, _, effective3 = aggregate(rows3)
+          assert effective3 == 1000.0
+          cp1000 = checkpoint_prefix(rows3, 1000)
+          assert cp1000 is not None
+
+          print("PASS: lifetime weighting and exact 900/1000 checkpoint arithmetic.")
+          PY
+
+      - name: Build outcome-blind prospective maturity report
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OUT="/tmp/pkgnv2-prospective-maturity"
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import io
+          import json
+          import math
+          import os
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import requests
+
+          D = Path("research/package-adjustment-nextgen-v2")
+          OUT = Path("/tmp/pkgnv2-prospective-maturity")
+
+          SHEET_URL = (
+              "https://docs.google.com/spreadsheets/d/e/"
+              "2PACX-1vTuKORGumlKJmUmBdeNWPstkj8VRjPoVkylbqHv1KqwoyziJYOUlkZUKRsSxzB3qHXmyjjLpGpH6W03/"
+              "pub?gid=458294959&single=true&output=csv"
+          )
+
+          prereg = json.loads(
+              (D / "prospective_time_holdout_preregistration_v1.json").read_text()
+          )
+          catalog_doc = json.loads(
+              (D / "package_vote_challenges_prospective_v1.json").read_text()
+          )
+          amendment = json.loads(
+              (D / "prospective_voting_restart_30_daily_v1.json").read_text()
+          )
+
+          transport = prereg["prospective_transport_and_sampling_contract"]
+          rules = amendment["superseding_evidence_rules"]
+
+          VOTE_PREFIX = transport["vote_prefix"]
+          META_PREFIX = transport["meta_prefix"]
+          SCHEMA_MARKER = transport["schema_marker"]
+          DAILY_CAP = int(rules["daily_valid_vote_cap_per_voter"])
+          LIFETIME_CAP = float(rules["effective_lifetime_cap_per_voter"])
+          MIN_VOTERS = int(rules["minimum_distinct_voters"])
+          MIN_CELL_EFFECTIVE = float(rules["minimum_effective_votes_per_cell"])
+          MIN_CELL_VOTERS = int(rules["minimum_distinct_voters_per_cell"])
+          CHECKPOINTS = [int(x) for x in rules["exact_checkpoints_effective_votes"]]
+          HARD_CAP = int(rules["hard_cap_effective_votes"])
+
+          def parse_utc(value):
+              s = str(value or "").strip()
+              if not s:
+                  return None
+              if s.endswith("Z"):
+                  s = s[:-1] + "+00:00"
+              try:
+                  dt = datetime.fromisoformat(s)
+              except ValueError:
+                  return None
+              if dt.tzinfo is None:
+                  dt = dt.replace(tzinfo=timezone.utc)
+              return dt.astimezone(timezone.utc)
+
+          cutoff = parse_utc(
+              amendment["timing"]["replacement_valid_ballot_start_utc"]
+          )
+          assert cutoff is not None
+
+          challenges = {
+              c["id"]: c
+              for c in catalog_doc["challenges"]
+          }
+          assert len(challenges) == 129
+
+          def cell_key(challenge):
+              return "|".join([
+                  str(challenge["family"]),
+                  str(challenge["cell_id"]),
+                  str(challenge["scale_label"]),
+                  str(challenge["split"]),
+              ])
+
+          cell_meta = {}
+          for challenge in challenges.values():
+              key = cell_key(challenge)
+              meta = {
+                  "family": challenge["family"],
+                  "cell_id": challenge["cell_id"],
+                  "scale_label": challenge["scale_label"],
+                  "split": challenge["split"],
+              }
+              if key in cell_meta:
+                  assert cell_meta[key] == meta
+              else:
+                  cell_meta[key] = meta
+
+          assert len(cell_meta) == 24
+
+          generated_at = datetime.now(timezone.utc)
+          response = requests.get(SHEET_URL, timeout=30)
+          response.raise_for_status()
+          sheet_sha256 = hashlib.sha256(response.content).hexdigest()
+          rows = list(csv.DictReader(io.StringIO(response.text)))
+
+          excluded = Counter()
+          raw_prospective_rows = 0
+          structurally_valid = []
+
+          for source_index, row in enumerate(rows):
+              keep = str(row.get("keep") or "")
+              if not keep.startswith(VOTE_PREFIX):
+                  continue
+              raw_prospective_rows += 1
+
+              ts = parse_utc(row.get("timestamp"))
+              if ts is None:
+                  excluded["invalid_timestamp"] += 1
+                  continue
+              if ts <= cutoff:
+                  excluded["pre_restart_or_at_cutoff"] += 1
+                  continue
+              if ts > generated_at:
+                  excluded["future_timestamp"] += 1
+                  continue
+
+              voter = str(row.get("voter_roster_id") or "").strip()
+              if not voter:
+                  excluded["missing_voter_id"] += 1
+                  continue
+
+              # OUTCOME-BLIND BY CONSTRUCTION:
+              # We use only the challenge-id portion before the final opaque
+              # response token. The token itself is never read, validated,
+              # counted, grouped, printed, or persisted.
+              payload = keep[len(VOTE_PREFIX):]
+              if "|" not in payload:
+                  excluded["malformed_vote_transport"] += 1
+                  continue
+              challenge_id = payload.split("|", 1)[0].strip()
+              if challenge_id not in challenges:
+                  excluded["unknown_challenge_id"] += 1
+                  continue
+
+              # Meta is checked only for namespace membership. Its suffix,
+              # which encodes randomized display orientation, is not read.
+              meta = str(row.get("trade") or "")
+              if not meta.startswith(META_PREFIX):
+                  excluded["invalid_meta_namespace"] += 1
+                  continue
+
+              if str(row.get("cut") or "") != SCHEMA_MARKER:
+                  excluded["invalid_schema_marker"] += 1
+                  continue
+
+              structurally_valid.append({
+                  "timestamp": ts,
+                  "source_index": source_index,
+                  "voter": voter,
+                  "challenge_id": challenge_id,
+              })
+
+          # Deterministic chronological order. No outcome field participates in
+          # ordering or any later operation.
+          structurally_valid.sort(
+              key=lambda r: (r["timestamp"], r["source_index"])
+          )
+
+          # Enforce the superseding 30/day rule server-side for maturity.
+          daily_counts = Counter()
+          valid = []
+          for row in structurally_valid:
+              day = row["timestamp"].date().isoformat()
+              key = (row["voter"], day)
+              if daily_counts[key] >= DAILY_CAP:
+                  excluded["daily_cap_excess"] += 1
+                  continue
+              daily_counts[key] += 1
+              valid.append(row)
+
+          def snapshot(rows_subset):
+              voter_counts = Counter(r["voter"] for r in rows_subset)
+              weights = {
+                  voter: min(1.0, LIFETIME_CAP / count)
+                  for voter, count in voter_counts.items()
+              }
+
+              per_cell_effective = {
+                  key: 0.0 for key in cell_meta
+              }
+              per_cell_voters = {
+                  key: set() for key in cell_meta
+              }
+              per_family_effective = defaultdict(float)
+              per_family_voters = defaultdict(set)
+              challenge_ids = set()
+
+              for row in rows_subset:
+                  challenge = challenges[row["challenge_id"]]
+                  key = cell_key(challenge)
+                  weight = weights[row["voter"]]
+                  per_cell_effective[key] += weight
+                  per_cell_voters[key].add(row["voter"])
+                  per_family_effective[challenge["family"]] += weight
+                  per_family_voters[challenge["family"]].add(row["voter"])
+                  challenge_ids.add(row["challenge_id"])
+
+              effective_total = sum(
+                  min(count, LIFETIME_CAP)
+                  for count in voter_counts.values()
+              )
+
+              cells = []
+              for key in sorted(cell_meta):
+                  eff = per_cell_effective[key]
+                  voters = len(per_cell_voters[key])
+                  meta = cell_meta[key]
+                  cells.append({
+                      **meta,
+                      "effective_votes": round(eff, 6),
+                      "distinct_voters": voters,
+                      "effective_vote_gate_pass": eff + 1e-12 >= MIN_CELL_EFFECTIVE,
+                      "voter_gate_pass": voters >= MIN_CELL_VOTERS,
+                      "cell_gate_pass": (
+                          eff + 1e-12 >= MIN_CELL_EFFECTIVE
+                          and voters >= MIN_CELL_VOTERS
+                      ),
+                  })
+
+              distinct_voters = len(voter_counts)
+              all_cell_gates = all(c["cell_gate_pass"] for c in cells)
+              coverage_pass = (
+                  distinct_voters >= MIN_VOTERS
+                  and all_cell_gates
+              )
+
+              return {
+                  "raw_post_daily_cap_ballots": len(rows_subset),
+                  "effective_votes": round(float(effective_total), 6),
+                  "distinct_voters": distinct_voters,
+                  "distinct_challenges": len(challenge_ids),
+                  "cells_observed": sum(c["effective_votes"] > 0 for c in cells),
+                  "cells_passing_both_gates": sum(c["cell_gate_pass"] for c in cells),
+                  "minimum_cell_effective_votes": round(
+                      min(c["effective_votes"] for c in cells), 6
+                  ),
+                  "minimum_cell_distinct_voters": min(
+                      c["distinct_voters"] for c in cells
+                  ),
+                  "coverage_gates_pass": coverage_pass,
+                  "cells": cells,
+                  "families": {
+                      family: {
+                          "effective_votes": round(effective, 6),
+                          "distinct_voters": len(per_family_voters[family]),
+                      }
+                      for family, effective in sorted(per_family_effective.items())
+                  },
+              }
+
+          def exact_checkpoint_prefix(threshold):
+              # Effective total equals sum(min(voter_count, lifetime_cap)).
+              # With integer cap 30, each chronologically accepted ballot
+              # advances this count by either exactly 1 or 0. Therefore exact
+              # 900/1000 prefixes can be reconstructed without reading outcomes.
+              assert float(LIFETIME_CAP).is_integer()
+              cap_int = int(LIFETIME_CAP)
+              counts = Counter()
+              running = 0
+
+              for idx, row in enumerate(valid):
+                  voter = row["voter"]
+                  before = min(counts[voter], cap_int)
+                  counts[voter] += 1
+                  after = min(counts[voter], cap_int)
+                  running += after - before
+
+                  if running == threshold:
+                      return valid[: idx + 1]
+                  if running > threshold:
+                      raise RuntimeError(
+                          f"effective count skipped exact checkpoint {threshold}"
+                      )
+              return None
+
+          current = snapshot(valid)
+
+          checkpoint_reports = {}
+          for checkpoint in CHECKPOINTS:
+              prefix = exact_checkpoint_prefix(checkpoint)
+              checkpoint_reports[str(checkpoint)] = (
+                  None if prefix is None else snapshot(prefix)
+              )
+
+          cp900 = checkpoint_reports.get("900")
+          cp1000 = checkpoint_reports.get("1000")
+
+          if cp900 is not None and cp900["coverage_gates_pass"]:
+              status = "STOP_AND_FREEZE_AT_900"
+              next_action = (
+                  "Stop collecting. Freeze the exact 900-effective-vote "
+                  "checkpoint before any model evaluation."
+              )
+              stop_checkpoint = 900
+          elif cp1000 is not None:
+              if cp1000["coverage_gates_pass"]:
+                  status = "STOP_AND_FREEZE_AT_1000"
+                  next_action = (
+                      "Stop collecting. Freeze the exact 1000-effective-vote "
+                      "checkpoint before any model evaluation."
+                  )
+                  stop_checkpoint = 1000
+              else:
+                  status = "STOP_UNRESOLVED_AT_HARD_CAP_1000"
+                  next_action = (
+                      "Stop collecting. Hard cap reached without all coverage "
+                      "gates; prospective evidence is unresolved."
+                  )
+                  stop_checkpoint = 1000
+          elif cp900 is not None:
+              status = "CONTINUE_TO_EXACT_1000"
+              next_action = (
+                  "The exact 900 checkpoint failed at least one coverage gate. "
+                  "Continue collection to the exact 1000 checkpoint only."
+              )
+              stop_checkpoint = None
+          else:
+              status = "COLLECT_TO_EXACT_900"
+              next_action = (
+                  "Continue collecting until the exact 900-effective-vote "
+                  "checkpoint."
+              )
+              stop_checkpoint = None
+
+          result = {
+              "schema_version": 1,
+              "status": status,
+              "generated_at_utc": generated_at.isoformat(),
+              "research_only": True,
+              "outcome_blind": True,
+              "model_evaluation_performed": False,
+              "model_predictions_read": False,
+              "vote_response_tokens_read": False,
+              "display_orientation_tokens_read": False,
+              "production_changed": False,
+              "source": {
+                  "sheet_sha256": sheet_sha256,
+                  "total_sheet_rows": len(rows),
+                  "raw_prospective_namespace_rows": raw_prospective_rows,
+              },
+              "contract": {
+                  "replacement_valid_ballot_start_utc": cutoff.isoformat(),
+                  "daily_valid_vote_cap_per_voter": DAILY_CAP,
+                  "effective_lifetime_cap_per_voter": LIFETIME_CAP,
+                  "ballot_weight_rule": (
+                      "min(1,30/valid_post_daily_cap_prospective_ballot_count_for_voter)"
+                  ),
+                  "minimum_distinct_voters": MIN_VOTERS,
+                  "minimum_effective_votes_per_cell": MIN_CELL_EFFECTIVE,
+                  "minimum_distinct_voters_per_cell": MIN_CELL_VOTERS,
+                  "required_cell_count": 24,
+                  "exact_checkpoints_effective_votes": CHECKPOINTS,
+                  "hard_cap_effective_votes": HARD_CAP,
+              },
+              "excluded_row_counts": dict(sorted(excluded.items())),
+              "current": current,
+              "exact_checkpoints": checkpoint_reports,
+              "stop_checkpoint": stop_checkpoint,
+              "next_action": next_action,
+          }
+
+          # Persisted output must contain aggregates only. Never expose voter
+          # identities, raw transport strings, response direction, or display
+          # orientation.
+          forbidden_keys = {
+              "voter",
+              "voter_id",
+              "voter_roster_id",
+              "keep",
+              "trade",
+              "cut",
+              "response",
+              "response_token",
+              "choice",
+              "choice_side",
+              "displayed_left",
+              "left_side",
+              "ballots",
+          }
+
+          def walk(value):
+              if isinstance(value, dict):
+                  for key, item in value.items():
+                      if key in forbidden_keys:
+                          raise RuntimeError(
+                              f"forbidden persisted outcome/identity key: {key}"
+                          )
+                      walk(item)
+              elif isinstance(value, list):
+                  for item in value:
+                      walk(item)
+
+          walk(result)
+
+          (OUT / "prospective_maturity.json").write_text(
+              json.dumps(result, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          lines = [
+              "# NextGen V2 Prospective Maturity Monitor",
+              "",
+              f"**Status:** `{status}`",
+              "",
+              f"- Generated: `{generated_at.isoformat()}`",
+              f"- Replacement cutoff: `{cutoff.isoformat()}`",
+              f"- Raw prospective namespace rows: **{raw_prospective_rows}**",
+              f"- Valid post-daily-cap ballots: **{current['raw_post_daily_cap_ballots']}**",
+              f"- Effective votes: **{current['effective_votes']:.2f}**",
+              f"- Distinct voters: **{current['distinct_voters']} / {MIN_VOTERS}**",
+              f"- Distinct challenges observed: **{current['distinct_challenges']} / 129**",
+              f"- Cells observed: **{current['cells_observed']} / 24**",
+              f"- Cells passing both gates now: **{current['cells_passing_both_gates']} / 24**",
+              f"- Minimum cell effective votes now: **{current['minimum_cell_effective_votes']:.2f} / {MIN_CELL_EFFECTIVE:.0f}**",
+              f"- Minimum cell distinct voters now: **{current['minimum_cell_distinct_voters']} / {MIN_CELL_VOTERS}**",
+              "",
+              "## Exact checkpoint status",
+              "",
+          ]
+
+          for checkpoint in CHECKPOINTS:
+              cp = checkpoint_reports[str(checkpoint)]
+              if cp is None:
+                  lines.append(
+                      f"- **{checkpoint}: not reached**"
+                  )
+              else:
+                  verdict = "PASS" if cp["coverage_gates_pass"] else "FAIL"
+                  lines.append(
+                      f"- **{checkpoint}: {verdict}** — "
+                      f"{cp['distinct_voters']} voters; "
+                      f"{cp['cells_passing_both_gates']}/24 cells pass; "
+                      f"min cell {cp['minimum_cell_effective_votes']:.2f} effective / "
+                      f"{cp['minimum_cell_distinct_voters']} voters"
+                  )
+
+          lines.extend([
+              "",
+              "## Current 24-cell coverage",
+              "",
+              "| Family | Cell | Scale | Effective | Voters | Gate |",
+              "|---|---|---:|---:|---:|---|",
+          ])
+
+          for cell in current["cells"]:
+              gate = "PASS" if cell["cell_gate_pass"] else "WAIT"
+              lines.append(
+                  f"| {cell['family']} | {cell['cell_id']} | "
+                  f"{cell['scale_label']} | {cell['effective_votes']:.2f} | "
+                  f"{cell['distinct_voters']} | {gate} |"
+              )
+
+          if excluded:
+              lines.extend([
+                  "",
+                  "## Excluded rows",
+                  "",
+              ])
+              for reason, count in sorted(excluded.items()):
+                  lines.append(f"- `{reason}`: **{count}**")
+
+          lines.extend([
+              "",
+              "## Next action",
+              "",
+              next_action,
+              "",
+              "> Outcome-blind monitor: no response direction, randomized display "
+              "orientation, M0/M2b prediction, loss, bootstrap, or model-performance "
+              "statistic is read or reported.",
+          ])
+
+          md = "\n".join(lines) + "\n"
+          (OUT / "prospective_maturity.md").write_text(md, encoding="utf-8")
+
+          # Add the same readable report to the GitHub Actions run summary.
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+              with open(summary_path, "a", encoding="utf-8") as f:
+                  f.write(md)
+
+          print(md)
+          print("OUTCOME_BLIND_MONITOR_STATUS=" + status)
+          PY
+
+      - name: Verify monitor output contains no outcome or voter-level leakage
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          out = Path("/tmp/pkgnv2-prospective-maturity")
+          result = json.loads((out / "prospective_maturity.json").read_text())
+          md = (out / "prospective_maturity.md").read_text()
+
+          assert result["outcome_blind"] is True
+          assert result["model_evaluation_performed"] is False
+          assert result["model_predictions_read"] is False
+          assert result["vote_response_tokens_read"] is False
+          assert result["display_orientation_tokens_read"] is False
+          assert result["production_changed"] is False
+
+          assert result["contract"]["daily_valid_vote_cap_per_voter"] == 30
+          assert result["contract"]["effective_lifetime_cap_per_voter"] == 30.0
+          assert result["contract"]["exact_checkpoints_effective_votes"] == [900, 1000]
+          assert len(result["current"]["cells"]) == 24
+
+          # These substrings must never appear as persisted schema labels.
+          forbidden = [
+              '"voter_id"',
+              '"voter_roster_id"',
+              '"choice"',
+              '"choice_side"',
+              '"displayed_left"',
+              '"keep"',
+              '"trade"',
+              '"cut"',
+          ]
+          json_text = (out / "prospective_maturity.json").read_text()
+          for token in forbidden:
+              assert token not in json_text, token
+
+          assert "M2b log loss" not in md
+          assert "M0 log loss" not in md
+          assert "bootstrap favorable" not in md.lower()
+
+          print("PASS: report is aggregate-only and outcome-blind.")
+          PY
+
+      - name: Upload maturity report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkgnv2-prospective-maturity
+          path: /tmp/pkgnv2-prospective-maturity/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Final read-only repository verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1)"
+          PYTHONDONTWRITEBYTECODE=1 \
+            python3 scripts/validation/check_package_adjustment_live.py
+          echo "PASS: monitor changed no repository files."
