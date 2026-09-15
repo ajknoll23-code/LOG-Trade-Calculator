@@ -1,0 +1,947 @@
+name: QB Production Multiplier Lineage Diagnostic
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Guard clean state and frozen evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+          # These are the frozen, pre-2026-outcome Production V2 artifacts used
+          # by this diagnostic. Phase 9 realized-outcome files are deliberately
+          # NOT inputs.
+          test "$(git hash-object research/production-v2/production_v2_phase1_audit.json)" = \
+            "bdd4657ff45e0c64f1406f27c1ffe6ad2e597d31"
+          test "$(git hash-object research/production-v2/production_v2_phase8_shadow_model.json)" = \
+            "5ea851cb5cfa472f6009fecc0ee3fd49460e1b33"
+          test "$(git hash-object research/production-v2/production_v2_phase8_shadow_model.py)" = \
+            "f9b7a74e57c447b979fd55bb446930c53cd97aff"
+
+          test -f research/legacy-prod-mult/prod_mult_lineage_audit.json
+          test -f research/legacy-prod-mult/prod_mult_lineage_audit.md
+          test -f scripts/validation/snapshot_values.py
+          test -f index.html
+
+      - name: Validate current deployed FV port
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/snapshot_values.py --selftest
+
+      - name: Build QB production-lineage diagnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OUT="/tmp/qb-production-multiplier-lineage-diagnostic"
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import importlib.util
+          import json
+          import math
+          import statistics
+          import subprocess
+          from collections import Counter
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          ROOT = Path(".")
+          OUT = Path("/tmp/qb-production-multiplier-lineage-diagnostic")
+
+          PHASE1_PATH = (
+              ROOT / "research/production-v2/production_v2_phase1_audit.json"
+          )
+          PHASE8_PATH = (
+              ROOT / "research/production-v2/production_v2_phase8_shadow_model.json"
+          )
+          LEGACY_LINEAGE_PATH = (
+              ROOT / "research/legacy-prod-mult/prod_mult_lineage_audit.json"
+          )
+          SNAPSHOT_VALUES_PATH = ROOT / "scripts/validation/snapshot_values.py"
+          INDEX_PATH = ROOT / "index.html"
+
+          MONITORING_REFERENCE = "evidence_hybrid__floor_0.15"
+
+          def sha256(path: Path) -> str:
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          def git_head() -> str:
+              return subprocess.check_output(
+                  ["git", "rev-parse", "HEAD"], text=True
+              ).strip()
+
+          def load_module(path: Path, name: str):
+              spec = importlib.util.spec_from_file_location(name, path)
+              if spec is None or spec.loader is None:
+                  raise RuntimeError(f"Could not import {path}")
+              mod = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(mod)
+              return mod
+
+          def finite(v):
+              try:
+                  x = float(v)
+              except (TypeError, ValueError):
+                  return None
+              return x if math.isfinite(x) else None
+
+          def mean(xs):
+              vals = [float(x) for x in xs if finite(x) is not None]
+              return statistics.fmean(vals) if vals else None
+
+          def median(xs):
+              vals = [float(x) for x in xs if finite(x) is not None]
+              return statistics.median(vals) if vals else None
+
+          def percentile(xs, q):
+              vals = sorted(float(x) for x in xs if finite(x) is not None)
+              if not vals:
+                  return None
+              if len(vals) == 1:
+                  return vals[0]
+              pos = (len(vals) - 1) * q
+              lo = math.floor(pos)
+              hi = math.ceil(pos)
+              if lo == hi:
+                  return vals[lo]
+              w = pos - lo
+              return vals[lo] * (1 - w) + vals[hi] * w
+
+          def summarize(xs):
+              vals = [float(x) for x in xs if finite(x) is not None]
+              if not vals:
+                  return {"n": 0}
+              return {
+                  "n": len(vals),
+                  "mean": mean(vals),
+                  "median": median(vals),
+                  "p90_abs": percentile([abs(x) for x in vals], 0.90),
+                  "p95_abs": percentile([abs(x) for x in vals], 0.95),
+                  "min": min(vals),
+                  "max": max(vals),
+                  "max_abs": max(abs(x) for x in vals),
+              }
+
+          def pearson(xs, ys):
+              pairs = [
+                  (float(x), float(y))
+                  for x, y in zip(xs, ys)
+                  if finite(x) is not None and finite(y) is not None
+              ]
+              if len(pairs) < 2:
+                  return None
+              xvals = [x for x, _ in pairs]
+              yvals = [y for _, y in pairs]
+              mx = statistics.fmean(xvals)
+              my = statistics.fmean(yvals)
+              dx = [x - mx for x in xvals]
+              dy = [y - my for y in yvals]
+              den = math.sqrt(sum(x*x for x in dx) * sum(y*y for y in dy))
+              return None if den == 0 else sum(a*b for a, b in zip(dx, dy)) / den
+
+          def average_ranks(values):
+              indexed = sorted(
+                  enumerate(values),
+                  key=lambda x: (-x[1], x[0]),
+              )
+              ranks = [0.0] * len(values)
+              i = 0
+              while i < len(indexed):
+                  j = i + 1
+                  while j < len(indexed) and indexed[j][1] == indexed[i][1]:
+                      j += 1
+                  avg_rank = ((i + 1) + j) / 2.0
+                  for k in range(i, j):
+                      ranks[indexed[k][0]] = avg_rank
+                  i = j
+              return ranks
+
+          def spearman(xs, ys):
+              pairs = [
+                  (float(x), float(y))
+                  for x, y in zip(xs, ys)
+                  if finite(x) is not None and finite(y) is not None
+              ]
+              if len(pairs) < 2:
+                  return None
+              return pearson(
+                  average_ranks([x for x, _ in pairs]),
+                  average_ranks([y for _, y in pairs]),
+              )
+
+          def normalize_name(s):
+              return "".join(ch for ch in str(s).lower() if ch.isalnum())
+
+          sv = load_module(SNAPSHOT_VALUES_PATH, "qb_prod_lineage_snapshot_values")
+          cfg = sv.load_from_html(INDEX_PATH)
+          deployed = sv.compute_all_values(cfg)
+
+          phase1 = json.loads(PHASE1_PATH.read_text())
+          phase8 = json.loads(PHASE8_PATH.read_text())
+          legacy = json.loads(LEGACY_LINEAGE_PATH.read_text())
+
+          assert phase8["status"] == "CONSOLIDATED_SHADOW_MODEL_RESEARCH_ONLY"
+          assert phase8["deployment_authorized"] is False
+          assert phase8["calibration_claim_authorized"] is False
+          assert phase8["monitoring_reference"]["variant"] == MONITORING_REFERENCE
+          assert MONITORING_REFERENCE in phase8["variants"]
+
+          phase1_players = phase1["players"]
+          ref_players = phase8["variants"][MONITORING_REFERENCE]["players"]
+          variant_keys = sorted(phase8["variants"])
+
+          qbs = []
+          for key, rec in phase1_players.items():
+              if rec.get("pos") != "QB":
+                  continue
+              if key not in deployed:
+                  continue
+
+              live = deployed[key]
+              live_raw = cfg["prod_mult"].get(key)
+              live_eff = float(live["prod_mult"])
+              phase1_current = rec["current"]
+              candidate = rec.get("candidate")
+              history = rec.get("history") or {}
+              forward = rec.get("forward") or {}
+              ref = ref_players.get(key) or {}
+
+              variant_rows = []
+              for variant in variant_keys:
+                  v = phase8["variants"][variant]["players"].get(key)
+                  if not v:
+                      continue
+                  variant_rows.append({
+                      "variant": variant,
+                      "raw_prod_mult": finite(v.get("raw_prod_mult")),
+                      "effective_prod_mult": finite(v.get("effective_prod_mult")),
+                      "ratio_to_baseline": finite(v.get("ratio_to_baseline")),
+                      "baseline_points": finite(v.get("baseline_points")),
+                      "floor_hit": v.get("floor_hit"),
+                      "ceiling_hit": v.get("ceiling_hit"),
+                      "source": v.get("source"),
+                  })
+
+              v_effective = [
+                  v["effective_prod_mult"]
+                  for v in variant_rows
+                  if v["effective_prod_mult"] is not None
+              ]
+
+              qbs.append({
+                  "key": key,
+                  "name": key,
+                  "age": int(rec["age"]),
+                  "role": rec["role"],
+                  "deployed_fv": int(live["value"]),
+                  "deployed_raw_prod_mult": (
+                      None if live_raw is None else float(live_raw)
+                  ),
+                  "deployed_effective_prod_mult": live_eff,
+                  "phase1_current_effective_prod_mult": finite(
+                      phase1_current.get("effective_prod_mult")
+                  ),
+                  "phase1_current_fv": int(
+                      phase1_current["fundamental_value"]
+                  ),
+                  "phase1_current_matches_live_effective_pm": (
+                      abs(
+                          live_eff
+                          - float(phase1_current["effective_prod_mult"])
+                      ) < 1e-12
+                  ),
+                  "phase1_current_matches_live_fv": (
+                      int(live["value"])
+                      == int(phase1_current["fundamental_value"])
+                  ),
+                  "history": {
+                      "games_played_2025": history.get("games_played_2025"),
+                      "true_ppg_2025": finite(history.get("true_ppg_2025")),
+                      "shrunk_ppg": finite(history.get("shrunk_ppg")),
+                      "shrinkage_k_used": finite(history.get("shrinkage_k_used")),
+                      "position_mean_ppg": finite(history.get("position_mean_ppg")),
+                      "durability_projected_games_2026": finite(
+                          history.get("durability_projected_games_2026")
+                      ),
+                      "history_component": finite(history.get("history_component")),
+                      "shrinkage_note": history.get("shrinkage_note"),
+                  },
+                  "forward": {
+                      "projection": finite(forward.get("projection")),
+                      "source": forward.get("source"),
+                      "sleeper_points": finite(forward.get("sleeper_points")),
+                      "fantasypros_points": finite(
+                          forward.get("fantasypros_points")
+                      ),
+                  },
+                  "phase1_combined_points": finite(
+                      rec.get("phase1_combined_points")
+                  ),
+                  "phase1_candidate": (
+                      None if candidate is None else {
+                          "production_ratio_to_baseline": finite(
+                              candidate.get("production_ratio_to_phase1_baseline")
+                          ),
+                          "baseline_points": finite(
+                              candidate.get("phase1_baseline_points")
+                          ),
+                          "raw_prod_mult": finite(candidate.get("raw_prod_mult")),
+                          "effective_prod_mult": finite(
+                              candidate.get("effective_prod_mult")
+                          ),
+                          "fv": int(candidate["value"]),
+                          "elite_floor_applied": bool(
+                              candidate.get("elite_floor_applied")
+                          ),
+                          "no_history_role_rescue_applied": bool(
+                              candidate.get("no_history_role_rescue_applied")
+                          ),
+                      }
+                  ),
+                  "phase8_monitoring_reference": {
+                      "source": ref.get("source"),
+                      "combined_points": finite(ref.get("combined_points")),
+                      "ratio_to_baseline": finite(ref.get("ratio_to_baseline")),
+                      "baseline_points": finite(ref.get("baseline_points")),
+                      "raw_unclamped_pm": finite(ref.get("raw_unclamped_pm")),
+                      "raw_prod_mult": finite(ref.get("raw_prod_mult")),
+                      "effective_prod_mult": finite(
+                          ref.get("effective_prod_mult")
+                      ),
+                      "floor_hit": ref.get("floor_hit"),
+                      "ceiling_hit": ref.get("ceiling_hit"),
+                      "elite_floor_applied": ref.get("elite_floor_applied"),
+                      "fv": int(ref["value"]),
+                  },
+                  "phase8_variant_effective_pm_range": (
+                      {
+                          "min": min(v_effective),
+                          "max": max(v_effective),
+                          "span": max(v_effective) - min(v_effective),
+                      }
+                      if v_effective else None
+                  ),
+                  "phase8_variants": variant_rows,
+              })
+
+          if len(qbs) < 50:
+              raise RuntimeError(f"Expected broad frozen QB cohort, got {len(qbs)}")
+
+          # Current/deployed rank and transparent lineage ranks.
+          def set_rank(field_getter, out_field, rows):
+              valid = [r for r in rows if field_getter(r) is not None]
+              valid.sort(
+                  key=lambda r: (
+                      -float(field_getter(r)),
+                      r["name"].lower(),
+                  )
+              )
+              for rank, r in enumerate(valid, 1):
+                  r[out_field] = rank
+
+          set_rank(
+              lambda r: r["deployed_effective_prod_mult"],
+              "deployed_pm_rank",
+              qbs,
+          )
+          set_rank(
+              lambda r: r["history"]["history_component"],
+              "history_component_rank",
+              qbs,
+          )
+          set_rank(
+              lambda r: r["forward"]["projection"],
+              "forward_projection_rank",
+              qbs,
+          )
+          set_rank(
+              lambda r: r["phase1_combined_points"],
+              "phase1_combined_rank",
+              qbs,
+          )
+          set_rank(
+              lambda r: (
+                  None if r["phase1_candidate"] is None
+                  else r["phase1_candidate"]["effective_prod_mult"]
+              ),
+              "phase1_candidate_pm_rank",
+              qbs,
+          )
+          set_rank(
+              lambda r: r["phase8_monitoring_reference"]["effective_prod_mult"],
+              "phase8_reference_pm_rank",
+              qbs,
+          )
+
+          # Residual between opaque deployed table and transparent frozen Phase-1
+          # reconstruction. This is diagnostic only: Phase 1 was explicitly not
+          # authorized as the true historical generator.
+          candidate_qbs = [
+              r for r in qbs if r["phase1_candidate"] is not None
+          ]
+          for r in candidate_qbs:
+              r["deployed_minus_phase1_candidate_effective_pm"] = (
+                  r["deployed_effective_prod_mult"]
+                  - r["phase1_candidate"]["effective_prod_mult"]
+              )
+              r["deployed_minus_phase8_reference_effective_pm"] = (
+                  r["deployed_effective_prod_mult"]
+                  - r["phase8_monitoring_reference"]["effective_prod_mult"]
+              )
+
+          residual_summary = summarize(
+              r["deployed_minus_phase1_candidate_effective_pm"]
+              for r in candidate_qbs
+          )
+          residual_outliers = sorted(
+              candidate_qbs,
+              key=lambda r: (
+                  -abs(r["deployed_minus_phase1_candidate_effective_pm"]),
+                  r["name"],
+              ),
+          )[:15]
+
+          # Cohort associations. These do not fit coefficients.
+          cohort_associations = {}
+          source_fields = {
+              "true_ppg_2025": lambda r: r["history"]["true_ppg_2025"],
+              "history_component": lambda r: r["history"]["history_component"],
+              "forward_projection": lambda r: r["forward"]["projection"],
+              "phase1_combined_points": lambda r: r["phase1_combined_points"],
+              "phase1_candidate_effective_pm": lambda r: (
+                  None if r["phase1_candidate"] is None
+                  else r["phase1_candidate"]["effective_prod_mult"]
+              ),
+              "phase8_reference_effective_pm": lambda r: (
+                  r["phase8_monitoring_reference"]["effective_prod_mult"]
+              ),
+          }
+          for label, getter in source_fields.items():
+              pairs = [
+                  (r["deployed_effective_prod_mult"], getter(r))
+                  for r in qbs
+                  if getter(r) is not None
+              ]
+              cohort_associations[label] = {
+                  "n": len(pairs),
+                  "pearson_with_deployed_pm": pearson(
+                      [x for x, _ in pairs], [y for _, y in pairs]
+                  ),
+                  "spearman_with_deployed_pm": spearman(
+                      [x for x, _ in pairs], [y for _, y in pairs]
+                  ),
+              }
+
+          # Exact named pair diagnostic. Names were the motivating example but
+          # no coefficient is fitted or selected by this workflow.
+          by_norm = {normalize_name(r["name"]): r for r in qbs}
+          allen = by_norm.get(normalize_name("Josh Allen"))
+          dak = by_norm.get(normalize_name("Dak Prescott"))
+          if allen is None or dak is None:
+              raise RuntimeError("Could not resolve Josh Allen and Dak Prescott")
+
+          def ratio(a, b):
+              if a is None or b is None or b == 0:
+                  return None
+              return a / b
+
+          def diff(a, b):
+              if a is None or b is None:
+                  return None
+              return a - b
+
+          # Phase-1 combined = 0.45 history + 0.55 forward. Decompose the
+          # Allen-Dak combined-point difference exactly by those additive terms.
+          hA = allen["history"]["history_component"]
+          hD = dak["history"]["history_component"]
+          fA = allen["forward"]["projection"]
+          fD = dak["forward"]["projection"]
+          cA = allen["phase1_combined_points"]
+          cD = dak["phase1_combined_points"]
+
+          additive = None
+          if None not in (hA, hD, fA, fD, cA, cD):
+              history_contrib = 0.45 * (hA - hD)
+              forward_contrib = 0.55 * (fA - fD)
+              combined_diff = cA - cD
+              if not math.isclose(
+                  history_contrib + forward_contrib,
+                  combined_diff,
+                  rel_tol=0,
+                  abs_tol=1e-8,
+              ):
+                  raise RuntimeError("Phase-1 additive decomposition drifted")
+              additive = {
+                  "history_contribution_points": history_contrib,
+                  "forward_contribution_points": forward_contrib,
+                  "combined_difference_points": combined_diff,
+                  "history_share_of_signed_difference": (
+                      history_contrib / combined_diff
+                      if abs(combined_diff) > 1e-12 else None
+                  ),
+                  "forward_share_of_signed_difference": (
+                      forward_contrib / combined_diff
+                      if abs(combined_diff) > 1e-12 else None
+                  ),
+              }
+
+          variant_pair_rows = []
+          for variant in variant_keys:
+              a = next(
+                  (
+                      x for x in allen["phase8_variants"]
+                      if x["variant"] == variant
+                  ),
+                  None,
+              )
+              d = next(
+                  (
+                      x for x in dak["phase8_variants"]
+                      if x["variant"] == variant
+                  ),
+                  None,
+              )
+              if a and d:
+                  variant_pair_rows.append({
+                      "variant": variant,
+                      "allen_effective_pm": a["effective_prod_mult"],
+                      "dak_effective_pm": d["effective_prod_mult"],
+                      "allen_over_dak_effective_pm": ratio(
+                          a["effective_prod_mult"],
+                          d["effective_prod_mult"],
+                      ),
+                      "allen_floor_hit": a["floor_hit"],
+                      "dak_floor_hit": d["floor_hit"],
+                      "allen_ceiling_hit": a["ceiling_hit"],
+                      "dak_ceiling_hit": d["ceiling_hit"],
+                  })
+
+          named_pair = {
+              "deployed": {
+                  "allen_fv": allen["deployed_fv"],
+                  "dak_fv": dak["deployed_fv"],
+                  "allen_effective_pm": allen["deployed_effective_prod_mult"],
+                  "dak_effective_pm": dak["deployed_effective_prod_mult"],
+                  "allen_over_dak_pm_ratio": ratio(
+                      allen["deployed_effective_prod_mult"],
+                      dak["deployed_effective_prod_mult"],
+                  ),
+                  "pm_difference": diff(
+                      allen["deployed_effective_prod_mult"],
+                      dak["deployed_effective_prod_mult"],
+                  ),
+                  "allen_pm_rank": allen["deployed_pm_rank"],
+                  "dak_pm_rank": dak["deployed_pm_rank"],
+              },
+              "frozen_phase1_inputs": {
+                  "allen": {
+                      "history": allen["history"],
+                      "forward": allen["forward"],
+                      "combined_points": allen["phase1_combined_points"],
+                      "candidate": allen["phase1_candidate"],
+                  },
+                  "dak": {
+                      "history": dak["history"],
+                      "forward": dak["forward"],
+                      "combined_points": dak["phase1_combined_points"],
+                      "candidate": dak["phase1_candidate"],
+                  },
+                  "ratios_allen_over_dak": {
+                      "true_ppg_2025": ratio(
+                          allen["history"]["true_ppg_2025"],
+                          dak["history"]["true_ppg_2025"],
+                      ),
+                      "history_component": ratio(hA, hD),
+                      "fantasypros_points": ratio(
+                          allen["forward"]["fantasypros_points"],
+                          dak["forward"]["fantasypros_points"],
+                      ),
+                      "sleeper_points": ratio(
+                          allen["forward"]["sleeper_points"],
+                          dak["forward"]["sleeper_points"],
+                      ),
+                      "forward_projection": ratio(fA, fD),
+                      "combined_points": ratio(cA, cD),
+                      "candidate_effective_pm": (
+                          ratio(
+                              allen["phase1_candidate"]["effective_prod_mult"],
+                              dak["phase1_candidate"]["effective_prod_mult"],
+                          )
+                          if allen["phase1_candidate"] and dak["phase1_candidate"]
+                          else None
+                      ),
+                  },
+                  "additive_combined_difference_decomposition": additive,
+              },
+              "phase8_monitoring_reference": {
+                  "allen": allen["phase8_monitoring_reference"],
+                  "dak": dak["phase8_monitoring_reference"],
+                  "allen_over_dak_effective_pm": ratio(
+                      allen["phase8_monitoring_reference"][
+                          "effective_prod_mult"
+                      ],
+                      dak["phase8_monitoring_reference"][
+                          "effective_prod_mult"
+                      ],
+                  ),
+              },
+              "phase8_all_frozen_variant_sensitivity": variant_pair_rows,
+              "important_lineage_limit": (
+                  "The deployed baked PROD_MULT table has no proven callable "
+                  "historical generator. Phase-1/Phase-8 lineage is transparent "
+                  "counterfactual reconstruction, not proof of why the baked "
+                  "table originally received its exact scalars."
+              ),
+          }
+
+          # Current deployed top QB cohort.
+          top_current = sorted(
+              qbs,
+              key=lambda r: (
+                  -r["deployed_effective_prod_mult"],
+                  r["name"],
+              ),
+          )
+
+          def compact(r):
+              return {
+                  "name": r["name"],
+                  "age": r["age"],
+                  "role": r["role"],
+                  "deployed_pm_rank": r.get("deployed_pm_rank"),
+                  "deployed_fv": r["deployed_fv"],
+                  "deployed_effective_pm": r["deployed_effective_prod_mult"],
+                  "true_ppg_2025": r["history"]["true_ppg_2025"],
+                  "history_component": r["history"]["history_component"],
+                  "fantasypros_points": r["forward"]["fantasypros_points"],
+                  "sleeper_points": r["forward"]["sleeper_points"],
+                  "forward_projection": r["forward"]["projection"],
+                  "phase1_combined_points": r["phase1_combined_points"],
+                  "phase1_candidate_effective_pm": (
+                      None if r["phase1_candidate"] is None
+                      else r["phase1_candidate"]["effective_prod_mult"]
+                  ),
+                  "phase8_reference_effective_pm": (
+                      r["phase8_monitoring_reference"]["effective_prod_mult"]
+                  ),
+                  "deployed_minus_phase1_candidate_effective_pm": (
+                      r.get("deployed_minus_phase1_candidate_effective_pm")
+                  ),
+                  "phase8_variant_effective_pm_range": (
+                      r["phase8_variant_effective_pm_range"]
+                  ),
+              }
+
+          report = {
+              "schema_version": 1,
+              "study_id": "qb-production-multiplier-lineage-diagnostic-v1",
+              "status": "read_only_upstream_production_lineage_diagnostic",
+              "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+              "git_sha": git_head(),
+              "research_only": True,
+              "read_only": True,
+              "2026_realized_outcomes_used": False,
+              "phase9_evaluation_read": False,
+              "ktc_used": False,
+              "market_value_used": False,
+              "package_vote_data_used": False,
+              "candidate_fit_performed": False,
+              "candidate_selected": False,
+              "production_change_authorized": False,
+              "production_changed": False,
+              "source_sha256": {
+                  "phase1_audit": sha256(PHASE1_PATH),
+                  "phase8_shadow": sha256(PHASE8_PATH),
+                  "legacy_lineage_audit": sha256(LEGACY_LINEAGE_PATH),
+                  "snapshot_values": sha256(SNAPSHOT_VALUES_PATH),
+                  "index_html": sha256(INDEX_PATH),
+              },
+              "architecture_facts": {
+                  "deployed_final_fv": (
+                      "FV = JS-round(5500 * position_weight * age_multiplier "
+                      "* effective_production_multiplier)"
+                  ),
+                  "phase1_transparent_candidate": (
+                      "combined = 0.45*canonical_2025_history_component + "
+                      "0.55*forward_projection; offense forward = 50/50 "
+                      "FantasyPros + Sleeper when both exist; "
+                      "raw_pm = clamp(-0.10 + 0.75*(combined/baseline), "
+                      "0.15, 1.55)"
+                  ),
+                  "explicit_dual_threat_or_rushing_feature": False,
+                  "dual_threat_signal_path": (
+                      "Only through league-scored historical PPG and provider "
+                      "projected total points; there is no separate QB rushing "
+                      "or elite-ceiling term in the frozen Phase-1/Phase-8 "
+                      "production construction."
+                  ),
+                  "phase8_is_frozen_pre_outcome_shadow_family": True,
+                  "phase8_monitoring_reference": MONITORING_REFERENCE,
+                  "legacy_generator_is_proven_source_of_deployed_table": False,
+              },
+              "qb_cohort": {
+                  "phase1_qb_count": len(qbs),
+                  "transparent_candidate_qb_count": len(candidate_qbs),
+                  "current_phase1_pm_exact_match_count": sum(
+                      r["phase1_current_matches_live_effective_pm"] for r in qbs
+                  ),
+                  "current_phase1_fv_exact_match_count": sum(
+                      r["phase1_current_matches_live_fv"] for r in qbs
+                  ),
+                  "deployed_vs_phase1_candidate_pm_residual": residual_summary,
+                  "associations_with_deployed_pm": cohort_associations,
+                  "phase1_forward_source_counts": dict(sorted(Counter(
+                      r["forward"]["source"] for r in qbs
+                  ).items())),
+              },
+              "named_pair_josh_allen_vs_dak_prescott": named_pair,
+              "top_20_current_qbs": [
+                  compact(r) for r in top_current[:20]
+              ],
+              "largest_15_deployed_vs_transparent_candidate_pm_residuals": [
+                  compact(r) for r in residual_outliers
+              ],
+              "all_qbs": qbs,
+              "scientific_guardrail": (
+                  "This workflow diagnoses frozen/current production lineage "
+                  "and source compression. It does not use 2026 realized outcomes, "
+                  "does not fit a replacement production model, and cannot "
+                  "recommend changing Allen, Dak, or any coefficient."
+              ),
+          }
+
+          json_path = OUT / "qb_production_multiplier_lineage_diagnostic_v1.json"
+          json_path.write_text(
+              json.dumps(report, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          def fmt(x, digits=4):
+              if x is None:
+                  return "n/a"
+              return f"{x:.{digits}f}"
+
+          dep = named_pair["deployed"]
+          ratios = named_pair["frozen_phase1_inputs"]["ratios_allen_over_dak"]
+          decomp = named_pair["frozen_phase1_inputs"][
+              "additive_combined_difference_decomposition"
+          ]
+          ref_ratio = named_pair["phase8_monitoring_reference"][
+              "allen_over_dak_effective_pm"
+          ]
+
+          lines = [
+              "# QB Production Multiplier Lineage Diagnostic V1",
+              "",
+              "**Status:** read-only upstream production-lineage diagnostic",
+              "",
+              "No 2026 realized outcome, KTC, market value, package vote, or "
+              "candidate fitting was used.",
+              "",
+              "## Josh Allen vs Dak Prescott",
+              "",
+              f"- Deployed effective PM: **{fmt(dep['allen_effective_pm'])} vs "
+              f"{fmt(dep['dak_effective_pm'])}**.",
+              f"- Deployed Allen/Dak PM ratio: **{fmt(dep['allen_over_dak_pm_ratio'])}×**.",
+              f"- Frozen Phase-1 true-PPG ratio: **{fmt(ratios['true_ppg_2025'])}×**.",
+              f"- Frozen Phase-1 history-component ratio: **{fmt(ratios['history_component'])}×**.",
+              f"- Frozen FantasyPros points ratio: **{fmt(ratios['fantasypros_points'])}×**.",
+              f"- Frozen Sleeper points ratio: **{fmt(ratios['sleeper_points'])}×**.",
+              f"- Frozen blended forward-projection ratio: **{fmt(ratios['forward_projection'])}×**.",
+              f"- Frozen combined-points ratio: **{fmt(ratios['combined_points'])}×**.",
+              f"- Frozen Phase-1 transparent candidate PM ratio: **{fmt(ratios['candidate_effective_pm'])}×**.",
+              f"- Frozen Phase-8 monitoring-reference PM ratio: **{fmt(ref_ratio)}×**.",
+              "",
+          ]
+
+          if decomp:
+              lines += [
+                  "### Phase-1 combined-point difference decomposition",
+                  "",
+                  f"- History contribution: **{fmt(decomp['history_contribution_points'], 2)} points**.",
+                  f"- Forward contribution: **{fmt(decomp['forward_contribution_points'], 2)} points**.",
+                  f"- Combined Allen-minus-Dak difference: **{fmt(decomp['combined_difference_points'], 2)} points**.",
+                  "",
+              ]
+
+          lines += [
+              "## Frozen Phase-8 sensitivity",
+              "",
+              "| Variant | Allen PM | Dak PM | Allen/Dak | Allen floor? | Dak floor? |",
+              "|---|---:|---:|---:|---|---|",
+          ]
+          for row in variant_pair_rows:
+              lines.append(
+                  f"| `{row['variant']}` | "
+                  f"{fmt(row['allen_effective_pm'])} | "
+                  f"{fmt(row['dak_effective_pm'])} | "
+                  f"{fmt(row['allen_over_dak_effective_pm'])}× | "
+                  f"{row['allen_floor_hit']} | {row['dak_floor_hit']} |"
+              )
+
+          lines += [
+              "",
+              "## Deployed table vs transparent Phase-1 reconstruction",
+              "",
+              f"- QB candidates compared: **{len(candidate_qbs)}**.",
+              f"- Median signed PM residual: **{fmt(residual_summary.get('median'))}**.",
+              f"- P90 absolute PM residual: **{fmt(residual_summary.get('p90_abs'))}**.",
+              f"- Maximum absolute PM residual: **{fmt(residual_summary.get('max_abs'))}**.",
+              "",
+              "The deployed table's original scalar lineage is not fully "
+              "reconstructable: the repository's legacy lineage audit already "
+              "proved the callable legacy generator is not the source of truth. "
+              "Therefore the transparent Phase-1/Phase-8 calculations are "
+              "counterfactual lineage diagnostics, not a claim about how the "
+              "baked values were originally hand-derived.",
+              "",
+              "## Top 20 deployed QB production multipliers",
+              "",
+              "| Rank | QB | Age | Deployed PM | 2025 true PPG | History comp | FP pts | Sleeper pts | Forward | Combined | P1 PM | P8 ref PM |",
+              "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+          ]
+          for r in top_current[:20]:
+              lines.append(
+                  f"| {r['deployed_pm_rank']} | {r['name']} | {r['age']} | "
+                  f"{fmt(r['deployed_effective_prod_mult'])} | "
+                  f"{fmt(r['history']['true_ppg_2025'], 2)} | "
+                  f"{fmt(r['history']['history_component'], 2)} | "
+                  f"{fmt(r['forward']['fantasypros_points'], 1)} | "
+                  f"{fmt(r['forward']['sleeper_points'], 1)} | "
+                  f"{fmt(r['forward']['projection'], 1)} | "
+                  f"{fmt(r['phase1_combined_points'], 1)} | "
+                  f"{fmt(None if r['phase1_candidate'] is None else r['phase1_candidate']['effective_prod_mult'])} | "
+                  f"{fmt(r['phase8_monitoring_reference']['effective_prod_mult'])} |"
+              )
+
+          lines += [
+              "",
+              "## Interpretation guardrail",
+              "",
+              "A large deployed-vs-transparent residual means the baked PM is "
+              "poorly explained by the frozen transparent reconstruction; it "
+              "does **not** prove the baked PM is wrong. Conversely, a small "
+              "residual shows the reconstruction approximates the current scalar "
+              "but still does not establish causal historical lineage.",
+              "",
+              "There is no explicit dual-threat, rushing-ceiling, or elite-QB "
+              "feature in the frozen transparent production architecture. Those "
+              "traits enter only insofar as they increase league-scored history "
+              "or provider projected total points.",
+              "",
+          ]
+
+          md = "\n".join(lines)
+          md_path = OUT / "qb_production_multiplier_lineage_diagnostic_v1.md"
+          md_path.write_text(md + "\n", encoding="utf-8")
+
+          summary_path = Path(
+              __import__("os").environ.get(
+                  "GITHUB_STEP_SUMMARY",
+                  "/tmp/qb-prod-lineage-summary.md",
+              )
+          )
+          with summary_path.open("a", encoding="utf-8") as f:
+              f.write(md + "\n")
+
+          print(md)
+          PY
+
+      - name: Validate scientific contract
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path(
+              "/tmp/qb-production-multiplier-lineage-diagnostic/"
+              "qb_production_multiplier_lineage_diagnostic_v1.json"
+          )
+          r = json.loads(path.read_text())
+
+          assert r["status"] == "read_only_upstream_production_lineage_diagnostic"
+          assert r["research_only"] is True
+          assert r["read_only"] is True
+          assert r["2026_realized_outcomes_used"] is False
+          assert r["phase9_evaluation_read"] is False
+          assert r["ktc_used"] is False
+          assert r["market_value_used"] is False
+          assert r["package_vote_data_used"] is False
+          assert r["candidate_fit_performed"] is False
+          assert r["candidate_selected"] is False
+          assert r["production_change_authorized"] is False
+          assert r["production_changed"] is False
+
+          cohort = r["qb_cohort"]
+          assert cohort["phase1_qb_count"] >= 50
+          assert cohort["transparent_candidate_qb_count"] >= 45
+
+          pair = r["named_pair_josh_allen_vs_dak_prescott"]
+          assert pair["deployed"]["allen_effective_pm"] > 0
+          assert pair["deployed"]["dak_effective_pm"] > 0
+          assert len(pair["phase8_all_frozen_variant_sensitivity"]) == 8
+
+          facts = r["architecture_facts"]
+          assert facts["explicit_dual_threat_or_rushing_feature"] is False
+          assert facts["legacy_generator_is_proven_source_of_deployed_table"] is False
+
+          print(
+              "PASS: QB production-lineage diagnostic is read-only, "
+              "pre-outcome/frozen-source, and non-fitting."
+          )
+          PY
+
+      - name: Run repository regression checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install "requests==2.34.2"
+          python3 scripts/validation/repo_regression_checks.py
+
+      - name: Upload diagnostic artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qb-production-multiplier-lineage-diagnostic-v1
+          path: /tmp/qb-production-multiplier-lineage-diagnostic/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Prove repository stayed unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          echo "PASS: QB production-lineage diagnostic made no repository changes."
