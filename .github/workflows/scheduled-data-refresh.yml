@@ -3,17 +3,23 @@ name: Scheduled Data Refresh
 # Automated source-data maintenance.
 #
 # Tuesday = full refresh:
-#   Sleeper sync -> team refresh -> Sleeper projections -> IDP filter ->
-#   FantasyPros -> identity crosswalk -> Team Utility lineup projections ->
-#   dual eligibility -> KTC aggregation -> KTC voter-balance research audit ->
-#   separate Market Value -> realized-outcome target refresh -> derived state ->
-#   value uncertainty envelopes -> append-only historical model/evidence snapshot -> fundamental + market out-of-sample evaluators.
+#   Sleeper sync -> standings-based 2027 draft-slot projection -> team refresh ->
+#   Sleeper projections -> IDP filter -> FantasyPros -> identity crosswalk ->
+#   Team Utility lineup projections -> dual eligibility -> KTC aggregation ->
+#   KTC voter-balance research audit -> separate Market Value ->
+#   realized-outcome target refresh -> derived state -> value uncertainty
+#   envelopes -> append-only historical model/evidence snapshot ->
+#   fundamental + market out-of-sample evaluators.
 #
 # Friday = light refresh:
-#   Same core projection/data chain, excluding the weekly dual-eligibility,
-#   KTC aggregation, KTC voter-balance research audit, separate Market Value
-#   refresh, and realized-outcome refresh steps, then captures another
-#   historical snapshot.
+#   Same core projection/data chain, excluding the weekly draft-slot projection,
+#   dual-eligibility, KTC aggregation, KTC voter-balance research audit,
+#   separate Market Value refresh, and realized-outcome refresh steps, then
+#   captures another historical snapshot.
+#
+# Draft-slot projection is intentionally Tuesday-only on the schedule. Updating
+# it during a live Thursday/Friday matchup could let partial-week points scored
+# move a standings tiebreaker before the week's games are complete.
 #
 # Everything runs sequentially in ONE job and is committed/pushed ONCE to
 # avoid the multi-workflow push races that can occur when independent writers
@@ -32,6 +38,11 @@ on:
         options:
           - full
           - light
+      update_draft_slots:
+        description: 'Also refresh the 2027 standings-based draft-slot projection'
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -76,6 +87,145 @@ jobs:
 
       - name: Refresh Sleeper league data
         run: python3 scripts/sync/sync_sleeper.py
+
+      - name: Draft-slot projection self-test
+        if: >-
+          (github.event_name == 'schedule' && github.event.schedule == '0 15 * * 2') ||
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.update_draft_slots == 'true')
+        run: python3 scripts/projections/draft_slot_projection_pipeline.py --selftest
+
+      - name: Refresh standings-based draft-slot projection
+        id: draftslot
+        if: >-
+          (github.event_name == 'schedule' && github.event.schedule == '0 15 * * 2') ||
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.update_draft_slots == 'true')
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          before_index="$RUNNER_TEMP/index.before-draft-slot.html"
+          before_projection="$RUNNER_TEMP/draft-slot.before.json"
+          had_projection=0
+
+          cp index.html "$before_index"
+          if [ -f data/draft_slot_projection.json ]; then
+            cp data/draft_slot_projection.json "$before_projection"
+            had_projection=1
+          fi
+
+          set +e
+          output="$(python3 scripts/projections/draft_slot_projection_pipeline.py \
+            --write-index \
+            --output data/draft_slot_projection.json 2>&1)"
+          rc=$?
+          set -e
+
+          printf '%s\n' "$output"
+
+          if [ "$rc" -eq 0 ]; then
+            echo "status=updated" >> "$GITHUB_OUTPUT"
+            echo "Draft-slot projection updated from the just-refreshed Sleeper standings."
+            exit 0
+          fi
+
+          # Restore the last known-good production projection before deciding
+          # whether this is a safe data-timing skip or a real pipeline failure.
+          cp "$before_index" index.html
+          if [ "$had_projection" -eq 1 ]; then
+            cp "$before_projection" data/draft_slot_projection.json
+          else
+            rm -f data/draft_slot_projection.json
+          fi
+
+          # These are intentional fail-closed states from the projection
+          # pipeline. They mean "do not update the projection yet", not that
+          # the broader source-data refresh should be blocked.
+          if printf '%s\n' "$output" | grep -Eq \
+            'Rosters do not all have the same number of completed regular-season games|No completed regular-season games yet|Exact standings tie remains after record and total points scored'; then
+            echo "::warning::Draft-slot projection skipped safely; last known-good projection preserved."
+            echo "status=preserved-last-good" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Any other error is unexpected. Keep the repo restored but fail the
+          # refresh so an implementation/source-contract problem cannot be
+          # silently swallowed.
+          echo "::error::Unexpected draft-slot projection failure."
+          exit "$rc"
+
+      - name: Verify refreshed draft-slot projection
+        if: steps.draftslot.outputs.status == 'updated'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import re
+          from pathlib import Path
+
+          projection_path = Path("data/draft_slot_projection.json")
+          roster_path = Path("data/league_rosters.json")
+          index_path = Path("index.html")
+
+          p = json.loads(projection_path.read_text(encoding="utf-8"))
+          index = index_path.read_text(encoding="utf-8")
+
+          assert p["schema_version"] == 1
+          assert p["status"] == "projected_from_regular_season_standings"
+          assert p["draft_season"] == "2027"
+
+          rule = p["league_rule"]
+          assert rule["primary"] == "reverse_regular_season_standings"
+          assert rule["tiebreaker"] == "total_points_scored"
+          assert rule["playoff_finish_used"] is False
+          assert rule["potential_points_used"] is False
+          assert rule["current_pick_holder_used_for_slot"] is False
+          assert rule["original_roster_id_determines_traded_pick_slot"] is True
+
+          actual_roster_sha = hashlib.sha256(roster_path.read_bytes()).hexdigest()
+          assert p["source"]["league_rosters_sha256"] == actual_roster_sha
+
+          standings = p["standings_worst_to_best"]
+          assert len(standings) == 12
+          assert [r["draft_order_rank"] for r in standings] == list(range(1, 13))
+          assert [r["tier"] for r in standings[:4]] == ["early"] * 4
+          assert [r["tier"] for r in standings[4:8]] == ["mid"] * 4
+          assert [r["tier"] for r in standings[8:]] == ["late"] * 4
+
+          for left, right in zip(standings, standings[1:]):
+              # No exact record+PF ties are allowed through the pipeline, so the
+              # confirmed league ordering must be strictly increasing here.
+              lk = (left["standing_points"], left["points_for"])
+              rk = (right["standing_points"], right["points_for"])
+              assert lk < rk, (lk, rk)
+
+          expected_date = p["projection_as_of_date"]
+          assert (
+              f"const DRAFT_SLOT_LAST_UPDATED = '{expected_date}';"
+              in index
+          )
+
+          m = re.search(
+              r"const\s+DRAFT_SLOT_PROJECTION\s*=\s*\{(.*?)\}\s*;",
+              index,
+              flags=re.DOTALL,
+          )
+          assert m
+          block = m.group(1)
+          for rid, tier in p["projection_by_roster_id"].items():
+              assert re.search(
+                  rf"\b{re.escape(rid)}\s*:\s*['\"]{tier}['\"]",
+                  block,
+              ), (rid, tier)
+
+          # Preserve reviewed production semantics.
+          assert "if(season !== DRAFT_SLOT_APPLIES_TO_SEASON) return 'mid';" in index
+          assert "const slot = pickSlotForSeason(t.roster_id, t.season);" in index
+
+          print("PASS: refreshed draft-slot projection matches current Sleeper standings.")
+          PY
 
       - name: Refresh trade history
         run: python3 scripts/sync/sync_trade_history.py
@@ -220,6 +370,7 @@ jobs:
       - name: Stage refreshed data and history
         run: |
           git add data/
+          git add index.html
           git add free-agent-board.html
           git add scripts/artifacts/generated/player_positions.json
           git add scripts/artifacts/generated/player_team_refresh.json
