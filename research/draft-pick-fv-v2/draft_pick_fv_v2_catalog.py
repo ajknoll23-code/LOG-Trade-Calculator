@@ -1,0 +1,857 @@
+#!/usr/bin/env python3
+"""
+Draft Pick FV V2 broad historical rookie-cohort catalog.
+
+CATALOG ONLY:
+  * verifies and reads the exact frozen DynastyProcess archive blob;
+  * whitelists identity/draft/rookie-ADP fields only;
+  * resolves DOB from nflverse identity data;
+  * maps continuous 2QB rookie ADP to a 12-team 6-round board;
+  * checks frozen feasibility and IDP-coverage gates;
+  * freezes eligible class years and the future dev/validation split.
+
+FORBIDDEN HERE:
+  * historical weekly/season outcomes,
+  * 2026 outcomes,
+  * KTC/current market values,
+  * package votes,
+  * candidate fitting/scoring,
+  * production mutation.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import io
+import json
+import math
+import re
+import subprocess
+import time
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import requests
+
+ROOT = Path(__file__).resolve().parents[2]
+RESEARCH = ROOT / "research" / "draft-pick-fv-v2"
+PREREG = RESEARCH / "preregistration_v2.json"
+PREREG_MANIFEST = RESEARCH / "preregistration_manifest_v2.json"
+
+OUT_JSON = RESEARCH / "broad_cohort_catalog_v2.json"
+OUT_MD = RESEARCH / "broad_cohort_catalog_v2.md"
+OUT_MANIFEST = RESEARCH / "broad_cohort_catalog_manifest_v2.json"
+
+EXPECTED_PREREG_SHA = (
+    "b41497d636547bf5115379a9cbc05f09d3dc1290bbdc966c386756c850409de3"
+)
+
+SOURCE_COMMIT = "ddbf693ee8e59fdfd100ab4f7fd144b70a13f70d"
+SOURCE_GIT_BLOB = "94cd1c40cd3b3c266bfc322117bf4756fc2e665d"
+SOURCE_URL = (
+    "https://raw.githubusercontent.com/dynastyprocess/data/"
+    + SOURCE_COMMIT
+    + "/files/archives/database.csv"
+)
+NFLVERSE_PLAYERS_URL = (
+    "https://github.com/nflverse/nflverse-data/releases/download/"
+    "players/players.csv"
+)
+DYNASTYPROCESS_IDS_URL = (
+    "https://raw.githubusercontent.com/dynastyprocess/data/master/"
+    "files/db_playerids.csv"
+)
+
+ALLOWED = (
+    "gsis_id",
+    "sleeper_id",
+    "name",
+    "pos",
+    "draft_year",
+    "draft_round",
+    "draft_pick",
+    "draft_rookieadp",
+    "draft_2QBrookieadp",
+)
+FORBIDDEN = (
+    "dynoECR",
+    "dyno2QBECR",
+    "dynpECR",
+    "rdpECR",
+    "ppr",
+    "ppr/g",
+    "offSnaps",
+    "gms",
+)
+TRACKED = ("QB", "RB", "WR", "TE", "DL", "LB", "DB")
+IDP = {"DL", "LB", "DB"}
+
+POS_MAP = {
+    "QB": "QB",
+    "RB": "RB",
+    "FB": "RB",
+    "WR": "WR",
+    "TE": "TE",
+    "DE": "DL",
+    "DT": "DL",
+    "NT": "DL",
+    "DL": "DL",
+    "EDGE": "DL",
+    "OLB": "LB",
+    "ILB": "LB",
+    "MLB": "LB",
+    "LB": "LB",
+    "CB": "DB",
+    "S": "DB",
+    "SS": "DB",
+    "FS": "DB",
+    "DB": "DB",
+}
+KNOWN_EXCLUDED = {"K", "P", "LS", "OL", "OT", "OG", "C", "G", "T", "DEF", "DST"}
+
+class CatalogError(RuntimeError):
+    pass
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+def sha256_path(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def git_blob_sha_bytes(data: bytes) -> str:
+    header = f"blob {len(data)}\0".encode("ascii")
+    return hashlib.sha1(header + data).hexdigest()
+
+def fetch_bytes(session: requests.Session, url: str, retries: int = 4) -> bytes:
+    last = None
+    for i in range(retries):
+        try:
+            r = session.get(url, timeout=60)
+            r.raise_for_status()
+            return r.content
+        except requests.RequestException as exc:
+            last = exc
+            if i + 1 < retries:
+                time.sleep(1.5 * (i + 1))
+    raise CatalogError(f"fetch failed {url}: {last}")
+
+def parse_csv(raw: bytes) -> tuple[list[str], list[dict[str, str]]]:
+    text = raw.decode("utf-8-sig")
+    reader = csv.DictReader(io.StringIO(text))
+    fields = list(reader.fieldnames or [])
+    return fields, [dict(r) for r in reader]
+
+def norm_id(value: Any) -> str | None:
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s or s.lower() in {"na", "nan", "none", "null"}:
+        return None
+    if re.fullmatch(r"\d+\.0", s):
+        s = s[:-2]
+    return s
+
+def norm_name(value: Any) -> str:
+    s = str(value or "").lower().strip()
+    s = re.sub(r"[\.'’`\-]", "", s)
+    s = re.sub(r"\b(jr|sr|ii|iii|iv|v)\b", "", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+def as_float(value: Any) -> float | None:
+    s = str(value or "").strip()
+    if not s or s.lower() in {"na", "nan", "none", "null"}:
+        return None
+    try:
+        x = float(s)
+    except ValueError:
+        return None
+    return x if math.isfinite(x) else None
+
+def as_int(value: Any) -> int | None:
+    x = as_float(value)
+    if x is None or abs(x - round(x)) > 1e-9:
+        return None
+    return int(round(x))
+
+def bucket_position(raw: Any) -> tuple[str | None, str]:
+    p = str(raw or "").upper().strip()
+    if p in POS_MAP:
+        return POS_MAP[p], "tracked"
+    if p in KNOWN_EXCLUDED:
+        return p, "known_excluded"
+    return None, "unresolved"
+
+def adp_cell(adp: float) -> tuple[int, str] | None:
+    if not (0.0 < adp <= 72.0):
+        return None
+    # No rounding: right-closed intervals (0,12], (12,24], ...
+    round_ = int(math.ceil(adp / 12.0))
+    base = 12.0 * (round_ - 1)
+    within = adp - base
+    if 0.0 < within <= 4.0:
+        tier = "early"
+    elif 4.0 < within <= 8.0:
+        tier = "mid"
+    elif 8.0 < within <= 12.0:
+        tier = "late"
+    else:
+        raise CatalogError(f"unreachable ADP mapping for {adp}")
+    return round_, tier
+
+def validate_birth_date(value: Any) -> str | None:
+    s = str(value or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        return None
+    try:
+        datetime.strptime(s, "%Y-%m-%d")
+    except ValueError:
+        return None
+    return s
+
+def find_col(fields: list[str], names: tuple[str, ...]) -> str | None:
+    lower = {f.lower(): f for f in fields}
+    for name in names:
+        if name.lower() in lower:
+            return lower[name.lower()]
+    return None
+
+def build_crosswalk(raw: bytes) -> tuple[dict[str, str], dict[str, Any]]:
+    fields, rows = parse_csv(raw)
+    sid_col = find_col(fields, ("sleeper_id", "sleeper"))
+    gid_col = find_col(fields, ("gsis_id", "gsis"))
+    if not sid_col or not gid_col:
+        raise CatalogError("crosswalk missing sleeper_id/gsis_id")
+    by_sid: dict[str, set[str]] = defaultdict(set)
+    for row in rows:
+        sid = norm_id(row.get(sid_col))
+        gid = norm_id(row.get(gid_col))
+        if sid and gid:
+            by_sid[sid].add(gid)
+    out = {
+        sid: next(iter(gids))
+        for sid, gids in by_sid.items()
+        if len(gids) == 1
+    }
+    return out, {
+        "rows": len(rows),
+        "usable_unique_mappings": len(out),
+        "ambiguous_sleeper_ids": sum(1 for v in by_sid.values() if len(v) > 1),
+        "sha256": sha256_bytes(raw),
+    }
+
+def build_nflverse(raw: bytes) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    fields, rows = parse_csv(raw)
+    gid_col = find_col(fields, ("gsis_id",))
+    dob_col = find_col(fields, ("birth_date", "birthdate"))
+    pos_col = find_col(fields, ("position", "position_group"))
+    name_col = find_col(fields, ("display_name", "full_name", "name"))
+    if not gid_col or not dob_col:
+        raise CatalogError("nflverse missing gsis_id/birth_date")
+    out = {}
+    for row in rows:
+        gid = norm_id(row.get(gid_col))
+        if gid and gid not in out:
+            out[gid] = {
+                "birth_date": validate_birth_date(row.get(dob_col)),
+                "position": row.get(pos_col) if pos_col else None,
+                "name": row.get(name_col) if name_col else None,
+            }
+    return out, {
+        "rows": len(rows),
+        "gsis_records": len(out),
+        "sha256": sha256_bytes(raw),
+    }
+
+def selftest() -> None:
+    assert adp_cell(0.1) == (1, "early")
+    assert adp_cell(4.0) == (1, "early")
+    assert adp_cell(4.0001) == (1, "mid")
+    assert adp_cell(8.0) == (1, "mid")
+    assert adp_cell(8.0001) == (1, "late")
+    assert adp_cell(12.0) == (1, "late")
+    assert adp_cell(12.0001) == (2, "early")
+    assert adp_cell(72.0) == (6, "late")
+    assert adp_cell(72.1) is None
+    assert bucket_position("DE") == ("DL", "tracked")
+    assert bucket_position("ILB") == ("LB", "tracked")
+    assert bucket_position("CB") == ("DB", "tracked")
+    assert bucket_position("K")[1] == "known_excluded"
+    assert norm_id("123.0") == "123"
+    assert norm_name("John Doe Jr.") == "john doe"
+    print("PASS: V2 broad catalog self-test")
+
+def build_catalog() -> dict[str, Any]:
+    prereg = json.loads(PREREG.read_text(encoding="utf-8"))
+    manifest = json.loads(PREREG_MANIFEST.read_text(encoding="utf-8"))
+    if sha256_path(PREREG) != EXPECTED_PREREG_SHA:
+        raise CatalogError("frozen preregistration SHA drifted")
+    if manifest["status"] != "frozen_preregistration":
+        raise CatalogError("preregistration manifest not frozen")
+
+    src = prereg["frozen_external_cohort_source"]
+    gates = prereg["maturity_and_feasibility_gates"]
+    cohort = prereg["cohort_definition"]
+
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "LOG-Trade-Calculator-Draft-Pick-FV-V2-Catalog/1.0"
+    })
+
+    raw = fetch_bytes(session, SOURCE_URL)
+    raw_blob = git_blob_sha_bytes(raw)
+    if raw_blob != SOURCE_GIT_BLOB:
+        raise CatalogError(
+            f"frozen source git blob mismatch: {raw_blob} != {SOURCE_GIT_BLOB}"
+        )
+
+    fields, source_rows = parse_csv(raw)
+    missing_allowed = [c for c in ALLOWED if c not in fields]
+    if missing_allowed:
+        raise CatalogError(f"frozen source missing allowed columns: {missing_allowed}")
+
+    # Prove forbidden fields exist in raw but are not copied into sanitized rows.
+    raw_forbidden_present = sorted(c for c in FORBIDDEN if c in fields)
+
+    cross_raw = fetch_bytes(session, DYNASTYPROCESS_IDS_URL)
+    sid_to_gsis, cross_meta = build_crosswalk(cross_raw)
+
+    nfl_raw = fetch_bytes(session, NFLVERSE_PLAYERS_URL)
+    nflverse, nfl_meta = build_nflverse(nfl_raw)
+
+    min_year = int(cohort["minimum_draft_year"])
+    max_year = int(cohort["latest_primary_draft_year"])
+
+    candidate_rows = []
+    primary_rows_unresolved = []
+    source_year_counts = Counter()
+    candidate_year_counts = Counter()
+    has_2qb_candidate = 0
+
+    for raw_row in source_rows:
+        # Hard whitelist: no other raw columns are retained below.
+        row = {k: raw_row.get(k) for k in ALLOWED}
+        year = as_int(row["draft_year"])
+        if year is None or not (min_year <= year <= max_year):
+            continue
+
+        pos_bucket, pos_status = bucket_position(row["pos"])
+        if pos_status == "known_excluded":
+            continue
+
+        one_adp = as_float(row["draft_rookieadp"])
+        two_adp = as_float(row["draft_2QBrookieadp"])
+
+        # "Candidate source rows" = tracked/unresolved-position rookies
+        # in the frozen year range with at least one valid rookie ADP
+        # in either source field. This denominator is fixed before
+        # seeing performance outcomes.
+        valid_one = one_adp is not None and 0.0 < one_adp <= 72.0
+        valid_two = two_adp is not None and 0.0 < two_adp <= 72.0
+        if not (valid_one or valid_two):
+            continue
+
+        source_year_counts[year] += 1
+        candidate_rows.append(row)
+        if valid_two:
+            has_2qb_candidate += 1
+            candidate_year_counts[year] += 1
+
+            source_gsis = norm_id(row["gsis_id"])
+            sleeper_id = norm_id(row["sleeper_id"])
+            mapped_gsis = sid_to_gsis.get(sleeper_id) if sleeper_id else None
+
+            conflict = (
+                source_gsis is not None
+                and mapped_gsis is not None
+                and source_gsis != mapped_gsis
+            )
+            resolved_gsis = None if conflict else (source_gsis or mapped_gsis)
+            identity_status = (
+                "conflict_source_vs_crosswalk"
+                if conflict
+                else "resolved_gsis"
+                if resolved_gsis
+                else "unresolved"
+            )
+
+            nflp = nflverse.get(resolved_gsis, {}) if resolved_gsis else {}
+            dob = nflp.get("birth_date")
+            cell = adp_cell(two_adp)
+            assert cell is not None
+            round_, tier = cell
+
+            primary_rows_unresolved.append({
+                "draft_year": year,
+                "player_name": str(row["name"] or "").strip() or None,
+                "normalized_name": norm_name(row["name"]),
+                "source_gsis_id": source_gsis,
+                "sleeper_id": sleeper_id,
+                "resolved_gsis_id": resolved_gsis,
+                "identity_status": identity_status,
+                "source_position": str(row["pos"] or "").upper().strip() or None,
+                "position_bucket": pos_bucket,
+                "position_resolution_status": pos_status,
+                "nfl_draft_round": as_int(row["draft_round"]),
+                "nfl_draft_pick": as_int(row["draft_pick"]),
+                "rookie_adp_1qb": one_adp if valid_one else None,
+                "rookie_adp_2qb": two_adp,
+                "mapped_round": round_,
+                "mapped_tier": tier,
+                "nflverse_birth_date": dob,
+                "dob_resolved": bool(dob),
+            })
+
+    # Deduplicate by draft year + stable identity. Conflicts are excluded.
+    grouped: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
+    identityless = []
+    for row in primary_rows_unresolved:
+        stable = row["resolved_gsis_id"] or row["sleeper_id"]
+        if not stable:
+            identityless.append(row)
+            continue
+        grouped[(row["draft_year"], stable)].append(row)
+
+    primary = []
+    duplicate_exact_collapsed = 0
+    duplicate_conflicts = []
+    compare_fields = (
+        "player_name",
+        "source_position",
+        "position_bucket",
+        "nfl_draft_round",
+        "nfl_draft_pick",
+        "rookie_adp_1qb",
+        "rookie_adp_2qb",
+        "mapped_round",
+        "mapped_tier",
+        "resolved_gsis_id",
+        "sleeper_id",
+    )
+    for key, rows in grouped.items():
+        if len(rows) == 1:
+            primary.append(rows[0])
+            continue
+        signatures = {
+            tuple(r.get(f) for f in compare_fields)
+            for r in rows
+        }
+        if len(signatures) == 1:
+            primary.append(rows[0])
+            duplicate_exact_collapsed += len(rows) - 1
+        else:
+            duplicate_conflicts.append({
+                "draft_year": key[0],
+                "stable_identity": key[1],
+                "row_count": len(rows),
+            })
+
+    # Identityless rows remain in coverage denominator but cannot enter
+    # the outcome cohort.
+    total_primary_candidates = len(primary_rows_unresolved)
+    resolved_primary_count = sum(
+        1 for r in primary_rows_unresolved
+        if r["identity_status"] == "resolved_gsis"
+        and r["position_resolution_status"] == "tracked"
+    )
+    identity_coverage = (
+        resolved_primary_count / total_primary_candidates
+        if total_primary_candidates else 0.0
+    )
+
+    # Outcome-eligible sanitized cohort requires tracked position,
+    # resolved GSIS identity, unique row, and valid 2QB ADP. DOB is not
+    # required for O1 but is required for the absolute O2 bridge.
+    eligible = [
+        r for r in primary
+        if r["identity_status"] == "resolved_gsis"
+        and r["position_resolution_status"] == "tracked"
+    ]
+    eligible.sort(key=lambda r: (
+        r["draft_year"],
+        r["rookie_adp_2qb"],
+        r["resolved_gsis_id"] or "",
+    ))
+
+    dob_count = sum(1 for r in eligible if r["dob_resolved"])
+    dob_coverage = dob_count / len(eligible) if eligible else 0.0
+
+    adp_coverage = (
+        has_2qb_candidate / len(candidate_rows)
+        if candidate_rows else 0.0
+    )
+
+    cell_counts = {
+        f"R{r}_{tier}": 0
+        for r in range(1, 7)
+        for tier in ("early", "mid", "late")
+    }
+    year_counts = Counter()
+    pos_counts = Counter()
+    for r in eligible:
+        cell_counts[f"R{r['mapped_round']}_{r['mapped_tier']}"] += 1
+        year_counts[r["draft_year"]] += 1
+        pos_counts[r["position_bucket"]] += 1
+
+    class_years = sorted(year_counts)
+    idp_count = sum(pos_counts[p] for p in IDP)
+    idp_share = idp_count / len(eligible) if eligible else 0.0
+
+    primary_gate_results = {
+        "distinct_primary_draft_classes": {
+            "required": int(gates["minimum_distinct_primary_draft_classes"]),
+            "observed": len(class_years),
+            "pass": len(class_years) >= int(gates["minimum_distinct_primary_draft_classes"]),
+        },
+        "total_primary_players": {
+            "required": int(gates["minimum_total_primary_players"]),
+            "observed": len(eligible),
+            "pass": len(eligible) >= int(gates["minimum_total_primary_players"]),
+        },
+        "minimum_players_per_round_tier_cell": {
+            "required": int(gates["minimum_players_per_round_tier_cell"]),
+            "observed": min(cell_counts.values()) if cell_counts else 0,
+            "pass": bool(cell_counts) and min(cell_counts.values()) >= int(
+                gates["minimum_players_per_round_tier_cell"]
+            ),
+        },
+        "identity_resolution_coverage": {
+            "required": float(gates["minimum_identity_resolution_coverage"]),
+            "observed": identity_coverage,
+            "pass": identity_coverage >= float(
+                gates["minimum_identity_resolution_coverage"]
+            ),
+        },
+        "dob_coverage_for_absolute_bridge": {
+            "required": float(gates["minimum_dob_coverage_for_absolute_bridge"]),
+            "observed": dob_coverage,
+            "pass": dob_coverage >= float(
+                gates["minimum_dob_coverage_for_absolute_bridge"]
+            ),
+        },
+        "2qb_adp_coverage_among_candidate_rows": {
+            "required": float(
+                gates["minimum_2qb_adp_coverage_among_candidate_rows"]
+            ),
+            "observed": adp_coverage,
+            "pass": adp_coverage >= float(
+                gates["minimum_2qb_adp_coverage_among_candidate_rows"]
+            ),
+        },
+    }
+    idp_gates = {
+        "idp_share": {
+            "required": float(gates["minimum_idp_share_for_full_idp_claim"]),
+            "observed": idp_share,
+            "pass": idp_share >= float(
+                gates["minimum_idp_share_for_full_idp_claim"]
+            ),
+        },
+        "idp_player_count": {
+            "required": int(gates["minimum_idp_players_for_full_idp_claim"]),
+            "observed": idp_count,
+            "pass": idp_count >= int(
+                gates["minimum_idp_players_for_full_idp_claim"]
+            ),
+        },
+    }
+
+    primary_pass = all(x["pass"] for x in primary_gate_results.values())
+    idp_pass = all(x["pass"] for x in idp_gates.values())
+
+    if not primary_pass:
+        status = "INSUFFICIENT_BROAD_COHORT_EVIDENCE"
+        scientific_scope = "STOP_NO_OUTCOME_INGESTION"
+    elif idp_pass:
+        status = "CATALOG_FROZEN_READY_FOR_OUTCOMES"
+        scientific_scope = "FULL_IDP_INCLUSIVE_ELIGIBLE"
+    else:
+        status = "CATALOG_FROZEN_READY_FOR_OUTCOMES"
+        scientific_scope = "OFFENSE_CONDITIONAL_ONLY"
+
+    # Split is frozen now, before outcome values are read. The future
+    # outcome-availability gate may only EXCLUDE classes; after that,
+    # split is recomputed as preregistered from the remaining years.
+    provisional_validation = class_years[-2:] if len(class_years) >= 2 else class_years[:]
+    provisional_development = [y for y in class_years if y not in provisional_validation]
+
+    sanitized_keys = {
+        "draft_year",
+        "player_name",
+        "normalized_name",
+        "source_gsis_id",
+        "sleeper_id",
+        "resolved_gsis_id",
+        "identity_status",
+        "source_position",
+        "position_bucket",
+        "position_resolution_status",
+        "nfl_draft_round",
+        "nfl_draft_pick",
+        "rookie_adp_1qb",
+        "rookie_adp_2qb",
+        "mapped_round",
+        "mapped_tier",
+        "nflverse_birth_date",
+        "dob_resolved",
+    }
+    assert all(set(r) <= sanitized_keys for r in eligible)
+    assert not any(f in r for r in eligible for f in FORBIDDEN)
+
+    return {
+        "schema_version": 2,
+        "catalog_id": "draft-pick-fv-v2-broad-cohort-catalog",
+        "study_id": prereg["study_id"],
+        "status": status,
+        "scientific_scope": scientific_scope,
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "research_only": True,
+        "candidate_fit_performed": False,
+        "candidate_scores_computed": False,
+        "historical_weekly_outcomes_read": False,
+        "2026_realized_outcomes_read": False,
+        "ktc_or_market_data_read": False,
+        "package_vote_data_read": False,
+        "production_change_authorized": False,
+        "preregistration_sha256": sha256_path(PREREG),
+        "source": {
+            "repository": "dynastyprocess/data",
+            "commit": SOURCE_COMMIT,
+            "path": "files/archives/database.csv",
+            "verified_git_blob_sha": raw_blob,
+            "raw_sha256": sha256_bytes(raw),
+            "raw_row_count": len(source_rows),
+            "raw_column_count": len(fields),
+            "raw_forbidden_columns_present_but_not_persisted": raw_forbidden_present,
+        },
+        "identity_sources": {
+            "dynastyprocess_crosswalk": cross_meta,
+            "nflverse_players": nfl_meta,
+        },
+        "coverage": {
+            "candidate_rows_with_any_valid_rookie_adp": len(candidate_rows),
+            "candidate_rows_with_valid_2qb_adp": has_2qb_candidate,
+            "2qb_adp_coverage": adp_coverage,
+            "primary_2qb_rows_before_identity_dedupe": total_primary_candidates,
+            "eligible_primary_rows": len(eligible),
+            "identity_resolution_coverage": identity_coverage,
+            "dob_resolved": dob_count,
+            "dob_coverage": dob_coverage,
+            "duplicate_exact_rows_collapsed": duplicate_exact_collapsed,
+            "duplicate_conflicting_player_years_excluded": duplicate_conflicts,
+            "identityless_primary_rows_excluded": len(identityless),
+            "draft_year_counts": {str(k): v for k, v in sorted(year_counts.items())},
+            "position_counts": dict(sorted(pos_counts.items())),
+            "round_tier_cell_counts": cell_counts,
+            "idp_count": idp_count,
+            "idp_share": idp_share,
+        },
+        "primary_gate_results": primary_gate_results,
+        "idp_gate_results": idp_gates,
+        "primary_class_years": class_years,
+        "provisional_development_years_before_outcome_availability": provisional_development,
+        "provisional_locked_validation_years_before_outcome_availability": provisional_validation,
+        "split_rule_reminder": (
+            "Outcome availability may only exclude classes. After exclusion, "
+            "the latest two remaining mature classes become locked validation "
+            "and all earlier remaining classes are development."
+        ),
+        "sanitized_primary_cohort": eligible,
+        "next_step": (
+            "Do not ingest outcomes; primary feasibility gates failed."
+            if not primary_pass
+            else
+            "Build outcome-availability catalog/evaluator under frozen V2 rules."
+        ),
+    }
+
+def write_outputs(catalog: dict[str, Any]) -> None:
+    OUT_JSON.write_text(
+        json.dumps(catalog, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    cov = catalog["coverage"]
+    lines = [
+        "# Draft Pick FV V2 — Broad Cohort Catalog",
+        "",
+        f"**Status:** `{catalog['status']}`",
+        f"**Scientific scope:** `{catalog['scientific_scope']}`",
+        "",
+        "The frozen broad source was sanitized before any historical "
+        "fantasy outcome ingestion. No candidate has been fit or scored.",
+        "",
+        "## Frozen source verification",
+        "",
+        f"- Git blob: `{catalog['source']['verified_git_blob_sha']}`",
+        f"- Raw rows: **{catalog['source']['raw_row_count']}**",
+        f"- Raw columns: **{catalog['source']['raw_column_count']}**",
+        "- Raw ECR/performance fields were detected only to prove they "
+        "were excluded; they are not present in the sanitized cohort.",
+        "",
+        "## Primary feasibility gates",
+        "",
+        "| Gate | Required | Observed | Pass |",
+        "|---|---:|---:|:---:|",
+    ]
+    for name, g in catalog["primary_gate_results"].items():
+        req = g["required"]
+        obs = g["observed"]
+        reqs = f"{req:.3f}" if isinstance(req, float) else str(req)
+        obss = f"{obs:.3f}" if isinstance(obs, float) else str(obs)
+        lines.append(
+            f"| {name} | {reqs} | {obss} | "
+            f"{'PASS' if g['pass'] else 'FAIL'} |"
+        )
+
+    lines += [
+        "",
+        "## IDP authorization gates",
+        "",
+        "| Gate | Required | Observed | Pass |",
+        "|---|---:|---:|:---:|",
+    ]
+    for name, g in catalog["idp_gate_results"].items():
+        req = g["required"]
+        obs = g["observed"]
+        reqs = f"{req:.3f}" if isinstance(req, float) else str(req)
+        obss = f"{obs:.3f}" if isinstance(obs, float) else str(obs)
+        lines.append(
+            f"| {name} | {reqs} | {obss} | "
+            f"{'PASS' if g['pass'] else 'FAIL'} |"
+        )
+
+    lines += [
+        "",
+        "## Coverage",
+        "",
+        f"- Candidate rows with any rookie ADP: **{cov['candidate_rows_with_any_valid_rookie_adp']}**",
+        f"- Candidate rows with valid 2QB ADP: **{cov['candidate_rows_with_valid_2qb_adp']}**",
+        f"- 2QB ADP coverage: **{cov['2qb_adp_coverage']:.2%}**",
+        f"- Eligible primary rows: **{cov['eligible_primary_rows']}**",
+        f"- Identity resolution coverage: **{cov['identity_resolution_coverage']:.2%}**",
+        f"- DOB coverage: **{cov['dob_coverage']:.2%}**",
+        f"- IDP share: **{cov['idp_share']:.2%}** ({cov['idp_count']} players)",
+        "",
+        "## Draft classes",
+        "",
+        f"- Primary years: **{', '.join(map(str, catalog['primary_class_years'])) or 'none'}**",
+        f"- Provisional development: **{', '.join(map(str, catalog['provisional_development_years_before_outcome_availability'])) or 'none'}**",
+        f"- Provisional locked validation: **{', '.join(map(str, catalog['provisional_locked_validation_years_before_outcome_availability'])) or 'none'}**",
+        "",
+        "## Round × tier counts",
+        "",
+        "| Cell | N |",
+        "|---|---:|",
+    ]
+    for cell, n in sorted(cov["round_tier_cell_counts"].items()):
+        lines.append(f"| {cell} | {n} |")
+
+    lines += [
+        "",
+        "## Guardrail",
+        "",
+        "No historical weekly outcomes, 2026 outcomes, KTC/current market "
+        "values, package votes, or candidate scores were read or produced.",
+        "",
+        f"**Next step:** {catalog['next_step']}",
+    ]
+    OUT_MD.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    manifest = {
+        "schema_version": 2,
+        "catalog_id": catalog["catalog_id"],
+        "study_id": catalog["study_id"],
+        "status": "frozen_catalog",
+        "scientific_status": catalog["status"],
+        "scientific_scope": catalog["scientific_scope"],
+        "files": {
+            str(OUT_JSON.relative_to(ROOT)): {
+                "sha256": sha256_path(OUT_JSON)
+            },
+            str(OUT_MD.relative_to(ROOT)): {
+                "sha256": sha256_path(OUT_MD)
+            },
+        },
+        "historical_weekly_outcomes_read": False,
+        "candidate_fit_performed": False,
+        "production_change_authorized": False,
+    }
+    OUT_MANIFEST.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+def check_outputs() -> None:
+    d = json.loads(OUT_JSON.read_text(encoding="utf-8"))
+    m = json.loads(OUT_MANIFEST.read_text(encoding="utf-8"))
+
+    assert d["candidate_fit_performed"] is False
+    assert d["candidate_scores_computed"] is False
+    assert d["historical_weekly_outcomes_read"] is False
+    assert d["2026_realized_outcomes_read"] is False
+    assert d["ktc_or_market_data_read"] is False
+    assert d["package_vote_data_read"] is False
+    assert d["production_change_authorized"] is False
+    assert d["source"]["verified_git_blob_sha"] == SOURCE_GIT_BLOB
+    assert d["preregistration_sha256"] == EXPECTED_PREREG_SHA
+
+    allowed = {
+        "INSUFFICIENT_BROAD_COHORT_EVIDENCE",
+        "CATALOG_FROZEN_READY_FOR_OUTCOMES",
+    }
+    assert d["status"] in allowed
+    assert d["scientific_scope"] in {
+        "STOP_NO_OUTCOME_INGESTION",
+        "OFFENSE_CONDITIONAL_ONLY",
+        "FULL_IDP_INCLUSIVE_ELIGIBLE",
+    }
+
+    forbidden = set(FORBIDDEN)
+    for row in d["sanitized_primary_cohort"]:
+        assert not forbidden.intersection(row)
+
+    for rel, rec in m["files"].items():
+        assert sha256_path(ROOT / rel) == rec["sha256"]
+
+    print(
+        "PASS: frozen V2 broad catalog contract; "
+        f"status={d['status']} scope={d['scientific_scope']}"
+    )
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--check", action="store_true")
+    args = ap.parse_args()
+
+    if args.selftest:
+        selftest()
+        return
+    if args.check:
+        check_outputs()
+        return
+
+    catalog = build_catalog()
+    write_outputs(catalog)
+    print(json.dumps({
+        "status": catalog["status"],
+        "scientific_scope": catalog["scientific_scope"],
+        "primary_class_years": catalog["primary_class_years"],
+        "primary_gate_results": catalog["primary_gate_results"],
+        "idp_gate_results": catalog["idp_gate_results"],
+        "coverage_summary": {
+            "eligible_primary_rows": catalog["coverage"]["eligible_primary_rows"],
+            "2qb_adp_coverage": catalog["coverage"]["2qb_adp_coverage"],
+            "identity_resolution_coverage": catalog["coverage"]["identity_resolution_coverage"],
+            "dob_coverage": catalog["coverage"]["dob_coverage"],
+            "idp_count": catalog["coverage"]["idp_count"],
+            "idp_share": catalog["coverage"]["idp_share"],
+        },
+    }, indent=2))
+
+if __name__ == "__main__":
+    main()
