@@ -1,0 +1,521 @@
+name: QB Elite FV Compression Diagnostic
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Guard clean repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Validate deployed FV Python port
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/snapshot_values.py --selftest
+
+      - name: Build read-only forensic report
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="/tmp/qb-elite-fv-compression-diagnostic"
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+
+          python3 - <<'PY'
+          import hashlib
+          import importlib.util
+          import json
+          import math
+          import re
+          import statistics
+          import subprocess
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          ROOT = Path(".")
+          INDEX = ROOT / "index.html"
+          PORT = ROOT / "scripts/validation/snapshot_values.py"
+          OUT = Path("/tmp/qb-elite-fv-compression-diagnostic")
+          BASE = 5500.0
+
+          def sha256(path):
+              h = hashlib.sha256()
+              with path.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def norm(name):
+              s = str(name or "").strip().lower()
+              s = re.sub(r"[.'’\-]", "", s)
+              return re.sub(r"\s+", " ", s).strip()
+
+          spec = importlib.util.spec_from_file_location("sv", PORT)
+          sv = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(sv)
+
+          cfg = sv.load_from_html(INDEX)
+          deployed = sv.compute_all_values(cfg)
+          pw = float(cfg["position_weight"]["QB"])
+          K = BASE * pw
+
+          def row_for(key):
+              info = cfg["player_db"][key]
+              role = info["role"]
+              age = int(info["age"])
+              prod, raw = sv.production_multiplier(
+                  key, role, cfg["prod_mult"],
+                  cfg["no_real_history"], cfg["role_mult"]
+              )
+              age_mult = sv.effective_age_multiplier(
+                  "QB", age, role, key, prod, raw, cfg
+              )
+              unrounded = K * prod * age_mult
+              rounded = math.floor(unrounded + 0.5)
+              assert rounded == int(deployed[key]["value"])
+              role_est = float(cfg["role_mult"].get(role, 1.0))
+
+              if raw is None:
+                  source = "role_estimate_no_player_prod_entry"
+              elif role == "Elite" and raw < 0.65 and abs(prod - 0.65) < 1e-12:
+                  source = "elite_floor_0.65"
+              elif (
+                  raw <= 0.15 and role_est > raw
+                  and key in cfg["no_real_history"]
+                  and abs(prod - role_est) < 1e-12
+              ):
+                  source = "no_history_role_estimate_rescue"
+              else:
+                  source = "player_production_multiplier"
+
+              return {
+                  "name": key,
+                  "age": age,
+                  "role": role,
+                  "final_fv": rounded,
+                  "final_unrounded_fv": unrounded,
+                  "effective_production_multiplier": float(prod),
+                  "raw_player_production_multiplier": (
+                      None if raw is None else float(raw)
+                  ),
+                  "production_source": source,
+                  "age_multiplier": float(age_mult),
+                  "position_weight": pw,
+                  "has_real_prod_data": bool(
+                      deployed[key]["has_real_prod_data"]
+                  ),
+                  "no_real_production_history": bool(
+                      deployed[key]["no_real_production_history"]
+                  ),
+              }
+
+          qbs = [
+              row_for(k)
+              for k, info in cfg["player_db"].items()
+              if info["pos"] == "QB"
+          ]
+          assert len(qbs) >= 30
+          qbs.sort(key=lambda r: (-r["final_fv"], r["name"].lower()))
+          for i, r in enumerate(qbs, 1):
+              r["final_fv_rank"] = i
+
+          prod_sorted = sorted(
+              qbs,
+              key=lambda r: (
+                  -r["effective_production_multiplier"],
+                  r["name"].lower(),
+              ),
+          )
+          prod_rank = {r["name"]: i for i, r in enumerate(prod_sorted, 1)}
+          for r in qbs:
+              r["production_multiplier_rank"] = prod_rank[r["name"]]
+
+          def resolve(name):
+              hits = [r for r in qbs if norm(r["name"]) == norm(name)]
+              if len(hits) != 1:
+                  raise RuntimeError(
+                      f"Expected one QB match for {name}: "
+                      f"{[r['name'] for r in hits]}"
+                  )
+              return hits[0]
+
+          allen = resolve("Josh Allen")
+          dak = resolve("Dak Prescott")
+
+          A, D = allen, dak
+          ap = A["effective_production_multiplier"]
+          dp = D["effective_production_multiplier"]
+          aa = A["age_multiplier"]
+          da = D["age_multiplier"]
+
+          raw_gap = A["final_unrounded_fv"] - D["final_unrounded_fv"]
+          age_contrib = K * (aa - da) * (ap + dp) / 2.0
+          prod_contrib = K * (ap - dp) * (aa + da) / 2.0
+          assert math.isclose(
+              age_contrib + prod_contrib, raw_gap,
+              rel_tol=0, abs_tol=1e-8
+          )
+
+          prod_ratio = ap / dp
+          age_ratio = aa / da
+          final_ratio = (
+              A["final_unrounded_fv"] / D["final_unrounded_fv"]
+          )
+          assert math.isclose(
+              prod_ratio * age_ratio, final_ratio,
+              rel_tol=0, abs_tol=1e-10
+          )
+
+          def cf(age_mult, prod_mult):
+              x = K * age_mult * prod_mult
+              return {
+                  "unrounded_fv": x,
+                  "rounded_fv": math.floor(x + 0.5),
+              }
+
+          pair = {
+              "josh_allen": A,
+              "dak_prescott": D,
+              "rounded_gap_allen_minus_dak": (
+                  A["final_fv"] - D["final_fv"]
+              ),
+              "unrounded_gap_allen_minus_dak": raw_gap,
+              "final_ratio_allen_over_dak": final_ratio,
+              "percent_gap_vs_dak": (final_ratio - 1.0) * 100.0,
+              "production_ratio_allen_over_dak": prod_ratio,
+              "age_ratio_allen_over_dak": age_ratio,
+              "shapley_gap_attribution_points": {
+                  "age_multiplier": age_contrib,
+                  "production_multiplier": prod_contrib,
+                  "sum": age_contrib + prod_contrib,
+              },
+              "counterfactuals": {
+                  "allen_with_dak_production": cf(aa, dp),
+                  "allen_with_dak_age": cf(da, ap),
+                  "dak_with_allen_production": cf(da, ap),
+                  "dak_with_allen_age": cf(aa, dp),
+              },
+          }
+
+          def band(lo, hi):
+              rows = qbs[lo - 1:hi]
+              vals = [r["final_fv"] for r in rows]
+              gaps = [
+                  rows[i]["final_fv"] - rows[i + 1]["final_fv"]
+                  for i in range(len(rows) - 1)
+              ]
+              pct = [
+                  100.0 * gaps[i] / rows[i + 1]["final_fv"]
+                  for i in range(len(gaps))
+                  if rows[i + 1]["final_fv"] > 0
+              ]
+              return {
+                  "rank_band": f"QB{lo}-QB{hi}",
+                  "n": len(rows),
+                  "top_value": vals[0],
+                  "bottom_value": vals[-1],
+                  "point_range": vals[0] - vals[-1],
+                  "top_to_bottom_ratio": vals[0] / vals[-1],
+                  "median_adjacent_point_gap": (
+                      statistics.median(gaps) if gaps else None
+                  ),
+                  "median_adjacent_percent_gap": (
+                      statistics.median(pct) if pct else None
+                  ),
+              }
+
+          qb1 = qbs[0]["final_fv"]
+          near_qb1 = {
+              str(p): sum(
+                  r["final_fv"] >= qb1 * (1 - p / 100.0)
+                  for r in qbs
+              )
+              for p in (5, 10, 15, 20, 25)
+          }
+
+          top12 = qbs[:12]
+          top12_pair_gaps = []
+          for i in range(len(top12)):
+              for j in range(i + 1, len(top12)):
+                  high = top12[i]["final_fv"]
+                  low = top12[j]["final_fv"]
+                  if low > 0:
+                      top12_pair_gaps.append(
+                          100.0 * (high / low - 1.0)
+                      )
+
+          ad_abs_pct = 100.0 * (
+              max(A["final_fv"], D["final_fv"])
+              / min(A["final_fv"], D["final_fv"])
+              - 1.0
+          )
+          ad_pair_percentile = (
+              100.0
+              * sum(x <= ad_abs_pct for x in top12_pair_gaps)
+              / len(top12_pair_gaps)
+              if top12_pair_gaps else None
+          )
+
+          dominant = (
+              "age_multiplier"
+              if abs(age_contrib) > abs(prod_contrib)
+              else "production_multiplier"
+          )
+          if math.isclose(
+              abs(age_contrib), abs(prod_contrib),
+              rel_tol=0.05, abs_tol=1.0
+          ):
+              dominant = "roughly_balanced_age_and_production"
+
+          report = {
+              "schema_version": 1,
+              "study_id": "qb-elite-fv-compression-diagnostic-v1",
+              "status": "read_only_mechanical_diagnostic",
+              "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+              "git_sha": subprocess.check_output(
+                  ["git", "rev-parse", "HEAD"], text=True
+              ).strip(),
+              "research_only": True,
+              "read_only": True,
+              "ktc_used": False,
+              "package_vote_data_used": False,
+              "realized_outcomes_used": False,
+              "candidate_fit_performed": False,
+              "candidate_selected": False,
+              "production_change_authorized": False,
+              "production_changed": False,
+              "source_sha256": {
+                  "index_html": sha256(INDEX),
+                  "snapshot_values_py": sha256(PORT),
+              },
+              "deployed_formula": {
+                  "formula": (
+                      "JS-round(5500 * position_weight * "
+                      "age_multiplier * effective_production_multiplier)"
+                  ),
+                  "base_scale": BASE,
+                  "qb_position_weight": pw,
+                  "common_qb_factor": K,
+                  "qb_age_curve": cfg["age_curve"]["QB"],
+                  "qb_post_peak_floor": cfg["qb_post_peak_floor"],
+                  "same_position_ratio_identity": (
+                      "QB_A/QB_B = "
+                      "(age_A/age_B)*(prod_A/prod_B) before rounding"
+                  ),
+              },
+              "motivating_pair": pair,
+              "cohort_spacing": {
+                  "qb_count": len(qbs),
+                  "qb1": {
+                      "name": qbs[0]["name"],
+                      "fv": qbs[0]["final_fv"],
+                  },
+                  "bands": [
+                      band(1, 5),
+                      band(6, 12),
+                      band(13, 24),
+                  ],
+                  "counts_within_percent_of_qb1": near_qb1,
+                  "top12_pairwise_percent_gap": {
+                      "n_pairs": len(top12_pair_gaps),
+                      "median": statistics.median(top12_pair_gaps),
+                      "mean": statistics.mean(top12_pair_gaps),
+                      "max": max(top12_pair_gaps),
+                      "allen_dak_absolute_percent_gap": ad_abs_pct,
+                      "allen_dak_percentile": ad_pair_percentile,
+                  },
+              },
+              "top_30_qbs": qbs[:30],
+              "all_qbs": qbs,
+              "mechanical_interpretation": {
+                  "dominant_current_allen_dak_gap_factor": dominant,
+                  "normative_correctness_claim": False,
+                  "allen_boost_recommended": False,
+                  "dak_penalty_recommended": False,
+                  "formula_change_recommended": False,
+              },
+              "next_phase_rule": (
+                  "Review the mechanical audit first. If a structural upper-QB "
+                  "compression hypothesis survives, preregister broad-cohort "
+                  "candidate families before fitting. Do not train a correction "
+                  "to Josh Allen vs Dak Prescott and do not use KTC as a fit target."
+              ),
+          }
+
+          (OUT / "qb_elite_fv_compression_diagnostic_v1.json").write_text(
+              json.dumps(report, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          lines = [
+              "# QB Elite FV Compression Diagnostic V1",
+              "",
+              "**Read-only mechanical audit. No candidate fitting or production change.**",
+              "",
+              "## Exact deployed QB formula",
+              "",
+              "`FV = JS-round(5500 × position weight × age multiplier × effective production multiplier)`",
+              "",
+              f"- QB position weight: **{pw:.6f}**",
+              f"- Common QB factor: **{K:.2f}**",
+              f"- QB age curve: `{cfg['age_curve']['QB']}`",
+              f"- QB post-peak floor: **{cfg['qb_post_peak_floor']:.6f}**",
+              "",
+              "For Allen vs Dak, base scale and QB position weight cancel. "
+              "Only the deployed age and effective-production multipliers "
+              "can create their intrinsic FV separation.",
+              "",
+              "## Josh Allen vs Dak Prescott",
+              "",
+              "| Metric | Josh Allen | Dak Prescott | Allen / Dak |",
+              "|---|---:|---:|---:|",
+              f"| Age | {A['age']} | {D['age']} | — |",
+              f"| Role | {A['role']} | {D['role']} | — |",
+              f"| Effective production multiplier | {ap:.6f} | {dp:.6f} | {prod_ratio:.4f}× |",
+              f"| Age multiplier | {aa:.6f} | {da:.6f} | {age_ratio:.4f}× |",
+              f"| Final FV | **{A['final_fv']}** | **{D['final_fv']}** | **{A['final_fv']/D['final_fv']:.4f}×** |",
+              "",
+              f"- Rounded gap: **{A['final_fv'] - D['final_fv']:+d}**",
+              f"- Unrounded gap: **{raw_gap:+.2f}**",
+              f"- Unrounded gap vs Dak: **{(final_ratio - 1) * 100:+.2f}%**",
+              f"- Age Shapley contribution: **{age_contrib:+.2f} FV**",
+              f"- Production Shapley contribution: **{prod_contrib:+.2f} FV**",
+              f"- Mechanically dominant current factor: **{dominant}**",
+              "",
+              "## Upper-QB spacing",
+              "",
+          ]
+
+          for s in report["cohort_spacing"]["bands"]:
+              lines.append(
+                  f"- **{s['rank_band']}**: {s['top_value']} → "
+                  f"{s['bottom_value']} (range {s['point_range']}; "
+                  f"top/bottom {s['top_to_bottom_ratio']:.4f}×; "
+                  f"median adjacent gap "
+                  f"{s['median_adjacent_point_gap']:.1f} FV / "
+                  f"{s['median_adjacent_percent_gap']:.2f}%)"
+              )
+
+          lines += [
+              "",
+              "## QBs within X% of current QB1",
+              "",
+          ]
+          for pct, count in near_qb1.items():
+              lines.append(f"- Within **{pct}%**: **{count} QBs**")
+
+          lines += [
+              "",
+              "## Top 30 deployed QBs",
+              "",
+              "| Rank | QB | Age | Role | FV | Prod mult | Age mult | Prod rank |",
+              "|---:|---|---:|---|---:|---:|---:|---:|",
+          ]
+          for r in qbs[:30]:
+              lines.append(
+                  f"| {r['final_fv_rank']} | {r['name']} | {r['age']} | "
+                  f"{r['role']} | {r['final_fv']} | "
+                  f"{r['effective_production_multiplier']:.4f} | "
+                  f"{r['age_multiplier']:.4f} | "
+                  f"{r['production_multiplier_rank']} |"
+              )
+
+          lines += [
+              "",
+              "## Guardrail",
+              "",
+              "This report does **not** establish that Allen should be raised, "
+              "Dak should be lowered, or the QB curve should be changed. "
+              "It uses no KTC, no package-vote outcomes, no future outcomes, "
+              "and fits no candidate. It only identifies how the current "
+              "deployed formula creates upper-QB spacing.",
+              "",
+          ]
+          md = "\n".join(lines)
+          (OUT / "qb_elite_fv_compression_diagnostic_v1.md").write_text(
+              md + "\n", encoding="utf-8"
+          )
+          print(md)
+          PY
+
+      - name: Validate scientific guardrails
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import math
+          from pathlib import Path
+
+          p = Path(
+              "/tmp/qb-elite-fv-compression-diagnostic/"
+              "qb_elite_fv_compression_diagnostic_v1.json"
+          )
+          r = json.loads(p.read_text())
+
+          assert r["status"] == "read_only_mechanical_diagnostic"
+          assert r["read_only"] is True
+          assert r["ktc_used"] is False
+          assert r["package_vote_data_used"] is False
+          assert r["realized_outcomes_used"] is False
+          assert r["candidate_fit_performed"] is False
+          assert r["candidate_selected"] is False
+          assert r["production_change_authorized"] is False
+          assert r["production_changed"] is False
+
+          pair = r["motivating_pair"]
+          attr = pair["shapley_gap_attribution_points"]
+          assert math.isclose(
+              attr["age_multiplier"] + attr["production_multiplier"],
+              attr["sum"], rel_tol=0, abs_tol=1e-8
+          )
+          assert len(r["all_qbs"]) >= 30
+          assert len(r["top_30_qbs"]) == 30
+          assert r["mechanical_interpretation"][
+              "normative_correctness_claim"
+          ] is False
+          assert r["mechanical_interpretation"][
+              "formula_change_recommended"
+          ] is False
+
+          print("PASS: read-only, non-fitting QB diagnostic contract.")
+          PY
+
+      - name: Upload diagnostic artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qb-elite-fv-compression-diagnostic-v1
+          path: /tmp/qb-elite-fv-compression-diagnostic/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Prove repository stayed unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          echo "PASS: diagnostic made no repository changes."
