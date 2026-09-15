@@ -1,0 +1,691 @@
+name: Draft Pick FV V3 MFL Historical Schema Qualification Audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir "requests==2.34.2"
+
+      - name: Guard prior V3 feasibility result and clean repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          test -f research/draft-pick-fv-v3/mfl_source_feasibility_v1.json
+          test -f research/draft-pick-fv-v3/mfl_source_feasibility_manifest_v1.json
+          test -f scripts/validation/repo_regression_checks.py
+          test ! -e research/draft-pick-fv-v3/mfl_schema_qualification_audit.py
+          test ! -e research/draft-pick-fv-v3/mfl_schema_qualification_v1.json
+          test ! -e research/draft-pick-fv-v3/mfl_schema_qualification_v1.md
+          test ! -e research/draft-pick-fv-v3/mfl_schema_qualification_manifest_v1.json
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          p = Path('research/draft-pick-fv-v3/mfl_source_feasibility_v1.json')
+          d = json.loads(p.read_text())
+          assert d['recommendation'] == 'DISCOVERY_INCONCLUSIVE_OR_INSUFFICIENT'
+          assert d['historical_player_outcomes_read'] is False
+          assert d['market_or_ktc_data_read'] is False
+          assert d['package_vote_data_read'] is False
+          assert d['candidate_fit_performed'] is False
+          assert d['candidate_scores_computed'] is False
+          assert d['production_change_authorized'] is False
+          assert d['years'] == [2018, 2019, 2020, 2021, 2022, 2023]
+          assert d['discovery_design']['max_per_term'] == 50
+          assert d['discovery_design']['max_candidates_per_year'] == 150
+          print('PASS: prior V3 feasibility result is frozen and inconclusive.')
+          PY
+
+      - name: Create historical schema qualification auditor
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p research/draft-pick-fv-v3
+
+          cat > research/draft-pick-fv-v3/mfl_schema_qualification_audit.py <<'PY'
+          #!/usr/bin/env python3
+          from __future__ import annotations
+
+          import argparse
+          import hashlib
+          import json
+          import math
+          import re
+          import time
+          from collections import Counter
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from typing import Any
+          from urllib.parse import urlencode
+
+          import requests
+
+          ROOT = Path(__file__).resolve().parents[2]
+          OUT = ROOT / 'research' / 'draft-pick-fv-v3'
+          PRIOR = OUT / 'mfl_source_feasibility_v1.json'
+          JSON_OUT = OUT / 'mfl_schema_qualification_v1.json'
+          MD_OUT = OUT / 'mfl_schema_qualification_v1.md'
+          MAN_OUT = OUT / 'mfl_schema_qualification_manifest_v1.json'
+
+          YEARS = list(range(2018, 2024))
+          HISTORICAL_TARGET_YEARS = [2018, 2019]
+          REFERENCE_YEARS = [2020, 2021, 2022, 2023]
+          SEARCH_TERMS = [
+              'dynasty', 'superflex', 'super flex', '2qb', '2 qb', 'rookie',
+              'idp', 'devy', 'empire', 'contract', 'salary', 'taxi',
+              'fantasy', 'football', 'league',
+          ]
+          NAME_DYNASTY_TOKENS = ['dynasty', 'dynast', 'devy', 'empire']
+          BASE = 'https://api.myfantasyleague.com'
+          MAX_PER_TERM = 50
+          MAX_CANDIDATES_PER_YEAR = 150
+          SLEEP = 1.02
+
+          # Frozen source-qualification gates. These are metadata-source gates only,
+          # not player-value/model-selection gates.
+          MIN_REFERENCE_ROOKIE_N = 20
+          MIN_REFERENCE_DYNASTY_N = 15
+          MIN_POINT_PRECISION = 0.90
+          MIN_WILSON_LOWER_95 = 0.80
+          MIN_HISTORICAL_PROXY_CANDIDATES_PER_YEAR = 8
+
+          DECISIONS = {
+              'ACCEPT_ROOKIE_POOL_AS_HISTORICAL_DYNASTY_PROXY',
+              'REJECT_ROOKIE_POOL_AS_HISTORICAL_DYNASTY_PROXY',
+              'INCONCLUSIVE_REFERENCE_SAMPLE',
+              'PROXY_VALIDATED_BUT_HISTORICAL_COVERAGE_THIN',
+          }
+
+          class AuditError(RuntimeError):
+              pass
+
+          def sha256(path: Path) -> str:
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          def stable_key(text: str) -> str:
+              return hashlib.sha256(text.encode()).hexdigest()
+
+          def as_list(x: Any) -> list[Any]:
+              if x is None:
+                  return []
+              return x if isinstance(x, list) else [x]
+
+          def safe_int(x: Any) -> int | None:
+              try:
+                  return int(str(x))
+              except (TypeError, ValueError):
+                  return None
+
+          def norm(x: Any) -> str:
+              return re.sub(r'\s+', ' ', str(x or '').strip()).lower()
+
+          def api_url(year: int, endpoint: str, **params: Any) -> str:
+              q = {'TYPE': endpoint, 'JSON': 1}
+              q.update({k: v for k, v in params.items() if v is not None})
+              return f'{BASE}/{year}/export?' + urlencode(q)
+
+          def get_json(session: requests.Session, url: str, retries: int = 4) -> dict[str, Any]:
+              last = None
+              for attempt in range(retries):
+                  try:
+                      r = session.get(url, timeout=45)
+                      r.raise_for_status()
+                      data = r.json()
+                      if not isinstance(data, dict):
+                          raise AuditError('non-object JSON')
+                      time.sleep(SLEEP)
+                      return data
+                  except (requests.RequestException, ValueError, AuditError) as exc:
+                      last = exc
+                      if attempt + 1 < retries:
+                          time.sleep(2 * (attempt + 1))
+              raise AuditError(f'{url}: {last}')
+
+          def search_ids(data: dict[str, Any]) -> list[str]:
+              leagues = data.get('leagues')
+              if not isinstance(leagues, dict):
+                  return []
+              out = []
+              for row in as_list(leagues.get('league')):
+                  if not isinstance(row, dict):
+                      continue
+                  lid = row.get('id') or row.get('league_id') or row.get('leagueId')
+                  if lid is not None:
+                      out.append(str(lid))
+              return out
+
+          def league_obj(data: dict[str, Any]) -> dict[str, Any] | None:
+              x = data.get('league')
+              return x if isinstance(x, dict) else None
+
+          def franchise_count(lg: dict[str, Any]) -> int | None:
+              f = lg.get('franchises')
+              return safe_int(f.get('count')) if isinstance(f, dict) else None
+
+          def qb_limit(lg: dict[str, Any]) -> str | None:
+              starters = lg.get('starters')
+              if not isinstance(starters, dict):
+                  return None
+              for row in as_list(starters.get('position')):
+                  if isinstance(row, dict) and str(row.get('name', '')).upper() == 'QB':
+                      v = str(row.get('limit', '')).strip()
+                      return v or None
+              return None
+
+          def is_sf(lg: dict[str, Any]) -> bool:
+              return qb_limit(lg) in {'1-2', '2'}
+
+          def rookie_pool(lg: dict[str, Any]) -> bool:
+              return norm(lg.get('draftPlayerPool')).startswith('rook')
+
+          def keeper_state(lg: dict[str, Any]) -> str:
+              if 'keeperType' not in lg or lg.get('keeperType') is None or norm(lg.get('keeperType')) == '':
+                  return 'missing'
+              v = norm(lg.get('keeperType'))
+              if v == 'dynasty':
+                  return 'dynasty'
+              if v == 'keeper':
+                  return 'keeper'
+              if v in {'none', 'redraft'}:
+                  return 'none'
+              return f'other:{v}'
+
+          def name_signal(name: Any) -> bool:
+              n = norm(name)
+              return any(tok in n for tok in NAME_DYNASTY_TOKENS)
+
+          def wilson_lower(successes: int, n: int, z: float = 1.96) -> float | None:
+              if n <= 0:
+                  return None
+              phat = successes / n
+              denom = 1 + z * z / n
+              center = phat + z * z / (2 * n)
+              margin = z * math.sqrt((phat * (1 - phat) + z * z / (4 * n)) / n)
+              return (center - margin) / denom
+
+          def discover(session: requests.Session, year: int) -> tuple[list[str], dict[str, Any]]:
+              term_counts: dict[str, int] = {}
+              errors: dict[str, str] = {}
+              all_ids: set[str] = set()
+              for term in SEARCH_TERMS:
+                  try:
+                      rows = search_ids(get_json(session, api_url(year, 'leagueSearch', SEARCH=term)))
+                  except AuditError as exc:
+                      rows = []
+                      errors[term] = str(exc)
+                  rows = sorted(set(rows), key=lambda x: stable_key(f'{year}|{term}|{x}'))[:MAX_PER_TERM]
+                  term_counts[term] = len(rows)
+                  all_ids.update(rows)
+              ordered = sorted(all_ids, key=lambda x: stable_key(f'{year}|candidate|{x}'))
+              selected = ordered[:MAX_CANDIDATES_PER_YEAR]
+              return selected, {
+                  'term_counts_after_cap': term_counts,
+                  'search_errors': errors,
+                  'unique_union_before_year_cap': len(ordered),
+                  'selected_for_settings_probe': len(selected),
+              }
+
+          def probe_year(session: requests.Session, year: int) -> dict[str, Any]:
+              ids, discovery = discover(session, year)
+              failures = Counter()
+              keeper_dist = Counter()
+              pool_dist = Counter()
+              qb_dist = Counter()
+              key_presence = Counter()
+              counts = Counter()
+              sf12_rows = []
+
+              for lid in ids:
+                  try:
+                      lg = league_obj(get_json(session, api_url(year, 'league', L=lid)))
+                  except AuditError:
+                      failures['league_fetch_failed'] += 1
+                      continue
+                  if not lg:
+                      failures['league_missing'] += 1
+                      continue
+
+                  counts['settings_read'] += 1
+                  for k in lg.keys():
+                      key_presence[str(k)] += 1
+
+                  kstate = keeper_state(lg)
+                  keeper_dist[kstate] += 1
+                  pool_dist[str(lg.get('draftPlayerPool'))] += 1
+                  qb_dist[str(qb_limit(lg))] += 1
+
+                  if franchise_count(lg) == 12:
+                      counts['team12'] += 1
+                  else:
+                      continue
+                  if is_sf(lg):
+                      counts['team12_sf'] += 1
+                  else:
+                      continue
+
+                  rp = rookie_pool(lg)
+                  ns = name_signal(lg.get('name'))
+                  if rp:
+                      counts['team12_sf_rookie'] += 1
+                  if kstate == 'missing':
+                      counts['team12_sf_keeper_missing'] += 1
+                      if rp:
+                          counts['team12_sf_rookie_keeper_missing'] += 1
+                  else:
+                      counts['team12_sf_keeper_observed'] += 1
+                      if rp:
+                          counts['team12_sf_rookie_keeper_observed'] += 1
+                          if kstate == 'dynasty':
+                              counts['team12_sf_rookie_reference_dynasty'] += 1
+                          else:
+                              counts['team12_sf_rookie_reference_nondynasty'] += 1
+
+                  if ns:
+                      counts['team12_sf_name_signal'] += 1
+                      if rp:
+                          counts['team12_sf_rookie_name_signal'] += 1
+
+                  sf12_rows.append({
+                      'league_id': lid,
+                      'name': lg.get('name'),
+                      'keeper_state': kstate,
+                      'draft_player_pool': lg.get('draftPlayerPool'),
+                      'qb_limit': qb_limit(lg),
+                      'rookie_pool': rp,
+                      'name_dynasty_signal': ns,
+                  })
+
+              return {
+                  'year': year,
+                  'discovery': discovery,
+                  'failure_counts': dict(failures),
+                  'pipeline_counts': dict(counts),
+                  'keeper_state_distribution': dict(keeper_dist),
+                  'draft_pool_distribution': dict(pool_dist),
+                  'qb_limit_distribution': dict(qb_dist),
+                  'top_level_key_presence': dict(key_presence.most_common()),
+                  'team12_sf_rows': sf12_rows,
+              }
+
+          def calibrate(results: list[dict[str, Any]]) -> dict[str, Any]:
+              reference_rows = []
+              for r in results:
+                  if r['year'] not in REFERENCE_YEARS:
+                      continue
+                  for row in r['team12_sf_rows']:
+                      if not row['rookie_pool']:
+                          continue
+                      if row['keeper_state'] == 'missing' or row['keeper_state'].startswith('other:'):
+                          continue
+                      reference_rows.append({'year': r['year'], **row})
+
+              successes = sum(1 for x in reference_rows if x['keeper_state'] == 'dynasty')
+              n = len(reference_rows)
+              precision = successes / n if n else None
+              lower = wilson_lower(successes, n)
+              nondynasty = Counter(x['keeper_state'] for x in reference_rows if x['keeper_state'] != 'dynasty')
+              name_success = sum(1 for x in reference_rows if x['keeper_state'] == 'dynasty' and x['name_dynasty_signal'])
+              name_nondynasty = sum(1 for x in reference_rows if x['keeper_state'] != 'dynasty' and x['name_dynasty_signal'])
+
+              hist_counts = {}
+              hist_name_counts = {}
+              for year in HISTORICAL_TARGET_YEARS:
+                  rows = next(r['team12_sf_rows'] for r in results if r['year'] == year)
+                  candidates = [x for x in rows if x['rookie_pool'] and x['keeper_state'] == 'missing']
+                  hist_counts[str(year)] = len(candidates)
+                  hist_name_counts[str(year)] = sum(1 for x in candidates if x['name_dynasty_signal'])
+
+              enough_reference = n >= MIN_REFERENCE_ROOKIE_N and successes >= MIN_REFERENCE_DYNASTY_N
+              proxy_passes = (
+                  enough_reference
+                  and precision is not None and precision >= MIN_POINT_PRECISION
+                  and lower is not None and lower >= MIN_WILSON_LOWER_95
+              )
+              enough_historical = all(
+                  hist_counts[str(y)] >= MIN_HISTORICAL_PROXY_CANDIDATES_PER_YEAR
+                  for y in HISTORICAL_TARGET_YEARS
+              )
+
+              if not enough_reference:
+                  decision = 'INCONCLUSIVE_REFERENCE_SAMPLE'
+              elif not proxy_passes:
+                  decision = 'REJECT_ROOKIE_POOL_AS_HISTORICAL_DYNASTY_PROXY'
+              elif not enough_historical:
+                  decision = 'PROXY_VALIDATED_BUT_HISTORICAL_COVERAGE_THIN'
+              else:
+                  decision = 'ACCEPT_ROOKIE_POOL_AS_HISTORICAL_DYNASTY_PROXY'
+
+              return {
+                  'reference_years': REFERENCE_YEARS,
+                  'reference_definition': (
+                      '12-team superflex leagues with draftPlayerPool starting Rookie and '
+                      'an observed keeperType label in 2020-2023'
+                  ),
+                  'primary_proxy_under_test': (
+                      'When keeperType is missing, a 12-team superflex Rookie-only draft '
+                      'is treated as a dynasty-source proxy.'
+                  ),
+                  'reference_rookie_n': n,
+                  'reference_dynasty_n': successes,
+                  'reference_nondynasty_n': n - successes,
+                  'reference_nondynasty_states': dict(nondynasty),
+                  'point_precision': precision,
+                  'wilson_lower_95': lower,
+                  'name_signal_among_reference_dynasty_n': name_success,
+                  'name_signal_among_reference_nondynasty_n': name_nondynasty,
+                  'historical_missing_keeper_rookie_proxy_candidates': hist_counts,
+                  'historical_name_signal_subset': hist_name_counts,
+                  'gates': {
+                      'min_reference_rookie_n': MIN_REFERENCE_ROOKIE_N,
+                      'min_reference_dynasty_n': MIN_REFERENCE_DYNASTY_N,
+                      'min_point_precision': MIN_POINT_PRECISION,
+                      'min_wilson_lower_95': MIN_WILSON_LOWER_95,
+                      'min_historical_proxy_candidates_per_year': MIN_HISTORICAL_PROXY_CANDIDATES_PER_YEAR,
+                  },
+                  'enough_reference': enough_reference,
+                  'proxy_passes_precision_gates': proxy_passes,
+                  'enough_historical_coverage': enough_historical,
+                  'decision': decision,
+              }
+
+          def run() -> dict[str, Any]:
+              prior = json.loads(PRIOR.read_text())
+              assert prior['recommendation'] == 'DISCOVERY_INCONCLUSIVE_OR_INSUFFICIENT'
+              assert prior['discovery_design']['search_terms'] == SEARCH_TERMS
+              assert prior['discovery_design']['max_per_term'] == MAX_PER_TERM
+              assert prior['discovery_design']['max_candidates_per_year'] == MAX_CANDIDATES_PER_YEAR
+
+              session = requests.Session()
+              session.headers.update({'User-Agent': 'LOG-Trade-Calculator-MFL-Schema-Audit/1.0'})
+              results = []
+              for year in YEARS:
+                  print(f'--- {year} ---', flush=True)
+                  r = probe_year(session, year)
+                  results.append(r)
+                  c = r['pipeline_counts']
+                  print(
+                      year,
+                      'probed', r['discovery']['selected_for_settings_probe'],
+                      '12T-SF', c.get('team12_sf', 0),
+                      'rookie', c.get('team12_sf_rookie', 0),
+                      'keeper-missing-rookie', c.get('team12_sf_rookie_keeper_missing', 0),
+                      'keeper-observed-rookie', c.get('team12_sf_rookie_keeper_observed', 0),
+                      flush=True,
+                  )
+
+              calibration = calibrate(results)
+              return {
+                  'schema_version': 1,
+                  'audit_id': 'draft-pick-fv-v3-mfl-historical-schema-qualification',
+                  'generated_at_utc': datetime.now(timezone.utc).isoformat(),
+                  'research_only': True,
+                  'pre_preregistration_source_research': True,
+                  'decision_rule_frozen_before_execution': True,
+                  'historical_player_outcomes_read': False,
+                  'market_or_ktc_data_read': False,
+                  'package_vote_data_read': False,
+                  'draft_results_read': False,
+                  'candidate_fit_performed': False,
+                  'candidate_scores_computed': False,
+                  'production_change_authorized': False,
+                  'years': YEARS,
+                  'historical_target_years': HISTORICAL_TARGET_YEARS,
+                  'reference_years': REFERENCE_YEARS,
+                  'api_endpoints_used': ['leagueSearch', 'league'],
+                  'prior_feasibility_sha256': sha256(PRIOR),
+                  'discovery_design': {
+                      'search_terms': SEARCH_TERMS,
+                      'max_per_term': MAX_PER_TERM,
+                      'max_candidates_per_year': MAX_CANDIDATES_PER_YEAR,
+                      'deterministic_sampling': True,
+                      'same_sampling_contract_as_prior_feasibility_audit': True,
+                  },
+                  'year_results': results,
+                  'calibration': calibration,
+                  'recommendation': calibration['decision'],
+                  'next_step': (
+                      'If ACCEPT: build a separate rerun of MFL feasibility using the frozen '
+                      'fallback qualifier explicit keeperType=dynasty OR keeperType missing + '
+                      'Rookie-only draft, without reading outcomes. If REJECT: add a second draft '
+                      'source rather than weakening the dynasty qualifier. If INCONCLUSIVE or thin: '
+                      'expand metadata discovery only, still without reading player outcomes.'
+                  ),
+              }
+
+          def write_outputs(d: dict[str, Any]) -> None:
+              JSON_OUT.write_text(json.dumps(d, indent=2, sort_keys=True) + '\n')
+
+              cal = d['calibration']
+              precision = 'n/a' if cal['point_precision'] is None else f"{cal['point_precision']:.3f}"
+              lower = 'n/a' if cal['wilson_lower_95'] is None else f"{cal['wilson_lower_95']:.3f}"
+              lines = [
+                  '# Draft Pick FV V3 — MFL Historical Schema Qualification Audit',
+                  '',
+                  f"**Recommendation:** `{d['recommendation']}`",
+                  '',
+                  'This audit reads MFL league metadata only. It does **not** read draft results, player outcomes, KTC/market data, package votes, or candidate model scores.',
+                  '',
+                  '## Frozen proxy test',
+                  '',
+                  'Primary question: when `keeperType` is missing, can a 12-team superflex league with a Rookie-only draft be treated as a defensible dynasty-source proxy?',
+                  '',
+                  f"- Reference Rookie-only rows: **{cal['reference_rookie_n']}**",
+                  f"- Explicit dynasty among them: **{cal['reference_dynasty_n']}**",
+                  f"- Point precision: **{precision}** (gate >= {MIN_POINT_PRECISION:.2f})",
+                  f"- Wilson 95% lower bound: **{lower}** (gate >= {MIN_WILSON_LOWER_95:.2f})",
+                  '',
+                  '## Historical coverage',
+                  '',
+                  '| Year | Missing keeperType + 12T SF Rookie-only | Name-signal subset |',
+                  '|---:|---:|---:|',
+              ]
+              for year in HISTORICAL_TARGET_YEARS:
+                  y = str(year)
+                  lines.append(
+                      f"| {year} | {cal['historical_missing_keeper_rookie_proxy_candidates'][y]} | "
+                      f"{cal['historical_name_signal_subset'][y]} |"
+                  )
+
+              lines += [
+                  '',
+                  '## Per-season metadata',
+                  '',
+                  '| Year | Probed | 12T SF | Rookie-only | Rookie + keeper missing | Rookie + keeper observed |',
+                  '|---:|---:|---:|---:|---:|---:|',
+              ]
+              for r in d['year_results']:
+                  c = r['pipeline_counts']
+                  lines.append(
+                      f"| {r['year']} | {r['discovery']['selected_for_settings_probe']} | "
+                      f"{c.get('team12_sf', 0)} | {c.get('team12_sf_rookie', 0)} | "
+                      f"{c.get('team12_sf_rookie_keeper_missing', 0)} | "
+                      f"{c.get('team12_sf_rookie_keeper_observed', 0)} |"
+                  )
+
+              lines += [
+                  '',
+                  '## Interpretation guard',
+                  '',
+                  'A green workflow means the schema audit executed correctly. The scientific source decision is the recommendation above.',
+                  '',
+                  f"**Next step:** {d['next_step']}",
+              ]
+              MD_OUT.write_text('\n'.join(lines) + '\n')
+
+              manifest = {
+                  'schema_version': 1,
+                  'audit_id': d['audit_id'],
+                  'status': 'historical_schema_qualification_audit_complete',
+                  'recommendation': d['recommendation'],
+                  'files': {
+                      str(JSON_OUT.relative_to(ROOT)): {'sha256': sha256(JSON_OUT)},
+                      str(MD_OUT.relative_to(ROOT)): {'sha256': sha256(MD_OUT)},
+                  },
+                  'draft_results_read': False,
+                  'historical_player_outcomes_read': False,
+                  'candidate_fit_performed': False,
+                  'production_change_authorized': False,
+              }
+              MAN_OUT.write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n')
+
+          def selftest() -> None:
+              league = {
+                  'name': 'Example Dynasty League',
+                  'keeperType': 'dynasty',
+                  'draftPlayerPool': 'Rookie',
+                  'franchises': {'count': '12'},
+                  'starters': {'position': [{'name': 'QB', 'limit': '1-2'}]},
+              }
+              assert franchise_count(league) == 12
+              assert is_sf(league)
+              assert rookie_pool(league)
+              assert keeper_state(league) == 'dynasty'
+              assert name_signal(league['name'])
+              missing = dict(league)
+              missing.pop('keeperType')
+              assert keeper_state(missing) == 'missing'
+              assert wilson_lower(18, 20) is not None
+              print('PASS: V3 MFL historical schema auditor self-test')
+
+          def check() -> None:
+              d = json.loads(JSON_OUT.read_text())
+              m = json.loads(MAN_OUT.read_text())
+              assert d['historical_player_outcomes_read'] is False
+              assert d['market_or_ktc_data_read'] is False
+              assert d['package_vote_data_read'] is False
+              assert d['draft_results_read'] is False
+              assert d['candidate_fit_performed'] is False
+              assert d['candidate_scores_computed'] is False
+              assert d['production_change_authorized'] is False
+              assert d['decision_rule_frozen_before_execution'] is True
+              assert d['api_endpoints_used'] == ['leagueSearch', 'league']
+              assert d['recommendation'] in DECISIONS
+              assert len(d['year_results']) == 6
+              for rel, rec in m['files'].items():
+                  assert sha256(ROOT / rel) == rec['sha256']
+              print('PASS:', d['recommendation'])
+
+          def main() -> None:
+              ap = argparse.ArgumentParser()
+              ap.add_argument('--selftest', action='store_true')
+              ap.add_argument('--check', action='store_true')
+              args = ap.parse_args()
+              if args.selftest:
+                  selftest()
+                  return
+              if args.check:
+                  check()
+                  return
+              d = run()
+              write_outputs(d)
+              cal = d['calibration']
+              print(json.dumps({
+                  'recommendation': d['recommendation'],
+                  'reference_rookie_n': cal['reference_rookie_n'],
+                  'reference_dynasty_n': cal['reference_dynasty_n'],
+                  'point_precision': cal['point_precision'],
+                  'wilson_lower_95': cal['wilson_lower_95'],
+                  'historical_proxy_candidates': cal['historical_missing_keeper_rookie_proxy_candidates'],
+              }, indent=2))
+
+          if __name__ == '__main__':
+              main()
+          PY
+
+          chmod +x research/draft-pick-fv-v3/mfl_schema_qualification_audit.py
+          python3 research/draft-pick-fv-v3/mfl_schema_qualification_audit.py --selftest
+
+      - name: Run historical MFL schema qualification audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 research/draft-pick-fv-v3/mfl_schema_qualification_audit.py
+
+      - name: Validate schema audit outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 research/draft-pick-fv-v3/mfl_schema_qualification_audit.py --check
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          d = json.loads(Path('research/draft-pick-fv-v3/mfl_schema_qualification_v1.json').read_text())
+          c = d['calibration']
+          print('Recommendation:', d['recommendation'])
+          print('Reference rookie N:', c['reference_rookie_n'])
+          print('Reference dynasty N:', c['reference_dynasty_n'])
+          print('Point precision:', c['point_precision'])
+          print('Wilson lower 95:', c['wilson_lower_95'])
+          print('Historical proxy candidates:', c['historical_missing_keeper_rookie_proxy_candidates'])
+          PY
+
+      - name: Run repository regression checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/repo_regression_checks.py
+
+      - name: Prove only V3 schema-audit files changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import subprocess
+          expected = {
+              'research/draft-pick-fv-v3/mfl_schema_qualification_audit.py',
+              'research/draft-pick-fv-v3/mfl_schema_qualification_v1.json',
+              'research/draft-pick-fv-v3/mfl_schema_qualification_v1.md',
+              'research/draft-pick-fv-v3/mfl_schema_qualification_manifest_v1.json',
+          }
+          raw = subprocess.check_output(
+              ['git', 'status', '--porcelain=v1', '--untracked-files=all'], text=True
+          )
+          actual = {line[3:] for line in raw.splitlines() if line}
+          assert actual == expected, (sorted(actual), sorted(expected))
+          print('PASS: exactly four intended V3 historical schema-audit files changed.')
+          PY
+
+      - name: Commit V3 historical schema qualification audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            research/draft-pick-fv-v3/mfl_schema_qualification_audit.py \
+            research/draft-pick-fv-v3/mfl_schema_qualification_v1.json \
+            research/draft-pick-fv-v3/mfl_schema_qualification_v1.md \
+            research/draft-pick-fv-v3/mfl_schema_qualification_manifest_v1.json
+          git commit -m "Audit historical MFL schema qualification for Draft Pick FV V3"
+          git push origin HEAD:main
