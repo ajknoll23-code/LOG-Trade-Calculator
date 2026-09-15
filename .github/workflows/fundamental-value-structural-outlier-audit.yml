@@ -1,0 +1,842 @@
+name: Fundamental Value Structural Outlier Audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Guard clean repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Validate deployed FV Python port
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/snapshot_values.py --selftest
+
+      - name: Build structural outlier audit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OUT="/tmp/fv-structural-outlier-audit"
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import importlib.util
+          import json
+          import math
+          import statistics
+          import subprocess
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          ROOT = Path(".")
+          INDEX = ROOT / "index.html"
+          PORT = ROOT / "scripts/validation/snapshot_values.py"
+          OUT = Path("/tmp/fv-structural-outlier-audit")
+          BASE_SCALE = 5500.0
+          TRACKED_POSITIONS = ("QB", "RB", "WR", "TE", "DL", "LB", "DB")
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def git_head() -> str:
+              return subprocess.check_output(
+                  ["git", "rev-parse", "HEAD"], text=True
+              ).strip()
+
+          def js_round_positive(x: float) -> int:
+              return math.floor(x + 0.5)
+
+          def safe_ratio(a: float, b: float):
+              if b <= 0:
+                  return None
+              return a / b
+
+          spec = importlib.util.spec_from_file_location("snapshot_values", PORT)
+          if spec is None or spec.loader is None:
+              raise RuntimeError("Could not import snapshot_values.py")
+          sv = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(sv)
+
+          cfg = sv.load_from_html(INDEX)
+          deployed = sv.compute_all_values(cfg)
+
+          rows = []
+          for key, info in cfg["player_db"].items():
+              pos = info["pos"]
+              if pos not in TRACKED_POSITIONS:
+                  continue
+
+              age = int(info["age"])
+              role = info["role"]
+              eff_prod, raw_prod = sv.production_multiplier(
+                  key,
+                  role,
+                  cfg["prod_mult"],
+                  cfg["no_real_history"],
+                  cfg["role_mult"],
+              )
+              age_mult = sv.effective_age_multiplier(
+                  pos,
+                  age,
+                  role,
+                  key,
+                  eff_prod,
+                  raw_prod,
+                  cfg,
+              )
+              pw = float(cfg["position_weight"].get(pos, 1.0))
+              common = BASE_SCALE * pw
+              unrounded = common * eff_prod * age_mult
+              rounded = js_round_positive(unrounded)
+              assert rounded == int(deployed[key]["value"])
+
+              role_est = float(cfg["role_mult"].get(role, 1.0))
+              if raw_prod is None:
+                  prod_source = "role_estimate_missing_player_prod"
+              elif (
+                  role == "Elite"
+                  and raw_prod < 0.65
+                  and abs(eff_prod - 0.65) < 1e-12
+              ):
+                  prod_source = "elite_floor_0.65"
+              elif (
+                  raw_prod <= 0.15
+                  and role_est > raw_prod
+                  and key in cfg["no_real_history"]
+                  and abs(eff_prod - role_est) < 1e-12
+              ):
+                  prod_source = "no_history_role_rescue"
+              else:
+                  prod_source = "player_production_multiplier"
+
+              raw_counterfactual = None
+              override_fv_delta = None
+              if raw_prod is not None and abs(float(raw_prod) - float(eff_prod)) > 1e-12:
+                  raw_age_mult = sv.effective_age_multiplier(
+                      pos,
+                      age,
+                      role,
+                      key,
+                      float(raw_prod),
+                      float(raw_prod),
+                      cfg,
+                  )
+                  raw_unrounded = common * float(raw_prod) * raw_age_mult
+                  raw_counterfactual = {
+                      "raw_production_multiplier": float(raw_prod),
+                      "age_multiplier_using_raw_production": float(raw_age_mult),
+                      "unrounded_fv": raw_unrounded,
+                      "rounded_fv": js_round_positive(raw_unrounded),
+                  }
+                  override_fv_delta = unrounded - raw_unrounded
+
+              production_only_unrounded = common * eff_prod
+              age_effect_points = unrounded - production_only_unrounded
+
+              rows.append({
+                  "name": key,
+                  "pos": pos,
+                  "age": age,
+                  "role": role,
+                  "final_fv": rounded,
+                  "final_unrounded_fv": unrounded,
+                  "position_weight": pw,
+                  "effective_production_multiplier": float(eff_prod),
+                  "raw_player_production_multiplier": (
+                      None if raw_prod is None else float(raw_prod)
+                  ),
+                  "production_source": prod_source,
+                  "age_multiplier": float(age_mult),
+                  "production_only_unrounded_fv": production_only_unrounded,
+                  "age_effect_points": age_effect_points,
+                  "age_effect_percent_of_production_only": (
+                      (age_mult - 1.0) * 100.0
+                  ),
+                  "raw_counterfactual": raw_counterfactual,
+                  "override_effect_points": override_fv_delta,
+                  "has_real_prod_data": bool(
+                      deployed[key]["has_real_prod_data"]
+                  ),
+                  "no_real_production_history": bool(
+                      deployed[key]["no_real_production_history"]
+                  ),
+              })
+
+          by_pos = defaultdict(list)
+          for row in rows:
+              by_pos[row["pos"]].append(row)
+
+          # Rank each position by production and by final FV.
+          for pos, group in by_pos.items():
+              fv_sorted = sorted(
+                  group,
+                  key=lambda r: (-r["final_fv"], r["name"].lower()),
+              )
+              prod_sorted = sorted(
+                  group,
+                  key=lambda r: (
+                      -r["effective_production_multiplier"],
+                      r["name"].lower(),
+                  ),
+              )
+              fv_rank = {r["name"]: i for i, r in enumerate(fv_sorted, 1)}
+              prod_rank = {r["name"]: i for i, r in enumerate(prod_sorted, 1)}
+              for r in group:
+                  r["fv_rank_within_position"] = fv_rank[r["name"]]
+                  r["production_rank_within_position"] = prod_rank[r["name"]]
+                  r["rank_shift_prod_to_fv"] = (
+                      prod_rank[r["name"]] - fv_rank[r["name"]]
+                  )
+
+          # Individual mechanism flags. These describe architecture; they do not
+          # claim that the value is wrong.
+          player_flags = []
+          for r in rows:
+              reasons = []
+              severity = 0.0
+
+              if r["production_source"] != "player_production_multiplier":
+                  reasons.append(r["production_source"])
+                  severity += 1.0
+
+              rank_shift = abs(r["rank_shift_prod_to_fv"])
+              pos_n = len(by_pos[r["pos"]])
+              if rank_shift >= max(5, math.ceil(pos_n * 0.10)):
+                  reasons.append(
+                      f"production rank {r['production_rank_within_position']} "
+                      f"to FV rank {r['fv_rank_within_position']} "
+                      f"(shift {r['rank_shift_prod_to_fv']:+d})"
+                  )
+                  severity += min(3.0, rank_shift / max(1.0, pos_n * 0.10))
+
+              age_effect_pct = abs(r["age_effect_percent_of_production_only"])
+              if age_effect_pct >= 20.0:
+                  reasons.append(
+                      f"age layer changes production-only value by "
+                      f"{r['age_effect_percent_of_production_only']:+.1f}%"
+                  )
+                  severity += min(3.0, age_effect_pct / 20.0)
+
+              if r["override_effect_points"] is not None:
+                  pct = (
+                      abs(r["override_effect_points"])
+                      / max(1.0, abs(r["final_unrounded_fv"]))
+                      * 100.0
+                  )
+                  if pct >= 10.0:
+                      reasons.append(
+                          f"production override changes FV by "
+                          f"{r['override_effect_points']:+.1f} points"
+                      )
+                      severity += min(3.0, pct / 10.0)
+
+              if reasons:
+                  player_flags.append({
+                      "name": r["name"],
+                      "pos": r["pos"],
+                      "age": r["age"],
+                      "role": r["role"],
+                      "fv": r["final_fv"],
+                      "prod_mult": r["effective_production_multiplier"],
+                      "age_mult": r["age_multiplier"],
+                      "severity": severity,
+                      "reasons": reasons,
+                  })
+
+          player_flags.sort(
+              key=lambda x: (-x["severity"], x["pos"], x["name"].lower())
+          )
+
+          # Pairwise structural comparisons within position.
+          pair_candidates = []
+          category_counts = Counter()
+
+          for pos, group in by_pos.items():
+              n = len(group)
+              for i in range(n):
+                  for j in range(i + 1, n):
+                      a = group[i]
+                      b = group[j]
+
+                      # Orient by production: high_prod has >= production.
+                      if (
+                          a["effective_production_multiplier"],
+                          a["final_unrounded_fv"],
+                      ) >= (
+                          b["effective_production_multiplier"],
+                          b["final_unrounded_fv"],
+                      ):
+                          hi, lo = a, b
+                      else:
+                          hi, lo = b, a
+
+                      hp = hi["effective_production_multiplier"]
+                      lp = lo["effective_production_multiplier"]
+                      if hp <= 0 or lp <= 0:
+                          continue
+
+                      prod_ratio = hp / lp
+                      fv_ratio = (
+                          hi["final_unrounded_fv"]
+                          / lo["final_unrounded_fv"]
+                      )
+                      age_ratio = hi["age_multiplier"] / lo["age_multiplier"]
+
+                      # Same-position identity, pre-rounding:
+                      # FV_hi/FV_lo = prod_ratio * age_ratio.
+                      if not math.isclose(
+                          prod_ratio * age_ratio,
+                          fv_ratio,
+                          rel_tol=0,
+                          abs_tol=1e-9,
+                      ):
+                          raise RuntimeError(
+                              f"pair identity drift for {hi['name']} vs {lo['name']}"
+                          )
+
+                      prod_log = math.log(prod_ratio)
+                      fv_log = math.log(fv_ratio)
+                      architecture_delta = fv_log - prod_log  # == log(age_ratio)
+
+                      categories = []
+                      reasons = []
+                      score_components = []
+
+                      # Higher production but lower final FV.
+                      if prod_ratio >= 1.10 and fv_ratio <= 0.98:
+                          categories.append("rank_reversal")
+                          reverse_ratio = 1.0 / max(fv_ratio, 1e-12)
+                          reasons.append(
+                              f"{hi['name']} has {prod_ratio:.3f}x the production "
+                              f"multiplier but only {fv_ratio:.3f}x the FV"
+                          )
+                          score_components.append(
+                              2.0
+                              + math.log(prod_ratio) * 4.0
+                              + math.log(reverse_ratio) * 4.0
+                          )
+
+                      compression_factor = prod_ratio / max(fv_ratio, 1e-12)
+                      if (
+                          prod_ratio >= 1.15
+                          and compression_factor >= 1.15
+                      ):
+                          categories.append("age_compression")
+                          reasons.append(
+                              f"age layer compresses a {prod_ratio:.3f}x "
+                              f"production gap to {fv_ratio:.3f}x FV"
+                          )
+                          score_components.append(
+                              math.log(compression_factor) * 8.0
+                          )
+
+                      amplification_factor = fv_ratio / prod_ratio
+                      if (
+                          fv_ratio >= 1.15
+                          and amplification_factor >= 1.15
+                      ):
+                          categories.append("age_amplification")
+                          reasons.append(
+                              f"age layer amplifies a {prod_ratio:.3f}x "
+                              f"production gap to {fv_ratio:.3f}x FV"
+                          )
+                          score_components.append(
+                              math.log(amplification_factor) * 8.0
+                          )
+
+                      symmetric_fv_ratio = max(
+                          fv_ratio, 1.0 / max(fv_ratio, 1e-12)
+                      )
+                      if (
+                          prod_ratio <= 1.08
+                          and symmetric_fv_ratio >= 1.20
+                      ):
+                          categories.append("near_production_large_fv_divergence")
+                          reasons.append(
+                              f"production multipliers are within "
+                              f"{(prod_ratio - 1.0) * 100.0:.1f}% but FV differs "
+                              f"by {(symmetric_fv_ratio - 1.0) * 100.0:.1f}%"
+                          )
+                          score_components.append(
+                              math.log(symmetric_fv_ratio) * 7.0
+                          )
+
+                      # Large age effect even when neither threshold above fires.
+                      age_ratio_sym = max(
+                          age_ratio, 1.0 / max(age_ratio, 1e-12)
+                      )
+                      if age_ratio_sym >= 1.25:
+                          categories.append("large_age_multiplier_gap")
+                          reasons.append(
+                              f"age multipliers differ by "
+                              f"{(age_ratio_sym - 1.0) * 100.0:.1f}%"
+                          )
+                          score_components.append(
+                              math.log(age_ratio_sym) * 5.0
+                          )
+
+                      if not categories:
+                          continue
+
+                      categories = sorted(set(categories))
+                      for c in categories:
+                          category_counts[c] += 1
+
+                      severity = max(score_components)
+                      if "rank_reversal" in categories:
+                          severity += 1.0
+
+                      pair_candidates.append({
+                          "pos": pos,
+                          "higher_production_player": hi["name"],
+                          "lower_production_player": lo["name"],
+                          "higher_production_player_age": hi["age"],
+                          "lower_production_player_age": lo["age"],
+                          "higher_production_player_role": hi["role"],
+                          "lower_production_player_role": lo["role"],
+                          "higher_production_player_fv": hi["final_fv"],
+                          "lower_production_player_fv": lo["final_fv"],
+                          "higher_production_multiplier": hp,
+                          "lower_production_multiplier": lp,
+                          "higher_production_age_multiplier": hi["age_multiplier"],
+                          "lower_production_age_multiplier": lo["age_multiplier"],
+                          "production_ratio": prod_ratio,
+                          "fv_ratio_high_prod_over_low_prod": fv_ratio,
+                          "age_multiplier_ratio": age_ratio,
+                          "architecture_log_delta": architecture_delta,
+                          "severity": severity,
+                          "categories": categories,
+                          "reasons": reasons,
+                      })
+
+          pair_candidates.sort(
+              key=lambda x: (
+                  -x["severity"],
+                  x["pos"],
+                  x["higher_production_player"].lower(),
+                  x["lower_production_player"].lower(),
+              )
+          )
+
+          # Top 25 overall, but cap any one player at 3 appearances so the
+          # review queue is not monopolized by a single extreme-age player.
+          top_25 = []
+          appearances = Counter()
+          for pair in pair_candidates:
+              names = (
+                  pair["higher_production_player"],
+                  pair["lower_production_player"],
+              )
+              if any(appearances[name] >= 3 for name in names):
+                  continue
+              top_25.append(pair)
+              for name in names:
+                  appearances[name] += 1
+              if len(top_25) == 25:
+                  break
+
+          # Also provide top five per position without the appearance cap.
+          top_by_position = {}
+          for pos in TRACKED_POSITIONS:
+              top_by_position[pos] = [
+                  p for p in pair_candidates if p["pos"] == pos
+              ][:5]
+
+          # Position-level spacing diagnostics.
+          position_summary = {}
+          for pos in TRACKED_POSITIONS:
+              group = sorted(
+                  by_pos[pos],
+                  key=lambda r: (-r["final_fv"], r["name"].lower()),
+              )
+              prod_vals = [
+                  r["effective_production_multiplier"] for r in group
+              ]
+              fv_vals = [r["final_fv"] for r in group]
+              age_mults = [r["age_multiplier"] for r in group]
+              rank_shifts = [abs(r["rank_shift_prod_to_fv"]) for r in group]
+
+              def band(k):
+                  subset = group[: min(k, len(group))]
+                  if not subset:
+                      return None
+                  return {
+                      "n": len(subset),
+                      "top_fv": subset[0]["final_fv"],
+                      "bottom_fv": subset[-1]["final_fv"],
+                      "top_to_bottom_fv_ratio": (
+                          subset[0]["final_fv"]
+                          / max(1, subset[-1]["final_fv"])
+                      ),
+                      "median_adjacent_fv_gap": (
+                          statistics.median(
+                              subset[i]["final_fv"] - subset[i + 1]["final_fv"]
+                              for i in range(len(subset) - 1)
+                          )
+                          if len(subset) >= 2 else None
+                      ),
+                  }
+
+              position_summary[pos] = {
+                  "player_count": len(group),
+                  "fv_min": min(fv_vals),
+                  "fv_max": max(fv_vals),
+                  "production_multiplier_min": min(prod_vals),
+                  "production_multiplier_max": max(prod_vals),
+                  "age_multiplier_min": min(age_mults),
+                  "age_multiplier_max": max(age_mults),
+                  "median_absolute_prod_to_fv_rank_shift": statistics.median(
+                      rank_shifts
+                  ),
+                  "max_absolute_prod_to_fv_rank_shift": max(rank_shifts),
+                  "top5": band(5),
+                  "top12": band(12),
+                  "production_source_counts": dict(sorted(Counter(
+                      r["production_source"] for r in group
+                  ).items())),
+              }
+
+          # Known architecture mechanism counts.
+          mechanism_counts = Counter(r["production_source"] for r in rows)
+          exact_floor_counts = Counter(
+              r["pos"]
+              for r in rows
+              if abs(r["effective_production_multiplier"] - 0.15) < 1e-12
+          )
+          age_one_counts = Counter(
+              r["pos"]
+              for r in rows
+              if abs(r["age_multiplier"] - 1.0) < 1e-12
+          )
+
+          report = {
+              "schema_version": 1,
+              "study_id": "fundamental-value-structural-outlier-audit-v1",
+              "status": "read_only_structural_diagnostic",
+              "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+              "git_sha": git_head(),
+              "research_only": True,
+              "read_only": True,
+              "external_market_data_used": False,
+              "ktc_used": False,
+              "package_vote_data_used": False,
+              "realized_outcomes_used": False,
+              "candidate_fit_performed": False,
+              "candidate_selected": False,
+              "production_change_authorized": False,
+              "production_changed": False,
+              "source_sha256": {
+                  "index_html": sha256(INDEX),
+                  "snapshot_values_py": sha256(PORT),
+              },
+              "deployed_formula": (
+                  "FV = JS-round(5500 * position_weight * "
+                  "effective_production_multiplier * age_multiplier)"
+              ),
+              "scope": {
+                  "positions": list(TRACKED_POSITIONS),
+                  "player_count": len(rows),
+                  "pairwise_comparisons_reviewed": sum(
+                      len(g) * (len(g) - 1) // 2
+                      for g in by_pos.values()
+                  ),
+                  "note": (
+                      "Flags are deterministic review triggers, not claims that "
+                      "a player's value is wrong."
+                  ),
+              },
+              "review_trigger_definitions": {
+                  "rank_reversal": (
+                      "same-position player has >=10% higher production "
+                      "multiplier but <=98% of the comparison player's FV"
+                  ),
+                  "age_compression": (
+                      "production ratio >=1.15 and age layer shrinks the ratio "
+                      "by a factor >=1.15"
+                  ),
+                  "age_amplification": (
+                      "FV ratio >=1.15 and age layer enlarges the production "
+                      "ratio by a factor >=1.15"
+                  ),
+                  "near_production_large_fv_divergence": (
+                      "production multipliers within 8%, but FV differs by >=20%"
+                  ),
+                  "large_age_multiplier_gap": (
+                      "same-position age multipliers differ by >=25%"
+                  ),
+              },
+              "mechanism_counts": dict(sorted(mechanism_counts.items())),
+              "exact_effective_prod_floor_0_15_counts_by_position": dict(
+                  sorted(exact_floor_counts.items())
+              ),
+              "age_multiplier_exactly_1_counts_by_position": dict(
+                  sorted(age_one_counts.items())
+              ),
+              "relationship_category_counts": dict(
+                  sorted(category_counts.items())
+              ),
+              "position_summary": position_summary,
+              "top_25_review_relationships": top_25,
+              "top_5_relationships_by_position": top_by_position,
+              "top_50_individual_mechanism_flags": player_flags[:50],
+              "all_players": sorted(
+                  rows,
+                  key=lambda r: (
+                      r["pos"],
+                      r["fv_rank_within_position"],
+                      r["name"].lower(),
+                  ),
+              ),
+              "scientific_guardrail": (
+                  "This audit diagnoses how the deployed formula transforms "
+                  "production, age, role/floor semantics, and position weight. "
+                  "It does not use market values, KTC, package-vote outcomes, "
+                  "or 2026 realized outcomes, and it does not recommend a "
+                  "coefficient change."
+              ),
+          }
+
+          json_path = OUT / "fv_structural_outlier_audit_v1.json"
+          json_path.write_text(
+              json.dumps(report, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          lines = [
+              "# Fundamental Value Structural Outlier Audit V1",
+              "",
+              "**Status:** read-only structural diagnostic",
+              "",
+              "This audit does not declare any player value wrong. It creates "
+              "a deterministic review queue showing where the deployed FV "
+              "architecture most strongly changes same-position production "
+              "relationships.",
+              "",
+              "## Scope",
+              "",
+              f"- Players audited: **{len(rows)}**",
+              f"- Same-position pairs reviewed: **{report['scope']['pairwise_comparisons_reviewed']}**",
+              f"- Production formula: `{report['deployed_formula']}`",
+              "- External market/KTC data: **not used**",
+              "- Package votes: **not used**",
+              "- 2026 realized outcomes: **not used**",
+              "- Model fitting: **none**",
+              "",
+              "## Architecture mechanism counts",
+              "",
+          ]
+
+          for key, value in sorted(mechanism_counts.items()):
+              lines.append(f"- `{key}`: **{value} players**")
+
+          lines += [
+              "",
+              "## Pairwise review-trigger counts",
+              "",
+          ]
+          for key, value in sorted(category_counts.items()):
+              lines.append(f"- `{key}`: **{value} relationships**")
+
+          lines += [
+              "",
+              "## Top 25 structural relationships to review",
+              "",
+              "| # | Pos | Higher production | Lower production | Prod ratio | FV ratio | Age mult ratio | Trigger(s) |",
+              "|---:|---|---|---|---:|---:|---:|---|",
+          ]
+
+          for idx, pair in enumerate(top_25, 1):
+              lines.append(
+                  f"| {idx} | {pair['pos']} | "
+                  f"{pair['higher_production_player']} "
+                  f"({pair['higher_production_player_age']}, "
+                  f"{pair['higher_production_player_fv']} FV) | "
+                  f"{pair['lower_production_player']} "
+                  f"({pair['lower_production_player_age']}, "
+                  f"{pair['lower_production_player_fv']} FV) | "
+                  f"{pair['production_ratio']:.3f}× | "
+                  f"{pair['fv_ratio_high_prod_over_low_prod']:.3f}× | "
+                  f"{pair['age_multiplier_ratio']:.3f}× | "
+                  f"{', '.join(pair['categories'])} |"
+              )
+
+          lines += [
+              "",
+              "## Exact reasons for the Top 25",
+              "",
+          ]
+          for idx, pair in enumerate(top_25, 1):
+              lines.append(
+                  f"**{idx}. {pair['higher_production_player']} vs "
+                  f"{pair['lower_production_player']} ({pair['pos']})**"
+              )
+              for reason in pair["reasons"]:
+                  lines.append(f"- {reason}.")
+              lines.append(
+                  f"- Age multipliers: "
+                  f"{pair['higher_production_age_multiplier']:.4f} vs "
+                  f"{pair['lower_production_age_multiplier']:.4f}."
+              )
+              lines.append("")
+
+          lines += [
+              "## Position-level upper-tier spacing",
+              "",
+              "| Pos | N | Top-5 FV range | Top-5 ratio | Top-12 FV range | Top-12 ratio | Median |prod-rank − FV-rank| |",
+              "|---|---:|---:|---:|---:|---:|---:|",
+          ]
+
+          for pos in TRACKED_POSITIONS:
+              s = position_summary[pos]
+              t5 = s["top5"]
+              t12 = s["top12"]
+              lines.append(
+                  f"| {pos} | {s['player_count']} | "
+                  f"{t5['top_fv']}→{t5['bottom_fv']} | "
+                  f"{t5['top_to_bottom_fv_ratio']:.3f}× | "
+                  f"{t12['top_fv']}→{t12['bottom_fv']} | "
+                  f"{t12['top_to_bottom_fv_ratio']:.3f}× | "
+                  f"{s['median_absolute_prod_to_fv_rank_shift']:.1f} |"
+              )
+
+          lines += [
+              "",
+              "## Top individual mechanism flags",
+              "",
+              "| Player | Pos | Age | FV | Prod mult | Age mult | Why flagged |",
+              "|---|---|---:|---:|---:|---:|---|",
+          ]
+          for r in player_flags[:25]:
+              lines.append(
+                  f"| {r['name']} | {r['pos']} | {r['age']} | "
+                  f"{r['fv']} | {r['prod_mult']:.4f} | "
+                  f"{r['age_mult']:.4f} | "
+                  f"{'; '.join(r['reasons'])} |"
+              )
+
+          lines += [
+              "",
+              "## Interpretation guardrail",
+              "",
+              "A flag means **review this relationship**, not **change this "
+              "player's value**. Many flags may be mathematically intended age "
+              "or floor effects. Any actual formula change must be justified "
+              "by broad historical/prospective evidence and separately "
+              "preregistered; this audit cannot authorize one.",
+              "",
+          ]
+
+          md = "\n".join(lines)
+          (OUT / "fv_structural_outlier_audit_v1.md").write_text(
+              md + "\n",
+              encoding="utf-8",
+          )
+
+          summary = Path(
+              __import__("os").environ.get(
+                  "GITHUB_STEP_SUMMARY",
+                  "/tmp/fv-audit-summary.md",
+              )
+          )
+          with summary.open("a", encoding="utf-8") as f:
+              f.write(md + "\n")
+
+          print(md)
+          PY
+
+      - name: Validate audit contract
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path(
+              "/tmp/fv-structural-outlier-audit/"
+              "fv_structural_outlier_audit_v1.json"
+          )
+          r = json.loads(path.read_text())
+
+          assert r["status"] == "read_only_structural_diagnostic"
+          assert r["research_only"] is True
+          assert r["read_only"] is True
+          assert r["external_market_data_used"] is False
+          assert r["ktc_used"] is False
+          assert r["package_vote_data_used"] is False
+          assert r["realized_outcomes_used"] is False
+          assert r["candidate_fit_performed"] is False
+          assert r["candidate_selected"] is False
+          assert r["production_change_authorized"] is False
+          assert r["production_changed"] is False
+
+          assert r["scope"]["player_count"] >= 500
+          assert r["scope"]["pairwise_comparisons_reviewed"] > 10000
+          assert len(r["top_25_review_relationships"]) == 25
+          assert len(r["position_summary"]) == 7
+          assert all(
+              len(r["top_5_relationships_by_position"][pos]) <= 5
+              for pos in ("QB", "RB", "WR", "TE", "DL", "LB", "DB")
+          )
+
+          for pair in r["top_25_review_relationships"]:
+              assert pair["categories"]
+              assert pair["reasons"]
+              assert pair["production_ratio"] >= 1.0
+
+          print(
+              "PASS: structural audit is descriptive, read-only, "
+              "non-market, and non-fitting."
+          )
+          PY
+
+      - name: Upload audit artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fundamental-value-structural-outlier-audit-v1
+          path: /tmp/fv-structural-outlier-audit/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Prove repository stayed unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          echo "PASS: structural audit made no repository changes."
