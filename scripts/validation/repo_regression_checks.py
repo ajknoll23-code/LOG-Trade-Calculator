@@ -330,6 +330,7 @@ def check_aliases_and_ktc_positions():
         "__pkgv5__|",
         "__pkgnv2__|",
         "__pkgnv2p1__|",
+        "__pkgv6__|",
     )
     assert package_prefixes == expected_package_prefixes, (
         "KTC/package-vote transport isolation drift: "
@@ -563,33 +564,41 @@ def check_team_utility_projection_runtime_invariants():
 
 
 
-def check_nextgen_package_sampling_contract():
+def check_package_sampling_contract():
     text = INDEX.read_text(encoding="utf-8")
     start = text.index("function packageVoteTodayKey(){")
     end = text.index("\nfunction render(){", start)
     block = text[start:end]
 
-    assert "PACKAGE_VOTE_NEXTGEN_V2_EXACT_CELL_SAMPLING_V2" in block
+    assert "PACKAGE_VOTE_V6_EXACT_CELL_SAMPLING_V1" in block
     assert "function packageVoteOwnPlayers()" not in block
     assert "function packageVoteEligibleChallenges()" not in block
     assert "own.has(" not in block
-    assert "const byFamily = new Map();" in block
-    assert "const cellKey = `${c.family}|${c.cell_id}|${c.scale_label}|${c.split}`;" in block
-    assert "const selectedCellKey = cells[Math.floor(Math.random() * cells.length)];" in block
+    assert "const byCell = new Map();" in block
+    assert "if(!byCell.has(c.research_cell)) byCell.set(c.research_cell, []);" in block
+    assert "const cells = Array.from(byCell.keys()).sort();" in block
+    assert "if(cells.length !== 24) return null;" in block
+    assert "const selectedCell = cells[Math.floor(Math.random() * cells.length)];" in block
     assert "let challengePool = cellPool.filter(c => !recent.has(c.id));" in block
     assert "if(!challengePool.length) challengePool = cellPool;" in block
-    assert "left: Math.random() < 0.5 ? 'A' : 'B'" in block
+    assert "left: Math.random() < 0.5 ? 'T' : 'P'" in block
     assert "Date.now() < Date.parse(PACKAGE_VOTE_VALID_AFTER_UTC)" in block
 
-    cell_idx = block.index("const selectedCellKey =")
+    cell_idx = block.index("const selectedCell =")
     recent_idx = block.index("const recent = new Set(packageVoteRecent());")
     assert cell_idx < recent_idx, "recent filtering must occur only after cell selection"
 
-    assert "core_concentration_2v2: 0.625" in text
-    assert "fragmentation_filler: 0.125" in text
-    assert "structural_topology_3v3: 0.25" in text
+    assert "Package Adjustment V6 Development: frozen 1-vs-3 composition catalog." in text
+    assert "const PACKAGE_VOTE_DAILY_LIMIT = 20;" in text
+    assert "__pkgv6__|" in text
+    assert "__pkgv6_meta__|" in text
+    assert "__pkgv6_schema__|6" in text
 
-    print("PASS NextGen V2 exact family/cell sampling contract: no voter-roster filtering; recent-memory post-cell only")
+    print(
+        "PASS V6 exact 24-cell sampling contract: no voter-roster filtering; "
+        "recent-memory post-cell only; display side randomized"
+    )
+
 
 def check_index_js_syntax():
     text = INDEX.read_text(encoding="utf-8")
@@ -618,7 +627,7 @@ def main():
         check_free_agent_board_parity,
         check_team_utility_projection_runtime_invariants,
         check_package_adjustment_live.validate,
-        check_nextgen_package_sampling_contract,
+        check_package_sampling_contract,
         check_index_js_syntax,
     ]
     for check in checks:
