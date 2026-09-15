@@ -281,39 +281,60 @@ jobs:
                   term_counts[term] = len(rows)
                   all_ids.update(rows)
 
+              # MFL leagueSearch is a live discovery index. Its raw result counts can
+              # legitimately drift between runs even for historical seasons. The prior
+              # audit did not persist all 150 sampled IDs, so exact reconstruction of
+              # yesterday's discovery universe is impossible once that live index moves.
+              # Treat that drift as metadata, not corruption. Keep the frozen search
+              # terms/caps/hash ordering, start after the current deterministic first 150,
+              # and explicitly exclude every prior 12T-SF ID that *was* persisted.
               ordered = sorted(all_ids, key=lambda x: stable_key(f'{year}|candidate|{x}'))
-              original_selected = ordered[:PRIOR_CANDIDATES_PER_YEAR]
-              expansion_selected = ordered[
-                  PRIOR_CANDIDATES_PER_YEAR:
-                  PRIOR_CANDIDATES_PER_YEAR + EXPANSION_CANDIDATES_PER_YEAR
-              ]
+              current_head = ordered[:PRIOR_CANDIDATES_PER_YEAR]
 
               p = prior_year(prior, year)
               pd = p['discovery']
-              if term_counts != pd['term_counts_after_cap']:
-                  raise AuditError(f'{year}: discovery term counts drifted; refusing to redefine the sampling frame')
-              if len(ordered) != pd['unique_union_before_year_cap']:
-                  raise AuditError(f'{year}: discovery union size drifted; refusing to redefine the sampling frame')
-              if len(original_selected) != pd['selected_for_settings_probe']:
-                  raise AuditError(f'{year}: reconstructed prior sample size mismatch')
-
-              original_set = set(original_selected)
               known_prior_sf = {str(x['league_id']) for x in p['team12_sf_rows']}
-              if not known_prior_sf.issubset(original_set):
-                  missing = sorted(known_prior_sf - original_set)
-                  raise AuditError(f'{year}: prior 12T-SF IDs no longer reconstruct inside original sample: {missing[:10]}')
+
+              candidate_tail = ordered[PRIOR_CANDIDATES_PER_YEAR:]
+              expansion_pool = [lid for lid in candidate_tail if lid not in known_prior_sf]
+              expansion_selected = expansion_pool[:EXPANSION_CANDIDATES_PER_YEAR]
+
+              term_count_drift = {
+                  term: {
+                      'prior': int(pd['term_counts_after_cap'].get(term, 0)),
+                      'current': int(term_counts.get(term, 0)),
+                  }
+                  for term in SEARCH_TERMS
+                  if int(pd['term_counts_after_cap'].get(term, 0)) != int(term_counts.get(term, 0))
+              }
+              prior_sf_in_current_union = known_prior_sf & set(ordered)
+              prior_sf_in_current_head = known_prior_sf & set(current_head)
+              prior_sf_in_current_tail = known_prior_sf & set(candidate_tail)
+
+              if set(expansion_selected) & known_prior_sf:
+                  raise AuditError(f'{year}: prior 12T-SF exclusion failed')
 
               return expansion_selected, {
                   'term_counts_after_cap': term_counts,
                   'search_errors': errors,
-                  'unique_union': len(ordered),
-                  'reconstructed_prior_sample_n': len(original_selected),
-                  'prior_12t_sf_ids_reconstructed_n': len(known_prior_sf),
-                  'expansion_pool_available_n': max(0, len(ordered) - PRIOR_CANDIDATES_PER_YEAR),
+                  'current_unique_union': len(ordered),
+                  'prior_unique_union': int(pd['unique_union_before_year_cap']),
+                  'union_size_drift': len(ordered) - int(pd['unique_union_before_year_cap']),
+                  'term_count_drift': term_count_drift,
+                  'live_search_drift_observed': bool(term_count_drift) or len(ordered) != int(pd['unique_union_before_year_cap']),
+                  'current_head_n': len(current_head),
+                  'prior_12t_sf_ids_known_n': len(known_prior_sf),
+                  'prior_12t_sf_ids_in_current_union_n': len(prior_sf_in_current_union),
+                  'prior_12t_sf_ids_in_current_head_n': len(prior_sf_in_current_head),
+                  'prior_12t_sf_ids_excluded_from_tail_n': len(prior_sf_in_current_tail),
+                  'expansion_pool_available_n': len(expansion_pool),
                   'selected_for_expansion_probe': len(expansion_selected),
                   'expansion_slice_start_zero_based': PRIOR_CANDIDATES_PER_YEAR,
-                  'expansion_slice_stop_exclusive': PRIOR_CANDIDATES_PER_YEAR + len(expansion_selected),
-                  'sampling_contract': 'next IDs in the same SHA256-stable candidate ordering used by the prior audit',
+                  'prior_persisted_12t_sf_ids_explicitly_excluded': True,
+                  'sampling_contract': (
+                      'Use the unchanged MFL search terms/caps and SHA256-stable ordering on the live discovery snapshot; '
+                      'skip the current first 150 IDs, exclude all persisted prior 12T-SF IDs, and probe up to the next 300 IDs.'
+                  ),
               }
 
 
@@ -403,7 +424,7 @@ jobs:
           def calibrate(prior: dict[str, Any], results: list[dict[str, Any]]) -> dict[str, Any]:
               prior_rows = extract_prior_reference(prior)
               expansion_rows = [
-                  {**x, 'league_id': str(x['league_id']), 'source': 'expansion_next_300_per_year'}
+                  {**x, 'league_id': str(x['league_id']), 'source': 'supplemental_live_snapshot_up_to_300_per_year'}
                   for r in results
                   for x in r['reference_rows']
               ]
@@ -550,8 +571,8 @@ jobs:
                       'prior_candidates_per_year': PRIOR_CANDIDATES_PER_YEAR,
                       'expansion_candidates_per_year': EXPANSION_CANDIDATES_PER_YEAR,
                       'sampling_contract': (
-                          'Reconstruct the prior SHA256-stable candidate ordering exactly, '
-                          'then probe the next 300 IDs per reference year after the original 150.'
+                          'Use unchanged search terms/caps and SHA256-stable ordering on the live MFL discovery snapshot; '
+                          'skip the current first 150, exclude persisted prior 12T-SF IDs, and probe up to 300 additional IDs/year.'
                       ),
                       'no_targeted_dynasty_enrichment': True,
                       'no_gate_changes': True,
@@ -586,8 +607,9 @@ jobs:
                   '',
                   '- Reference years: **2020–2023**',
                   f'- Original deterministic sample: **{PRIOR_CANDIDATES_PER_YEAR} candidates/year**',
-                  f'- Expansion: **next {EXPANSION_CANDIDATES_PER_YEAR} candidates/year** in the same SHA256-stable ordering',
+                  f'- Expansion: **up to {EXPANSION_CANDIDATES_PER_YEAR} additional candidates/year** from the live discovery snapshot after the current first {PRIOR_CANDIDATES_PER_YEAR}, with persisted prior 12T-SF IDs excluded',
                   '- Search terms, per-term cap, proxy definition, and scientific gates are unchanged.',
+                  '- Live MFL search-index drift is recorded diagnostically rather than treated as a fatal error.',
                   '- No dynasty-targeted enrichment is used.',
                   '',
                   '## Combined proxy evidence',
