@@ -1,0 +1,841 @@
+name: Draft Pick FV V1 Historical Outcome Preregistration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  preregister:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install regression dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir "requests==2.34.2"
+          python3 - <<'PY'
+          import requests
+          assert requests.__version__ == "2.34.2"
+          print("requests import OK:", requests.__version__)
+          PY
+
+      - name: Guard clean repository and required sources
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          test -f index.html
+          test -f config.json
+          test -f scripts/validation/snapshot_values.py
+          test -f scripts/validation/repo_regression_checks.py
+          test -f data/draft_slot_projection.json
+
+          test ! -e research/draft-pick-fv-v1/preregistration_v1.json
+          test ! -e research/draft-pick-fv-v1/preregistration_v1.md
+          test ! -e research/draft-pick-fv-v1/preregistration_manifest_v1.json
+
+      - name: Freeze Draft Pick FV V1 preregistration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p research/draft-pick-fv-v1
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import math
+          import re
+          import subprocess
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          ROOT = Path(".")
+          INDEX = ROOT / "index.html"
+          CONFIG = ROOT / "config.json"
+          SNAPSHOT = ROOT / "scripts/validation/snapshot_values.py"
+          PROJECTION = ROOT / "data/draft_slot_projection.json"
+          OUT = ROOT / "research/draft-pick-fv-v1"
+
+          def sha256(path: Path) -> str:
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          def git_blob(path: Path) -> str:
+              return subprocess.check_output(
+                  ["git", "hash-object", str(path)],
+                  text=True,
+              ).strip()
+
+          def git_head() -> str:
+              return subprocess.check_output(
+                  ["git", "rev-parse", "HEAD"],
+                  text=True,
+              ).strip()
+
+          html = INDEX.read_text(encoding="utf-8")
+          config = json.loads(CONFIG.read_text(encoding="utf-8"))
+
+          # Freeze the exact deployed pick table without interpreting comments.
+          pick_match = re.search(
+              r"const\s+PICK_BASE\s*=\s*\{(.*?)\n\};",
+              html,
+              flags=re.DOTALL,
+          )
+          if not pick_match:
+              raise RuntimeError("Could not extract deployed PICK_BASE")
+
+          round_re = re.compile(
+              r"(\d+)\s*:\s*\{\s*"
+              r"early\s*:\s*([0-9.]+)\s*,\s*"
+              r"mid\s*:\s*([0-9.]+)\s*,\s*"
+              r"late\s*:\s*([0-9.]+)"
+          )
+          pick_base = {
+              str(int(r)): {
+                  "early": float(e),
+                  "mid": float(m),
+                  "late": float(l),
+              }
+              for r, e, m, l in round_re.findall(pick_match.group(1))
+          }
+          if sorted(map(int, pick_base)) != [1, 2, 3, 4, 5, 6]:
+              raise RuntimeError(
+                  f"Unexpected deployed PICK_BASE rounds: {sorted(pick_base)}"
+              )
+
+          yd_match = re.search(
+              r"const\s+YEAR_DISCOUNT\s*=\s*\{(.*?)\}\s*;",
+              html,
+              flags=re.DOTALL,
+          )
+          if not yd_match:
+              raise RuntimeError("Could not extract YEAR_DISCOUNT")
+          year_discount = {
+              year: float(value)
+              for year, value in re.findall(
+                  r"['\"](\d{4})['\"]\s*:\s*([0-9.]+)",
+                  yd_match.group(1),
+              )
+          }
+
+          # Freeze current position weights from the deployed source.
+          pw_match = re.search(
+              r"const\s+POS_WEIGHT\s*=\s*\{(.*?)\}\s*;",
+              html,
+              flags=re.DOTALL,
+          )
+          if not pw_match:
+              raise RuntimeError("Could not extract POS_WEIGHT")
+          pos_weight = {
+              pos: float(value)
+              for pos, value in re.findall(
+                  r"([A-Z]+)\s*:\s*([0-9.]+)",
+                  pw_match.group(1),
+              )
+          }
+          required_pos = ("QB", "RB", "WR", "TE", "DL", "LB", "DB")
+          missing_pos = [p for p in required_pos if p not in pos_weight]
+          if missing_pos:
+              raise RuntimeError(f"Missing position weights: {missing_pos}")
+
+          # The bridge uses the deployed ageMultiplier implementation itself.
+          age_func = re.search(
+              r"function\s+ageMultiplier\s*\([^)]*\)\s*\{",
+              html,
+          )
+          if not age_func:
+              raise RuntimeError("Could not locate deployed ageMultiplier()")
+
+          prereg = {
+              "schema_version": 1,
+              "study_id": "draft-pick-fv-v1-historical-outcome",
+              "status": "preregistered_before_historical_draft_or_outcome_ingestion",
+              "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+              "preregistered_at_head_sha": git_head(),
+              "research_only": True,
+              "production_change_authorized": False,
+              "historical_draft_data_read_before_freeze": False,
+              "historical_player_outcomes_read_before_freeze": False,
+              "ktc_or_market_data_allowed_as_fit_target": False,
+              "package_vote_data_allowed": False,
+              "2026_realized_outcomes_allowed": False,
+              "question": (
+                  "Does a market-independent outcome model of this league's actual "
+                  "historical rookie draft picks support the deployed draft-pick "
+                  "Fundamental Value scale and round/tier shape?"
+              ),
+              "scope": {
+                  "league_id_source": "config.json",
+                  "league_id": str(config.get("league_id")),
+                  "current_season": str(config.get("season")),
+                  "league_size": 12,
+                  "rounds": [1, 2, 3, 4, 5, 6],
+                  "slot_tiers": {
+                      "early": [1, 2, 3, 4],
+                      "mid": [5, 6, 7, 8],
+                      "late": [9, 10, 11, 12],
+                  },
+                  "positions": list(required_pos),
+                  "future_year_discount_in_scope": False,
+                  "multi_pick_package_additivity_in_scope": False,
+                  "salary_contract_value_in_scope": False,
+                  "team_utility_in_scope": False,
+                  "market_value_in_scope": False,
+                  "note": (
+                      "V1 studies the value of the rookie-selection opportunity itself. "
+                      "Future-year time preference and package consolidation are separate "
+                      "economic questions and cannot be inferred cleanly from rookie outcomes."
+                  ),
+              },
+              "frozen_deployed_baseline": {
+                  "candidate_id": "C0_DEPLOYED",
+                  "pick_base_2027": pick_base,
+                  "year_discount_recorded_for_context_only": year_discount,
+                  "source": "index.html",
+                  "fit_status": "baseline_only_never_refit",
+              },
+              "source_contract": {
+                  "rookie_draft_order_source": {
+                      "provider": "Sleeper public API",
+                      "method": (
+                          "Start from config.json league_id; walk previous_league_id "
+                          "season chain. For each predecessor season, inspect completed "
+                          "drafts and their draft picks."
+                      ),
+                      "draft_selection": [
+                          "league must have exactly 12 rosters",
+                          "draft must be completed",
+                          "draft must be a linear/non-snake dynasty rookie draft",
+                          "draft must contain at least 4 rounds and no more than 8",
+                          "initial startup draft is never treated as a rookie draft",
+                          "if a season has more than one plausible rookie draft, that season is ambiguous and excluded rather than guessed",
+                          "only rounds 1-6 enter this study",
+                      ],
+                      "pick_cell_mapping": (
+                          "Within each round: slots 1-4 early, 5-8 mid, 9-12 late."
+                      ),
+                  },
+                  "historical_scoring_source": {
+                      "provider": "Sleeper weekly NFL stats",
+                      "scoring_rule": (
+                          "Score every historical season under the calculator's current "
+                          "league scoring implementation, not under historical market value."
+                      ),
+                      "weeks": "regular-season weeks 1-18 where available",
+                      "full_nfl_universe": True,
+                  },
+                  "birth_date_source": {
+                      "primary": "nflverse player database",
+                      "secondary": "Sleeper player metadata only when independently consistent",
+                      "rule": (
+                          "No guessed DOB. Missing/unresolved DOB excludes that player from "
+                          "the absolute FV bridge but not from the raw football-utility shape endpoint."
+                      ),
+                  },
+                  "position_source": {
+                      "primary": "draft-time Sleeper pick metadata collapsed to QB/RB/WR/TE/DL/LB/DB",
+                      "secondary": "nflverse/Sleeper player record only for missing draft metadata",
+                      "excluded": ["K", "DEF", "unresolved"],
+                  },
+              },
+              "maturity_and_feasibility_gates": {
+                  "primary_horizon_seasons": 3,
+                  "primary_latest_eligible_draft_year": 2023,
+                  "no_2026_outcomes": True,
+                  "minimum_complete_draft_classes_for_model_selection": 6,
+                  "minimum_complete_draft_classes_for_any_absolute_scale_claim": 6,
+                  "minimum_players_per_round_tier_cell_across_primary_sample": 12,
+                  "minimum_absolute_bridge_dob_coverage": 0.85,
+                  "minimum_position_resolution_coverage": 0.95,
+                  "equal_games_not_required": True,
+                  "if_gate_fails": (
+                      "Stop with INSUFFICIENT_HISTORICAL_EVIDENCE. Do not fit a "
+                      "replacement curve and do not change production."
+                  ),
+              },
+              "primary_outcomes": {
+                  "O1_shape": {
+                      "name": "three_year_replacement_adjusted_football_utility",
+                      "definition": (
+                          "For each drafted rookie and each of the first three NFL "
+                          "seasons after the draft, compute league-scored season total "
+                          "points. Determine that season's position replacement PPG from "
+                          "the full NFL universe at the frozen replacement rank. Annual "
+                          "surplus = max(0, season_total - replacement_ppg * scheduled_games). "
+                          "Primary O1 is the sum of annual surplus across years 1-3."
+                      ),
+                      "scale_use": (
+                          "O1 is used to test relative round/tier SHAPE only. It is not "
+                          "called Fundamental Value and is not directly compared in raw "
+                          "units with deployed FV."
+                      ),
+                  },
+                  "O2_scale": {
+                      "name": "three_year_player_equivalent_fv",
+                      "definition": (
+                          "For each of years 1-3, convert realized season production into "
+                          "a research player-equivalent FV using the current 5500 base, "
+                          "current position weight, deployed ageMultiplier at that season's "
+                          "age, and a frozen transparent realized production multiplier. "
+                          "O2 is the equal-weight arithmetic mean of those three annual "
+                          "player-equivalent FVs."
+                      ),
+                      "realized_production_multiplier": {
+                          "if_games_played_zero": 0.0,
+                          "otherwise_ratio": (
+                              "season_total_points / (replacement_ppg * scheduled_games)"
+                          ),
+                          "transform": "clamp(-0.10 + 0.75 * ratio, 0.15, 1.55)",
+                          "source_lineage": (
+                              "Frozen transparent Production V2 benchmark transform; "
+                              "not estimated from rookie-pick outcomes."
+                          ),
+                      },
+                      "annual_equivalent_formula": (
+                          "5500 * current_position_weight[pos] * "
+                          "deployed_ageMultiplier(pos, age_at_season) * realized_prod_mult"
+                      ),
+                      "aggregation": "mean(year1_fv, year2_fv, year3_fv)",
+                      "reason_for_mean_not_sum": (
+                          "A mean preserves the player's point-in-time FV unit scale. "
+                          "Summing annual FVs would create career-value units that are "
+                          "not comparable with current deployed player FV."
+                      ),
+                  },
+              },
+              "frozen_replacement_ranks": {
+                  "QB": 29,
+                  "RB": 25,
+                  "WR": 28,
+                  "TE": 11,
+                  "DL": 16,
+                  "LB": 28,
+                  "DB": 22,
+                  "lineage": (
+                      "Primary Phase-2 replacement ranks already used in roster-economics research."
+                  ),
+              },
+              "frozen_scale_bridge": {
+                  "base_scale": 5500.0,
+                  "position_weight": pos_weight,
+                  "age_multiplier_source": "deployed index.html ageMultiplier()",
+                  "production_transform": {
+                      "intercept": -0.10,
+                      "slope": 0.75,
+                      "floor": 0.15,
+                      "ceiling": 1.55,
+                      "zero_games_override": 0.0,
+                  },
+              },
+              "candidate_families": {
+                  "C0_DEPLOYED": {
+                      "parameters": 0,
+                      "definition": "exact deployed 6x3 PICK_BASE table",
+                      "eligible_for_selection": True,
+                      "role": "baseline",
+                  },
+                  "C1_GLOBAL_RESCALE": {
+                      "parameters": 1,
+                      "definition": "k * C0_DEPLOYED",
+                      "bounds": {"k": [0.50, 1.50]},
+                      "eligible_for_selection": True,
+                      "interpretation": (
+                          "Tests whether shape is broadly right but absolute FV scale is wrong."
+                      ),
+                  },
+                  "C2_LOW_PARAMETER_OUTCOME_CURVE": {
+                      "parameters": 5,
+                      "definition": (
+                          "V(round,tier)=A*exp(-b1*I(round>=2)"
+                          "-b2*max(round-2,0)-tier_penalty[tier])"
+                      ),
+                      "tier_penalty": {
+                          "early": 0.0,
+                          "mid": "m",
+                          "late": "l",
+                      },
+                      "bounds": {
+                          "A": [3000.0, 10000.0],
+                          "b1": [0.0, 1.50],
+                          "b2": [0.0, 0.75],
+                          "m": [0.0, 0.60],
+                          "l": [0.0, 0.90],
+                      },
+                      "constraint": "0 <= m <= l",
+                      "eligible_for_selection": True,
+                      "interpretation": (
+                          "Allows a distinct Round-1-to-2 cliff, smoother later-round "
+                          "decay, and shared monotone early/mid/late tier penalties."
+                      ),
+                  },
+                  "C3_MONOTONE_CELL_DIAGNOSTIC": {
+                      "parameters": "up_to_18",
+                      "definition": (
+                          "Cell means projected onto the monotone partial order: "
+                          "earlier round >= later round and early >= mid >= late."
+                      ),
+                      "eligible_for_selection": False,
+                      "role": (
+                          "Diagnostic upper bound only; never deployable from this study "
+                          "because its flexibility is too high for the expected class count."
+                      ),
+                  },
+              },
+              "model_development_plan": {
+                  "class_order": "ascending rookie draft year",
+                  "development_classes": (
+                      "All primary-mature draft classes except the latest two."
+                  ),
+                  "locked_historical_validation_classes": (
+                      "The latest two primary-mature draft classes. They are not read "
+                      "for parameter fitting."
+                  ),
+                  "fit_target": "O2 three-year player-equivalent FV",
+                  "fit_loss": (
+                      "Equal-cell macro MAE across 18 round-tier cells. Each cell "
+                      "receives equal weight regardless of player count."
+                  ),
+                  "optimizer": (
+                      "Deterministic bounded grid plus local refinement; no stochastic "
+                      "optimizer and no named-player exclusions based on results."
+                  ),
+                  "O1_use": (
+                      "O1 normalized cell shape is a required robustness endpoint, "
+                      "not a coefficient-fitting target."
+                  ),
+              },
+              "validation_and_selection": {
+                  "baseline": "C0_DEPLOYED",
+                  "primary_metric": "equal-cell macro MAE on O2",
+                  "eligibility_gates": [
+                      "validation macro MAE improvement versus C0 >= 5%",
+                      "candidate improves MAE in each of the two locked validation draft classes",
+                      "O1 normalized-shape macro error does not regress versus C0 by more than 2%",
+                      "two-year O2 robustness MAE does not regress versus C0 by more than 2%",
+                      "four-year O2 robustness, where mature, does not regress versus C0 by more than 2%",
+                      "all 18 predicted cells remain positive",
+                      "round monotonicity holds for every tier",
+                      "early >= mid >= late holds for every round",
+                      "non-null fitted parameter at a bound makes C1/C2 ineligible",
+                      "absolute bridge DOB coverage >= 85%",
+                      "position resolution coverage >= 95%",
+                  ],
+                  "winner_rule": (
+                      "Among eligible C1/C2 candidates, choose lowest validation O2 "
+                      "macro MAE. If within 1% relative MAE, choose fewer parameters. "
+                      "C3 can never win."
+                  ),
+                  "none_eligible_rule": (
+                      "STOP_NO_PICK_FV_CANDIDATE. Keep deployed values unchanged."
+                  ),
+              },
+              "uncertainty": {
+                  "primary": (
+                      "Cluster bootstrap by rookie draft class; all picks from one "
+                      "class remain together in every bootstrap resample."
+                  ),
+                  "resamples": 10000,
+                  "report": [
+                      "95% interval for each round-tier O1 mean",
+                      "95% interval for each round-tier O2 mean",
+                      "95% interval for candidate-minus-C0 macro MAE",
+                      "class-level candidate-minus-C0 MAE",
+                  ],
+                  "no_independent_pick_assumption": True,
+              },
+              "robustness": {
+                  "horizons": {
+                      "H2": "first two completed NFL seasons",
+                      "H3": "primary; first three completed NFL seasons",
+                      "H4": "first four completed NFL seasons where mature",
+                  },
+                  "replacement_rank_sensitivity": {
+                      "legacy": {
+                          "QB": 18,
+                          "RB": 32,
+                          "WR": 36,
+                          "TE": 15,
+                          "DL": 32,
+                          "LB": 32,
+                          "DB": 32,
+                      },
+                      "rule": (
+                          "No selected candidate may improve only because of one "
+                          "replacement-rank convention."
+                      ),
+                  },
+                  "position_subgroups": (
+                      "Report offense (QB/RB/WR/TE) and IDP (DL/LB/DB) separately. "
+                      "Do not fit position-specific pick curves in V1."
+                  ),
+                  "exact_slot_diagnostic": (
+                      "Report 1.01-1.12 within-round outcome means where sample permits, "
+                      "but do not fit 12 separate slot values in V1."
+                  ),
+              },
+              "anti_leakage_and_forbidden_actions": [
+                  "Do not query KTC or any dynasty market source for fit targets.",
+                  "Do not use the deployed pick table as an outcome label.",
+                  "Do not use 2026 realized NFL outcomes.",
+                  "Do not use package-adjustment votes.",
+                  "Do not tune around any named rookie or current trade.",
+                  "Do not alter PICK_BASE, YEAR_DISCOUNT, pickValue(), or production UI.",
+                  "Do not change future-year discount from this study.",
+                  "Do not infer a multi-pick consolidation penalty from this study.",
+                  "Do not deploy a candidate merely because historical validation passes.",
+              ],
+              "post_selection_rule": {
+                  "if_candidate_selected": (
+                      "Freeze the selected class and coefficients in a new immutable "
+                      "candidate artifact. Then design a separate confirmation step "
+                      "before any production bake."
+                  ),
+                  "if_no_candidate": (
+                      "Close Draft Pick FV V1 with production unchanged; no anecdotal rescue."
+                  ),
+              },
+              "source_hashes_at_preregistration": {
+                  "index.html": {
+                      "sha256": sha256(INDEX),
+                      "git_blob": git_blob(INDEX),
+                  },
+                  "config.json": {
+                      "sha256": sha256(CONFIG),
+                      "git_blob": git_blob(CONFIG),
+                  },
+                  "scripts/validation/snapshot_values.py": {
+                      "sha256": sha256(SNAPSHOT),
+                      "git_blob": git_blob(SNAPSHOT),
+                  },
+                  "data/draft_slot_projection.json": {
+                      "sha256": sha256(PROJECTION),
+                      "git_blob": git_blob(PROJECTION),
+                  },
+              },
+          }
+
+          # Mathematical self-checks on frozen candidate family C2.
+          def c2_value(round_: int, tier: str, A: float, b1: float, b2: float, m: float, l: float) -> float:
+              penalties = {"early": 0.0, "mid": m, "late": l}
+              return A * math.exp(
+                  -b1 * (1 if round_ >= 2 else 0)
+                  -b2 * max(round_ - 2, 0)
+                  -penalties[tier]
+              )
+
+          test_params = [
+              (7500.0, 0.4, 0.2, 0.1, 0.2),
+              (3000.0, 0.0, 0.0, 0.0, 0.0),
+              (10000.0, 1.5, 0.75, 0.6, 0.9),
+          ]
+          for A, b1, b2, m, l in test_params:
+              for tier in ("early", "mid", "late"):
+                  vals = [
+                      c2_value(r, tier, A, b1, b2, m, l)
+                      for r in range(1, 7)
+                  ]
+                  assert all(v > 0 for v in vals)
+                  assert all(a >= b for a, b in zip(vals, vals[1:]))
+              for r in range(1, 7):
+                  e = c2_value(r, "early", A, b1, b2, m, l)
+                  mid = c2_value(r, "mid", A, b1, b2, m, l)
+                  late = c2_value(r, "late", A, b1, b2, m, l)
+                  assert e >= mid >= late > 0
+
+          json_path = OUT / "preregistration_v1.json"
+          json_path.write_text(
+              json.dumps(prereg, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          md = f"""# Draft Pick FV V1 — Historical Outcome Preregistration
+
+          **Status:** preregistered before historical rookie-draft or outcome ingestion
+
+          ## Research question
+
+          {prereg['question']}
+
+          ## Why this study exists
+
+          The deployed pick table is internally monotone, but much of its shape is
+          market-benchmarked and its absolute early-first anchor was chosen to fit
+          the calculator's existing scale. That is not independent Fundamental Value
+          validation. This study uses realized football outcomes from this league's
+          actual historical rookie drafts and explicitly forbids KTC/market data as
+          an outcome target.
+
+          ## Scope
+
+          - 12-team league.
+          - Rounds 1-6.
+          - Early = slots 1-4; Mid = 5-8; Late = 9-12.
+          - QB/RB/WR/TE/DL/LB/DB.
+          - Primary horizon = first 3 completed NFL seasons.
+          - Future-year discount is **out of scope**.
+          - Multi-pick package consolidation is **out of scope**.
+          - Salary/contracts, Team Utility, and Market Value are **out of scope**.
+
+          ## Primary endpoints
+
+          **O1 — three-year replacement-adjusted football utility**
+
+          For each drafted rookie, annual surplus is:
+
+          `max(0, season total points - replacement PPG × scheduled games)`
+
+          summed over the first three NFL seasons. O1 tests relative curve **shape**;
+          its raw units are not called FV.
+
+          **O2 — three-year player-equivalent FV**
+
+          For each of years 1-3:
+
+          `5500 × current position weight × deployed age multiplier × realized production multiplier`
+
+          where realized production multiplier is:
+
+          `clamp(-0.10 + 0.75 × ratio, 0.15, 1.55)`
+
+          with `ratio = season total / (replacement PPG × scheduled games)`.
+          A player with zero games gets realized production multiplier `0.0`.
+          O2 is the arithmetic **mean** of the three annual equivalents so the result
+          remains in player-FV units instead of career-sum units.
+
+          ## Frozen replacement ranks
+
+          - QB 29
+          - RB 25
+          - WR 28
+          - TE 11
+          - DL 16
+          - LB 28
+          - DB 22
+
+          ## Candidates
+
+          - **C0:** exact deployed PICK_BASE; baseline, no fitting.
+          - **C1:** one-parameter global rescale of C0.
+          - **C2:** five-parameter monotone round/tier outcome curve with one R1→R2
+            cliff parameter, one later-round decay parameter, and shared mid/late
+            penalties.
+          - **C3:** monotone 18-cell diagnostic only; cannot win.
+
+          ## Data split
+
+          Primary-mature classes require three fully completed NFL seasons. At least
+          **6 complete rookie-draft classes** are required. The **latest two** mature
+          classes are locked historical validation and cannot be read for fitting.
+          All earlier mature classes are development.
+
+          If the league history does not meet the preregistered maturity/coverage
+          gates, the study stops as `INSUFFICIENT_HISTORICAL_EVIDENCE`; it does not
+          weaken the rules after seeing results.
+
+          ## Selection gates
+
+          A replacement candidate must:
+
+          - improve locked-validation equal-cell O2 macro MAE by at least **5%** vs C0;
+          - improve both locked validation draft classes individually;
+          - avoid >2% regression on O1 normalized shape;
+          - avoid >2% regression on H2 and mature H4 O2 robustness;
+          - remain positive and monotone by round and tier;
+          - avoid non-null parameter-boundary saturation;
+          - maintain DOB bridge coverage >=85% and position coverage >=95%.
+
+          If C1 and C2 are within 1% relative validation MAE, the lower-parameter
+          candidate wins. If none qualifies, production stays unchanged.
+
+          ## Uncertainty
+
+          10,000-resample bootstrap clustered by **draft class**, never by individual
+          pick, because picks from one rookie class share class-strength shocks.
+
+          ## Forbidden
+
+          No KTC/market fitting, no 2026 outcomes, no package votes, no named-player
+          tuning, no future-year discount change, no package-consolidation inference,
+          and no production bake from this workflow.
+
+          ## Next step after this preregistration
+
+          Build a separate data-catalog workflow that walks the Sleeper predecessor
+          league chain, identifies unambiguous completed rookie drafts, resolves
+          players/positions/DOBs, and checks whether the preregistered maturity gates
+          are actually satisfiable. **No candidate fitting occurs until that catalog
+          is frozen.**
+          """
+          md = "\n".join(line.rstrip() for line in md.splitlines())
+          md_path = OUT / "preregistration_v1.md"
+          md_path.write_text(md.strip() + "\n", encoding="utf-8")
+
+          manifest = {
+              "schema_version": 1,
+              "study_id": prereg["study_id"],
+              "status": "frozen_preregistration",
+              "preregistered_at_head_sha": prereg["preregistered_at_head_sha"],
+              "files": {
+                  "research/draft-pick-fv-v1/preregistration_v1.json": {
+                      "sha256": sha256(json_path),
+                  },
+                  "research/draft-pick-fv-v1/preregistration_v1.md": {
+                      "sha256": sha256(md_path),
+                  },
+              },
+              "no_historical_draft_or_outcome_ingestion_performed": True,
+              "production_change_authorized": False,
+          }
+          manifest_path = OUT / "preregistration_manifest_v1.json"
+          manifest_path.write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          print("Draft Pick FV V1 preregistration frozen.")
+          print("JSON SHA256:", sha256(json_path))
+          print("MD SHA256:", sha256(md_path))
+          print("Manifest SHA256:", sha256(manifest_path))
+          PY
+
+      - name: Validate preregistration contract
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path("research/draft-pick-fv-v1")
+          p = json.loads((root / "preregistration_v1.json").read_text())
+
+          assert p["schema_version"] == 1
+          assert p["study_id"] == "draft-pick-fv-v1-historical-outcome"
+          assert p["status"] == "preregistered_before_historical_draft_or_outcome_ingestion"
+          assert p["research_only"] is True
+          assert p["production_change_authorized"] is False
+          assert p["historical_draft_data_read_before_freeze"] is False
+          assert p["historical_player_outcomes_read_before_freeze"] is False
+          assert p["ktc_or_market_data_allowed_as_fit_target"] is False
+          assert p["package_vote_data_allowed"] is False
+          assert p["2026_realized_outcomes_allowed"] is False
+
+          assert p["scope"]["league_size"] == 12
+          assert p["scope"]["rounds"] == [1, 2, 3, 4, 5, 6]
+          assert p["scope"]["future_year_discount_in_scope"] is False
+          assert p["scope"]["multi_pick_package_additivity_in_scope"] is False
+
+          gates = p["maturity_and_feasibility_gates"]
+          assert gates["primary_horizon_seasons"] == 3
+          assert gates["minimum_complete_draft_classes_for_model_selection"] == 6
+          assert gates["minimum_absolute_bridge_dob_coverage"] == 0.85
+          assert gates["minimum_position_resolution_coverage"] == 0.95
+
+          c = p["candidate_families"]
+          assert c["C0_DEPLOYED"]["parameters"] == 0
+          assert c["C1_GLOBAL_RESCALE"]["parameters"] == 1
+          assert c["C2_LOW_PARAMETER_OUTCOME_CURVE"]["parameters"] == 5
+          assert c["C3_MONOTONE_CELL_DIAGNOSTIC"]["eligible_for_selection"] is False
+
+          assert p["frozen_replacement_ranks"] == {
+              "QB": 29,
+              "RB": 25,
+              "WR": 28,
+              "TE": 11,
+              "DL": 16,
+              "LB": 28,
+              "DB": 22,
+              "lineage": "Primary Phase-2 replacement ranks already used in roster-economics research.",
+          }
+
+          assert p["uncertainty"]["resamples"] == 10000
+          assert p["uncertainty"]["no_independent_pick_assumption"] is True
+
+          manifest = json.loads(
+              (root / "preregistration_manifest_v1.json").read_text()
+          )
+          assert manifest["status"] == "frozen_preregistration"
+          assert manifest["no_historical_draft_or_outcome_ingestion_performed"] is True
+          assert manifest["production_change_authorized"] is False
+
+          print("PASS: Draft Pick FV V1 preregistration contract validated.")
+          PY
+
+      - name: Run repository regression checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/repo_regression_checks.py
+
+      - name: Prove only preregistration files changed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import subprocess
+
+          expected = {
+              "research/draft-pick-fv-v1/preregistration_manifest_v1.json",
+              "research/draft-pick-fv-v1/preregistration_v1.json",
+              "research/draft-pick-fv-v1/preregistration_v1.md",
+          }
+
+          raw = subprocess.check_output(
+              ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+              text=True,
+          )
+          actual = {
+              line[3:]
+              for line in raw.splitlines()
+              if line
+          }
+
+          print("Changed files:")
+          for path in sorted(actual):
+              print(" ", path)
+
+          assert actual == expected, (sorted(actual), sorted(expected))
+          print("PASS: exactly the three intended preregistration files changed.")
+          PY
+
+      - name: Commit frozen preregistration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            research/draft-pick-fv-v1/preregistration_v1.json \
+            research/draft-pick-fv-v1/preregistration_v1.md \
+            research/draft-pick-fv-v1/preregistration_manifest_v1.json
+
+          git commit -m "Freeze Draft Pick FV V1 historical outcome preregistration"
+          git push origin HEAD:main
