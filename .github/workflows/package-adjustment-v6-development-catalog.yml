@@ -1,0 +1,808 @@
+name: Package Adjustment V6 Development Catalog
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  build-catalog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13.15'
+
+      - name: Install regression dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install "requests==2.34.2"
+
+      - name: Guard frozen V6 preregistration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          D="research/package-adjustment-v6"
+          test -z "$(git status --porcelain=v1)"
+
+          test "$(git hash-object "$D/development_preregistration_v1.json")" = \
+            "81f20cb8afd78f624153c3337377f56ebf8115ae"
+          test "$(git hash-object "$D/development_preregistration_v1.md")" = \
+            "8aa2bca3e17a5b5092687f55566c581fcb113261"
+          test "$(git hash-object "$D/development_preregistration_v1_manifest.json")" = \
+            "f088b43799428bfc13cbf7d2fa5fad2efacc20b2"
+
+          test ! -e "$D/generate_package_vote_challenges_v6.py"
+          test ! -e "$D/package_vote_challenges_v6.json"
+          test ! -e "$D/development_catalog_v1_manifest.json"
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          d = Path("research/package-adjustment-v6")
+          cfg = json.loads((d / "development_preregistration_v1.json").read_text())
+          man = json.loads((d / "development_preregistration_v1_manifest.json").read_text())
+
+          assert cfg["status"] == "frozen_v6_development_preregistration"
+          assert cfg["frozen"] is True
+          assert cfg["production_revision_must_remain"] == "v1.6-v5-size2-composition-overlay"
+          assert cfg["development_catalog_design"]["cell_count"] == 24
+          assert cfg["scope"]["eligible_topology"] == "exactly_one_player_vs_exactly_three_players"
+
+          assert man["status"] == "frozen_v6_development_preregistration_manifest"
+          assert man["development_catalog_generated"] is False
+          assert man["development_voting_activated"] is False
+          assert man["model_fit_performed"] is False
+          assert man["candidate_selected"] is False
+          assert man["production_change_authorized"] is False
+
+          print("PASS: frozen V6 preregistration is intact and catalog surface is unused.")
+          PY
+
+      - name: Verify production remains V1.6
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 \
+            python3 scripts/validation/check_package_adjustment_live.py
+
+      - name: Write preregistered V6 catalog generator
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > research/package-adjustment-v6/generate_package_vote_challenges_v6.py <<'PY'
+          #!/usr/bin/env python3
+          from __future__ import annotations
+
+          import hashlib
+          import itertools
+          import json
+          import math
+          import re
+          import sys
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          ROOT = Path(__file__).resolve().parents[2]
+          D = ROOT / "research/package-adjustment-v6"
+
+          PREREG = D / "development_preregistration_v1.json"
+          VALUES = ROOT / "scripts/artifacts/generated/value_uncertainty.json"
+          ROSTERS = ROOT / "data/league_rosters.json"
+          OUT = D / "package_vote_challenges_v6.json"
+          MANIFEST = D / "development_catalog_v1_manifest.json"
+
+          TARGET_POSITIONS = ("QB", "RB", "WR", "TE", "DL", "LB", "DB")
+          TARGET_TIER_RANKS = {
+              "elite": (0, 1, 2),
+              "premium": (3, 4, 5, 6, 7),
+              "starter": (8, 9, 10, 11, 12, 13, 14, 15),
+          }
+
+          # Catalog-construction tolerances are deterministic engineering tolerances,
+          # not fitted model parameters.
+          NEAREST_POOL = 22
+          MAX_RATIO_ERROR = 0.035
+          MAX_PACKAGE_SHARE_ERROR = 0.040
+          MAX_PLAYER_APPEARANCE_SOFT = 18
+
+          # Exact motivating anecdote is excluded from the development catalog.
+          MOTIVATING_TARGET = "josh allen"
+          MOTIVATING_PACKAGE = frozenset({
+              "dak prescott",
+              "ryan flournoy",
+              "jayden reed",
+          })
+
+          POS_MAP = {
+              "QB": "QB", "RB": "RB", "WR": "WR", "TE": "TE", "K": "K",
+              "DL": "DL", "DE": "DL", "DT": "DL",
+              "LB": "LB", "OLB": "LB", "ILB": "LB",
+              "DB": "DB", "CB": "DB", "S": "DB", "SS": "DB", "FS": "DB",
+          }
+
+          def read_json(path: Path):
+              return json.loads(path.read_text(encoding="utf-8"))
+
+          def sha256(path: Path) -> str:
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          def normalize_name(value) -> str:
+              s = str(value or "").strip().lower()
+              s = re.sub(r"[.'’\-]", "", s)
+              return re.sub(r"\s+", " ", s).strip()
+
+          def slug(value) -> str:
+              return re.sub(r"[^a-z0-9]+", "_", normalize_name(value)).strip("_")
+
+          def normalize_pos(value):
+              return POS_MAP.get(str(value or "").upper())
+
+          def finite(value):
+              try:
+                  x = float(value)
+              except (TypeError, ValueError):
+                  return None
+              return x if math.isfinite(x) else None
+
+          def player_universe():
+              values_doc = read_json(VALUES)
+              rosters_doc = read_json(ROSTERS)
+
+              value_index = {}
+              for name, row in (values_doc.get("players") or {}).items():
+                  fv = finite(row.get("center_value"))
+                  pos = normalize_pos(row.get("pos"))
+                  if fv is None or fv <= 0 or not pos or pos == "K":
+                      continue
+                  value_index[normalize_name(name)] = {"fv": float(fv), "pos": pos}
+
+              rostered = {}
+              for roster in rosters_doc.get("rosters") or []:
+                  for slot in ("starters", "bench", "taxi", "reserve_ir"):
+                      for raw in roster.get(slot) or []:
+                          key = normalize_name(raw.get("name"))
+                          row = value_index.get(key)
+                          if not row:
+                              continue
+                          rostered[key] = {
+                              "key": key,
+                              "name": str(raw.get("name") or key),
+                              "pos": row["pos"],
+                              "fv": float(row["fv"]),
+                              "team": raw.get("team"),
+                              "age": raw.get("age"),
+                          }
+
+              players = sorted(
+                  rostered.values(),
+                  key=lambda p: (-float(p["fv"]), p["key"]),
+              )
+              if len(players) < 350:
+                  raise RuntimeError(f"too few rostered valued players: {len(players)}")
+              return players
+
+          def target_candidates_by_tier(players, pos):
+              pool = [p for p in players if p["pos"] == pos]
+              out = {}
+              for tier, ranks in TARGET_TIER_RANKS.items():
+                  out[tier] = [(r, pool[r]) for r in ranks if r < len(pool)]
+              return out
+
+          def nearest_candidates(players, desired, target_fv, target_key):
+              allowed = [
+                  p for p in players
+                  if p["key"] != target_key
+                  and float(p["fv"]) < target_fv
+              ]
+              allowed.sort(
+                  key=lambda p: (
+                      abs(float(p["fv"]) - desired),
+                      p["key"],
+                  )
+              )
+              return allowed[:NEAREST_POOL]
+
+          def is_exact_motivating_trade(anchor, package) -> bool:
+              if normalize_name(anchor["name"]) != MOTIVATING_TARGET:
+                  return False
+              names = frozenset(normalize_name(p["name"]) for p in package)
+              return names == MOTIVATING_PACKAGE
+
+          def construct_package(anchor, players, shares, apex_level, appearance_counts):
+              target_fv = float(anchor["fv"])
+              top_share = float(shares[0])
+              ratio_target = float(apex_level) / top_share
+              total_goal = target_fv * ratio_target
+              desired = [total_goal * float(s) for s in shares]
+
+              pools = [
+                  nearest_candidates(players, d, target_fv, anchor["key"])
+                  for d in desired
+              ]
+              if any(len(pool) < 4 for pool in pools):
+                  return None
+
+              best = None
+              for triple in itertools.product(*pools):
+                  keys = [p["key"] for p in triple]
+                  if len(set(keys)) != 3:
+                      continue
+
+                  vals = [float(p["fv"]) for p in triple]
+                  if not (vals[0] >= vals[1] >= vals[2]):
+                      continue
+                  if any(v >= target_fv for v in vals):
+                      continue
+                  if is_exact_motivating_trade(anchor, triple):
+                      continue
+
+                  total = sum(vals)
+                  ratio = total / target_fv
+                  ratio_err = abs(ratio - ratio_target)
+                  if ratio_err > MAX_RATIO_ERROR:
+                      continue
+
+                  actual_shares = [v / total for v in vals]
+                  share_errs = [
+                      abs(actual_shares[i] - float(shares[i]))
+                      for i in range(3)
+                  ]
+                  if max(share_errs) > MAX_PACKAGE_SHARE_ERROR:
+                      continue
+
+                  reuse_penalty = sum(
+                      max(0, appearance_counts[p["key"]] - MAX_PLAYER_APPEARANCE_SOFT)
+                      for p in triple
+                  )
+
+                  score = (
+                      ratio_err,
+                      max(share_errs),
+                      sum(share_errs),
+                      reuse_penalty,
+                      tuple(keys),
+                  )
+                  if best is None or score < best[0]:
+                      best = (score, list(triple))
+
+              return None if best is None else best[1]
+
+          def challenge_record(anchor, package, profile, apex_level, tier, rank_within_pos):
+              target_fv = float(anchor["fv"])
+              package_fv = sum(float(p["fv"]) for p in package)
+              ratio = package_fv / target_fv
+              vals = [float(p["fv"]) for p in package]
+              actual_shares = [v / package_fv for v in vals]
+              hhi = sum(s*s for s in actual_shares)
+              phi = 1.0 - hhi
+
+              expected_ratio = float(apex_level) / float(profile["shares"][0])
+              profile_code = profile["label"].replace("/", "_")
+              apex_code = int(round(float(apex_level) * 100))
+
+              cid = (
+                  f"pkgv6_{anchor['pos'].lower()}_{slug(anchor['name'])}_"
+                  f"{profile_code}_a{apex_code}"
+              )
+
+              return {
+                  "id": cid,
+                  "schema_version": 6,
+                  "experiment": "package_adjustment_v6_three_player_composition_development",
+                  "research_cell": f"{profile['label']}|apex_{apex_level:.2f}",
+                  "target_tier": tier,
+                  "target_rank_within_position": int(rank_within_pos),
+                  "target": {
+                      "key": anchor["key"],
+                      "name": anchor["name"],
+                      "pos": anchor["pos"],
+                      "team": anchor.get("team"),
+                      "age": anchor.get("age"),
+                      "fv": round(target_fv, 3),
+                  },
+                  "package": [{
+                      "key": p["key"],
+                      "name": p["name"],
+                      "pos": p["pos"],
+                      "team": p.get("team"),
+                      "age": p.get("age"),
+                      "fv": round(float(p["fv"]), 3),
+                  } for p in package],
+                  "package_size": 3,
+                  "target_fv": round(target_fv, 3),
+                  "package_fv": round(package_fv, 3),
+                  "raw_package_to_target_ratio": round(ratio, 6),
+                  "ratio_target": round(expected_ratio, 9),
+                  "apex_piece_to_target_target": float(apex_level),
+                  "component_profile": {
+                      "label": profile["label"],
+                      "intended_package_shares": [float(x) for x in profile["shares"]],
+                      "intended_hhi": float(profile["hhi"]),
+                      "intended_phi": float(profile["phi"]),
+                      "actual_package_shares": [round(x, 6) for x in actual_shares],
+                      "actual_piece_to_target_shares": [
+                          round(v / target_fv, 6) for v in vals
+                      ],
+                      "actual_hhi": round(hhi, 9),
+                      "actual_phi": round(phi, 9),
+                      "largest_piece_to_target": round(max(vals) / target_fv, 6),
+                  },
+              }
+
+          def validate(challenges, cfg):
+              design = cfg["development_catalog_design"]
+              profiles = design["composition_profiles"]
+              apex_levels = [float(x) for x in design["apex_piece_to_target_levels"]]
+              expected_cells = {
+                  f"{p['label']}|apex_{a:.2f}"
+                  for p in profiles
+                  for a in apex_levels
+              }
+
+              ids = [c["id"] for c in challenges]
+              if len(ids) != len(set(ids)):
+                  raise RuntimeError("duplicate V6 challenge IDs")
+
+              targets = sorted({c["target"]["key"] for c in challenges})
+              if len(targets) < int(design["minimum_distinct_targets"]):
+                  raise RuntimeError(
+                      f"too few V6 targets: {len(targets)} < {design['minimum_distinct_targets']}"
+                  )
+
+              positions = {c["target"]["pos"] for c in challenges}
+              missing_pos = set(design["target_position_coverage_required"]) - positions
+              if missing_pos:
+                  raise RuntimeError(f"missing V6 target positions: {sorted(missing_pos)}")
+
+              by_target = defaultdict(list)
+              by_cell = defaultdict(list)
+              for c in challenges:
+                  by_target[c["target"]["key"]].append(c)
+                  by_cell[c["research_cell"]].append(c)
+
+                  if c["package_size"] != 3 or len(c["package"]) != 3:
+                      raise RuntimeError(f"{c['id']}: V6 must remain exactly 1-vs-3")
+
+                  if any(float(p["fv"]) >= float(c["target_fv"]) for p in c["package"]):
+                      raise RuntimeError(f"{c['id']}: package piece >= target FV")
+
+                  if is_exact_motivating_trade(c["target"], c["package"]):
+                      raise RuntimeError(f"{c['id']}: exact motivating trade leaked into catalog")
+
+                  ratio_err = abs(
+                      float(c["raw_package_to_target_ratio"]) - float(c["ratio_target"])
+                  )
+                  if ratio_err > MAX_RATIO_ERROR + 1e-12:
+                      raise RuntimeError(f"{c['id']}: ratio outside tolerance")
+
+                  intended = c["component_profile"]["intended_package_shares"]
+                  actual = c["component_profile"]["actual_package_shares"]
+                  if max(abs(float(a) - float(b)) for a, b in zip(actual, intended)) > MAX_PACKAGE_SHARE_ERROR + 1e-12:
+                      raise RuntimeError(f"{c['id']}: composition outside tolerance")
+
+              if set(by_cell) != expected_cells:
+                  missing = sorted(expected_cells - set(by_cell))
+                  extra = sorted(set(by_cell) - expected_cells)
+                  raise RuntimeError(f"V6 cell mismatch missing={missing} extra={extra}")
+
+              for target_key, rows in by_target.items():
+                  got = {c["research_cell"] for c in rows}
+                  if got != expected_cells:
+                      raise RuntimeError(f"{target_key}: incomplete 24-cell V6 grid")
+
+              target_count = len(by_target)
+              if any(len(rows) != target_count for rows in by_cell.values()):
+                  raise RuntimeError("each V6 research cell must contain every selected target")
+
+              return by_target, by_cell
+
+          def selftest():
+              fake_target = {
+                  "key": "target",
+                  "name": "Target",
+                  "pos": "WR",
+                  "team": "ARI",
+                  "age": 25,
+                  "fv": 100.0,
+              }
+              profile = {
+                  "label": "50/30/20",
+                  "shares": [0.50, 0.30, 0.20],
+                  "hhi": 0.38,
+                  "phi": 0.62,
+              }
+              package = [
+                  {"key": "a", "name": "A", "pos": "QB", "fv": 80.0},
+                  {"key": "b", "name": "B", "pos": "RB", "fv": 48.0},
+                  {"key": "c", "name": "C", "pos": "TE", "fv": 32.0},
+              ]
+              c = challenge_record(fake_target, package, profile, 0.80, "elite", 0)
+              assert c["package_size"] == 3
+              assert abs(c["raw_package_to_target_ratio"] - 1.6) < 1e-12
+              assert c["component_profile"]["actual_package_shares"] == [0.5, 0.3, 0.2]
+              assert abs(c["component_profile"]["actual_phi"] - 0.62) < 1e-12
+              assert is_exact_motivating_trade(
+                  {"name": "Josh Allen"},
+                  [
+                      {"name": "Dak Prescott"},
+                      {"name": "Ryan Flournoy"},
+                      {"name": "Jayden Reed"},
+                  ],
+              )
+              print("Package Adjustment V6 catalog generator self-test passed.")
+
+          def main():
+              if "--selftest" in sys.argv:
+                  selftest()
+                  return
+
+              cfg = read_json(PREREG)
+              assert cfg["status"] == "frozen_v6_development_preregistration"
+              assert cfg["frozen"] is True
+              assert cfg["development_catalog_design"]["cell_count"] == 24
+              assert cfg["scope"]["eligible_topology"] == "exactly_one_player_vs_exactly_three_players"
+
+              profiles = cfg["development_catalog_design"]["composition_profiles"]
+              apex_levels = [
+                  float(x)
+                  for x in cfg["development_catalog_design"]["apex_piece_to_target_levels"]
+              ]
+              players = player_universe()
+
+              appearance_counts = Counter()
+              challenges = []
+              selected_targets = []
+
+              # Same deterministic tiered target-selection philosophy that was already
+              # used successfully in V3. A target is selected only if the full frozen
+              # 24-cell V6 grid is constructible for it.
+              for pos in TARGET_POSITIONS:
+                  tiers = target_candidates_by_tier(players, pos)
+                  for tier in ("elite", "premium", "starter"):
+                      chosen = None
+
+                      for rank_within_pos, anchor in tiers[tier]:
+                          local_appearance = Counter(appearance_counts)
+                          cells = []
+                          ok = True
+
+                          for profile in profiles:
+                              for apex in apex_levels:
+                                  pkg = construct_package(
+                                      anchor,
+                                      players,
+                                      profile["shares"],
+                                      apex,
+                                      local_appearance,
+                                  )
+                                  if pkg is None:
+                                      ok = False
+                                      break
+                                  cells.append((profile, apex, pkg))
+                                  for p in pkg:
+                                      local_appearance[p["key"]] += 1
+                              if not ok:
+                                  break
+
+                          if ok:
+                              chosen = (
+                                  rank_within_pos,
+                                  anchor,
+                                  cells,
+                                  local_appearance,
+                              )
+                              break
+
+                      if chosen is None:
+                          print(
+                              f"NOTE: no fully constructible V6 target for {pos}/{tier}; skipping tier"
+                          )
+                          continue
+
+                      rank_within_pos, anchor, cells, appearance_counts = chosen
+                      selected_targets.append({
+                          "key": anchor["key"],
+                          "name": anchor["name"],
+                          "pos": pos,
+                          "tier": tier,
+                          "rank_within_position": int(rank_within_pos),
+                          "fv": float(anchor["fv"]),
+                      })
+
+                      for profile, apex, pkg in cells:
+                          challenges.append(
+                              challenge_record(
+                                  anchor,
+                                  pkg,
+                                  profile,
+                                  apex,
+                                  tier,
+                                  rank_within_pos,
+                              )
+                          )
+
+              by_target, by_cell = validate(challenges, cfg)
+
+              if len(by_target) < 20:
+                  raise RuntimeError(
+                      f"V6 requires at least 20 fully constructible targets; got {len(by_target)}"
+                  )
+
+              profile_counts = Counter(
+                  c["component_profile"]["label"] for c in challenges
+              )
+              apex_counts = Counter(
+                  f"{float(c['apex_piece_to_target_target']):.2f}" for c in challenges
+              )
+              position_counts = Counter(c["target"]["pos"] for c in challenges)
+              tier_counts = Counter(c["target_tier"] for c in challenges)
+              cell_counts = Counter(c["research_cell"] for c in challenges)
+
+              ratio_errors = [
+                  abs(float(c["raw_package_to_target_ratio"]) - float(c["ratio_target"]))
+                  for c in challenges
+              ]
+              share_errors = [
+                  max(
+                      abs(float(a) - float(b))
+                      for a, b in zip(
+                          c["component_profile"]["actual_package_shares"],
+                          c["component_profile"]["intended_package_shares"],
+                      )
+                  )
+                  for c in challenges
+              ]
+
+              payload = {
+                  "schema_version": 6,
+                  "status": "frozen_package_adjustment_v6_development_catalog",
+                  "frozen": True,
+                  "released": False,
+                  "voting_activated": False,
+                  "research_only": True,
+                  "consumer_changed": False,
+                  "production_formula_enabled": False,
+                  "production_revision_retained": "v1.6-v5-size2-composition-overlay",
+                  "candidate_predictions_used_for_catalog_selection": False,
+                  "exact_motivating_trade_included": False,
+                  "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+                  "purpose": (
+                      "Fresh development catalog for estimating three-player composition "
+                      "effects in exactly-one-player-vs-exactly-three-player trades."
+                  ),
+                  "source_sha256": {
+                      "development_preregistration_v1": sha256(PREREG),
+                      "value_uncertainty": sha256(VALUES),
+                      "league_rosters": sha256(ROSTERS),
+                      "generator": sha256(Path(__file__)),
+                  },
+                  "design": {
+                      "composition_profiles": profiles,
+                      "apex_piece_to_target_levels": apex_levels,
+                      "ratio_rule": cfg["development_catalog_design"]["ratio_rule"],
+                      "cell_count": 24,
+                      "target_positions": list(TARGET_POSITIONS),
+                      "target_tier_ranks": {
+                          k: list(v) for k, v in TARGET_TIER_RANKS.items()
+                      },
+                      "max_ratio_error": MAX_RATIO_ERROR,
+                      "max_package_share_error": MAX_PACKAGE_SHARE_ERROR,
+                      "candidate_predictions_may_not_be_used": True,
+                      "exact_named_motivating_trade_excluded": True,
+                  },
+                  "targets": selected_targets,
+                  "challenges": challenges,
+                  "catalog_diagnostics": {
+                      "challenge_count": len(challenges),
+                      "target_count": len(by_target),
+                      "research_cell_count": len(by_cell),
+                      "expected_challenges_per_cell": len(by_target),
+                      "profile_counts": dict(sorted(profile_counts.items())),
+                      "apex_counts": dict(sorted(apex_counts.items())),
+                      "target_position_counts": dict(sorted(position_counts.items())),
+                      "target_tier_counts": dict(sorted(tier_counts.items())),
+                      "research_cell_counts": dict(sorted(cell_counts.items())),
+                      "max_abs_ratio_error": max(ratio_errors),
+                      "max_abs_package_share_error": max(share_errors),
+                      "max_package_player_appearance_count": max(appearance_counts.values()),
+                      "motivating_trade_matches": 0,
+                  },
+              }
+
+              OUT.write_text(
+                  json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                  encoding="utf-8",
+              )
+
+              manifest = {
+                  "schema_version": 1,
+                  "status": "frozen_v6_development_catalog_manifest",
+                  "frozen": True,
+                  "research_only": True,
+                  "generated_at_utc": payload["generated_at_utc"],
+                  "production_revision_retained": "v1.6-v5-size2-composition-overlay",
+                  "preregistration_sha256": sha256(PREREG),
+                  "generator_sha256": sha256(Path(__file__)),
+                  "value_uncertainty_sha256": sha256(VALUES),
+                  "league_rosters_sha256": sha256(ROSTERS),
+                  "catalog_sha256": sha256(OUT),
+                  "challenge_count": len(challenges),
+                  "target_count": len(by_target),
+                  "research_cell_count": len(by_cell),
+                  "candidate_predictions_used": False,
+                  "exact_motivating_trade_included": False,
+                  "released": False,
+                  "voting_activated": False,
+                  "development_votes_collected": False,
+                  "model_fit_performed": False,
+                  "production_change_authorized": False,
+              }
+              MANIFEST.write_text(
+                  json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                  encoding="utf-8",
+              )
+
+              print(
+                  f"PASS: generated frozen unreleased V6 catalog with "
+                  f"{len(challenges)} challenges, {len(by_target)} targets, "
+                  f"{len(by_cell)} cells."
+              )
+              print("Catalog SHA256:", manifest["catalog_sha256"])
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          chmod +x research/package-adjustment-v6/generate_package_vote_challenges_v6.py
+
+      - name: Run V6 generator self-test
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 research/package-adjustment-v6/generate_package_vote_challenges_v6.py --selftest
+
+      - name: Generate frozen unreleased V6 development catalog
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 research/package-adjustment-v6/generate_package_vote_challenges_v6.py
+
+      - name: Validate frozen V6 catalog contract
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from collections import Counter, defaultdict
+          from pathlib import Path
+
+          D = Path("research/package-adjustment-v6")
+          cfg = json.loads((D / "development_preregistration_v1.json").read_text())
+          cat = json.loads((D / "package_vote_challenges_v6.json").read_text())
+          man = json.loads((D / "development_catalog_v1_manifest.json").read_text())
+
+          def sha256(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          assert cat["status"] == "frozen_package_adjustment_v6_development_catalog"
+          assert cat["frozen"] is True
+          assert cat["released"] is False
+          assert cat["voting_activated"] is False
+          assert cat["candidate_predictions_used_for_catalog_selection"] is False
+          assert cat["exact_motivating_trade_included"] is False
+          assert cat["production_formula_enabled"] is False
+          assert cat["production_revision_retained"] == "v1.6-v5-size2-composition-overlay"
+
+          challenges = cat["challenges"]
+          assert len(challenges) >= 480
+          assert len({c["target"]["key"] for c in challenges}) >= 20
+          assert len({c["research_cell"] for c in challenges}) == 24
+
+          expected_profiles = {
+              p["label"] for p in cfg["development_catalog_design"]["composition_profiles"]
+          }
+          assert {c["component_profile"]["label"] for c in challenges} == expected_profiles
+
+          by_target = defaultdict(set)
+          for c in challenges:
+              by_target[c["target"]["key"]].add(c["research_cell"])
+              assert c["package_size"] == 3
+              assert len(c["package"]) == 3
+              assert all(float(p["fv"]) < float(c["target_fv"]) for p in c["package"])
+
+          assert all(len(cells) == 24 for cells in by_target.values())
+
+          required_positions = set(cfg["development_catalog_design"]["target_position_coverage_required"])
+          got_positions = {c["target"]["pos"] for c in challenges}
+          assert required_positions <= got_positions
+
+          assert man["status"] == "frozen_v6_development_catalog_manifest"
+          assert man["catalog_sha256"] == sha256(D / "package_vote_challenges_v6.json")
+          assert man["generator_sha256"] == sha256(D / "generate_package_vote_challenges_v6.py")
+          assert man["preregistration_sha256"] == sha256(D / "development_preregistration_v1.json")
+          assert man["candidate_predictions_used"] is False
+          assert man["released"] is False
+          assert man["voting_activated"] is False
+          assert man["development_votes_collected"] is False
+          assert man["model_fit_performed"] is False
+          assert man["production_change_authorized"] is False
+
+          print("PASS: frozen V6 catalog matches the preregistered 24-cell design and remains unreleased.")
+          PY
+
+      - name: Verify production still remains V1.6
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 \
+            python3 scripts/validation/check_package_adjustment_live.py
+
+      - name: Run repo regression checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 \
+            python3 scripts/validation/repo_regression_checks.py
+
+      - name: Prove only intended V6 catalog files changed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t changed < <(
+            git status --porcelain=v1 --untracked-files=all \
+              | sed 's/^?? //' \
+              | sed 's/^ M //' \
+              | sort
+          )
+
+          printf '%s\n' "${changed[@]}"
+
+          expected=(
+            "research/package-adjustment-v6/development_catalog_v1_manifest.json"
+            "research/package-adjustment-v6/generate_package_vote_challenges_v6.py"
+            "research/package-adjustment-v6/package_vote_challenges_v6.json"
+          )
+
+          test "${#changed[@]}" -eq "${#expected[@]}"
+          for i in "${!expected[@]}"; do
+            test "${changed[$i]}" = "${expected[$i]}"
+          done
+
+      - name: Commit frozen unreleased V6 development catalog
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            research/package-adjustment-v6/development_catalog_v1_manifest.json \
+            research/package-adjustment-v6/generate_package_vote_challenges_v6.py \
+            research/package-adjustment-v6/package_vote_challenges_v6.json
+
+          git commit -m "Freeze Package Adjustment V6 development catalog"
+          git push origin HEAD:main
