@@ -1,0 +1,752 @@
+name: Draft Pick FV V2 Broad Cohort Preregistration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  preregister:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install regression dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir "requests==2.34.2"
+          python3 - <<'PY'
+          import requests
+          assert requests.__version__ == "2.34.2"
+          print("requests import OK:", requests.__version__)
+          PY
+
+      - name: Guard V1 closure and clean repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          test -f index.html
+          test -f config.json
+          test -f scripts/validation/snapshot_values.py
+          test -f scripts/validation/repo_regression_checks.py
+          test -f research/draft-pick-fv-v1/historical_draft_catalog_v1.json
+          test -f research/draft-pick-fv-v1/historical_draft_catalog_manifest_v1.json
+
+          test ! -e research/draft-pick-fv-v2/preregistration_v2.json
+          test ! -e research/draft-pick-fv-v2/preregistration_v2.md
+          test ! -e research/draft-pick-fv-v2/preregistration_manifest_v2.json
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          p = Path("research/draft-pick-fv-v1/historical_draft_catalog_v1.json")
+          d = json.loads(p.read_text(encoding="utf-8"))
+          assert d["status"] == "INSUFFICIENT_HISTORICAL_EVIDENCE"
+          assert d["candidate_fit_performed"] is False
+          assert d["candidate_scores_computed"] is False
+          assert d["historical_weekly_outcomes_read"] is False
+          assert d["production_change_authorized"] is False
+          assert d["primary_mature_class_years"] == []
+          print("PASS: V1 is closed without a fit or production change.")
+          PY
+
+      - name: Validate canonical player FV parser
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/snapshot_values.py --selftest
+
+      - name: Freeze V2 preregistration
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p research/draft-pick-fv-v2
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import importlib.util
+          import json
+          import math
+          import re
+          import subprocess
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          ROOT = Path(".")
+          OUT = ROOT / "research/draft-pick-fv-v2"
+          INDEX = ROOT / "index.html"
+          CONFIG = ROOT / "config.json"
+          SNAPSHOT = ROOT / "scripts/validation/snapshot_values.py"
+          V1CAT = ROOT / "research/draft-pick-fv-v1/historical_draft_catalog_v1.json"
+          V1MAN = ROOT / "research/draft-pick-fv-v1/historical_draft_catalog_manifest_v1.json"
+
+          SOURCE_REPO = "dynastyprocess/data"
+          SOURCE_COMMIT = "ddbf693ee8e59fdfd100ab4f7fd144b70a13f70d"
+          SOURCE_PATH = "files/archives/database.csv"
+          SOURCE_GIT_BLOB = "94cd1c40cd3b3c266bfc322117bf4756fc2e665d"
+          SOURCE_RAW_URL = (
+              "https://raw.githubusercontent.com/dynastyprocess/data/"
+              + SOURCE_COMMIT
+              + "/files/archives/database.csv"
+          )
+
+          def sha256(path: Path) -> str:
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          def git_blob(path: Path) -> str:
+              return subprocess.check_output(
+                  ["git", "hash-object", str(path)], text=True
+              ).strip()
+
+          def git_head() -> str:
+              return subprocess.check_output(
+                  ["git", "rev-parse", "HEAD"], text=True
+              ).strip()
+
+          spec = importlib.util.spec_from_file_location("sv", SNAPSHOT)
+          if spec is None or spec.loader is None:
+              raise RuntimeError("Could not import snapshot_values.py")
+          sv = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(sv)
+          cfg = sv.load_from_html(INDEX)
+          html = INDEX.read_text(encoding="utf-8")
+
+          required_pos = ("QB", "RB", "WR", "TE", "DL", "LB", "DB")
+          pos_weight = {p: float(cfg["position_weight"][p]) for p in required_pos}
+
+          pick_body = sv.extract_object_body(html, "PICK_BASE")
+          pick_base = {
+              str(int(r)): {
+                  "early": float(e),
+                  "mid": float(m),
+                  "late": float(l),
+              }
+              for r, e, m, l in re.findall(
+                  r"(\d+)\s*:\s*\{\s*early\s*:\s*([0-9.]+)\s*,\s*"
+                  r"mid\s*:\s*([0-9.]+)\s*,\s*late\s*:\s*([0-9.]+)",
+                  pick_body,
+              )
+          }
+          assert sorted(map(int, pick_base)) == [1, 2, 3, 4, 5, 6]
+
+          year_body = sv.extract_object_body(html, "YEAR_DISCOUNT")
+          year_discount = {
+              y: float(v)
+              for y, v in re.findall(
+                  r"['\"](\d{4})['\"]\s*:\s*([0-9.]+)",
+                  year_body,
+              )
+          }
+          assert year_discount
+
+          v1 = json.loads(V1CAT.read_text(encoding="utf-8"))
+          v1man = json.loads(V1MAN.read_text(encoding="utf-8"))
+          assert v1["status"] == "INSUFFICIENT_HISTORICAL_EVIDENCE"
+          assert v1man["scientific_status"] == "INSUFFICIENT_HISTORICAL_EVIDENCE"
+
+          prereg = {
+              "schema_version": 2,
+              "study_id": "draft-pick-fv-v2-broad-historical-rookie-cohort",
+              "status": "preregistered_before_broad_cohort_ingestion",
+              "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+              "preregistered_at_head_sha": git_head(),
+              "research_only": True,
+              "production_change_authorized": False,
+              "v1_closed_without_fit": True,
+              "broad_cohort_source_read_before_freeze": False,
+              "historical_player_outcomes_read_before_freeze": False,
+              "ktc_or_market_data_allowed_as_fit_target": False,
+              "package_vote_data_allowed": False,
+              "2026_realized_outcomes_allowed": False,
+
+              "question": (
+                  "In a broad historical 2QB/Superflex rookie-ADP cohort, do "
+                  "realized football outcomes support the absolute scale and "
+                  "round/tier shape of the deployed draft-pick Fundamental Values?"
+              ),
+
+              "reason_for_v2": {
+                  "v1_status": v1["status"],
+                  "v1_failure_mode": (
+                      "The user's Sleeper predecessor chain begins too recently "
+                      "to provide any rookie class mature for the frozen "
+                      "three-season outcome horizon."
+                  ),
+                  "rule": (
+                      "V1 gates are not relaxed. V2 is a separate study using "
+                      "a broad historical source population under a new freeze."
+                  ),
+                  "v1_catalog_sha256": sha256(V1CAT),
+              },
+
+              "scope": {
+                  "format_target": "2QB/Superflex",
+                  "team_count_for_pick_mapping": 12,
+                  "rounds": [1, 2, 3, 4, 5, 6],
+                  "tracked_positions": list(required_pos),
+                  "future_year_discount_in_scope": False,
+                  "multi_pick_package_additivity_in_scope": False,
+                  "salary_contract_value_in_scope": False,
+                  "team_utility_in_scope": False,
+                  "current_market_value_in_scope": False,
+                  "full_idp_claim_pre_authorized": False,
+                  "idp_limitation": (
+                      "The external historical rookie-ADP source may be "
+                      "offense-dominant. V2 can support a full IDP-inclusive "
+                      "pick-FV claim only if the frozen catalog passes both "
+                      "preregistered IDP coverage gates."
+                  ),
+              },
+
+              "frozen_external_cohort_source": {
+                  "repository": SOURCE_REPO,
+                  "commit": SOURCE_COMMIT,
+                  "path": SOURCE_PATH,
+                  "git_blob_sha": SOURCE_GIT_BLOB,
+                  "raw_url": SOURCE_RAW_URL,
+                  "primary_ordering_field": "draft_2QBrookieadp",
+                  "one_qb_robustness_field": "draft_rookieadp",
+                  "allowed_catalog_columns": [
+                      "gsis_id",
+                      "sleeper_id",
+                      "name",
+                      "pos",
+                      "draft_year",
+                      "draft_round",
+                      "draft_pick",
+                      "draft_rookieadp",
+                      "draft_2QBrookieadp",
+                  ],
+                  "forbidden_fields": [
+                      "dynoECR",
+                      "dyno2QBECR",
+                      "dynpECR",
+                      "rdpECR",
+                      "ppr",
+                      "ppr/g",
+                      "offSnaps",
+                      "gms",
+                  ],
+                  "anti_leakage_rule": (
+                      "The next catalog must explicitly whitelist only allowed "
+                      "identity/draft/rookie-ADP fields and persist no ECR, "
+                      "market, current-value, or performance columns."
+                  ),
+              },
+
+              "cohort_definition": {
+                  "primary_adp": "draft_2QBrookieadp",
+                  "primary_adp_required": True,
+                  "no_one_qb_fallback_into_primary": True,
+                  "valid_primary_adp_range": "(0,72]",
+                  "minimum_draft_year": 2010,
+                  "latest_primary_draft_year": 2023,
+                  "continuous_cell_mapping": (
+                      "For round r=1..6 let base=12*(r-1). "
+                      "early: base<ADP<=base+4; "
+                      "mid: base+4<ADP<=base+8; "
+                      "late: base+8<ADP<=base+12. "
+                      "Do not round ADP before cell assignment."
+                  ),
+                  "duplicate_rule": (
+                      "One row per unique (draft_year, stable player identity). "
+                      "Exact duplicate allowed fields may collapse; conflicting "
+                      "duplicates are excluded and reported."
+                  ),
+                  "identity_priority": [
+                      "gsis_id",
+                      "sleeper_id",
+                      "normalized name + draft_year for diagnostics only",
+                  ],
+              },
+
+              "maturity_and_feasibility_gates": {
+                  "primary_horizon_seasons": 3,
+                  "minimum_distinct_primary_draft_classes": 6,
+                  "minimum_total_primary_players": 216,
+                  "minimum_players_per_round_tier_cell": 12,
+                  "minimum_identity_resolution_coverage": 0.95,
+                  "minimum_dob_coverage_for_absolute_bridge": 0.85,
+                  "minimum_2qb_adp_coverage_among_candidate_rows": 0.80,
+                  "minimum_idp_share_for_full_idp_claim": 0.10,
+                  "minimum_idp_players_for_full_idp_claim": 36,
+                  "if_primary_gate_fails": (
+                      "Stop as INSUFFICIENT_BROAD_COHORT_EVIDENCE. "
+                      "Do not fit and do not change production."
+                  ),
+                  "if_only_idp_gate_fails": (
+                      "Study may continue as OFFENSE_CONDITIONAL_ONLY, but V2 "
+                      "cannot directly authorize full IDP-inclusive pick FVs."
+                  ),
+              },
+
+              "frozen_deployed_baseline": {
+                  "candidate_id": "C0_DEPLOYED",
+                  "pick_base_2027": pick_base,
+                  "year_discount_context_only": year_discount,
+                  "fit_status": "baseline_only_never_refit",
+              },
+
+              "frozen_replacement_ranks": {
+                  "QB": 29,
+                  "RB": 25,
+                  "WR": 28,
+                  "TE": 11,
+                  "DL": 16,
+                  "LB": 28,
+                  "DB": 22,
+              },
+
+              "historical_outcome_contract": {
+                  "provider": "Sleeper historical weekly NFL stats",
+                  "endpoint_template": (
+                      "https://api.sleeper.app/v1/stats/nfl/regular/{season}/{week}"
+                  ),
+                  "weeks_requested": list(range(1, 19)),
+                  "availability_gate": (
+                      "Each primary class must have nonempty outcome data for "
+                      "draft_year through draft_year+2. Missing required seasons "
+                      "exclude the class before the development/validation split; "
+                      "all feasibility gates are then rechecked."
+                  ),
+                  "scoring_source": (
+                      "Current reviewed league scoring logic from "
+                      "research/roster-economics/historical_weekly_points_pipeline.py"
+                  ),
+                  "alternate_provider_after_results_allowed": False,
+              },
+
+              "primary_outcomes": {
+                  "O1_shape": {
+                      "name": "three_year_replacement_adjusted_football_utility",
+                      "definition": (
+                          "Score the rookie's first three NFL seasons under "
+                          "league scoring. Replacement PPG is full-NFL season "
+                          "PPG at the frozen positional rank among players with "
+                          "at least 3 games. Annual surplus=max(0, season_total - "
+                          "replacement_ppg*scheduled_games). Sum years 1-3."
+                      ),
+                      "scheduled_games": {
+                          "through_2020": 16,
+                          "2021_and_later": 17,
+                      },
+                      "use": "shape robustness only; raw O1 is not FV",
+                  },
+                  "O2_scale": {
+                      "name": "three_year_player_equivalent_fv",
+                      "annual_equivalent_formula": (
+                          "5500 * frozen_position_weight[pos] * "
+                          "role_neutral_age_multiplier * realized_prod_mult"
+                      ),
+                      "realized_prod_mult": (
+                          "0.0 if zero games; otherwise clamp(-0.10 + 0.75 * "
+                          "(season_total/(replacement_ppg*scheduled_games)), "
+                          "0.15, 1.55)"
+                      ),
+                      "age_bridge": {
+                          "source": "snapshot_values.age_multiplier()",
+                          "role": "Starter",
+                          "age_as_of": "September 1 of evaluated season",
+                          "real_production_arg": "realized_prod_mult",
+                          "raw_production_arg": "realized_prod_mult",
+                          "rb_elite_youth_bonus_active": False,
+                          "dob_required": True,
+                      },
+                      "aggregation": "arithmetic mean of years 1-3 annual FV equivalents",
+                  },
+              },
+
+              "frozen_scale_bridge": {
+                  "base_scale": 5500.0,
+                  "position_weight": pos_weight,
+                  "age_curve": cfg["age_curve"],
+                  "qb_post_peak_floor": float(cfg["qb_post_peak_floor"]),
+                  "lb_post_peak_decay_power": float(cfg["lb_post_peak_decay_power"]),
+                  "production_transform": {
+                      "intercept": -0.10,
+                      "slope": 0.75,
+                      "floor": 0.15,
+                      "ceiling": 1.55,
+                      "zero_games_override": 0.0,
+                  },
+              },
+
+              "candidate_families": {
+                  "C0_DEPLOYED": {
+                      "parameters": 0,
+                      "definition": "exact deployed 6x3 PICK_BASE",
+                      "eligible": True,
+                  },
+                  "C1_GLOBAL_RESCALE": {
+                      "parameters": 1,
+                      "definition": "k*C0",
+                      "bounds": {"k": [0.50, 1.50]},
+                      "eligible": True,
+                  },
+                  "C2_LOW_PARAMETER_OUTCOME_CURVE": {
+                      "parameters": 5,
+                      "definition": (
+                          "A*exp(-b1*I(round>=2)-b2*max(round-2,0)"
+                          "-tier_penalty[tier])"
+                      ),
+                      "bounds": {
+                          "A": [3000.0, 10000.0],
+                          "b1": [0.0, 1.50],
+                          "b2": [0.0, 0.75],
+                          "m": [0.0, 0.60],
+                          "l": [0.0, 0.90],
+                      },
+                      "tier_penalty": {"early": 0.0, "mid": "m", "late": "l"},
+                      "constraint": "0<=m<=l",
+                      "eligible": True,
+                  },
+                  "C3_MONOTONE_CELL_DIAGNOSTIC": {
+                      "parameters": "up_to_18",
+                      "definition": "monotone projected cell targets",
+                      "eligible": False,
+                  },
+              },
+
+              "split_and_fit": {
+                  "class_unit": "draft_year",
+                  "split_timing": "after source and outcome availability gates",
+                  "locked_validation_classes": "latest two remaining mature classes",
+                  "development_classes": "all earlier remaining mature classes",
+                  "fit_target": "individual-player O2",
+                  "fit_loss": (
+                      "Equal-cell macro MAE: MAE within each of 18 round-tier "
+                      "cells, then equal average across cells."
+                  ),
+                  "optimizer": "deterministic bounded grid + deterministic local refinement",
+                  "validation_used_for_fit": False,
+              },
+
+              "selection": {
+                  "baseline": "C0_DEPLOYED",
+                  "primary_metric": "locked-validation equal-cell macro MAE on O2",
+                  "eligibility_gates": [
+                      "validation macro MAE improvement vs C0 >=5%",
+                      "improve O2 MAE in each locked validation class",
+                      "O1 normalized-shape error regression <=2%",
+                      "H2 O2 macro-MAE regression <=2%",
+                      "mature H4 O2 macro-MAE regression <=2%",
+                      "all 18 cells positive and monotone",
+                      "non-null fitted parameter at a bound is ineligible",
+                      "identity coverage >=95%",
+                      "DOB coverage >=85%",
+                  ],
+                  "winner_rule": (
+                      "Lowest validation O2 macro MAE among eligible C1/C2; "
+                      "if within 1% relative MAE choose fewer parameters."
+                  ),
+                  "none_eligible": "STOP_NO_BROAD_COHORT_PICK_FV_CANDIDATE",
+                  "idp_rule": (
+                      "A winner remains offense-conditional unless both frozen "
+                      "IDP coverage gates pass."
+                  ),
+              },
+
+              "uncertainty": {
+                  "cluster_unit": "draft_year",
+                  "bootstrap_resamples": 10000,
+                  "no_independent_player_assumption_within_class": True,
+              },
+
+              "robustness": {
+                  "H2": "first two NFL seasons",
+                  "H3": "primary first three NFL seasons",
+                  "H4": "first four NFL seasons where mature",
+                  "one_qb_adp": (
+                      "draft_rookieadp is diagnostic only and never fills "
+                      "missing 2QB ADP."
+                  ),
+                  "legacy_replacement_ranks": {
+                      "QB": 18,
+                      "RB": 32,
+                      "WR": 36,
+                      "TE": 15,
+                      "DL": 32,
+                      "LB": 32,
+                      "DB": 32,
+                  },
+                  "offense_vs_idp": "report separately; do not fit position-specific curves",
+              },
+
+              "forbidden": [
+                  "KTC/current market values as fit targets",
+                  "archive ECR/value/performance columns in the sanitized catalog",
+                  "2026 realized NFL outcomes",
+                  "package-adjustment votes",
+                  "named-rookie or current-trade tuning",
+                  "1QB ADP fallback into the primary cohort",
+                  "post-inspection relaxation of maturity/cell gates",
+                  "future-year discount changes",
+                  "multi-pick consolidation inference",
+                  "production changes from preregistration or catalog workflows",
+              ],
+
+              "post_selection": {
+                  "if_selected": (
+                      "Freeze candidate coefficients/results; require a separate "
+                      "confirmation and explicit IDP-coverage decision before "
+                      "any production bake."
+                  ),
+                  "if_none": "Close V2 with production unchanged.",
+              },
+
+              "source_hashes_at_freeze": {
+                  "index.html": {"sha256": sha256(INDEX), "git_blob": git_blob(INDEX)},
+                  "config.json": {"sha256": sha256(CONFIG), "git_blob": git_blob(CONFIG)},
+                  "scripts/validation/snapshot_values.py": {
+                      "sha256": sha256(SNAPSHOT),
+                      "git_blob": git_blob(SNAPSHOT),
+                  },
+                  "v1_catalog": {
+                      "sha256": sha256(V1CAT),
+                      "git_blob": git_blob(V1CAT),
+                  },
+                  "v1_manifest": {
+                      "sha256": sha256(V1MAN),
+                      "git_blob": git_blob(V1MAN),
+                  },
+              },
+          }
+
+          # Mathematical self-test of C2 family.
+          def c2(r, tier, A, b1, b2, m, l):
+              pen = {"early": 0.0, "mid": m, "late": l}[tier]
+              return A * math.exp(
+                  -b1 * (1 if r >= 2 else 0)
+                  -b2 * max(r - 2, 0)
+                  -pen
+              )
+
+          for params in (
+              (7500, 0.4, 0.2, 0.1, 0.2),
+              (3000, 0.0, 0.0, 0.0, 0.0),
+              (10000, 1.5, 0.75, 0.6, 0.9),
+          ):
+              A, b1, b2, m, l = params
+              for tier in ("early", "mid", "late"):
+                  vals = [c2(r, tier, A, b1, b2, m, l) for r in range(1, 7)]
+                  assert all(a >= b > 0 for a, b in zip(vals, vals[1:]))
+              for r in range(1, 7):
+                  assert c2(r, "early", *params) >= c2(r, "mid", *params) >= c2(r, "late", *params)
+
+          jp = OUT / "preregistration_v2.json"
+          jp.write_text(json.dumps(prereg, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+          md = f"""# Draft Pick FV V2 — Broad Historical Rookie Cohort Preregistration
+
+          **Status:** preregistered before broad-cohort or historical-outcome ingestion
+
+          ## Why V2 exists
+
+          V1 stopped correctly because the user's Sleeper history contains no
+          three-season-mature rookie class. V1's rules are not being weakened.
+          V2 is a new broad-cohort study.
+
+          ## Research question
+
+          {prereg['question']}
+
+          ## Frozen cohort source
+
+          `{SOURCE_REPO}@{SOURCE_COMMIT}:{SOURCE_PATH}`
+
+          Primary ordering is `draft_2QBrookieadp`. 1QB rookie ADP is robustness
+          only and can never fill missing 2QB ADP. The archive also contains ECR
+          and later performance columns; those are forbidden and must not enter
+          the sanitized V2 catalog.
+
+          ADP is not rounded before mapping to a 12-team board:
+          slots 1-4 = early, 5-8 = mid, 9-12 = late, rounds 1-6.
+
+          ## Feasibility
+
+          V2 requires at least 6 mature classes, 216 players total, 12 players in
+          every round×tier cell, >=95% identity resolution, >=85% DOB coverage,
+          and >=80% 2QB ADP coverage among candidate source rows.
+
+          A full IDP-inclusive claim additionally requires >=10% IDP share and at
+          least 36 DL/LB/DB players. Otherwise the study may continue only as
+          `OFFENSE_CONDITIONAL_ONLY`.
+
+          ## Outcomes and candidates
+
+          O1 is three-year replacement-adjusted football utility.
+          O2 is three-year player-equivalent FV on the frozen 5500 player scale.
+
+          Candidates:
+          - C0 exact deployed table.
+          - C1 one-parameter global rescale.
+          - C2 five-parameter monotone round/tier curve.
+          - C3 flexible monotone diagnostic; cannot win.
+
+          The latest two mature classes are locked validation. A replacement must
+          improve validation O2 macro MAE by >=5%, improve both validation classes,
+          survive O1/H2/H4 robustness, remain monotone, and avoid parameter-boundary
+          saturation. No qualifier means production remains unchanged.
+
+          ## Still out of scope
+
+          Future-year discounts and multi-pick consolidation remain separate studies.
+
+          ## Next step
+
+          Build a sanitized broad-cohort catalog from the frozen archive source,
+          verify the source hash and all feasibility/IDP gates, and freeze the
+          development/validation class split before any outcome download.
+          """
+          md = "\n".join(line.rstrip() for line in md.splitlines()).strip() + "\n"
+          mp = OUT / "preregistration_v2.md"
+          mp.write_text(md, encoding="utf-8")
+
+          manifest = {
+              "schema_version": 2,
+              "study_id": prereg["study_id"],
+              "status": "frozen_preregistration",
+              "preregistered_at_head_sha": prereg["preregistered_at_head_sha"],
+              "files": {
+                  str(jp.relative_to(ROOT)): {"sha256": sha256(jp)},
+                  str(mp.relative_to(ROOT)): {"sha256": sha256(mp)},
+              },
+              "broad_cohort_source_read": False,
+              "historical_player_outcomes_read": False,
+              "candidate_fit_performed": False,
+              "production_change_authorized": False,
+          }
+          manp = OUT / "preregistration_manifest_v2.json"
+          manp.write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          print("V2 preregistration frozen.")
+          print("JSON SHA256:", sha256(jp))
+          print("MD SHA256:", sha256(mp))
+          print("Manifest SHA256:", sha256(manp))
+          PY
+
+      - name: Validate V2 preregistration contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path("research/draft-pick-fv-v2")
+          p = json.loads((root / "preregistration_v2.json").read_text())
+
+          assert p["schema_version"] == 2
+          assert p["study_id"] == "draft-pick-fv-v2-broad-historical-rookie-cohort"
+          assert p["status"] == "preregistered_before_broad_cohort_ingestion"
+          assert p["research_only"] is True
+          assert p["production_change_authorized"] is False
+          assert p["v1_closed_without_fit"] is True
+          assert p["broad_cohort_source_read_before_freeze"] is False
+          assert p["historical_player_outcomes_read_before_freeze"] is False
+          assert p["ktc_or_market_data_allowed_as_fit_target"] is False
+          assert p["2026_realized_outcomes_allowed"] is False
+
+          src = p["frozen_external_cohort_source"]
+          assert src["commit"] == "ddbf693ee8e59fdfd100ab4f7fd144b70a13f70d"
+          assert src["path"] == "files/archives/database.csv"
+          assert src["git_blob_sha"] == "94cd1c40cd3b3c266bfc322117bf4756fc2e665d"
+          assert src["primary_ordering_field"] == "draft_2QBrookieadp"
+          assert "ppr" in src["forbidden_fields"]
+          assert "dyno2QBECR" in src["forbidden_fields"]
+
+          c = p["cohort_definition"]
+          assert c["primary_adp_required"] is True
+          assert c["no_one_qb_fallback_into_primary"] is True
+          assert c["valid_primary_adp_range"] == "(0,72]"
+
+          g = p["maturity_and_feasibility_gates"]
+          assert g["minimum_distinct_primary_draft_classes"] == 6
+          assert g["minimum_total_primary_players"] == 216
+          assert g["minimum_players_per_round_tier_cell"] == 12
+          assert g["minimum_identity_resolution_coverage"] == 0.95
+          assert g["minimum_dob_coverage_for_absolute_bridge"] == 0.85
+          assert g["minimum_idp_share_for_full_idp_claim"] == 0.10
+          assert g["minimum_idp_players_for_full_idp_claim"] == 36
+
+          fam = p["candidate_families"]
+          assert fam["C0_DEPLOYED"]["parameters"] == 0
+          assert fam["C1_GLOBAL_RESCALE"]["parameters"] == 1
+          assert fam["C2_LOW_PARAMETER_OUTCOME_CURVE"]["parameters"] == 5
+          assert fam["C3_MONOTONE_CELL_DIAGNOSTIC"]["eligible"] is False
+
+          m = json.loads((root / "preregistration_manifest_v2.json").read_text())
+          assert m["status"] == "frozen_preregistration"
+          assert m["broad_cohort_source_read"] is False
+          assert m["historical_player_outcomes_read"] is False
+          assert m["candidate_fit_performed"] is False
+          assert m["production_change_authorized"] is False
+
+          print("PASS: V2 preregistration contract validated.")
+          PY
+
+      - name: Run repository regression checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/repo_regression_checks.py
+
+      - name: Prove only V2 preregistration files changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import subprocess
+
+          expected = {
+              "research/draft-pick-fv-v2/preregistration_v2.json",
+              "research/draft-pick-fv-v2/preregistration_v2.md",
+              "research/draft-pick-fv-v2/preregistration_manifest_v2.json",
+          }
+          raw = subprocess.check_output(
+              ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+              text=True,
+          )
+          actual = {line[3:] for line in raw.splitlines() if line}
+          assert actual == expected, (sorted(actual), sorted(expected))
+          print("PASS: exactly the intended three V2 preregistration files changed.")
+          PY
+
+      - name: Commit frozen V2 preregistration
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            research/draft-pick-fv-v2/preregistration_v2.json \
+            research/draft-pick-fv-v2/preregistration_v2.md \
+            research/draft-pick-fv-v2/preregistration_manifest_v2.json
+          git commit -m "Freeze Draft Pick FV V2 broad cohort preregistration"
+          git push origin HEAD:main
