@@ -1,7 +1,7 @@
 # Position Weight / Cross-Position Economics V2 — Phase 5 Prospective Evaluator
 
 Method: `position-weight-v2-phase5-prospective-v1`  
-Status: **`READY_WAITING_FOR_COMPLETED_WEEK_1`**
+Status: **`COLLECTION_ONLY`**
 
 ## Guardrail
 
@@ -9,7 +9,7 @@ Status: **`READY_WAITING_FOR_COMPLETED_WEEK_1`**
 
 - Frozen at: **2026-09-06T01:51:36.482597Z**
 - Frozen prediction SHA256: `bfe708b0aa991a2cfbafbb008b60944349fc040134e4bcd67f8d3cf79691ca47`
-- Completed consecutive weeks used: **none**
+- Completed consecutive weeks used: **[1]**
 - Full structural-allocation universe: **549**
 - Primary real-history cohort: **441**
 
@@ -28,24 +28,25 @@ Same-position pairs are excluded. A common global scale cannot change this metri
 
 | Variant | Players | Pairwise accuracy | Comparable cross-position pairs |
 |---|---:|---:|---:|
-| `deployed_control` | 0 | — | 0 |
-| `bridge_50` | 0 | — | 0 |
+| `deployed_control` | 374 | 0.6876 | 42182 |
+| `bridge_50` | 374 | 0.6942 | 42182 |
 
-Bridge-50 pairwise accuracy delta vs control: **—**
+Bridge-50 pairwise accuracy delta vs control: **+0.0066**
 
 ## Secondary normalized-error metric
 
 | Variant | Min-max MAE | Min-max RMSE |
 |---|---:|---:|
-| `deployed_control` | — | — |
-| `bridge_50` | — | — |
+| `deployed_control` | 0.2435 | 0.2989 |
+| `bridge_50` | 0.2012 | 0.2475 |
 
-Bridge-50 normalized MAE delta vs control: **—**
+Bridge-50 normalized MAE delta vs control: **-0.0422**
 
 ## Weekly structural allocation audit
 
 | Week | Usable | QB | RB | WR | TE | DL | LB | DB |
 |---:|---|---:|---:|---:|---:|---:|---:|---:|
+| 1 | Yes | 24 | 34 | 26 | 12 | 29 | 42 | 25 |
 
 ## Readiness ladder
 
