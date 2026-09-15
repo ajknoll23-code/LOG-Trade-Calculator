@@ -2,12 +2,12 @@
 
 ## Status
 
-**READY_WAITING_FOR_COMPLETED_WEEK_1**
+**COLLECTING_NO_CALIBRATION**
 
 - Production files mutated: **0**
 - Deployment authorized: **No**
 - Frozen candidate matrix: **120 V2 variants + deployed control**
-- Completed consecutive weeks: **0**
+- Completed consecutive weeks: **1**
 
 ## Frozen protocol
 
@@ -27,9 +27,29 @@
 
 ## Completed outcome state
 
-- Outcome refresh: `2026-09-13T23:50:52.725343Z`
-- Completed weeks recognized: **[]**
-- Consecutive prefix used: **[]**
+- Outcome refresh: `2026-09-15T11:18:22.222170Z`
+- Completed weeks recognized: **[1]**
+- Consecutive prefix used: **[1]**
+
+## weeks_1_to_1_early
+
+Weeks: **[1]**  
+Active normal-candidate players: **435**  
+Deployed control rank: **121 / 121**  
+Phase-8 monitoring reference rank: **72 / 121**
+
+| Rank | Variant | FP wt | History wt | Ranks | Floor | Primary Spearman | Δ vs deployed | Pairwise |
+|---:|---|---:|---:|---|---:|---:|---:|---:|
+| 1 | `fp_1.00__history_0.25__documented__floor_0.15` | 100% | 25% | documented | 0.15 | 0.498168 | 0.051469 | 0.677993 |
+| 2 | `fp_0.75__history_0.25__documented__floor_0.15` | 75% | 25% | documented | 0.15 | 0.497816 | 0.051117 | 0.677944 |
+| 3 | `fp_1.00__history_0.25__documented__floor_0.05` | 100% | 25% | documented | 0.05 | 0.497661 | 0.050962 | 0.677466 |
+| 4 | `fp_0.75__history_0.25__documented__floor_0.05` | 75% | 25% | documented | 0.05 | 0.497474 | 0.050775 | 0.677573 |
+| 5 | `fp_0.75__history_0.25__documented__floor_0.10` | 75% | 25% | documented | 0.10 | 0.497338 | 0.050639 | 0.677683 |
+| 6 | `fp_1.00__history_0.25__documented__floor_0.20` | 100% | 25% | documented | 0.20 | 0.497276 | 0.050577 | 0.678064 |
+| 7 | `fp_1.00__history_0.25__documented__floor_0.10` | 100% | 25% | documented | 0.10 | 0.49726 | 0.050561 | 0.677454 |
+| 8 | `fp_0.75__history_0.25__documented__floor_0.20` | 75% | 25% | documented | 0.20 | 0.497193 | 0.050494 | 0.678228 |
+| 9 | `fp_0.75__history_0.25__evidence_hybrid__floor_0.15` | 75% | 25% | evidence_hybrid | 0.15 | 0.49716 | 0.050461 | 0.678559 |
+| 10 | `fp_0.00__history_0.25__documented__floor_0.15` | 0% | 25% | documented | 0.15 | 0.496952 | 0.050253 | 0.677534 |
 
 ## Stability
 
@@ -37,6 +57,6 @@ Requires at least 8 completed consecutive weeks.
 
 ## Interpretation
 
-Outcome capture exists, but no completed consecutive 2026 week is yet eligible under the leakage-safe completion rule.
+Phase 9 is collecting realized evidence. Results are smoke-test diagnostics only and must not influence coefficients.
 
 Phase 9 never deploys a coefficient automatically. Any eventual winner must survive independent-window stability, position guardrails, bootstrap uncertainty, and comparison against the frozen deployed model before Phase 10.

@@ -1,7 +1,7 @@
 # KTC Voter-Balance Research Analysis
 
 Method: `ktc-voter-balance-analysis-v1`  
-Source generated at: `2026-09-13T23:50:51.870713`  
+Source generated at: `2026-09-15T11:18:21.308016`  
 Status: `research_only_no_market_value_change`
 
 ## Critical interpretation
@@ -14,88 +14,88 @@ The purpose is to quantify how much the raw league ranking changes when every le
 
 - Distinct league voters: **10**
 - Voters currently down-weighted by the lifetime cap: **2**
-- Largest raw voter share: **59.91%**
+- Largest raw voter share: **57.46%**
 - Largest effective voter share: **15.62%**
-- Raw HHI: **0.3850** (effective voter count ≈ **2.597**)
+- Raw HHI: **0.3652** (effective voter count ≈ **2.738**)
 - Balanced HHI: **0.1196** (effective voter count ≈ **8.364**)
-- Raw league ballots: **469**
-- Effective league ballots after weighting: **192.0** (**40.94%** of raw mass)
+- Raw league ballots: **489**
+- Effective league ballots after weighting: **192.0** (**39.26%** of raw mass)
 
 ## Rank agreement: raw vs voter-balanced
 
-- Common rated players: **496**
-- Spearman rank correlation: **0.845894**
-- Median absolute rank shift: **46.5** spots
-- 90th-percentile absolute rank shift: **122.25** spots
-- Maximum absolute rank shift: **324.0** spots
-- Top-10 overlap: **2/10 (20.0%)**
+- Common rated players: **498**
+- Spearman rank correlation: **0.843362**
+- Median absolute rank shift: **46.0** spots
+- 90th-percentile absolute rank shift: **124.6** spots
+- Maximum absolute rank shift: **310.0** spots
+- Top-10 overlap: **1/10 (10.0%)**
 - Top-20 overlap: **8/20 (40.0%)**
-- Top-50 overlap: **33/50 (66.0%)**
+- Top-50 overlap: **32/50 (64.0%)**
 
 ## Top 20 side-by-side
 
 | Rank | Raw league | Voter-balanced |
 |---:|---|---|
 | 1 | jeremiyah love | xavier worthy |
-| 2 | tyler shough | terrel bernard |
-| 3 | tucker kraft | travis etienne |
-| 4 | trey mcbride | fernando mendoza |
-| 5 | makai lemon | carnell tate |
-| 6 | josh allen | tyler shough |
-| 7 | bhayshul tuten | jeremiyah love |
-| 8 | micah parsons | dorian williams |
-| 9 | rome odunze | alex anzalone |
-| 10 | david bailey | patrick mahomes |
-| 11 | brock bowers | rashid shaheed |
-| 12 | carson schwesinger | dillon thieneman |
-| 13 | rashid shaheed | devon witherspoon |
-| 14 | carnell tate | micah parsons |
-| 15 | harold fannin | rome odunze |
-| 16 | malik willis | josh allen |
-| 17 | terrel bernard | luther burden |
-| 18 | kyle pitts | brock purdy |
-| 19 | will anderson | aidan hutchinson |
-| 20 | ty simpson | george karlaftis |
+| 2 | sonny styles | terrel bernard |
+| 3 | myles garrett | travis etienne |
+| 4 | tyler shough | dorian williams |
+| 5 | tucker kraft | fernando mendoza |
+| 6 | micah parsons | carnell tate |
+| 7 | will anderson | alex anzalone |
+| 8 | makai lemon | sonny styles |
+| 9 | josh allen | dillon thieneman |
+| 10 | bhayshul tuten | rashid shaheed |
+| 11 | rome odunze | devon witherspoon |
+| 12 | carson schwesinger | tyler shough |
+| 13 | trey mcbride | jeremiyah love |
+| 14 | david bailey | micah parsons |
+| 15 | nick emmanwori | will anderson |
+| 16 | rashid shaheed | patrick mahomes |
+| 17 | harold fannin | aidan hutchinson |
+| 18 | carnell tate | josh allen |
+| 19 | brock bowers | brock purdy |
+| 20 | maxx crosby | kc concepcion |
 
 ## Largest gainers after voter balancing
 
 | Player | Raw rank | Balanced rank | Improvement | |Δ rank| |
 |---|---:|---:|---:|---:|
-| bradley chubb | 391.0 | 67.0 | +324.0 | 324.0 |
-| jadeveon clowney | 402.0 | 104.0 | +298.0 | 298.0 |
-| bobby okereke | 418.0 | 130.0 | +288.0 | 288.0 |
-| chig okonkwo | 468.0 | 203.0 | +265.0 | 265.0 |
-| eric wilson | 312.0 | 74.0 | +238.0 | 238.0 |
-| tank dell | 333.0 | 118.0 | +215.0 | 215.0 |
-| brian branch | 327.0 | 123.0 | +204.0 | 204.0 |
-| uchenna nwosu | 269.0 | 68.0 | +201.0 | 201.0 |
-| patrick queen | 279.0 | 79.0 | +200.0 | 200.0 |
-| cooper dejean | 300.0 | 114.0 | +186.0 | 186.0 |
-| mansoor delane | 245.0 | 65.0 | +180.0 | 180.0 |
-| xavier hutchinson | 302.0 | 125.0 | +177.0 | 177.0 |
-| alex singleton | 304.0 | 131.0 | +173.0 | 173.0 |
-| kenyon sadiq | 243.0 | 73.0 | +170.0 | 170.0 |
-| klavon chaisson | 316.0 | 150.0 | +166.0 | 166.0 |
+| bradley chubb | 382.0 | 72.0 | +310.0 | 310.0 |
+| chig okonkwo | 466.0 | 164.0 | +302.0 | 302.0 |
+| bobby okereke | 421.0 | 136.0 | +285.0 | 285.0 |
+| jadeveon clowney | 401.0 | 120.0 | +281.0 | 281.0 |
+| eric wilson | 315.0 | 71.0 | +244.0 | 244.0 |
+| mansoor delane | 331.0 | 105.0 | +226.0 | 226.0 |
+| brian branch | 334.0 | 126.0 | +208.0 | 208.0 |
+| patrick queen | 284.0 | 77.0 | +207.0 | 207.0 |
+| uchenna nwosu | 267.0 | 64.0 | +203.0 | 203.0 |
+| tank dell | 333.0 | 131.0 | +202.0 | 202.0 |
+| xavier hutchinson | 304.0 | 103.0 | +201.0 | 201.0 |
+| cooper dejean | 300.0 | 112.0 | +188.0 | 188.0 |
+| alex singleton | 301.0 | 119.0 | +182.0 | 182.0 |
+| kenyon sadiq | 241.0 | 70.0 | +171.0 | 171.0 |
+| demarcus lawrence | 444.0 | 281.0 | +163.0 | 163.0 |
 
 ## Largest decliners after voter balancing
 
 | Player | Raw rank | Balanced rank | Improvement | |Δ rank| |
 |---|---:|---:|---:|---:|
-| jonathon cooper | 85.0 | 383.0 | -298.0 | 298.0 |
-| chuba hubbard | 155.0 | 402.0 | -247.0 | 247.0 |
-| christian rozeboom | 266.0 | 481.0 | -215.0 | 215.0 |
-| cade klubnik | 131.0 | 336.0 | -205.0 | 205.0 |
-| demarvion overshown | 210.5 | 400.5 | -190.0 | 190.0 |
-| tykee smith | 83.0 | 271.0 | -188.0 | 188.0 |
-| tyler warren | 205.0 | 392.0 | -187.0 | 187.0 |
-| juwan johnson | 248.0 | 433.0 | -185.0 | 185.0 |
-| derwin james | 291.0 | 474.0 | -183.0 | 183.0 |
-| cashius howell | 247.0 | 423.0 | -176.0 | 176.0 |
-| travon walker | 239.0 | 408.0 | -169.0 | 169.0 |
-| akheem mesidor | 228.0 | 396.0 | -168.0 | 168.0 |
-| malachi lawrence | 181.0 | 347.0 | -166.0 | 166.0 |
-| quentin lake | 249.5 | 409.0 | -159.5 | 159.5 |
-| myles murphy | 322.0 | 477.0 | -155.0 | 155.0 |
+| jonathon cooper | 88.0 | 393.0 | -305.0 | 305.0 |
+| chuba hubbard | 133.0 | 402.0 | -269.0 | 269.0 |
+| demarvion overshown | 208.0 | 407.0 | -199.0 | 199.0 |
+| christian rozeboom | 285.0 | 479.0 | -194.0 | 194.0 |
+| tyler warren | 211.0 | 405.0 | -194.0 | 194.0 |
+| tykee smith | 84.0 | 272.0 | -188.0 | 188.0 |
+| juwan johnson | 249.0 | 435.0 | -186.0 | 186.0 |
+| cashius howell | 244.0 | 428.0 | -184.0 | 184.0 |
+| derwin james | 294.0 | 477.0 | -183.0 | 183.0 |
+| travon walker | 233.0 | 414.0 | -181.0 | 181.0 |
+| quentin lake | 245.0 | 417.0 | -172.0 | 172.0 |
+| malik mustapha | 295.0 | 455.0 | -160.0 | 160.0 |
+| myles murphy | 323.0 | 481.0 | -158.0 | 158.0 |
+| pat bryant | 299.0 | 454.0 | -155.0 | 155.0 |
+| brian burns | 170.0 | 323.0 | -153.0 | 153.0 |
 
 ## Decision guardrail
 
