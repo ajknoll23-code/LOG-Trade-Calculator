@@ -1,0 +1,1028 @@
+name: Draft Pick Valuation Structural Audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Guard clean repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          test -f index.html
+          test -f scripts/validation/repo_regression_checks.py
+
+      - name: Build read-only draft-pick valuation audit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OUT="/tmp/draft-pick-valuation-structural-audit"
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import math
+          import re
+          import statistics
+          import subprocess
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          ROOT = Path(".")
+          OUT = Path("/tmp/draft-pick-valuation-structural-audit")
+          INDEX = ROOT / "index.html"
+
+          def sha256(path: Path) -> str:
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          def git_head() -> str:
+              return subprocess.check_output(
+                  ["git", "rev-parse", "HEAD"], text=True
+              ).strip()
+
+          html = INDEX.read_text(encoding="utf-8")
+          script_parts = re.findall(
+              r"<script\b[^>]*>(.*?)</script>",
+              html,
+              flags=re.IGNORECASE | re.DOTALL,
+          )
+          if not script_parts:
+              raise RuntimeError("No inline JavaScript found in index.html")
+          js = "\n".join(script_parts)
+
+          # ---------- JavaScript source extraction ----------
+          def scan_balanced(text: str, open_idx: int, open_ch: str, close_ch: str) -> int:
+              if text[open_idx] != open_ch:
+                  raise ValueError("scan_balanced start mismatch")
+              depth = 0
+              i = open_idx
+              quote = None
+              escaped = False
+              line_comment = False
+              block_comment = False
+              while i < len(text):
+                  ch = text[i]
+                  nxt = text[i + 1] if i + 1 < len(text) else ""
+
+                  if line_comment:
+                      if ch == "\n":
+                          line_comment = False
+                      i += 1
+                      continue
+
+                  if block_comment:
+                      if ch == "*" and nxt == "/":
+                          block_comment = False
+                          i += 2
+                      else:
+                          i += 1
+                      continue
+
+                  if quote:
+                      if escaped:
+                          escaped = False
+                          i += 1
+                          continue
+                      if ch == "\\":
+                          escaped = True
+                          i += 1
+                          continue
+                      if ch == quote:
+                          quote = None
+                      i += 1
+                      continue
+
+                  if ch == "/" and nxt == "/":
+                      line_comment = True
+                      i += 2
+                      continue
+                  if ch == "/" and nxt == "*":
+                      block_comment = True
+                      i += 2
+                      continue
+                  if ch in ("'", '"', "`"):
+                      quote = ch
+                      i += 1
+                      continue
+
+                  if ch == open_ch:
+                      depth += 1
+                  elif ch == close_ch:
+                      depth -= 1
+                      if depth == 0:
+                          return i
+                  i += 1
+
+              raise RuntimeError(
+                  f"Unbalanced JavaScript {open_ch}{close_ch} starting at {open_idx}"
+              )
+
+          def extract_function(text: str, name: str):
+              m = re.search(
+                  rf"\bfunction\s+{re.escape(name)}\s*\([^)]*\)\s*\{{",
+                  text,
+              )
+              if m:
+                  brace = text.find("{", m.start())
+                  end = scan_balanced(text, brace, "{", "}")
+                  return text[m.start():end + 1].strip()
+
+              m = re.search(
+                  rf"\b(?:const|let|var)\s+{re.escape(name)}\s*=\s*"
+                  rf"function\s*\([^)]*\)\s*\{{",
+                  text,
+              )
+              if m:
+                  brace = text.find("{", m.start())
+                  end = scan_balanced(text, brace, "{", "}")
+                  semi = end + 1
+                  while semi < len(text) and text[semi].isspace():
+                      semi += 1
+                  if semi < len(text) and text[semi] == ";":
+                      semi += 1
+                  return text[m.start():semi].strip()
+
+              m = re.search(
+                  rf"\b(?:const|let|var)\s+{re.escape(name)}\s*=\s*"
+                  rf"(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>\s*\{{",
+                  text,
+              )
+              if m:
+                  brace = text.find("{", m.start())
+                  end = scan_balanced(text, brace, "{", "}")
+                  semi = end + 1
+                  while semi < len(text) and text[semi].isspace():
+                      semi += 1
+                  if semi < len(text) and text[semi] == ";":
+                      semi += 1
+                  return text[m.start():semi].strip()
+
+              m = re.search(
+                  rf"\b(?:const|let|var)\s+{re.escape(name)}\s*=\s*"
+                  rf"(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>",
+                  text,
+              )
+              if m:
+                  i = m.end()
+                  quote = None
+                  escaped = False
+                  p = b = c = 0
+                  while i < len(text):
+                      ch = text[i]
+                      if quote:
+                          if escaped:
+                              escaped = False
+                          elif ch == "\\":
+                              escaped = True
+                          elif ch == quote:
+                              quote = None
+                      else:
+                          if ch in ("'", '"', "`"):
+                              quote = ch
+                          elif ch == "(":
+                              p += 1
+                          elif ch == ")":
+                              p -= 1
+                          elif ch == "[":
+                              b += 1
+                          elif ch == "]":
+                              b -= 1
+                          elif ch == "{":
+                              c += 1
+                          elif ch == "}":
+                              c -= 1
+                          elif ch == ";" and p == b == c == 0:
+                              return text[m.start():i + 1].strip()
+                      i += 1
+              return None
+
+          def extract_var_decl(text: str, name: str):
+              m = re.search(
+                  rf"\b(?:const|let|var)\s+{re.escape(name)}\s*=",
+                  text,
+              )
+              if not m:
+                  return None
+              i = m.end()
+              quote = None
+              escaped = False
+              p = b = c = 0
+              line_comment = False
+              block_comment = False
+              while i < len(text):
+                  ch = text[i]
+                  nxt = text[i + 1] if i + 1 < len(text) else ""
+                  if line_comment:
+                      if ch == "\n":
+                          line_comment = False
+                      i += 1
+                      continue
+                  if block_comment:
+                      if ch == "*" and nxt == "/":
+                          block_comment = False
+                          i += 2
+                      else:
+                          i += 1
+                      continue
+                  if quote:
+                      if escaped:
+                          escaped = False
+                      elif ch == "\\":
+                          escaped = True
+                      elif ch == quote:
+                          quote = None
+                      i += 1
+                      continue
+                  if ch == "/" and nxt == "/":
+                      line_comment = True
+                      i += 2
+                      continue
+                  if ch == "/" and nxt == "*":
+                      block_comment = True
+                      i += 2
+                      continue
+                  if ch in ("'", '"', "`"):
+                      quote = ch
+                  elif ch == "(":
+                      p += 1
+                  elif ch == ")":
+                      p -= 1
+                  elif ch == "[":
+                      b += 1
+                  elif ch == "]":
+                      b -= 1
+                  elif ch == "{":
+                      c += 1
+                  elif ch == "}":
+                      c -= 1
+                  elif ch == ";" and p == b == c == 0:
+                      return text[m.start():i + 1].strip()
+                  i += 1
+              return None
+
+          def extract_round_expression(text: str):
+              candidates = []
+              for m in re.finditer(
+                  r"\bp\.value\s*=\s*Math\.round\s*\(",
+                  text,
+              ):
+                  open_idx = text.find("(", m.start())
+                  end = scan_balanced(text, open_idx, "(", ")")
+                  expr = text[open_idx + 1:end].strip()
+                  stmt_end = end + 1
+                  while stmt_end < len(text) and text[stmt_end].isspace():
+                      stmt_end += 1
+                  if stmt_end < len(text) and text[stmt_end] == ";":
+                      stmt_end += 1
+                  statement = text[m.start():stmt_end].strip()
+                  candidates.append({
+                      "expression": expr,
+                      "statement": statement,
+                      "start": m.start(),
+                  })
+              relevant = [
+                  c for c in candidates
+                  if "pickRoundBaseValue" in c["expression"]
+                  and "futurePickYearDiscount" in c["expression"]
+              ]
+              if len(relevant) != 1:
+                  raise RuntimeError(
+                      "Expected exactly one draft-pick numeric assignment using "
+                      "pickRoundBaseValue and futurePickYearDiscount; "
+                      f"found {len(relevant)}"
+                  )
+              return relevant[0]
+
+          helper_names = (
+              "pickRoundBaseValue",
+              "futurePickYearDiscount",
+              "getDraftSlotTier",
+          )
+          helper_sources = {
+              name: extract_function(js, name)
+              for name in helper_names
+          }
+          for required in ("pickRoundBaseValue", "futurePickYearDiscount"):
+              if not helper_sources[required]:
+                  raise RuntimeError(
+                      f"Could not extract deployed helper {required} from index.html"
+                  )
+
+          assignment = extract_round_expression(js)
+
+          base_year_matches = re.findall(
+              r"\byearsOut\s*=\s*Math\.max\s*\(\s*0\s*,\s*"
+              r"year\s*-\s*(20\d{2})\s*\)",
+              js,
+          )
+          base_years = sorted({int(x) for x in base_year_matches})
+          if len(base_years) != 1:
+              raise RuntimeError(
+                  f"Expected one deployed future-pick base year, found {base_years}"
+              )
+          base_year = base_years[0]
+
+          slot_tokens = (
+              "futureDraftPosition",
+              "draftPosition",
+              "draftSlot",
+              "pickSlot",
+              "projectedPosition",
+              "getDraftSlotTier",
+          )
+          numeric_assignment_slot_tokens = [
+              token for token in slot_tokens
+              if token.lower() in assignment["expression"].lower()
+          ]
+          numeric_value_is_slot_independent_by_source = (
+              len(numeric_assignment_slot_tokens) == 0
+          )
+
+          a0 = max(0, assignment["start"] - 1000)
+          a1 = min(len(js), assignment["start"] + 1400)
+          assignment_context = js[a0:a1].strip()
+
+          # ---------- Minimal exact Node evaluation of deployed helpers ----------
+          JS_KEYWORDS = {
+              "break","case","catch","class","const","continue","debugger","default",
+              "delete","do","else","export","extends","finally","for","function",
+              "if","import","in","instanceof","let","new","return","super","switch",
+              "this","throw","try","typeof","var","void","while","with","yield",
+              "true","false","null","undefined","NaN","Infinity","of","await",
+              "async","static","get","set",
+          }
+          JS_BUILTINS = {
+              "Math","Number","String","Boolean","Array","Object","JSON","Date",
+              "RegExp","Set","Map","parseInt","parseFloat","isNaN","console",
+              "Error","TypeError","Promise","BigInt",
+          }
+
+          def identifiers(source: str):
+              return set(re.findall(
+                  r"(?<!\.)\b[A-Za-z_$][A-Za-z0-9_$]*\b",
+                  source,
+              ))
+
+          resolved = {}
+          for name, src in helper_sources.items():
+              if src:
+                  resolved[name] = src
+
+          for _ in range(8):
+              added = False
+              combined = "\n".join(resolved.values())
+              for ident in sorted(identifiers(combined)):
+                  if ident in resolved or ident in JS_KEYWORDS or ident in JS_BUILTINS:
+                      continue
+                  src = extract_function(js, ident)
+                  if src is None:
+                      src = extract_var_decl(js, ident)
+                  if src is None or len(src) > 50000:
+                      continue
+                  resolved[ident] = src
+                  added = True
+              if not added:
+                  break
+
+          source_items = []
+          for name, src in resolved.items():
+              pos = js.find(src)
+              source_items.append((pos if pos >= 0 else 10**12, name, src))
+          source_items.sort()
+
+          harness = "\n\n".join(src for _, _, src in source_items)
+          harness += r'''
+
+          function auditSafe(fn) {
+            try {
+              const value = fn();
+              if (typeof value === "number" && !Number.isFinite(value)) {
+                return {__error: "non-finite"};
+              }
+              return value;
+            } catch (e) {
+              return {__error: String(e && e.message ? e.message : e)};
+            }
+          }
+
+          const auditOutput = {
+            roundBase: [],
+            discount: [],
+            slotTrials: {},
+          };
+
+          for (let r = 1; r <= 12; r++) {
+            auditOutput.roundBase.push({
+              round: r,
+              value: auditSafe(() => pickRoundBaseValue(r)),
+            });
+          }
+          for (let y = 0; y <= 10; y++) {
+            auditOutput.discount.push({
+              yearsOut: y,
+              value: auditSafe(() => futurePickYearDiscount(y)),
+            });
+          }
+
+          if (typeof getDraftSlotTier === "function") {
+            const trials = {
+              numeric: s => getDraftSlotTier(s),
+              futureDraftPosition: s => getDraftSlotTier({
+                futureDraftPosition: s,
+                pickRound: 1,
+                pickYear: 2026,
+                year: 2026,
+              }),
+              draftPosition: s => getDraftSlotTier({
+                draftPosition: s,
+                pickRound: 1,
+                pickYear: 2026,
+                year: 2026,
+              }),
+              draftSlot: s => getDraftSlotTier({
+                draftSlot: s,
+                pickRound: 1,
+                pickYear: 2026,
+                year: 2026,
+              }),
+              projectedPosition: s => getDraftSlotTier({
+                projectedPosition: s,
+                pickRound: 1,
+                pickYear: 2026,
+                year: 2026,
+              }),
+            };
+            for (const [name, fn] of Object.entries(trials)) {
+              auditOutput.slotTrials[name] = [];
+              for (let s = 1; s <= 12; s++) {
+                auditOutput.slotTrials[name].push({
+                  slot: s,
+                  value: auditSafe(() => fn(s)),
+                });
+              }
+            }
+          }
+
+          process.stdout.write(JSON.stringify(auditOutput));
+          '''
+
+          harness_path = OUT / "deployed_pick_helper_harness.js"
+          harness_path.write_text(harness + "\n", encoding="utf-8")
+
+          node = subprocess.run(
+              ["node", str(harness_path)],
+              text=True,
+              capture_output=True,
+          )
+          if node.returncode != 0:
+              raise RuntimeError(
+                  "Exact deployed helper evaluation failed.\n"
+                  f"STDOUT:\n{node.stdout}\nSTDERR:\n{node.stderr}"
+              )
+          try:
+              eval_out = json.loads(node.stdout)
+          except json.JSONDecodeError as e:
+              raise RuntimeError(
+                  f"Node helper harness returned non-JSON output: {node.stdout[:1000]}"
+              ) from e
+
+          def plain_numeric(v):
+              return (
+                  isinstance(v, (int, float))
+                  and not isinstance(v, bool)
+                  and math.isfinite(float(v))
+              )
+
+          round_rows = []
+          for row in eval_out["roundBase"]:
+              if plain_numeric(row["value"]):
+                  round_rows.append({
+                      "round": int(row["round"]),
+                      "base_value": float(row["value"]),
+                  })
+
+          if len(round_rows) < 4:
+              raise RuntimeError(
+                  f"Deployed pickRoundBaseValue yielded only {len(round_rows)} "
+                  "numeric outputs across rounds 1-12"
+              )
+
+          modeled_rounds = [
+              r for r in round_rows if r["base_value"] > 0
+          ]
+          if not modeled_rounds:
+              raise RuntimeError("No positive deployed round base values found")
+
+          discount_rows = []
+          for row in eval_out["discount"]:
+              if plain_numeric(row["value"]):
+                  discount_rows.append({
+                      "years_out": int(row["yearsOut"]),
+                      "discount": float(row["value"]),
+                      "year": base_year + int(row["yearsOut"]),
+                  })
+          if len(discount_rows) < 5:
+              raise RuntimeError("Too few numeric future-pick discount outputs")
+
+          chosen_slot_trial = None
+          chosen_slot_rows = None
+          for trial_name, rows in eval_out.get("slotTrials", {}).items():
+              vals = []
+              ok = True
+              for row in rows:
+                  v = row.get("value")
+                  if isinstance(v, dict) and "__error" in v:
+                      ok = False
+                      break
+                  if isinstance(v, (dict, list)):
+                      vals.append(json.dumps(v, sort_keys=True))
+                  else:
+                      vals.append(str(v))
+              if ok and len(set(vals)) >= 2:
+                  chosen_slot_trial = trial_name
+                  chosen_slot_rows = rows
+                  break
+
+          if chosen_slot_rows is None:
+              for trial_name, rows in eval_out.get("slotTrials", {}).items():
+                  if all(
+                      not (
+                          isinstance(row.get("value"), dict)
+                          and "__error" in row.get("value")
+                      )
+                      for row in rows
+                  ):
+                      chosen_slot_trial = trial_name
+                      chosen_slot_rows = rows
+                      break
+
+          slot_tiers = None
+          if chosen_slot_rows is not None:
+              slot_tiers = [
+                  {"slot": int(r["slot"]), "tier": r["value"]}
+                  for r in chosen_slot_rows
+              ]
+
+          # ---------- Structural calculations ----------
+          round_monotonic_violations = []
+          sorted_rounds = sorted(modeled_rounds, key=lambda x: x["round"])
+          for left, right in zip(sorted_rounds, sorted_rounds[1:]):
+              if right["base_value"] > left["base_value"] + 1e-12:
+                  round_monotonic_violations.append({
+                      "earlier_round": left,
+                      "later_round": right,
+                  })
+
+          year_monotonic_violations = []
+          sorted_discounts = sorted(discount_rows, key=lambda x: x["years_out"])
+          for left, right in zip(sorted_discounts, sorted_discounts[1:]):
+              if right["discount"] > left["discount"] + 1e-12:
+                  year_monotonic_violations.append({
+                      "nearer_year": left,
+                      "farther_year": right,
+                  })
+
+          discount_step_ratios = []
+          for left, right in zip(sorted_discounts, sorted_discounts[1:]):
+              ratio = (
+                  right["discount"] / left["discount"]
+                  if left["discount"] != 0 else None
+              )
+              discount_step_ratios.append({
+                  "from_years_out": left["years_out"],
+                  "to_years_out": right["years_out"],
+                  "ratio": ratio,
+              })
+          finite_step_ratios = [
+              x["ratio"] for x in discount_step_ratios
+              if x["ratio"] is not None and math.isfinite(x["ratio"])
+          ]
+          constant_ratio = (
+              bool(finite_step_ratios)
+              and max(finite_step_ratios) - min(finite_step_ratios) <= 1e-12
+          )
+          discount_shape = (
+              "geometric_constant_step_ratio"
+              if constant_ratio
+              else "piecewise_or_non_geometric"
+          )
+
+          round_spacing = []
+          for left, right in zip(sorted_rounds, sorted_rounds[1:]):
+              round_spacing.append({
+                  "from_round": left["round"],
+                  "to_round": right["round"],
+                  "absolute_drop": left["base_value"] - right["base_value"],
+                  "later_over_earlier_ratio": (
+                      right["base_value"] / left["base_value"]
+                      if left["base_value"] else None
+                  ),
+              })
+
+          modeled_values = []
+          for rr in sorted_rounds:
+              for dd in sorted_discounts:
+                  raw = rr["base_value"] * dd["discount"]
+                  value = math.floor(raw + 0.5)
+                  modeled_values.append({
+                      "round": rr["round"],
+                      "year": dd["year"],
+                      "years_out": dd["years_out"],
+                      "round_base": rr["base_value"],
+                      "discount": dd["discount"],
+                      "pre_round_value": raw,
+                      "deployed_value": int(value),
+                      "distinct_numeric_values_across_12_slots": (
+                          1 if numeric_value_is_slot_independent_by_source else None
+                      ),
+                  })
+
+          collisions = {}
+          for row in modeled_values:
+              collisions.setdefault(row["deployed_value"], []).append({
+                  "round": row["round"],
+                  "year": row["year"],
+                  "years_out": row["years_out"],
+              })
+          collision_groups = [
+              {
+                  "deployed_value": value,
+                  "combinations": combos,
+                  "combination_count": len(combos),
+              }
+              for value, combos in sorted(collisions.items(), reverse=True)
+              if len(combos) > 1
+          ]
+
+          adjacent_year_collisions = []
+          by_round = {}
+          for row in modeled_values:
+              by_round.setdefault(row["round"], []).append(row)
+          for rnd, rows in by_round.items():
+              rows.sort(key=lambda r: r["years_out"])
+              for a, b in zip(rows, rows[1:]):
+                  if a["deployed_value"] == b["deployed_value"]:
+                      adjacent_year_collisions.append({
+                          "round": rnd,
+                          "nearer_year": a["year"],
+                          "farther_year": b["year"],
+                          "deployed_value": a["deployed_value"],
+                      })
+
+          related_files = []
+          for root_name in ("research", "scripts"):
+              root = ROOT / root_name
+              if not root.exists():
+                  continue
+              for p in root.rglob("*"):
+                  if not p.is_file():
+                      continue
+                  base = p.name.lower()
+                  if any(tok in base for tok in ("draft", "pick", "slot")):
+                      related_files.append(p.as_posix())
+          related_files = sorted(set(related_files))[:250]
+
+          slot_tier_distinct = None
+          if slot_tiers is not None:
+              canonical = [
+                  json.dumps(x["tier"], sort_keys=True)
+                  if isinstance(x["tier"], (dict, list))
+                  else str(x["tier"])
+                  for x in slot_tiers
+              ]
+              slot_tier_distinct = len(set(canonical))
+
+          source_facts = {
+              "numeric_assignment_statement": assignment["statement"],
+              "numeric_assignment_expression": assignment["expression"],
+              "numeric_assignment_slot_tokens": numeric_assignment_slot_tokens,
+              "numeric_value_is_slot_independent_by_source": (
+                  numeric_value_is_slot_independent_by_source
+              ),
+              "future_pick_base_year": base_year,
+              "futureDraftPosition_present_anywhere_in_js": (
+                  "futureDraftPosition" in js
+              ),
+              "getDraftSlotTier_present": helper_sources["getDraftSlotTier"] is not None,
+              "slot_tier_invocation_used_for_audit": chosen_slot_trial,
+              "slot_tier_distinct_outputs_1_to_12": slot_tier_distinct,
+              "ui_or_metadata_distinguishes_slot_while_numeric_value_is_flat": (
+                  numeric_value_is_slot_independent_by_source
+                  and (
+                      "futureDraftPosition" in js
+                      or (
+                          slot_tier_distinct is not None
+                          and slot_tier_distinct >= 2
+                      )
+                  )
+              ),
+          }
+
+          report = {
+              "schema_version": 1,
+              "study_id": "draft-pick-valuation-structural-audit-v1",
+              "status": "read_only_deployed_draft_pick_architecture_audit",
+              "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+              "git_sha": git_head(),
+              "research_only": True,
+              "read_only": True,
+              "ktc_used": False,
+              "market_value_used": False,
+              "package_vote_data_used": False,
+              "production_v2_phase9_read": False,
+              "2026_realized_outcomes_used": False,
+              "candidate_fit_performed": False,
+              "candidate_selected": False,
+              "draft_pick_formula_changed": False,
+              "production_change_authorized": False,
+              "source_sha256": {
+                  "index_html": sha256(INDEX),
+              },
+              "deployed_source_facts": source_facts,
+              "helper_sources": {
+                  name: {
+                      "present": src is not None,
+                      "sha256": (
+                          hashlib.sha256(src.encode("utf-8")).hexdigest()
+                          if src is not None else None
+                      ),
+                      "source": src,
+                  }
+                  for name, src in helper_sources.items()
+              },
+              "numeric_assignment_context": assignment_context,
+              "round_base_values_raw_1_to_12": eval_out["roundBase"],
+              "modeled_positive_round_base_values": sorted_rounds,
+              "future_discount_values_0_to_10_years_out": sorted_discounts,
+              "future_discount_step_ratios": discount_step_ratios,
+              "future_discount_shape": discount_shape,
+              "round_spacing": round_spacing,
+              "slot_tiers_1_to_12": slot_tiers,
+              "slot_tier_trial_raw": eval_out.get("slotTrials", {}),
+              "modeled_numeric_values": modeled_values,
+              "rounding_collision_groups": collision_groups,
+              "adjacent_year_rounding_collisions": adjacent_year_collisions,
+              "invariants": {
+                  "round_monotonicity_violations": round_monotonic_violations,
+                  "future_year_monotonicity_violations": year_monotonic_violations,
+                  "round_monotonicity_pass": len(round_monotonic_violations) == 0,
+                  "future_year_monotonicity_pass": len(year_monotonic_violations) == 0,
+              },
+              "related_repo_files_by_filename_only": related_files,
+              "interpretation_guardrail": (
+                  "This audit describes the deployed mathematical architecture. "
+                  "Slot-flat numeric valuation, if present, is an architectural "
+                  "fact and not by itself evidence that the pick model is wrong. "
+                  "No historical rookie outcome or market-value target was fit."
+              ),
+              "next_research_if_warranted": (
+                  "If slot-flat valuation is confirmed and considered material, "
+                  "the next defensible step is a separately preregistered historical "
+                  "rookie-outcome study of within-round slot gradients and future-year "
+                  "discounting. This diagnostic does not select such a curve."
+              ),
+          }
+
+          json_path = OUT / "draft_pick_valuation_structural_audit_v1.json"
+          json_path.write_text(
+              json.dumps(report, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          def fmt(v, digits=4):
+              if v is None:
+                  return "n/a"
+              if isinstance(v, bool):
+                  return "yes" if v else "no"
+              if isinstance(v, int):
+                  return str(v)
+              return f"{float(v):.{digits}f}"
+
+          lines = [
+              "# Draft Pick Valuation Structural Audit V1",
+              "",
+              "**Status:** read-only deployed-architecture audit",
+              "",
+              "No KTC, market value, package votes, Production V2 Phase 9, "
+              "2026 realized outcomes, or candidate fitting were used.",
+              "",
+              "## Exact deployed numeric assignment",
+              "",
+              "```javascript",
+              assignment["statement"],
+              "```",
+              "",
+              f"- Future-pick base year inferred from deployed source: **{base_year}**.",
+              f"- Projected draft slot enters the numeric assignment: "
+              f"**{'YES' if not numeric_value_is_slot_independent_by_source else 'NO'}**.",
+              f"- `futureDraftPosition` exists elsewhere in deployed JavaScript: "
+              f"**{'YES' if source_facts['futureDraftPosition_present_anywhere_in_js'] else 'NO'}**.",
+              f"- Slot-tier/UI helper exists: "
+              f"**{'YES' if source_facts['getDraftSlotTier_present'] else 'NO'}**.",
+              "",
+              "## Round base values",
+              "",
+              "| Round | Base value |",
+              "|---:|---:|",
+          ]
+          for row in sorted_rounds:
+              lines.append(
+                  f"| {row['round']} | {fmt(row['base_value'], 2)} |"
+              )
+
+          lines += [
+              "",
+              "## Future-year discount schedule",
+              "",
+              "| Year | Years out | Discount | Step ratio vs prior year |",
+              "|---:|---:|---:|---:|",
+          ]
+          step_by_to = {
+              x["to_years_out"]: x["ratio"]
+              for x in discount_step_ratios
+          }
+          for row in sorted_discounts:
+              lines.append(
+                  f"| {row['year']} | {row['years_out']} | "
+                  f"{fmt(row['discount'], 6)} | "
+                  f"{fmt(step_by_to.get(row['years_out']), 6)} |"
+              )
+
+          lines += [
+              "",
+              f"Discount shape over the evaluated deployed helper horizon: "
+              f"**{discount_shape}**.",
+              "",
+              "## Structural invariants",
+              "",
+              f"- Earlier-round monotonicity: "
+              f"**{'PASS' if not round_monotonic_violations else 'FAIL'}**.",
+              f"- Nearer-year monotonicity: "
+              f"**{'PASS' if not year_monotonic_violations else 'FAIL'}**.",
+              f"- Numeric slot dependence: "
+              f"**{'present' if not numeric_value_is_slot_independent_by_source else 'absent'}**.",
+              "",
+          ]
+
+          if slot_tiers is not None:
+              lines += [
+                  "## Slot metadata / UI tiering",
+                  "",
+                  f"Exact helper invocation selected: `{chosen_slot_trial}`.",
+                  "",
+                  "| Projected slot | UI/helper tier |",
+                  "|---:|---|",
+              ]
+              for row in slot_tiers:
+                  tier = row["tier"]
+                  if isinstance(tier, (dict, list)):
+                      tier = json.dumps(tier, sort_keys=True)
+                  lines.append(f"| {row['slot']} | `{tier}` |")
+              lines += [""]
+
+          if (
+              source_facts[
+                  "ui_or_metadata_distinguishes_slot_while_numeric_value_is_flat"
+              ]
+          ):
+              lines += [
+                  "## Key architectural finding",
+                  "",
+                  "The deployed application distinguishes projected within-round "
+                  "slot in metadata/UI, while the raw numeric draft-pick value is "
+                  "computed from **round base × future-year discount only**. "
+                  "Therefore, for a fixed round and year, projected slots 1 through "
+                  "12 receive the same raw numeric value under the deployed formula.",
+                  "",
+                  "That is a structural fact, **not yet a finding that the model is "
+                  "wrong**. Establishing a within-round gradient would require a "
+                  "separately preregistered outcome study.",
+                  "",
+              ]
+
+          lines += [
+              "## Rounding collisions",
+              "",
+              f"- Cross round/year collision groups in the enumerated helper horizon: "
+              f"**{len(collision_groups)}**.",
+              f"- Same-round adjacent-year collisions: "
+              f"**{len(adjacent_year_collisions)}**.",
+              "",
+              "## Research guardrail",
+              "",
+              "This audit does not estimate or recommend a slot curve, draft-class "
+              "strength coefficient, or replacement discount. Any such model must "
+              "be frozen in a separate preregistration before fitting.",
+              "",
+          ]
+
+          md = "\n".join(lines)
+          md_path = OUT / "draft_pick_valuation_structural_audit_v1.md"
+          md_path.write_text(md + "\n", encoding="utf-8")
+
+          summary_path = Path(
+              __import__("os").environ.get(
+                  "GITHUB_STEP_SUMMARY",
+                  "/tmp/draft-pick-audit-summary.md",
+              )
+          )
+          with summary_path.open("a", encoding="utf-8") as f:
+              f.write(md + "\n")
+
+          print(md)
+          PY
+
+      - name: Validate scientific and architecture contract
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path(
+              "/tmp/draft-pick-valuation-structural-audit/"
+              "draft_pick_valuation_structural_audit_v1.json"
+          )
+          r = json.loads(path.read_text())
+
+          assert r["status"] == "read_only_deployed_draft_pick_architecture_audit"
+          assert r["research_only"] is True
+          assert r["read_only"] is True
+          assert r["ktc_used"] is False
+          assert r["market_value_used"] is False
+          assert r["package_vote_data_used"] is False
+          assert r["production_v2_phase9_read"] is False
+          assert r["2026_realized_outcomes_used"] is False
+          assert r["candidate_fit_performed"] is False
+          assert r["candidate_selected"] is False
+          assert r["draft_pick_formula_changed"] is False
+          assert r["production_change_authorized"] is False
+
+          facts = r["deployed_source_facts"]
+          assert "pickRoundBaseValue" in facts["numeric_assignment_expression"]
+          assert "futurePickYearDiscount" in facts["numeric_assignment_expression"]
+
+          assert len(r["modeled_positive_round_base_values"]) >= 1
+          assert len(r["future_discount_values_0_to_10_years_out"]) >= 5
+          assert r["invariants"]["round_monotonicity_pass"] is True
+          assert r["invariants"]["future_year_monotonicity_pass"] is True
+
+          if facts["numeric_value_is_slot_independent_by_source"]:
+              for row in r["modeled_numeric_values"]:
+                  assert row["distinct_numeric_values_across_12_slots"] == 1
+
+          print(
+              "PASS: draft-pick audit is read-only, non-market, non-outcome, "
+              "non-fitting, and exact-source grounded."
+          )
+          PY
+
+      - name: Run repository regression checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install "requests==2.34.2"
+          python3 scripts/validation/repo_regression_checks.py
+
+      - name: Upload audit artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: draft-pick-valuation-structural-audit-v1
+          path: /tmp/draft-pick-valuation-structural-audit/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Prove repository stayed unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          echo "PASS: draft-pick valuation audit made no repository changes."
