@@ -1,0 +1,1062 @@
+name: Package Adjustment NextGen V2 M3 Development Fit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  fit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13.15'
+
+      - name: Install frozen fit dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install "numpy==2.3.3" "scipy==1.16.2" "requests==2.34.2"
+
+      - name: Guard frozen M3 preregistration and spent evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          D="research/package-adjustment-nextgen-v2"
+
+          test -z "$(git status --porcelain=v1)"
+
+          test "$(git hash-object "$D/m3_development_preregistration_v1.json")" = \
+            "ff29e53ff05e1a96e47d9f91e535585d438f788f"
+          test "$(git hash-object "$D/m3_development_preregistration_v1_manifest.json")" = \
+            "afda67beb00a94011f0dae2bfe2549a9ba8c3cfa"
+          test "$(git hash-object "$D/prospective_exact_900_frozen_v1.json")" = \
+            "e0a6e80d98c19b9fa672b863844e4541817dbc88"
+          test "$(git hash-object "$D/package_vote_challenges_prospective_v1.json")" = \
+            "b338b18291c5058c5a2b941e1293322e2e70ea8c"
+          test "$(git hash-object "$D/research_candidate_m2b_v1.json")" = \
+            "1560124540e1104fdc4f4e9f367d984b46921cb9"
+
+          test "$(sha256sum "$D/m3_development_preregistration_v1.json" | awk '{print $1}')" = \
+            "9b3e6b45d04d8859b7ecc413847cd2c67a49fa0e4163fd3d8136839f47e07ca8"
+          test "$(sha256sum "$D/prospective_exact_900_frozen_v1.json" | awk '{print $1}')" = \
+            "9b00c103efb47dd54976bb0c9d35c8c87cf96ea9c9d7adeac5db15552b2e9c8c"
+
+          for p in \
+            "$D/m3_development_fit_results_v1.json" \
+            "$D/m3_development_fit_summary_v1.md" \
+            "$D/m3_development_fit_manifest_v1.json" \
+            "$D/research_candidate_m3_v1.json" \
+            "$D/research_candidate_m3_v1.md"
+          do
+            test ! -e "$p"
+          done
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          d = Path("research/package-adjustment-nextgen-v2")
+          cfg = json.loads((d / "m3_development_preregistration_v1.json").read_text())
+          man = json.loads((d / "m3_development_preregistration_v1_manifest.json").read_text())
+
+          assert cfg["status"] == "frozen_m3_development_preregistration"
+          assert cfg["frozen"] is True
+          assert cfg["research_only"] is True
+          assert cfg["production_change_authorized"] is False
+          assert set(cfg["candidate_classes"]) == {"M3a", "M3b", "M3c"}
+          assert cfg["cross_validation"]["fold_count"] == 4
+          assert cfg["development_model_selection"]["minimum_combined_cv_improvement"] == 0.003
+          assert cfg["development_model_selection"]["maximum_family_cv_regression"] == 0.003
+          assert cfg["development_model_selection"]["minimum_folds_with_positive_combined_improvement"] == 3
+          assert man["model_fit_performed"] is False
+          assert man["candidate_selected"] is False
+
+          print("PASS: exact frozen M3 development contract is intact.")
+          PY
+
+      - name: Verify production remains V1.6 before development fit
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 \
+            python3 scripts/validation/check_package_adjustment_live.py
+
+      - name: Run preregistered M3 development fit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import bisect
+          import hashlib
+          import json
+          import math
+          from collections import defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import numpy as np
+          from scipy.optimize import minimize
+
+          D = Path("research/package-adjustment-nextgen-v2")
+          CFG_PATH = D / "m3_development_preregistration_v1.json"
+          DATA_PATH = D / "prospective_exact_900_frozen_v1.json"
+          CATALOG_PATH = D / "package_vote_challenges_prospective_v1.json"
+          M2B_PATH = D / "research_candidate_m2b_v1.json"
+          PROSPECTIVE_PREREG_PATH = D / "prospective_time_holdout_preregistration_v1.json"
+
+          RESULTS_PATH = D / "m3_development_fit_results_v1.json"
+          SUMMARY_PATH = D / "m3_development_fit_summary_v1.md"
+          MANIFEST_PATH = D / "m3_development_fit_manifest_v1.json"
+          CANDIDATE_PATH = D / "research_candidate_m3_v1.json"
+          CANDIDATE_MD_PATH = D / "research_candidate_m3_v1.md"
+
+          def sha256(path: Path) -> str:
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          cfg = json.loads(CFG_PATH.read_text())
+          data = json.loads(DATA_PATH.read_text())
+          catalog_doc = json.loads(CATALOG_PATH.read_text())
+          m2b_doc = json.loads(M2B_PATH.read_text())
+          prospective_prereg = json.loads(PROSPECTIVE_PREREG_PATH.read_text())
+
+          assert cfg["status"] == "frozen_m3_development_preregistration"
+          assert cfg["cross_validation"]["fold_count"] == 4
+          assert cfg["optimizer"]["method"] == "scipy_L-BFGS-B"
+
+          ballots = list(data["ballots"])
+          challenges = {c["id"]: c for c in catalog_doc["challenges"]}
+          assert len(ballots) == 960
+          assert len(challenges) == 129
+          assert abs(sum(float(r["frozen_ballot_weight"]) for r in ballots) - 900.0) < 1e-9
+          assert {r["challenge_id"] for r in ballots} == set(challenges)
+
+          # Frozen M2b scoring parameters. The candidate file contains the fitted
+          # parameter vector; the earlier frozen prospective preregistration contains
+          # the exact fixed knot/domain constants used for prospective scoring.
+          p = prospective_prereg["frozen_prediction_models"]["M2b"]
+          candidate_p = m2b_doc["frozen_candidate_parameters"]
+          v_ref = float(p["v_ref"])
+          knots = [float(x) for x in p["knots_normalized"]]
+          domain_max = float(p["inverse_domain_max_normalized"])
+          deltas = [float(x) for x in p["slope_increments"]]
+          assert deltas == [float(x) for x in candidate_p["slope_increments"]]
+          assert abs(float(p["log_beta"]) - float(candidate_p["log_beta"])) < 1e-15
+          assert abs(float(p["delta_left"]) - float(candidate_p["delta_left"])) < 1e-15
+          assert abs(v_ref - 5401.0) < 1e-12
+          assert len(knots) == 6 and len(deltas) == 4
+
+          raw_slopes = [1.0]
+          running = 1.0
+          for dlt in deltas:
+              running += dlt
+              raw_slopes.append(running)
+          raw_y = [0.0] * len(knots)
+          for i, slope in enumerate(raw_slopes):
+              raw_y[i + 1] = raw_y[i] + slope * (knots[i + 1] - knots[i])
+          norm = raw_y[-2]
+          slopes = [s / norm for s in raw_slopes]
+          ys = [y / norm for y in raw_y]
+
+          def g(x: float) -> float:
+              if x < -1e-12 or x > domain_max + 1e-12:
+                  raise RuntimeError(f"asset outside frozen M2b domain: {x}")
+              x = min(max(float(x), 0.0), domain_max)
+              i = bisect.bisect_right(knots, x) - 1
+              i = max(0, min(i, len(slopes) - 1))
+              return ys[i] + slopes[i] * (x - knots[i])
+
+          def inv(u: float) -> float:
+              if u < -1e-12 or u > ys[-1] + 1e-12:
+                  raise RuntimeError(f"utility outside frozen M2b inverse domain: {u}")
+              u = min(max(float(u), 0.0), ys[-1])
+              i = bisect.bisect_right(ys, u) - 1
+              i = max(0, min(i, len(slopes) - 1))
+              return knots[i] + (u - ys[i]) / slopes[i]
+
+          def vals(side):
+              return [float(a["fv"]) for a in side["assets"]]
+
+          def raw_score(side):
+              return float(sum(vals(side)))
+
+          def m2b_score(side):
+              u = sum(g(v / v_ref) for v in vals(side))
+              return v_ref * inv(u)
+
+          def top_share(side):
+              vv = vals(side)
+              return max(vv) / sum(vv)
+
+          def sigmoid(x):
+              x = float(x)
+              if x >= 0:
+                  z = math.exp(-x)
+                  return 1.0 / (1.0 + z)
+              z = math.exp(x)
+              return z / (1.0 + z)
+
+          def softplus(x):
+              x = float(x)
+              if x > 40:
+                  return x
+              if x < -40:
+                  return math.exp(x)
+              return math.log1p(math.exp(x))
+
+          # Precompute challenge features and immutable scores.
+          feats = {}
+          cells_to_challenges = defaultdict(list)
+          for cid, c in challenges.items():
+              a0, b0 = raw_score(c["side_a"]), raw_score(c["side_b"])
+              a2, b2 = m2b_score(c["side_a"]), m2b_score(c["side_b"])
+              ca = int(c["side_a"]["asset_count"])
+              cb = int(c["side_b"]["asset_count"])
+              cell_key = "|".join([
+                  str(c["family"]),
+                  str(c["cell_id"]),
+                  str(c["scale_label"]),
+                  str(c["split"]),
+              ])
+              f = {
+                  "challenge_id": cid,
+                  "family": str(c["family"]),
+                  "cell_id": str(c["cell_id"]),
+                  "scale_label": str(c["scale_label"]),
+                  "split": str(c["split"]),
+                  "cell_key": cell_key,
+                  "m0_a": a0,
+                  "m0_b": b0,
+                  "m2b_a": a2,
+                  "m2b_b": b2,
+                  "mean_raw_side_total": (a0 + b0) / 2.0,
+                  "asset_count_a": ca,
+                  "asset_count_b": cb,
+                  "unequal_count": 1.0 if ca != cb else 0.0,
+                  "extra_assets": float(max(0, max(ca, cb) - 2)),
+                  "maximum_top_asset_share": max(top_share(c["side_a"]), top_share(c["side_b"])),
+              }
+              feats[cid] = f
+              cells_to_challenges[cell_key].append(cid)
+
+          assert len(cells_to_challenges) == 24
+
+          # Deterministic stratified grouped challenge folds.
+          challenge_fold = {}
+          salt = "pkgnv2-m3-cv-v1|"
+          for cell_key in sorted(cells_to_challenges):
+              ordered = sorted(
+                  cells_to_challenges[cell_key],
+                  key=lambda cid: hashlib.sha256((salt + cid).encode()).hexdigest(),
+              )
+              if len(ordered) < 4:
+                  raise RuntimeError(f"cell cannot cover all four folds: {cell_key}")
+              for i, cid in enumerate(ordered):
+                  challenge_fold[cid] = i % 4
+
+          fold_cell_coverage = {i: set() for i in range(4)}
+          for cid, fold in challenge_fold.items():
+              fold_cell_coverage[fold].add(feats[cid]["cell_key"])
+          for fold in range(4):
+              if len(fold_cell_coverage[fold]) != 24:
+                  missing = sorted(set(cells_to_challenges) - fold_cell_coverage[fold])
+                  raise RuntimeError(f"fold {fold} missing cells: {missing}")
+
+          rows = []
+          for r in ballots:
+              cid = r["challenge_id"]
+              left_a = bool(r["canonical_a_displayed_left"])
+              assert left_a == (str(r["display_left"]).upper() == "A")
+              y = 1.0 if str(r["human_choice"]).upper() == "A" else 0.0
+              rows.append({
+                  "challenge_id": cid,
+                  "fold": challenge_fold[cid],
+                  "cell_key": feats[cid]["cell_key"],
+                  "family": feats[cid]["family"],
+                  "weight": float(r["frozen_ballot_weight"]),
+                  "left_a": 1.0 if left_a else 0.0,
+                  "y": y,
+              })
+
+          def alpha_for(model: str, theta_gate, f):
+              if model in {"M0", "M2b"}:
+                  return 0.0 if model == "M0" else 1.0
+
+              a0 = float(theta_gate[0])
+              z = a0 + softplus(theta_gate[1]) * math.log(f["mean_raw_side_total"] / v_ref)
+              if model in {"M3b", "M3c"}:
+                  z -= softplus(theta_gate[2]) * f["unequal_count"]
+                  z -= softplus(theta_gate[3]) * f["extra_assets"]
+              if model == "M3c":
+                  z += softplus(theta_gate[4]) * (f["maximum_top_asset_share"] - 0.5)
+              return sigmoid(z)
+
+          gate_dim = {"M0": 0, "M2b": 0, "M3a": 2, "M3b": 4, "M3c": 5}
+
+          def scores(model, theta_gate, f):
+              if model == "M0":
+                  return f["m0_a"], f["m0_b"], 0.0
+              if model == "M2b":
+                  return f["m2b_a"], f["m2b_b"], 1.0
+              a = alpha_for(model, theta_gate, f)
+              sa = f["m0_a"] + a * (f["m2b_a"] - f["m0_a"])
+              sb = f["m0_b"] + a * (f["m2b_b"] - f["m0_b"])
+              return sa, sb, a
+
+          def row_loss(row, model, theta):
+              gd = gate_dim[model]
+              gate = theta[:gd]
+              log_beta = float(theta[gd])
+              delta_left = float(theta[gd + 1])
+              sa, sb, _ = scores(model, gate, feats[row["challenge_id"]])
+              eta = math.exp(log_beta) * ((sa - sb) / v_ref) + delta_left * row["left_a"]
+              return float(np.logaddexp(0.0, eta) - row["y"] * eta)
+
+          def equal_cell_macro(rows_subset, model, theta):
+              by_cell = defaultdict(list)
+              for r in rows_subset:
+                  by_cell[r["cell_key"]].append(r)
+              losses = []
+              for cell in sorted(by_cell):
+                  rr = by_cell[cell]
+                  den = sum(x["weight"] for x in rr)
+                  if den <= 0:
+                      raise RuntimeError("zero cell weight")
+                  losses.append(sum(x["weight"] * row_loss(x, model, theta) for x in rr) / den)
+              return float(sum(losses) / len(losses))
+
+          def validation_predictions(rows_subset, model, theta):
+              out = []
+              gd = gate_dim[model]
+              gate = theta[:gd]
+              log_beta = float(theta[gd])
+              delta_left = float(theta[gd + 1])
+              beta = math.exp(log_beta)
+              for r in rows_subset:
+                  f = feats[r["challenge_id"]]
+                  sa, sb, alpha = scores(model, gate, f)
+                  eta = beta * ((sa - sb) / v_ref) + delta_left * r["left_a"]
+                  loss = float(np.logaddexp(0.0, eta) - r["y"] * eta)
+                  out.append({**r, "loss": loss, "alpha": alpha})
+              return out
+
+          bounds_cfg = cfg["optimizer"]["bounds"]
+          b_gate = tuple(map(float, bounds_cfg["raw_gate_coefficients"]))
+          b_a0 = tuple(map(float, bounds_cfg["a0"]))
+          b_lb = tuple(map(float, bounds_cfg["log_beta"]))
+          b_dl = tuple(map(float, bounds_cfg["delta_left"]))
+          boundary_tol = float(cfg["optimizer"]["boundary_tolerance"])
+          starts_n = int(cfg["optimizer"]["multistart_count_per_model_per_fit"])
+          seed0 = int(cfg["optimizer"]["deterministic_multistart_seed"])
+
+          def bounds_for(model):
+              gd = gate_dim[model]
+              gate_bounds = []
+              if gd:
+                  gate_bounds.append(b_a0)
+                  gate_bounds.extend([b_gate] * (gd - 1))
+              return gate_bounds + [b_lb, b_dl]
+
+          def deterministic_starts(model, fold_token):
+              bounds = bounds_for(model)
+              dim = len(bounds)
+              # One neutral deterministic start plus preregistered seeded random starts.
+              starts = [np.zeros(dim, dtype=float)]
+              seed_material = f"{seed0}|{model}|{fold_token}".encode()
+              seed = int.from_bytes(hashlib.sha256(seed_material).digest()[:8], "big")
+              rng = np.random.default_rng(seed)
+              for _ in range(starts_n - 1):
+                  x = np.array([rng.uniform(lo * 0.5, hi * 0.5) for lo, hi in bounds], dtype=float)
+                  starts.append(x)
+              assert len(starts) == starts_n
+              return starts
+
+          def near_boundary(theta, bounds):
+              hits = []
+              for i, (x, (lo, hi)) in enumerate(zip(theta, bounds)):
+                  if abs(float(x) - lo) <= boundary_tol:
+                      hits.append({"index": i, "side": "lower", "value": float(x), "bound": lo})
+                  if abs(float(x) - hi) <= boundary_tol:
+                      hits.append({"index": i, "side": "upper", "value": float(x), "bound": hi})
+              return hits
+
+          def fit(model, train_rows, fold_token):
+              bounds = bounds_for(model)
+              best = None
+              attempts = []
+              for start_index, x0 in enumerate(deterministic_starts(model, fold_token)):
+                  res = minimize(
+                      lambda x: equal_cell_macro(train_rows, model, x),
+                      x0,
+                      method="L-BFGS-B",
+                      bounds=bounds,
+                      options={"maxiter": 3000, "ftol": 1e-13, "gtol": 1e-8, "maxls": 50},
+                  )
+                  item = {
+                      "start_index": start_index,
+                      "success": bool(res.success),
+                      "status": int(res.status),
+                      "message": str(res.message),
+                      "objective": float(res.fun) if math.isfinite(float(res.fun)) else None,
+                      "nit": int(res.nit),
+                      "parameters": [float(x) for x in res.x],
+                  }
+                  attempts.append(item)
+                  if res.success and math.isfinite(float(res.fun)):
+                      key = (float(res.fun), tuple(float(x) for x in res.x))
+                      if best is None or key < best["key"]:
+                          best = {"key": key, "result": res}
+              if best is None:
+                  return {
+                      "success": False,
+                      "attempts": attempts,
+                      "best": None,
+                      "boundary_hits": [],
+                  }
+              res = best["result"]
+              hits = near_boundary(res.x, bounds)
+              return {
+                  "success": True,
+                  "attempts": attempts,
+                  "best": {
+                      "objective": float(res.fun),
+                      "parameters": [float(x) for x in res.x],
+                      "nit": int(res.nit),
+                  },
+                  "boundary_hits": hits,
+              }
+
+          models = ["M0", "M2b", "M3a", "M3b", "M3c"]
+          cv_fit = {m: {} for m in models}
+          oof = {m: [] for m in models}
+          fold_metrics = {m: {} for m in models}
+
+          for fold in range(4):
+              train = [r for r in rows if r["fold"] != fold]
+              val = [r for r in rows if r["fold"] == fold]
+              assert len({r["cell_key"] for r in val}) == 24
+
+              for model in models:
+                  fit_out = fit(model, train, f"cv{fold}")
+                  cv_fit[model][str(fold)] = fit_out
+                  if not fit_out["success"]:
+                      continue
+                  theta = fit_out["best"]["parameters"]
+                  preds = validation_predictions(val, model, theta)
+                  oof[model].extend(preds)
+
+                  # Fold validation equal-cell macro.
+                  cell_groups = defaultdict(list)
+                  for x in preds:
+                      cell_groups[x["cell_key"]].append(x)
+                  cell_losses = {}
+                  for cell, rr in cell_groups.items():
+                      den = sum(x["weight"] for x in rr)
+                      cell_losses[cell] = sum(x["weight"] * x["loss"] for x in rr) / den
+                  fold_metrics[model][str(fold)] = {
+                      "validation_equal_cell_macro_log_loss": float(sum(cell_losses.values()) / len(cell_losses)),
+                      "validation_cell_count": len(cell_losses),
+                      "fit_boundary_hits": fit_out["boundary_hits"],
+                  }
+
+          for model in models:
+              if len(oof[model]) != len(rows):
+                  raise RuntimeError(f"{model} missing OOF predictions due to fit failure")
+
+          def summarize_oof(preds):
+              by_cell = defaultdict(list)
+              for x in preds:
+                  by_cell[x["cell_key"]].append(x)
+
+              cell = {}
+              for key, rr in sorted(by_cell.items()):
+                  den = sum(x["weight"] for x in rr)
+                  cell[key] = {
+                      "log_loss": float(sum(x["weight"] * x["loss"] for x in rr) / den),
+                      "effective_weight": float(den),
+                      "family": rr[0]["family"],
+                  }
+
+              combined = float(sum(v["log_loss"] for v in cell.values()) / len(cell))
+              fam = {}
+              families = sorted({v["family"] for v in cell.values()})
+              for family in families:
+                  vv = [v["log_loss"] for v in cell.values() if v["family"] == family]
+                  fam[family] = float(sum(vv) / len(vv))
+              return {"combined": combined, "families": fam, "cells": cell}
+
+          cv_summary = {m: summarize_oof(oof[m]) for m in models}
+          base = cv_summary["M0"]
+
+          selection = {}
+          eligible_models = []
+          for model in ["M3a", "M3b", "M3c"]:
+              s = cv_summary[model]
+              improvement = base["combined"] - s["combined"]
+              family_regressions = {
+                  family: s["families"][family] - base["families"][family]
+                  for family in base["families"]
+              }
+              positive_folds = sum(
+                  1 for fold in range(4)
+                  if fold_metrics["M0"][str(fold)]["validation_equal_cell_macro_log_loss"]
+                     - fold_metrics[model][str(fold)]["validation_equal_cell_macro_log_loss"] > 0
+              )
+              all_fit_success = all(cv_fit[model][str(f)]["success"] for f in range(4))
+              any_boundary = any(bool(cv_fit[model][str(f)]["boundary_hits"]) for f in range(4))
+              gates = {
+                  "combined_improvement_at_least_0_003": improvement >= 0.003 - 1e-15,
+                  "no_family_regression_exceeds_0_003": max(family_regressions.values()) <= 0.003 + 1e-15,
+                  "at_least_3_of_4_folds_positive": positive_folds >= 3,
+                  "all_fold_fits_successful": all_fit_success,
+                  "no_optimizer_boundary_solution": not any_boundary,
+              }
+              eligible = all(gates.values())
+              selection[model] = {
+                  "cv_loss": s["combined"],
+                  "cv_improvement_vs_M0": improvement,
+                  "family_regression_vs_M0": family_regressions,
+                  "positive_fold_count": positive_folds,
+                  "gates": gates,
+                  "eligible": eligible,
+                  "complexity_rank": int(cfg["candidate_classes"][model]["complexity_rank"]),
+              }
+              if eligible:
+                  eligible_models.append(model)
+
+          selected = None
+          if eligible_models:
+              best_model = min(eligible_models, key=lambda m: (selection[m]["cv_loss"], m))
+              best_loss = selection[best_model]["cv_loss"]
+              within = [
+                  m for m in eligible_models
+                  if selection[m]["cv_loss"] <= best_loss + 0.001 + 1e-15
+              ]
+              selected = min(
+                  within,
+                  key=lambda m: (selection[m]["complexity_rank"], selection[m]["cv_loss"], m),
+              )
+
+          full_fit = None
+          candidate_written = False
+          candidate_status = None
+          if selected is not None:
+              full_fit = fit(selected, rows, "full")
+              if not full_fit["success"]:
+                  candidate_status = "selected_class_full_refit_failed_unresolved"
+              elif full_fit["boundary_hits"]:
+                  candidate_status = "selected_class_full_refit_boundary_unresolved"
+              else:
+                  candidate_status = "m3_frozen_research_candidate"
+                  theta = full_fit["best"]["parameters"]
+                  gd = gate_dim[selected]
+                  gate = theta[:gd]
+                  candidate = {
+                      "schema_version": 1,
+                      "candidate_id": f"pkgnv2-{selected.lower()}-v1",
+                      "status": "m3_frozen_research_candidate",
+                      "frozen": True,
+                      "research_only": True,
+                      "production_candidate": False,
+                      "production_change_authorized": False,
+                      "automatic_production_promotion_allowed": False,
+                      "selected_model_class": selected,
+                      "selected_model_name": cfg["candidate_classes"][selected]["name"],
+                      "scoring_rule": cfg["shared_score_components"]["M3_side_score"],
+                      "gate_rule": cfg["candidate_classes"][selected]["gate_linear_predictor"],
+                      "parameters": {
+                          "gate_parameter_names": cfg["candidate_classes"][selected]["free_gate_parameters"],
+                          "gate_parameter_values": [float(x) for x in gate],
+                          "log_beta": float(theta[gd]),
+                          "beta": float(math.exp(theta[gd])),
+                          "delta_left": float(theta[gd + 1]),
+                          "v_ref": v_ref,
+                      },
+                      "frozen_M2b_component": {
+                          "candidate_git_blob_sha": "1560124540e1104fdc4f4e9f367d984b46921cb9",
+                          "candidate_sha256": sha256(M2B_PATH),
+                      },
+                      "development_evidence": {
+                          "spent_only": True,
+                          "effective_votes": 900.0,
+                          "raw_ballots": 960,
+                          "challenge_count": 129,
+                          "cell_count": 24,
+                      },
+                      "development_cv": {
+                          "M0_combined_log_loss": base["combined"],
+                          "candidate_combined_log_loss": cv_summary[selected]["combined"],
+                          "improvement_M0_minus_candidate": (
+                              base["combined"] - cv_summary[selected]["combined"]
+                          ),
+                          "family_log_loss": cv_summary[selected]["families"],
+                          "positive_fold_count": selection[selected]["positive_fold_count"],
+                      },
+                      "fresh_prospective_confirmation_required": True,
+                      "parameters_may_not_change_after_freeze": True,
+                      "next_action": (
+                          "Preregister a completely fresh M3 prospective holdout before "
+                          "generating the fresh catalog or collecting new votes."
+                      ),
+                  }
+                  CANDIDATE_PATH.write_text(
+                      json.dumps(candidate, indent=2, sort_keys=True) + "\n",
+                      encoding="utf-8",
+                  )
+                  candidate_md = "\n".join([
+                      "# Frozen NextGen V2 M3 Research Candidate",
+                      "",
+                      "**Status:** `m3_frozen_research_candidate`",
+                      "",
+                      f"- Selected class: **{selected}**",
+                      f"- Development CV M0 loss: **{base['combined']:.6f}**",
+                      f"- Development CV candidate loss: **{cv_summary[selected]['combined']:.6f}**",
+                      f"- Development CV improvement: **{(base['combined'] - cv_summary[selected]['combined']):.6f}**",
+                      f"- Positive folds: **{selection[selected]['positive_fold_count']} / 4**",
+                      "",
+                      "This candidate was selected and refit only on **spent development evidence**. "
+                      "It is not production eligible. Its parameters are frozen and may not change.",
+                      "",
+                      "A completely fresh preregistered prospective holdout is required before any "
+                      "production decision. Production remains V1.6.",
+                      "",
+                  ])
+                  CANDIDATE_MD_PATH.write_text(candidate_md, encoding="utf-8")
+                  candidate_written = True
+
+          # Reference M2b development performance (refit calibration only).
+          m2b_ref = {
+              "cv_loss": cv_summary["M2b"]["combined"],
+              "cv_improvement_vs_M0": base["combined"] - cv_summary["M2b"]["combined"],
+              "family_regression_vs_M0": {
+                  family: cv_summary["M2b"]["families"][family] - base["families"][family]
+                  for family in base["families"]
+              },
+          }
+
+          result_status = (
+              "m3_candidate_frozen_research_only"
+              if candidate_written
+              else (
+                  candidate_status
+                  if candidate_status is not None
+                  else "no_m3_candidate_qualified_under_frozen_rules"
+              )
+          )
+
+          generated = datetime.now(timezone.utc).isoformat()
+          results = {
+              "schema_version": 1,
+              "fit_id": "pkgnv2-m3-development-fit-v1",
+              "status": result_status,
+              "generated_at_utc": generated,
+              "research_only": True,
+              "production_change_authorized": False,
+              "automatic_production_promotion_allowed": False,
+              "production_revision_unchanged": "v1.6-v5-size2-composition-overlay",
+              "preregistration": {
+                  "git_blob_sha": "ff29e53ff05e1a96e47d9f91e535585d438f788f",
+                  "sha256": sha256(CFG_PATH),
+              },
+              "fold_assignment": {
+                  "method": cfg["cross_validation"]["method"],
+                  "all_four_folds_cover_all_24_cells": True,
+                  "challenge_to_fold": {k: challenge_fold[k] for k in sorted(challenge_fold)},
+              },
+              "optimizer_implementation": {
+                  "scipy_method": "L-BFGS-B",
+                  "multistart_count": starts_n,
+                  "neutral_start_plus_seeded_random_starts": True,
+                  "seed_root": seed0,
+                  "boundary_tolerance": boundary_tol,
+                  "all_parameters_treated_as_material_for_boundary_guard": True,
+              },
+              "cv": {
+                  "M0": cv_summary["M0"],
+                  "M2b_reference": cv_summary["M2b"],
+                  "M3a": cv_summary["M3a"],
+                  "M3b": cv_summary["M3b"],
+                  "M3c": cv_summary["M3c"],
+                  "fold_metrics": fold_metrics,
+                  "fit_details": cv_fit,
+              },
+              "m2b_reference": m2b_ref,
+              "selection": {
+                  "candidate_results": selection,
+                  "eligible_candidates": eligible_models,
+                  "selected_model_class": selected,
+                  "selection_rule_applied": True,
+              },
+              "full_refit": full_fit,
+              "candidate_written": candidate_written,
+              "candidate_status": candidate_status,
+              "fresh_prospective_confirmation_required": True,
+              "spent_900_votes_may_not_be_used_as_confirmation": True,
+              "next_action": (
+                  "If a frozen M3 candidate exists, preregister a fresh prospective holdout. "
+                  "If none exists, stop this M3 branch under the frozen development rules."
+              ),
+          }
+          RESULTS_PATH.write_text(
+              json.dumps(results, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          lines = [
+              "# NextGen V2 M3 Development Fit",
+              "",
+              f"**Status:** `{result_status}`",
+              "",
+              "Production remains `v1.6-v5-size2-composition-overlay`.",
+              "",
+              "## Cross-validated development results",
+              "",
+              "| Model | CV loss | Improvement vs M0 | Positive folds | Eligible |",
+              "|---|---:|---:|---:|---|",
+          ]
+          lines.append(f"| M0 | {base['combined']:.6f} | — | — | baseline |")
+          lines.append(
+              f"| M2b reference | {cv_summary['M2b']['combined']:.6f} | "
+              f"{(base['combined'] - cv_summary['M2b']['combined']):.6f} | — | reference only |"
+          )
+          for model in ["M3a", "M3b", "M3c"]:
+              s = selection[model]
+              lines.append(
+                  f"| {model} | {s['cv_loss']:.6f} | {s['cv_improvement_vs_M0']:.6f} | "
+                  f"{s['positive_fold_count']} / 4 | {'YES' if s['eligible'] else 'NO'} |"
+              )
+
+          lines += ["", "## Family regressions versus M0", ""]
+          for model in ["M3a", "M3b", "M3c"]:
+              rr = selection[model]["family_regression_vs_M0"]
+              lines.append(
+                  f"- **{model}:** core {rr['core_concentration_2v2']:.6f}; "
+                  f"fragmentation {rr['fragmentation_filler']:.6f}; "
+                  f"structural 3v3 {rr['structural_topology_3v3']:.6f}"
+              )
+
+          lines += ["", "## Frozen selection", ""]
+          if candidate_written:
+              lines += [
+                  f"Selected **{selected}** under the preregistered rules and refit it on all "
+                  "spent development evidence.",
+                  "",
+                  "Its parameters are frozen in `research_candidate_m3_v1.json`. "
+                  "It remains research-only and requires a completely fresh prospective test.",
+              ]
+          elif selected is None:
+              lines += [
+                  "No M3 candidate qualified under the frozen development rules.",
+                  "",
+                  "This M3 branch stops here. No candidate was manufactured after seeing the results.",
+              ]
+          else:
+              lines += [
+                  f"{selected} qualified in CV, but its full refit was unresolved: `{candidate_status}`.",
+                  "",
+                  "No frozen candidate was created.",
+              ]
+
+          SUMMARY_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+          manifest = {
+              "schema_version": 1,
+              "status": "m3_development_fit_manifest",
+              "generated_at_utc": generated,
+              "research_only": True,
+              "production_change_authorized": False,
+              "production_revision_unchanged": "v1.6-v5-size2-composition-overlay",
+              "model_fit_performed": True,
+              "candidate_selected": selected is not None,
+              "candidate_frozen": candidate_written,
+              "selected_model_class": selected,
+              "result_status": result_status,
+              "source_artifacts": {
+                  "preregistration": {
+                      "path": str(CFG_PATH),
+                      "git_blob_sha": "ff29e53ff05e1a96e47d9f91e535585d438f788f",
+                      "sha256": sha256(CFG_PATH),
+                  },
+                  "spent_dataset": {
+                      "path": str(DATA_PATH),
+                      "git_blob_sha": "e0a6e80d98c19b9fa672b863844e4541817dbc88",
+                      "sha256": sha256(DATA_PATH),
+                  },
+                  "catalog": {
+                      "path": str(CATALOG_PATH),
+                      "git_blob_sha": "b338b18291c5058c5a2b941e1293322e2e70ea8c",
+                      "sha256": sha256(CATALOG_PATH),
+                  },
+                  "m2b_component": {
+                      "path": str(M2B_PATH),
+                      "git_blob_sha": "1560124540e1104fdc4f4e9f367d984b46921cb9",
+                      "sha256": sha256(M2B_PATH),
+                  },
+                  "prospective_scoring_contract": {
+                      "path": str(PROSPECTIVE_PREREG_PATH),
+                      "git_blob_sha": "f37b18ec24ae9fa73872069963be7d13f620e80a",
+                      "sha256": sha256(PROSPECTIVE_PREREG_PATH),
+                  },
+              },
+              "outputs": {
+                  "results": {"path": str(RESULTS_PATH), "sha256": sha256(RESULTS_PATH)},
+                  "summary": {"path": str(SUMMARY_PATH), "sha256": sha256(SUMMARY_PATH)},
+              },
+              "fresh_prospective_confirmation_required": True,
+          }
+          if candidate_written:
+              manifest["outputs"]["candidate"] = {
+                  "path": str(CANDIDATE_PATH),
+                  "sha256": sha256(CANDIDATE_PATH),
+              }
+              manifest["outputs"]["candidate_markdown"] = {
+                  "path": str(CANDIDATE_MD_PATH),
+                  "sha256": sha256(CANDIDATE_MD_PATH),
+              }
+
+          MANIFEST_PATH.write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          print(json.dumps({
+              "status": result_status,
+              "M0_cv_loss": base["combined"],
+              "M2b_reference_cv_loss": cv_summary["M2b"]["combined"],
+              "selection": {
+                  m: {
+                      "eligible": selection[m]["eligible"],
+                      "improvement": selection[m]["cv_improvement_vs_M0"],
+                      "positive_folds": selection[m]["positive_fold_count"],
+                  }
+                  for m in ["M3a", "M3b", "M3c"]
+              },
+              "selected": selected,
+              "candidate_frozen": candidate_written,
+          }, indent=2))
+          PY
+
+      - name: Verify M3 fit outputs and exact change surface
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import subprocess
+          from pathlib import Path
+
+          d = Path("research/package-adjustment-nextgen-v2")
+          results_path = d / "m3_development_fit_results_v1.json"
+          summary_path = d / "m3_development_fit_summary_v1.md"
+          manifest_path = d / "m3_development_fit_manifest_v1.json"
+          candidate_path = d / "research_candidate_m3_v1.json"
+          candidate_md_path = d / "research_candidate_m3_v1.md"
+
+          result = json.loads(results_path.read_text())
+          man = json.loads(manifest_path.read_text())
+
+          assert result["research_only"] is True
+          assert result["production_change_authorized"] is False
+          assert result["automatic_production_promotion_allowed"] is False
+          assert result["production_revision_unchanged"] == "v1.6-v5-size2-composition-overlay"
+          assert result["fold_assignment"]["all_four_folds_cover_all_24_cells"] is True
+          assert result["spent_900_votes_may_not_be_used_as_confirmation"] is True
+          assert man["model_fit_performed"] is True
+          assert man["fresh_prospective_confirmation_required"] is True
+
+          selected = result["selection"]["selected_model_class"]
+          frozen = result["candidate_written"]
+
+          expected = {
+              str(results_path),
+              str(summary_path),
+              str(manifest_path),
+          }
+          if frozen:
+              assert selected in {"M3a", "M3b", "M3c"}
+              expected |= {str(candidate_path), str(candidate_md_path)}
+              candidate = json.loads(candidate_path.read_text())
+              assert candidate["status"] == "m3_frozen_research_candidate"
+              assert candidate["selected_model_class"] == selected
+              assert candidate["research_only"] is True
+              assert candidate["production_candidate"] is False
+              assert candidate["parameters_may_not_change_after_freeze"] is True
+          else:
+              assert not candidate_path.exists()
+              assert not candidate_md_path.exists()
+
+          def sha256(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          assert man["outputs"]["results"]["sha256"] == sha256(results_path)
+          assert man["outputs"]["summary"]["sha256"] == sha256(summary_path)
+
+          rows = subprocess.check_output(["git", "status", "--porcelain=v1"], text=True).splitlines()
+          paths = {row[3:] for row in rows if len(row) >= 4}
+          if paths != expected:
+              raise RuntimeError(f"unexpected changed paths: {sorted(paths)}")
+
+          # Re-evaluate frozen eligibility booleans from stored metrics.
+          for model in ["M3a", "M3b", "M3c"]:
+              s = result["selection"]["candidate_results"][model]
+              recomputed = (
+                  s["cv_improvement_vs_M0"] >= 0.003 - 1e-15
+                  and max(s["family_regression_vs_M0"].values()) <= 0.003 + 1e-15
+                  and s["positive_fold_count"] >= 3
+                  and s["gates"]["all_fold_fits_successful"]
+                  and s["gates"]["no_optimizer_boundary_solution"]
+              )
+              assert recomputed == s["eligible"]
+
+          print(f"PASS: M3 fit output verified; selected={selected!r}, candidate_frozen={frozen}.")
+          PY
+
+          git diff --check
+
+      - name: Run repository regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 \
+            python3 scripts/validation/repo_regression_checks.py
+
+      - name: Re-prove production and fit-only research boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PYTHONDONTWRITEBYTECODE=1 \
+            python3 scripts/validation/check_package_adjustment_live.py
+
+          python3 - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+
+          d = Path("research/package-adjustment-nextgen-v2")
+          result = json.loads((d / "m3_development_fit_results_v1.json").read_text())
+
+          expected = {
+              str(d / "m3_development_fit_results_v1.json"),
+              str(d / "m3_development_fit_summary_v1.md"),
+              str(d / "m3_development_fit_manifest_v1.json"),
+          }
+          if result["candidate_written"]:
+              expected |= {
+                  str(d / "research_candidate_m3_v1.json"),
+                  str(d / "research_candidate_m3_v1.md"),
+              }
+
+          rows = subprocess.check_output(["git", "status", "--porcelain=v1"], text=True).splitlines()
+          paths = {row[3:] for row in rows if len(row) >= 4}
+          if paths != expected:
+              raise RuntimeError(f"regressions changed unexpected paths: {sorted(paths)}")
+
+          print("PASS: production remains V1.6; only preregistered M3 development outputs changed.")
+          PY
+
+      - name: Upload M3 development proof
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkgnv2-m3-development-fit-v1
+          path: |
+            research/package-adjustment-nextgen-v2/m3_development_fit_results_v1.json
+            research/package-adjustment-nextgen-v2/m3_development_fit_summary_v1.md
+            research/package-adjustment-nextgen-v2/m3_development_fit_manifest_v1.json
+            research/package-adjustment-nextgen-v2/research_candidate_m3_v1.json
+            research/package-adjustment-nextgen-v2/research_candidate_m3_v1.md
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Commit M3 development result
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            research/package-adjustment-nextgen-v2/m3_development_fit_results_v1.json \
+            research/package-adjustment-nextgen-v2/m3_development_fit_summary_v1.md \
+            research/package-adjustment-nextgen-v2/m3_development_fit_manifest_v1.json
+
+          if [ -e research/package-adjustment-nextgen-v2/research_candidate_m3_v1.json ]; then
+            git add \
+              research/package-adjustment-nextgen-v2/research_candidate_m3_v1.json \
+              research/package-adjustment-nextgen-v2/research_candidate_m3_v1.md
+          fi
+
+          git commit -m "Fit NextGen V2 M3 development candidates"
+
+      - name: Rebase safely and verify committed boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git pull --rebase origin main
+
+          test "$(git hash-object research/package-adjustment-nextgen-v2/m3_development_preregistration_v1.json)" = \
+            "ff29e53ff05e1a96e47d9f91e535585d438f788f"
+          test "$(git hash-object research/package-adjustment-nextgen-v2/m3_development_preregistration_v1_manifest.json)" = \
+            "afda67beb00a94011f0dae2bfe2549a9ba8c3cfa"
+
+          python3 - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+
+          d = Path("research/package-adjustment-nextgen-v2")
+          result = json.loads((d / "m3_development_fit_results_v1.json").read_text())
+
+          expected = {
+              str(d / "m3_development_fit_results_v1.json"),
+              str(d / "m3_development_fit_summary_v1.md"),
+              str(d / "m3_development_fit_manifest_v1.json"),
+          }
+          if result["candidate_written"]:
+              expected |= {
+                  str(d / "research_candidate_m3_v1.json"),
+                  str(d / "research_candidate_m3_v1.md"),
+              }
+
+          parent = subprocess.check_output(["git", "rev-parse", "HEAD^"], text=True).strip()
+          head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          changed = set(
+              subprocess.check_output(["git", "diff", "--name-only", parent, head], text=True).splitlines()
+          )
+          if changed != expected:
+              raise RuntimeError(f"rebased commit changed unexpected paths: {sorted(changed)}")
+          if subprocess.check_output(["git", "status", "--porcelain=v1"], text=True).strip():
+              raise RuntimeError("working tree not clean after rebase")
+
+          print("PASS: rebased M3 development commit contains exactly intended outputs.")
+          PY
+
+      - name: Push M3 development result to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git push origin main
+          git log --oneline -1
