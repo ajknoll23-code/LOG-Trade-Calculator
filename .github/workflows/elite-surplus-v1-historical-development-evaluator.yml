@@ -1,0 +1,1172 @@
+name: Elite Surplus V1 Historical Development Evaluator
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      ELITE_SURPLUS_WEEK2_CUTOFF_UTC: '2026-09-18T00:15:00+00:00'
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install regression dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install "requests==2.34.2"
+
+      - name: Guard frozen preregistration and source evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+          test "$(git hash-object research/elite-surplus-v1/development_preregistration_v1.json)" = \
+            "ef3a3c9ceeb7b1d98ee37370d492966287065b54"
+          test "$(git hash-object research/elite-surplus-v1/development_preregistration_v1.md)" = \
+            "a1a33e2da8b5297b62e2bbb350bf4937bc46ce73"
+          test "$(git hash-object research/elite-surplus-v1/development_preregistration_v1_manifest.json)" = \
+            "3b85be9c2513e8499bfb1a24c91741c2b4200397"
+
+          test ! -e research/elite-surplus-v1/historical_development_evaluation_v1.json
+          test ! -e research/elite-surplus-v1/historical_development_evaluation_v1.md
+          test ! -e research/elite-surplus-v1/historical_development_manifest_v1.json
+          test ! -e research/elite-surplus-v1/selected_candidate_v1.json
+          test ! -e research/elite-surplus-v1/prospective_prediction_snapshot_v1.json
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          root = Path(".")
+          cfg_path = root / "research/elite-surplus-v1/development_preregistration_v1.json"
+          md_path = root / "research/elite-surplus-v1/development_preregistration_v1.md"
+          man_path = root / "research/elite-surplus-v1/development_preregistration_v1_manifest.json"
+
+          sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+
+          cfg = json.loads(cfg_path.read_text())
+          man = json.loads(man_path.read_text())
+
+          assert sha(cfg_path) == "0136e66d59cd707a708229067c03267bbcd41abcbdf83e0664ad679fa04f2182"
+          assert sha(md_path) == "d1098f88506b168a8b7dff77264464ccf37b2483b01f0245a4cb22ee9e11c4ad"
+          assert man["development_preregistration_sha256"] == sha(cfg_path)
+          assert man["development_summary_sha256"] == sha(md_path)
+          assert man["historical_fit_performed"] is False
+          assert man["candidate_selected"] is False
+          assert cfg["candidate_fit_performed"] is False
+          assert cfg["candidate_selected"] is False
+
+          for rel, rec in cfg["source_provenance"].items():
+              p = root / rel
+              assert p.exists(), rel
+              actual = sha(p)
+              assert actual == rec["sha256"], (rel, actual, rec["sha256"])
+
+          print("PASS: frozen Elite Surplus V1 preregistration and all source hashes match.")
+          PY
+
+      - name: Guard pre-Week-2 prospective eligibility window
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import os
+          from datetime import datetime, timezone
+
+          cutoff = datetime.fromisoformat(os.environ["ELITE_SURPLUS_WEEK2_CUTOFF_UTC"])
+          now = datetime.now(timezone.utc)
+          if not now < cutoff:
+              raise RuntimeError(
+                  "The preregistered Weeks 2-8 prospective window can no longer "
+                  "be frozen before the first Week 2 kickoff. Do not fit or "
+                  "backdate a candidate; a new prospective-window preregistration "
+                  "is required."
+              )
+          print("PASS: candidate/snapshot can still be frozen before Week 2 kickoff.")
+          print("Now UTC:", now.isoformat())
+          print("Week 2 first-kickoff cutoff UTC:", cutoff.isoformat())
+          PY
+
+      - name: Validate reviewed model ports
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import importlib.util
+          from pathlib import Path
+
+          path = Path("research/baseline-backtester/baseline_backtester.py")
+          spec = importlib.util.spec_from_file_location(
+              "elite_surplus_v1_historical_backtester_selftest",
+              path,
+          )
+          if spec is None or spec.loader is None:
+              raise RuntimeError("Could not import baseline_backtester.py")
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          module.run_selftest()
+          PY
+
+          python3 scripts/validation/snapshot_values.py --selftest
+
+      - name: Fit on 2024 and validate once on 2025
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import importlib.util
+          import json
+          import math
+          import os
+          import statistics
+          import subprocess
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          ROOT = Path(".")
+          D = ROOT / "research/elite-surplus-v1"
+
+          PREREG = D / "development_preregistration_v1.json"
+          PREREG_MAN = D / "development_preregistration_v1_manifest.json"
+          POINTS_PATH = ROOT / "research/roster-economics/weekly_points_by_season.json"
+          BACKTESTTER_PATH = ROOT / "research/baseline-backtester/baseline_backtester.py"
+          SNAPSHOT_VALUES_PATH = ROOT / "scripts/validation/snapshot_values.py"
+          INDEX_PATH = ROOT / "index.html"
+
+          OUT_JSON = D / "historical_development_evaluation_v1.json"
+          OUT_MD = D / "historical_development_evaluation_v1.md"
+          OUT_MAN = D / "historical_development_manifest_v1.json"
+          SELECTED_PATH = D / "selected_candidate_v1.json"
+          SNAPSHOT_PATH = D / "prospective_prediction_snapshot_v1.json"
+
+          CUTOFF = datetime.fromisoformat(os.environ["ELITE_SURPLUS_WEEK2_CUTOFF_UTC"])
+
+          def sha256(path: Path) -> str:
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          def git_blob(path: Path) -> str:
+              return subprocess.check_output(
+                  ["git", "hash-object", str(path)], text=True
+              ).strip()
+
+          def git_head() -> str:
+              return subprocess.check_output(
+                  ["git", "rev-parse", "HEAD"], text=True
+              ).strip()
+
+          def load_module(path: Path, name: str):
+              spec = importlib.util.spec_from_file_location(name, path)
+              if spec is None or spec.loader is None:
+                  raise RuntimeError(f"Could not import {path}")
+              mod = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(mod)
+              return mod
+
+          def avg(xs):
+              xs = list(xs)
+              if not xs:
+                  raise RuntimeError("Cannot average an empty sequence")
+              return statistics.fmean(xs)
+
+          prereg = json.loads(PREREG.read_text())
+          prereg_manifest = json.loads(PREREG_MAN.read_text())
+          points = json.loads(POINTS_PATH.read_text())
+
+          bt = load_module(BACKTESTTER_PATH, "elite_surplus_v1_bt")
+          sv = load_module(SNAPSHOT_VALUES_PATH, "elite_surplus_v1_sv")
+
+          PRIMARY_ANCHOR = int(
+              prereg["normalization"]["primary_research_anchor"]["rank"]
+          )
+          LEGACY_ANCHOR = int(
+              prereg["normalization"]["legacy_sensitivity_anchor"]["rank"]
+          )
+          assert PRIMARY_ANCHOR == 29
+          assert LEGACY_ANCHOR == 18
+
+          def candidate_value(label: str, x: float, param=None) -> float:
+              if label == "E0":
+                  return x
+              if label == "E1":
+                  c = float(param)
+                  return x if x <= 1.0 else 1.0 + c * (x - 1.0)
+              if label == "E2":
+                  gamma = float(param)
+                  return x if x <= 1.0 else x ** gamma
+              if label == "E3":
+                  alpha = float(param)
+                  return x if x <= 1.0 else x + alpha * (x - 1.0) ** 2
+              raise KeyError(label)
+
+          PARAM_META = {
+              "E1": (
+                  "c",
+                  tuple(map(float, prereg["candidate_functions"]["E1"]["c_bounds"])),
+                  float(prereg["candidate_functions"]["E1"]["null_value"]),
+              ),
+              "E2": (
+                  "gamma",
+                  tuple(map(float, prereg["candidate_functions"]["E2"]["gamma_bounds"])),
+                  float(prereg["candidate_functions"]["E2"]["null_value"]),
+              ),
+              "E3": (
+                  "alpha",
+                  tuple(map(float, prereg["candidate_functions"]["E3"]["alpha_bounds"])),
+                  float(prereg["candidate_functions"]["E3"]["null_value"]),
+              ),
+          }
+
+          def prepare_fold(fold, anchor_rank: int):
+              rows = []
+              for pid, train_row in fold["train"].items():
+                  if train_row.get("pos_bucket") != "QB":
+                      continue
+                  if pid not in fold["target"]:
+                      continue
+                  rows.append({
+                      "pid": pid,
+                      "name": train_row.get("name", pid),
+                      "train_ppg": float(train_row["ppg"]),
+                      "future_ppg": float(fold["target"][pid]),
+                  })
+
+              if len(rows) < anchor_rank:
+                  return None
+
+              train_sorted = sorted(
+                  rows, key=lambda r: (-r["train_ppg"], r["name"], r["pid"])
+              )
+              future_sorted = sorted(
+                  rows, key=lambda r: (-r["future_ppg"], r["name"], r["pid"])
+              )
+
+              train_den = train_sorted[anchor_rank - 1]["train_ppg"]
+              future_den = future_sorted[anchor_rank - 1]["future_ppg"]
+              if train_den <= 0 or future_den <= 0:
+                  return None
+
+              result_rows = []
+              for rank, row in enumerate(train_sorted, 1):
+                  result_rows.append({
+                      **row,
+                      "training_rank": rank,
+                      "x_training_ratio": row["train_ppg"] / train_den,
+                      "y_future_ratio": row["future_ppg"] / future_den,
+                  })
+
+              return {
+                  "name": fold["name"],
+                  "season": fold["season"],
+                  "anchor_rank": anchor_rank,
+                  "eligible_qbs": len(rows),
+                  "training_anchor_ppg": train_den,
+                  "future_anchor_ppg": future_den,
+                  "rows": result_rows,
+              }
+
+          def rolling_prepared(window: int, season: str, anchor_rank: int):
+              folds = bt.build_folds(points, window)
+              out = []
+              for fold in folds:
+                  if fold["season"] != season:
+                      continue
+                  rec = prepare_fold(fold, anchor_rank)
+                  if rec is not None:
+                      out.append(rec)
+              return out
+
+          def cross_prepared(window: int, anchor_rank: int):
+              folds = bt.build_folds(points, window)
+              out = []
+              for fold in folds:
+                  if fold["season"] != "cross":
+                      continue
+                  rec = prepare_fold(fold, anchor_rank)
+                  if rec is not None:
+                      out.append(rec)
+              return out
+
+          def fold_metrics(prepared, label: str, param, cohort_rank: int):
+              rows = [
+                  r for r in prepared["rows"]
+                  if r["training_rank"] <= cohort_rank
+              ]
+              if not rows:
+                  raise RuntimeError("Empty cohort")
+              errors = [
+                  candidate_value(label, r["x_training_ratio"], param)
+                  - r["y_future_ratio"]
+                  for r in rows
+              ]
+              return {
+                  "n": len(errors),
+                  "mae": avg(abs(e) for e in errors),
+                  "rmse": math.sqrt(avg(e * e for e in errors)),
+                  "bias": avg(errors),
+              }
+
+          def aggregate_metrics(folds, label: str, param, anchor_rank: int):
+              if not folds:
+                  raise RuntimeError("No folds available")
+              per_fold = []
+              for f in folds:
+                  rec = {
+                      "fold": f["name"],
+                      "eligible_qbs": f["eligible_qbs"],
+                      "top5": fold_metrics(f, label, param, 5),
+                      "top12": fold_metrics(f, label, param, 12),
+                      "broad": fold_metrics(f, label, param, anchor_rank),
+                  }
+                  per_fold.append(rec)
+
+              return {
+                  "fold_count": len(per_fold),
+                  "top5_mae": avg(r["top5"]["mae"] for r in per_fold),
+                  "top5_rmse": avg(r["top5"]["rmse"] for r in per_fold),
+                  "top12_mae": avg(r["top12"]["mae"] for r in per_fold),
+                  "top12_rmse": avg(r["top12"]["rmse"] for r in per_fold),
+                  "broad_mae": avg(r["broad"]["mae"] for r in per_fold),
+                  "broad_rmse": avg(r["broad"]["rmse"] for r in per_fold),
+                  "per_fold": per_fold,
+              }
+
+          def objective_2024(label: str, param, folds_2024):
+              return aggregate_metrics(
+                  folds_2024, label, param, PRIMARY_ANCHOR
+              )["top12_mae"]
+
+          def max_distortion(label: str, param) -> float:
+              vals = []
+              for i in range(20001):
+                  x = 1.0 + 2.0 * i / 20000.0
+                  vals.append(abs(candidate_value(label, x, param) - x))
+              return max(vals)
+
+          def fit_parameter(label: str, folds):
+              pname, bounds, null = PARAM_META[label]
+              lo, hi = bounds
+
+              coarse_n = 5001
+              coarse_step = (hi - lo) / (coarse_n - 1)
+              best = None
+              for i in range(coarse_n):
+                  p = lo + coarse_step * i
+                  loss = objective_2024(label, p, folds)
+                  key = (loss, abs(p - null), p)
+                  if best is None or key < best[0]:
+                      best = (key, p, loss)
+
+              coarse_best = best[1]
+              fine_lo = max(lo, coarse_best - coarse_step)
+              fine_hi = min(hi, coarse_best + coarse_step)
+              fine_n = 10001
+              if fine_hi == fine_lo:
+                  fine_values = [fine_lo]
+              else:
+                  fine_step = (fine_hi - fine_lo) / (fine_n - 1)
+                  fine_values = [
+                      fine_lo + fine_step * i for i in range(fine_n)
+                  ]
+
+              best = None
+              for p in fine_values:
+                  loss = objective_2024(label, p, folds)
+                  key = (loss, abs(p - null), p)
+                  if best is None or key < best[0]:
+                      best = (key, p, loss)
+
+              p = float(best[1])
+              loss = float(best[2])
+              boundary_tol = 1e-10
+              at_lower = abs(p - lo) <= boundary_tol
+              at_upper = abs(p - hi) <= boundary_tol
+              is_null = abs(p - null) <= boundary_tol
+              unresolved_boundary = (at_lower or at_upper) and not is_null
+
+              return {
+                  "candidate": label,
+                  "parameter_name": pname,
+                  "parameter": p,
+                  "bounds": [lo, hi],
+                  "null_value": null,
+                  "fit_2024_top12_mae": loss,
+                  "coarse_grid_points": coarse_n,
+                  "local_refinement_points": len(fine_values),
+                  "coarse_step": coarse_step,
+                  "tie_rule": "lower_MAE_then_closest_to_null_then_lower_parameter",
+                  "at_lower_bound": at_lower,
+                  "at_upper_bound": at_upper,
+                  "exact_null_collapse": is_null,
+                  "unresolved_non_null_boundary": unresolved_boundary,
+                  "max_abs_distortion_x_1_to_3": max_distortion(label, p),
+              }
+
+          # Frozen fit and validation folds.
+          train_2024_4 = rolling_prepared(4, "2024", PRIMARY_ANCHOR)
+          valid_2025_4 = rolling_prepared(4, "2025", PRIMARY_ANCHOR)
+          assert len(train_2024_4) == 7, len(train_2024_4)
+          assert len(valid_2025_4) == 7, len(valid_2025_4)
+
+          baseline_primary = aggregate_metrics(
+              valid_2025_4, "E0", None, PRIMARY_ANCHOR
+          )
+
+          fit_results = {}
+          validation = {}
+
+          def rel_improvement(base, cand):
+              return (base - cand) / base
+
+          def rel_regression(base, cand):
+              return (cand - base) / base
+
+          for label in ("E1", "E2", "E3"):
+              fit = fit_parameter(label, train_2024_4)
+              fit_results[label] = fit
+              p = fit["parameter"]
+
+              primary = aggregate_metrics(
+                  valid_2025_4, label, p, PRIMARY_ANCHOR
+              )
+
+              fold_wins = 0
+              fold_comparisons = []
+              for b, c in zip(
+                  baseline_primary["per_fold"], primary["per_fold"]
+              ):
+                  assert b["fold"] == c["fold"]
+                  bmae = b["top12"]["mae"]
+                  cmae = c["top12"]["mae"]
+                  win = cmae < bmae - 1e-12
+                  fold_wins += int(win)
+                  fold_comparisons.append({
+                      "fold": b["fold"],
+                      "baseline_top12_mae": bmae,
+                      "candidate_top12_mae": cmae,
+                      "candidate_lower_mae": win,
+                  })
+
+              robust = {}
+              for window in (2, 6):
+                  vf = rolling_prepared(window, "2025", PRIMARY_ANCHOR)
+                  b = aggregate_metrics(vf, "E0", None, PRIMARY_ANCHOR)
+                  c = aggregate_metrics(vf, label, p, PRIMARY_ANCHOR)
+                  robust[str(window)] = {
+                      "fold_count": len(vf),
+                      "baseline_top12_mae": b["top12_mae"],
+                      "candidate_top12_mae": c["top12_mae"],
+                      "relative_regression": rel_regression(
+                          b["top12_mae"], c["top12_mae"]
+                      ),
+                  }
+
+              legacy_folds = rolling_prepared(4, "2025", LEGACY_ANCHOR)
+              legacy_b = aggregate_metrics(
+                  legacy_folds, "E0", None, LEGACY_ANCHOR
+              )
+              legacy_c = aggregate_metrics(
+                  legacy_folds, label, p, LEGACY_ANCHOR
+              )
+
+              cross_folds = cross_prepared(4, PRIMARY_ANCHOR)
+              cross_b = aggregate_metrics(
+                  cross_folds, "E0", None, PRIMARY_ANCHOR
+              )
+              cross_c = aggregate_metrics(
+                  cross_folds, label, p, PRIMARY_ANCHOR
+              )
+
+              gates = prereg[
+                  "historical_validation_and_selection"
+              ]["eligibility_gates"]
+
+              gate_results = {
+                  "top12_relative_mae_improvement": {
+                      "value": rel_improvement(
+                          baseline_primary["top12_mae"],
+                          primary["top12_mae"],
+                      ),
+                      "required_minimum": float(
+                          gates["minimum_relative_MAE_improvement_vs_E0_top12"]
+                      ),
+                  },
+                  "2025_fold_wins": {
+                      "value": fold_wins,
+                      "required_minimum": int(
+                          gates["minimum_2025_folds_with_lower_top12_MAE"]
+                      ),
+                  },
+                  "top5_mae_nonregression": {
+                      "candidate": primary["top5_mae"],
+                      "baseline": baseline_primary["top5_mae"],
+                      "pass": primary["top5_mae"] <= baseline_primary["top5_mae"] + 1e-12,
+                  },
+                  "broad_mae_relative_regression": {
+                      "value": rel_regression(
+                          baseline_primary["broad_mae"],
+                          primary["broad_mae"],
+                      ),
+                      "maximum": float(
+                          gates["broad_rank1_to_primary_anchor_MAE_max_relative_regression"]
+                      ),
+                  },
+                  "top12_rmse_relative_regression": {
+                      "value": rel_regression(
+                          baseline_primary["top12_rmse"],
+                          primary["top12_rmse"],
+                      ),
+                      "maximum": float(
+                          gates["RMSE_top12_max_relative_regression"]
+                      ),
+                  },
+                  "robustness_2_week_relative_regression": {
+                      "value": robust["2"]["relative_regression"],
+                      "maximum": float(
+                          gates["robustness_2_week_MAE_max_relative_regression"]
+                      ),
+                  },
+                  "robustness_6_week_relative_regression": {
+                      "value": robust["6"]["relative_regression"],
+                      "maximum": float(
+                          gates["robustness_6_week_MAE_max_relative_regression"]
+                      ),
+                  },
+                  "legacy_qb18_relative_regression": {
+                      "value": rel_regression(
+                          legacy_b["top12_mae"],
+                          legacy_c["top12_mae"],
+                      ),
+                      "maximum": float(
+                          gates["legacy_QB18_anchor_MAE_max_relative_regression"]
+                      ),
+                  },
+                  "non_null_boundary_resolved": {
+                      "pass": not fit["unresolved_non_null_boundary"],
+                  },
+              }
+
+              gate_results["top12_relative_mae_improvement"]["pass"] = (
+                  gate_results["top12_relative_mae_improvement"]["value"]
+                  >= gate_results["top12_relative_mae_improvement"]["required_minimum"]
+              )
+              gate_results["2025_fold_wins"]["pass"] = (
+                  gate_results["2025_fold_wins"]["value"]
+                  >= gate_results["2025_fold_wins"]["required_minimum"]
+              )
+              for key in (
+                  "broad_mae_relative_regression",
+                  "top12_rmse_relative_regression",
+                  "robustness_2_week_relative_regression",
+                  "robustness_6_week_relative_regression",
+                  "legacy_qb18_relative_regression",
+              ):
+                  gate_results[key]["pass"] = (
+                      gate_results[key]["value"]
+                      <= gate_results[key]["maximum"] + 1e-12
+                  )
+
+              eligible = all(x["pass"] for x in gate_results.values())
+
+              validation[label] = {
+                  "parameter": p,
+                  "primary_2025": primary,
+                  "baseline_primary_2025": {
+                      k: v for k, v in baseline_primary.items()
+                      if k != "per_fold"
+                  },
+                  "fold_wins": fold_wins,
+                  "fold_comparisons": fold_comparisons,
+                  "robustness": robust,
+                  "legacy_qb18_sensitivity": {
+                      "fold_count": len(legacy_folds),
+                      "baseline_top12_mae": legacy_b["top12_mae"],
+                      "candidate_top12_mae": legacy_c["top12_mae"],
+                      "relative_regression": rel_regression(
+                          legacy_b["top12_mae"],
+                          legacy_c["top12_mae"],
+                      ),
+                  },
+                  "cross_season_robustness_only": {
+                      "fold_count": len(cross_folds),
+                      "baseline_top12_mae": cross_b["top12_mae"],
+                      "candidate_top12_mae": cross_c["top12_mae"],
+                  },
+                  "gate_results": gate_results,
+                  "eligible": eligible,
+              }
+
+          eligible = [
+              label for label in ("E1", "E2", "E3")
+              if validation[label]["eligible"]
+          ]
+
+          selected_label = None
+          if eligible:
+              best_loss = min(
+                  validation[x]["primary_2025"]["top12_mae"]
+                  for x in eligible
+              )
+              close = [
+                  x for x in eligible
+                  if validation[x]["primary_2025"]["top12_mae"]
+                  <= best_loss + 0.005 + 1e-15
+              ]
+              close.sort(
+                  key=lambda x: (
+                      fit_results[x]["max_abs_distortion_x_1_to_3"],
+                      x,
+                  )
+              )
+              selected_label = close[0]
+
+          generated = datetime.now(timezone.utc)
+          before_cutoff = generated < CUTOFF
+          assert before_cutoff
+
+          report = {
+              "schema_version": 1,
+              "study_id": "elite-surplus-v1-historical-development-evaluation-v1",
+              "status": (
+                  "historical_candidate_selected_pending_freeze"
+                  if selected_label
+                  else "closed_no_historical_candidate"
+              ),
+              "generated_at_utc": generated.isoformat(),
+              "git_head_before_outputs": git_head(),
+              "research_only": True,
+              "production_change_authorized": False,
+              "automatic_production_promotion_allowed": False,
+              "ktc_used": False,
+              "market_value_used": False,
+              "package_vote_data_used": False,
+              "2026_outcomes_used": False,
+              "named_player_fit_target_used": False,
+              "preregistration_sha256": sha256(PREREG),
+              "preregistration_blob": git_blob(PREREG),
+              "preregistration_manifest_sha256": sha256(PREREG_MAN),
+              "source_sha256": {
+                  "weekly_points": sha256(POINTS_PATH),
+                  "baseline_backtester": sha256(BACKTESTTER_PATH),
+                  "snapshot_values": sha256(SNAPSHOT_VALUES_PATH),
+                  "index_html": sha256(INDEX_PATH),
+              },
+              "operational_prospective_cutoff": {
+                  "first_week2_kickoff_utc": CUTOFF.isoformat(),
+                  "checked_before_candidate_freeze": True,
+                  "still_before_cutoff": before_cutoff,
+                  "schedule_basis": (
+                      "2026 NFL Week 2 opener: Detroit at Buffalo, "
+                      "2026-09-17 20:15 Eastern / 2026-09-18 00:15 UTC"
+                  ),
+              },
+              "method": {
+                  "fit_season": 2024,
+                  "validation_season": 2025,
+                  "primary_forward_window_weeks": 4,
+                  "robustness_windows_weeks": [2, 6],
+                  "primary_anchor_rank": PRIMARY_ANCHOR,
+                  "legacy_sensitivity_anchor_rank": LEGACY_ANCHOR,
+                  "fit_cohort": "training_time_top12_QBs",
+                  "fit_objective": "equal_fold_mean_MAE_of_relative_production_ratio",
+                  "future_denominator": (
+                      "future-period PPG at the same frozen rank among "
+                      "eligible QB future outcomes"
+                  ),
+                  "optimizer": {
+                      "coarse_grid_points": 5001,
+                      "local_refinement_points": 10001,
+                      "tie_rule": "lower_MAE_then_closest_to_null_then_lower_parameter",
+                  },
+                  "spearman_used_for_selection": False,
+              },
+              "fit_2024": fit_results,
+              "baseline_2025_primary": baseline_primary,
+              "validation_2025": validation,
+              "eligible_candidates": eligible,
+              "selected_candidate_class": selected_label,
+              "selection_rule_applied": prereg[
+                  "historical_validation_and_selection"
+              ]["selection_rule"],
+              "fresh_confirmation": {
+                  "week1_spent": True,
+                  "intended_window": "2026_weeks_2_through_8_inclusive",
+                  "started": False,
+              },
+          }
+
+          selected_payload = None
+          snapshot_payload = None
+
+          if selected_label is not None:
+              # Refit only the already-selected class on all 2024+2025 rolling
+              # 4-week development folds, exactly as preregistered.
+              combined = train_2024_4 + valid_2025_4
+              refit = fit_parameter(selected_label, combined)
+              selected_param = refit["parameter"]
+
+              selected_payload = {
+                  "schema_version": 1,
+                  "candidate_id": "elite-surplus-v1-selected-candidate-v1",
+                  "status": "frozen_historical_candidate_pre_week2",
+                  "frozen_at_utc": datetime.now(timezone.utc).isoformat(),
+                  "candidate_class": selected_label,
+                  "candidate_name": prereg["candidate_functions"][selected_label]["name"],
+                  "parameter_name": refit["parameter_name"],
+                  "parameter": selected_param,
+                  "parameter_bounds": refit["bounds"],
+                  "null_value": refit["null_value"],
+                  "combined_2024_2025_refit_top12_mae": refit["fit_2024_top12_mae"],
+                  "refit_fold_count": len(combined),
+                  "refit_data": "2024_and_2025_rolling_4_week_folds_only",
+                  "historical_selection_result_sha256": None,
+                  "preregistration_sha256": sha256(PREREG),
+                  "source_sha256": report["source_sha256"],
+                  "week2_first_kickoff_utc": CUTOFF.isoformat(),
+                  "frozen_before_week2_kickoff": True,
+                  "production_change_authorized": False,
+                  "prospective_confirmation_started": False,
+              }
+
+              # Create the one frozen pre-Week-2 baseline-FV prediction snapshot.
+              current_cfg = sv.load_from_html(INDEX_PATH)
+              current = sv.compute_all_values(current_cfg)
+              qbs = [
+                  {"name": name, **rec}
+                  for name, rec in current.items()
+                  if rec["pos"] == "QB"
+              ]
+              qbs.sort(key=lambda r: (-int(r["value"]), r["name"].lower()))
+              if len(qbs) < PRIMARY_ANCHOR:
+                  raise RuntimeError("Current deployed QB cohort has fewer than 29 QBs")
+
+              fv29 = float(qbs[PRIMARY_ANCHOR - 1]["value"])
+              fv18 = float(qbs[LEGACY_ANCHOR - 1]["value"])
+              if fv29 <= 0 or fv18 <= 0:
+                  raise RuntimeError("Invalid frozen FV denominator")
+
+              rows = []
+              for rank, q in enumerate(qbs, 1):
+                  x29 = float(q["value"]) / fv29
+                  gx29 = candidate_value(selected_label, x29, selected_param)
+                  x18 = float(q["value"]) / fv18
+                  gx18 = candidate_value(selected_label, x18, selected_param)
+                  rows.append({
+                      "rank": rank,
+                      "name": q["name"],
+                      "baseline_fv": int(q["value"]),
+                      "age": int(q["age"]),
+                      "role": q["role"],
+                      "x_qb29": x29,
+                      "candidate_ratio_qb29": gx29,
+                      "research_transformed_score_qb29_scale": fv29 * gx29,
+                      "x_qb18_sensitivity": x18,
+                      "candidate_ratio_qb18_sensitivity": gx18,
+                      "primary_top12": rank <= 12,
+                      "elite_top5": rank <= 5,
+                      "broad_rank1_to_qb29": rank <= PRIMARY_ANCHOR,
+                  })
+
+              def norm(s):
+                  return "".join(ch for ch in s.lower() if ch.isalnum())
+
+              row_by_norm = {norm(r["name"]): r for r in rows}
+              allen = row_by_norm.get(norm("Josh Allen"))
+              dak = row_by_norm.get(norm("Dak Prescott"))
+              if allen is None or dak is None:
+                  raise RuntimeError("Could not resolve frozen Allen/Dak diagnostic")
+
+              named_diag = {
+                  "allowed_only_after_candidate_freeze": True,
+                  "used_in_fit_or_selection": False,
+                  "josh_allen": allen,
+                  "dak_prescott": dak,
+                  "baseline_fv_ratio_allen_over_dak": (
+                      allen["baseline_fv"] / dak["baseline_fv"]
+                  ),
+                  "candidate_research_score_ratio_allen_over_dak": (
+                      allen["research_transformed_score_qb29_scale"]
+                      / dak["research_transformed_score_qb29_scale"]
+                  ),
+              }
+
+              snapshot_payload = {
+                  "schema_version": 1,
+                  "snapshot_id": "elite-surplus-v1-pre-week2-prediction-snapshot-v1",
+                  "status": "frozen_pre_week2_prediction_snapshot",
+                  "frozen_at_utc": datetime.now(timezone.utc).isoformat(),
+                  "week2_first_kickoff_utc": CUTOFF.isoformat(),
+                  "frozen_before_week2_kickoff": True,
+                  "intended_outcome_window": "2026_weeks_2_through_8_inclusive",
+                  "candidate_class": selected_label,
+                  "parameter_name": refit["parameter_name"],
+                  "parameter": selected_param,
+                  "primary_anchor_rank": PRIMARY_ANCHOR,
+                  "primary_anchor_player": qbs[PRIMARY_ANCHOR - 1]["name"],
+                  "primary_anchor_fv": int(fv29),
+                  "legacy_anchor_rank": LEGACY_ANCHOR,
+                  "legacy_anchor_player": qbs[LEGACY_ANCHOR - 1]["name"],
+                  "legacy_anchor_fv": int(fv18),
+                  "index_html_sha256": sha256(INDEX_PATH),
+                  "snapshot_values_sha256": sha256(SNAPSHOT_VALUES_PATH),
+                  "qb_count": len(rows),
+                  "rows": rows,
+                  "named_example_diagnostic_after_freeze": named_diag,
+                  "no_weekly_refit": True,
+                  "2026_week1_used": False,
+                  "production_change_authorized": False,
+              }
+
+              # Write historical evaluation first so the selected-candidate
+              # payload can cryptographically bind to it.
+              OUT_JSON.write_text(
+                  json.dumps(report, indent=2, sort_keys=True) + "\n",
+                  encoding="utf-8",
+              )
+              selected_payload["historical_selection_result_sha256"] = sha256(OUT_JSON)
+              SELECTED_PATH.write_text(
+                  json.dumps(selected_payload, indent=2, sort_keys=True) + "\n",
+                  encoding="utf-8",
+              )
+              snapshot_payload["selected_candidate_sha256"] = sha256(SELECTED_PATH)
+              SNAPSHOT_PATH.write_text(
+                  json.dumps(snapshot_payload, indent=2, sort_keys=True) + "\n",
+                  encoding="utf-8",
+              )
+              report["status"] = "historical_candidate_selected_and_frozen_pre_week2"
+              report["selected_candidate_refit"] = {
+                  "candidate_class": selected_label,
+                  "parameter_name": refit["parameter_name"],
+                  "parameter": selected_param,
+                  "combined_refit_top12_mae": refit["fit_2024_top12_mae"],
+                  "selected_candidate_sha256": sha256(SELECTED_PATH),
+                  "prediction_snapshot_sha256": sha256(SNAPSHOT_PATH),
+              }
+              report["named_example_scored_after_candidate_freeze"] = True
+              OUT_JSON.write_text(
+                  json.dumps(report, indent=2, sort_keys=True) + "\n",
+                  encoding="utf-8",
+              )
+          else:
+              report["named_example_scored_after_candidate_freeze"] = False
+              OUT_JSON.write_text(
+                  json.dumps(report, indent=2, sort_keys=True) + "\n",
+                  encoding="utf-8",
+              )
+
+          # Human-readable report.
+          def pct(x):
+              return f"{100.0*x:.2f}%"
+
+          lines = [
+              "# Elite Surplus V1 — Historical Development Evaluation",
+              "",
+              f"**Status:** `{report['status']}`",
+              "",
+              "Historical development only. 2026 outcomes, KTC, market values, "
+              "and package votes were not used.",
+              "",
+              "## 2024 fitted parameters",
+              "",
+              "| Candidate | Parameter | 2024 fit MAE | Boundary unresolved? |",
+              "|---|---:|---:|---|",
+          ]
+          for label in ("E1", "E2", "E3"):
+              f = fit_results[label]
+              lines.append(
+                  f"| {label} | {f['parameter']:.8f} | "
+                  f"{f['fit_2024_top12_mae']:.6f} | "
+                  f"{'YES' if f['unresolved_non_null_boundary'] else 'no'} |"
+              )
+
+          lines += [
+              "",
+              "## Frozen 2025 validation",
+              "",
+              f"E0 baseline top-12 MAE: **{baseline_primary['top12_mae']:.6f}**.",
+              "",
+              "| Candidate | 2025 top12 MAE | Rel improvement | Fold wins | Top5 MAE | Broad MAE | Eligible |",
+              "|---|---:|---:|---:|---:|---:|---|",
+          ]
+          for label in ("E1", "E2", "E3"):
+              v = validation[label]
+              imp = v["gate_results"]["top12_relative_mae_improvement"]["value"]
+              lines.append(
+                  f"| {label} | {v['primary_2025']['top12_mae']:.6f} | "
+                  f"{pct(imp)} | {v['fold_wins']}/7 | "
+                  f"{v['primary_2025']['top5_mae']:.6f} | "
+                  f"{v['primary_2025']['broad_mae']:.6f} | "
+                  f"{'YES' if v['eligible'] else 'no'} |"
+              )
+
+          lines += [
+              "",
+              "## Decision",
+              "",
+          ]
+          if selected_label is None:
+              lines += [
+                  "**No preregistered challenger qualified.** Elite Surplus V1 "
+                  "stops here. No rescue formula and no production change.",
+                  "",
+              ]
+          else:
+              refit = report["selected_candidate_refit"]
+              lines += [
+                  f"Selected and frozen historical candidate: **{selected_label}**.",
+                  "",
+                  f"Frozen parameter: `{refit['parameter_name']} = {refit['parameter']:.10f}`.",
+                  "",
+                  "A pre-Week-2 FV prediction snapshot was frozen for the fixed "
+                  "2026 Weeks 2–8 prospective confirmation window. The named "
+                  "Allen/Dak example was scored only after candidate freeze and "
+                  "did not influence selection.",
+                  "",
+              ]
+
+          lines += [
+              "## Governance",
+              "",
+              "- No production change is authorized.",
+              "- Week 1 remains spent and ineligible.",
+              "- No 2026 outcome was read.",
+              "- A historical winner, if any, still requires the one-time fresh "
+              "Weeks 2–8 confirmation.",
+              "- Even a prospective pass remains blocked on review of the "
+              "underlying frozen FV component studies.",
+              "",
+          ]
+          OUT_MD.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+          manifest = {
+              "schema_version": 1,
+              "study_id": report["study_id"],
+              "status": report["status"],
+              "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+              "preregistration_sha256": sha256(PREREG),
+              "historical_evaluation_sha256": sha256(OUT_JSON),
+              "historical_summary_sha256": sha256(OUT_MD),
+              "candidate_selected": selected_label is not None,
+              "candidate_class": selected_label,
+              "selected_candidate_sha256": (
+                  sha256(SELECTED_PATH) if SELECTED_PATH.exists() else None
+              ),
+              "prediction_snapshot_sha256": (
+                  sha256(SNAPSHOT_PATH) if SNAPSHOT_PATH.exists() else None
+              ),
+              "week2_first_kickoff_utc": CUTOFF.isoformat(),
+              "frozen_before_week2_kickoff": datetime.now(timezone.utc) < CUTOFF,
+              "2026_outcomes_used": False,
+              "production_change_authorized": False,
+          }
+          OUT_MAN.write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          print(OUT_MD.read_text())
+          print("Historical evaluation SHA256:", sha256(OUT_JSON))
+          print("Manifest status:", manifest["status"])
+          if selected_label:
+              print("Selected candidate SHA256:", sha256(SELECTED_PATH))
+              print("Prediction snapshot SHA256:", sha256(SNAPSHOT_PATH))
+          PY
+
+      - name: Validate frozen decision contract
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          D = Path("research/elite-surplus-v1")
+          r = json.loads(
+              (D / "historical_development_evaluation_v1.json").read_text()
+          )
+          m = json.loads(
+              (D / "historical_development_manifest_v1.json").read_text()
+          )
+
+          assert r["research_only"] is True
+          assert r["production_change_authorized"] is False
+          assert r["ktc_used"] is False
+          assert r["market_value_used"] is False
+          assert r["package_vote_data_used"] is False
+          assert r["2026_outcomes_used"] is False
+          assert r["named_player_fit_target_used"] is False
+          assert r["method"]["fit_season"] == 2024
+          assert r["method"]["validation_season"] == 2025
+          assert r["method"]["primary_forward_window_weeks"] == 4
+          assert r["method"]["spearman_used_for_selection"] is False
+
+          for label in ("E1", "E2", "E3"):
+              assert label in r["fit_2024"]
+              assert label in r["validation_2025"]
+              assert isinstance(r["validation_2025"][label]["eligible"], bool)
+
+          selected = r["selected_candidate_class"]
+          assert m["candidate_selected"] == (selected is not None)
+
+          if selected is None:
+              assert r["status"] == "closed_no_historical_candidate"
+              assert not (D / "selected_candidate_v1.json").exists()
+              assert not (D / "prospective_prediction_snapshot_v1.json").exists()
+              assert r["named_example_scored_after_candidate_freeze"] is False
+          else:
+              assert r["status"] == "historical_candidate_selected_and_frozen_pre_week2"
+              assert selected in r["eligible_candidates"]
+              assert (D / "selected_candidate_v1.json").exists()
+              assert (D / "prospective_prediction_snapshot_v1.json").exists()
+
+              c = json.loads((D / "selected_candidate_v1.json").read_text())
+              s = json.loads((D / "prospective_prediction_snapshot_v1.json").read_text())
+              assert c["candidate_class"] == selected
+              assert c["frozen_before_week2_kickoff"] is True
+              assert c["production_change_authorized"] is False
+              assert s["candidate_class"] == selected
+              assert s["frozen_before_week2_kickoff"] is True
+              assert s["2026_week1_used"] is False
+              assert s["no_weekly_refit"] is True
+              assert s["production_change_authorized"] is False
+              assert s["qb_count"] >= 29
+              assert sum(x["primary_top12"] for x in s["rows"]) == 12
+              assert sum(x["elite_top5"] for x in s["rows"]) == 5
+              assert sum(x["broad_rank1_to_qb29"] for x in s["rows"]) == 29
+              assert s["named_example_diagnostic_after_freeze"]["used_in_fit_or_selection"] is False
+              assert r["named_example_scored_after_candidate_freeze"] is True
+
+              cutoff = datetime.fromisoformat(
+                  os.environ["ELITE_SURPLUS_WEEK2_CUTOFF_UTC"]
+              )
+              assert datetime.now(timezone.utc) < cutoff
+
+          print("PASS: historical selection and freeze obey the preregistered contract.")
+          PY
+
+      - name: Run repository regression checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/repo_regression_checks.py
+
+      - name: Prove only Elite Surplus evaluation artifacts changed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+
+          D = Path("research/elite-surplus-v1")
+          r = json.loads(
+              (D / "historical_development_evaluation_v1.json").read_text()
+          )
+
+          expected = {
+              "research/elite-surplus-v1/historical_development_evaluation_v1.json",
+              "research/elite-surplus-v1/historical_development_evaluation_v1.md",
+              "research/elite-surplus-v1/historical_development_manifest_v1.json",
+          }
+          if r["selected_candidate_class"] is not None:
+              expected |= {
+                  "research/elite-surplus-v1/selected_candidate_v1.json",
+                  "research/elite-surplus-v1/prospective_prediction_snapshot_v1.json",
+              }
+
+          raw = subprocess.check_output(
+              ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+              text=True,
+          )
+          actual = set()
+          for line in raw.splitlines():
+              if not line:
+                  continue
+              actual.add(line[3:])
+
+          print("Changed files:")
+          for x in sorted(actual):
+              print(x)
+
+          assert actual == expected, (sorted(actual), sorted(expected))
+          print("PASS: only preregistered Elite Surplus evaluation artifacts changed.")
+          PY
+
+      - name: Commit historical result and any frozen candidate snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          r = json.loads(
+              Path(
+                  "research/elite-surplus-v1/"
+                  "historical_development_evaluation_v1.json"
+              ).read_text()
+          )
+          if r["selected_candidate_class"] is not None:
+              cutoff = datetime.fromisoformat(
+                  os.environ["ELITE_SURPLUS_WEEK2_CUTOFF_UTC"]
+              )
+              if not datetime.now(timezone.utc) < cutoff:
+                  raise RuntimeError(
+                      "Refusing to commit a supposedly pre-Week-2 candidate "
+                      "or prediction snapshot after the first Week 2 kickoff."
+                  )
+          PY
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            research/elite-surplus-v1/historical_development_evaluation_v1.json \
+            research/elite-surplus-v1/historical_development_evaluation_v1.md \
+            research/elite-surplus-v1/historical_development_manifest_v1.json
+
+          if test -f research/elite-surplus-v1/selected_candidate_v1.json; then
+            git add \
+              research/elite-surplus-v1/selected_candidate_v1.json \
+              research/elite-surplus-v1/prospective_prediction_snapshot_v1.json
+          fi
+
+          git commit -m "Evaluate Elite Surplus V1 historical development"
+          git push origin HEAD:main
