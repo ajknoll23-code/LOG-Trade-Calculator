@@ -1,0 +1,746 @@
+name: Draft Pick FV Mathematical Audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Guard required production sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          test -f index.html
+          test -f data/draft_slot_projection.json
+          test -f scripts/validation/snapshot_values.py
+          test -f scripts/validation/repo_regression_checks.py
+
+      - name: Validate deployed player FV port
+        run: python3 scripts/validation/snapshot_values.py --selftest
+
+      - name: Build read-only mathematical audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="/tmp/draft-pick-fv-mathematical-audit"
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import importlib.util
+          import json
+          import math
+          import re
+          import subprocess
+          from pathlib import Path
+          from statistics import median
+
+          ROOT = Path(".")
+          OUT = Path("/tmp/draft-pick-fv-mathematical-audit")
+          INDEX = ROOT / "index.html"
+          PROJECTION = ROOT / "data/draft_slot_projection.json"
+          SNAPSHOT_MODULE = ROOT / "scripts/validation/snapshot_values.py"
+
+          def sha256(path: Path) -> str:
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          def git_head() -> str:
+              return subprocess.check_output(
+                  ["git", "rev-parse", "HEAD"], text=True
+              ).strip()
+
+          html = INDEX.read_text(encoding="utf-8")
+
+          def extract_object_body(content: str, name: str) -> str:
+              marker = re.search(
+                  rf"\bconst\s+{re.escape(name)}\s*=\s*\{{", content
+              )
+              if not marker:
+                  raise RuntimeError(f"Could not locate const {name}")
+              brace = content.find("{", marker.start())
+              depth = 0
+              quote = None
+              escaped = False
+              line_comment = False
+              block_comment = False
+              i = brace
+              while i < len(content):
+                  ch = content[i]
+                  nxt = content[i + 1] if i + 1 < len(content) else ""
+
+                  if line_comment:
+                      if ch == "\n":
+                          line_comment = False
+                      i += 1
+                      continue
+                  if block_comment:
+                      if ch == "*" and nxt == "/":
+                          block_comment = False
+                          i += 2
+                      else:
+                          i += 1
+                      continue
+                  if quote is not None:
+                      if escaped:
+                          escaped = False
+                      elif ch == "\\":
+                          escaped = True
+                      elif ch == quote:
+                          quote = None
+                      i += 1
+                      continue
+                  if ch == "/" and nxt == "/":
+                      line_comment = True
+                      i += 2
+                      continue
+                  if ch == "/" and nxt == "*":
+                      block_comment = True
+                      i += 2
+                      continue
+                  if ch in ("'", '"', "`"):
+                      quote = ch
+                      i += 1
+                      continue
+                  if ch == "{":
+                      depth += 1
+                  elif ch == "}":
+                      depth -= 1
+                      if depth == 0:
+                          return content[brace + 1:i]
+                  i += 1
+              raise RuntimeError(f"Unterminated object {name}")
+
+          pick_body = extract_object_body(html, "PICK_BASE")
+          round_re = re.compile(
+              r"(\d+)\s*:\s*\{\s*"
+              r"early\s*:\s*([0-9.]+)\s*,\s*"
+              r"mid\s*:\s*([0-9.]+)\s*,\s*"
+              r"late\s*:\s*([0-9.]+)"
+          )
+          pick_base = {
+              int(r): {
+                  "early": float(e),
+                  "mid": float(m),
+                  "late": float(l),
+              }
+              for r, e, m, l in round_re.findall(pick_body)
+          }
+          if sorted(pick_base) != [1, 2, 3, 4, 5, 6]:
+              raise RuntimeError(
+                  f"Unexpected PICK_BASE rounds: {sorted(pick_base)}"
+              )
+
+          yd_body = extract_object_body(html, "YEAR_DISCOUNT")
+          year_discount = {
+              year: float(value)
+              for year, value in re.findall(
+                  r"['\"](\d{4})['\"]\s*:\s*([0-9.]+)", yd_body
+              )
+          }
+          if not year_discount:
+              raise RuntimeError("YEAR_DISCOUNT parsed empty")
+
+          season_match = re.search(
+              r"const\s+PICK_SEASONS\s*=\s*\[(.*?)\]\s*;",
+              html,
+              flags=re.DOTALL,
+          )
+          if not season_match:
+              raise RuntimeError("Could not locate PICK_SEASONS")
+          pick_seasons = re.findall(r"['\"](\d{4})['\"]", season_match.group(1))
+
+          applies_match = re.search(
+              r"let\s+DRAFT_SLOT_APPLIES_TO_SEASON\s*=\s*['\"](\d{4})['\"]",
+              html,
+          )
+          if not applies_match:
+              raise RuntimeError("Could not locate DRAFT_SLOT_APPLIES_TO_SEASON")
+          applies_season = applies_match.group(1)
+
+          fallback_match = re.search(
+              r"const\s+disc\s*=\s*YEAR_DISCOUNT\[year\]\s*\?\?\s*([0-9.]+)",
+              html,
+          )
+          if not fallback_match:
+              raise RuntimeError("Could not extract pickValue year fallback")
+          unknown_year_fallback = float(fallback_match.group(1))
+
+          projection = json.loads(PROJECTION.read_text(encoding="utf-8"))
+
+          # Import the deployed player-FV port without writing a snapshot.
+          spec = importlib.util.spec_from_file_location(
+              "snapshot_values_audit", SNAPSHOT_MODULE
+          )
+          if spec is None or spec.loader is None:
+              raise RuntimeError("Could not import snapshot_values.py")
+          sv = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(sv)
+          cfg = sv.load_from_html(INDEX)
+          player_values = sv.compute_all_values(cfg)
+
+          player_rows = sorted(
+              (
+                  {
+                      "name": name,
+                      "pos": row["pos"],
+                      "value": int(row["value"]),
+                  }
+                  for name, row in player_values.items()
+              ),
+              key=lambda x: (-x["value"], x["name"]),
+          )
+          all_player_fv = [row["value"] for row in player_rows]
+          if not all_player_fv:
+              raise RuntimeError("No player values computed")
+
+          slots = ("early", "mid", "late")
+          rounds = sorted(pick_base)
+
+          def js_round_positive(x: float) -> int:
+              return math.floor(x + 0.5)
+
+          def pick_value(round_: int, slot: str, year: str) -> int:
+              base_row = pick_base.get(round_, pick_base[6])
+              base = base_row.get(slot, pick_base[6]["late"])
+              disc = year_discount.get(year, unknown_year_fallback)
+              return js_round_positive(base * disc)
+
+          # ------------------------------------------------------------
+          # 1) Fundamental arithmetic invariants
+          # ------------------------------------------------------------
+          positivity_failures = []
+          slot_order_failures = []
+          round_order_failures = []
+          year_order_failures = []
+
+          explicit_years_by_discount = sorted(
+              year_discount,
+              key=lambda y: (-year_discount[y], y),
+          )
+
+          for year in explicit_years_by_discount:
+              for rnd in rounds:
+                  vals = {slot: pick_value(rnd, slot, year) for slot in slots}
+                  for slot, value in vals.items():
+                      if value <= 0:
+                          positivity_failures.append(
+                              {"year": year, "round": rnd, "slot": slot, "value": value}
+                          )
+                  if not vals["early"] >= vals["mid"] >= vals["late"]:
+                      slot_order_failures.append(
+                          {"year": year, "round": rnd, "values": vals}
+                      )
+
+              for slot in slots:
+                  seq = [(rnd, pick_value(rnd, slot, year)) for rnd in rounds]
+                  for left, right in zip(seq, seq[1:]):
+                      if right[1] > left[1]:
+                          round_order_failures.append(
+                              {
+                                  "year": year,
+                                  "slot": slot,
+                                  "earlier": left,
+                                  "later": right,
+                              }
+                          )
+
+          for rnd in rounds:
+              for slot in slots:
+                  seq = [
+                      (year, pick_value(rnd, slot, year))
+                      for year in explicit_years_by_discount
+                  ]
+                  for left, right in zip(seq, seq[1:]):
+                      if right[1] > left[1]:
+                          year_order_failures.append(
+                              {
+                                  "round": rnd,
+                                  "slot": slot,
+                                  "nearer": left,
+                                  "farther": right,
+                              }
+                          )
+
+          # ------------------------------------------------------------
+          # 2) Shape diagnostics
+          # ------------------------------------------------------------
+          tier_spreads = {}
+          round_decay = {}
+          for rnd in rounds:
+              e = pick_base[rnd]["early"]
+              m = pick_base[rnd]["mid"]
+              l = pick_base[rnd]["late"]
+              tier_spreads[str(rnd)] = {
+                  "early_over_mid": e / m,
+                  "mid_over_late": m / l,
+                  "early_over_late": e / l,
+                  "mid_discount_from_early": 1.0 - m / e,
+                  "late_discount_from_early": 1.0 - l / e,
+                  "early_minus_mid": e - m,
+                  "mid_minus_late": m - l,
+              }
+
+          for slot in slots:
+              round_decay[slot] = []
+              for r1, r2 in zip(rounds, rounds[1:]):
+                  round_decay[slot].append(
+                      {
+                          "from_round": r1,
+                          "to_round": r2,
+                          "retention": pick_base[r2][slot] / pick_base[r1][slot],
+                          "discount": 1.0 - pick_base[r2][slot] / pick_base[r1][slot],
+                      }
+                  )
+
+          # Production comment says R5-R6 continue the observed R3->R4 decay.
+          # Test that literal mathematical claim instead of assuming it.
+          extrapolation_check = {}
+          for slot in slots:
+              observed_3_to_4 = pick_base[4][slot] / pick_base[3][slot]
+              actual_4_to_5 = pick_base[5][slot] / pick_base[4][slot]
+              actual_5_to_6 = pick_base[6][slot] / pick_base[5][slot]
+              extrapolation_check[slot] = {
+                  "r3_to_r4_retention": observed_3_to_4,
+                  "r4_to_r5_retention": actual_4_to_5,
+                  "r5_to_r6_retention": actual_5_to_6,
+                  "r4_to_r5_abs_gap_vs_literal_continuation": abs(
+                      actual_4_to_5 - observed_3_to_4
+                  ),
+                  "r5_to_r6_abs_gap_vs_literal_continuation": abs(
+                      actual_5_to_6 - observed_3_to_4
+                  ),
+                  "literal_continuation_matches": (
+                      math.isclose(actual_4_to_5, observed_3_to_4, rel_tol=0, abs_tol=5e-4)
+                      and math.isclose(actual_5_to_6, observed_3_to_4, rel_tol=0, abs_tol=5e-4)
+                  ),
+              }
+
+          # ------------------------------------------------------------
+          # 3) Time-discount diagnostics
+          # ------------------------------------------------------------
+          d2027 = year_discount.get("2027")
+          d2028 = year_discount.get("2028")
+          d2029 = year_discount.get("2029")
+          temporal = {
+              "year_discount": year_discount,
+              "unknown_year_fallback": unknown_year_fallback,
+              "ratio_2028_to_2027": (
+                  d2028 / d2027 if d2027 and d2028 is not None else None
+              ),
+              "ratio_2029_to_2028": (
+                  d2029 / d2028 if d2028 and d2029 is not None else None
+              ),
+              "geometric_085_squared": 0.85 ** 2,
+              "geometric_085_cubed": 0.85 ** 3,
+              "2029_gap_vs_085_squared": (
+                  d2029 - 0.85 ** 2 if d2029 is not None else None
+              ),
+              "fallback_gap_vs_085_cubed": unknown_year_fallback - 0.85 ** 3,
+              "fallback_is_flat_for_all_unknown_years": True,
+          }
+
+          # ------------------------------------------------------------
+          # 4) Current tradeable value grid and boundary jumps
+          # ------------------------------------------------------------
+          current_grid = {}
+          for season in pick_seasons:
+              # Current architecture only projects the determining season;
+              # farther years remain mid.
+              if season == applies_season:
+                  tiers = slots
+              else:
+                  tiers = ("mid",)
+              current_grid[season] = {
+                  str(rnd): {
+                      slot: pick_value(rnd, slot, season)
+                      for slot in tiers
+                  }
+                  for rnd in rounds
+              }
+
+          boundary_jumps = {}
+          for rnd in rounds:
+              e = pick_base[rnd]["early"]
+              m = pick_base[rnd]["mid"]
+              l = pick_base[rnd]["late"]
+              boundary_jumps[str(rnd)] = {
+                  "early_to_mid_absolute": e - m,
+                  "early_to_mid_pct_of_early": (e - m) / e,
+                  "mid_to_late_absolute": m - l,
+                  "mid_to_late_pct_of_mid": (m - l) / m,
+              }
+
+          # ------------------------------------------------------------
+          # 5) Cross-asset scale diagnostics
+          # ------------------------------------------------------------
+          def player_percentile_below(value: int) -> float:
+              return sum(v <= value for v in all_player_fv) / len(all_player_fv)
+
+          cross_asset = {}
+          for rnd in rounds:
+              cross_asset[str(rnd)] = {}
+              for slot in slots:
+                  value = int(pick_base[rnd][slot])
+                  nearest = min(
+                      player_rows,
+                      key=lambda row: (abs(row["value"] - value), -row["value"], row["name"]),
+                  )
+                  cross_asset[str(rnd)][slot] = {
+                      "pick_value_2027": value,
+                      "player_percentile_at_or_below": player_percentile_below(value),
+                      "nearest_player_fv": nearest,
+                      "players_strictly_above": sum(v > value for v in all_player_fv),
+                  }
+
+          player_summary = {
+              "count": len(player_rows),
+              "max": player_rows[0],
+              "top_10": player_rows[:10],
+              "median_value": median(all_player_fv),
+          }
+
+          # ------------------------------------------------------------
+          # 6) Additive package-equivalence diagnostics
+          # ------------------------------------------------------------
+          anchor = pick_base[1]["early"]
+          additive_equivalents = {}
+          for rnd in rounds:
+              additive_equivalents[str(rnd)] = {}
+              for slot in slots:
+                  v = pick_base[rnd][slot]
+                  additive_equivalents[str(rnd)][slot] = {
+                      "count_to_equal_one_early_first": anchor / v,
+                      "smallest_integer_count_to_meet_or_exceed": math.ceil(anchor / v),
+                      "integer_package_value": math.ceil(anchor / v) * v,
+                      "integer_package_pct_vs_early_first": (
+                          math.ceil(anchor / v) * v / anchor
+                      ),
+                  }
+
+          # ------------------------------------------------------------
+          # 7) Architecture/source-lineage classification
+          # ------------------------------------------------------------
+          pick_comment_start = html.rfind("/*", 0, html.find("const PICK_BASE"))
+          pick_comment_end = html.find("*/", pick_comment_start) + 2
+          pick_comment = (
+              html[pick_comment_start:pick_comment_end].strip()
+              if pick_comment_start >= 0 and pick_comment_end > 1
+              else ""
+          )
+          year_comment_start = html.rfind("/*", 0, html.find("const YEAR_DISCOUNT"))
+          year_comment_end = html.find("*/", year_comment_start) + 2
+          year_comment = (
+              html[year_comment_start:year_comment_end].strip()
+              if year_comment_start >= 0 and year_comment_end > 1
+              else ""
+          )
+
+          source_lineage = {
+              "pick_base_comment": pick_comment,
+              "year_discount_comment": year_comment,
+              "market_benchmark_language_present": (
+                  "KeepTradeCut" in pick_comment or "KTC" in pick_comment
+              ),
+              "rounds_5_6_explicitly_extrapolated": (
+                  "Rounds 5-6" in pick_comment and "extrapolat" in pick_comment.lower()
+              ),
+              "2029_explicitly_extrapolated": (
+                  "2029" in year_comment and "extrapolat" in year_comment.lower()
+              ),
+          }
+
+          arithmetic_pass = not any(
+              (
+                  positivity_failures,
+                  slot_order_failures,
+                  round_order_failures,
+                  year_order_failures,
+              )
+          )
+
+          literal_r56_matches = all(
+              row["literal_continuation_matches"]
+              for row in extrapolation_check.values()
+          )
+
+          findings = []
+          if arithmetic_pass:
+              findings.append(
+                  "PASS: all explicit pick values are positive and monotone by slot, round, and explicit year discount."
+              )
+          else:
+              findings.append(
+                  "FAIL: at least one basic arithmetic/monotonicity invariant is violated."
+              )
+
+          if not literal_r56_matches:
+              findings.append(
+                  "FLAG: deployed R5/R6 values do not literally continue each tier's R3->R4 retention rate, despite the source comment saying that R5/R6 do so."
+              )
+
+          if source_lineage["market_benchmark_language_present"]:
+              findings.append(
+                  "LIMITATION: PICK_BASE is market-benchmarked, so internal arithmetic cannot by itself establish these numbers as independent Fundamental Value."
+              )
+
+          findings.append(
+              "LIMITATION: early/mid/late tiers are step functions; exact slots within each four-pick band intentionally share one value."
+          )
+          findings.append(
+              "LIMITATION: multi-pick totals remain additive unless another production layer explicitly applies a consolidation cost; this audit reports package-equivalence pressure but does not fit a penalty."
+          )
+
+          report = {
+              "audit_id": "draft-pick-fv-mathematical-audit-v1",
+              "head_sha": git_head(),
+              "source_sha256": {
+                  "index.html": sha256(INDEX),
+                  "data/draft_slot_projection.json": sha256(PROJECTION),
+                  "scripts/validation/snapshot_values.py": sha256(SNAPSHOT_MODULE),
+              },
+              "scope": {
+                  "read_only": True,
+                  "production_mutation": False,
+                  "external_market_refresh": False,
+                  "candidate_fitting": False,
+                  "question": (
+                      "Does the deployed draft-pick valuation system satisfy its own "
+                      "mathematical invariants, maintain coherent cross-round/tier/year "
+                      "relationships, and sit coherently on the current player-FV scale?"
+                  ),
+              },
+              "deployed_constants": {
+                  "pick_base": pick_base,
+                  "year_discount": year_discount,
+                  "pick_seasons": pick_seasons,
+                  "draft_slot_applies_to_season": applies_season,
+                  "unknown_year_fallback": unknown_year_fallback,
+              },
+              "projection_contract": {
+                  "draft_season": projection.get("draft_season"),
+                  "status": projection.get("status"),
+                  "league_rule": projection.get("league_rule"),
+                  "projection_as_of_date": projection.get("projection_as_of_date"),
+              },
+              "basic_invariants": {
+                  "arithmetic_pass": arithmetic_pass,
+                  "positivity_failures": positivity_failures,
+                  "slot_order_failures": slot_order_failures,
+                  "round_order_failures": round_order_failures,
+                  "year_order_failures": year_order_failures,
+              },
+              "tier_spreads": tier_spreads,
+              "boundary_jumps": boundary_jumps,
+              "round_decay": round_decay,
+              "round_5_6_extrapolation_check": extrapolation_check,
+              "temporal_discount": temporal,
+              "current_tradeable_value_grid": current_grid,
+              "player_fv_scale": player_summary,
+              "cross_asset_scale": cross_asset,
+              "additive_package_equivalents": additive_equivalents,
+              "source_lineage": source_lineage,
+              "findings": findings,
+              "verdict": {
+                  "internal_arithmetic": (
+                      "PASS" if arithmetic_pass else "FAIL"
+                  ),
+                  "independent_fundamental_value_validation": "NOT_ESTABLISHED",
+                  "production_change_authorized": False,
+              },
+          }
+
+          json_path = OUT / "draft_pick_fv_mathematical_audit_v1.json"
+          json_path.write_text(
+              json.dumps(report, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          lines = []
+          lines.append("# Draft Pick FV Mathematical Audit V1")
+          lines.append("")
+          lines.append(f"- Head SHA: `{report['head_sha']}`")
+          lines.append(f"- Internal arithmetic: **{report['verdict']['internal_arithmetic']}**")
+          lines.append("- Independent FV validation: **NOT ESTABLISHED**")
+          lines.append("- Production mutation: **none**")
+          lines.append("")
+          lines.append("## Deployed 2027 base values")
+          lines.append("")
+          lines.append("| Round | Early | Mid | Late | Early/Mid | Mid/Late |")
+          lines.append("|---:|---:|---:|---:|---:|---:|")
+          for rnd in rounds:
+              s = tier_spreads[str(rnd)]
+              lines.append(
+                  f"| {rnd} | {pick_base[rnd]['early']:.0f} | "
+                  f"{pick_base[rnd]['mid']:.0f} | {pick_base[rnd]['late']:.0f} | "
+                  f"{s['early_over_mid']:.4f} | {s['mid_over_late']:.4f} |"
+              )
+
+          lines.append("")
+          lines.append("## Round retention")
+          lines.append("")
+          lines.append("| Slot | R1→R2 | R2→R3 | R3→R4 | R4→R5 | R5→R6 |")
+          lines.append("|---|---:|---:|---:|---:|---:|")
+          for slot in slots:
+              vals = [row["retention"] for row in round_decay[slot]]
+              lines.append(
+                  "| " + slot.title() + " | "
+                  + " | ".join(f"{v:.4f}" for v in vals) + " |"
+              )
+
+          lines.append("")
+          lines.append("## R5/R6 literal extrapolation check")
+          lines.append("")
+          lines.append("| Slot | R3→R4 | R4→R5 | R5→R6 | Literal match? |")
+          lines.append("|---|---:|---:|---:|---:|")
+          for slot in slots:
+              x = extrapolation_check[slot]
+              lines.append(
+                  f"| {slot.title()} | {x['r3_to_r4_retention']:.6f} | "
+                  f"{x['r4_to_r5_retention']:.6f} | "
+                  f"{x['r5_to_r6_retention']:.6f} | "
+                  f"{'YES' if x['literal_continuation_matches'] else 'NO'} |"
+              )
+
+          lines.append("")
+          lines.append("## Player-FV scale")
+          lines.append("")
+          top = player_summary["max"]
+          lines.append(
+              f"- Player rows: {player_summary['count']}"
+          )
+          lines.append(
+              f"- Current maximum player FV: **{top['value']}** "
+              f"({top['name']}, {top['pos']})"
+          )
+          lines.append(
+              f"- 2027 early 1st: **{int(pick_base[1]['early'])}**"
+          )
+          lines.append(
+              f"- Early-1st / max-player ratio: "
+              f"**{pick_base[1]['early'] / top['value']:.4f}**"
+          )
+
+          lines.append("")
+          lines.append("## Additive package pressure")
+          lines.append("")
+          lines.append("| Asset | Count equal to early 1st | Smallest integer count ≥ early 1st |")
+          lines.append("|---|---:|---:|")
+          for rnd in rounds:
+              for slot in slots:
+                  x = additive_equivalents[str(rnd)][slot]
+                  lines.append(
+                      f"| R{rnd} {slot} | "
+                      f"{x['count_to_equal_one_early_first']:.3f} | "
+                      f"{x['smallest_integer_count_to_meet_or_exceed']} |"
+                  )
+
+          lines.append("")
+          lines.append("## Findings")
+          lines.append("")
+          for item in findings:
+              lines.append(f"- {item}")
+
+          lines.append("")
+          lines.append("## Interpretation guardrail")
+          lines.append("")
+          lines.append(
+              "This audit can establish mathematical consistency of the deployed "
+              "curve and expose structural pressure points. It cannot convert a "
+              "market-benchmarked table into independent Fundamental Value evidence. "
+              "That requires a separate preregistered outcome-based pick-value study."
+          )
+
+          md_path = OUT / "draft_pick_fv_mathematical_audit_v1.md"
+          md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+          print("\n".join(findings))
+          print(
+              f"Player max FV={top['value']} ({top['name']}); "
+              f"early 1st={int(pick_base[1]['early'])}; "
+              f"ratio={pick_base[1]['early']/top['value']:.4f}"
+          )
+          print(f"Wrote {json_path}")
+          print(f"Wrote {md_path}")
+          PY
+
+      - name: Validate audit contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          p = Path("/tmp/draft-pick-fv-mathematical-audit/draft_pick_fv_mathematical_audit_v1.json")
+          d = json.loads(p.read_text(encoding="utf-8"))
+
+          assert d["audit_id"] == "draft-pick-fv-mathematical-audit-v1"
+          assert d["scope"]["read_only"] is True
+          assert d["scope"]["production_mutation"] is False
+          assert d["scope"]["candidate_fitting"] is False
+          assert d["verdict"]["production_change_authorized"] is False
+
+          # Basic arithmetic must be deterministic. A failure here should make
+          # the workflow red rather than burying a broken production invariant
+          # inside an artifact.
+          assert d["basic_invariants"]["arithmetic_pass"] is True
+          assert not d["basic_invariants"]["positivity_failures"]
+          assert not d["basic_invariants"]["slot_order_failures"]
+          assert not d["basic_invariants"]["round_order_failures"]
+          assert not d["basic_invariants"]["year_order_failures"]
+
+          assert d["projection_contract"]["draft_season"] == "2027"
+          assert d["projection_contract"]["status"] == "projected_from_regular_season_standings"
+
+          # This audit is specifically designed not to overclaim FV validity.
+          assert d["verdict"]["independent_fundamental_value_validation"] == "NOT_ESTABLISHED"
+
+          print("PASS: mathematical audit contract validated.")
+          PY
+
+      - name: Run repository regression checks
+        run: python3 scripts/validation/repo_regression_checks.py
+
+      - name: Upload mathematical audit artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: draft-pick-fv-mathematical-audit-v1
+          path: |
+            /tmp/draft-pick-fv-mathematical-audit/draft_pick_fv_mathematical_audit_v1.json
+            /tmp/draft-pick-fv-mathematical-audit/draft_pick_fv_mathematical_audit_v1.md
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Prove repository stayed unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "$(git status --porcelain=v1 --untracked-files=all)" ]; then
+            echo "::error::Read-only audit modified the repository."
+            git status --short
+            exit 1
+          fi
+          echo "PASS: repository unchanged."
