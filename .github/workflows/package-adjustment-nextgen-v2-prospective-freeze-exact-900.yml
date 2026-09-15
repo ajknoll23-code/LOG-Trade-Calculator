@@ -1,0 +1,821 @@
+name: Package Adjustment NextGen V2 Freeze Exact 900
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  freeze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13.15'
+
+      - name: Install freeze dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install "requests==2.34.2"
+
+      - name: Guard frozen prospective contract and one-time freeze surface
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          D="research/package-adjustment-nextgen-v2"
+          DATA="$D/prospective_exact_900_frozen_v1.json"
+          MANIFEST="$D/prospective_exact_900_freeze_manifest_v1.json"
+
+          test -z "$(git status --porcelain=v1)"
+
+          # Same frozen inputs guarded by the green maturity monitor.
+          git merge-base --is-ancestor \
+            4b52df39f3c9a02d3b114c4cdfc81dd5af411049 HEAD
+          test "$(git hash-object "$D/prospective_time_holdout_preregistration_v1.json")" = \
+            "f37b18ec24ae9fa73872069963be7d13f620e80a"
+          test "$(git hash-object "$D/package_vote_challenges_prospective_v1.json")" = \
+            "b338b18291c5058c5a2b941e1293322e2e70ea8c"
+          test "$(git hash-object "$D/prospective_voting_restart_30_daily_v1.json")" = \
+            "2b8fbc79d0c0c7da31aa0a2ce2d2c4b44c554e2b"
+
+          # The preregistered frozen candidate must also remain byte-identical.
+          test "$(git hash-object "$D/research_candidate_m2b_v1.json")" = \
+            "1560124540e1104fdc4f4e9f367d984b46921cb9"
+          test "$(sha256sum "$D/research_candidate_m2b_v1.json" | awk '{print $1}')" = \
+            "4b27bc48ca90fb7c3a60745a51d6cfe8b98ef26fe7c6791b12983b3e39f534a7"
+
+          # This is a one-time immutable freeze. Refuse to overwrite it.
+          test ! -e "$DATA"
+          test ! -e "$MANIFEST"
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          d = Path("research/package-adjustment-nextgen-v2")
+          prereg = json.loads((d / "prospective_time_holdout_preregistration_v1.json").read_text())
+          amendment = json.loads((d / "prospective_voting_restart_30_daily_v1.json").read_text())
+          catalog = json.loads((d / "package_vote_challenges_prospective_v1.json").read_text())
+
+          assert prereg["status"] == "frozen_prospective_time_holdout_preregistration"
+          assert prereg["frozen"] is True
+          assert prereg["required_sequence_after_this_freeze"][4] == (
+              "freeze_exact_mature_prospective_evidence_checkpoint"
+          )
+          assert prereg["required_sequence_after_this_freeze"][5] == (
+              "evaluate_frozen_M2b_vs_frozen_M0_once"
+          )
+          assert prereg["prospective_evaluation_contract"]["evaluation_occurs_once_after_maturity"] is True
+
+          evidence = prereg["prospective_evidence_maturity_and_stopping"]
+          assert evidence["monitor_must_be_outcome_blind"] is True
+          assert evidence["exact_checkpoints_effective_votes"] == [900, 1000]
+          assert evidence["stop_at_first_checkpoint_where_all_coverage_gates_pass"] is True
+
+          rules = amendment["superseding_evidence_rules"]
+          assert rules["daily_valid_vote_cap_per_voter"] == 30
+          assert rules["effective_lifetime_cap_per_voter"] == 30.0
+          assert rules["minimum_distinct_voters"] == 30
+          assert rules["minimum_effective_votes_per_cell"] == 15.0
+          assert rules["minimum_distinct_voters_per_cell"] == 10
+          assert rules["exact_checkpoints_effective_votes"] == [900, 1000]
+          assert rules["first_checkpoint_effective_votes"] == 900
+          assert rules["hard_cap_effective_votes"] == 1000
+          assert rules["stopping_is_coverage_only"] is True
+
+          assert catalog["catalog_id"] == "pkgnv2-prospective-catalog-v1"
+          assert len(catalog["challenges"]) == 129
+          assert all(c["evaluation_only"] is True for c in catalog["challenges"])
+          assert all(c["fit_eligible"] is False for c in catalog["challenges"])
+
+          print("PASS: frozen prospective contract is unchanged and freeze surface is unused.")
+          PY
+
+      - name: Verify production remains V1.6 before freeze
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 \
+            python3 scripts/validation/check_package_adjustment_live.py
+
+      - name: Freeze exact 900-effective-vote checkpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import io
+          import json
+          import os
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import requests
+
+          D = Path("research/package-adjustment-nextgen-v2")
+          DATA_PATH = D / "prospective_exact_900_frozen_v1.json"
+          MANIFEST_PATH = D / "prospective_exact_900_freeze_manifest_v1.json"
+          REPORT_PATH = Path("/tmp/prospective_exact_900_freeze_report.md")
+
+          SHEET_URL = (
+              "https://docs.google.com/spreadsheets/d/e/"
+              "2PACX-1vTuKORGumlKJmUmBdeNWPstkj8VRjPoVkylbqHv1KqwoyziJYOUlkZUKRsSxzB3qHXmyjjLpGpH6W03/"
+              "pub?gid=458294959&single=true&output=csv"
+          )
+
+          # This timestamp and aggregate fingerprint come from the successful
+          # outcome-blind maturity run supplied before this freeze workflow was
+          # created. Rows after this instant can never enter the frozen checkpoint.
+          MATURITY_ANCHOR_UTC = "2026-09-14T22:26:47.010241+00:00"
+          MATURITY_REPORT_SHA256 = (
+              "8faa1323c90eb8e197b2baf69a53449951606d71852fb1b61160f6771ad1f58b"
+          )
+          EXPECTED_ANCHORED_RAW_NAMESPACE_ROWS = 980
+          EXPECTED_ANCHORED_VALID_POST_DAILY_CAP = 960
+          EXPECTED_ANCHORED_EFFECTIVE = 900.0
+          EXPECTED_ANCHORED_DISTINCT_VOTERS = 30
+          EXPECTED_ANCHORED_DISTINCT_CHALLENGES = 129
+          EXPECTED_ANCHORED_CELLS_OBSERVED = 24
+          EXPECTED_ANCHORED_CELLS_PASSING = 24
+          EXPECTED_ANCHORED_MIN_CELL_EFFECTIVE = 30.0
+          EXPECTED_ANCHORED_MIN_CELL_VOTERS = 19
+
+          prereg_path = D / "prospective_time_holdout_preregistration_v1.json"
+          catalog_path = D / "package_vote_challenges_prospective_v1.json"
+          amendment_path = D / "prospective_voting_restart_30_daily_v1.json"
+          candidate_path = D / "research_candidate_m2b_v1.json"
+
+          prereg = json.loads(prereg_path.read_text())
+          catalog_doc = json.loads(catalog_path.read_text())
+          amendment = json.loads(amendment_path.read_text())
+
+          transport = prereg["prospective_transport_and_sampling_contract"]
+          rules = amendment["superseding_evidence_rules"]
+
+          VOTE_PREFIX = transport["vote_prefix"]
+          META_PREFIX = transport["meta_prefix"]
+          SCHEMA_MARKER = transport["schema_marker"]
+          DAILY_CAP = int(rules["daily_valid_vote_cap_per_voter"])
+          LIFETIME_CAP = float(rules["effective_lifetime_cap_per_voter"])
+          MIN_VOTERS = int(rules["minimum_distinct_voters"])
+          MIN_CELL_EFFECTIVE = float(rules["minimum_effective_votes_per_cell"])
+          MIN_CELL_VOTERS = int(rules["minimum_distinct_voters_per_cell"])
+          CHECKPOINT = int(rules["first_checkpoint_effective_votes"])
+
+          assert CHECKPOINT == 900
+          assert float(LIFETIME_CAP).is_integer() and int(LIFETIME_CAP) == 30
+
+          def parse_utc(value):
+              s = str(value or "").strip()
+              if not s:
+                  return None
+              if s.endswith("Z"):
+                  s = s[:-1] + "+00:00"
+              try:
+                  dt = datetime.fromisoformat(s)
+              except ValueError:
+                  return None
+              if dt.tzinfo is None:
+                  dt = dt.replace(tzinfo=timezone.utc)
+              return dt.astimezone(timezone.utc)
+
+          cutoff = parse_utc(amendment["timing"]["replacement_valid_ballot_start_utc"])
+          maturity_anchor = parse_utc(MATURITY_ANCHOR_UTC)
+          assert cutoff is not None and maturity_anchor is not None
+          assert maturity_anchor > cutoff
+
+          challenges = {c["id"]: c for c in catalog_doc["challenges"]}
+          assert len(challenges) == 129
+
+          def cell_key(challenge):
+              return "|".join([
+                  str(challenge["family"]),
+                  str(challenge["cell_id"]),
+                  str(challenge["scale_label"]),
+                  str(challenge["split"]),
+              ])
+
+          cell_meta = {}
+          for challenge in challenges.values():
+              key = cell_key(challenge)
+              meta = {
+                  "family": challenge["family"],
+                  "cell_id": challenge["cell_id"],
+                  "scale_label": challenge["scale_label"],
+                  "split": challenge["split"],
+              }
+              if key in cell_meta:
+                  assert cell_meta[key] == meta
+              else:
+                  cell_meta[key] = meta
+          assert len(cell_meta) == 24
+
+          frozen_at = datetime.now(timezone.utc)
+          response = requests.get(SHEET_URL, timeout=30)
+          response.raise_for_status()
+          content_type = str(response.headers.get("content-type") or "").lower()
+          if "text/html" in content_type or "<html" in response.text[:500].lower():
+              raise RuntimeError("sheet export returned HTML instead of CSV")
+
+          sheet_bytes = response.content
+          sheet_sha256 = hashlib.sha256(sheet_bytes).hexdigest()
+          rows = list(csv.DictReader(io.StringIO(response.text)))
+          if not rows:
+              raise RuntimeError("sheet export contains no data rows")
+
+          required_columns = {"timestamp", "voter_roster_id", "keep", "trade", "cut"}
+          missing_columns = required_columns - set(rows[0].keys())
+          if missing_columns:
+              raise RuntimeError(f"sheet missing required columns: {sorted(missing_columns)}")
+
+          total_namespace_rows_at_fetch = 0
+          anchored_namespace_rows = 0
+          rows_after_maturity_anchor = 0
+          anchored_excluded = Counter()
+          structurally_valid = []
+
+          # IMPORTANT: checkpoint eligibility below is outcome-blind. The final
+          # response suffix and display-orientation suffix are deliberately not
+          # parsed until AFTER the exact checkpoint prefix has been selected and
+          # its maturity fingerprint has been revalidated.
+          for source_index, row in enumerate(rows):
+              keep = str(row.get("keep") or "")
+              if not keep.startswith(VOTE_PREFIX):
+                  continue
+              total_namespace_rows_at_fetch += 1
+
+              ts = parse_utc(row.get("timestamp"))
+              if ts is None:
+                  # A malformed timestamp that existed by the maturity anchor
+                  # would change the anchored fingerprint and must be visible.
+                  anchored_excluded["invalid_timestamp"] += 1
+                  continue
+
+              if ts > maturity_anchor:
+                  rows_after_maturity_anchor += 1
+                  continue
+
+              anchored_namespace_rows += 1
+
+              if ts <= cutoff:
+                  anchored_excluded["pre_restart_or_at_cutoff"] += 1
+                  continue
+
+              voter = str(row.get("voter_roster_id") or "").strip()
+              if not voter:
+                  anchored_excluded["missing_voter_id"] += 1
+                  continue
+
+              payload = keep[len(VOTE_PREFIX):]
+              if "|" not in payload:
+                  anchored_excluded["malformed_vote_transport"] += 1
+                  continue
+              challenge_id = payload.split("|", 1)[0].strip()
+              if challenge_id not in challenges:
+                  anchored_excluded["unknown_challenge_id"] += 1
+                  continue
+
+              trade = str(row.get("trade") or "")
+              if not trade.startswith(META_PREFIX):
+                  anchored_excluded["invalid_meta_namespace"] += 1
+                  continue
+
+              cut = str(row.get("cut") or "")
+              if cut != SCHEMA_MARKER:
+                  anchored_excluded["invalid_schema_marker"] += 1
+                  continue
+
+              structurally_valid.append({
+                  "timestamp": ts,
+                  "timestamp_raw": str(row.get("timestamp") or ""),
+                  "source_index": source_index,
+                  "source_row_number": source_index + 2,
+                  "voter": voter,
+                  "challenge_id": challenge_id,
+                  # Preserve raw strings opaquely for post-selection reveal.
+                  "keep_raw": keep,
+                  "trade_raw": trade,
+                  "cut_raw": cut,
+              })
+
+          structurally_valid.sort(key=lambda r: (r["timestamp"], r["source_index"]))
+
+          daily_counts = Counter()
+          valid = []
+          for row in structurally_valid:
+              day = row["timestamp"].date().isoformat()
+              key = (row["voter"], day)
+              if daily_counts[key] >= DAILY_CAP:
+                  anchored_excluded["daily_cap_excess"] += 1
+                  continue
+              daily_counts[key] += 1
+              valid.append(row)
+
+          def snapshot(rows_subset):
+              voter_counts = Counter(r["voter"] for r in rows_subset)
+              weights = {
+                  voter: min(1.0, LIFETIME_CAP / count)
+                  for voter, count in voter_counts.items()
+              }
+
+              per_cell_effective = {key: 0.0 for key in cell_meta}
+              per_cell_voters = {key: set() for key in cell_meta}
+              challenge_ids = set()
+
+              for row in rows_subset:
+                  challenge = challenges[row["challenge_id"]]
+                  key = cell_key(challenge)
+                  weight = weights[row["voter"]]
+                  per_cell_effective[key] += weight
+                  per_cell_voters[key].add(row["voter"])
+                  challenge_ids.add(row["challenge_id"])
+
+              cells = []
+              for key in sorted(cell_meta):
+                  eff = per_cell_effective[key]
+                  voters = len(per_cell_voters[key])
+                  meta = cell_meta[key]
+                  cells.append({
+                      **meta,
+                      "effective_votes": round(float(eff), 6),
+                      "distinct_voters": voters,
+                      "effective_vote_gate_pass": eff + 1e-12 >= MIN_CELL_EFFECTIVE,
+                      "voter_gate_pass": voters >= MIN_CELL_VOTERS,
+                      "cell_gate_pass": (
+                          eff + 1e-12 >= MIN_CELL_EFFECTIVE
+                          and voters >= MIN_CELL_VOTERS
+                      ),
+                  })
+
+              effective_total = sum(
+                  min(count, LIFETIME_CAP) for count in voter_counts.values()
+              )
+              return {
+                  "raw_post_daily_cap_ballots": len(rows_subset),
+                  "effective_votes": round(float(effective_total), 6),
+                  "distinct_voters": len(voter_counts),
+                  "distinct_challenges": len(challenge_ids),
+                  "cells_observed": sum(c["effective_votes"] > 0 for c in cells),
+                  "cells_passing_both_gates": sum(c["cell_gate_pass"] for c in cells),
+                  "minimum_cell_effective_votes": round(
+                      min(c["effective_votes"] for c in cells), 6
+                  ),
+                  "minimum_cell_distinct_voters": min(c["distinct_voters"] for c in cells),
+                  "coverage_gates_pass": (
+                      len(voter_counts) >= MIN_VOTERS
+                      and all(c["cell_gate_pass"] for c in cells)
+                  ),
+                  "cells": cells,
+              }
+
+          def exact_checkpoint_prefix(threshold):
+              cap_int = int(LIFETIME_CAP)
+              counts = Counter()
+              running = 0
+              for idx, row in enumerate(valid):
+                  voter = row["voter"]
+                  before = min(counts[voter], cap_int)
+                  counts[voter] += 1
+                  after = min(counts[voter], cap_int)
+                  running += after - before
+                  if running == threshold:
+                      return valid[: idx + 1]
+                  if running > threshold:
+                      raise RuntimeError(f"effective count skipped checkpoint {threshold}")
+              return None
+
+          # Reproduce the exact maturity-run aggregate state using only fields
+          # the outcome-blind monitor was allowed to inspect.
+          anchored_current = snapshot(valid)
+          assert anchored_namespace_rows == EXPECTED_ANCHORED_RAW_NAMESPACE_ROWS, (
+              anchored_namespace_rows,
+              EXPECTED_ANCHORED_RAW_NAMESPACE_ROWS,
+          )
+          assert len(valid) == EXPECTED_ANCHORED_VALID_POST_DAILY_CAP, (
+              len(valid),
+              EXPECTED_ANCHORED_VALID_POST_DAILY_CAP,
+          )
+          assert anchored_excluded == Counter({"pre_restart_or_at_cutoff": 20}), anchored_excluded
+          assert anchored_current["effective_votes"] == EXPECTED_ANCHORED_EFFECTIVE
+          assert anchored_current["distinct_voters"] == EXPECTED_ANCHORED_DISTINCT_VOTERS
+          assert anchored_current["distinct_challenges"] == EXPECTED_ANCHORED_DISTINCT_CHALLENGES
+          assert anchored_current["cells_observed"] == EXPECTED_ANCHORED_CELLS_OBSERVED
+          assert anchored_current["cells_passing_both_gates"] == EXPECTED_ANCHORED_CELLS_PASSING
+          assert anchored_current["minimum_cell_effective_votes"] == EXPECTED_ANCHORED_MIN_CELL_EFFECTIVE
+          assert anchored_current["minimum_cell_distinct_voters"] == EXPECTED_ANCHORED_MIN_CELL_VOTERS
+
+          checkpoint_rows = exact_checkpoint_prefix(CHECKPOINT)
+          if checkpoint_rows is None:
+              raise RuntimeError("exact 900-effective-vote checkpoint could not be reconstructed")
+
+          checkpoint = snapshot(checkpoint_rows)
+          assert checkpoint["effective_votes"] == 900.0
+          assert checkpoint["distinct_voters"] == 30
+          assert checkpoint["cells_observed"] == 24
+          assert checkpoint["cells_passing_both_gates"] == 24
+          assert checkpoint["minimum_cell_effective_votes"] == 30.0
+          assert checkpoint["minimum_cell_distinct_voters"] == 19
+          assert checkpoint["coverage_gates_pass"] is True
+
+          # Only now, after checkpoint selection is immutable in memory and the
+          # maturity fingerprint has passed, reveal the response/orientation
+          # suffixes needed by the later one-time frozen evaluation.
+          voter_counts = Counter(r["voter"] for r in checkpoint_rows)
+          frozen_weights = {
+              voter: min(1.0, LIFETIME_CAP / count)
+              for voter, count in voter_counts.items()
+          }
+
+          voter_cluster_map = {}
+          ballots = []
+          source_commitment_rows = []
+
+          for ordinal, row in enumerate(checkpoint_rows, start=1):
+              voter = row["voter"]
+              if voter not in voter_cluster_map:
+                  voter_cluster_map[voter] = f"v{len(voter_cluster_map) + 1:02d}"
+
+              payload = row["keep_raw"][len(VOTE_PREFIX):]
+              challenge_id, sep, choice = payload.partition("|")
+              if not sep or challenge_id != row["challenge_id"] or choice not in {"A", "B"}:
+                  raise RuntimeError(
+                      f"invalid frozen response token at source row {row['source_row_number']}"
+                  )
+
+              display_left = row["trade_raw"][len(META_PREFIX):]
+              if display_left not in {"A", "B"}:
+                  raise RuntimeError(
+                      f"invalid frozen display orientation at source row {row['source_row_number']}"
+                  )
+
+              challenge = challenges[challenge_id]
+              cluster = voter_cluster_map[voter]
+              weight = float(frozen_weights[voter])
+
+              ballots.append({
+                  "ordinal": ordinal,
+                  "source_row_number": row["source_row_number"],
+                  "timestamp_utc": row["timestamp"].isoformat(),
+                  "voter_cluster": cluster,
+                  "challenge_id": challenge_id,
+                  "family": challenge["family"],
+                  "cell_id": challenge["cell_id"],
+                  "scale_label": challenge["scale_label"],
+                  "split": challenge["split"],
+                  "frozen_ballot_weight": weight,
+                  "human_choice": choice,
+                  "display_left": display_left,
+                  "canonical_a_displayed_left": display_left == "A",
+              })
+
+              # Commitment binds the freeze back to the exact source row while
+              # keeping the raw voter identifier out of the repository artifact.
+              source_commitment_rows.append({
+                  "source_index": row["source_index"],
+                  "timestamp_raw": row["timestamp_raw"],
+                  "voter": voter,
+                  "keep": row["keep_raw"],
+                  "trade": row["trade_raw"],
+                  "cut": row["cut_raw"],
+              })
+
+          assert len(voter_cluster_map) == 30
+          assert abs(sum(b["frozen_ballot_weight"] for b in ballots) - 900.0) < 1e-8
+
+          source_commitment_bytes = (
+              json.dumps(source_commitment_rows, sort_keys=True, separators=(",", ":"))
+              .encode("utf-8")
+          )
+          source_commitment_sha256 = hashlib.sha256(source_commitment_bytes).hexdigest()
+
+          dataset = {
+              "schema_version": 1,
+              "status": "frozen_exact_900_prospective_evidence",
+              "frozen": True,
+              "research_only": True,
+              "production_changed": False,
+              "model_evaluation_performed": False,
+              "checkpoint_selection_outcome_blind": True,
+              "checkpoint_effective_votes": 900,
+              "replacement_valid_ballot_start_utc": cutoff.isoformat(),
+              "maturity_anchor_utc": maturity_anchor.isoformat(),
+              "ballot_weight_rule": (
+                  "min(1,30/valid_post_daily_cap_prospective_ballot_count_for_voter)"
+              ),
+              "raw_checkpoint_ballot_count": len(ballots),
+              "distinct_voter_clusters": len(voter_cluster_map),
+              "frozen_effective_votes": 900.0,
+              "ballots": ballots,
+          }
+
+          dataset_text = json.dumps(dataset, indent=2, sort_keys=True) + "\n"
+          DATA_PATH.write_text(dataset_text, encoding="utf-8")
+          dataset_sha256 = hashlib.sha256(dataset_text.encode("utf-8")).hexdigest()
+
+          def file_sha256(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          manifest = {
+              "schema_version": 1,
+              "status": "frozen_exact_900_prospective_evidence_manifest",
+              "frozen": True,
+              "research_only": True,
+              "production_change_authorized": False,
+              "model_evaluation_performed": False,
+              "frozen_at_utc": frozen_at.isoformat(),
+              "github_source_commit": os.environ.get("GITHUB_SHA"),
+              "maturity_anchor": {
+                  "status": "STOP_AND_FREEZE_AT_900",
+                  "generated_at_utc": maturity_anchor.isoformat(),
+                  "supplied_report_sha256": MATURITY_REPORT_SHA256,
+                  "raw_prospective_namespace_rows": EXPECTED_ANCHORED_RAW_NAMESPACE_ROWS,
+                  "valid_post_daily_cap_ballots": EXPECTED_ANCHORED_VALID_POST_DAILY_CAP,
+                  "effective_votes": EXPECTED_ANCHORED_EFFECTIVE,
+                  "distinct_voters": EXPECTED_ANCHORED_DISTINCT_VOTERS,
+                  "distinct_challenges": EXPECTED_ANCHORED_DISTINCT_CHALLENGES,
+                  "cells_observed": EXPECTED_ANCHORED_CELLS_OBSERVED,
+                  "cells_passing_both_gates": EXPECTED_ANCHORED_CELLS_PASSING,
+                  "minimum_cell_effective_votes": EXPECTED_ANCHORED_MIN_CELL_EFFECTIVE,
+                  "minimum_cell_distinct_voters": EXPECTED_ANCHORED_MIN_CELL_VOTERS,
+              },
+              "frozen_contract": {
+                  "preregistration": {
+                      "path": str(prereg_path),
+                      "git_blob_sha": "f37b18ec24ae9fa73872069963be7d13f620e80a",
+                      "sha256": file_sha256(prereg_path),
+                  },
+                  "restart_amendment": {
+                      "path": str(amendment_path),
+                      "git_blob_sha": "2b8fbc79d0c0c7da31aa0a2ce2d2c4b44c554e2b",
+                      "sha256": file_sha256(amendment_path),
+                  },
+                  "prospective_catalog": {
+                      "path": str(catalog_path),
+                      "git_blob_sha": "b338b18291c5058c5a2b941e1293322e2e70ea8c",
+                      "sha256": file_sha256(catalog_path),
+                  },
+                  "frozen_candidate": {
+                      "path": str(candidate_path),
+                      "git_blob_sha": "1560124540e1104fdc4f4e9f367d984b46921cb9",
+                      "sha256": file_sha256(candidate_path),
+                  },
+              },
+              "source_sheet": {
+                  "sha256_at_freeze_fetch": sheet_sha256,
+                  "total_csv_data_rows_at_fetch": len(rows),
+                  "prospective_namespace_rows_at_fetch": total_namespace_rows_at_fetch,
+                  "prospective_rows_after_maturity_anchor_ignored": rows_after_maturity_anchor,
+                  "anchored_prospective_namespace_rows": anchored_namespace_rows,
+                  "anchored_excluded_row_counts": dict(sorted(anchored_excluded.items())),
+                  "anchored_valid_post_daily_cap_ballots": len(valid),
+                  "frozen_checkpoint_source_commitment_sha256": source_commitment_sha256,
+              },
+              "checkpoint": {
+                  "effective_votes": checkpoint["effective_votes"],
+                  "raw_post_daily_cap_ballots": checkpoint["raw_post_daily_cap_ballots"],
+                  "distinct_voters": checkpoint["distinct_voters"],
+                  "distinct_challenges": checkpoint["distinct_challenges"],
+                  "cells_observed": checkpoint["cells_observed"],
+                  "cells_passing_both_gates": checkpoint["cells_passing_both_gates"],
+                  "minimum_cell_effective_votes": checkpoint["minimum_cell_effective_votes"],
+                  "minimum_cell_distinct_voters": checkpoint["minimum_cell_distinct_voters"],
+                  "coverage_gates_pass": checkpoint["coverage_gates_pass"],
+                  "post_checkpoint_anchored_valid_rows_excluded": len(valid) - len(checkpoint_rows),
+                  "cells": checkpoint["cells"],
+              },
+              "dataset": {
+                  "path": str(DATA_PATH),
+                  "sha256": dataset_sha256,
+                  "byte_length": len(dataset_text.encode("utf-8")),
+                  "raw_ballot_count": len(ballots),
+                  "effective_vote_count": 900.0,
+                  "voter_cluster_count": len(voter_cluster_map),
+                  "contains_human_choice": True,
+                  "contains_display_orientation": True,
+                  "contains_model_predictions": False,
+                  "contains_model_performance_statistics": False,
+                  "contains_raw_voter_identifiers": False,
+              },
+              "next_action": (
+                  "Evaluate frozen M2b versus frozen M0 exactly once using only this frozen dataset "
+                  "and the preregistered evaluation contract."
+              ),
+          }
+
+          MANIFEST_PATH.write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          # Self-audit the just-written immutable artifacts.
+          reread_dataset = json.loads(DATA_PATH.read_text())
+          reread_manifest = json.loads(MANIFEST_PATH.read_text())
+          assert reread_dataset["status"] == "frozen_exact_900_prospective_evidence"
+          assert reread_dataset["model_evaluation_performed"] is False
+          assert reread_dataset["frozen_effective_votes"] == 900.0
+          assert reread_dataset["distinct_voter_clusters"] == 30
+          assert reread_manifest["model_evaluation_performed"] is False
+          assert reread_manifest["dataset"]["sha256"] == hashlib.sha256(
+              DATA_PATH.read_bytes()
+          ).hexdigest()
+          assert reread_manifest["dataset"]["contains_model_predictions"] is False
+          assert reread_manifest["dataset"]["contains_model_performance_statistics"] is False
+          assert reread_manifest["dataset"]["contains_raw_voter_identifiers"] is False
+
+          report = "\n".join([
+              "# NextGen V2 Exact-900 Prospective Freeze",
+              "",
+              "**Status:** `FROZEN_EXACT_900`",
+              "",
+              f"- Maturity anchor: `{maturity_anchor.isoformat()}`",
+              f"- Frozen raw checkpoint ballots: **{len(ballots)}**",
+              "- Frozen effective votes: **900.00**",
+              f"- Distinct voter clusters: **{len(voter_cluster_map)}**",
+              f"- Distinct challenges in checkpoint: **{checkpoint['distinct_challenges']}**",
+              "- Cells passing both gates: **24 / 24**",
+              f"- Minimum cell effective votes: **{checkpoint['minimum_cell_effective_votes']:.2f}**",
+              f"- Minimum cell voters: **{checkpoint['minimum_cell_distinct_voters']}**",
+              f"- Anchored valid rows after checkpoint excluded: **{len(valid) - len(checkpoint_rows)}**",
+              f"- Later prospective rows after maturity anchor ignored: **{rows_after_maturity_anchor}**",
+              f"- Frozen dataset SHA-256: `{dataset_sha256}`",
+              f"- Source commitment SHA-256: `{source_commitment_sha256}`",
+              "",
+              "No M0 or M2b prediction, loss, bootstrap, model comparison, or pass/fail evaluation was computed.",
+              "",
+              "Next action: run the one-time preregistered M2b-vs-M0 evaluation from the committed frozen dataset.",
+              "",
+          ])
+          REPORT_PATH.write_text(report, encoding="utf-8")
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+              with open(summary_path, "a", encoding="utf-8") as f:
+                  f.write(report)
+
+          print(report)
+          PY
+
+      - name: Verify freeze artifacts contain no model evaluation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          d = Path("research/package-adjustment-nextgen-v2")
+          data_path = d / "prospective_exact_900_frozen_v1.json"
+          manifest_path = d / "prospective_exact_900_freeze_manifest_v1.json"
+          data = json.loads(data_path.read_text())
+          manifest = json.loads(manifest_path.read_text())
+
+          assert data["frozen"] is True
+          assert data["checkpoint_selection_outcome_blind"] is True
+          assert data["model_evaluation_performed"] is False
+          assert data["checkpoint_effective_votes"] == 900
+          assert data["frozen_effective_votes"] == 900.0
+          assert data["distinct_voter_clusters"] == 30
+          assert len(data["ballots"]) == manifest["dataset"]["raw_ballot_count"]
+          assert abs(sum(x["frozen_ballot_weight"] for x in data["ballots"]) - 900.0) < 1e-8
+          assert {x["human_choice"] for x in data["ballots"]} <= {"A", "B"}
+          assert {x["display_left"] for x in data["ballots"]} <= {"A", "B"}
+          assert len({x["voter_cluster"] for x in data["ballots"]}) == 30
+
+          assert manifest["status"] == "frozen_exact_900_prospective_evidence_manifest"
+          assert manifest["model_evaluation_performed"] is False
+          assert manifest["checkpoint"]["coverage_gates_pass"] is True
+          assert manifest["checkpoint"]["cells_passing_both_gates"] == 24
+          assert manifest["dataset"]["sha256"] == hashlib.sha256(data_path.read_bytes()).hexdigest()
+          assert manifest["dataset"]["contains_model_predictions"] is False
+          assert manifest["dataset"]["contains_model_performance_statistics"] is False
+          assert manifest["dataset"]["contains_raw_voter_identifiers"] is False
+
+          # These prediction/performance fields must not appear anywhere in the
+          # frozen ballot dataset. Human choice and display orientation are now
+          # intentionally revealed because the checkpoint has already been fixed.
+          data_text = data_path.read_text().lower()
+          forbidden_dataset_tokens = [
+              '"m0_', '"m2b_', 'log_loss', 'bootstrap', 'prediction_probability',
+              'model_winner', 'prospective_validation_passed',
+              'prospective_validation_failed',
+          ]
+          for token in forbidden_dataset_tokens:
+              assert token not in data_text, token
+
+          print("PASS: exact-900 evidence is frozen; no model evaluation was performed.")
+          PY
+
+      - name: Run repository regression checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 \
+            python3 scripts/validation/repo_regression_checks.py
+
+      - name: Verify production still remains V1.6 after freeze
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 \
+            python3 scripts/validation/check_package_adjustment_live.py
+
+      - name: Prove exactly two intended research files changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import subprocess
+
+          expected = {
+              "research/package-adjustment-nextgen-v2/prospective_exact_900_frozen_v1.json",
+              "research/package-adjustment-nextgen-v2/prospective_exact_900_freeze_manifest_v1.json",
+          }
+          lines = subprocess.check_output(
+              ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+              text=True,
+          ).splitlines()
+          actual = {line[3:] for line in lines if line.strip()}
+          if actual != expected:
+              raise SystemExit(
+                  "unexpected repository change surface: "
+                  f"expected={sorted(expected)} actual={sorted(actual)}"
+              )
+          print("PASS: only the two intended frozen research files changed.")
+          PY
+
+      - name: Upload exact-900 freeze proof artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkgnv2-prospective-exact-900-freeze-proof
+          path: |
+            research/package-adjustment-nextgen-v2/prospective_exact_900_frozen_v1.json
+            research/package-adjustment-nextgen-v2/prospective_exact_900_freeze_manifest_v1.json
+            /tmp/prospective_exact_900_freeze_report.md
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Commit exact-900 freeze to main
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          D="research/package-adjustment-nextgen-v2"
+          DATA="$D/prospective_exact_900_frozen_v1.json"
+          MANIFEST="$D/prospective_exact_900_freeze_manifest_v1.json"
+
+          git config user.name "trade-desk-research-bot"
+          git config user.email "actions@users.noreply.github.com"
+
+          git add "$DATA" "$MANIFEST"
+
+          mapfile -t STAGED < <(git diff --cached --name-only | sort)
+          EXPECTED=(
+            "$DATA"
+            "$MANIFEST"
+          )
+          mapfile -t EXPECTED_SORTED < <(printf '%s\n' "${EXPECTED[@]}" | sort)
+          test "${#STAGED[@]}" -eq 2
+          test "$(printf '%s\n' "${STAGED[@]}")" = "$(printf '%s\n' "${EXPECTED_SORTED[@]}")"
+
+          git commit -m "Freeze NextGen V2 prospective evidence at exact 900"
+          git pull --rebase origin main
+
+          # Re-check frozen inputs after rebasing before publishing the freeze.
+          test "$(git hash-object "$D/prospective_time_holdout_preregistration_v1.json")" = \
+            "f37b18ec24ae9fa73872069963be7d13f620e80a"
+          test "$(git hash-object "$D/package_vote_challenges_prospective_v1.json")" = \
+            "b338b18291c5058c5a2b941e1293322e2e70ea8c"
+          test "$(git hash-object "$D/prospective_voting_restart_30_daily_v1.json")" = \
+            "2b8fbc79d0c0c7da31aa0a2ce2d2c4b44c554e2b"
+          test "$(git hash-object "$D/research_candidate_m2b_v1.json")" = \
+            "1560124540e1104fdc4f4e9f367d984b46921cb9"
+
+          # The rebased freeze commit itself must still touch exactly two paths.
+          mapfile -t COMMITTED < <(git diff-tree --no-commit-id --name-only -r HEAD | sort)
+          test "${#COMMITTED[@]}" -eq 2
+          test "$(printf '%s\n' "${COMMITTED[@]}")" = "$(printf '%s\n' "${EXPECTED_SORTED[@]}")"
+
+          git push origin main
+          echo "PASS: exact-900 prospective evidence frozen and committed to main."
