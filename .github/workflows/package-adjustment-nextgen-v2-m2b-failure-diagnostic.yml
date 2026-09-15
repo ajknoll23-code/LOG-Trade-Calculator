@@ -1,0 +1,401 @@
+name: Package Adjustment NextGen V2 M2b Failure Diagnostic
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13.15'
+
+      - name: Guard spent evidence and frozen failed evaluation
+        shell: bash
+        run: |
+          set -euo pipefail
+          D="research/package-adjustment-nextgen-v2"
+          OUT_JSON="$D/prospective_m2b_failure_diagnostic_v1.json"
+          OUT_MD="$D/prospective_m2b_failure_diagnostic_v1.md"
+
+          test -z "$(git status --porcelain=v1)"
+          test "$(git hash-object "$D/prospective_time_holdout_preregistration_v1.json")" = "f37b18ec24ae9fa73872069963be7d13f620e80a"
+          test "$(git hash-object "$D/package_vote_challenges_prospective_v1.json")" = "b338b18291c5058c5a2b941e1293322e2e70ea8c"
+          test "$(git hash-object "$D/research_candidate_m2b_v1.json")" = "1560124540e1104fdc4f4e9f367d984b46921cb9"
+          test "$(git hash-object "$D/prospective_exact_900_frozen_v1.json")" = "e0a6e80d98c19b9fa672b863844e4541817dbc88"
+          test "$(git hash-object "$D/prospective_exact_900_freeze_manifest_v1.json")" = "515c86c8270cefe17763865006f46072f061338a"
+          test "$(git hash-object "$D/prospective_m2b_vs_m0_evaluation_v1.json")" = "dc41bc6080bc2a36f122b2a3f9e555a328a778c7"
+          test "$(git hash-object "$D/prospective_m2b_vs_m0_evaluation_manifest_v1.json")" = "19eba3fb5cdca83c9f118f9fd12b5ffd2f54beff"
+          test "$(sha256sum "$D/prospective_exact_900_frozen_v1.json" | awk '{print $1}')" = "9b00c103efb47dd54976bb0c9d35c8c87cf96ea9c9d7adeac5db15552b2e9c8c"
+          test "$(sha256sum "$D/prospective_m2b_vs_m0_evaluation_v1.json" | awk '{print $1}')" = "4318ea2dfd6c523d47daf96f67f3a70cc93d2125387bfcc0babb1aab3153ddfe"
+          test ! -e "$OUT_JSON"
+          test ! -e "$OUT_MD"
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          d = Path("research/package-adjustment-nextgen-v2")
+          result = json.loads((d / "prospective_m2b_vs_m0_evaluation_v1.json").read_text())
+          manifest = json.loads((d / "prospective_m2b_vs_m0_evaluation_manifest_v1.json").read_text())
+          assert result["status"] == "prospective_validation_failed_research_only"
+          assert result["production_candidate_eligible"] is False
+          assert result["production_change_authorized"] is False
+          assert result["production_revision_unchanged"] == "v1.6-v5-size2-composition-overlay"
+          assert result["source_evidence"]["effective_votes"] == 900.0
+          assert result["source_evidence"]["voter_clusters"] == 30
+          assert result["source_evidence"]["required_cells"] == 24
+          assert result["source_evidence"]["distinct_challenges"] == 129
+          assert manifest["one_time_evaluation_consumed"] is True
+          assert manifest["evaluation_status"] == result["status"]
+          gate = result["pass_gate"]
+          assert gate["all_conditions_passed"] is False
+          assert gate["bootstrap_favorable_fraction_at_least_0_80"] is True
+          assert gate["combined_improvement_at_least_0_005"] is False
+          assert gate["no_family_regression_exceeds_0_005"] is False
+          print("PASS: exact failed prospective evaluation is frozen and spent.")
+          PY
+
+      - name: Verify production remains V1.6 before diagnosis
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/validation/check_package_adjustment_live.py
+
+      - name: Build post-hoc failure diagnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+          import bisect, hashlib, json, math
+          from collections import defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          D = Path("research/package-adjustment-nextgen-v2")
+          DATA = D / "prospective_exact_900_frozen_v1.json"
+          CATALOG = D / "package_vote_challenges_prospective_v1.json"
+          PREREG = D / "prospective_time_holdout_preregistration_v1.json"
+          EVAL = D / "prospective_m2b_vs_m0_evaluation_v1.json"
+          OUT_JSON = D / "prospective_m2b_failure_diagnostic_v1.json"
+          OUT_MD = D / "prospective_m2b_failure_diagnostic_v1.md"
+
+          data = json.loads(DATA.read_text())
+          catalog_doc = json.loads(CATALOG.read_text())
+          prereg = json.loads(PREREG.read_text())
+          evaluation = json.loads(EVAL.read_text())
+          ballots = list(data["ballots"])
+          challenges = {c["id"]: c for c in catalog_doc["challenges"]}
+
+          assert evaluation["status"] == "prospective_validation_failed_research_only"
+          assert len(ballots) == 960 and len(challenges) == 129
+          assert abs(sum(float(r["frozen_ballot_weight"]) for r in ballots) - 900.0) < 1e-9
+          assert len({r["voter_cluster"] for r in ballots}) == 30
+          assert {r["challenge_id"] for r in ballots} == set(challenges)
+
+          m0 = prereg["frozen_prediction_models"]["M0"]
+          m2 = prereg["frozen_prediction_models"]["M2b"]
+          vref = float(m2["v_ref"])
+          knots = [float(x) for x in m2["knots_normalized"]]
+          deltas = [float(x) for x in m2["slope_increments"]]
+          domain_max = float(m2["inverse_domain_max_normalized"])
+
+          raw_slopes = [1.0]
+          running = 1.0
+          for d in deltas:
+              running += d
+              raw_slopes.append(running)
+          raw_y = [0.0] * len(knots)
+          for i, slope in enumerate(raw_slopes):
+              raw_y[i + 1] = raw_y[i] + slope * (knots[i + 1] - knots[i])
+          norm = raw_y[len(knots) - 2]
+          slopes = [s / norm for s in raw_slopes]
+          ys = [y / norm for y in raw_y]
+
+          def g(x):
+              if x < -1e-12 or x > domain_max + 1e-12:
+                  raise RuntimeError(f"asset outside M2b support: {x}")
+              x = min(max(x, 0.0), domain_max)
+              i = max(0, min(bisect.bisect_right(knots, x) - 1, len(slopes) - 1))
+              return ys[i] + slopes[i] * (x - knots[i])
+
+          def inv(u):
+              if u < -1e-12 or u > ys[-1] + 1e-12:
+                  raise RuntimeError(f"utility outside M2b inverse support: {u}")
+              u = min(max(u, 0.0), ys[-1])
+              i = max(0, min(bisect.bisect_right(ys, u) - 1, len(slopes) - 1))
+              return knots[i] + (u - ys[i]) / slopes[i]
+
+          def vals(side): return [float(a["fv"]) for a in side["assets"]]
+          def raw(side): return float(sum(vals(side)))
+          def score2(side): return vref * inv(sum(g(v / vref) for v in vals(side)))
+          def sigmoid(x):
+              if x >= 0:
+                  z = math.exp(-x); return 1.0 / (1.0 + z)
+              z = math.exp(x); return z / (1.0 + z)
+          def nll(y, p):
+              p = min(max(p, 1e-15), 1 - 1e-15)
+              return -(y * math.log(p) + (1-y) * math.log(1-p))
+          def ckey(c):
+              return "|".join([c["family"], c["cell_id"], c["scale_label"], c["split"]])
+
+          features = {}
+          for cid, c in challenges.items():
+              a0, b0 = raw(c["side_a"]), raw(c["side_b"])
+              a2, b2 = score2(c["side_a"]), score2(c["side_b"])
+              gap0, gap2 = a0-b0, a2-b2
+              delta_abs = abs(gap2) - abs(gap0)
+              effect = "unchanged" if abs(delta_abs) <= 1e-9 else ("strengthened" if delta_abs > 0 else "weakened")
+              features[cid] = {
+                  "family": c["family"], "cell_id": c["cell_id"], "scale_label": c["scale_label"],
+                  "split": c["split"], "cell_key": ckey(c),
+                  "topology": f'{c["side_a"]["asset_count"]}v{c["side_b"]["asset_count"]}',
+                  "gap0": gap0, "gap2": gap2, "absolute_gap_change": delta_abs,
+                  "gap_strength_effect": effect,
+              }
+
+          rows, by_challenge = [], defaultdict(list)
+          for b in ballots:
+              f = features[b["challenge_id"]]
+              left_a = bool(b["canonical_a_displayed_left"])
+              assert left_a == (str(b["display_left"]).upper() == "A")
+              y = 1.0 if str(b["human_choice"]).upper() == "A" else 0.0
+              w = float(b["frozen_ballot_weight"])
+              eta0 = float(m0["beta"]) * f["gap0"] / vref + float(m0["delta_left"]) * left_a
+              eta2 = float(m2["beta"]) * f["gap2"] / vref + float(m2["delta_left"]) * left_a
+              p0, p2 = sigmoid(eta0), sigmoid(eta2)
+              r = {**f, "challenge_id": b["challenge_id"], "voter_cluster": b["voter_cluster"],
+                   "weight": w, "y": y, "p0": p0, "p2": p2, "l0": nll(y,p0), "l2": nll(y,p2)}
+              rows.append(r); by_challenge[b["challenge_id"]].append(r)
+
+          def summary(group):
+              den = sum(r["weight"] for r in group)
+              l0 = sum(r["weight"]*r["l0"] for r in group)/den
+              l2 = sum(r["weight"]*r["l2"] for r in group)/den
+              return {
+                  "raw_ballots": len(group), "effective_weight": den,
+                  "distinct_voters": len({r["voter_cluster"] for r in group}),
+                  "distinct_challenges": len({r["challenge_id"] for r in group}),
+                  "M0_log_loss": l0, "M2b_log_loss": l2, "improvement_M0_minus_M2b": l0-l2,
+                  "weighted_observed_A_rate": sum(r["weight"]*r["y"] for r in group)/den,
+                  "weighted_M0_mean_predicted_A": sum(r["weight"]*r["p0"] for r in group)/den,
+                  "weighted_M2b_mean_predicted_A": sum(r["weight"]*r["p2"] for r in group)/den,
+              }
+
+          def grouped(field):
+              g = defaultdict(list)
+              for r in rows: g[str(r[field])].append(r)
+              return {k: summary(v) for k,v in sorted(g.items())}
+
+          fam_scale, cells = defaultdict(list), defaultdict(list)
+          for r in rows:
+              fam_scale[f'{r["family"]}|{r["scale_label"]}'].append(r)
+              cells[r["cell_key"]].append(r)
+          cell_summary = {k: summary(v) for k,v in sorted(cells.items())}
+          family_summary = grouped("family")
+
+          eval_primary = evaluation["point_estimates"]["primary"]
+          macro0 = sum(v["M0_log_loss"] for v in cell_summary.values()) / 24
+          macro2 = sum(v["M2b_log_loss"] for v in cell_summary.values()) / 24
+          assert abs(macro0 - float(eval_primary["M0_combined_log_loss"])) < 1e-12
+          assert abs(macro2 - float(eval_primary["M2b_combined_log_loss"])) < 1e-12
+
+          eval_families = evaluation["point_estimates"]["families"]
+          for family, s in family_summary.items():
+              fcells = [v for k,v in cell_summary.items() if k.startswith(family + "|")]
+              f0 = sum(v["M0_log_loss"] for v in fcells)/len(fcells)
+              f2 = sum(v["M2b_log_loss"] for v in fcells)/len(fcells)
+              assert abs(f0 - float(eval_families[family]["M0_log_loss"])) < 1e-12
+              assert abs(f2 - float(eval_families[family]["M2b_log_loss"])) < 1e-12
+              s["equal_cell_macro_M0_log_loss"] = f0
+              s["equal_cell_macro_M2b_log_loss"] = f2
+              s["equal_cell_macro_improvement_M0_minus_M2b"] = f0-f2
+
+          challenge_summary = []
+          for cid, group in by_challenge.items():
+              s = summary(group); f = features[cid]
+              challenge_summary.append({"challenge_id":cid, "family":f["family"], "cell_id":f["cell_id"],
+                  "scale_label":f["scale_label"], "topology":f["topology"],
+                  "gap_strength_effect":f["gap_strength_effect"], "raw_gap_a_minus_b":f["gap0"],
+                  "m2b_gap_a_minus_b":f["gap2"], "absolute_gap_change":f["absolute_gap_change"], **s})
+          harmful = sorted(challenge_summary, key=lambda x:(x["improvement_M0_minus_M2b"],x["challenge_id"]))[:15]
+          helpful = sorted(challenge_summary, key=lambda x:(-x["improvement_M0_minus_M2b"],x["challenge_id"]))[:15]
+
+          out = {
+              "schema_version":1,
+              "diagnostic_id":"pkgnv2-m2b-prospective-failure-diagnostic-v1",
+              "status":"completed_posthoc_failure_diagnostic_research_only",
+              "generated_at_utc":datetime.now(timezone.utc).isoformat(),
+              "research_only":True, "spent_evidence_only":True,
+              "production_change_authorized":False,
+              "production_revision_unchanged":"v1.6-v5-size2-composition-overlay",
+              "candidate_created_or_tuned":False,
+              "model_refit_or_parameter_tuning_performed":False,
+              "source":{"evaluation_status":evaluation["status"],
+                        "evaluation_result_sha256":hashlib.sha256(EVAL.read_bytes()).hexdigest(),
+                        "frozen_dataset_sha256":hashlib.sha256(DATA.read_bytes()).hexdigest(),
+                        "effective_votes":900.0,"raw_ballots":960,"voter_clusters":30,
+                        "distinct_challenges":129,"required_cells":24},
+              "reproduction_check":{"M0_equal_cell_macro_log_loss":macro0,
+                    "M2b_equal_cell_macro_log_loss":macro2,
+                    "improvement_M0_minus_M2b":macro0-macro2,
+                    "matches_frozen_one_time_evaluation":True},
+              "diagnostics":{"by_family":family_summary,"by_scale":grouped("scale_label"),
+                    "by_family_and_scale":{k:summary(v) for k,v in sorted(fam_scale.items())},
+                    "by_topology":grouped("topology"),"by_m2b_gap_strength_effect":grouped("gap_strength_effect"),
+                    "by_cell":cell_summary,"most_harmful_challenges":harmful,"most_helpful_challenges":helpful},
+              "observed_signals":[
+                  {"signal":"universal_transform_not_supported_across_families",
+                   "evidence":{f:family_summary[f]["equal_cell_macro_improvement_M0_minus_M2b"] for f in sorted(family_summary)},
+                   "interpretation":"M2b transferred unevenly across trade families; fragmentation/filler was the only preregistered family that materially regressed."},
+                  {"signal":"direction_consistent_but_effect_size_below_floor",
+                   "evidence":{"combined_improvement":float(eval_primary["improvement_M0_minus_M2b"]),
+                               "required_improvement":float(eval_primary["minimum_required_improvement"]),
+                               "bootstrap_favorable_fraction":float(evaluation["bootstrap"]["M2b_favorable_fraction_vs_M0"])},
+                   "interpretation":"The bootstrap strongly favored M2b, but the frozen point-estimate gain was too small for the preregistered gate."}
+              ],
+              "m3_design_constraints":[
+                  "Treat the exact 900-vote prospective dataset as spent development evidence; it may inform M3 design/training but may not serve as fresh confirmation.",
+                  "Do not patch or promote M2b in production; production remains V1.6.",
+                  "Do not force one universal package transform across core concentration, fragmentation/filler, and structural topology without a safety interaction.",
+                  "Give fragmentation/filler an explicit topology/family interaction or shrinkage path capable of reverting toward raw-FV M0 behavior.",
+                  "Any M3 fitting or model selection may use only evidence already designated as spent/development evidence.",
+                  "Freeze the complete M3 candidate and all evaluation rules before any new prospective exposure.",
+                  "Generate a fresh challenge catalog without using future outcomes or model-performance-driven selection.",
+                  "Require a fresh prospective holdout before any M3 production-eligibility decision."
+              ],
+              "next_action":"Use this diagnostic as spent development evidence to design research-only M3 candidates; do not evaluate production eligibility again until a fresh preregistered prospective holdout exists."
+          }
+          OUT_JSON.write_text(json.dumps(out,indent=2,sort_keys=True)+"\n")
+
+          def f6(x): return f"{float(x):.6f}"
+          md = ["# NextGen V2 M2b Prospective Failure Diagnostic","",
+                "**Status:** `completed_posthoc_failure_diagnostic_research_only`","",
+                "This is a post-hoc diagnostic over spent prospective evidence. It does not retune M2b, create M3, or authorize a production change.","",
+                "## Frozen result reproduction","",
+                f"- M0 combined equal-cell log loss: **{f6(macro0)}**",
+                f"- M2b combined equal-cell log loss: **{f6(macro2)}**",
+                f"- Improvement (M0 - M2b): **{f6(macro0-macro2)}**",
+                f"- Required improvement: **{f6(eval_primary['minimum_required_improvement'])}**",
+                f"- Bootstrap favorable fraction: **{evaluation['bootstrap']['M2b_favorable_fraction_vs_M0']:.4f}**","",
+                "## Family diagnosis","","| Family | M0 | M2b | Improvement |","|---|---:|---:|---:|"]
+          for family in sorted(family_summary):
+              s=family_summary[family]
+              md.append(f"| {family} | {f6(s['equal_cell_macro_M0_log_loss'])} | {f6(s['equal_cell_macro_M2b_log_loss'])} | {f6(s['equal_cell_macro_improvement_M0_minus_M2b'])} |")
+          md += ["","## Family × scale","","| Family / scale | M0 weighted loss | M2b weighted loss | Improvement |","|---|---:|---:|---:|"]
+          for key,s in sorted(out["diagnostics"]["by_family_and_scale"].items()):
+              md.append(f"| {key} | {f6(s['M0_log_loss'])} | {f6(s['M2b_log_loss'])} | {f6(s['improvement_M0_minus_M2b'])} |")
+          md += ["","## Most harmful challenges","","| Challenge | Family | Scale | Topology | Improvement |","|---|---|---|---|---:|"]
+          for r in harmful[:10]: md.append(f"| `{r['challenge_id']}` | {r['family']} | {r['scale_label']} | {r['topology']} | {f6(r['improvement_M0_minus_M2b'])} |")
+          md += ["","## Most helpful challenges","","| Challenge | Family | Scale | Topology | Improvement |","|---|---|---|---|---:|"]
+          for r in helpful[:10]: md.append(f"| `{r['challenge_id']}` | {r['family']} | {r['scale_label']} | {r['topology']} | {f6(r['improvement_M0_minus_M2b'])} |")
+          md += ["","## M3 design constraints",""] + [f"- {x}" for x in out["m3_design_constraints"]] + ["","## Next action","",out["next_action"],""]
+          OUT_MD.write_text("\n".join(md))
+          print("PASS: frozen evaluation reproduced exactly and diagnostic written.")
+          PY
+
+      - name: Verify diagnostic boundary and content
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, subprocess
+          from pathlib import Path
+          d=Path("research/package-adjustment-nextgen-v2")
+          expected={str(d/"prospective_m2b_failure_diagnostic_v1.json"),str(d/"prospective_m2b_failure_diagnostic_v1.md")}
+          paths={r[3:] for r in subprocess.check_output(["git","status","--porcelain=v1"],text=True).splitlines() if len(r)>=4}
+          if paths != expected: raise RuntimeError(f"unexpected changed paths: {sorted(paths)}")
+          doc=json.loads((d/"prospective_m2b_failure_diagnostic_v1.json").read_text())
+          assert doc["status"]=="completed_posthoc_failure_diagnostic_research_only"
+          assert doc["research_only"] and doc["spent_evidence_only"]
+          assert doc["production_change_authorized"] is False
+          assert doc["candidate_created_or_tuned"] is False
+          assert doc["model_refit_or_parameter_tuning_performed"] is False
+          assert doc["reproduction_check"]["matches_frozen_one_time_evaluation"] is True
+          assert len(doc["diagnostics"]["by_cell"])==24
+          assert len(doc["diagnostics"]["most_harmful_challenges"])==15
+          assert len(doc["diagnostics"]["most_helpful_challenges"])==15
+          assert len(doc["m3_design_constraints"])==8
+          print("PASS: exactly two research-only diagnostic files created.")
+          PY
+          git diff --check
+
+      - name: Run repository regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/validation/repo_regression_checks.py
+
+      - name: Re-prove production and two-file boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/validation/check_package_adjustment_live.py
+          python3 - <<'PY'
+          import subprocess
+          expected={"research/package-adjustment-nextgen-v2/prospective_m2b_failure_diagnostic_v1.json","research/package-adjustment-nextgen-v2/prospective_m2b_failure_diagnostic_v1.md"}
+          paths={r[3:] for r in subprocess.check_output(["git","status","--porcelain=v1"],text=True).splitlines() if len(r)>=4}
+          if paths != expected: raise RuntimeError(f"regressions changed unexpected paths: {sorted(paths)}")
+          print("PASS: production remains V1.6 and only diagnostic files changed.")
+          PY
+
+      - name: Upload diagnostic proof artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkgnv2-m2b-failure-diagnostic-v1
+          path: |
+            research/package-adjustment-nextgen-v2/prospective_m2b_failure_diagnostic_v1.json
+            research/package-adjustment-nextgen-v2/prospective_m2b_failure_diagnostic_v1.md
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Commit diagnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add research/package-adjustment-nextgen-v2/prospective_m2b_failure_diagnostic_v1.json research/package-adjustment-nextgen-v2/prospective_m2b_failure_diagnostic_v1.md
+          git commit -m "Diagnose NextGen V2 M2b prospective failure"
+
+      - name: Rebase safely and verify committed boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          git pull --rebase origin main
+          test "$(git hash-object research/package-adjustment-nextgen-v2/prospective_m2b_vs_m0_evaluation_v1.json)" = "dc41bc6080bc2a36f122b2a3f9e555a328a778c7"
+          test "$(git hash-object research/package-adjustment-nextgen-v2/prospective_m2b_vs_m0_evaluation_manifest_v1.json)" = "19eba3fb5cdca83c9f118f9fd12b5ffd2f54beff"
+          python3 - <<'PY'
+          import subprocess
+          expected={"research/package-adjustment-nextgen-v2/prospective_m2b_failure_diagnostic_v1.json","research/package-adjustment-nextgen-v2/prospective_m2b_failure_diagnostic_v1.md"}
+          parent=subprocess.check_output(["git","rev-parse","HEAD^"],text=True).strip()
+          head=subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip()
+          changed=set(subprocess.check_output(["git","diff","--name-only",parent,head],text=True).splitlines())
+          if changed != expected: raise RuntimeError(f"rebased commit changed unexpected paths: {sorted(changed)}")
+          if subprocess.check_output(["git","status","--porcelain=v1"],text=True).strip(): raise RuntimeError("working tree not clean after rebase")
+          print("PASS: rebased commit still contains exactly two intended files.")
+          PY
+
+      - name: Push diagnostic to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git push origin main
+          git log --oneline -1
