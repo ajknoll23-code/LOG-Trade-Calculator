@@ -1,0 +1,750 @@
+name: Draft Slot Projection Activation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  activate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Guard current architecture and clean state
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          test -f index.html
+          test -f config.json
+          test -f data/league_rosters.json
+          test -f scripts/validation/repo_regression_checks.py
+
+          test ! -e scripts/projections/draft_slot_projection_pipeline.py
+          test ! -e data/draft_slot_projection.json
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          text = Path("index.html").read_text(encoding="utf-8")
+
+          required = [
+              "const PICK_BASE = {",
+              "const YEAR_DISCOUNT = {",
+              "let DRAFT_SLOT_APPLIES_TO_SEASON = '2027';",
+              "const DRAFT_SLOT_LAST_UPDATED = null;",
+              "const DRAFT_SLOT_PROJECTION = {",
+              "function tierForPick(rosterId)",
+              "function pickSlotForSeason(rosterId, season)",
+              "function computeTeamPicks(rosterId)",
+              "const slot = pickSlotForSeason(t.roster_id, t.season);",
+          ]
+          missing = [x for x in required if x not in text]
+          if missing:
+              raise RuntimeError(
+                  "Draft-pick architecture changed before activation: "
+                  + repr(missing)
+              )
+
+          print("PASS: current draft-pick architecture is the reviewed placeholder state.")
+          PY
+
+      - name: Create deterministic standings projection pipeline
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > scripts/projections/draft_slot_projection_pipeline.py <<'PY'
+          #!/usr/bin/env python3
+          """
+          Project the next rookie-draft slot tier from the league's CURRENT
+          regular-season standings and bake that projection into index.html.
+
+          League rule, confirmed directly by the league owner:
+            1. Rookie draft order is reverse regular-season standings.
+            2. Total points scored is the standings tiebreaker.
+
+          For this 12-team league:
+            projected 1.01-1.04 -> early
+            projected 1.05-1.08 -> mid
+            projected 1.09-1.12 -> late
+
+          Important:
+          - This is NOT a market model and does not fit coefficients.
+          - Playoff finish, potential points, roster strength, and pick holder
+            are not used to determine slot.
+          - A traded pick retains the tier of its ORIGINAL roster_id. index.html
+            already enforces that in computeTeamPicks().
+          - Only the next upcoming rookie draft uses the standings projection.
+            Farther-future seasons remain "mid" through pickSlotForSeason().
+          - If two teams are still tied after record AND total points scored,
+            the pipeline refuses to guess instead of silently inventing a third
+            league tiebreaker.
+          """
+
+          from __future__ import annotations
+
+          import argparse
+          import hashlib
+          import json
+          import math
+          import re
+          from dataclasses import dataclass
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from typing import Any, Iterable
+
+          ROOT = Path(__file__).resolve().parents[2]
+          DEFAULT_ROSTERS = ROOT / "data/league_rosters.json"
+          DEFAULT_CONFIG = ROOT / "config.json"
+          DEFAULT_INDEX = ROOT / "index.html"
+          DEFAULT_OUTPUT = ROOT / "data/draft_slot_projection.json"
+
+          LEAGUE_SIZE = 12
+          EARLY_END = 4
+          MID_END = 8
+
+          LAST_UPDATED_RE = re.compile(
+              r"const\s+DRAFT_SLOT_LAST_UPDATED\s*=\s*"
+              r"(?:null|'[^']*'|\"[^\"]*\")\s*;"
+          )
+          PROJECTION_RE = re.compile(
+              r"const\s+DRAFT_SLOT_PROJECTION\s*=\s*\{.*?\}\s*;",
+              flags=re.DOTALL,
+          )
+          APPLIES_SEASON_RE = re.compile(
+              r"let\s+DRAFT_SLOT_APPLIES_TO_SEASON\s*=\s*['\"](\d{4})['\"]\s*;"
+          )
+
+          @dataclass(frozen=True)
+          class Standing:
+              roster_id: int
+              wins: int
+              losses: int
+              ties: int
+              points_for: float
+              games_played: int
+              standing_points: float
+
+          def file_sha256(path: Path) -> str:
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          def as_int(value: Any, field: str, roster_id: int) -> int:
+              try:
+                  out = int(value)
+              except (TypeError, ValueError) as exc:
+                  raise RuntimeError(
+                      f"Roster {roster_id}: invalid {field}={value!r}"
+                  ) from exc
+              if out < 0:
+                  raise RuntimeError(
+                      f"Roster {roster_id}: negative {field}={out}"
+                  )
+              return out
+
+          def sleeper_points(settings: dict[str, Any], roster_id: int) -> float:
+              """
+              Sleeper stores whole points and hundredths separately:
+              fpts=251, fpts_decimal=11 -> 251.11.
+              """
+              whole = as_int(settings.get("fpts", 0), "fpts", roster_id)
+              decimal = as_int(
+                  settings.get("fpts_decimal", 0),
+                  "fpts_decimal",
+                  roster_id,
+              )
+              if decimal > 99:
+                  raise RuntimeError(
+                      f"Roster {roster_id}: fpts_decimal outside 0..99: {decimal}"
+                  )
+              return whole + decimal / 100.0
+
+          def standing_from_roster(roster: dict[str, Any]) -> Standing:
+              roster_id = as_int(roster.get("roster_id"), "roster_id", -1)
+              settings = roster.get("settings")
+              if not isinstance(settings, dict):
+                  raise RuntimeError(
+                      f"Roster {roster_id}: missing settings object"
+                  )
+
+              wins = as_int(settings.get("wins", 0), "wins", roster_id)
+              losses = as_int(settings.get("losses", 0), "losses", roster_id)
+              ties = as_int(settings.get("ties", 0), "ties", roster_id)
+              games_played = wins + losses + ties
+
+              return Standing(
+                  roster_id=roster_id,
+                  wins=wins,
+                  losses=losses,
+                  ties=ties,
+                  points_for=sleeper_points(settings, roster_id),
+                  games_played=games_played,
+                  # Ties count as half a win for standings ordering. With the
+                  # league's normal equal-games schedule, this is equivalent
+                  # to ordering by record/winning percentage.
+                  standing_points=wins + 0.5 * ties,
+              )
+
+          def validate_standings(rows: list[Standing]) -> None:
+              if len(rows) != LEAGUE_SIZE:
+                  raise RuntimeError(
+                      f"Expected {LEAGUE_SIZE} rosters, found {len(rows)}"
+                  )
+
+              ids = [r.roster_id for r in rows]
+              if len(set(ids)) != LEAGUE_SIZE:
+                  raise RuntimeError("Duplicate roster_id in league_rosters.json")
+
+              if set(ids) != set(range(1, LEAGUE_SIZE + 1)):
+                  raise RuntimeError(
+                      "Expected roster IDs 1..12; found "
+                      + repr(sorted(ids))
+                  )
+
+              game_counts = {r.games_played for r in rows}
+              if len(game_counts) != 1:
+                  raise RuntimeError(
+                      "Rosters do not all have the same number of completed "
+                      f"regular-season games: {sorted(game_counts)}. Refusing "
+                      "to bake a standings projection from an incomplete week."
+                  )
+
+              games = next(iter(game_counts))
+              if games <= 0:
+                  raise RuntimeError(
+                      "No completed regular-season games yet. Keep all future "
+                      "picks at mid until real standings exist."
+                  )
+
+              # User confirmed PF is the tiebreaker. If record AND PF are
+              # identical, no third league tiebreaker has been supplied.
+              by_primary: dict[tuple[float, float], list[int]] = {}
+              for r in rows:
+                  key = (r.standing_points, r.points_for)
+                  by_primary.setdefault(key, []).append(r.roster_id)
+
+              unresolved = {
+                  key: ids
+                  for key, ids in by_primary.items()
+                  if len(ids) > 1
+              }
+              if unresolved:
+                  raise RuntimeError(
+                      "Exact standings tie remains after record and total "
+                      "points scored; no third league tiebreaker is defined. "
+                      f"Refusing to guess: {unresolved}"
+                  )
+
+          def rank_standings(rows: Iterable[Standing]) -> list[Standing]:
+              """
+              Worst -> best.
+
+              Reverse regular-season standings:
+                lower standing_points first;
+                lower total points scored first as confirmed tiebreaker.
+
+              All teams must have equal games played (validated separately).
+              """
+              return sorted(
+                  rows,
+                  key=lambda r: (
+                      r.standing_points,
+                      r.points_for,
+                  ),
+              )
+
+          def tier_for_rank(rank: int) -> str:
+              if not 1 <= rank <= LEAGUE_SIZE:
+                  raise ValueError(rank)
+              if rank <= EARLY_END:
+                  return "early"
+              if rank <= MID_END:
+                  return "mid"
+              return "late"
+
+          def synced_timestamp(payload: dict[str, Any]) -> tuple[str, str]:
+              raw = payload.get("synced_at")
+              try:
+                  ts = float(raw)
+              except (TypeError, ValueError) as exc:
+                  raise RuntimeError(
+                      f"league_rosters.json missing numeric synced_at: {raw!r}"
+                  ) from exc
+              if not math.isfinite(ts):
+                  raise RuntimeError("synced_at is non-finite")
+
+              dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+              return dt.isoformat(), dt.date().isoformat()
+
+          def extract_applies_season(index_text: str) -> str:
+              m = APPLIES_SEASON_RE.search(index_text)
+              if not m:
+                  raise RuntimeError(
+                      "Could not find DRAFT_SLOT_APPLIES_TO_SEASON in index.html"
+                  )
+              return m.group(1)
+
+          def format_projection_js(mapping: dict[int, str]) -> str:
+              lines = ["const DRAFT_SLOT_PROJECTION = {"]
+              for start in (1, 7):
+                  end = min(start + 5, LEAGUE_SIZE)
+                  parts = [
+                      f"{rid}:'{mapping[rid]}'"
+                      for rid in range(start, end + 1)
+                  ]
+                  lines.append("  " + ", ".join(parts) + ",")
+              lines.append("};")
+              return "\n".join(lines)
+
+          def patch_index(
+              index_path: Path,
+              mapping: dict[int, str],
+              as_of_date: str,
+              expected_draft_season: str,
+          ) -> None:
+              text = index_path.read_text(encoding="utf-8")
+
+              actual_season = extract_applies_season(text)
+              if actual_season != expected_draft_season:
+                  raise RuntimeError(
+                      "DRAFT_SLOT_APPLIES_TO_SEASON mismatch: "
+                      f"index={actual_season}, expected={expected_draft_season}"
+                  )
+
+              last_matches = list(LAST_UPDATED_RE.finditer(text))
+              projection_matches = list(PROJECTION_RE.finditer(text))
+              if len(last_matches) != 1:
+                  raise RuntimeError(
+                      "Expected exactly one DRAFT_SLOT_LAST_UPDATED declaration; "
+                      f"found {len(last_matches)}"
+                  )
+              if len(projection_matches) != 1:
+                  raise RuntimeError(
+                      "Expected exactly one DRAFT_SLOT_PROJECTION declaration; "
+                      f"found {len(projection_matches)}"
+                  )
+
+              text = LAST_UPDATED_RE.sub(
+                  f"const DRAFT_SLOT_LAST_UPDATED = '{as_of_date}';",
+                  text,
+                  count=1,
+              )
+              text = PROJECTION_RE.sub(
+                  format_projection_js(mapping),
+                  text,
+                  count=1,
+              )
+
+              # Preserve two key reviewed production invariants:
+              # 1) farther future seasons stay mid;
+              # 2) traded pick slot follows original roster_id, not holder.
+              required = [
+                  "if(season !== DRAFT_SLOT_APPLIES_TO_SEASON) return 'mid';",
+                  "const slot = pickSlotForSeason(t.roster_id, t.season);",
+              ]
+              missing = [x for x in required if x not in text]
+              if missing:
+                  raise RuntimeError(
+                      "Refusing to write: reviewed original-owner/future-season "
+                      f"logic is missing: {missing}"
+                  )
+
+              index_path.write_text(text, encoding="utf-8")
+
+          def load_inputs(
+              rosters_path: Path,
+              config_path: Path,
+          ) -> tuple[dict[str, Any], dict[str, Any]]:
+              rosters = json.loads(rosters_path.read_text(encoding="utf-8"))
+              config = json.loads(config_path.read_text(encoding="utf-8"))
+              if not isinstance(rosters.get("rosters"), list):
+                  raise RuntimeError("league_rosters.json missing rosters list")
+              return rosters, config
+
+          def build_projection(
+              rosters_payload: dict[str, Any],
+              config: dict[str, Any],
+              source_path: Path,
+          ) -> dict[str, Any]:
+              source_season = str(config.get("season", "")).strip()
+              if not re.fullmatch(r"\d{4}", source_season):
+                  raise RuntimeError(
+                      f"config.json season is invalid: {source_season!r}"
+                  )
+              draft_season = str(int(source_season) + 1)
+
+              rows = [
+                  standing_from_roster(r)
+                  for r in rosters_payload["rosters"]
+              ]
+              validate_standings(rows)
+              ordered = rank_standings(rows)
+
+              synced_at_utc, as_of_date = synced_timestamp(rosters_payload)
+
+              standings = []
+              mapping: dict[int, str] = {}
+              for rank, row in enumerate(ordered, 1):
+                  tier = tier_for_rank(rank)
+                  mapping[row.roster_id] = tier
+                  standings.append({
+                      "projected_pick": f"1.{rank:02d}",
+                      "draft_order_rank": rank,
+                      "tier": tier,
+                      "roster_id": row.roster_id,
+                      "record": {
+                          "wins": row.wins,
+                          "losses": row.losses,
+                          "ties": row.ties,
+                      },
+                      "standing_points": row.standing_points,
+                      "points_for": row.points_for,
+                      "games_played": row.games_played,
+                  })
+
+              return {
+                  "schema_version": 1,
+                  "pipeline_id": "draft-slot-projection-pipeline-v1",
+                  "status": "projected_from_regular_season_standings",
+                  "league_id": rosters_payload.get("league_id"),
+                  "source_season": source_season,
+                  "draft_season": draft_season,
+                  "source_synced_at_utc": synced_at_utc,
+                  "projection_as_of_date": as_of_date,
+                  "league_rule": {
+                      "primary": "reverse_regular_season_standings",
+                      "tiebreaker": "total_points_scored",
+                      "playoff_finish_used": False,
+                      "potential_points_used": False,
+                      "current_pick_holder_used_for_slot": False,
+                      "original_roster_id_determines_traded_pick_slot": True,
+                  },
+                  "tier_mapping": {
+                      "early": "draft_order_ranks_1_through_4",
+                      "mid": "draft_order_ranks_5_through_8",
+                      "late": "draft_order_ranks_9_through_12",
+                  },
+                  "projection_by_roster_id": {
+                      str(rid): mapping[rid]
+                      for rid in sorted(mapping)
+                  },
+                  "standings_worst_to_best": standings,
+                  "source": {
+                      "league_rosters_path": str(source_path.relative_to(ROOT)),
+                      "league_rosters_sha256": file_sha256(source_path),
+                  },
+              }
+
+          def run_selftest() -> None:
+              def row(
+                  roster_id: int,
+                  wins: int,
+                  losses: int,
+                  pf: float,
+                  ties: int = 0,
+              ) -> Standing:
+                  return Standing(
+                      roster_id=roster_id,
+                      wins=wins,
+                      losses=losses,
+                      ties=ties,
+                      points_for=pf,
+                      games_played=wins + losses + ties,
+                      standing_points=wins + 0.5 * ties,
+                  )
+
+              # Direction: worst record picks first.
+              synthetic = [
+                  row(i, i - 1, 11 - (i - 1), 100.0 + i)
+                  for i in range(1, 13)
+              ]
+              validate_standings(synthetic)
+              ranked = rank_standings(synthetic)
+              assert ranked[0].roster_id == 1
+              assert ranked[-1].roster_id == 12
+              assert tier_for_rank(1) == "early"
+              assert tier_for_rank(4) == "early"
+              assert tier_for_rank(5) == "mid"
+              assert tier_for_rank(8) == "mid"
+              assert tier_for_rank(9) == "late"
+              assert tier_for_rank(12) == "late"
+
+              # Confirmed tiebreaker: same record, lower PF is worse / earlier.
+              tied = [
+                  row(1, 5, 6, 900.0),
+                  row(2, 5, 6, 950.0),
+              ]
+              assert [r.roster_id for r in rank_standings(tied)] == [1, 2]
+
+              # Exact record + PF tie must not silently use roster_id.
+              unresolved = [
+                  row(i, i - 1, 11 - (i - 1), 100.0 + i)
+                  for i in range(1, 13)
+              ]
+              unresolved[0] = row(1, 0, 11, 101.0)
+              unresolved[1] = row(2, 0, 11, 101.0)
+              try:
+                  validate_standings(unresolved)
+              except RuntimeError as exc:
+                  assert "no third league tiebreaker" in str(exc)
+              else:
+                  raise AssertionError("Exact unresolved tie did not fail closed")
+
+              # Incomplete week must fail closed.
+              incomplete = [
+                  row(i, i - 1, 11 - (i - 1), 100.0 + i)
+                  for i in range(1, 13)
+              ]
+              incomplete[-1] = row(12, 10, 0, 112.0)
+              try:
+                  validate_standings(incomplete)
+              except RuntimeError as exc:
+                  assert "same number of completed" in str(exc)
+              else:
+                  raise AssertionError("Incomplete-week standings did not fail")
+
+              print("PASS: draft-slot projection self-test")
+
+          def parse_args() -> argparse.Namespace:
+              p = argparse.ArgumentParser()
+              p.add_argument("--rosters", type=Path, default=DEFAULT_ROSTERS)
+              p.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+              p.add_argument("--index", type=Path, default=DEFAULT_INDEX)
+              p.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+              p.add_argument("--write-index", action="store_true")
+              p.add_argument("--selftest", action="store_true")
+              return p.parse_args()
+
+          def main() -> None:
+              args = parse_args()
+
+              if args.selftest:
+                  run_selftest()
+                  return
+
+              rosters_payload, config = load_inputs(
+                  args.rosters,
+                  args.config,
+              )
+              result = build_projection(
+                  rosters_payload,
+                  config,
+                  args.rosters,
+              )
+
+              current_index = args.index.read_text(encoding="utf-8")
+              actual_applies = extract_applies_season(current_index)
+              if actual_applies != result["draft_season"]:
+                  raise RuntimeError(
+                      "Current index projection season does not match config: "
+                      f"{actual_applies} vs {result['draft_season']}"
+                  )
+
+              args.output.parent.mkdir(parents=True, exist_ok=True)
+              args.output.write_text(
+                  json.dumps(result, indent=2, sort_keys=True) + "\n",
+                  encoding="utf-8",
+              )
+
+              if args.write_index:
+                  mapping = {
+                      int(k): v
+                      for k, v in result[
+                          "projection_by_roster_id"
+                      ].items()
+                  }
+                  patch_index(
+                      args.index,
+                      mapping,
+                      result["projection_as_of_date"],
+                      result["draft_season"],
+                  )
+
+              print(
+                  json.dumps(
+                      {
+                          "draft_season": result["draft_season"],
+                          "projection_as_of_date": result[
+                              "projection_as_of_date"
+                          ],
+                          "projection_by_roster_id": result[
+                              "projection_by_roster_id"
+                          ],
+                          "standings_worst_to_best": result[
+                              "standings_worst_to_best"
+                          ],
+                          "wrote_index": bool(args.write_index),
+                      },
+                      indent=2,
+                  )
+              )
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          chmod +x scripts/projections/draft_slot_projection_pipeline.py
+          python3 scripts/projections/draft_slot_projection_pipeline.py --selftest
+
+      - name: Bake current standings projection into production
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 scripts/projections/draft_slot_projection_pipeline.py \
+            --write-index \
+            --output data/draft_slot_projection.json
+
+      - name: Validate baked standings and pick ownership semantics
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          result = json.loads(
+              Path("data/draft_slot_projection.json").read_text()
+          )
+          index = Path("index.html").read_text(encoding="utf-8")
+
+          assert result["schema_version"] == 1
+          assert result["status"] == "projected_from_regular_season_standings"
+          assert result["league_rule"]["primary"] == "reverse_regular_season_standings"
+          assert result["league_rule"]["tiebreaker"] == "total_points_scored"
+          assert result["league_rule"]["playoff_finish_used"] is False
+          assert result["league_rule"]["potential_points_used"] is False
+          assert result["league_rule"]["current_pick_holder_used_for_slot"] is False
+          assert result["league_rule"]["original_roster_id_determines_traded_pick_slot"] is True
+
+          standings = result["standings_worst_to_best"]
+          assert len(standings) == 12
+          assert [x["draft_order_rank"] for x in standings] == list(range(1, 13))
+          assert [x["tier"] for x in standings[:4]] == ["early"] * 4
+          assert [x["tier"] for x in standings[4:8]] == ["mid"] * 4
+          assert [x["tier"] for x in standings[8:]] == ["late"] * 4
+
+          # Primary standings direction.
+          for a, b in zip(standings, standings[1:]):
+              ka = (a["standing_points"], a["points_for"])
+              kb = (b["standing_points"], b["points_for"])
+              assert ka < kb, (ka, kb)
+
+          # The bake date and all 12 roster tiers must match index.html.
+          expected_date = result["projection_as_of_date"]
+          assert (
+              f"const DRAFT_SLOT_LAST_UPDATED = '{expected_date}';"
+              in index
+          )
+
+          m = re.search(
+              r"const\s+DRAFT_SLOT_PROJECTION\s*=\s*\{(.*?)\}\s*;",
+              index,
+              flags=re.DOTALL,
+          )
+          assert m
+          body = m.group(1)
+          for rid, tier in result["projection_by_roster_id"].items():
+              assert re.search(
+                  rf"\b{re.escape(rid)}\s*:\s*['\"]{tier}['\"]",
+                  body,
+              ), (rid, tier)
+
+          # These two lines are the critical production semantics:
+          # farther-future drafts remain mid, and acquired picks use the
+          # original roster_id for projected slot.
+          assert "if(season !== DRAFT_SLOT_APPLIES_TO_SEASON) return 'mid';" in index
+          assert "const slot = pickSlotForSeason(t.roster_id, t.season);" in index
+
+          # No placeholder state remains for the upcoming draft.
+          assert "const DRAFT_SLOT_LAST_UPDATED = null;" not in index
+          assert "1:'mid', 2:'mid', 3:'mid', 4:'mid', 5:'mid', 6:'mid'," not in body
+
+          print("PASS: baked standings projection and original-owner semantics validated.")
+          print()
+          print("Projected 2027 draft order:")
+          for row in standings:
+              rec = row["record"]
+              print(
+                  f"{row['projected_pick']}  roster {row['roster_id']:>2}  "
+                  f"{rec['wins']}-{rec['losses']}-{rec['ties']}  "
+                  f"PF {row['points_for']:.2f}  -> {row['tier']}"
+              )
+          PY
+
+      - name: Run repository regression checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet "requests==2.34.2"
+          python3 scripts/validation/repo_regression_checks.py
+
+      - name: Prove only intended production files changed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import subprocess
+
+          expected = {
+              "data/draft_slot_projection.json",
+              "index.html",
+              "scripts/projections/draft_slot_projection_pipeline.py",
+          }
+
+          raw = subprocess.check_output(
+              ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+              text=True,
+          )
+          actual = {
+              line[3:]
+              for line in raw.splitlines()
+              if line
+          }
+
+          print("Changed files:")
+          for path in sorted(actual):
+              print(path)
+
+          assert actual == expected, (sorted(actual), sorted(expected))
+          print("PASS: exactly the intended three files changed.")
+          PY
+
+      - name: Commit draft slot projection activation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            scripts/projections/draft_slot_projection_pipeline.py \
+            data/draft_slot_projection.json \
+            index.html
+
+          git commit -m "Activate standings-based draft slot projection"
+          git push origin HEAD:main
