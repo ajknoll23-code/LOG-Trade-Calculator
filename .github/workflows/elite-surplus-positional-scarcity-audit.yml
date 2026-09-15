@@ -1,0 +1,854 @@
+name: Elite Surplus Positional Scarcity Audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Guard clean repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Validate reviewed upstreams
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 research/baseline-backtester/baseline_backtester.py --selftest
+          python3 scripts/validation/snapshot_values.py --selftest
+
+          test -f research/roster-economics/weekly_points_by_season.json
+          test -f research/replacement-level-v2/replacement_level_v2_phase2_historical_backtest.json
+          test -f research/replacement-level-v2/replacement_level_v2_phase2_historical_backtest.md
+
+      - name: Build read-only elite surplus and scarcity audit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OUT="/tmp/elite-surplus-positional-scarcity-audit"
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import importlib.util
+          import json
+          import math
+          import statistics
+          import subprocess
+          from collections import defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          ROOT = Path(".")
+          OUT = Path("/tmp/elite-surplus-positional-scarcity-audit")
+
+          POINTS_PATH = (
+              ROOT / "research" / "roster-economics" / "weekly_points_by_season.json"
+          )
+          BACKTESTER_PATH = (
+              ROOT / "research" / "baseline-backtester" / "baseline_backtester.py"
+          )
+          REPLACEMENT_JSON = (
+              ROOT / "research" / "replacement-level-v2"
+              / "replacement_level_v2_phase2_historical_backtest.json"
+          )
+          REPLACEMENT_MD = (
+              ROOT / "research" / "replacement-level-v2"
+              / "replacement_level_v2_phase2_historical_backtest.md"
+          )
+          SNAPSHOT_VALUES_PATH = ROOT / "scripts" / "validation" / "snapshot_values.py"
+          INDEX_PATH = ROOT / "index.html"
+
+          TRACKED_POSITIONS = ("QB", "RB", "WR", "TE", "DL", "LB", "DB")
+          WINDOWS = (2, 4, 6)
+          PRIMARY_WINDOW = 4
+
+          # Frozen/reviewed Phase-2 primary 4-week historical leaders.
+          # These are denominator anchors for descriptive surplus measurement,
+          # not coefficients being selected by this audit.
+          RESEARCH_REPLACEMENT_RANK = {
+              "QB": 29,
+              "RB": 25,
+              "WR": 28,
+              "TE": 11,
+              "DL": 16,
+              "LB": 28,
+              "DB": 22,
+          }
+
+          # Legacy deployed/documented comparison anchors from the reviewed
+          # baseline architecture. Sensitivity only.
+          LEGACY_REPLACEMENT_RANK = {
+              "QB": 18,
+              "RB": 32,
+              "WR": 36,
+              "TE": 15,
+              "DL": 32,
+              "LB": 32,
+              "DB": 32,
+          }
+
+          TIER_RANKS = (1, 3, 5, 12)
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def git_head() -> str:
+              return subprocess.check_output(
+                  ["git", "rev-parse", "HEAD"], text=True
+              ).strip()
+
+          def load_module(path: Path, name: str):
+              spec = importlib.util.spec_from_file_location(name, path)
+              if spec is None or spec.loader is None:
+                  raise RuntimeError(f"Could not import {path}")
+              module = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(module)
+              return module
+
+          def finite(values):
+              out = []
+              for x in values:
+                  try:
+                      y = float(x)
+                  except (TypeError, ValueError):
+                      continue
+                  if math.isfinite(y):
+                      out.append(y)
+              return out
+
+          def median(values):
+              vals = finite(values)
+              return statistics.median(vals) if vals else None
+
+          def mean(values):
+              vals = finite(values)
+              return statistics.fmean(vals) if vals else None
+
+          def quantile(values, q):
+              vals = sorted(finite(values))
+              if not vals:
+                  return None
+              if len(vals) == 1:
+                  return vals[0]
+              pos = (len(vals) - 1) * q
+              lo = math.floor(pos)
+              hi = math.ceil(pos)
+              if lo == hi:
+                  return vals[lo]
+              w = pos - lo
+              return vals[lo] * (1 - w) + vals[hi] * w
+
+          def summarize(values):
+              vals = finite(values)
+              if not vals:
+                  return {
+                      "n": 0,
+                      "median": None,
+                      "mean": None,
+                      "q25": None,
+                      "q75": None,
+                      "min": None,
+                      "max": None,
+                  }
+              return {
+                  "n": len(vals),
+                  "median": median(vals),
+                  "mean": mean(vals),
+                  "q25": quantile(vals, 0.25),
+                  "q75": quantile(vals, 0.75),
+                  "min": min(vals),
+                  "max": max(vals),
+              }
+
+          backtester = load_module(
+              BACKTESTER_PATH, "elite_surplus_reviewed_backtester"
+          )
+          sv = load_module(
+              SNAPSHOT_VALUES_PATH, "elite_surplus_snapshot_values"
+          )
+
+          points = json.loads(POINTS_PATH.read_text(encoding="utf-8"))
+          replacement_result = json.loads(
+              REPLACEMENT_JSON.read_text(encoding="utf-8")
+          )
+
+          if replacement_result.get("method_version") != (
+              "replacement-level-v2-phase2-historical-backtest-v1"
+          ):
+              raise RuntimeError("Replacement Phase-2 method version drifted")
+
+          if set(points.get("seasons", {})) & {"2024", "2025"} != {"2024", "2025"}:
+              raise RuntimeError("Historical points must contain 2024 and 2025")
+
+          # Guard the hard-coded descriptive anchors against the reviewed report.
+          md_text = REPLACEMENT_MD.read_text(encoding="utf-8")
+          expected_rows = {
+              "QB": "| QB | 18 | 18 | 29 |",
+              "RB": "| RB | 32 | 26 | 25 |",
+              "WR": "| WR | 36 | 34 | 28 |",
+              "TE": "| TE | 15 | 15 | 11 |",
+              "DL": "| DL | 32 | 23 | 16 |",
+              "LB": "| LB | 32 | 32 | 28 |",
+              "DB": "| DB | 32 | 30 | 22 |",
+          }
+          for pos, needle in expected_rows.items():
+              if needle not in md_text:
+                  raise RuntimeError(
+                      f"Reviewed replacement leader drift for {pos}: "
+                      f"expected report fragment {needle!r}"
+                  )
+
+          def rank_value(sorted_values, rank):
+              if not sorted_values:
+                  return None
+              idx = min(max(int(rank), 1), len(sorted_values)) - 1
+              return float(sorted_values[idx])
+
+          def future_position_rows(fold, pos):
+              rows = []
+              for pid, target_ppg in fold["target"].items():
+                  train_row = fold["train"].get(pid)
+                  if not train_row or train_row.get("pos_bucket") != pos:
+                      continue
+                  rows.append({
+                      "pid": pid,
+                      "name": train_row.get("name", pid),
+                      "train_ppg": float(train_row["ppg"]),
+                      "future_ppg": float(target_ppg),
+                  })
+              return rows
+
+          def fold_metrics(fold, pos, replacement_rank):
+              rows = future_position_rows(fold, pos)
+              if len(rows) < max(15, min(replacement_rank, 12)):
+                  return None
+
+              future_sorted = sorted(
+                  rows,
+                  key=lambda r: (-r["future_ppg"], r["name"]),
+              )
+              training_sorted = sorted(
+                  rows,
+                  key=lambda r: (-r["train_ppg"], r["name"]),
+              )
+
+              future_ppgs = [r["future_ppg"] for r in future_sorted]
+              replacement_ppg = rank_value(future_ppgs, replacement_rank)
+              if replacement_ppg is None or replacement_ppg <= 0:
+                  return None
+
+              tiers = {}
+              for rank in TIER_RANKS:
+                  ppg = rank_value(future_ppgs, rank)
+                  if ppg is None:
+                      continue
+                  tiers[str(rank)] = {
+                      "future_ppg": ppg,
+                      "ppg_over_replacement": ppg / replacement_ppg,
+                      "surplus_ppg": ppg - replacement_ppg,
+                  }
+
+              if not all(str(r) in tiers for r in TIER_RANKS):
+                  return None
+
+              # Upper-tier curvature in realized production. This is descriptive,
+              # not a value-utility function.
+              p1 = tiers["1"]["future_ppg"]
+              p3 = tiers["3"]["future_ppg"]
+              p5 = tiers["5"]["future_ppg"]
+              p12 = tiers["12"]["future_ppg"]
+
+              upper_step = p1 - p5
+              middle_step = p5 - p12
+              upper_to_middle_step_ratio = (
+                  upper_step / middle_step
+                  if middle_step > 1e-12 else None
+              )
+
+              # Concentration of positive surplus among the top 12.
+              top12_surpluses = [
+                  max(0.0, r["future_ppg"] - replacement_ppg)
+                  for r in future_sorted[:12]
+              ]
+              total_top12_surplus = sum(top12_surpluses)
+              top1_surplus_share = (
+                  top12_surpluses[0] / total_top12_surplus
+                  if total_top12_surplus > 0 else None
+              )
+              top5_surplus_share = (
+                  sum(top12_surpluses[:5]) / total_top12_surplus
+                  if total_top12_surplus > 0 else None
+              )
+
+              # Training-time elite persistence. No current 2026 data is used.
+              future_rank = {
+                  r["pid"]: i for i, r in enumerate(future_sorted, 1)
+              }
+              future_by_pid = {r["pid"]: r for r in future_sorted}
+
+              persistence = {}
+              for n in (1, 3, 5, 12):
+                  cohort = training_sorted[:n]
+                  if not cohort:
+                      continue
+                  future_ranks = [
+                      future_rank[r["pid"]]
+                      for r in cohort
+                      if r["pid"] in future_rank
+                  ]
+                  future_surplus = [
+                      future_by_pid[r["pid"]]["future_ppg"] - replacement_ppg
+                      for r in cohort
+                      if r["pid"] in future_by_pid
+                  ]
+                  persistence[str(n)] = {
+                      "cohort_n": len(cohort),
+                      "same_tier_retention_rate": (
+                          sum(rank <= n for rank in future_ranks)
+                          / len(future_ranks)
+                          if future_ranks else None
+                      ),
+                      "future_top5_rate": (
+                          sum(rank <= 5 for rank in future_ranks)
+                          / len(future_ranks)
+                          if future_ranks else None
+                      ),
+                      "future_top12_rate": (
+                          sum(rank <= 12 for rank in future_ranks)
+                          / len(future_ranks)
+                          if future_ranks else None
+                      ),
+                      "positive_future_surplus_rate": (
+                          sum(x > 0 for x in future_surplus)
+                          / len(future_surplus)
+                          if future_surplus else None
+                      ),
+                      "median_future_rank": median(future_ranks),
+                      "median_future_surplus_ppg": median(future_surplus),
+                  }
+
+              return {
+                  "fold": fold["name"],
+                  "season_segment": fold["season"],
+                  "eligible_players": len(rows),
+                  "replacement_rank": replacement_rank,
+                  "future_replacement_ppg": replacement_ppg,
+                  "tiers": tiers,
+                  "ratios": {
+                      "rank1_to_rank3_ppg": p1 / p3 if p3 > 0 else None,
+                      "rank1_to_rank5_ppg": p1 / p5 if p5 > 0 else None,
+                      "rank1_to_rank12_ppg": p1 / p12 if p12 > 0 else None,
+                      "rank3_to_rank12_ppg": p3 / p12 if p12 > 0 else None,
+                      "rank5_to_rank12_ppg": p5 / p12 if p12 > 0 else None,
+                      "upper_to_middle_step_ratio": upper_to_middle_step_ratio,
+                  },
+                  "surplus_concentration": {
+                      "top1_share_of_top12_positive_surplus": top1_surplus_share,
+                      "top5_share_of_top12_positive_surplus": top5_surplus_share,
+                      "top12_total_positive_surplus_ppg": total_top12_surplus,
+                  },
+                  "persistence": persistence,
+              }
+
+          def aggregate_fold_set(fold_rows):
+              if not fold_rows:
+                  return None
+
+              out = {
+                  "n_folds": len(fold_rows),
+                  "replacement_ppg": summarize(
+                      r["future_replacement_ppg"] for r in fold_rows
+                  ),
+                  "tiers": {},
+                  "ratios": {},
+                  "surplus_concentration": {},
+                  "persistence": {},
+              }
+
+              for rank in TIER_RANKS:
+                  k = str(rank)
+                  out["tiers"][k] = {
+                      "future_ppg": summarize(
+                          r["tiers"][k]["future_ppg"] for r in fold_rows
+                      ),
+                      "ppg_over_replacement": summarize(
+                          r["tiers"][k]["ppg_over_replacement"]
+                          for r in fold_rows
+                      ),
+                      "surplus_ppg": summarize(
+                          r["tiers"][k]["surplus_ppg"] for r in fold_rows
+                      ),
+                  }
+
+              ratio_keys = (
+                  "rank1_to_rank3_ppg",
+                  "rank1_to_rank5_ppg",
+                  "rank1_to_rank12_ppg",
+                  "rank3_to_rank12_ppg",
+                  "rank5_to_rank12_ppg",
+                  "upper_to_middle_step_ratio",
+              )
+              for key in ratio_keys:
+                  out["ratios"][key] = summarize(
+                      r["ratios"][key] for r in fold_rows
+                      if r["ratios"].get(key) is not None
+                  )
+
+              conc_keys = (
+                  "top1_share_of_top12_positive_surplus",
+                  "top5_share_of_top12_positive_surplus",
+                  "top12_total_positive_surplus_ppg",
+              )
+              for key in conc_keys:
+                  out["surplus_concentration"][key] = summarize(
+                      r["surplus_concentration"][key] for r in fold_rows
+                      if r["surplus_concentration"].get(key) is not None
+                  )
+
+              for n in (1, 3, 5, 12):
+                  k = str(n)
+                  metrics = (
+                      "same_tier_retention_rate",
+                      "future_top5_rate",
+                      "future_top12_rate",
+                      "positive_future_surplus_rate",
+                      "median_future_rank",
+                      "median_future_surplus_ppg",
+                  )
+                  out["persistence"][k] = {}
+                  for metric in metrics:
+                      out["persistence"][k][metric] = summarize(
+                          r["persistence"][k][metric]
+                          for r in fold_rows
+                          if k in r["persistence"]
+                          and r["persistence"][k].get(metric) is not None
+                      )
+
+              return out
+
+          historical = {}
+          raw_primary = {}
+          for window in WINDOWS:
+              folds = backtester.build_folds(points, window)
+              historical[str(window)] = {}
+              for pos in TRACKED_POSITIONS:
+                  rank = RESEARCH_REPLACEMENT_RANK[pos]
+                  rows = []
+                  for fold in folds:
+                      rec = fold_metrics(fold, pos, rank)
+                      if rec is not None:
+                          rows.append(rec)
+
+                  historical[str(window)][pos] = aggregate_fold_set(rows)
+                  if window == PRIMARY_WINDOW:
+                      raw_primary[pos] = rows
+
+          # Sensitivity: primary 4-week window using the legacy denominator.
+          legacy_sensitivity = {}
+          primary_folds = backtester.build_folds(points, PRIMARY_WINDOW)
+          for pos in TRACKED_POSITIONS:
+              rows = []
+              for fold in primary_folds:
+                  rec = fold_metrics(
+                      fold, pos, LEGACY_REPLACEMENT_RANK[pos]
+                  )
+                  if rec is not None:
+                      rows.append(rec)
+              legacy_sensitivity[pos] = aggregate_fold_set(rows)
+
+          # Current deployed FV spacing is an architecture comparison only.
+          # It is not treated as historical outcome ground truth.
+          cfg = sv.load_from_html(INDEX_PATH)
+          current = sv.compute_all_values(cfg)
+
+          current_spacing = {}
+          for pos in TRACKED_POSITIONS:
+              group = [
+                  {"name": name, **row}
+                  for name, row in current.items()
+                  if row["pos"] == pos
+              ]
+              group.sort(key=lambda r: (-r["value"], r["name"]))
+              if len(group) < 12:
+                  raise RuntimeError(f"Current {pos} cohort has <12 players")
+
+              fv1 = float(group[0]["value"])
+              fv3 = float(group[2]["value"])
+              fv5 = float(group[4]["value"])
+              fv12 = float(group[11]["value"])
+
+              primary = historical[str(PRIMARY_WINDOW)][pos]
+              hist_15 = primary["ratios"]["rank1_to_rank5_ppg"]["median"]
+              hist_112 = primary["ratios"]["rank1_to_rank12_ppg"]["median"]
+
+              current_spacing[pos] = {
+                  "current_top_players": [
+                      {
+                          "rank": i,
+                          "name": group[i - 1]["name"],
+                          "fv": group[i - 1]["value"],
+                          "age": group[i - 1]["age"],
+                          "role": group[i - 1]["role"],
+                      }
+                      for i in (1, 3, 5, 12)
+                  ],
+                  "fv_ratios": {
+                      "rank1_to_rank3": fv1 / fv3,
+                      "rank1_to_rank5": fv1 / fv5,
+                      "rank1_to_rank12": fv1 / fv12,
+                      "rank3_to_rank12": fv3 / fv12,
+                      "rank5_to_rank12": fv5 / fv12,
+                  },
+                  "historical_primary_future_ppg_median_ratios": {
+                      "rank1_to_rank5": hist_15,
+                      "rank1_to_rank12": hist_112,
+                  },
+                  "descriptive_spacing_index": {
+                      "current_fv_rank1_to_rank5_div_hist_future_ppg": (
+                          (fv1 / fv5) / hist_15
+                          if hist_15 and hist_15 > 0 else None
+                      ),
+                      "current_fv_rank1_to_rank12_div_hist_future_ppg": (
+                          (fv1 / fv12) / hist_112
+                          if hist_112 and hist_112 > 0 else None
+                      ),
+                  },
+                  "guardrail": (
+                      "Current FV spacing and historical future-PPG spacing are "
+                      "different objects. These ratios are descriptive only and "
+                      "cannot by themselves validate a nonlinear value transform."
+                  ),
+              }
+
+          # Position comparison table from the primary 4-week window.
+          position_comparison = {}
+          for pos in TRACKED_POSITIONS:
+              primary = historical[str(PRIMARY_WINDOW)][pos]
+              position_comparison[pos] = {
+                  "replacement_rank": RESEARCH_REPLACEMENT_RANK[pos],
+                  "n_folds": primary["n_folds"],
+                  "median_rank1_over_replacement": (
+                      primary["tiers"]["1"]["ppg_over_replacement"]["median"]
+                  ),
+                  "median_rank5_over_replacement": (
+                      primary["tiers"]["5"]["ppg_over_replacement"]["median"]
+                  ),
+                  "median_rank12_over_replacement": (
+                      primary["tiers"]["12"]["ppg_over_replacement"]["median"]
+                  ),
+                  "median_rank1_to_rank5_ppg": (
+                      primary["ratios"]["rank1_to_rank5_ppg"]["median"]
+                  ),
+                  "median_rank1_to_rank12_ppg": (
+                      primary["ratios"]["rank1_to_rank12_ppg"]["median"]
+                  ),
+                  "median_upper_to_middle_step_ratio": (
+                      primary["ratios"]["upper_to_middle_step_ratio"]["median"]
+                  ),
+                  "median_top1_share_top12_surplus": (
+                      primary["surplus_concentration"][
+                          "top1_share_of_top12_positive_surplus"
+                      ]["median"]
+                  ),
+                  "training_top1_future_top5_rate": (
+                      primary["persistence"]["1"]["future_top5_rate"]["mean"]
+                  ),
+                  "training_top5_same_tier_retention_rate": (
+                      primary["persistence"]["5"][
+                          "same_tier_retention_rate"
+                      ]["mean"]
+                  ),
+                  "training_top5_positive_future_surplus_rate": (
+                      primary["persistence"]["5"][
+                          "positive_future_surplus_rate"
+                      ]["mean"]
+                  ),
+              }
+
+          report = {
+              "schema_version": 1,
+              "study_id": "elite-surplus-positional-scarcity-audit-v1",
+              "status": "read_only_historical_structural_audit",
+              "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+              "git_sha": git_head(),
+              "research_only": True,
+              "read_only": True,
+              "historical_seasons_used": ["2024", "2025"],
+              "current_2026_outcomes_used": False,
+              "ktc_used": False,
+              "market_value_used": False,
+              "package_vote_data_used": False,
+              "candidate_fit_performed": False,
+              "candidate_selected": False,
+              "nonlinear_transform_fit": False,
+              "production_change_authorized": False,
+              "age_curve_change_authorized": False,
+              "replacement_level_change_authorized": False,
+              "position_weight_change_authorized": False,
+              "production_changed": False,
+              "source_sha256": {
+                  "weekly_points_by_season": sha256(POINTS_PATH),
+                  "baseline_backtester_py": sha256(BACKTESTER_PATH),
+                  "replacement_phase2_json": sha256(REPLACEMENT_JSON),
+                  "replacement_phase2_md": sha256(REPLACEMENT_MD),
+                  "snapshot_values_py": sha256(SNAPSHOT_VALUES_PATH),
+                  "index_html": sha256(INDEX_PATH),
+              },
+              "method": {
+                  "primary_forward_window_weeks": PRIMARY_WINDOW,
+                  "robustness_forward_windows_weeks": list(WINDOWS),
+                  "research_replacement_ranks": RESEARCH_REPLACEMENT_RANK,
+                  "legacy_replacement_ranks_sensitivity": LEGACY_REPLACEMENT_RANK,
+                  "tier_ranks": list(TIER_RANKS),
+                  "historical_fold_builder": (
+                      "reviewed baseline_backtester.build_folds; rolling 2024 "
+                      "and 2025 week-9..15 folds plus 2024-full-to-2025-full"
+                  ),
+                  "scarcity_definition": (
+                      "realized future PPG and positive PPG surplus above a "
+                      "position-specific replacement-rank denominator"
+                  ),
+                  "persistence_definition": (
+                      "training-time elite ranks tracked into subsequent "
+                      "future production within the same historical fold"
+                  ),
+                  "important_limitation": (
+                      "Production scarcity/persistence can justify studying a "
+                      "nonlinear dynasty-utility layer, but cannot prove the "
+                      "correct utility function or coefficient."
+                  ),
+              },
+              "historical_by_window": historical,
+              "primary_window_raw_folds": raw_primary,
+              "legacy_rank_sensitivity_primary_window": legacy_sensitivity,
+              "position_comparison_primary_window": position_comparison,
+              "current_deployed_fv_spacing": current_spacing,
+              "decision_guardrail": (
+                  "This audit may identify whether elite production is scarce, "
+                  "concentrated, and persistent. It must not select, fit, or "
+                  "deploy an elite bonus, scarcity multiplier, convex transform, "
+                  "or position-specific coefficient. Any candidate family must "
+                  "be separately preregistered after reviewing this report."
+              ),
+          }
+
+          json_path = OUT / "elite_surplus_positional_scarcity_audit_v1.json"
+          json_path.write_text(
+              json.dumps(report, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          def fnum(x, digits=3):
+              if x is None:
+                  return "n/a"
+              return f"{x:.{digits}f}"
+
+          lines = [
+              "# Elite Surplus / Positional Scarcity Audit V1",
+              "",
+              "**Status:** read-only historical structural audit",
+              "",
+              "This audit asks whether elite production is unusually scarce, "
+              "concentrated, and persistent relative to position-specific "
+              "replacement production. It does **not** fit or recommend an "
+              "elite-value bonus.",
+              "",
+              "## Scientific isolation",
+              "",
+              "- Historical seasons: **2024 and 2025 only**",
+              "- 2026 prospective outcomes: **not used**",
+              "- KTC / market values: **not used**",
+              "- Package votes: **not used**",
+              "- Candidate fitting: **none**",
+              "- Production/age/replacement/position-weight mutation: **none**",
+              "",
+              "## Primary 4-week historical results",
+              "",
+              "| Pos | Repl rank | Folds | R1 / repl | R5 / repl | R12 / repl | R1 / R5 | R1 / R12 | Top1 share of top12 surplus | Train top1 → future top5 | Train top5 retained top5 |",
+              "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+          ]
+
+          for pos in TRACKED_POSITIONS:
+              p = position_comparison[pos]
+              lines.append(
+                  f"| {pos} | {p['replacement_rank']} | {p['n_folds']} | "
+                  f"{fnum(p['median_rank1_over_replacement'])}× | "
+                  f"{fnum(p['median_rank5_over_replacement'])}× | "
+                  f"{fnum(p['median_rank12_over_replacement'])}× | "
+                  f"{fnum(p['median_rank1_to_rank5_ppg'])}× | "
+                  f"{fnum(p['median_rank1_to_rank12_ppg'])}× | "
+                  f"{fnum(p['median_top1_share_top12_surplus'] * 100 if p['median_top1_share_top12_surplus'] is not None else None, 1)}% | "
+                  f"{fnum(p['training_top1_future_top5_rate'] * 100 if p['training_top1_future_top5_rate'] is not None else None, 1)}% | "
+                  f"{fnum(p['training_top5_same_tier_retention_rate'] * 100 if p['training_top5_same_tier_retention_rate'] is not None else None, 1)}% |"
+              )
+
+          lines += [
+              "",
+              "## Current deployed FV spacing vs historical production spacing",
+              "",
+              "This is a **descriptive architecture comparison only**. FV and "
+              "future PPG are not the same target, so a ratio mismatch does not "
+              "by itself prove compression or justify a nonlinear transform.",
+              "",
+              "| Pos | Current FV R1/R5 | Hist median future PPG R1/R5 | Spacing index | Current FV R1/R12 | Hist median future PPG R1/R12 | Spacing index |",
+              "|---|---:|---:|---:|---:|---:|---:|",
+          ]
+
+          for pos in TRACKED_POSITIONS:
+              c = current_spacing[pos]
+              fv15 = c["fv_ratios"]["rank1_to_rank5"]
+              hp15 = c["historical_primary_future_ppg_median_ratios"][
+                  "rank1_to_rank5"
+              ]
+              ix15 = c["descriptive_spacing_index"][
+                  "current_fv_rank1_to_rank5_div_hist_future_ppg"
+              ]
+              fv112 = c["fv_ratios"]["rank1_to_rank12"]
+              hp112 = c["historical_primary_future_ppg_median_ratios"][
+                  "rank1_to_rank12"
+              ]
+              ix112 = c["descriptive_spacing_index"][
+                  "current_fv_rank1_to_rank12_div_hist_future_ppg"
+              ]
+              lines.append(
+                  f"| {pos} | {fnum(fv15)}× | {fnum(hp15)}× | "
+                  f"{fnum(ix15)} | {fnum(fv112)}× | {fnum(hp112)}× | "
+                  f"{fnum(ix112)} |"
+              )
+
+          lines += [
+              "",
+              "## What this can and cannot establish",
+              "",
+              "If a position shows large and persistent elite surplus above "
+              "replacement, that is evidence that an explicit dynasty-utility "
+              "study may be worthwhile. It is **not** evidence that a particular "
+              "convex formula, tier bonus, exponent, or multiplier is correct.",
+              "",
+              "Any next-stage candidate family must be separately preregistered "
+              "and must not be trained to Josh Allen vs Dak Prescott.",
+              "",
+          ]
+
+          md = "\n".join(lines)
+          (OUT / "elite_surplus_positional_scarcity_audit_v1.md").write_text(
+              md + "\n",
+              encoding="utf-8",
+          )
+
+          summary_path = Path(
+              __import__("os").environ.get(
+                  "GITHUB_STEP_SUMMARY",
+                  "/tmp/elite-surplus-summary.md",
+              )
+          )
+          with summary_path.open("a", encoding="utf-8") as f:
+              f.write(md + "\n")
+
+          print(md)
+          PY
+
+      - name: Validate scientific contract
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path(
+              "/tmp/elite-surplus-positional-scarcity-audit/"
+              "elite_surplus_positional_scarcity_audit_v1.json"
+          )
+          r = json.loads(path.read_text())
+
+          assert r["status"] == "read_only_historical_structural_audit"
+          assert r["research_only"] is True
+          assert r["read_only"] is True
+          assert r["historical_seasons_used"] == ["2024", "2025"]
+          assert r["current_2026_outcomes_used"] is False
+          assert r["ktc_used"] is False
+          assert r["market_value_used"] is False
+          assert r["package_vote_data_used"] is False
+          assert r["candidate_fit_performed"] is False
+          assert r["candidate_selected"] is False
+          assert r["nonlinear_transform_fit"] is False
+          assert r["production_change_authorized"] is False
+          assert r["age_curve_change_authorized"] is False
+          assert r["replacement_level_change_authorized"] is False
+          assert r["position_weight_change_authorized"] is False
+          assert r["production_changed"] is False
+
+          positions = ("QB", "RB", "WR", "TE", "DL", "LB", "DB")
+          for window in ("2", "4", "6"):
+              assert set(r["historical_by_window"][window]) == set(positions)
+              for pos in positions:
+                  rec = r["historical_by_window"][window][pos]
+                  assert rec is not None
+                  assert rec["n_folds"] >= 10
+
+          for pos in positions:
+              primary = r["position_comparison_primary_window"][pos]
+              assert primary["n_folds"] >= 10
+              assert primary["replacement_rank"] >= 1
+              assert primary["median_rank1_over_replacement"] >= 1.0
+              assert primary["median_rank5_over_replacement"] >= 1.0
+              assert primary["median_rank12_over_replacement"] >= 1.0
+
+              current = r["current_deployed_fv_spacing"][pos]
+              assert len(current["current_top_players"]) == 4
+              assert current["fv_ratios"]["rank1_to_rank5"] >= 1.0
+              assert current["fv_ratios"]["rank1_to_rank12"] >= 1.0
+
+          print(
+              "PASS: elite-surplus audit is historical-only, read-only, "
+              "non-market, non-vote, and non-fitting."
+          )
+          PY
+
+      - name: Upload audit artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: elite-surplus-positional-scarcity-audit-v1
+          path: /tmp/elite-surplus-positional-scarcity-audit/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Prove repository stayed unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          echo "PASS: elite-surplus audit made no repository changes."
