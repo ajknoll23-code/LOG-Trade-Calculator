@@ -17,7 +17,7 @@ Policy SHA256: `bafc53164f6d98448965c5d0b531b14be31a3d744f0e4a44d6cdac71b6c05247
 | Pos | N | Median half-width | Median provider component | Median history component | Median availability component |
 |---|---:|---:|---:|---:|---:|
 | QB | 64 | 37.5% | 2.3% | 17.2% | 28.9% |
-| RB | 97 | 24.1% | 5.3% | 18.5% | 4.3% |
+| RB | 97 | 24.1% | 5.2% | 18.5% | 4.3% |
 | WR | 114 | 25.5% | 5.7% | 22.5% | 6.9% |
 | TE | 44 | 24.5% | 6.4% | 19.2% | 7.1% |
 | DL | 86 | 25.0% | 9.1% | 21.0% | 5.2% |
