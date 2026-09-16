@@ -1,0 +1,1213 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import math
+import re
+import time
+import unicodedata
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlencode
+
+import requests
+
+ROOT = Path(__file__).resolve().parents[2] if "research" in Path(__file__).parts else Path.cwd()
+V3 = ROOT / "research" / "draft-pick-fv-v3"
+
+CATALOG = V3 / "historical_draft_source_catalog_v3.json"
+PREREG = V3 / "preregistration_v3.json"
+PREREG_MAN = V3 / "preregistration_manifest_v3.json"
+POOLED = V3 / "mfl_pooled_design_v1.json"
+
+JSON_OUT = V3 / "historical_draft_pick_harvest_v3.json"
+MD_OUT = V3 / "historical_draft_pick_harvest_v3.md"
+MAN_OUT = V3 / "historical_draft_pick_harvest_manifest_v3.json"
+
+YEARS = [2018, 2019, 2020, 2021, 2022, 2023]
+DEV_YEARS = {2018, 2019, 2020, 2021}
+VAL_YEARS = {2022, 2023}
+
+BASE = "https://api.myfantasyleague.com"
+REQUEST_SLEEP_SECONDS = 1.20
+REQUEST_RETRIES = 6
+IDENTITY_MIN_COVERAGE = 0.95
+
+IDENTITY_ALLOWED_COLUMNS = [
+    "mfl_id",
+    "gsis_id",
+    "sleeper_id",
+    "name",
+    "merge_name",
+    "position",
+    "draft_year",
+    "db_season",
+]
+
+class GateError(RuntimeError):
+    pass
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def load(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text())
+
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def as_list(x: Any) -> list[Any]:
+    if x is None:
+        return []
+    return x if isinstance(x, list) else [x]
+
+def safe_int(x: Any) -> int | None:
+    try:
+        if x is None:
+            return None
+        s = str(x).strip()
+        if not re.fullmatch(r"[+-]?\d+", s):
+            return None
+        return int(s)
+    except (TypeError, ValueError):
+        return None
+
+def nonempty_id(x: Any) -> str | None:
+    s = str(x or "").strip()
+    if not s or s.upper() in {"NA", "N/A", "NULL", "NONE", "NAN"}:
+        return None
+    return s
+
+def clean_name(x: Any) -> str:
+    s = str(x or "").strip()
+    if "," in s:
+        bits = [z.strip() for z in s.split(",", 1)]
+        if len(bits) == 2 and bits[0] and bits[1]:
+            s = bits[1] + " " + bits[0]
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.lower()
+    s = re.sub(r"\b(jr|sr|ii|iii|iv|v)\b\.?", " ", s)
+    s = s.replace("'", "").replace("’", "")
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+def norm_position(x: Any) -> str:
+    s = str(x or "").strip().upper()
+    aliases = {
+        "DE": "DL",
+        "DT": "DL",
+        "NT": "DL",
+        "EDGE": "DL",
+        "ILB": "LB",
+        "OLB": "LB",
+        "CB": "DB",
+        "S": "DB",
+        "FS": "DB",
+        "SS": "DB",
+    }
+    return aliases.get(s, s)
+
+def api_url(year: int, endpoint: str, **params: Any) -> str:
+    q = {"TYPE": endpoint, "JSON": 1}
+    q.update({k: v for k, v in params.items() if v is not None})
+    return f"{BASE}/{year}/export?" + urlencode(q)
+
+def get_json(
+    session: requests.Session,
+    url: str,
+    retries: int = REQUEST_RETRIES,
+) -> dict[str, Any]:
+    last: Exception | None = None
+    for attempt in range(retries):
+        try:
+            r = session.get(url, timeout=45)
+            r.raise_for_status()
+            data = r.json()
+            if not isinstance(data, dict):
+                raise GateError("non-object JSON")
+            time.sleep(REQUEST_SLEEP_SECONDS)
+            return data
+        except (
+            requests.exceptions.RequestException,
+            ValueError,
+            GateError,
+        ) as exc:
+            last = exc
+            if attempt + 1 < retries:
+                time.sleep(min(30, 2 ** (attempt + 1)))
+    raise GateError(f"{url}: {type(last).__name__}: {last}")
+
+def draft_picks(data: dict[str, Any]) -> list[dict[str, Any]]:
+    root = data.get("draftResults")
+    if not isinstance(root, dict):
+        return []
+    out: list[dict[str, Any]] = []
+    for unit_index, unit in enumerate(as_list(root.get("draftUnit"))):
+        if not isinstance(unit, dict):
+            continue
+        for row_index, p in enumerate(as_list(unit.get("draftPick"))):
+            if isinstance(p, dict):
+                q = dict(p)
+                q["_unit_index"] = unit_index
+                q["_row_index"] = row_index
+                out.append(q)
+    return out
+
+def players_rows(data: dict[str, Any]) -> list[dict[str, Any]]:
+    root = data.get("players")
+    if not isinstance(root, dict):
+        return []
+    return [x for x in as_list(root.get("player")) if isinstance(x, dict)]
+
+def pick_token(p: dict[str, Any]) -> Any:
+    for key in (
+        "pick",
+        "pickNumber",
+        "pick_number",
+        "overallPick",
+        "overall_pick",
+        "overall",
+    ):
+        if key in p and str(p.get(key) or "").strip():
+            return p.get(key)
+    return None
+
+def parse_dotted_pick(value: Any, rnd: int) -> int | None:
+    s = str(value or "").strip()
+    m = re.fullmatch(r"0*(\d+)[.\-]0*(\d+)", s)
+    if not m:
+        return None
+    rr = int(m.group(1))
+    within = int(m.group(2))
+    if rr != rnd or not (1 <= within <= 12):
+        return None
+    return (rnd - 1) * 12 + within
+
+def assign_exact_slots(raw: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    staged: list[dict[str, Any]] = []
+    anomalies: list[dict[str, Any]] = []
+    integer_tokens: list[tuple[int, int]] = []
+
+    for i, p in enumerate(raw):
+        rnd = safe_int(p.get("round"))
+        if rnd is None or not (1 <= rnd <= 99):
+            anomalies.append({
+                "kind": "missing_or_invalid_round",
+                "raw_index": i,
+            })
+            continue
+
+        token = pick_token(p)
+        dotted = parse_dotted_pick(token, rnd)
+        token_int = safe_int(token)
+
+        staged.append({
+            "raw": p,
+            "round": rnd,
+            "token": None if token is None else str(token),
+            "dotted_slot": dotted,
+            "token_int": token_int,
+        })
+        if dotted is None and token_int is not None:
+            integer_tokens.append((rnd, token_int))
+
+    if not staged:
+        return [], anomalies + [{"kind": "no_parseable_draft_rows"}]
+
+    # A four-plus-round 12-team draft disambiguates MFL integer pick style:
+    # any integer >12 means the API is using overall numbering.
+    integer_mode = "overall" if any(v > 12 for _, v in integer_tokens) else "within_round"
+
+    assigned: list[dict[str, Any]] = []
+    for s in staged:
+        rnd = s["round"]
+        slot = s["dotted_slot"]
+        source = "dotted_round_pick" if slot is not None else None
+
+        if slot is None:
+            n = s["token_int"]
+            if n is None:
+                anomalies.append({
+                    "kind": "missing_or_unparseable_pick_number",
+                    "round": rnd,
+                    "token": s["token"],
+                })
+                continue
+
+            if integer_mode == "overall":
+                if n < 1:
+                    anomalies.append({"kind": "invalid_overall_pick", "value": n})
+                    continue
+                expected_round = ((n - 1) // 12) + 1
+                if expected_round != rnd:
+                    anomalies.append({
+                        "kind": "overall_pick_round_mismatch",
+                        "round": rnd,
+                        "pick": n,
+                        "expected_round": expected_round,
+                    })
+                    continue
+                slot = n
+                source = "integer_overall_pick"
+            else:
+                if not (1 <= n <= 12):
+                    anomalies.append({
+                        "kind": "within_round_pick_out_of_range",
+                        "round": rnd,
+                        "pick": n,
+                    })
+                    continue
+                slot = (rnd - 1) * 12 + n
+                source = "integer_within_round_pick"
+
+        p = s["raw"]
+        assigned.append({
+            "slot": int(slot),
+            "round": rnd,
+            "within_round_pick": ((int(slot) - 1) % 12) + 1,
+            "mfl_player_id": nonempty_id(p.get("player")),
+            "franchise_id": nonempty_id(
+                p.get("franchise")
+                or p.get("franchise_id")
+                or p.get("franchiseId")
+            ),
+            "slot_parse_source": source,
+        })
+
+    return assigned, anomalies
+
+def tier_for_within(within: int) -> str:
+    if 1 <= within <= 4:
+        return "early"
+    if 5 <= within <= 8:
+        return "mid"
+    if 9 <= within <= 12:
+        return "late"
+    raise GateError(f"invalid within-round pick {within}")
+
+def required_depth(scope: dict[str, Any]) -> int:
+    if bool(scope.get("primary_r6")) or bool(scope.get("idp_sensitivity_r6")):
+        return 6
+    if bool(scope.get("primary_r5")) or bool(scope.get("idp_sensitivity_r5")):
+        return 5
+    if bool(scope.get("primary_r1_r4")):
+        return 4
+    raise GateError("frozen catalog row has no eligible scope")
+
+def check_freeze() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    cat = load(CATALOG)
+    pre = load(PREREG)
+    man = load(PREREG_MAN)
+    pooled = load(POOLED)
+
+    if man["status"] != "FROZEN_PRE_OUTCOME":
+        raise GateError("V3 preregistration is not FROZEN_PRE_OUTCOME")
+    if man["output_hashes"][CATALOG.name] != sha256(CATALOG):
+        raise GateError("frozen catalog hash drifted")
+    if man["output_hashes"][PREREG.name] != sha256(PREREG):
+        raise GateError("frozen preregistration hash drifted")
+
+    if cat["contains_player_outcomes"] is not False:
+        raise GateError("catalog outcome firewall violated")
+    if cat["contains_market_or_ktc_values"] is not False:
+        raise GateError("catalog market firewall violated")
+    if pre["historical_player_outcomes_read_before_freeze"] is not False:
+        raise GateError("prereg says outcomes already read")
+    if pre["production_change_authorized"] is not False:
+        raise GateError("unexpected production authorization")
+    if pooled["result"]["decision"] != "ACCEPT_MFL_YEAR_BALANCED_POOLED_R1_R6_DESIGN":
+        raise GateError("accepted pooled design drifted")
+
+    return cat, pre, man
+
+def harvest_year(year: int, out_path: Path) -> None:
+    if year not in YEARS:
+        raise GateError(f"unsupported year {year}")
+
+    cat, pre, man = check_freeze()
+    rows = [r for r in cat["rows"] if int(r["draft_year"]) == year]
+    rows.sort(key=lambda r: int(r["league_id"]))
+
+    expected_n = sum(
+        1 for r in cat["rows"] if int(r["draft_year"]) == year
+    )
+    if len(rows) != expected_n or not rows:
+        raise GateError(f"{year}: frozen catalog row selection mismatch")
+
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": f"LOG-Trade-Calculator-Draft-Pick-FV-V3-Harvest-{year}/1.0"
+    })
+
+    league_results: list[dict[str, Any]] = []
+
+    for idx, row in enumerate(rows, start=1):
+        lid = str(row["league_id"])
+        depth = required_depth(row["scope"])
+        expected_slots = set(range(1, depth * 12 + 1))
+
+        fetch_error = None
+        raw: list[dict[str, Any]] = []
+        try:
+            data = get_json(session, api_url(year, "draftResults", L=lid))
+            raw = draft_picks(data)
+        except GateError as exc:
+            fetch_error = str(exc)
+
+        parsed: list[dict[str, Any]] = []
+        anomalies: list[dict[str, Any]] = []
+        if fetch_error is None:
+            parsed, anomalies = assign_exact_slots(raw)
+
+        # Restrict to the exact depth authorized for this frozen league.
+        scoped = [p for p in parsed if p["slot"] in expected_slots]
+
+        slot_counter = Counter(p["slot"] for p in scoped)
+        duplicate_slots = sorted(k for k, v in slot_counter.items() if v > 1)
+
+        # Frozen duplicate-player rule: retain first occurrence by exact slot,
+        # remove later occurrences, and report the anomaly.
+        scoped.sort(key=lambda p: (p["slot"], p["mfl_player_id"] or ""))
+        seen_players: set[str] = set()
+        deduped: list[dict[str, Any]] = []
+        duplicate_players: list[dict[str, Any]] = []
+        for p in scoped:
+            pid = p["mfl_player_id"]
+            if pid and pid in seen_players:
+                duplicate_players.append({
+                    "mfl_player_id": pid,
+                    "removed_slot": p["slot"],
+                })
+                continue
+            if pid:
+                seen_players.add(pid)
+            deduped.append(p)
+
+        by_slot: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for p in deduped:
+            by_slot[p["slot"]].append(p)
+
+        missing_slots = sorted(expected_slots - set(by_slot))
+        blank_player_slots = sorted(
+            p["slot"] for p in deduped
+            if p["slot"] in expected_slots and not p["mfl_player_id"]
+        )
+        exact_complete = (
+            fetch_error is None
+            and not anomalies
+            and not duplicate_slots
+            and not duplicate_players
+            and not missing_slots
+            and not blank_player_slots
+            and len(deduped) == len(expected_slots)
+            and all(len(by_slot[s]) == 1 for s in expected_slots)
+        )
+
+        picks_out = []
+        for p in deduped:
+            if p["slot"] not in expected_slots:
+                continue
+            r = int(p["round"])
+            within = int(p["within_round_pick"])
+            league_scope = dict(row["scope"])
+            pick_scope = {
+                "primary_r1_r4": bool(league_scope.get("primary_r1_r4")) and r <= 4,
+                "primary_r5": bool(league_scope.get("primary_r5")) and r <= 5,
+                "primary_r6": bool(league_scope.get("primary_r6")) and r <= 6,
+                "idp_sensitivity_r5": bool(league_scope.get("idp_sensitivity_r5")) and r <= 5,
+                "idp_sensitivity_r6": bool(league_scope.get("idp_sensitivity_r6")) and r <= 6,
+            }
+            picks_out.append({
+                "draft_year": year,
+                "league_id": lid,
+                "overall_slot": int(p["slot"]),
+                "round": r,
+                "within_round_pick": within,
+                "tier": tier_for_within(within),
+                "mfl_player_id": p["mfl_player_id"],
+                "franchise_id": p["franchise_id"],
+                "slot_parse_source": p["slot_parse_source"],
+                "league_scope": league_scope,
+                "pick_scope": pick_scope,
+                "split": "development" if year in DEV_YEARS else "locked_validation",
+            })
+
+        league_results.append({
+            "draft_year": year,
+            "league_id": lid,
+            "league_name": row.get("league_name"),
+            "idp": bool(row.get("idp", False)),
+            "required_depth": depth,
+            "expected_pick_n": depth * 12,
+            "transport_ok": fetch_error is None,
+            "fetch_error": fetch_error,
+            "raw_draft_pick_n": len(raw),
+            "parsed_scoped_pick_n_before_player_dedupe": len(scoped),
+            "retained_pick_n": len(picks_out),
+            "duplicate_slot_ids": duplicate_slots,
+            "duplicate_player_occurrences_removed": duplicate_players,
+            "missing_expected_slots": missing_slots,
+            "blank_player_slots": blank_player_slots,
+            "parse_anomalies": anomalies,
+            "exact_complete": exact_complete,
+            "scope": dict(row["scope"]),
+            "picks": picks_out,
+        })
+
+        if idx % 10 == 0 or idx == len(rows):
+            complete_n = sum(1 for x in league_results if x["exact_complete"])
+            print(
+                f"{year}: {idx}/{len(rows)} frozen leagues; "
+                f"exact_complete={complete_n}",
+                flush=True,
+            )
+
+    result = {
+        "schema_version": 1,
+        "stage": "draft_pick_harvest_year",
+        "generated_at_utc": now(),
+        "year": year,
+        "research_only": True,
+        "historical_player_outcomes_read": False,
+        "market_or_ktc_values_read": False,
+        "package_vote_data_read": False,
+        "candidate_fit_performed": False,
+        "candidate_scores_computed": False,
+        "validation_scored": False,
+        "production_change_authorized": False,
+        "api_endpoints_used": ["draftResults"],
+        "frozen_catalog_sha256": sha256(CATALOG),
+        "frozen_preregistration_sha256": sha256(PREREG),
+        "frozen_preregistration_manifest_sha256": sha256(PREREG_MAN),
+        "frozen_catalog_row_n": len(rows),
+        "exact_complete_league_n": sum(
+            1 for x in league_results if x["exact_complete"]
+        ),
+        "transport_failure_n": sum(
+            1 for x in league_results if not x["transport_ok"]
+        ),
+        "structural_failure_n": sum(
+            1 for x in league_results
+            if x["transport_ok"] and not x["exact_complete"]
+        ),
+        "league_results": league_results,
+    }
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    print(json.dumps({
+        "year": year,
+        "catalog_leagues": result["frozen_catalog_row_n"],
+        "complete": result["exact_complete_league_n"],
+        "transport_failures": result["transport_failure_n"],
+        "structural_failures": result["structural_failure_n"],
+    }, indent=2, sort_keys=True))
+
+def read_identity_csv(path: Path) -> tuple[
+    dict[str, dict[str, Any]],
+    dict[tuple[str, str, int], list[dict[str, Any]]],
+    list[str],
+]:
+    by_mfl: dict[str, dict[str, Any]] = {}
+    by_fallback: dict[tuple[str, str, int], list[dict[str, Any]]] = defaultdict(list)
+
+    with path.open(newline="", encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        index = {name: i for i, name in enumerate(header)}
+        missing = [c for c in IDENTITY_ALLOWED_COLUMNS if c not in index]
+        if missing:
+            raise GateError(f"identity source missing required columns: {missing}")
+
+        # Deliberately project only the preregistration-relevant identity columns.
+        # Other columns in the external file, including any market-platform IDs,
+        # are never accessed by this program.
+        for raw in reader:
+            if len(raw) < len(header):
+                raw = raw + [""] * (len(header) - len(raw))
+
+            rec = {
+                c: raw[index[c]]
+                for c in IDENTITY_ALLOWED_COLUMNS
+            }
+            mid = nonempty_id(rec["mfl_id"])
+            if not mid:
+                continue
+
+            if mid in by_mfl:
+                raise GateError(f"duplicate mfl_id in identity source: {mid}")
+
+            row = {
+                "mfl_id": mid,
+                "gsis_id": nonempty_id(rec["gsis_id"]),
+                "sleeper_id": nonempty_id(rec["sleeper_id"]),
+                "name": nonempty_id(rec["name"]),
+                "merge_name": nonempty_id(rec["merge_name"]),
+                "position": nonempty_id(rec["position"]),
+                "draft_year": safe_int(rec["draft_year"]),
+                "db_season": safe_int(rec["db_season"]),
+            }
+            by_mfl[mid] = row
+
+            nm = clean_name(row["merge_name"] or row["name"])
+            pos = norm_position(row["position"])
+            dy = row["draft_year"]
+            if nm and pos and dy:
+                by_fallback[(nm, pos, int(dy))].append(row)
+
+    return by_mfl, by_fallback, header
+
+def fetch_mfl_player_metadata(
+    session: requests.Session,
+    year: int,
+    player_ids: list[str],
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    if not player_ids:
+        return {}, []
+
+    out: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+    ids = sorted(set(player_ids), key=lambda x: (len(x), x))
+
+    for start in range(0, len(ids), 100):
+        chunk = ids[start:start + 100]
+        try:
+            data = get_json(
+                session,
+                api_url(
+                    year,
+                    "players",
+                    PLAYERS=",".join(chunk),
+                    DETAILS=1,
+                ),
+                retries=4,
+            )
+        except GateError as exc:
+            errors.append(str(exc))
+            continue
+
+        for row in players_rows(data):
+            pid = nonempty_id(row.get("id") or row.get("player_id"))
+            if not pid or pid not in chunk:
+                continue
+            out[pid] = {
+                "name": nonempty_id(row.get("name")),
+                "position": nonempty_id(row.get("position")),
+            }
+
+    return out, errors
+
+def aggregate(
+    partial_dir: Path,
+    identity_csv: Path,
+    identity_source_commit: str,
+    identity_source_url: str,
+) -> None:
+    cat, pre, man = check_freeze()
+
+    partials: list[dict[str, Any]] = []
+    for year in YEARS:
+        p = partial_dir / f"year_{year}.json"
+        if not p.exists():
+            raise GateError(f"missing year artifact {p}")
+        d = load(p)
+        if int(d["year"]) != year:
+            raise GateError(f"year artifact mismatch: {p}")
+        if d["frozen_catalog_sha256"] != sha256(CATALOG):
+            raise GateError(f"{year}: catalog hash mismatch")
+        if d["frozen_preregistration_sha256"] != sha256(PREREG):
+            raise GateError(f"{year}: prereg hash mismatch")
+        if d["historical_player_outcomes_read"] is not False:
+            raise GateError(f"{year}: outcome firewall violation")
+        partials.append(d)
+
+    expected_keys = {
+        (int(r["draft_year"]), str(r["league_id"]))
+        for r in cat["rows"]
+    }
+    got_keys = {
+        (int(lg["draft_year"]), str(lg["league_id"]))
+        for d in partials
+        for lg in d["league_results"]
+    }
+    duplicate_key_n = (
+        sum(len(d["league_results"]) for d in partials) - len(got_keys)
+    )
+    catalog_key_exact = expected_keys == got_keys and duplicate_key_n == 0
+
+    league_results = [
+        lg
+        for d in partials
+        for lg in d["league_results"]
+    ]
+
+    transport_failures = [
+        {
+            "draft_year": lg["draft_year"],
+            "league_id": lg["league_id"],
+            "error": lg["fetch_error"],
+        }
+        for lg in league_results
+        if not lg["transport_ok"]
+    ]
+    structural_failures = [
+        {
+            "draft_year": lg["draft_year"],
+            "league_id": lg["league_id"],
+            "missing_expected_slots": lg["missing_expected_slots"],
+            "duplicate_slot_ids": lg["duplicate_slot_ids"],
+            "duplicate_player_occurrences_removed": lg[
+                "duplicate_player_occurrences_removed"
+            ],
+            "blank_player_slots": lg["blank_player_slots"],
+            "parse_anomalies": lg["parse_anomalies"],
+        }
+        for lg in league_results
+        if lg["transport_ok"] and not lg["exact_complete"]
+    ]
+
+    harvest_pass = (
+        catalog_key_exact
+        and not transport_failures
+        and not structural_failures
+        and len(league_results) == len(cat["rows"])
+        and all(lg["exact_complete"] for lg in league_results)
+    )
+
+    by_mfl, by_fallback, identity_header = read_identity_csv(identity_csv)
+
+    pick_rows: list[dict[str, Any]] = []
+    for lg in league_results:
+        for p in lg["picks"]:
+            q = dict(p)
+            q["league_exact_complete"] = bool(lg["exact_complete"])
+            q["league_idp"] = bool(lg["idp"])
+            q["identity"] = None
+            pick_rows.append(q)
+
+    # Unique MFL player IDs define the preregistered identity denominator.
+    unique_player_ids = sorted({
+        str(p["mfl_player_id"])
+        for p in pick_rows
+        if p["mfl_player_id"]
+    }, key=lambda x: (len(x), x))
+
+    unresolved_for_metadata: dict[int, list[str]] = defaultdict(list)
+    resolution_by_mfl: dict[str, dict[str, Any]] = {}
+
+    for mid in unique_player_ids:
+        row = by_mfl.get(mid)
+        if row and (row["gsis_id"] or row["sleeper_id"]):
+            resolution_by_mfl[mid] = {
+                "resolved": True,
+                "resolution_method": "exact_mfl_id_crosswalk",
+                "gsis_id": row["gsis_id"],
+                "sleeper_id": row["sleeper_id"],
+                "name": row["name"],
+                "position": row["position"],
+                "identity_source_draft_year": row["draft_year"],
+            }
+
+    # Exact MFL IDs without a stable GSIS/Sleeper mapping, or IDs absent
+    # from the crosswalk, may use ONLY the preregistered unambiguous
+    # normalized name + position + draft class fallback.
+    unresolved_ids = [
+        mid for mid in unique_player_ids if mid not in resolution_by_mfl
+    ]
+
+    # Pick year is known from the source catalog. Fetch MFL player
+    # metadata only for the unresolved IDs, and only for identity fallback.
+    years_for_mid: dict[str, set[int]] = defaultdict(set)
+    for p in pick_rows:
+        mid = p["mfl_player_id"]
+        if mid in unresolved_ids:
+            years_for_mid[mid].add(int(p["draft_year"]))
+
+    for mid in unresolved_ids:
+        for y in years_for_mid[mid]:
+            unresolved_for_metadata[y].append(mid)
+
+    mfl_metadata: dict[tuple[int, str], dict[str, Any]] = {}
+    mfl_metadata_errors: dict[str, list[str]] = {}
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "LOG-Trade-Calculator-Draft-Pick-FV-V3-Identity-Fallback/1.0"
+    })
+    for y in sorted(unresolved_for_metadata):
+        meta, errs = fetch_mfl_player_metadata(
+            session, y, unresolved_for_metadata[y]
+        )
+        for mid, r in meta.items():
+            mfl_metadata[(y, mid)] = r
+        if errs:
+            mfl_metadata_errors[str(y)] = errs
+
+    fallback_audit: list[dict[str, Any]] = []
+    for mid in unresolved_ids:
+        candidates_from_years: list[tuple[int, dict[str, Any]]] = []
+        for y in sorted(years_for_mid[mid]):
+            exact = by_mfl.get(mid)
+            name = exact["name"] if exact else None
+            pos = exact["position"] if exact else None
+
+            meta = mfl_metadata.get((y, mid))
+            if meta:
+                name = name or meta.get("name")
+                pos = pos or meta.get("position")
+
+            key = (clean_name(name), norm_position(pos), y)
+            candidates = [
+                c for c in by_fallback.get(key, [])
+                if c["gsis_id"] or c["sleeper_id"]
+            ]
+
+            # Unique stable identity only. Multiple crosswalk rows with
+            # identical stable IDs are collapsed before uniqueness test.
+            stable = {}
+            for c in candidates:
+                stable_key = (c["gsis_id"], c["sleeper_id"])
+                stable[stable_key] = c
+
+            if len(stable) == 1:
+                chosen = next(iter(stable.values()))
+                candidates_from_years.append((y, chosen))
+
+            fallback_audit.append({
+                "mfl_player_id": mid,
+                "draft_year": y,
+                "normalized_name": key[0],
+                "normalized_position": key[1],
+                "candidate_stable_identity_n": len(stable),
+            })
+
+        stable_across_years = {}
+        for y, c in candidates_from_years:
+            stable_across_years[(c["gsis_id"], c["sleeper_id"])] = c
+
+        if len(stable_across_years) == 1:
+            chosen = next(iter(stable_across_years.values()))
+            resolution_by_mfl[mid] = {
+                "resolved": True,
+                "resolution_method": "unambiguous_name_position_draft_class",
+                "gsis_id": chosen["gsis_id"],
+                "sleeper_id": chosen["sleeper_id"],
+                "name": chosen["name"],
+                "position": chosen["position"],
+                "identity_source_draft_year": chosen["draft_year"],
+            }
+
+    for mid in unique_player_ids:
+        if mid not in resolution_by_mfl:
+            exact = by_mfl.get(mid)
+            resolution_by_mfl[mid] = {
+                "resolved": False,
+                "resolution_method": "unresolved",
+                "gsis_id": exact["gsis_id"] if exact else None,
+                "sleeper_id": exact["sleeper_id"] if exact else None,
+                "name": exact["name"] if exact else None,
+                "position": exact["position"] if exact else None,
+                "identity_source_draft_year": exact["draft_year"] if exact else None,
+            }
+
+    for p in pick_rows:
+        mid = p["mfl_player_id"]
+        ident = dict(resolution_by_mfl[mid]) if mid else {
+            "resolved": False,
+            "resolution_method": "blank_mfl_player_id",
+            "gsis_id": None,
+            "sleeper_id": None,
+            "name": None,
+            "position": None,
+            "identity_source_draft_year": None,
+        }
+        p["name"] = ident.pop("name")
+        p["position"] = ident.pop("position")
+        p["gsis_id"] = ident.pop("gsis_id")
+        p["sleeper_id"] = ident.pop("sleeper_id")
+        p["identity_source_draft_year"] = ident.pop(
+            "identity_source_draft_year"
+        )
+        p["identity_resolved"] = ident.pop("resolved")
+        p["identity_resolution_method"] = ident.pop("resolution_method")
+
+    resolved_unique = sum(
+        1 for mid in unique_player_ids
+        if resolution_by_mfl[mid]["resolved"]
+    )
+    denominator = len(unique_player_ids)
+    coverage = resolved_unique / denominator if denominator else 0.0
+    identity_pass = denominator > 0 and coverage >= IDENTITY_MIN_COVERAGE
+
+    resolution_counts = Counter(
+        resolution_by_mfl[mid]["resolution_method"]
+        for mid in unique_player_ids
+    )
+    unresolved_detail = [
+        {
+            "mfl_player_id": mid,
+            "name": resolution_by_mfl[mid]["name"],
+            "position": resolution_by_mfl[mid]["position"],
+            "draft_years_seen": sorted(years_for_mid.get(mid, [])),
+            "has_gsis_id": bool(resolution_by_mfl[mid]["gsis_id"]),
+            "has_sleeper_id": bool(resolution_by_mfl[mid]["sleeper_id"]),
+        }
+        for mid in unique_player_ids
+        if not resolution_by_mfl[mid]["resolved"]
+    ]
+
+    decision = (
+        "PASS_IDENTITY_GATE_OUTCOMES_AUTHORIZED_NEXT_STAGE"
+        if harvest_pass and identity_pass
+        else "STOP_PRE_OUTCOME_IDENTITY_OR_HARVEST_GATE"
+    )
+
+    picks_by_year = {
+        str(y): sum(1 for p in pick_rows if int(p["draft_year"]) == y)
+        for y in YEARS
+    }
+    unique_by_year = {
+        str(y): len({
+            p["mfl_player_id"]
+            for p in pick_rows
+            if int(p["draft_year"]) == y and p["mfl_player_id"]
+        })
+        for y in YEARS
+    }
+
+    payload = {
+        "schema_version": 1,
+        "study_id": "draft-pick-fv-v3-historical-draft-harvest-identity",
+        "generated_at_utc": now(),
+        "decision": decision,
+        "research_only": True,
+        "pre_outcome_stage": True,
+        "historical_player_outcomes_read": False,
+        "market_or_ktc_values_read": False,
+        "package_vote_data_read": False,
+        "candidate_fit_performed": False,
+        "candidate_scores_computed": False,
+        "validation_scored": False,
+        "production_change_authorized": False,
+        "frozen_inputs": {
+            CATALOG.name: sha256(CATALOG),
+            PREREG.name: sha256(PREREG),
+            PREREG_MAN.name: sha256(PREREG_MAN),
+            POOLED.name: sha256(POOLED),
+        },
+        "mfl_transport": {
+            "api_endpoints_used": (
+                ["draftResults"]
+                if not unresolved_ids
+                else ["draftResults", "players"]
+            ),
+            "players_endpoint_used_only_for_unresolved_identity_fallback": bool(
+                unresolved_ids
+            ),
+            "request_retries": REQUEST_RETRIES,
+            "request_spacing_seconds": REQUEST_SLEEP_SECONDS,
+        },
+        "harvest_gate": {
+            "pass": harvest_pass,
+            "frozen_catalog_league_n": len(cat["rows"]),
+            "observed_league_n": len(league_results),
+            "catalog_key_exact": catalog_key_exact,
+            "duplicate_catalog_key_n": duplicate_key_n,
+            "exact_complete_league_n": sum(
+                1 for lg in league_results if lg["exact_complete"]
+            ),
+            "transport_failure_n": len(transport_failures),
+            "structural_failure_n": len(structural_failures),
+            "transport_failures": transport_failures,
+            "structural_failures": structural_failures,
+        },
+        "identity_gate": {
+            "pass": identity_pass,
+            "minimum_required": IDENTITY_MIN_COVERAGE,
+            "denominator_definition": (
+                "unique nonblank MFL player IDs in the eligible harvested "
+                "frozen source catalog"
+            ),
+            "unique_player_n": denominator,
+            "resolved_unique_player_n": resolved_unique,
+            "coverage": coverage,
+            "resolution_method_counts": dict(resolution_counts),
+            "unresolved_unique_player_n": denominator - resolved_unique,
+            "unresolved_players": unresolved_detail,
+            "fallback_audit": fallback_audit,
+            "mfl_players_fallback_fetch_errors": mfl_metadata_errors,
+        },
+        "identity_source": {
+            "provider": "DynastyProcess ffverse player IDs",
+            "repository": "dynastyprocess/data",
+            "commit": identity_source_commit,
+            "url": identity_source_url,
+            "sha256": sha256(identity_csv),
+            "projected_columns_accessed": IDENTITY_ALLOWED_COLUMNS,
+            "source_header": identity_header,
+            "mfl_id_primary_key_enforced_unique": True,
+            "market_value_columns_accessed": False,
+            "ktc_identifier_column_accessed": False,
+            "note": (
+                "The external source file contains many platform ID columns. "
+                "This program accesses only the explicit identity projection above; "
+                "no market/value columns or KTC identifier column are accessed."
+            ),
+        },
+        "counts": {
+            "pick_rows_total": len(pick_rows),
+            "pick_rows_by_year": picks_by_year,
+            "unique_players_by_year": unique_by_year,
+            "catalog_scope_totals": cat["totals"],
+        },
+        "split": {
+            "development_years": sorted(DEV_YEARS),
+            "locked_validation_years": sorted(VAL_YEARS),
+            "locked_validation_scored": False,
+        },
+        "next_step": (
+            "Historical outcome ingestion is authorized only in a separate "
+            "workflow under the frozen preregistration contract."
+            if decision == "PASS_IDENTITY_GATE_OUTCOMES_AUTHORIZED_NEXT_STAGE"
+            else
+            "Stop before historical outcomes. Resolve only the documented "
+            "transport/structure/identity gate failure without changing the "
+            "frozen source, outcome, validation, or model rules."
+        ),
+        "picks": sorted(
+            pick_rows,
+            key=lambda p: (
+                int(p["draft_year"]),
+                int(p["league_id"]),
+                int(p["overall_slot"]),
+            ),
+        ),
+    }
+
+    JSON_OUT.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+    pct = 100.0 * coverage
+    md_lines = [
+        "# Draft Pick FV V3 — Historical Draft Harvest & Identity Gate",
+        "",
+        f"**Decision:** `{decision}`",
+        "",
+        "This stage remains pre-outcome. No historical NFL player outcomes, "
+        "market/KTC values, package votes, candidate fits, validation scores, "
+        "or production changes were read or produced.",
+        "",
+        "## Harvest gate",
+        "",
+        f"- Frozen source leagues: **{len(cat['rows'])}**",
+        f"- Exact-complete leagues: **{sum(1 for x in league_results if x['exact_complete'])}**",
+        f"- Transport failures: **{len(transport_failures)}**",
+        f"- Structural failures: **{len(structural_failures)}**",
+        f"- Harvest gate: **{'PASS' if harvest_pass else 'FAIL'}**",
+        "",
+        "## Identity gate",
+        "",
+        f"- Unique drafted MFL identities: **{denominator}**",
+        f"- Resolved to GSIS and/or Sleeper: **{resolved_unique}**",
+        f"- Coverage: **{pct:.2f}%**",
+        f"- Required: **{IDENTITY_MIN_COVERAGE * 100:.0f}%**",
+        f"- Identity gate: **{'PASS' if identity_pass else 'FAIL'}**",
+        "",
+        "## Frozen split",
+        "",
+        "- Development: **2018-2021**",
+        "- Locked validation: **2022-2023**",
+        "- Validation scoring performed here: **No**",
+        "",
+        "## Next stage",
+        "",
+        payload["next_step"],
+    ]
+    MD_OUT.write_text("\n".join(md_lines) + "\n")
+
+    manifest = {
+        "schema_version": 1,
+        "study_id": payload["study_id"],
+        "generated_at_utc": payload["generated_at_utc"],
+        "decision": decision,
+        "status": (
+            "PRE_OUTCOME_IDENTITY_GATE_PASSED"
+            if decision == "PASS_IDENTITY_GATE_OUTCOMES_AUTHORIZED_NEXT_STAGE"
+            else "PRE_OUTCOME_STOP"
+        ),
+        "historical_player_outcomes_read": False,
+        "market_or_ktc_values_read": False,
+        "package_vote_data_read": False,
+        "candidate_fit_performed": False,
+        "candidate_scores_computed": False,
+        "validation_scored": False,
+        "production_change_authorized": False,
+        "harvest_gate_pass": harvest_pass,
+        "identity_gate_pass": identity_pass,
+        "identity_coverage": coverage,
+        "identity_unique_player_n": denominator,
+        "identity_resolved_unique_player_n": resolved_unique,
+        "identity_source_commit": identity_source_commit,
+        "identity_source_sha256": sha256(identity_csv),
+        "frozen_input_hashes": payload["frozen_inputs"],
+        "output_hashes": {
+            JSON_OUT.name: sha256(JSON_OUT),
+            MD_OUT.name: sha256(MD_OUT),
+        },
+    }
+    MAN_OUT.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+    print(json.dumps({
+        "decision": decision,
+        "harvest_gate_pass": harvest_pass,
+        "identity_gate_pass": identity_pass,
+        "identity_coverage": coverage,
+        "unique_players": denominator,
+        "resolved_unique_players": resolved_unique,
+    }, indent=2, sort_keys=True))
+
+def check_outputs() -> None:
+    payload = load(JSON_OUT)
+    man = load(MAN_OUT)
+
+    allowed_decisions = {
+        "PASS_IDENTITY_GATE_OUTCOMES_AUTHORIZED_NEXT_STAGE",
+        "STOP_PRE_OUTCOME_IDENTITY_OR_HARVEST_GATE",
+    }
+    assert payload["decision"] in allowed_decisions
+    assert man["decision"] == payload["decision"]
+
+    assert payload["historical_player_outcomes_read"] is False
+    assert payload["market_or_ktc_values_read"] is False
+    assert payload["package_vote_data_read"] is False
+    assert payload["candidate_fit_performed"] is False
+    assert payload["candidate_scores_computed"] is False
+    assert payload["validation_scored"] is False
+    assert payload["production_change_authorized"] is False
+
+    assert man["historical_player_outcomes_read"] is False
+    assert man["candidate_fit_performed"] is False
+    assert man["validation_scored"] is False
+    assert man["production_change_authorized"] is False
+
+    assert man["output_hashes"][JSON_OUT.name] == sha256(JSON_OUT)
+    assert man["output_hashes"][MD_OUT.name] == sha256(MD_OUT)
+
+    if payload["decision"] == "PASS_IDENTITY_GATE_OUTCOMES_AUTHORIZED_NEXT_STAGE":
+        assert payload["harvest_gate"]["pass"] is True
+        assert payload["identity_gate"]["pass"] is True
+        assert payload["identity_gate"]["coverage"] >= IDENTITY_MIN_COVERAGE
+    else:
+        assert (
+            payload["harvest_gate"]["pass"] is False
+            or payload["identity_gate"]["pass"] is False
+        )
+
+    # Every persisted pick must preserve frozen split and exact slot/tier.
+    for p in payload["picks"]:
+        y = int(p["draft_year"])
+        assert p["split"] == (
+            "development" if y in DEV_YEARS else "locked_validation"
+        )
+        slot = int(p["overall_slot"])
+        assert int(p["round"]) == ((slot - 1) // 12) + 1
+        within = ((slot - 1) % 12) + 1
+        assert int(p["within_round_pick"]) == within
+        assert p["tier"] == tier_for_within(within)
+
+    print("PASS: harvest/identity outputs validated with outcome firewall intact.")
+
+def selftest() -> None:
+    # Slot parsing: both common MFL encodings.
+    rows_within = [
+        {"round": "1", "pick": str(i), "player": str(100 + i)}
+        for i in range(1, 13)
+    ] + [
+        {"round": "2", "pick": str(i), "player": str(200 + i)}
+        for i in range(1, 13)
+    ]
+    a, e = assign_exact_slots(rows_within)
+    assert not e
+    assert [x["slot"] for x in a] == list(range(1, 25))
+
+    rows_overall = [
+        {
+            "round": str(((i - 1) // 12) + 1),
+            "pick": str(i),
+            "player": str(300 + i),
+        }
+        for i in range(1, 25)
+    ]
+    a, e = assign_exact_slots(rows_overall)
+    assert not e
+    assert [x["slot"] for x in a] == list(range(1, 25))
+
+    rows_dotted = [
+        {"round": "1", "pick": f"1.{i:02d}", "player": str(400 + i)}
+        for i in range(1, 13)
+    ]
+    a, e = assign_exact_slots(rows_dotted)
+    assert not e
+    assert [x["slot"] for x in a] == list(range(1, 13))
+
+    assert clean_name("Odell Beckham Jr.") == "odell beckham"
+    assert norm_position("CB") == "DB"
+    assert tier_for_within(4) == "early"
+    assert tier_for_within(5) == "mid"
+    assert tier_for_within(12) == "late"
+    print("PASS: V3 harvest/identity self-test")
+
+def main() -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("--selftest", action="store_true")
+    p.add_argument("--harvest-year", type=int)
+    p.add_argument("--out")
+    p.add_argument("--aggregate-dir")
+    p.add_argument("--identity-csv")
+    p.add_argument("--identity-source-commit")
+    p.add_argument("--identity-source-url")
+    p.add_argument("--check", action="store_true")
+    args = p.parse_args()
+
+    if args.selftest:
+        selftest()
+        return
+
+    if args.harvest_year is not None:
+        if not args.out:
+            raise SystemExit("--out required with --harvest-year")
+        harvest_year(args.harvest_year, Path(args.out))
+        return
+
+    if args.aggregate_dir:
+        needed = [
+            args.identity_csv,
+            args.identity_source_commit,
+            args.identity_source_url,
+        ]
+        if not all(needed):
+            raise SystemExit(
+                "--identity-csv, --identity-source-commit, and "
+                "--identity-source-url are required with --aggregate-dir"
+            )
+        aggregate(
+            Path(args.aggregate_dir),
+            Path(args.identity_csv),
+            str(args.identity_source_commit),
+            str(args.identity_source_url),
+        )
+        check_outputs()
+        return
+
+    if args.check:
+        check_outputs()
+        return
+
+    raise SystemExit("choose --selftest, --harvest-year, --aggregate-dir, or --check")
+
+if __name__ == "__main__":
+    main()
