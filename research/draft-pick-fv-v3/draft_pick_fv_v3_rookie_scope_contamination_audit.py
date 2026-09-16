@@ -1,0 +1,523 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import re
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+ROOT = Path.cwd()
+V3 = ROOT / "research" / "draft-pick-fv-v3"
+
+PREREG = V3 / "preregistration_v3.json"
+PREREG_MAN = V3 / "preregistration_manifest_v3.json"
+CATALOG = V3 / "historical_draft_source_catalog_v3.json"
+POOLED = V3 / "mfl_pooled_design_v1.json"
+CORPUS = V3 / "historical_draft_pick_contract_repair_v3.jsonl"
+CONTRACT_MAN = V3 / "historical_draft_pick_contract_repair_manifest_v3.json"
+NS = V3 / "custom_player_identity_namespace_audit_v3.json"
+NS_MAN = V3 / "custom_player_identity_namespace_audit_manifest_v3.json"
+
+SCRIPT_OUT = V3 / "draft_pick_fv_v3_rookie_scope_contamination_audit.py"
+JSON_OUT = V3 / "rookie_scope_contamination_audit_v3.json"
+MD_OUT = V3 / "rookie_scope_contamination_audit_v3.md"
+MAN_OUT = V3 / "rookie_scope_contamination_audit_manifest_v3.json"
+
+YEARS = [2018, 2019, 2020, 2021, 2022, 2023]
+SCOPES = (
+    "primary_r1_r4",
+    "primary_r5",
+    "primary_r6",
+    "idp_sensitivity_r5",
+    "idp_sensitivity_r6",
+)
+
+def load(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text())
+
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def iter_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows = []
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                rows.append(json.loads(line))
+    return rows
+
+def norm_name(x: Any) -> str:
+    return re.sub(r"\s+", " ", str(x or "").strip().lower())
+
+def explicit_devy_marker(name: Any) -> bool:
+    n = norm_name(name)
+    patterns = (
+        r"\bdevy\b",
+        r"\bdevy pick\b",
+        r"\bdevy placeholder\b",
+        r"\bplaceholder devy\b",
+    )
+    return any(re.search(p, n) for p in patterns)
+
+def guard() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    pre = load(PREREG)
+    cat = load(CATALOG)
+    pooled = load(POOLED)
+    ns = load(NS)
+    pm = load(PREREG_MAN)
+    cm = load(CONTRACT_MAN)
+    nm = load(NS_MAN)
+
+    assert pm["status"] == "FROZEN_PRE_OUTCOME"
+    assert pooled["result"]["decision"] == "ACCEPT_MFL_YEAR_BALANCED_POOLED_R1_R6_DESIGN"
+    assert cm["decision"] == "STOP_PRE_OUTCOME_CONTRACT_REPAIR_IDENTITY_GATE"
+    assert ns["decision"] == "IDENTITY_NAMESPACE_COLLISION_CONFIRMED_PROTOCOL_CLARIFICATION_REQUIRED"
+    assert nm["decision"] == ns["decision"]
+    assert "Rookie-only draft pool" in cat["eligibility_rules"]["base_qualifier"]
+
+    for obj in (pm, cm, ns, nm):
+        assert obj["historical_player_outcomes_read"] is False
+        assert obj["candidate_fit_performed"] is False
+        assert obj["validation_scored"] is False
+        assert obj["production_change_authorized"] is False
+
+    return pre, cat, pooled, ns
+
+def pooled_gate_thresholds(pooled: dict[str, Any]) -> dict[str, float]:
+    # The accepted pooled-design freeze stores the preregistered
+    # sufficiency thresholds under new_design_sufficiency_criteria.
+    # Assert the exact frozen values so a future schema drift cannot
+    # silently change the contamination audit.
+    c = pooled["new_design_sufficiency_criteria"]
+
+    expected = {
+        "r1_r4_nonmock_total_min": 180,
+        "r5_nonidp_nonmock_total_min": 60,
+        "r6_nonidp_nonmock_total_min": 36,
+        "r6_nonidp_nonmock_min_each_year": 3,
+        "r6_nonidp_effective_years_min": 4.5,
+        "r6_nonidp_nonmock_max_year_share": 0.3,
+        "r6_idp_nonmock_total_min_for_sensitivity_only": 20,
+        "r6_idp_nonmock_min_years_represented": 5,
+    }
+    for key, value in expected.items():
+        if key not in c:
+            raise KeyError(
+                f"accepted pooled design missing frozen criterion: {key}"
+            )
+        if float(c[key]) != float(value):
+            raise RuntimeError(
+                f"frozen pooled criterion drift for {key}: "
+                f"expected {value}, got {c[key]}"
+            )
+
+    return {
+        "r1_r4_total_min": float(c["r1_r4_nonmock_total_min"]),
+        "r5_nonidp_total_min": float(c["r5_nonidp_nonmock_total_min"]),
+        "r6_nonidp_total_min": float(c["r6_nonidp_nonmock_total_min"]),
+        "r6_min_per_year": float(c["r6_nonidp_nonmock_min_each_year"]),
+        "r6_effective_years_min": float(c["r6_nonidp_effective_years_min"]),
+        "r6_max_year_share_max": float(c["r6_nonidp_nonmock_max_year_share"]),
+        "idp_r6_total_min": float(
+            c["r6_idp_nonmock_total_min_for_sensitivity_only"]
+        ),
+        "idp_r6_years_min": float(
+            c["r6_idp_nonmock_min_years_represented"]
+        ),
+    }
+
+def effective_years(counts: list[int]) -> float:
+    total = sum(counts)
+    if total <= 0:
+        return 0.0
+    shares = [c / total for c in counts if c > 0]
+    hhi = sum(s * s for s in shares)
+    return 1.0 / hhi if hhi else 0.0
+
+def main() -> None:
+    pre, cat, pooled, ns = guard()
+    picks = iter_jsonl(CORPUS)
+
+    catalog_by_key = {
+        (int(r["draft_year"]), str(r["league_id"])): r
+        for r in cat["rows"]
+    }
+
+    # League-scoped custom metadata from namespace audit.
+    custom = {
+        (
+            int(r["draft_year"]),
+            str(r["league_id"]),
+            str(r["mfl_player_id"]),
+        ): r
+        for r in ns["occurrence_group_audit"]
+    }
+
+    evidence = defaultdict(list)
+    diagnostic_unknown = defaultdict(list)
+
+    for p in picks:
+        key = (int(p["draft_year"]), str(p["league_id"]))
+        dy = int(p["draft_year"])
+
+        # Standard/exact identity path: the crosswalk's draft class is
+        # football identity metadata, not an outcome. Same-year is the
+        # target cohort; earlier/later class is positive contamination.
+        identity_class = p.get("identity_draft_class")
+        if p.get("identity_resolved") and isinstance(identity_class, int):
+            if identity_class != dy:
+                evidence[key].append({
+                    "overall_slot": int(p["overall_slot"]),
+                    "mfl_player_id": str(p["mfl_player_id"]),
+                    "kind": (
+                        "resolved_future_nfl_class"
+                        if identity_class > dy
+                        else "resolved_past_nfl_class"
+                    ),
+                    "draft_year": dy,
+                    "identity_draft_class": identity_class,
+                    "name": p.get("name"),
+                    "position": p.get("position"),
+                })
+            continue
+
+        ckey = (dy, str(p["league_id"]), str(p["mfl_player_id"]))
+        c = custom.get(ckey)
+        if not c:
+            diagnostic_unknown[key].append({
+                "overall_slot": int(p["overall_slot"]),
+                "mfl_player_id": str(p["mfl_player_id"]),
+                "kind": "unresolved_no_league_scoped_metadata_audit_row",
+            })
+            continue
+
+        meta = c.get("league_metadata") or {}
+        name = meta.get("name")
+        status = c.get("same_class_match_status")
+        candidate_years = c.get("external_candidate_draft_years") or []
+
+        if explicit_devy_marker(name):
+            evidence[key].append({
+                "overall_slot": int(p["overall_slot"]),
+                "mfl_player_id": str(p["mfl_player_id"]),
+                "kind": "explicit_devy_custom_player",
+                "draft_year": dy,
+                "name": name,
+                "position": meta.get("position"),
+                "candidate_draft_years": candidate_years,
+            })
+        elif status == "name_position_only_future_draft_class":
+            evidence[key].append({
+                "overall_slot": int(p["overall_slot"]),
+                "mfl_player_id": str(p["mfl_player_id"]),
+                "kind": "custom_future_nfl_class",
+                "draft_year": dy,
+                "name": name,
+                "position": meta.get("position"),
+                "candidate_draft_years": candidate_years,
+            })
+        elif status == "name_position_only_past_draft_class":
+            evidence[key].append({
+                "overall_slot": int(p["overall_slot"]),
+                "mfl_player_id": str(p["mfl_player_id"]),
+                "kind": "custom_past_nfl_class",
+                "draft_year": dy,
+                "name": name,
+                "position": meta.get("position"),
+                "candidate_draft_years": candidate_years,
+            })
+        elif status in {
+            "metadata_present_no_external_identity",
+            "name_position_other_class_or_mixed",
+        }:
+            diagnostic_unknown[key].append({
+                "overall_slot": int(p["overall_slot"]),
+                "mfl_player_id": str(p["mfl_player_id"]),
+                "kind": status,
+                "name": name,
+                "position": meta.get("position"),
+                "candidate_draft_years": candidate_years,
+            })
+
+    contaminated_keys = set(evidence)
+
+    league_rows = []
+    for key, r in sorted(catalog_by_key.items()):
+        yr, lid = key
+        ev = evidence.get(key, [])
+        unk = diagnostic_unknown.get(key, [])
+        league_rows.append({
+            "draft_year": yr,
+            "league_id": lid,
+            "league_name": r.get("league_name"),
+            "idp": bool(r.get("idp")),
+            "scope": r["scope"],
+            "positive_rookie_scope_contamination": bool(ev),
+            "positive_evidence_n": len(ev),
+            "evidence_kind_counts": dict(Counter(x["kind"] for x in ev)),
+            "evidence": ev,
+            "diagnostic_unknown_n": len(unk),
+            "diagnostic_unknown": unk,
+        })
+
+    # Clean-subset diagnostic. This does not amend the frozen catalog;
+    # it asks whether the original pooled evidence gates would survive
+    # removal of leagues with positive out-of-class evidence.
+    clean = [r for r in league_rows if not r["positive_rookie_scope_contamination"]]
+
+    counts = {}
+    for scope in SCOPES:
+        counts[scope] = {
+            "frozen_total": sum(1 for r in league_rows if r["scope"].get(scope)),
+            "contaminated": sum(
+                1 for r in league_rows
+                if r["scope"].get(scope)
+                and r["positive_rookie_scope_contamination"]
+            ),
+            "clean_total": sum(1 for r in clean if r["scope"].get(scope)),
+            "clean_by_year": {
+                str(y): sum(
+                    1 for r in clean
+                    if r["draft_year"] == y and r["scope"].get(scope)
+                )
+                for y in YEARS
+            },
+        }
+
+    th = pooled_gate_thresholds(pooled)
+    r6_by_year = [
+        counts["primary_r6"]["clean_by_year"][str(y)]
+        for y in YEARS
+    ]
+    idp_r6_by_year = [
+        counts["idp_sensitivity_r6"]["clean_by_year"][str(y)]
+        for y in YEARS
+    ]
+    r6_total = sum(r6_by_year)
+    r6_eff = effective_years(r6_by_year)
+    r6_max_share = max(r6_by_year) / r6_total if r6_total else 1.0
+    idp_years = sum(c > 0 for c in idp_r6_by_year)
+
+    gate_results = {
+        "r1_r4_nonmock_total": {
+            "value": counts["primary_r1_r4"]["clean_total"],
+            "threshold": th["r1_r4_total_min"],
+            "pass": counts["primary_r1_r4"]["clean_total"] >= th["r1_r4_total_min"],
+        },
+        "r5_nonidp_nonmock_total": {
+            "value": counts["primary_r5"]["clean_total"],
+            "threshold": th["r5_nonidp_total_min"],
+            "pass": counts["primary_r5"]["clean_total"] >= th["r5_nonidp_total_min"],
+        },
+        "r6_nonidp_nonmock_total": {
+            "value": counts["primary_r6"]["clean_total"],
+            "threshold": th["r6_nonidp_total_min"],
+            "pass": counts["primary_r6"]["clean_total"] >= th["r6_nonidp_total_min"],
+        },
+        "r6_nonidp_min_per_year": {
+            "value": min(r6_by_year),
+            "threshold": th["r6_min_per_year"],
+            "pass": min(r6_by_year) >= th["r6_min_per_year"],
+        },
+        "r6_nonidp_hhi_effective_years": {
+            "value": r6_eff,
+            "threshold": th["r6_effective_years_min"],
+            "pass": r6_eff >= th["r6_effective_years_min"],
+        },
+        "r6_nonidp_max_year_share": {
+            "value": r6_max_share,
+            "threshold": th["r6_max_year_share_max"],
+            "pass": r6_max_share <= th["r6_max_year_share_max"],
+        },
+        "idp_r6_nonmock_total": {
+            "value": counts["idp_sensitivity_r6"]["clean_total"],
+            "threshold": th["idp_r6_total_min"],
+            "pass": counts["idp_sensitivity_r6"]["clean_total"] >= th["idp_r6_total_min"],
+        },
+        "idp_r6_years_represented": {
+            "value": idp_years,
+            "threshold": th["idp_r6_years_min"],
+            "pass": idp_years >= th["idp_r6_years_min"],
+        },
+    }
+
+    all_gates = all(x["pass"] for x in gate_results.values())
+    contaminated_n = len(contaminated_keys)
+
+    if contaminated_n == 0:
+        decision = "NO_POSITIVE_ROOKIE_SCOPE_CONTAMINATION_DETECTED"
+    elif all_gates:
+        decision = "ROOKIE_SCOPE_CONTAMINATION_CONFIRMED_CLEAN_SUBSET_PASSES_FROZEN_POOLED_GATES"
+    else:
+        decision = "ROOKIE_SCOPE_CONTAMINATION_CONFIRMED_CLEAN_SUBSET_FAILS_FROZEN_POOLED_GATES"
+
+    payload = {
+        "schema_version": 1,
+        "study_id": "draft-pick-fv-v3-rookie-scope-contamination-audit",
+        "generated_at_utc": now(),
+        "decision": decision,
+        "diagnostic_only": True,
+        "authorizes_outcome_ingestion": False,
+        "authorizes_source_catalog_amendment": False,
+        "historical_player_outcomes_read": False,
+        "market_or_ktc_values_read": False,
+        "package_vote_data_read": False,
+        "candidate_fit_performed": False,
+        "candidate_scores_computed": False,
+        "validation_scored": False,
+        "production_change_authorized": False,
+        "frozen_rules_changed": False,
+        "positive_contamination_definition": [
+            "resolved stable identity has NFL draft class different from the MFL draft year",
+            "league-scoped custom metadata explicitly names a devy/placeholder pick",
+            "league-scoped custom name+position maps only to a future or past NFL draft class",
+        ],
+        "not_automatically_contamination": [
+            "custom metadata with no external stable identity",
+            "ambiguous/mixed external draft classes",
+            "league name alone",
+        ],
+        "audit_counts": {
+            "frozen_catalog_league_n": len(league_rows),
+            "positive_contaminated_league_n": contaminated_n,
+            "clean_league_n": len(clean),
+            "league_n_with_diagnostic_unknowns": sum(
+                1 for r in league_rows if r["diagnostic_unknown_n"] > 0
+            ),
+            "positive_evidence_occurrence_n": sum(
+                r["positive_evidence_n"] for r in league_rows
+            ),
+            "positive_evidence_kind_counts": dict(Counter(
+                x["kind"]
+                for r in league_rows
+                for x in r["evidence"]
+            )),
+        },
+        "scope_counts": counts,
+        "clean_subset_frozen_pooled_gate_recheck": {
+            "pass": all_gates,
+            "r6_clean_by_year": dict(zip(map(str, YEARS), r6_by_year)),
+            "idp_r6_clean_by_year": dict(zip(map(str, YEARS), idp_r6_by_year)),
+            "gates": gate_results,
+        },
+        "league_audit": league_rows,
+        "source_hashes": {
+            PREREG.name: sha256(PREREG),
+            PREREG_MAN.name: sha256(PREREG_MAN),
+            CATALOG.name: sha256(CATALOG),
+            POOLED.name: sha256(POOLED),
+            CORPUS.name: sha256(CORPUS),
+            CONTRACT_MAN.name: sha256(CONTRACT_MAN),
+            NS.name: sha256(NS),
+            NS_MAN.name: sha256(NS_MAN),
+        },
+        "next_step": (
+            "If clean subset passes all frozen pooled gates, freeze a separate "
+            "pre-outcome protocol clarification that excludes only leagues with "
+            "positive out-of-class evidence and defines league-scoped custom "
+            "identity keys; then rerun the unchanged 95% identity gate. "
+            "If any frozen pooled gate fails, do not ingest outcomes."
+        ),
+    }
+    JSON_OUT.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+    lines = [
+        "# Draft Pick FV V3 — Rookie Scope Contamination Audit",
+        "",
+        f"**Decision:** `{decision}`",
+        "",
+        "This is a pre-outcome diagnostic audit. It does not amend the frozen "
+        "source catalog and cannot authorize historical outcome ingestion.",
+        "",
+        "## Positive contamination evidence",
+        "",
+        f"- Frozen catalog leagues: **{len(league_rows)}**",
+        f"- Leagues with positive out-of-class evidence: **{contaminated_n}**",
+        f"- Clean-by-evidence leagues: **{len(clean)}**",
+        f"- Positive contaminated pick occurrences: **{payload['audit_counts']['positive_evidence_occurrence_n']}**",
+        "",
+        "## Clean-subset scope counts",
+        "",
+    ]
+    for scope in SCOPES:
+        c = counts[scope]
+        lines.append(
+            f"- {scope}: frozen **{c['frozen_total']}**, "
+            f"contaminated **{c['contaminated']}**, clean **{c['clean_total']}**"
+        )
+
+    lines += [
+        "",
+        "## Frozen pooled gate recheck",
+        "",
+    ]
+    for name, g in gate_results.items():
+        lines.append(
+            f"- {name}: **{g['value']}** vs threshold **{g['threshold']}** — "
+            f"**{'PASS' if g['pass'] else 'FAIL'}**"
+        )
+
+    lines += [
+        "",
+        f"Overall clean-subset pooled gate: **{'PASS' if all_gates else 'FAIL'}**",
+        "",
+        "## Outcome firewall",
+        "",
+        "- Historical NFL outcomes read: **No**",
+        "- Candidate fit performed: **No**",
+        "- Locked validation scored: **No**",
+        "- Production change authorized: **No**",
+        "",
+        "## Next step",
+        "",
+        payload["next_step"],
+    ]
+    MD_OUT.write_text("\n".join(lines) + "\n")
+
+    manifest = {
+        "schema_version": 1,
+        "study_id": payload["study_id"],
+        "generated_at_utc": payload["generated_at_utc"],
+        "decision": decision,
+        "diagnostic_only": True,
+        "authorizes_outcome_ingestion": False,
+        "authorizes_source_catalog_amendment": False,
+        "historical_player_outcomes_read": False,
+        "candidate_fit_performed": False,
+        "candidate_scores_computed": False,
+        "validation_scored": False,
+        "production_change_authorized": False,
+        "frozen_rules_changed": False,
+        "contaminated_league_n": contaminated_n,
+        "clean_subset_pooled_gate_pass": all_gates,
+        "source_hashes": payload["source_hashes"],
+        "output_hashes": {
+            JSON_OUT.name: sha256(JSON_OUT),
+            MD_OUT.name: sha256(MD_OUT),
+        },
+    }
+    MAN_OUT.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+    print(json.dumps({
+        "decision": decision,
+        "contaminated_leagues": contaminated_n,
+        "clean_leagues": len(clean),
+        "evidence_occurrences": payload["audit_counts"]["positive_evidence_occurrence_n"],
+        "evidence_kinds": payload["audit_counts"]["positive_evidence_kind_counts"],
+        "scope_clean_counts": {
+            s: counts[s]["clean_total"] for s in SCOPES
+        },
+        "r6_clean_by_year": dict(zip(map(str, YEARS), r6_by_year)),
+        "clean_subset_pooled_gate_pass": all_gates,
+        "gate_results": gate_results,
+    }, indent=2, sort_keys=True))
+
+if __name__ == "__main__":
+    main()
