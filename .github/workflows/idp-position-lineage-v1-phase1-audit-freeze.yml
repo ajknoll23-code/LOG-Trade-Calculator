@@ -52,6 +52,7 @@ jobs:
             scripts/validation/repo_regression_checks.py
             research/team-utility/team_utility_starter_objective_audit.py
             data/league_rosters.json
+            data/free_agents.json
             scripts/artifacts/generated/player_positions.json
           )
           for f in "${required[@]}"; do
@@ -105,7 +106,8 @@ jobs:
             ],
             "target_cohort": "exact frozen rows where legacy_model_position != current_valuation_position",
             "expected_target_count": 46,
-            "target_position_authority": "frozen IDP V1 current_valuation_position, verified against the production-parity current universe (baked PLAYER_DB plus live league-roster merge) before evaluation",
+            "current_scope_policy": "all 46 remain frozen audit targets; only targets currently present in the production-parity core valuation universe may become migration candidates; free-agent-only or otherwise non-rendered targets are explicit holds",
+            "target_position_authority": "frozen IDP V1 current_valuation_position, verified against current generated player_positions for all 46 and against the live merged PLAYER_DB for current-core targets",
             "held_fixed": [
               "2025 true PPG inputs",
               "IDP V1 2026 projection",
@@ -137,8 +139,9 @@ jobs:
             "hard_gates": [
               "immutable IDP V1 release artifact hashes match the release manifest",
               "target mismatch count is exactly 46",
-              "current PLAYER_DB position matches frozen current_valuation_position for every target row",
-              "current deployed raw PROD_MULT matches the frozen deployed IDP V1 candidate for every target row",
+              "current generated player-position map matches frozen current_valuation_position for every target row",
+              "live merged PLAYER_DB position matches frozen current_valuation_position for every current-core target row",
+              "current deployed raw PROD_MULT matches the frozen deployed IDP V1 candidate for every current-core target row",
               "every target row is classified as recomputed candidate or explicit documented hold",
               "no unguarded exact-floor no-history rescue discontinuity",
               "all simulated candidate values are finite positive integers",
@@ -170,9 +173,12 @@ jobs:
           refreshes are deliberately excluded.
 
           For each mismatch, Phase 1 recomputes the frozen history component using
-          the player's frozen current valuation position, verifies that position
-          against the production-parity current universe (static PLAYER_DB plus the
-          same live league-roster merge used by production), preserves the frozen V1
+          the player's frozen current valuation position. All 46 rows remain in
+          the audit, but only rows currently present in the production-parity core
+          valuation universe can become candidates. Free-agent-only or otherwise
+          non-rendered rows are explicit holds. Position authority is checked against
+          the current generated player-position map for all 46 and the live merged
+          PLAYER_DB for current-core rows. The audit preserves the frozen V1
           forward projection, evaluates against the already-frozen V1 replacement
           baseline for that current position, and transports only the resulting clean
           position-lineage model delta onto the actual deployed raw production
@@ -216,6 +222,7 @@ jobs:
           INDEX = ROOT / "index.html"
           SNAPSHOT_VALUES = ROOT / "scripts" / "validation" / "snapshot_values.py"
           LEAGUE_ROSTERS = ROOT / "data" / "league_rosters.json"
+          FREE_AGENTS = ROOT / "data" / "free_agents.json"
           PLAYER_POSITIONS = (
               ROOT / "scripts" / "artifacts" / "generated" / "player_positions.json"
           )
@@ -316,6 +323,34 @@ jobs:
                       + json.dumps(unresolved[:20], sort_keys=True)
                   )
               return cfg
+
+          def classify_target_scope(mismatch_rows, current_values, free_doc):
+              """Classify frozen targets without assuming they still render in core."""
+              free_by_id = {
+                  str(r.get("player_id")): r
+                  for r in (free_doc.get("free_agents") or [])
+                  if r.get("player_id") not in (None, "")
+              }
+              out = {}
+              for key, row in mismatch_rows:
+                  sid = row.get("sleeper_id")
+                  sid = str(sid) if sid not in (None, "") else None
+                  if key in current_values:
+                      out[key] = {
+                          "scope": "current_core",
+                          "free_agent_row": None,
+                      }
+                  elif sid and sid in free_by_id:
+                      out[key] = {
+                          "scope": "free_agent_only",
+                          "free_agent_row": free_by_id[sid],
+                      }
+                  else:
+                      out[key] = {
+                          "scope": "not_currently_rendered",
+                          "free_agent_row": None,
+                      }
+              return out
 
           def recompute_history(current_pos, old_history, frozen_history_doc):
               n = int(old_history.get("games_played_2025") or 0)
@@ -418,6 +453,8 @@ jobs:
               final_v1 = read_json(FINAL_V1_VALIDATION)
               cfg = load_current_production_cfg(snapshot_values)
               current_values = snapshot_values.compute_all_values(cfg)
+              position_map = read_json(PLAYER_POSITIONS)
+              free_doc = read_json(FREE_AGENTS)
 
               hash_mismatches = verify_frozen_release_hashes(release_manifest)
 
@@ -449,23 +486,80 @@ jobs:
               mismatch_rows.sort(key=lambda item: item[0])
               mismatch_keys = {key for key, _ in mismatch_rows}
 
+              target_scope = classify_target_scope(
+                  mismatch_rows, current_values, free_doc
+              )
+              live_target_keys = {
+                  key
+                  for key, meta in target_scope.items()
+                  if meta["scope"] == "current_core"
+              }
+              free_agent_only_keys = {
+                  key
+                  for key, meta in target_scope.items()
+                  if meta["scope"] == "free_agent_only"
+              }
+              nonrendered_keys = {
+                  key
+                  for key, meta in target_scope.items()
+                  if meta["scope"] == "not_currently_rendered"
+              }
+
               current_position_mismatches = []
+              live_core_position_mismatches = []
+              free_agent_position_mismatches = []
               deployed_raw_mismatches = []
               duplicate_sleeper_ids = []
               sleeper_seen = {}
 
               for key, row in mismatch_rows:
-                  info = cfg["player_db"].get(key)
-                  if not info or info["pos"] != row["current_valuation_position"]:
+                  frozen_current_pos = row["current_valuation_position"]
+                  mapped_pos = position_map.get(key)
+                  if mapped_pos != frozen_current_pos:
                       current_position_mismatches.append({
                           "key": key,
-                          "frozen_current_position": row.get(
-                              "current_valuation_position"
-                          ),
-                          "current_player_db_position": (
-                              info.get("pos") if info else None
-                          ),
+                          "frozen_current_position": frozen_current_pos,
+                          "current_generated_position": mapped_pos,
                       })
+
+                  scope_meta = target_scope[key]
+                  if scope_meta["scope"] == "current_core":
+                      info = cfg["player_db"].get(key)
+                      if (
+                          not info
+                          or info.get("pos") != frozen_current_pos
+                      ):
+                          live_core_position_mismatches.append({
+                              "key": key,
+                              "frozen_current_position": frozen_current_pos,
+                              "live_core_position": (
+                                  info.get("pos") if info else None
+                              ),
+                          })
+
+                      deployed = finite(cfg["prod_mult"].get(key))
+                      frozen_deployed = finite(row.get("candidate_prod_mult"))
+                      if (
+                          deployed is None
+                          or frozen_deployed is None
+                          or abs(deployed - frozen_deployed) > 1e-9
+                      ):
+                          deployed_raw_mismatches.append({
+                              "key": key,
+                              "current_raw_prod_mult": deployed,
+                              "frozen_v1_deployed_prod_mult": frozen_deployed,
+                          })
+
+                  elif scope_meta["scope"] == "free_agent_only":
+                      fa = scope_meta["free_agent_row"] or {}
+                      fa_pos = str(fa.get("pos") or "")
+                      if fa_pos and fa_pos != frozen_current_pos:
+                          free_agent_position_mismatches.append({
+                              "key": key,
+                              "sleeper_id": row.get("sleeper_id"),
+                              "frozen_current_position": frozen_current_pos,
+                              "current_free_agent_position": fa_pos,
+                          })
 
                   sid = row.get("sleeper_id")
                   if sid not in (None, ""):
@@ -476,19 +570,6 @@ jobs:
                               "keys": [sleeper_seen[sid], key],
                           })
                       sleeper_seen[sid] = key
-
-                  deployed = finite(cfg["prod_mult"].get(key))
-                  frozen_deployed = finite(row.get("candidate_prod_mult"))
-                  if (
-                      deployed is None
-                      or frozen_deployed is None
-                      or abs(deployed - frozen_deployed) > 1e-9
-                  ):
-                      deployed_raw_mismatches.append({
-                          "key": key,
-                          "current_raw_prod_mult": deployed,
-                          "frozen_v1_deployed_prod_mult": frozen_deployed,
-                      })
 
               candidate_prod = dict(cfg["prod_mult"])
               rows = []
@@ -505,6 +586,7 @@ jobs:
                   legacy_combined = finite(row.get("new_model_combined"))
 
                   reason = None
+                  current_scope = target_scope[key]["scope"]
                   current_history = None
                   current_combined = None
                   legacy_clean_pm = None
@@ -514,7 +596,11 @@ jobs:
                   final_raw = live_raw
                   guarded = False
 
-                  if frozen_hist is None:
+                  if current_scope != "current_core":
+                      reason = (
+                          "current_scope_hold_" + current_scope
+                      )
+                  elif frozen_hist is None:
                       reason = "missing_frozen_history_record"
                   elif (
                       live_raw is None
@@ -590,12 +676,18 @@ jobs:
                   if reason:
                       hold_counts[reason] = hold_counts.get(reason, 0) + 1
 
-                  candidate_prod[key] = final_raw
+                  if (
+                      current_scope == "current_core"
+                      and final_raw is not None
+                  ):
+                      candidate_prod[key] = final_raw
+
                   rows.append({
                       "key": key,
                       "sleeper_id": row.get("sleeper_id"),
                       "legacy_model_position": legacy_pos,
                       "current_valuation_position": current_pos,
+                      "current_scope": current_scope,
                       "v1_projection": v1_projection,
                       "legacy_history_component": finite(
                           row.get("history_component")
@@ -616,6 +708,12 @@ jobs:
                       ),
                       "hold_reason": reason,
                       "floor_rescue_guarded": guarded,
+                      "current_fv": None,
+                      "candidate_fv": None,
+                      "fv_delta": None,
+                      "fv_pct_change": None,
+                      "effective_current_prod_mult": None,
+                      "effective_candidate_prod_mult": None,
                   })
 
               candidate_cfg = copy.deepcopy(cfg)
@@ -642,15 +740,25 @@ jobs:
                           offense_changes.append(key)
 
               row_by_key = {r["key"]: r for r in rows}
-              for key in mismatch_keys:
+              for key in sorted(live_target_keys):
                   old = current_values[key]
                   new = candidate_values[key]
                   if not isinstance(new["value"], int) or new["value"] <= 0:
                       invalid_candidate_values.append(key)
 
+                  candidate_raw = finite(
+                      row_by_key[key]["candidate_raw_prod_mult"]
+                  )
+                  deployed_raw = finite(
+                      row_by_key[key]["deployed_raw_prod_mult"]
+                  )
                   raw_delta = (
-                      float(row_by_key[key]["candidate_raw_prod_mult"])
-                      - float(row_by_key[key]["deployed_raw_prod_mult"])
+                      candidate_raw - deployed_raw
+                      if (
+                          candidate_raw is not None
+                          and deployed_raw is not None
+                      )
+                      else 0.0
                   )
                   fv_delta = int(new["value"]) - int(old["value"])
                   eps = 1e-12
@@ -677,7 +785,7 @@ jobs:
                   })
 
               changed_target_keys = sorted(
-                  key for key in mismatch_keys
+                  key for key in live_target_keys
                   if current_values[key]["value"]
                   != candidate_values[key]["value"]
               )
@@ -698,7 +806,7 @@ jobs:
                           "rank_delta": new_rank[key] - old_rank[key],
                       }
                       for key in keys
-                      if key in mismatch_keys
+                      if key in live_target_keys
                   ]
                   rank_summary[pos] = {
                       "target_count": len(movers),
@@ -760,6 +868,14 @@ jobs:
                       "pass": not current_position_mismatches,
                       "mismatches": current_position_mismatches,
                   },
+                  "live_core_positions_match_frozen_target": {
+                      "pass": not live_core_position_mismatches,
+                      "mismatches": live_core_position_mismatches,
+                  },
+                  "free_agent_positions_match_frozen_target": {
+                      "pass": not free_agent_position_mismatches,
+                      "mismatches": free_agent_position_mismatches,
+                  },
                   "live_roster_merge_resolved": {
                       "pass": not (
                           cfg.get("live_merge_stats", {}).get(
@@ -816,16 +932,21 @@ jobs:
                   )
 
               fv_deltas = [
-                  row_by_key[k]["fv_delta"] for k in mismatch_keys
+                  row_by_key[k]["fv_delta"]
+                  for k in live_target_keys
+                  if row_by_key[k]["fv_delta"] is not None
               ]
               pct_deltas = [
-                  row_by_key[k]["fv_pct_change"] for k in mismatch_keys
+                  row_by_key[k]["fv_pct_change"]
+                  for k in live_target_keys
+                  if row_by_key[k]["fv_pct_change"] is not None
               ]
-              raw_deltas = [
-                  float(row_by_key[k]["candidate_raw_prod_mult"])
-                  - float(row_by_key[k]["deployed_raw_prod_mult"])
-                  for k in mismatch_keys
-              ]
+              raw_deltas = []
+              for k in live_target_keys:
+                  c = finite(row_by_key[k]["candidate_raw_prod_mult"])
+                  d = finite(row_by_key[k]["deployed_raw_prod_mult"])
+                  if c is not None and d is not None:
+                      raw_deltas.append(c - d)
 
               largest = sorted(
                   rows,
@@ -874,6 +995,9 @@ jobs:
                   },
                   "counts": {
                       "target_mismatch_rows": len(mismatch_rows),
+                      "current_core_target_rows": len(live_target_keys),
+                      "free_agent_only_target_rows": len(free_agent_only_keys),
+                      "not_currently_rendered_target_rows": len(nonrendered_keys),
                       "recomputed_candidates": recomputed,
                       "explicit_holds": len(mismatch_rows) - recomputed,
                       "floor_rescue_guarded": len(floor_guarded),
@@ -917,6 +1041,9 @@ jobs:
                       str(LEAGUE_ROSTERS.relative_to(ROOT)): sha256(
                           LEAGUE_ROSTERS
                       ),
+                      str(FREE_AGENTS.relative_to(ROOT)): sha256(
+                          FREE_AGENTS
+                      ),
                       str(PLAYER_POSITIONS.relative_to(ROOT)): sha256(
                           PLAYER_POSITIONS
                       ),
@@ -939,6 +1066,9 @@ jobs:
                   "## Frozen cohort",
                   "",
                   f"- Position-lineage mismatches: **{c['target_mismatch_rows']}**",
+                  f"- Current-core targets: **{c['current_core_target_rows']}**",
+                  f"- Free-agent-only targets held: **{c['free_agent_only_target_rows']}**",
+                  f"- Not-currently-rendered targets held: **{c['not_currently_rendered_target_rows']}**",
                   f"- Recomputed candidates: **{c['recomputed_candidates']}**",
                   f"- Explicit holds: **{c['explicit_holds']}**",
                   f"- Floor-rescue guarded holds: **{c['floor_rescue_guarded']}**",
@@ -1072,6 +1202,25 @@ jobs:
               assert rec["durability_projected_games_2026"] == 17.0
               assert clamp(2.0, 0.15, 1.55) == 1.55
               assert clamp(0.0, 0.15, 1.55) == 0.15
+
+              fake_rows = [
+                  ("core", {"sleeper_id": "1"}),
+                  ("fa", {"sleeper_id": "2"}),
+                  ("gone", {"sleeper_id": "3"}),
+              ]
+              scopes = classify_target_scope(
+                  fake_rows,
+                  {"core": {"value": 1}},
+                  {
+                      "free_agents": [
+                          {"player_id": "2", "name": "FA", "pos": "DB"}
+                      ]
+                  },
+              )
+              assert scopes["core"]["scope"] == "current_core"
+              assert scopes["fa"]["scope"] == "free_agent_only"
+              assert scopes["gone"]["scope"] == "not_currently_rendered"
+
               print("IDP Position Lineage V1 Phase 1 self-test PASS")
 
           def main():
@@ -1132,6 +1281,27 @@ jobs:
           values = snapshot_values.compute_all_values(merged)
           assert "bradley chubb" in values
           assert values["bradley chubb"]["value"] > 0
+
+          positions = json.loads(
+              (
+                  root / "scripts" / "artifacts" / "generated"
+                  / "player_positions.json"
+              ).read_text()
+          )
+          free_doc = json.loads(
+              (root / "data" / "free_agents.json").read_text()
+          )
+          free_by_id = {
+              str(r["player_id"]): r
+              for r in free_doc["free_agents"]
+              if r.get("player_id") is not None
+          }
+
+          assert positions["jamal adams"] == "DB"
+          assert "4077" in free_by_id
+          assert free_by_id["4077"]["name"] == "Jamal Adams"
+          assert free_by_id["4077"]["pos"] == "DB"
+          assert "jamal adams" not in values
 
           print(
               "PASS live merge:",
