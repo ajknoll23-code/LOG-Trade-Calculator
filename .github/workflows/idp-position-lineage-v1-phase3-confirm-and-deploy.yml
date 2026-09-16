@@ -1,0 +1,811 @@
+name: IDP Position Lineage V1 Phase 3 Confirm and Deploy
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  confirm-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install repository regression dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir "requests>=2.32,<3"
+          python3 - <<'PY'
+          import requests
+          print("requests import PASS:", requests.__version__)
+          PY
+
+      - name: Guard frozen research and clean repository
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          required=(
+            index.html
+            data/league_rosters.json
+            scripts/artifacts/generated/player_positions.json
+            scripts/validation/snapshot_values.py
+            scripts/validation/repo_regression_checks.py
+            research/team-utility/team_utility_starter_objective_audit.py
+            research/idp-position-lineage-v1/phase1b_current_core_cohort.json
+            research/idp-position-lineage-v1/idp_position_lineage_v1_phase1b.json
+            research/idp-position-lineage-v1/phase1b_manifest.json
+            research/idp-position-lineage-v1/idp_position_lineage_v1_phase2.json
+            research/idp-position-lineage-v1/phase2_manifest.json
+            research/idp-position-lineage-v1/idp_position_lineage_v1_phase2b.json
+            research/idp-position-lineage-v1/phase2b_manifest.json
+          )
+          for f in "${required[@]}"; do
+            test -f "$f" || { echo "Missing required input: $f"; exit 1; }
+          done
+
+          test "$(git branch --show-current)" = "main"
+          test -z "$(git status --porcelain)"
+
+          outputs=(
+            model/releases/idp-position-lineage-v1/release.json
+            scripts/model/apply_idp_position_lineage_v1_release.py
+            research/idp-position-lineage-v1/phase3_production_confirmation.json
+            research/idp-position-lineage-v1/phase3_production_confirmation.md
+            research/idp-position-lineage-v1/phase3_manifest.json
+          )
+          for f in "${outputs[@]}"; do
+            test ! -e "$f" || {
+              echo "Refusing to overwrite existing Position Lineage V1 deployment artifact: $f"
+              exit 1
+            }
+          done
+
+          git rev-parse HEAD | tee "${RUNNER_TEMP}/starting_sha.txt"
+
+          sha256sum \
+            data/league_rosters.json \
+            scripts/artifacts/generated/player_positions.json \
+            > "${RUNNER_TEMP}/phase3-live-inputs.sha256"
+
+      - name: Preflight full repository regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/repo_regression_checks.py
+
+      - name: Verify frozen Phase 1B, Phase 2, and Phase 2B evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          root = Path(".")
+          r = root / "research" / "idp-position-lineage-v1"
+
+          def sha(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          p1b = json.loads((r / "idp_position_lineage_v1_phase1b.json").read_text())
+          m1b = json.loads((r / "phase1b_manifest.json").read_text())
+          p2 = json.loads((r / "idp_position_lineage_v1_phase2.json").read_text())
+          m2 = json.loads((r / "phase2_manifest.json").read_text())
+          p2b = json.loads((r / "idp_position_lineage_v1_phase2b.json").read_text())
+          m2b = json.loads((r / "phase2b_manifest.json").read_text())
+
+          assert p1b["decision"] == "PASS_IDP_POSITION_LINEAGE_V1_PHASE1B_CURRENT_CORE_FREEZE"
+          assert p2["decision"] == "STOP_IDP_POSITION_LINEAGE_V1_PHASE2_SHADOW_SANITY"
+          assert p2b["decision"] == "PASS_IDP_POSITION_LINEAGE_V1_PHASE2B_AGE_FEEDBACK_SHADOW"
+          assert p1b["production_change_authorized"] is False
+          assert p2["production_change_authorized"] is False
+          assert p2b["production_change_authorized"] is False
+
+          for manifest in (m1b, m2, m2b):
+              for rel, expected in manifest["output_sha256"].items():
+                  path = root / rel
+                  assert path.exists(), rel
+                  actual = sha(path)
+                  assert actual == expected, (
+                      f"Frozen evidence drift: {rel}: {actual} != {expected}"
+                  )
+
+          assert p1b["counts"]["current_core_cohort"] == 27
+          assert p1b["counts"]["candidate_rows"] == 24
+          assert p1b["counts"]["held_rows"] == 3
+          assert p2b["counts"]["candidate_rows"] == 24
+          assert p2b["counts"]["held_rows"] == 3
+
+          print("PASS: frozen Position Lineage V1 evidence is intact.")
+          PY
+
+      - name: Write approved production release
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p model/releases/idp-position-lineage-v1
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          root = Path(".")
+          r = root / "research" / "idp-position-lineage-v1"
+          out = root / "model" / "releases" / "idp-position-lineage-v1" / "release.json"
+
+          def sha(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          p1b = json.loads((r / "idp_position_lineage_v1_phase1b.json").read_text())
+          p2b = json.loads((r / "idp_position_lineage_v1_phase2b.json").read_text())
+          cohort = json.loads((r / "phase1b_current_core_cohort.json").read_text())
+
+          p1b_by_key = {row["key"]: row for row in p1b["rows"]}
+          p2b_by_key = {row["key"]: row for row in p2b["rows"]}
+
+          candidates = []
+          holds = []
+
+          for row in cohort["rows"]:
+              key = row["key"]
+              frozen = p1b_by_key[key]
+              shadow = p2b_by_key[key]
+
+              base = {
+                  "key": key,
+                  "sleeper_id": row.get("sleeper_id"),
+                  "legacy_model_position": row["legacy_model_position"],
+                  "current_position": row["current_position"],
+                  "deployed_raw_prod_mult": float(
+                      frozen["deployed_raw_prod_mult"]
+                  ),
+                  "phase2b_current_fv": int(shadow["current_fv"]),
+                  "phase2b_shadow_fv": int(shadow["shadow_fv"]),
+              }
+
+              if frozen["status"] == "candidate":
+                  candidates.append({
+                      **base,
+                      "candidate_raw_prod_mult": float(
+                          frozen["candidate_raw_prod_mult"]
+                      ),
+                  })
+              else:
+                  holds.append(base)
+
+          candidates.sort(key=lambda row: row["key"])
+          holds.sort(key=lambda row: row["key"])
+
+          assert len(candidates) == 24
+          assert len(holds) == 3
+
+          release = {
+              "release_id": "idp-position-lineage-v1",
+              "status": "APPROVED_BY_PHASE2B_PENDING_PHASE3_DEPLOYMENT",
+              "method": (
+                  "exact Phase1B raw PROD_MULT candidate, validated by "
+                  "Phase2B age-feedback shadow"
+              ),
+              "candidate_count": len(candidates),
+              "held_count": len(holds),
+              "candidate_overrides": candidates,
+              "held_rows": holds,
+              "scope": "core PROD_MULT_DATA only",
+              "deployment_policy": {
+                  "only_candidate_raw_prod_mult_changes": True,
+                  "held_rows_unchanged": True,
+                  "noncohort_prod_mult_unchanged": True,
+                  "offense_unchanged": True,
+                  "position_age_role_formula_unchanged": True
+              },
+              "phase1b_manifest_sha256": sha(r / "phase1b_manifest.json"),
+              "phase2_manifest_sha256": sha(r / "phase2_manifest.json"),
+              "phase2b_manifest_sha256": sha(r / "phase2b_manifest.json")
+          }
+
+          out.write_text(json.dumps(release, indent=2, sort_keys=True) + "\n")
+          print("Wrote", out, "with", len(candidates), "candidates and", len(holds), "holds.")
+          PY
+
+      - name: Write deterministic PROD_MULT applicator
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > scripts/model/apply_idp_position_lineage_v1_release.py <<'PY'
+          #!/usr/bin/env python3
+          """Apply/check the approved IDP Position Lineage V1 PROD_MULT release."""
+
+          from __future__ import annotations
+
+          import argparse
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          SCRIPT = Path(__file__).resolve()
+          ROOT = SCRIPT.parents[2]
+          INDEX = ROOT / "index.html"
+          RELEASE = (
+              ROOT / "model" / "releases" / "idp-position-lineage-v1" / "release.json"
+          )
+
+          sys.path.insert(0, str(ROOT / "scripts" / "validation"))
+          import snapshot_values
+
+          def read_json(path):
+              return json.loads(path.read_text(encoding="utf-8"))
+
+          def locate_prod_object(text):
+              marker = "PROD_MULT_DATA"
+              idx = text.find(marker)
+              if idx < 0:
+                  raise RuntimeError("PROD_MULT_DATA marker not found")
+              brace = text.find("{", idx)
+              if brace < 0:
+                  raise RuntimeError("PROD_MULT_DATA opening brace not found")
+
+              depth = 0
+              quote = None
+              escape = False
+              for i in range(brace, len(text)):
+                  ch = text[i]
+                  if quote is not None:
+                      if escape:
+                          escape = False
+                      elif ch == "\\":
+                          escape = True
+                      elif ch == quote:
+                          quote = None
+                      continue
+                  if ch in ("'", '"', "`"):
+                      quote = ch
+                      continue
+                  if ch == "{":
+                      depth += 1
+                  elif ch == "}":
+                      depth -= 1
+                      if depth == 0:
+                          return brace, i + 1
+              raise RuntimeError("Unclosed PROD_MULT_DATA object")
+
+          def parse_prod(text):
+              cfg = snapshot_values.load_from_html(INDEX)
+              return dict(cfg["prod_mult"])
+
+          def render(text, release):
+              start, end = locate_prod_object(text)
+              body = text[start:end]
+
+              before_cfg = snapshot_values.load_from_html(INDEX)
+              before_prod = dict(before_cfg["prod_mult"])
+
+              for row in release["candidate_overrides"]:
+                  key = row["key"]
+                  expected_old = float(row["deployed_raw_prod_mult"])
+                  candidate = float(row["candidate_raw_prod_mult"])
+
+                  actual_old = before_prod.get(key)
+                  if actual_old is None or abs(actual_old - expected_old) > 1e-9:
+                      raise RuntimeError(
+                          f"Current deployed raw mismatch for {key}: "
+                          f"{actual_old} != {expected_old}"
+                      )
+
+                  pattern = re.compile(
+                      r"('" + re.escape(key) + r"'\s*:\s*)(-?(?:\d+(?:\.\d*)?|\.\d+))"
+                  )
+                  matches = list(pattern.finditer(body))
+                  if len(matches) != 1:
+                      raise RuntimeError(
+                          f"Expected exactly one PROD_MULT_DATA literal for {key}; "
+                          f"found {len(matches)}"
+                      )
+
+                  body = pattern.sub(
+                      lambda m: m.group(1) + format(candidate, ".4f").rstrip("0").rstrip("."),
+                      body,
+                      count=1,
+                  )
+
+              return text[:start] + body + text[end:]
+
+          def validate_exact(before_text, after_text, release):
+              tmp_before = INDEX.read_text(encoding="utf-8")
+              try:
+                  INDEX.write_text(before_text, encoding="utf-8")
+                  before = snapshot_values.load_from_html(INDEX)["prod_mult"]
+                  INDEX.write_text(after_text, encoding="utf-8")
+                  after = snapshot_values.load_from_html(INDEX)["prod_mult"]
+              finally:
+                  INDEX.write_text(tmp_before, encoding="utf-8")
+
+              expected_keys = {
+                  row["key"] for row in release["candidate_overrides"]
+              }
+              actual_changed = {
+                  key
+                  for key in before
+                  if float(before[key]) != float(after[key])
+              }
+
+              if actual_changed != expected_keys:
+                  raise RuntimeError(
+                      f"Changed PROD_MULT keys mismatch. "
+                      f"Expected {sorted(expected_keys)}; actual {sorted(actual_changed)}"
+                  )
+
+              for row in release["held_rows"]:
+                  key = row["key"]
+                  if float(before[key]) != float(after[key]):
+                      raise RuntimeError(f"Held row changed: {key}")
+
+              if set(before) != set(after):
+                  raise RuntimeError("PROD_MULT_DATA key set changed")
+
+          def main():
+              ap = argparse.ArgumentParser()
+              group = ap.add_mutually_exclusive_group(required=True)
+              group.add_argument("--write", action="store_true")
+              group.add_argument("--check", action="store_true")
+              group.add_argument("--selftest", action="store_true")
+              args = ap.parse_args()
+
+              if args.selftest:
+                  sample = "const PROD_MULT_DATA = {'alpha':0.5,'beta':0.7};"
+                  release = {
+                      "candidate_overrides": [{
+                          "key": "alpha",
+                          "deployed_raw_prod_mult": 0.5,
+                          "candidate_raw_prod_mult": 0.8
+                      }],
+                      "held_rows": []
+                  }
+                  # Pure substitution smoke test.
+                  start, end = locate_prod_object(sample)
+                  assert start < end
+                  pat = re.compile(r"('alpha'\s*:\s*)(-?(?:\d+(?:\.\d*)?|\.\d+))")
+                  changed = sample[:start] + pat.sub(r"\g<1>0.8", sample[start:end], count=1) + sample[end:]
+                  assert "'alpha':0.8" in changed
+                  print("IDP Position Lineage V1 applicator self-test PASS")
+                  return
+
+              release = read_json(RELEASE)
+              before = INDEX.read_text(encoding="utf-8")
+
+              if args.check:
+                  cfg = snapshot_values.load_from_html(INDEX)
+                  prod = cfg["prod_mult"]
+                  for row in release["candidate_overrides"]:
+                      actual = float(prod[row["key"]])
+                      expected = float(row["candidate_raw_prod_mult"])
+                      if abs(actual - expected) > 1e-9:
+                          raise SystemExit(
+                              f"Stale deployment for {row['key']}: "
+                              f"{actual} != {expected}"
+                          )
+                  print("PASS: IDP Position Lineage V1 release is deployed")
+                  return
+
+              after = render(before, release)
+              validate_exact(before, after, release)
+              INDEX.write_text(after, encoding="utf-8")
+              print(
+                  "Wrote index.html with",
+                  len(release["candidate_overrides"]),
+                  "approved Position Lineage V1 PROD_MULT changes.",
+              )
+
+          if __name__ == "__main__":
+              main()
+          PY
+          chmod +x scripts/model/apply_idp_position_lineage_v1_release.py
+
+      - name: Compile and self-test release applicator
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile scripts/model/apply_idp_position_lineage_v1_release.py
+          python3 scripts/model/apply_idp_position_lineage_v1_release.py --selftest
+
+      - name: Freeze current-snapshot expected shadow before deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import copy
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          root = Path(".")
+          sys.path.insert(0, str(root / "scripts" / "validation"))
+          sys.path.insert(0, str(root / "research" / "team-utility"))
+
+          import snapshot_values
+          import team_utility_starter_objective_audit as starter_audit
+
+          release = json.loads(
+              (
+                  root / "model" / "releases" / "idp-position-lineage-v1"
+                  / "release.json"
+              ).read_text()
+          )
+          positions = json.loads(
+              (
+                  root / "scripts" / "artifacts" / "generated"
+                  / "player_positions.json"
+              ).read_text()
+          )
+          rosters = json.loads(
+              (root / "data" / "league_rosters.json").read_text()
+          )
+
+          base = snapshot_values.load_from_html(root / "index.html")
+          current_cfg = starter_audit.merge_live_league_into_cfg(base, rosters)
+          unresolved = (
+              current_cfg.get("live_merge_stats", {}).get("unresolved_positions") or []
+          )
+          assert not unresolved, unresolved
+
+          current_values = snapshot_values.compute_all_values(current_cfg)
+
+          cohort = release["candidate_overrides"] + release["held_rows"]
+          assert len(cohort) == 27
+
+          for row in cohort:
+              key = row["key"]
+              assert key in current_values, f"Frozen core cohort no longer renders: {key}"
+              assert current_cfg["player_db"][key]["pos"] == row["current_position"], key
+              assert positions.get(key) == row["current_position"], key
+              deployed = float(current_cfg["prod_mult"][key])
+              expected = float(row["deployed_raw_prod_mult"])
+              assert abs(deployed - expected) <= 1e-9, (
+                  f"Deployed raw drift for {key}: {deployed} != {expected}"
+              )
+
+          shadow_cfg = copy.deepcopy(current_cfg)
+          for row in release["candidate_overrides"]:
+              shadow_cfg["prod_mult"][row["key"]] = float(
+                  row["candidate_raw_prod_mult"]
+              )
+
+          shadow_values = snapshot_values.compute_all_values(shadow_cfg)
+
+          noncohort_changes = []
+          for key, current in current_values.items():
+              shadow = shadow_values[key]
+              if current["value"] == shadow["value"]:
+                  continue
+              if key not in {r["key"] for r in release["candidate_overrides"]}:
+                  noncohort_changes.append(key)
+          assert not noncohort_changes, noncohort_changes
+
+          for row in release["held_rows"]:
+              key = row["key"]
+              assert current_values[key]["value"] == shadow_values[key]["value"], key
+
+          expected = {
+              key: {
+                  "value": int(row["value"]),
+                  "pos": row["pos"],
+                  "age": row["age"],
+                  "role": row["role"],
+                  "age_mult": row["age_mult"],
+                  "prod_mult": row["prod_mult"],
+                  "raw_prod_mult": row["raw_prod_mult"],
+                  "no_real_production_history": row["no_real_production_history"]
+              }
+              for key, row in shadow_values.items()
+          }
+
+          payload = {
+              "rendered_count": len(expected),
+              "candidate_count": len(release["candidate_overrides"]),
+              "held_count": len(release["held_rows"]),
+              "expected_rows": expected
+          }
+
+          out = Path(os.environ["RUNNER_TEMP"]) / "idp-position-lineage-current-shadow.json"
+          out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+          print("PASS: current-snapshot shadow frozen for", len(expected), "rendered rows.")
+          PY
+
+      - name: Apply approved release to index.html
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/model/apply_idp_position_lineage_v1_release.py --write
+          python3 scripts/model/apply_idp_position_lineage_v1_release.py --check
+
+      - name: Confirm deployed calculator exactly reproduces current shadow
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          root = Path(".")
+          sys.path.insert(0, str(root / "scripts" / "validation"))
+          sys.path.insert(0, str(root / "research" / "team-utility"))
+
+          import snapshot_values
+          import team_utility_starter_objective_audit as starter_audit
+
+          expected = json.loads(
+              (
+                  Path(os.environ["RUNNER_TEMP"])
+                  / "idp-position-lineage-current-shadow.json"
+              ).read_text()
+          )
+          rosters = json.loads(
+              (root / "data" / "league_rosters.json").read_text()
+          )
+
+          base = snapshot_values.load_from_html(root / "index.html")
+          deployed_cfg = starter_audit.merge_live_league_into_cfg(base, rosters)
+          deployed_values = snapshot_values.compute_all_values(deployed_cfg)
+
+          assert set(deployed_values) == set(expected["expected_rows"])
+
+          mismatches = []
+          fields = (
+              "value",
+              "pos",
+              "age",
+              "role",
+              "age_mult",
+              "prod_mult",
+              "raw_prod_mult",
+              "no_real_production_history",
+          )
+          for key, exp in expected["expected_rows"].items():
+              actual = deployed_values[key]
+              changes = {
+                  field: {
+                      "expected": exp[field],
+                      "actual": actual[field],
+                  }
+                  for field in fields
+                  if actual[field] != exp[field]
+              }
+              if changes:
+                  mismatches.append({"key": key, "changes": changes})
+
+          if mismatches:
+              raise SystemExit(
+                  "Deployed calculator does not reproduce current shadow: "
+                  + json.dumps(mismatches[:20], indent=2)
+              )
+
+          print(
+              "PASS: deployed calculator exactly reproduces current shadow for",
+              len(deployed_values),
+              "rendered rows.",
+          )
+          PY
+
+      - name: Run full repository regression suite after deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/repo_regression_checks.py
+
+      - name: Write Phase 3 production confirmation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import subprocess
+          from pathlib import Path
+
+          root = Path(".")
+          r = root / "research" / "idp-position-lineage-v1"
+          release_path = (
+              root / "model" / "releases" / "idp-position-lineage-v1" / "release.json"
+          )
+          apply_path = (
+              root / "scripts" / "model"
+              / "apply_idp_position_lineage_v1_release.py"
+          )
+
+          def sha(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          release = json.loads(release_path.read_text())
+          p2b = json.loads(
+              (r / "idp_position_lineage_v1_phase2b.json").read_text()
+          )
+
+          result = {
+              "study_id": "idp-position-lineage-v1",
+              "phase": 3,
+              "status": "PRODUCTION_CONFIRMATION_COMPLETE",
+              "decision": "PASS_IDP_POSITION_LINEAGE_V1_PHASE3_CONFIRMED_AND_DEPLOYED",
+              "production_change_authorized": True,
+              "production_change_applied": True,
+              "candidate_count_deployed": len(release["candidate_overrides"]),
+              "held_count": len(release["held_rows"]),
+              "production_scope": "index.html PROD_MULT_DATA only",
+              "noncohort_prod_mult_changed": 0,
+              "offense_prod_mult_changed": 0,
+              "phase2b_decision": p2b["decision"],
+              "deployment_mechanism": (
+                  "direct exact-key PROD_MULT_DATA replacement for the "
+                  "24 Phase1B/Phase2B-approved current-core candidates"
+              ),
+              "sha256": {
+                  "index.html": sha(root / "index.html"),
+                  "release.json": sha(release_path),
+                  "apply_script": sha(apply_path),
+                  "phase1b_manifest": sha(r / "phase1b_manifest.json"),
+                  "phase2_manifest": sha(r / "phase2_manifest.json"),
+                  "phase2b_manifest": sha(r / "phase2b_manifest.json")
+              },
+              "phase2b_diagnostics": p2b["diagnostics"]
+          }
+
+          json_path = r / "phase3_production_confirmation.json"
+          md_path = r / "phase3_production_confirmation.md"
+
+          json_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+
+          d = p2b["diagnostics"]
+          md = f"""# IDP Position Lineage V1 — Phase 3 Production Confirmation
+
+          **Decision:** `{result['decision']}`
+
+          IDP Position Lineage V1 is deployed.
+
+          - Approved raw `PROD_MULT_DATA` changes: **{result['candidate_count_deployed']}**
+          - Explicit holds: **{result['held_count']}**
+          - Non-cohort production changes: **0**
+          - Offense production changes: **0**
+          - Current-snapshot shadow reproduced exactly: **Yes**
+          - Post-deployment repository regression suite: **PASS**
+
+          ## Carried-forward Phase 2B evidence
+
+          - Phase 2B decision: `{result['phase2b_decision']}`
+          - Median total FV delta: **{d['candidate_total_fv_delta']['median']:+.1f}**
+          - Median direct production effect: **{d['direct_production_effect_fv']['median']:+.1f}**
+          - Median age-feedback effect: **{d['age_feedback_effect_fv']['median']:+.1f}**
+          - Median age-feedback share: **{d['age_feedback_share_of_abs_total']['median']:.1%}**
+
+          ## Deployment architecture
+
+          The deployment modifies only the 24 approved existing keys inside
+          `PROD_MULT_DATA` in `index.html`. It does not alter positions, ages,
+          roles, position weights, age curves, no-history lineage, Team Utility,
+          offense values, or free-agent production logic.
+
+          The deterministic applicator/checker is:
+          `scripts/model/apply_idp_position_lineage_v1_release.py`.
+          """
+          md_path.write_text(
+              "\n".join(line.strip() for line in md.splitlines()) + "\n"
+          )
+
+          manifest = {
+              "study_id": result["study_id"],
+              "phase": 3,
+              "decision": result["decision"],
+              "production_change_applied": True,
+              "release_sha256": sha(release_path),
+              "index_sha256": sha(root / "index.html"),
+              "apply_script_sha256": sha(apply_path),
+              "phase3_result_sha256": sha(json_path),
+              "phase3_markdown_sha256": sha(md_path)
+          }
+          (r / "phase3_manifest.json").write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+          )
+
+          print(json.dumps({
+              "decision": result["decision"],
+              "candidate_count_deployed": result["candidate_count_deployed"],
+              "held_count": result["held_count"]
+          }, indent=2))
+          PY
+
+      - name: Prove live inputs stable and exact deployment diff
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          find . -type d -name __pycache__ -prune -exec rm -rf {} +
+          sha256sum -c "${RUNNER_TEMP}/phase3-live-inputs.sha256"
+
+          python3 - <<'PY'
+          import subprocess
+
+          expected = {
+              "index.html",
+              "model/releases/idp-position-lineage-v1/release.json",
+              "scripts/model/apply_idp_position_lineage_v1_release.py",
+              "research/idp-position-lineage-v1/phase3_production_confirmation.json",
+              "research/idp-position-lineage-v1/phase3_production_confirmation.md",
+              "research/idp-position-lineage-v1/phase3_manifest.json",
+          }
+
+          raw = subprocess.check_output(
+              ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+              text=True,
+          )
+          actual = set()
+          for line in raw.splitlines():
+              if not line:
+                  continue
+              path = line[3:]
+              if " -> " in path:
+                  path = path.split(" -> ", 1)[1]
+              actual.add(path)
+
+          if actual != expected:
+              raise SystemExit(
+                  "Phase 3 deployment diff mismatch.\n"
+                  f"Expected: {sorted(expected)}\n"
+                  f"Actual:   {sorted(actual)}"
+              )
+
+          print("PASS: exact six-file Phase 3 deployment diff.")
+          PY
+
+      - name: Commit confirmed IDP Position Lineage V1 deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            index.html \
+            model/releases/idp-position-lineage-v1/release.json \
+            scripts/model/apply_idp_position_lineage_v1_release.py \
+            research/idp-position-lineage-v1/phase3_production_confirmation.json \
+            research/idp-position-lineage-v1/phase3_production_confirmation.md \
+            research/idp-position-lineage-v1/phase3_manifest.json
+
+          git diff --cached --quiet && {
+            echo "No Phase 3 deployment changes to commit"
+            exit 1
+          }
+
+          git fetch origin main
+          if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
+            echo "main advanced during Phase 3. Refusing stale deployment."
+            echo "Local HEAD:  $(git rev-parse HEAD)"
+            echo "Origin main: $(git rev-parse origin/main)"
+            exit 1
+          fi
+
+          git commit -m "Deploy IDP Position Lineage V1"
+          git push origin HEAD:main
