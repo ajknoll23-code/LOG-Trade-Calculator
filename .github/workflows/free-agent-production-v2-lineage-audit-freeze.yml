@@ -109,7 +109,6 @@ jobs:
           from __future__ import annotations
 
           import argparse
-          import ast
           from collections import Counter, defaultdict
           import hashlib
           import importlib.util
@@ -205,56 +204,48 @@ jobs:
               return mod
 
 
-          def extract_js_object_block(text: str, marker: str) -> str:
-              start = text.find(marker)
-              if start < 0:
-                  raise RuntimeError(f"Could not locate {marker}")
-              brace = text.find("{", start)
-              if brace < 0:
-                  raise RuntimeError(f"Could not locate opening brace for {marker}")
-              depth = 0
-              in_string = False
-              quote = None
-              escaped = False
-              for i in range(brace, len(text)):
-                  ch = text[i]
-                  if in_string:
-                      if escaped:
-                          escaped = False
-                      elif ch == "\\":
-                          escaped = True
-                      elif ch == quote:
-                          in_string = False
-                      continue
-                  if ch in ("'", '"'):
-                      in_string = True
-                      quote = ch
-                  elif ch == "{":
-                      depth += 1
-                  elif ch == "}":
-                      depth -= 1
-                      if depth == 0:
-                          return text[brace:i + 1]
-              raise RuntimeError(f"Unterminated object for {marker}")
+          def eval_js_const_object(const_source: str, variable: str):
+              """Evaluate trusted repository JavaScript with Node and return JSON data."""
+              js = (
+                  const_source
+                  + "\nprocess.stdout.write(JSON.stringify("
+                  + variable
+                  + "));\n"
+              )
+              proc = subprocess.run(
+                  ["node", "-e", js],
+                  capture_output=True,
+                  text=True,
+                  check=False,
+              )
+              if proc.returncode != 0:
+                  raise RuntimeError(
+                      f"Node failed evaluating {variable}: {proc.stderr.strip()[:2000]}"
+                  )
+              try:
+                  return json.loads(proc.stdout)
+              except json.JSONDecodeError as exc:
+                  raise RuntimeError(
+                      f"Node returned invalid JSON for {variable}: {proc.stdout[:500]!r}"
+                  ) from exc
 
 
           def parse_fa_prod_table():
-              block = extract_js_object_block(
-                  BOARD.read_text(encoding="utf-8"),
-                  "const FA_PROD_MULT_DATA =",
-              )
-              # The table is deliberately simple JS object-literal syntax. Turn
-              # its bare field names into Python dict keys, then literal-eval it.
-              py = re.sub(r"(?<=[{,])\s*(prod|pos|team|role)\s*:", r" '\1':", block)
-              py = re.sub(r"\bnull\b", "None", py)
-              py = re.sub(r"\btrue\b", "True", py)
-              py = re.sub(r"\bfalse\b", "False", py)
-              try:
-                  obj = ast.literal_eval(py)
-              except Exception as exc:
-                  raise RuntimeError(f"FA_PROD_MULT_DATA parse failed: {exc}") from exc
+              # FA_PROD_MULT_DATA is JavaScript. Reuse the repo's canonical constant
+              # extractor and let Node evaluate the exact JS syntax instead of translating
+              # it into Python. This correctly handles JS-only numeric syntax.
+              scripts_dir = ROOT / "scripts"
+              if str(scripts_dir) not in sys.path:
+                  sys.path.insert(0, str(scripts_dir))
+              from sync import sync_free_agent_valuation
+
+              board_text = BOARD.read_text(encoding="utf-8")
+              const_source = sync_free_agent_valuation._extract_const_object(
+                  board_text, "FA_PROD_MULT_DATA"
+              )[2]
+              obj = eval_js_const_object(const_source, "FA_PROD_MULT_DATA")
               if not isinstance(obj, dict):
-                  raise RuntimeError("FA_PROD_MULT_DATA is not a dict")
+                  raise RuntimeError("FA_PROD_MULT_DATA did not evaluate to an object")
 
               rows = []
               for raw_name, value in obj.items():
@@ -275,7 +266,6 @@ jobs:
                           "deployed_prod": prod,
                       })
               return rows
-
 
           def index_free_agents():
               doc = read_json(FREE_AGENTS)
@@ -833,11 +823,16 @@ jobs:
               assert norm_name("A.J.-Brown") == "ajbrown"
               assert clamp(-5, PM_MIN, PM_MAX) == PM_MIN
               assert clamp(5, PM_MIN, PM_MAX) == PM_MAX
-              sample = "const FA_PROD_MULT_DATA = {'same name':[{prod:0.3,pos:'RB',team:'ARI'},{prod:0.2,pos:'DB',team:'SEA'}]};"
-              block = extract_js_object_block(sample, "const FA_PROD_MULT_DATA =")
-              py = re.sub(r"(?<=[{,])\s*(prod|pos|team|role)\s*:", r" '\1':", block)
-              parsed = ast.literal_eval(py)
+              sample = (
+                  "const FA_PROD_MULT_DATA = {"
+                  "'same name':[{prod:0.3,pos:'RB',team:'ARI'}],"
+                  "/* expanded coverage added 2026-08-20 */"
+                  "'legacy numeric':{prod:01,pos:'WR',team:'TST'}"
+                  "};"
+              )
+              parsed = eval_js_const_object(sample, "FA_PROD_MULT_DATA")
               assert parsed["same name"][0]["pos"] == "RB"
+              assert parsed["legacy numeric"]["prod"] == 1
               assert HISTORY_WEIGHT + FORWARD_WEIGHT == 1.0
               assert PM_RATIO_SLOPE == 0.75
               assert REPLACEMENT_RANK == {
@@ -874,6 +869,29 @@ jobs:
           python3 research/free-agent-production-v2/free_agent_production_v2_phase1.py --selftest
           python3 scripts/model/production_history_component.py --selftest
           python3 scripts/model/idp_v1_projection.py
+
+      - name: Preflight real FA production table parser
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version
+          python3 - <<'PY'
+          import importlib.util
+          import sys
+          from pathlib import Path
+
+          path = Path("research/free-agent-production-v2/free_agent_production_v2_phase1.py")
+          spec = importlib.util.spec_from_file_location("fa_prod_v2_phase1_parser_check", path)
+          assert spec is not None and spec.loader is not None
+          mod = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = mod
+          spec.loader.exec_module(mod)
+
+          rows = mod.parse_fa_prod_table()
+          assert rows, "FA_PROD_MULT_DATA parser returned zero rows"
+          assert all(r["pos"] and r["deployed_prod"] is not None for r in rows)
+          print(f"PASS: Node parsed real FA_PROD_MULT_DATA: {len(rows)} entries")
+          PY
 
       - name: Preflight Phase 1 repo imports and runtime classifier
         shell: bash
