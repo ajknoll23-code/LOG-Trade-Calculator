@@ -1,0 +1,647 @@
+name: Draft Pick FV V3 MFL Pooled Design Freeze
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Guard frozen source-only evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          test -f research/draft-pick-fv-v3/mfl_validated_proxy_feasibility_v1.json
+          test -f research/draft-pick-fv-v3/mfl_2018_boundary_recovery_v1.json
+          test -f research/draft-pick-fv-v3/mfl_2018_final_boundary_resolution_v1.json
+          test -f scripts/validation/repo_regression_checks.py
+
+          test ! -e research/draft-pick-fv-v3/mfl_pooled_design_freeze.py
+          test ! -e research/draft-pick-fv-v3/mfl_pooled_design_v1.json
+          test ! -e research/draft-pick-fv-v3/mfl_pooled_design_v1.md
+          test ! -e research/draft-pick-fv-v3/mfl_pooled_design_manifest_v1.json
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          base = Path("research/draft-pick-fv-v3")
+          feas = json.loads((base / "mfl_validated_proxy_feasibility_v1.json").read_text())
+          rec = json.loads((base / "mfl_2018_boundary_recovery_v1.json").read_text())
+          final = json.loads((base / "mfl_2018_final_boundary_resolution_v1.json").read_text())
+
+          assert feas["recommendation"] == "DISCOVERY_INCONCLUSIVE_OR_INSUFFICIENT"
+          assert feas["summary"]["total_full4"] == 217
+          assert feas["summary"]["total_full6"] == 69
+          assert feas["summary"]["total_full6_idp"] == 25
+          assert feas["historical_player_outcomes_read"] is False
+          assert feas["market_or_ktc_data_read"] is False
+          assert feas["package_vote_data_read"] is False
+          assert feas["candidate_fit_performed"] is False
+          assert feas["candidate_scores_computed"] is False
+          assert feas["production_change_authorized"] is False
+
+          assert rec["result"]["full4_lower_bound"] == 24
+          assert rec["result"]["gate"] == 25
+          assert rec["historical_player_outcomes_read"] is False
+          assert rec["candidate_fit_performed"] is False
+
+          assert final["result"]["decision"] == "MFL_2018_FULL4_GATE_STILL_UNRESOLVED_TRANSPORT"
+          assert final["result"]["full4_lower_bound"] == 24
+          assert final["result"]["gate"] == 25
+          assert final["result"]["still_unresolved_n"] == 9
+          assert final["historical_player_outcomes_read"] is False
+          assert final["candidate_fit_performed"] is False
+
+          print("PASS: frozen source-only evidence is intact; no outcome ingestion has occurred.")
+          PY
+
+      - name: Create pooled-design freezer
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > research/draft-pick-fv-v3/mfl_pooled_design_freeze.py <<'PY'
+          #!/usr/bin/env python3
+          from __future__ import annotations
+
+          import argparse
+          import hashlib
+          import json
+          import math
+          from collections import Counter
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from typing import Any
+
+          ROOT = Path(__file__).resolve().parents[2]
+          OUT = ROOT / "research" / "draft-pick-fv-v3"
+
+          FEAS = OUT / "mfl_validated_proxy_feasibility_v1.json"
+          RECOVERY = OUT / "mfl_2018_boundary_recovery_v1.json"
+          FINAL = OUT / "mfl_2018_final_boundary_resolution_v1.json"
+
+          JSON_OUT = OUT / "mfl_pooled_design_v1.json"
+          MD_OUT = OUT / "mfl_pooled_design_v1.md"
+          MAN_OUT = OUT / "mfl_pooled_design_manifest_v1.json"
+
+          YEARS = [2018, 2019, 2020, 2021, 2022, 2023]
+
+          # These are NEW design-sufficiency criteria, defined after source-only
+          # feasibility counts were observed but BEFORE any player outcomes,
+          # market/KTC data, candidate scores, or model fitting.
+          #
+          # They do NOT retroactively replace the inherited feasibility heuristics
+          # of >=25 full4/year and >=20 full6/year. Those remain failed/inconclusive
+          # exactly as recorded in the prior audit.
+          DESIGN = {
+              "r1_r4_nonmock_total_min": 180,
+              "r5_nonidp_nonmock_total_min": 60,
+              "r6_nonidp_nonmock_total_min": 36,
+              "r6_nonidp_nonmock_min_each_year": 3,
+              "r6_nonidp_nonmock_max_year_share": 0.30,
+              "r6_nonidp_effective_years_min": 4.5,
+              "r6_idp_nonmock_total_min_for_sensitivity_only": 20,
+              "r6_idp_nonmock_min_years_represented": 5,
+          }
+
+          class AuditError(RuntimeError):
+              pass
+
+          def sha256(path: Path) -> str:
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          def load(path: Path) -> dict[str, Any]:
+              return json.loads(path.read_text())
+
+          def is_obvious_mock(row: dict[str, Any]) -> bool:
+              # Preserve the exact diagnostic frozen by the source-feasibility audit.
+              return bool(row.get("obvious_mock_name", False))
+
+          def hhi_effective_years(counts: dict[int, int]) -> float:
+              total = sum(counts.values())
+              if total <= 0:
+                  return 0.0
+              shares = [v / total for v in counts.values() if v > 0]
+              return 1.0 / sum(s * s for s in shares)
+
+          def summarize(feas: dict[str, Any]) -> dict[str, Any]:
+              years: dict[int, dict[str, int]] = {}
+              rows_all: list[tuple[int, dict[str, Any]]] = []
+
+              for yr in feas["year_results"]:
+                  year = int(yr["year"])
+                  if year not in YEARS:
+                      continue
+                  pc = yr["pipeline_counts"]
+                  years[year] = {
+                      "reported_full4": int(pc["full4"]),
+                      "reported_full5": int(pc["full5"]),
+                      "reported_full6": int(pc["full6"]),
+                      "reported_full4_idp": int(pc["full4_idp"]),
+                      "reported_full5_idp": int(pc["full5_idp"]),
+                      "reported_full6_idp": int(pc["full6_idp"]),
+                      "reported_qualified": int(pc["qualified"]),
+                      "reported_obvious_mock": int(pc["qualified_obvious_mock_name"]),
+                  }
+                  for row in yr["qualifying_leagues"]:
+                      rows_all.append((year, row))
+
+              if sorted(years) != YEARS:
+                  raise AuditError(f"expected years {YEARS}, got {sorted(years)}")
+
+              # Independently reconstruct counts from frozen qualifying-league rows.
+              rec = {
+                  y: Counter(
+                      full4=0, full5=0, full6=0,
+                      full4_nonmock=0, full5_nonmock=0, full6_nonmock=0,
+                      full4_nonidp_nonmock=0, full5_nonidp_nonmock=0, full6_nonidp_nonmock=0,
+                      full4_idp_nonmock=0, full5_idp_nonmock=0, full6_idp_nonmock=0,
+                      mock_qualified=0, mock_full4=0, mock_full5=0, mock_full6=0,
+                  )
+                  for y in YEARS
+              }
+
+              for year, row in rows_all:
+                  d = row["depth"]
+                  mock = is_obvious_mock(row)
+                  idp = bool(row.get("idp", False))
+                  if mock:
+                      rec[year]["mock_qualified"] += 1
+
+                  for depth in (4, 5, 6):
+                      key = f"full{depth}"
+                      if not bool(d.get(key, False)):
+                          continue
+                      rec[year][key] += 1
+                      if mock:
+                          rec[year][f"mock_{key}"] += 1
+                          continue
+                      rec[year][f"{key}_nonmock"] += 1
+                      if idp:
+                          rec[year][f"{key}_idp_nonmock"] += 1
+                      else:
+                          rec[year][f"{key}_nonidp_nonmock"] += 1
+
+              # Verify reconstruction against the frozen aggregate pipeline counts.
+              for year in YEARS:
+                  for depth in (4, 5, 6):
+                      got = rec[year][f"full{depth}"]
+                      want = years[year][f"reported_full{depth}"]
+                      if got != want:
+                          raise AuditError(
+                              f"{year}: reconstructed full{depth}={got} != frozen pipeline count {want}"
+                          )
+                  if rec[year]["mock_qualified"] != years[year]["reported_obvious_mock"]:
+                      raise AuditError(
+                          f"{year}: reconstructed mock-qualified count drifted "
+                          f"({rec[year]['mock_qualified']} vs {years[year]['reported_obvious_mock']})"
+                      )
+
+              totals = Counter()
+              for year in YEARS:
+                  totals.update(rec[year])
+
+              if totals["full4"] != int(feas["summary"]["total_full4"]):
+                  raise AuditError("total full4 reconstruction drifted")
+              if totals["full6"] != int(feas["summary"]["total_full6"]):
+                  raise AuditError("total full6 reconstruction drifted")
+
+              r6_nonidp = {y: int(rec[y]["full6_nonidp_nonmock"]) for y in YEARS}
+              r6_idp = {y: int(rec[y]["full6_idp_nonmock"]) for y in YEARS}
+              r5_nonidp = {y: int(rec[y]["full5_nonidp_nonmock"]) for y in YEARS}
+              r4_nonmock = {y: int(rec[y]["full4_nonmock"]) for y in YEARS}
+
+              total_r6_nonidp = sum(r6_nonidp.values())
+              total_r6_idp = sum(r6_idp.values())
+              total_r5_nonidp = sum(r5_nonidp.values())
+              total_r4_nonmock = sum(r4_nonmock.values())
+
+              max_year_share = (
+                  max(r6_nonidp.values()) / total_r6_nonidp
+                  if total_r6_nonidp else 1.0
+              )
+              effective_years = hhi_effective_years(r6_nonidp)
+
+              criteria = {
+                  "r1_r4_nonmock_total": {
+                      "value": total_r4_nonmock,
+                      "required": DESIGN["r1_r4_nonmock_total_min"],
+                      "pass": total_r4_nonmock >= DESIGN["r1_r4_nonmock_total_min"],
+                  },
+                  "r5_nonidp_nonmock_total": {
+                      "value": total_r5_nonidp,
+                      "required": DESIGN["r5_nonidp_nonmock_total_min"],
+                      "pass": total_r5_nonidp >= DESIGN["r5_nonidp_nonmock_total_min"],
+                  },
+                  "r6_nonidp_nonmock_total": {
+                      "value": total_r6_nonidp,
+                      "required": DESIGN["r6_nonidp_nonmock_total_min"],
+                      "pass": total_r6_nonidp >= DESIGN["r6_nonidp_nonmock_total_min"],
+                  },
+                  "r6_nonidp_min_each_year": {
+                      "value": min(r6_nonidp.values()),
+                      "required": DESIGN["r6_nonidp_nonmock_min_each_year"],
+                      "pass": min(r6_nonidp.values()) >= DESIGN["r6_nonidp_nonmock_min_each_year"],
+                  },
+                  "r6_nonidp_max_year_share": {
+                      "value": max_year_share,
+                      "required_max": DESIGN["r6_nonidp_nonmock_max_year_share"],
+                      "pass": max_year_share <= DESIGN["r6_nonidp_nonmock_max_year_share"],
+                  },
+                  "r6_nonidp_effective_years": {
+                      "value": effective_years,
+                      "required": DESIGN["r6_nonidp_effective_years_min"],
+                      "pass": effective_years >= DESIGN["r6_nonidp_effective_years_min"],
+                  },
+                  "r6_idp_total_sensitivity_only": {
+                      "value": total_r6_idp,
+                      "required": DESIGN["r6_idp_nonmock_total_min_for_sensitivity_only"],
+                      "pass": total_r6_idp >= DESIGN["r6_idp_nonmock_total_min_for_sensitivity_only"],
+                  },
+                  "r6_idp_years_represented": {
+                      "value": sum(1 for v in r6_idp.values() if v > 0),
+                      "required": DESIGN["r6_idp_nonmock_min_years_represented"],
+                      "pass": sum(1 for v in r6_idp.values() if v > 0)
+                              >= DESIGN["r6_idp_nonmock_min_years_represented"],
+                  },
+              }
+
+              core_keys = [
+                  "r1_r4_nonmock_total",
+                  "r5_nonidp_nonmock_total",
+                  "r6_nonidp_nonmock_total",
+                  "r6_nonidp_min_each_year",
+                  "r6_nonidp_max_year_share",
+                  "r6_nonidp_effective_years",
+              ]
+              core_pass = all(criteria[k]["pass"] for k in core_keys)
+              idp_sensitivity_pass = (
+                  criteria["r6_idp_total_sensitivity_only"]["pass"]
+                  and criteria["r6_idp_years_represented"]["pass"]
+              )
+
+              if core_pass:
+                  decision = "ACCEPT_MFL_YEAR_BALANCED_POOLED_R1_R6_DESIGN"
+              elif (
+                  criteria["r1_r4_nonmock_total"]["pass"]
+                  and criteria["r5_nonidp_nonmock_total"]["pass"]
+              ):
+                  decision = "ACCEPT_MFL_R1_R5_DEEP_R6_NEEDS_SECOND_SOURCE"
+              else:
+                  decision = "MFL_POOLING_INSUFFICIENT_NEEDS_SECOND_SOURCE"
+
+              return {
+                  "years": years,
+                  "reconstructed_by_year": {
+                      str(y): dict(rec[y]) for y in YEARS
+                  },
+                  "totals": dict(totals),
+                  "analysis": {
+                      "r1_r4_nonmock_by_year": {str(k): v for k, v in r4_nonmock.items()},
+                      "r5_nonidp_nonmock_by_year": {str(k): v for k, v in r5_nonidp.items()},
+                      "r6_nonidp_nonmock_by_year": {str(k): v for k, v in r6_nonidp.items()},
+                      "r6_idp_nonmock_by_year": {str(k): v for k, v in r6_idp.items()},
+                      "r6_nonidp_total": total_r6_nonidp,
+                      "r6_idp_total": total_r6_idp,
+                      "r6_nonidp_max_year_share": max_year_share,
+                      "r6_nonidp_effective_years_hhi": effective_years,
+                      "r6_exact_slot_support_if_complete_drafts": total_r6_nonidp,
+                      "r5_exact_slot_support_if_complete_drafts": total_r5_nonidp,
+                  },
+                  "criteria": criteria,
+                  "core_pass": core_pass,
+                  "idp_sensitivity_pass": idp_sensitivity_pass,
+                  "decision": decision,
+              }
+
+          def build_payload() -> dict[str, Any]:
+              feas = load(FEAS)
+              recovery = load(RECOVERY)
+              final = load(FINAL)
+
+              if feas["recommendation"] != "DISCOVERY_INCONCLUSIVE_OR_INSUFFICIENT":
+                  raise AuditError("unexpected prior feasibility recommendation")
+              if feas["historical_player_outcomes_read"] is not False:
+                  raise AuditError("prior feasibility evidence already read outcomes")
+              if recovery["historical_player_outcomes_read"] is not False:
+                  raise AuditError("recovery evidence already read outcomes")
+              if final["historical_player_outcomes_read"] is not False:
+                  raise AuditError("final boundary evidence already read outcomes")
+
+              result = summarize(feas)
+
+              return {
+                  "schema_version": 1,
+                  "audit_id": "draft-pick-fv-v3-mfl-pooled-design-freeze",
+                  "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+                  "research_only": True,
+                  "pre_outcome_design_freeze": True,
+                  "historical_player_outcomes_read": False,
+                  "market_or_ktc_data_read": False,
+                  "package_vote_data_read": False,
+                  "candidate_fit_performed": False,
+                  "candidate_scores_computed": False,
+                  "production_change_authorized": False,
+                  "source_evidence_sha256": {
+                      "mfl_validated_proxy_feasibility_v1.json": sha256(FEAS),
+                      "mfl_2018_boundary_recovery_v1.json": sha256(RECOVERY),
+                      "mfl_2018_final_boundary_resolution_v1.json": sha256(FINAL),
+                  },
+                  "prior_feasibility_status_preserved": {
+                      "recommendation": feas["recommendation"],
+                      "inherited_min_full4_per_year": feas["feasibility_heuristics_only"]["min_full4_per_year"],
+                      "inherited_min_full6_per_year": feas["feasibility_heuristics_only"]["min_full6_per_year"],
+                      "inherited_min_full6_idp_per_year": feas["feasibility_heuristics_only"]["min_full6_idp_per_year"],
+                      "retroactively_reclassified_as_pass": False,
+                      "note": (
+                          "This design freeze does not change or reinterpret the earlier source-feasibility result. "
+                          "It defines a new pooled estimator design after source-only counts were observed and before "
+                          "any player outcome ingestion."
+                      ),
+                  },
+                  "2018_boundary_preserved": {
+                      "confirmed_full4_lower_bound": final["result"]["full4_lower_bound"],
+                      "gate": final["result"]["gate"],
+                      "still_unresolved_transport_ids": final["result"]["still_unresolved_n"],
+                      "formal_gate_pass_claimed": False,
+                      "practical_source_handling": (
+                          "Treat MFL as the primary R1-R4 source while retaining the formal 2018 24/25 "
+                          "transport-limited near-pass in the audit record."
+                      ),
+                  },
+                  "new_design_sufficiency_criteria": DESIGN,
+                  "mock_handling_frozen_before_outcomes": {
+                      "rule": "exclude rows with frozen obvious_mock_name == true from model-construction samples",
+                      "reason": "production pick values should be based on real league drafts, not obvious mocks",
+                      "name_rule_is_not_recomputed": True,
+                  },
+                  "idp_handling_frozen_before_outcomes": {
+                      "primary_non_idp_curve": "fit separately using non-IDP qualifying drafts",
+                      "idp_curve": (
+                          "do not pool IDP drafts into the primary non-IDP curve; use IDP full6 evidence "
+                          "for a separately reported sensitivity/secondary curve only unless a later, separately "
+                          "preregistered IDP design authorizes production use"
+                      ),
+                  },
+                  "pooling_design_if_accepted": {
+                      "years": YEARS,
+                      "r1_r4": (
+                          "use all frozen qualifying non-mock complete-R1-R4 drafts; year-balance downstream "
+                          "market aggregation so each draft class contributes equal total weight"
+                      ),
+                      "r5": (
+                          "use qualifying non-mock non-IDP complete-R1-R5 drafts with equal total weight per year"
+                      ),
+                      "r6": (
+                          "use qualifying non-mock non-IDP complete-R1-R6 drafts in a pooled hierarchical/smoothed "
+                          "slot estimator; equal total weight per year; do not estimate six independent per-year "
+                          "raw slot curves"
+                      ),
+                      "year_weighting": "1/6 total weight per draft class, divided equally among eligible drafts within year",
+                      "deep_round_estimator_constraint": (
+                          "R5-R6 must use shrinkage/smoothing across adjacent slots and years; no unsmoothed "
+                          "per-year deep-slot production curve is authorized"
+                      ),
+                      "selection_unit_note": (
+                          "league drafts describe market selection frequency; downstream outcome uncertainty must "
+                          "cluster repeated selections of the same player within draft class rather than treating "
+                          "every league pick as an independent player outcome"
+                      ),
+                  },
+                  "result": result,
+                  "next_step_if_accepted": (
+                      "Freeze the V3 historical draft-catalog harvest and outcome-model preregistration, then "
+                      "collect only the frozen qualifying league/draft IDs needed by this design. Do not read "
+                      "historical player outcomes until that preregistration is committed."
+                  ),
+                  "next_step_if_not_accepted": (
+                      "Audit a second historical draft source. Do not weaken these new pooled-design criteria "
+                      "after seeing the result."
+                  ),
+              }
+
+          def write_outputs(payload: dict[str, Any]) -> None:
+              JSON_OUT.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+              r = payload["result"]
+              a = r["analysis"]
+              c = r["criteria"]
+
+              lines = [
+                  "# Draft Pick FV V3 — MFL Pooled Design Freeze",
+                  "",
+                  f"**Decision:** `{r['decision']}`",
+                  "",
+                  "## Scientific status",
+                  "",
+                  "- The earlier MFL per-year feasibility result remains `DISCOVERY_INCONCLUSIVE_OR_INSUFFICIENT`.",
+                  "- The 2018 R1-R4 boundary remains a formal 24/25 transport-limited near-pass, not a retroactive pass.",
+                  "- This document defines a new pooled estimator design before any player-outcome ingestion.",
+                  "- No historical player outcomes, KTC/market values, package votes, candidate scores, or model fits were read.",
+                  "",
+                  "## Frozen pooled evidence after excluding obvious mocks",
+                  "",
+                  f"- R1-R4 non-mock complete drafts: **{c['r1_r4_nonmock_total']['value']}**",
+                  f"- R5 non-IDP non-mock complete drafts: **{c['r5_nonidp_nonmock_total']['value']}**",
+                  f"- R6 non-IDP non-mock complete drafts: **{c['r6_nonidp_nonmock_total']['value']}**",
+                  f"- R6 non-IDP minimum in any year: **{c['r6_nonidp_min_each_year']['value']}**",
+                  f"- R6 non-IDP maximum year share: **{c['r6_nonidp_max_year_share']['value']:.3f}**",
+                  f"- R6 non-IDP effective years (HHI): **{c['r6_nonidp_effective_years']['value']:.3f}**",
+                  f"- R6 IDP non-mock complete drafts: **{c['r6_idp_total_sensitivity_only']['value']}**",
+                  "",
+                  "## Frozen estimator rule",
+                  "",
+                  "If accepted, R5-R6 are not estimated as six independent yearly curves. "
+                  "They use year-balanced pooled evidence with smoothing/shrinkage across adjacent slots and years.",
+                  "",
+                  "Obvious mocks are excluded using the already-frozen diagnostic flag. "
+                  "IDP drafts are not mixed into the primary non-IDP curve.",
+                  "",
+              ]
+              MD_OUT.write_text("\n".join(lines))
+
+              manifest = {
+                  "schema_version": 1,
+                  "audit_id": payload["audit_id"],
+                  "generated_at_utc": payload["generated_at_utc"],
+                  "status": "mfl_pooled_design_freeze_complete",
+                  "decision": r["decision"],
+                  "historical_player_outcomes_read": False,
+                  "market_or_ktc_data_read": False,
+                  "package_vote_data_read": False,
+                  "candidate_fit_performed": False,
+                  "candidate_scores_computed": False,
+                  "production_change_authorized": False,
+                  "files": {
+                      JSON_OUT.name: sha256(JSON_OUT),
+                      MD_OUT.name: sha256(MD_OUT),
+                  },
+              }
+              MAN_OUT.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+          def selftest() -> None:
+              counts = {2018: 3, 2019: 3, 2020: 10, 2021: 8, 2022: 11, 2023: 9}
+              eff = hhi_effective_years(counts)
+              assert 5.0 < eff < 6.1
+              assert abs(sum(counts.values()) - 44) < 1e-9
+              assert max(counts.values()) / sum(counts.values()) == 11 / 44
+              print("PASS: pooled-design freezer self-test")
+
+          def check() -> None:
+              payload = load(JSON_OUT)
+              manifest = load(MAN_OUT)
+              assert payload["historical_player_outcomes_read"] is False
+              assert payload["candidate_fit_performed"] is False
+              assert payload["prior_feasibility_status_preserved"]["retroactively_reclassified_as_pass"] is False
+              assert payload["2018_boundary_preserved"]["formal_gate_pass_claimed"] is False
+              assert manifest["decision"] == payload["result"]["decision"]
+              assert manifest["files"][JSON_OUT.name] == sha256(JSON_OUT)
+              assert manifest["files"][MD_OUT.name] == sha256(MD_OUT)
+              print("PASS: pooled-design outputs validated")
+
+          def main() -> None:
+              p = argparse.ArgumentParser()
+              p.add_argument("--selftest", action="store_true")
+              p.add_argument("--check", action="store_true")
+              args = p.parse_args()
+
+              if args.selftest:
+                  selftest()
+                  return
+              if args.check:
+                  check()
+                  return
+
+              payload = build_payload()
+              write_outputs(payload)
+              print(json.dumps({
+                  "decision": payload["result"]["decision"],
+                  "criteria": payload["result"]["criteria"],
+                  "r6_nonidp_by_year": payload["result"]["analysis"]["r6_nonidp_nonmock_by_year"],
+                  "r6_idp_by_year": payload["result"]["analysis"]["r6_idp_nonmock_by_year"],
+              }, indent=2, sort_keys=True))
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          chmod +x research/draft-pick-fv-v3/mfl_pooled_design_freeze.py
+          python3 research/draft-pick-fv-v3/mfl_pooled_design_freeze.py --selftest
+
+      - name: Run pooled-design freeze
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 research/draft-pick-fv-v3/mfl_pooled_design_freeze.py
+
+      - name: Validate pooled-design outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 research/draft-pick-fv-v3/mfl_pooled_design_freeze.py --check
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          p = json.loads(Path("research/draft-pick-fv-v3/mfl_pooled_design_v1.json").read_text())
+          print("Decision:", p["result"]["decision"])
+          print("R6 non-IDP by year:", p["result"]["analysis"]["r6_nonidp_nonmock_by_year"])
+          print("R6 IDP by year:", p["result"]["analysis"]["r6_idp_nonmock_by_year"])
+          print("R6 non-IDP total:", p["result"]["analysis"]["r6_nonidp_total"])
+          print("R6 non-IDP effective years:", p["result"]["analysis"]["r6_nonidp_effective_years_hhi"])
+          print("IDP sensitivity pass:", p["result"]["idp_sensitivity_pass"])
+          PY
+
+      - name: Run repository regression checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/repo_regression_checks.py
+
+      - name: Prove only pooled-design files changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import subprocess
+
+          expected = {
+              "research/draft-pick-fv-v3/mfl_pooled_design_freeze.py",
+              "research/draft-pick-fv-v3/mfl_pooled_design_v1.json",
+              "research/draft-pick-fv-v3/mfl_pooled_design_v1.md",
+              "research/draft-pick-fv-v3/mfl_pooled_design_manifest_v1.json",
+          }
+
+          out = subprocess.check_output(
+              ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+              text=True,
+          )
+          changed = set()
+          for line in out.splitlines():
+              if not line.strip():
+                  continue
+              path = line[3:]
+              if " -> " in path:
+                  path = path.split(" -> ", 1)[1]
+              changed.add(path)
+
+          if changed != expected:
+              raise SystemExit(
+                  "Unexpected changed-file set.\n"
+                  f"Expected: {sorted(expected)}\n"
+                  f"Actual:   {sorted(changed)}"
+              )
+
+          print("PASS: exactly four intended pooled-design research files changed.")
+          PY
+
+      - name: Commit pooled-design freeze
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            research/draft-pick-fv-v3/mfl_pooled_design_freeze.py \
+            research/draft-pick-fv-v3/mfl_pooled_design_v1.json \
+            research/draft-pick-fv-v3/mfl_pooled_design_v1.md \
+            research/draft-pick-fv-v3/mfl_pooled_design_manifest_v1.json
+
+          git diff --cached --quiet && {
+            echo "No staged changes to commit."
+            exit 1
+          }
+
+          # Reduce the chance of a long-running research workflow losing a push race.
+          git pull --rebase --autostash origin main
+
+          # Re-run the safety checks after rebasing onto the latest main.
+          python3 research/draft-pick-fv-v3/mfl_pooled_design_freeze.py --check
+          python3 scripts/validation/repo_regression_checks.py
+
+          git commit -m "Freeze pooled MFL design for Draft Pick FV V3"
+          git push origin HEAD:main
