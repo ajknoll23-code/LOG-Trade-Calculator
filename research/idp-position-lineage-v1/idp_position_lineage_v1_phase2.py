@@ -1,0 +1,769 @@
+#!/usr/bin/env python3
+"""IDP Position Lineage V1 Phase 2 shadow/sanity validation."""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import hashlib
+import json
+import math
+from pathlib import Path
+import statistics
+import subprocess
+import sys
+
+SCRIPT = Path(__file__).resolve()
+ROOT = SCRIPT.parents[2]
+RESEARCH = ROOT / "research" / "idp-position-lineage-v1"
+
+P1B_JSON = RESEARCH / "idp_position_lineage_v1_phase1b.json"
+P1B_MANIFEST = RESEARCH / "phase1b_manifest.json"
+P1B_COHORT = RESEARCH / "phase1b_current_core_cohort.json"
+PREREG = RESEARCH / "phase2_preregistration.json"
+
+INDEX = ROOT / "index.html"
+ROSTERS = ROOT / "data" / "league_rosters.json"
+POSITIONS = (
+    ROOT / "scripts" / "artifacts" / "generated" / "player_positions.json"
+)
+
+OUT_JSON = RESEARCH / "idp_position_lineage_v1_phase2.json"
+OUT_MD = RESEARCH / "idp_position_lineage_v1_phase2.md"
+MANIFEST = RESEARCH / "phase2_manifest.json"
+
+PM_MIN = 0.15
+PM_MAX = 1.55
+ROUND_TOL = 0.000051
+IDP = {"DL", "LB", "DB"}
+
+def read_json(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+def sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def finite(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        x = float(value)
+    except (TypeError, ValueError):
+        return None
+    return x if math.isfinite(x) else None
+
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+def summarize(values):
+    vals = sorted(
+        float(v) for v in values
+        if v is not None and math.isfinite(float(v))
+    )
+    if not vals:
+        return {"n": 0}
+    def pct(q):
+        if len(vals) == 1:
+            return vals[0]
+        x = (len(vals) - 1) * q
+        lo = int(math.floor(x))
+        hi = int(math.ceil(x))
+        if lo == hi:
+            return vals[lo]
+        f = x - lo
+        return vals[lo] * (1 - f) + vals[hi] * f
+    return {
+        "n": len(vals),
+        "mean": statistics.fmean(vals),
+        "median": statistics.median(vals),
+        "p10": pct(0.10),
+        "p25": pct(0.25),
+        "p75": pct(0.75),
+        "p90": pct(0.90),
+        "p95": pct(0.95),
+        "min": vals[0],
+        "max": vals[-1],
+    }
+
+def load_runtime():
+    sys.path.insert(0, str(ROOT / "scripts" / "validation"))
+    sys.path.insert(0, str(ROOT / "research" / "team-utility"))
+    import snapshot_values
+    import team_utility_starter_objective_audit as starter_audit
+
+    base = snapshot_values.load_from_html(INDEX)
+    rosters = read_json(ROSTERS)
+    merged = starter_audit.merge_live_league_into_cfg(base, rosters)
+    unresolved = (
+        merged.get("live_merge_stats", {}).get("unresolved_positions") or []
+    )
+    if unresolved:
+        raise RuntimeError(
+            "live merge unresolved positions: "
+            + json.dumps(unresolved[:20], sort_keys=True)
+        )
+    return snapshot_values, merged
+
+def verify_manifest_outputs(manifest):
+    errors = []
+    for rel, expected in manifest["output_sha256"].items():
+        path = ROOT / rel
+        actual = sha256(path) if path.exists() else "missing"
+        if actual != expected:
+            errors.append({
+                "path": rel,
+                "expected": expected,
+                "actual": actual,
+            })
+    return errors
+
+def ordinal_ranks(values, keys):
+    ordered = sorted(
+        keys,
+        key=lambda k: (-int(values[k]["value"]), k),
+    )
+    return {k: i + 1 for i, k in enumerate(ordered)}
+
+def percentile_rank(values, pos, key):
+    peers = sorted(
+        [
+            int(v["value"])
+            for k, v in values.items()
+            if v["pos"] == pos
+        ]
+    )
+    if not peers:
+        return None
+    x = int(values[key]["value"])
+    le = sum(v <= x for v in peers)
+    return le / len(peers)
+
+def build():
+    p1b = read_json(P1B_JSON)
+    p1b_manifest = read_json(P1B_MANIFEST)
+    cohort_doc = read_json(P1B_COHORT)
+    positions = read_json(POSITIONS)
+
+    snapshot_values, cfg = load_runtime()
+    current_values = snapshot_values.compute_all_values(cfg)
+
+    hash_errors = verify_manifest_outputs(p1b_manifest)
+
+    cohort = list(cohort_doc["rows"])
+    cohort_keys = [r["key"] for r in cohort]
+    cohort_set = set(cohort_keys)
+    p1b_rows = {
+        r["key"]: r for r in p1b["rows"]
+    }
+
+    identity_position_errors = []
+    deployed_raw_errors = []
+    reconstruction_errors = []
+    offset_errors = []
+    held_mutation_errors = []
+
+    candidate_prod = dict(cfg["prod_mult"])
+    candidate_keys = []
+    held_keys = []
+    candidate_meta = {}
+
+    for cohort_row in cohort:
+        key = cohort_row["key"]
+        frozen_row = p1b_rows[key]
+        current_pos = cohort_row["current_position"]
+        info = cfg["player_db"].get(key)
+
+        if (
+            key not in current_values
+            or not info
+            or info.get("pos") != current_pos
+            or positions.get(key) != current_pos
+        ):
+            identity_position_errors.append({
+                "key": key,
+                "cohort_position": current_pos,
+                "generated_position": positions.get(key),
+                "live_position": (
+                    info.get("pos") if info else None
+                ),
+                "renders": key in current_values,
+            })
+            continue
+
+        deployed = finite(cfg["prod_mult"].get(key))
+        p1b_deployed = finite(
+            frozen_row["deployed_raw_prod_mult"]
+        )
+        if (
+            deployed is None
+            or p1b_deployed is None
+            or abs(deployed - p1b_deployed) > 1e-9
+        ):
+            deployed_raw_errors.append({
+                "key": key,
+                "current_deployed": deployed,
+                "phase1b_deployed": p1b_deployed,
+            })
+
+        if frozen_row["status"] == "hold":
+            held_keys.append(key)
+            candidate_prod[key] = deployed
+            continue
+
+        candidate_keys.append(key)
+        candidate = finite(
+            frozen_row["candidate_raw_prod_mult"]
+        )
+        legacy_clean = finite(
+            frozen_row["legacy_clean_model_prod_mult"]
+        )
+        current_clean = finite(
+            frozen_row["current_clean_model_prod_mult"]
+        )
+        if None in (
+            deployed,
+            candidate,
+            legacy_clean,
+            current_clean,
+        ):
+            reconstruction_errors.append({
+                "key": key,
+                "reason": "missing_numeric_component",
+            })
+            continue
+
+        raw_unclamped = (
+            deployed + current_clean - legacy_clean
+        )
+        reconstructed = round(
+            clamp(raw_unclamped, PM_MIN, PM_MAX), 4
+        )
+        if abs(candidate - reconstructed) > 1e-9:
+            reconstruction_errors.append({
+                "key": key,
+                "candidate": candidate,
+                "reconstructed": reconstructed,
+                "raw_unclamped": raw_unclamped,
+            })
+
+        clamped = (
+            raw_unclamped < PM_MIN - 1e-12
+            or raw_unclamped > PM_MAX + 1e-12
+        )
+        old_offset = deployed - legacy_clean
+        new_offset = candidate - current_clean
+        offset_residual = new_offset - old_offset
+        if not clamped and abs(offset_residual) > ROUND_TOL:
+            offset_errors.append({
+                "key": key,
+                "old_offset": old_offset,
+                "new_offset": new_offset,
+                "residual": offset_residual,
+            })
+
+        candidate_meta[key] = {
+            "raw_unclamped": raw_unclamped,
+            "clamped": clamped,
+            "old_model_offset": old_offset,
+            "new_model_offset": new_offset,
+            "offset_residual": offset_residual,
+        }
+        candidate_prod[key] = candidate
+
+    shadow_cfg = copy.deepcopy(cfg)
+    shadow_cfg["prod_mult"] = candidate_prod
+    shadow_values = snapshot_values.compute_all_values(shadow_cfg)
+
+    metadata_errors = []
+    invalid_values = []
+    direction_errors = []
+    noncohort_changes = []
+    offense_changes = []
+
+    rows = []
+    for key in cohort_keys:
+        old = current_values.get(key)
+        new = shadow_values.get(key)
+        frozen = p1b_rows[key]
+        info = cfg["player_db"].get(key)
+
+        if old is None or new is None or info is None:
+            continue
+
+        if frozen["status"] == "hold" and old["value"] != new["value"]:
+            held_mutation_errors.append({
+                "key": key,
+                "current_fv": old["value"],
+                "shadow_fv": new["value"],
+            })
+
+        for field in ("pos", "age", "role"):
+            old_field = (
+                old[field] if field in old else info.get(field)
+            )
+            new_field = (
+                new[field] if field in new else info.get(field)
+            )
+            if old_field != new_field:
+                metadata_errors.append({
+                    "key": key,
+                    "field": field,
+                    "old": old_field,
+                    "new": new_field,
+                })
+
+        if old["age_mult"] != new["age_mult"]:
+            metadata_errors.append({
+                "key": key,
+                "field": "age_mult",
+                "old": old["age_mult"],
+                "new": new["age_mult"],
+            })
+        if (
+            old["no_real_production_history"]
+            != new["no_real_production_history"]
+        ):
+            metadata_errors.append({
+                "key": key,
+                "field": "no_real_production_history",
+            })
+
+        if not isinstance(new["value"], int) or new["value"] <= 0:
+            invalid_values.append(key)
+
+        old_raw = finite(
+            frozen["deployed_raw_prod_mult"]
+        )
+        new_raw = finite(
+            frozen["candidate_raw_prod_mult"]
+        )
+        raw_delta = (
+            new_raw - old_raw
+            if old_raw is not None and new_raw is not None
+            else 0.0
+        )
+        fv_delta = int(new["value"]) - int(old["value"])
+        if (
+            (raw_delta > 1e-12 and fv_delta < 0)
+            or (raw_delta < -1e-12 and fv_delta > 0)
+        ):
+            direction_errors.append({
+                "key": key,
+                "raw_delta": raw_delta,
+                "fv_delta": fv_delta,
+            })
+
+        pos = old["pos"]
+        pos_keys = [
+            k for k, v in current_values.items()
+            if v["pos"] == pos
+        ]
+        old_rank_map = ordinal_ranks(current_values, pos_keys)
+        new_rank_map = ordinal_ranks(shadow_values, pos_keys)
+
+        rows.append({
+            "key": key,
+            "status": frozen["status"],
+            "current_position": pos,
+            "deployed_raw_prod_mult": old_raw,
+            "candidate_raw_prod_mult": new_raw,
+            "raw_prod_mult_delta": raw_delta,
+            "current_fv": int(old["value"]),
+            "shadow_fv": int(new["value"]),
+            "fv_delta": fv_delta,
+            "fv_pct_change": (
+                fv_delta / old["value"]
+                if old["value"] else None
+            ),
+            "current_position_rank": old_rank_map[key],
+            "shadow_position_rank": new_rank_map[key],
+            "position_rank_delta": (
+                new_rank_map[key] - old_rank_map[key]
+            ),
+            "current_position_percentile": percentile_rank(
+                current_values, pos, key
+            ),
+            "shadow_position_percentile": percentile_rank(
+                shadow_values, pos, key
+            ),
+            "age": old["age"],
+            "role": old["role"],
+            "age_mult": old["age_mult"],
+            "position_weight": cfg["position_weight"][pos],
+            "no_real_production_history": old[
+                "no_real_production_history"
+            ],
+            "transport": candidate_meta.get(key),
+        })
+
+    for key, old in current_values.items():
+        new = shadow_values[key]
+        if old["value"] == new["value"]:
+            continue
+        if key not in cohort_set:
+            noncohort_changes.append({
+                "key": key,
+                "pos": old["pos"],
+                "current_fv": old["value"],
+                "shadow_fv": new["value"],
+            })
+        if old["pos"] in {"QB", "RB", "WR", "TE", "K"}:
+            offense_changes.append(key)
+
+    def position_distribution(values, pos):
+        vals = [
+            v["value"] for v in values.values()
+            if v["pos"] == pos
+        ]
+        return summarize(vals)
+
+    position_diagnostics = {}
+    for pos in sorted(IDP):
+        current_keys = [
+            k for k, v in current_values.items()
+            if v["pos"] == pos
+        ]
+        current_rank = ordinal_ranks(
+            current_values, current_keys
+        )
+        shadow_rank = ordinal_ranks(
+            shadow_values, current_keys
+        )
+        target = [
+            r for r in rows
+            if r["current_position"] == pos
+        ]
+        position_diagnostics[pos] = {
+            "population_n": len(current_keys),
+            "current_distribution": position_distribution(
+                current_values, pos
+            ),
+            "shadow_distribution": position_distribution(
+                shadow_values, pos
+            ),
+            "target_n": len(target),
+            "candidate_n": sum(
+                r["status"] == "candidate" for r in target
+            ),
+            "top12_entries": sum(
+                current_rank[r["key"]] > 12
+                and shadow_rank[r["key"]] <= 12
+                for r in target
+            ),
+            "top12_exits": sum(
+                current_rank[r["key"]] <= 12
+                and shadow_rank[r["key"]] > 12
+                for r in target
+            ),
+            "top24_entries": sum(
+                current_rank[r["key"]] > 24
+                and shadow_rank[r["key"]] <= 24
+                for r in target
+            ),
+            "top24_exits": sum(
+                current_rank[r["key"]] <= 24
+                and shadow_rank[r["key"]] > 24
+                for r in target
+            ),
+            "top36_entries": sum(
+                current_rank[r["key"]] > 36
+                and shadow_rank[r["key"]] <= 36
+                for r in target
+            ),
+            "top36_exits": sum(
+                current_rank[r["key"]] <= 36
+                and shadow_rank[r["key"]] > 36
+                for r in target
+            ),
+            "max_abs_rank_move": max(
+                (
+                    abs(
+                        shadow_rank[r["key"]]
+                        - current_rank[r["key"]]
+                    )
+                    for r in target
+                ),
+                default=0,
+            ),
+        }
+
+    candidate_rows = [
+        r for r in rows if r["status"] == "candidate"
+    ]
+    clamped_candidates = [
+        r["key"] for r in candidate_rows
+        if (r.get("transport") or {}).get("clamped")
+    ]
+
+    gates = {
+        "phase1b_pass_and_hashes_intact": {
+            "pass": (
+                p1b["decision"]
+                == "PASS_IDP_POSITION_LINEAGE_V1_PHASE1B_CURRENT_CORE_FREEZE"
+                and not hash_errors
+            ),
+            "phase1b_decision": p1b["decision"],
+            "hash_errors": hash_errors,
+        },
+        "frozen_cohort_identity_position_intact": {
+            "pass": not identity_position_errors,
+            "errors": identity_position_errors,
+        },
+        "deployed_raw_still_matches_phase1b": {
+            "pass": not deployed_raw_errors,
+            "errors": deployed_raw_errors,
+        },
+        "transport_reconstruction_exact": {
+            "pass": not reconstruction_errors,
+            "errors": reconstruction_errors,
+        },
+        "unclamped_model_offset_preserved": {
+            "pass": not offset_errors,
+            "errors": offset_errors,
+            "rounding_tolerance": ROUND_TOL,
+            "clamped_candidates": clamped_candidates,
+        },
+        "candidate_metadata_and_age_multiplier_unchanged": {
+            "pass": not metadata_errors,
+            "errors": metadata_errors,
+        },
+        "held_rows_unchanged": {
+            "pass": not held_mutation_errors,
+            "errors": held_mutation_errors,
+        },
+        "candidate_values_valid": {
+            "pass": not invalid_values,
+            "keys": invalid_values,
+        },
+        "prod_direction_fv_monotonic": {
+            "pass": not direction_errors,
+            "errors": direction_errors,
+        },
+        "zero_noncohort_fv_changes": {
+            "pass": not noncohort_changes,
+            "changes": noncohort_changes[:25],
+        },
+        "zero_offense_fv_changes": {
+            "pass": not offense_changes,
+            "keys": offense_changes,
+        },
+    }
+
+    all_pass = all(g["pass"] for g in gates.values())
+    decision = (
+        "PASS_IDP_POSITION_LINEAGE_V1_PHASE2_SHADOW_SANITY"
+        if all_pass
+        else "STOP_IDP_POSITION_LINEAGE_V1_PHASE2_SHADOW_SANITY"
+    )
+
+    largest = sorted(
+        candidate_rows,
+        key=lambda r: (-abs(r["fv_delta"]), r["key"]),
+    )[:30]
+
+    return {
+        "study_id": "idp-position-lineage-v1",
+        "phase": 2,
+        "status": "SHADOW_SANITY_COMPLETE",
+        "decision": decision,
+        "production_change_authorized": False,
+        "repo_commit_sha_evaluated": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True
+        ).strip(),
+        "counts": {
+            "frozen_cohort": len(cohort_keys),
+            "candidate_rows": len(candidate_keys),
+            "held_rows": len(held_keys),
+            "changed_candidate_fv_rows": sum(
+                r["fv_delta"] != 0
+                for r in candidate_rows
+            ),
+            "clamped_candidates": len(
+                clamped_candidates
+            ),
+        },
+        "gates": gates,
+        "diagnostics": {
+            "candidate_raw_delta": summarize(
+                [r["raw_prod_mult_delta"] for r in candidate_rows]
+            ),
+            "candidate_fv_delta": summarize(
+                [r["fv_delta"] for r in candidate_rows]
+            ),
+            "candidate_fv_pct_change": summarize(
+                [r["fv_pct_change"] for r in candidate_rows]
+            ),
+            "candidate_abs_rank_move": summarize(
+                [
+                    abs(r["position_rank_delta"])
+                    for r in candidate_rows
+                ]
+            ),
+            "position_distribution": position_diagnostics,
+            "largest_absolute_fv_movers": largest,
+        },
+        "rows": rows,
+        "next_step_if_pass": (
+            "SEPARATE_GUARDED_PRODUCTION_CONFIRMATION"
+        ),
+        "next_step_if_stop": (
+            "CLOSE_OR_REPAIR_WITHOUT_WEAKENING_GATES"
+        ),
+    }
+
+def markdown(r):
+    c = r["counts"]
+    d = r["diagnostics"]
+    lines = [
+        "# IDP Position Lineage V1 — Phase 2 Shadow Sanity",
+        "",
+        f"**Decision:** `{r['decision']}`",
+        "",
+        "Production remains unchanged.",
+        "",
+        "## Frozen candidate",
+        "",
+        f"- Current-core cohort: **{c['frozen_cohort']}**",
+        f"- Candidate rows: **{c['candidate_rows']}**",
+        f"- Held rows: **{c['held_rows']}**",
+        f"- Candidate rows with changed FV: **{c['changed_candidate_fv_rows']}**",
+        f"- Clamp-saturated candidates: **{c['clamped_candidates']}**",
+        "",
+        "## Hard gates",
+        "",
+        "| Gate | Result |",
+        "|---|---|",
+    ]
+    for key, gate in r["gates"].items():
+        lines.append(
+            f"| `{key}` | {'PASS' if gate['pass'] else 'FAIL'} |"
+        )
+
+    lines += [
+        "",
+        "## Candidate movement diagnostics",
+        "",
+        f"- Median raw PROD_MULT delta: **{d['candidate_raw_delta'].get('median', 0):+.4f}**",
+        f"- Median FV delta: **{d['candidate_fv_delta'].get('median', 0):+.1f}**",
+        f"- P90 FV delta: **{d['candidate_fv_delta'].get('p90', 0):+.1f}**",
+        f"- Median FV % change: **{d['candidate_fv_pct_change'].get('median', 0):+.1%}**",
+        f"- Median absolute position-rank move: **{d['candidate_abs_rank_move'].get('median', 0):.1f}**",
+        f"- P90 absolute position-rank move: **{d['candidate_abs_rank_move'].get('p90', 0):.1f}**",
+        "",
+        "## Position distribution diagnostics",
+        "",
+        "| Pos | Pop N | Targets | Candidates | Current median FV | Shadow median FV | Top-12 in/out | Top-24 in/out | Top-36 in/out | Max abs move |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for pos in sorted(IDP):
+        s = d["position_distribution"][pos]
+        lines.append(
+            f"| {pos} | {s['population_n']} | {s['target_n']} | "
+            f"{s['candidate_n']} | "
+            f"{s['current_distribution'].get('median', 0):.1f} | "
+            f"{s['shadow_distribution'].get('median', 0):.1f} | "
+            f"{s['top12_entries']}/{s['top12_exits']} | "
+            f"{s['top24_entries']}/{s['top24_exits']} | "
+            f"{s['top36_entries']}/{s['top36_exits']} | "
+            f"{s['max_abs_rank_move']} |"
+        )
+
+    lines += [
+        "",
+        "## Largest candidate FV movers",
+        "",
+        "| Player | Pos | Old FV | Shadow FV | Delta | Old Prod | New Prod | Rank Delta |",
+        "|---|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for row in d["largest_absolute_fv_movers"][:20]:
+        lines.append(
+            f"| {row['key']} | {row['current_position']} | "
+            f"{row['current_fv']} | {row['shadow_fv']} | "
+            f"{row['fv_delta']:+d} | "
+            f"{row['deployed_raw_prod_mult']:.4f} | "
+            f"{row['candidate_raw_prod_mult']:.4f} | "
+            f"{row['position_rank_delta']:+d} |"
+        )
+
+    lines += [
+        "",
+        "## Decision semantics",
+        "",
+        "A PASS establishes that the large movement is structurally "
+        "isolated and consistent with the original IDP V1 transport "
+        "methodology. It does not by itself authorize deployment.",
+        "",
+    ]
+    return "\n".join(lines)
+
+def write():
+    result = build()
+    OUT_JSON.write_text(
+        json.dumps(result, indent=2, sort_keys=True) + "\n"
+    )
+    OUT_MD.write_text(markdown(result) + "\n")
+
+    manifest = {
+        "study_id": result["study_id"],
+        "phase": 2,
+        "decision": result["decision"],
+        "production_change_authorized": False,
+        "repo_commit_sha_evaluated": result[
+            "repo_commit_sha_evaluated"
+        ],
+        "preregistration_sha256": sha256(PREREG),
+        "phase1b_manifest_sha256": sha256(P1B_MANIFEST),
+        "output_sha256": {
+            str(PREREG.relative_to(ROOT)): sha256(PREREG),
+            str(
+                (RESEARCH / "phase2_preregistration.md").relative_to(ROOT)
+            ): sha256(RESEARCH / "phase2_preregistration.md"),
+            str(SCRIPT.relative_to(ROOT)): sha256(SCRIPT),
+            str(OUT_JSON.relative_to(ROOT)): sha256(OUT_JSON),
+            str(OUT_MD.relative_to(ROOT)): sha256(OUT_MD),
+        },
+    }
+    MANIFEST.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    )
+
+    print(json.dumps({
+        "decision": result["decision"],
+        "cohort": result["counts"]["frozen_cohort"],
+        "candidates": result["counts"]["candidate_rows"],
+        "held": result["counts"]["held_rows"],
+        "changed": result["counts"]["changed_candidate_fv_rows"],
+    }, indent=2))
+
+def selftest():
+    deployed = 0.90
+    legacy_clean = 0.65
+    current_clean = 0.95
+    candidate = round(
+        clamp(
+            deployed + current_clean - legacy_clean,
+            PM_MIN,
+            PM_MAX,
+        ),
+        4,
+    )
+    assert candidate == 1.20
+    assert abs(
+        (candidate - current_clean)
+        - (deployed - legacy_clean)
+    ) <= ROUND_TOL
+    print("IDP Position Lineage V1 Phase 2 self-test PASS")
+
+def main():
+    ap = argparse.ArgumentParser()
+    group = ap.add_mutually_exclusive_group(required=True)
+    group.add_argument("--selftest", action="store_true")
+    group.add_argument("--write", action="store_true")
+    args = ap.parse_args()
+    if args.selftest:
+        selftest()
+    else:
+        write()
+
+if __name__ == "__main__":
+    main()
