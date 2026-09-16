@@ -24,6 +24,7 @@ INDEX = REPO_ROOT / "index.html"
 BASELINE = REPO_ROOT / "model" / "releases" / "idp-v1" / "prod_mult_pre_v1_baseline.json"
 CANDIDATE = REPO_ROOT / "model" / "releases" / "idp-v1" / "idp_v1_model_delta_transport_candidate.json"
 PATCH = REPO_ROOT / "model" / "releases" / "idp-v1" / "idp_v1_prod_mult_patch.json"
+POSITION_LINEAGE_RELEASE = REPO_ROOT / "model" / "releases" / "idp-position-lineage-v1" / "release.json"
 JSON_OUT = SCRIPT_DIR / "idp_v1_final_deployment_validation.json"
 REPORT = SCRIPT_DIR / "idp_v1_final_deployment_validation.md"
 IDP_POSITIONS = ("LB", "DL", "DB")
@@ -86,48 +87,167 @@ def validate_deployment():
     patch = json.load(open(PATCH, encoding="utf-8"))
     current = {k: float(v) for k, v in cfg["prod_mult"].items()}
 
-    # Exact deployed-table integrity.
+    # Layer-aware deployed-table integrity.
+    #
+    # The immutable IDP V1 release remains the historical base release. A later
+    # approved position-lineage release may intentionally replace a narrow set
+    # of those deployed raw multipliers. Validate V1 against its own immutable
+    # baseline/candidate first, then validate any successor overlay on top.
     if set(current) != set(baseline):
         missing = sorted(set(baseline) - set(current))
         extra = sorted(set(current) - set(baseline))
-        raise AssertionError(f"PROD_MULT key set changed across V1 deployment; missing={missing[:10]} extra={extra[:10]}")
+        raise AssertionError(
+            "PROD_MULT key set changed across deployed IDP stack; "
+            f"missing={missing[:10]} extra={extra[:10]}"
+        )
 
     patch_by_key = {e["key"]: e for e in patch["entries"]}
-    actual_changed = {k for k in baseline if abs(current[k] - baseline[k]) > 1e-12}
     expected_changed = set(patch_by_key)
-    if actual_changed != expected_changed:
-        missing = sorted(expected_changed - actual_changed)
-        unexpected = sorted(actual_changed - expected_changed)
-        raise AssertionError(f"deployed changed-key set != approved patch; missing={missing[:10]} unexpected={unexpected[:10]}")
 
-    for key, row in candidate["players"].items():
-        if key not in current:
-            raise AssertionError(f"candidate key missing from deployed PROD_MULT: {key}")
-        expected = fmt_value(row["candidate_prod_mult"])
-        if abs(current[key] - expected) > 1e-12:
-            raise AssertionError(f"deployed candidate mismatch {key}: expected {expected}, got {current[key]}")
-
+    v1_expected = dict(baseline)
     for key, e in patch_by_key.items():
         if abs(float(e["old"]) - baseline[key]) > 1e-12:
-            raise AssertionError(f"patch old value no longer matches immutable baseline: {key}")
-        if abs(fmt_value(e["new"]) - current[key]) > 1e-12:
-            raise AssertionError(f"patch new value no longer matches deployed value: {key}")
+            raise AssertionError(
+                f"patch old value no longer matches immutable baseline: {key}"
+            )
+        v1_expected[key] = fmt_value(e["new"])
 
-    # Reconstruct the exact old live valuation by swapping only PROD_MULT back
-    # to the immutable baseline; every other current valuation constant remains
-    # identical, which is exactly the release attribution we want.
+    v1_changed = {
+        k for k in baseline
+        if abs(v1_expected[k] - baseline[k]) > 1e-12
+    }
+    if v1_changed != expected_changed:
+        missing = sorted(expected_changed - v1_changed)
+        unexpected = sorted(v1_changed - expected_changed)
+        raise AssertionError(
+            "reconstructed V1 changed-key set != approved patch; "
+            f"missing={missing[:10]} unexpected={unexpected[:10]}"
+        )
+
+    for key, row in candidate["players"].items():
+        if key not in v1_expected:
+            raise AssertionError(
+                f"candidate key missing from reconstructed V1 PROD_MULT: {key}"
+            )
+        expected = fmt_value(row["candidate_prod_mult"])
+        if abs(v1_expected[key] - expected) > 1e-12:
+            raise AssertionError(
+                f"reconstructed V1 candidate mismatch {key}: "
+                f"expected {expected}, got {v1_expected[key]}"
+            )
+
+    for key, e in patch_by_key.items():
+        if abs(fmt_value(e["new"]) - v1_expected[key]) > 1e-12:
+            raise AssertionError(
+                f"patch new value no longer matches reconstructed V1 value: {key}"
+            )
+
+    lineage_release = None
+    lineage_candidates = {}
+    lineage_holds = {}
+    expected_current = dict(v1_expected)
+
+    if POSITION_LINEAGE_RELEASE.exists():
+        lineage_release = json.load(
+            open(POSITION_LINEAGE_RELEASE, encoding="utf-8")
+        )
+        if lineage_release.get("release_id") != "idp-position-lineage-v1":
+            raise AssertionError(
+                "unexpected Position Lineage release_id: "
+                f"{lineage_release.get('release_id')}"
+            )
+
+        candidate_rows = lineage_release.get("candidate_overrides") or []
+        hold_rows = lineage_release.get("held_rows") or []
+        if len(candidate_rows) != 24 or len(hold_rows) != 3:
+            raise AssertionError(
+                "Position Lineage release count mismatch: "
+                f"candidates={len(candidate_rows)} holds={len(hold_rows)}"
+            )
+
+        lineage_candidates = {row["key"]: row for row in candidate_rows}
+        lineage_holds = {row["key"]: row for row in hold_rows}
+        if len(lineage_candidates) != len(candidate_rows):
+            raise AssertionError("duplicate Position Lineage candidate key")
+        if len(lineage_holds) != len(hold_rows):
+            raise AssertionError("duplicate Position Lineage hold key")
+        if set(lineage_candidates) & set(lineage_holds):
+            raise AssertionError("Position Lineage candidate/hold key sets overlap")
+
+        for key, row in lineage_candidates.items():
+            if key not in v1_expected:
+                raise AssertionError(
+                    f"Position Lineage candidate missing from V1 table: {key}"
+                )
+            base = float(row["deployed_raw_prod_mult"])
+            if abs(v1_expected[key] - base) > 1e-12:
+                raise AssertionError(
+                    f"Position Lineage base mismatch {key}: "
+                    f"release={base}, reconstructed_v1={v1_expected[key]}"
+                )
+            expected_current[key] = fmt_value(row["candidate_raw_prod_mult"])
+
+        for key, row in lineage_holds.items():
+            if key not in v1_expected:
+                raise AssertionError(
+                    f"Position Lineage hold missing from V1 table: {key}"
+                )
+            base = float(row["deployed_raw_prod_mult"])
+            if abs(v1_expected[key] - base) > 1e-12:
+                raise AssertionError(
+                    f"Position Lineage hold base mismatch {key}: "
+                    f"release={base}, reconstructed_v1={v1_expected[key]}"
+                )
+
+    current_mismatches = []
+    for key in baseline:
+        if abs(current[key] - expected_current[key]) > 1e-12:
+            current_mismatches.append((key, expected_current[key], current[key]))
+    if current_mismatches:
+        raise AssertionError(
+            "live PROD_MULT does not match V1 + approved successor stack: "
+            f"{current_mismatches[:10]}"
+        )
+
+    lineage_changed = {
+        key for key in v1_expected
+        if abs(expected_current[key] - v1_expected[key]) > 1e-12
+    }
+    if lineage_release is not None and lineage_changed != set(lineage_candidates):
+        missing = sorted(set(lineage_candidates) - lineage_changed)
+        unexpected = sorted(lineage_changed - set(lineage_candidates))
+        raise AssertionError(
+            "Position Lineage changed-key set mismatch: "
+            f"missing={missing[:10]} unexpected={unexpected[:10]}"
+        )
+
+    actual_changed = v1_changed
+    current_stack_changed = {
+        k for k in baseline
+        if abs(current[k] - baseline[k]) > 1e-12
+    }
+
+    # Preserve historical V1 movement independently of successor layers.
     old_cfg = dict(cfg)
-    old_cfg["prod_mult"] = dict(current)
-    old_cfg["prod_mult"].update(baseline)
+    old_cfg["prod_mult"] = dict(baseline)
+    v1_cfg = dict(cfg)
+    v1_cfg["prod_mult"] = dict(v1_expected)
+
     old_values = snapshot_values.compute_all_values(old_cfg)
-    new_values = snapshot_values.compute_all_values(cfg)
+    new_values = snapshot_values.compute_all_values(v1_cfg)
+    current_values = snapshot_values.compute_all_values(cfg)
     old_ranks, new_ranks = rank_map(old_values), rank_map(new_values)
 
     # Non-IDP final values must be completely unchanged by this deployment.
     non_idp_diffs = []
     for key, old in old_values.items():
-        if old["pos"] not in IDP_POSITIONS and new_values[key]["value"] != old["value"]:
-            non_idp_diffs.append((key, old["value"], new_values[key]["value"]))
+        if (
+            old["pos"] not in IDP_POSITIONS
+            and current_values[key]["value"] != old["value"]
+        ):
+            non_idp_diffs.append(
+                (key, old["value"], current_values[key]["value"])
+            )
     if non_idp_diffs:
         raise AssertionError(f"non-IDP final values changed: {non_idp_diffs[:10]}")
 
@@ -140,7 +260,7 @@ def validate_deployment():
         new = new_values[key]
         pct = (new["value"] / old["value"] - 1) * 100 if old["value"] else None
         raw_old = baseline.get(key)
-        raw_new = current.get(key)
+        raw_new = v1_expected.get(key)
         raw_pct = ((raw_new / raw_old - 1) * 100) if raw_old and raw_new is not None else None
         cand = candidate["players"].get(key, {})
         row = {
@@ -183,7 +303,7 @@ def validate_deployment():
     by_cohort_final = defaultdict(list)
     for key, cand in candidate["players"].items():
         cohort = cand["v1_source_cohort"]
-        old_raw, new_raw = baseline[key], current[key]
+        old_raw, new_raw = baseline[key], v1_expected[key]
         by_cohort_raw[cohort].append((new_raw / old_raw - 1) * 100 if old_raw else None)
         match = next((r for r in rows if r["key"] == key), None)
         if match:
@@ -192,8 +312,8 @@ def validate_deployment():
     clamp = {
         "pre_v1_raw_candidate_floor_0_15": sum(1 for k in candidate["players"] if abs(baseline[k] - 0.15) < 1e-12),
         "pre_v1_raw_candidate_ceiling_1_55": sum(1 for k in candidate["players"] if abs(baseline[k] - 1.55) < 1e-12),
-        "deployed_raw_candidate_floor_0_15": sum(1 for k in candidate["players"] if abs(current[k] - 0.15) < 1e-12),
-        "deployed_raw_candidate_ceiling_1_55": sum(1 for k in candidate["players"] if abs(current[k] - 1.55) < 1e-12),
+        "deployed_raw_candidate_floor_0_15": sum(1 for k in candidate["players"] if abs(v1_expected[k] - 0.15) < 1e-12),
+        "deployed_raw_candidate_ceiling_1_55": sum(1 for k in candidate["players"] if abs(v1_expected[k] - 1.55) < 1e-12),
     }
 
     row_map = {r["key"]: r for r in rows}
@@ -210,8 +330,10 @@ def validate_deployment():
             "legacy_model_position": cand.get("legacy_model_position"),
             "current_valuation_position": cand.get("current_valuation_position"),
             "old_raw_prod_mult": baseline.get(key),
-            "new_raw_prod_mult": current.get(key),
-            "raw_prod_mult_pct_change": ((current[key] / baseline[key] - 1) * 100) if baseline.get(key) else None,
+            "new_raw_prod_mult": v1_expected.get(key),
+            "raw_prod_mult_pct_change": (
+                (v1_expected[key] / baseline[key] - 1) * 100
+            ) if baseline.get(key) else None,
             "source_cohort": cand.get("v1_source_cohort"),
             "update_status": cand.get("update_status"),
             "old_value": final_row.get("old_value") if final_row else None,
@@ -227,6 +349,11 @@ def validate_deployment():
         "deployed_prod_mult_entry_count": len(current),
         "approved_changed_entry_count": len(expected_changed),
         "actual_changed_entry_count": len(actual_changed),
+        "current_stack_changed_entry_count": len(current_stack_changed),
+        "position_lineage_overlay_active": lineage_release is not None,
+        "position_lineage_overlay_candidate_count": len(lineage_candidates),
+        "position_lineage_overlay_hold_count": len(lineage_holds),
+        "position_lineage_overlay_changed_entry_count": len(lineage_changed),
         "candidate_player_count": len(candidate["players"]),
         "exact_hold_candidate_count": len(candidate["players"]) - len(expected_changed),
         "non_idp_final_value_changes": len(non_idp_diffs),
@@ -274,7 +401,11 @@ def build_report(result):
         f"- Exact candidate holds: **{result['exact_hold_candidate_count']}**",
         f"- Floor-rescue discontinuity guards: **{result['update_status_counts'].get('exact_hold_floor_rescue_discontinuity_guard', 0)}**",
         f"- Non-IDP final-value changes: **{result['non_idp_final_value_changes']}**",
-        f"- Legacy/current position mismatches intentionally isolated: **{result['position_lineage_mismatch_count']}**",
+        f"- Frozen V1 legacy/current position mismatches: **{result['position_lineage_mismatch_count']}**",
+        f"- Position Lineage V1 successor active: **{result['position_lineage_overlay_active']}**",
+        f"- Position Lineage V1 approved overrides: **{result['position_lineage_overlay_candidate_count']}**",
+        f"- Position Lineage V1 explicit holds: **{result['position_lineage_overlay_hold_count']}**",
+        f"- Current stacked changed PROD_MULT entries vs pre-V1: **{result['current_stack_changed_entry_count']}**",
         "",
         "## Internal V1 replacement-baseline movement",
         "",
