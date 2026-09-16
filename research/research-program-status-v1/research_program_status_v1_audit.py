@@ -1,0 +1,619 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import subprocess
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+
+SCRIPT = Path(__file__).resolve()
+ROOT = SCRIPT.parents[2]
+OUTDIR = SCRIPT.parent
+PREREG = OUTDIR / "research_program_status_v1_preregistration.json"
+OUTJSON = OUTDIR / "research_program_status_v1_status.json"
+OUTMD = OUTDIR / "research_program_status_v1_status.md"
+MANIFEST = OUTDIR / "research_program_status_v1_manifest.json"
+
+VALID = {"completed", "collecting-frozen", "blocked", "actionable-now"}
+PRIORITY = {
+    "data_identity_integrity": 0,
+    "fundamental_value_correctness": 1,
+    "trade_mechanics": 2,
+    "market_opinion_lens": 3,
+}
+
+# Stable registry order is the preregistered within-lane tie-break.
+REGISTRY = [
+    dict(
+        id="identity_v2",
+        name="Unified FantasyPros ↔ Sleeper Identity V2",
+        research_dir="identity-v2",
+        domain="data_identity_integrity",
+        classification="actionable-now",
+        evidence=[(
+            "research/identity-v2/unified_fantasypros_sleeper_identity_v2.md",
+            ["STRUCTURALLY_CLEAN_REVIEW_COVERAGE_BEFORE_PROMOTION",
+             "Manual-review rows: **17**",
+             "does **not** promote anything automatically"]
+        )],
+        next_action="Adjudicate the 17 unresolved identity rows and freeze a reviewed resolution artifact. Do not promote the resolver in the same step.",
+        trigger="Promotion remains blocked until unresolved/conflicting rows are explicitly reviewed and a separate production-isolation check passes."
+    ),
+    dict(
+        id="production_v2",
+        name="Production V2 Phase 9",
+        research_dir="production-v2",
+        domain="fundamental_value_correctness",
+        classification="collecting-frozen",
+        evidence=[(
+            "research/production-v2/production_v2_phase9_evaluation.md",
+            ["COLLECTING_NO_CALIBRATION",
+             "Completed consecutive weeks: **1**",
+             "Weeks 8–11: calibration review eligible"]
+        )],
+        next_action="Continue frozen prospective collection only.",
+        trigger="Calibration review first becomes eligible at Week 8."
+    ),
+    dict(
+        id="position_weight_v2",
+        name="Position Weight V2 Phase 5",
+        research_dir="position-weight-v2",
+        domain="fundamental_value_correctness",
+        classification="collecting-frozen",
+        evidence=[(
+            "research/position-weight-v2/position_weight_v2_phase5_evaluation.md",
+            ["COLLECTION_ONLY", "bridge_50", "Weeks 8"]
+        )],
+        next_action="Continue frozen prospective collection only.",
+        trigger="Calibration review first becomes eligible at Week 8."
+    ),
+    dict(
+        id="replacement_level_v2",
+        name="Replacement Level V2 Phase 5",
+        research_dir="replacement-level-v2",
+        domain="fundamental_value_correctness",
+        classification="collecting-frozen",
+        evidence=[(
+            "research/replacement-level-v2/replacement_level_v2_phase5_evaluation.md",
+            ["COLLECTION_ONLY", "stable_positions_only", "Weeks 8"]
+        )],
+        next_action="Continue frozen prospective collection only.",
+        trigger="Calibration review first becomes eligible at Week 8."
+    ),
+    dict(
+        id="age_curve_v2",
+        name="Age Curve V2 Phase 5",
+        research_dir="age-curve-v2",
+        domain="fundamental_value_correctness",
+        classification="collecting-frozen",
+        evidence=[(
+            "research/age-curve-v2/age_curve_v2_phase5_evaluation.md",
+            ["COLLECTION_ONLY",
+             "Production deployment is not authorized",
+             "Weeks 8"]
+        )],
+        next_action="Continue frozen prospective collection only.",
+        trigger="Calibration review first becomes eligible at Week 8."
+    ),
+    dict(
+        id="opportunity_v2",
+        name="Opportunity / Role Signal V2 Phase 5",
+        research_dir="opportunity-v2",
+        domain="fundamental_value_correctness",
+        classification="collecting-frozen",
+        evidence=[(
+            "research/opportunity-v2/opportunity_v2_phase5_evaluation.md",
+            ["COLLECTION_ONLY",
+             "Production deployment is not authorized",
+             "Weeks 8"]
+        )],
+        next_action="Continue frozen prospective collection only.",
+        trigger="Calibration review first becomes eligible at Week 8."
+    ),
+    dict(
+        id="durability_v2",
+        name="Durability V2 Phase 5",
+        research_dir="durability-v2",
+        domain="fundamental_value_correctness",
+        classification="collecting-frozen",
+        evidence=[(
+            "research/durability-v2/durability_v2_phase5_evaluation.md",
+            ["COLLECTION_ONLY_INTERIM_BYE_UNADJUSTED",
+             "Production deployment is not authorized"]
+        )],
+        next_action="Continue frozen collection; interim metrics remain descriptive.",
+        trigger="The full-season primary target becomes authoritative only after the regular-season evidence window completes."
+    ),
+    dict(
+        id="no_history_v2",
+        name="No-History / Rookie Value V2 Phase 3",
+        research_dir="no-history-v2",
+        domain="fundamental_value_correctness",
+        classification="collecting-frozen",
+        evidence=[(
+            "research/no-history-v2/no_history_v2_phase3_evaluation.md",
+            ["COLLECTION_ONLY",
+             "Production deployment is not authorized",
+             "Weeks 8"]
+        )],
+        next_action="Continue frozen prospective collection only.",
+        trigger="Do not select a prospect-prior weight before Week 8."
+    ),
+    dict(
+        id="cross_position_apex_v1",
+        name="Cross-Position Apex Calibration V1",
+        research_dir="cross-position-apex-calibration-v1",
+        domain="fundamental_value_correctness",
+        classification="blocked",
+        evidence=[(
+            "research/cross-position-apex-calibration-v1/cross_position_apex_calibration_v1_phase2_reconciliation.md",
+            ["HOLD_DEPLOYMENT_CONTINUE_FROZEN_COLLECTION",
+             "No production change is authorized",
+             "collection_only"]
+        )],
+        next_action="Do not create another calibration model. Re-run reconciliation when the upstream frozen studies reach review eligibility.",
+        trigger="Blocked on Position Weight V2, Replacement Level V2, and Production V2 maturity."
+    ),
+    dict(
+        id="team_utility_v1",
+        name="Team Utility Current Architecture",
+        research_dir="team-utility",
+        domain="trade_mechanics",
+        classification="blocked",
+        evidence=[
+            ("research/team-utility/team_utility_starter_objective_audit.md",
+             ["Team Utility Starter-Objective Audit",
+              "No production values or Team Utility constants were changed",
+              "starter-selection objective only"]),
+            ("research/team-utility/team_utility_bench_weight_stage2.md",
+             ["KEEP_0_15",
+              "Do not reopen the coefficient",
+              "Fundamental Value remains the accounting unit"])
+        ],
+        next_action="Hold production architecture. A projection-based starter objective must begin as a separately versioned preregistered successor, not an in-place edit.",
+        trigger="Governance hold while prospective/model-history evidence matures; the 0.15 bench coefficient is already closed under current evidence."
+    ),
+    dict(
+        id="team_utility_bench_weight_v1",
+        name="Team Utility Bench Weight V1",
+        research_dir="team-utility",
+        domain="trade_mechanics",
+        classification="completed",
+        evidence=[(
+            "research/team-utility/team_utility_bench_weight_stage2.md",
+            ["KEEP_0_15", "Lock **`TU_BENCH_WEIGHT = 0.15`**"]
+        )],
+        next_action="None under current evidence; preserve 0.15.",
+        trigger="Reopen only under one of the explicitly documented evidence conditions."
+    ),
+    dict(
+        id="package_adjustment_nextgen_v2",
+        name="Package Adjustment NextGen V2",
+        research_dir="package-adjustment-nextgen-v2",
+        domain="trade_mechanics",
+        classification="completed",
+        evidence=[(
+            "research/package-adjustment-nextgen-v2/package_adjustment_nextgen_v2_research_closeout_v1.md",
+            ["research_closed_no_successor_candidate",
+             "No production change",
+             "Do not create an M4"]
+        )],
+        next_action="None for this branch.",
+        trigger="A future revisit requires a genuinely new hypothesis, preregistration, and fresh confirmation evidence."
+    ),
+    dict(
+        id="draft_pick_fv_v4",
+        name="Draft Pick FV V4 Clean Source Recovery",
+        research_dir="draft-pick-fv-v4",
+        domain="fundamental_value_correctness",
+        classification="blocked",
+        evidence=[(
+            "research/draft-pick-fv-v4/clean_source_recovery_v4.md",
+            ["STOP_V4_CLEAN_SOURCE_RECOVERY_INSUFFICIENT",
+             "Stop the MFL historical-draft recovery path",
+             "Do not ingest outcomes"]
+        )],
+        next_action="Do not continue the MFL recovery path. A future draft-pick study needs a genuinely different clean source/design.",
+        trigger="Frozen R6 clean-source coverage gates failed."
+    ),
+    dict(
+        id="elite_surplus_v1",
+        name="Elite Surplus V1",
+        research_dir="elite-surplus-v1",
+        domain="fundamental_value_correctness",
+        classification="completed",
+        evidence=[(
+            "research/elite-surplus-v1/historical_development_evaluation_v1.md",
+            ["closed_no_historical_candidate",
+             "No preregistered challenger qualified",
+             "No rescue formula"]
+        )],
+        next_action="None for the closed V1 branch.",
+        trigger="A new hypothesis requires a new research cycle rather than rescue tuning."
+    ),
+    dict(
+        id="offense_position_lineage_v1",
+        name="Offense Position Lineage V1",
+        research_dir="offense-position-lineage-v1",
+        domain="fundamental_value_correctness",
+        classification="completed",
+        evidence=[(
+            "research/offense-position-lineage-v1/offense_position_lineage_v1_phase1.json",
+            ["STOP_OFFENSE_POSITION_LINEAGE_V1_NO_MATERIAL_CANDIDATE"]
+        )],
+        next_action="None; no material current-core offense lineage candidate was found.",
+        trigger="Reopen only if a new material current-core lineage mismatch appears."
+    ),
+    dict(
+        id="idp_position_lineage_v1",
+        name="IDP Position Lineage V1",
+        research_dir="idp-position-lineage-v1",
+        domain="fundamental_value_correctness",
+        classification="completed",
+        evidence=[(
+            "research/idp-position-lineage-v1/idp_position_lineage_v1_phase2b.md",
+            ["PASS_IDP_POSITION_LINEAGE_V1_PHASE2B_AGE_FEEDBACK_SHADOW",
+             "zero_noncohort_fv_changes",
+             "zero_offense_fv_changes"]
+        )],
+        commit_marker="Deploy IDP Position Lineage V1",
+        next_action="None; deployed release remains under ordinary regression monitoring.",
+        trigger="A future lineage anomaly requires a new audit trigger."
+    ),
+    dict(
+        id="free_agent_production_v2",
+        name="Free-Agent Production V2",
+        research_dir="free-agent-production-v2",
+        domain="fundamental_value_correctness",
+        classification="completed",
+        evidence=[(
+            "research/free-agent-production-v2/phase3_production_confirmation.md",
+            ["PASS_FA_PROD_V2_PHASE3_CONFIRMED_AND_DEPLOYED",
+             "Free-Agent Production V2 is now deployed",
+             "Full repository regression suite after deployment: **PASS**"]
+        )],
+        next_action="None; deployed mechanism remains under regression monitoring.",
+        trigger="A new defect requires a new isolated audit."
+    ),
+    dict(
+        id="market_value_v2",
+        name="Market Value V2 Blended KTC Shadow",
+        research_dir="market-value-v2",
+        domain="market_opinion_lens",
+        classification="actionable-now",
+        evidence=[(
+            "research/market-value-v2/market_value_v2_shadow.md",
+            ["RESEARCH ONLY / SHADOW",
+             "production_promotion_allowed",
+             "policy hypothesis, not a fitted truth"]
+        )],
+        next_action="Preregister an independent voter-policy/identity-robustness validation for the guest-weight hypothesis. Keep Market Value V1 deployed.",
+        trigger="Production promotion remains prohibited by the current shadow artifact."
+    ),
+]
+
+SUPPORT_OR_LEGACY = {
+    "age-calibration", "baseline-backtester", "durability",
+    "draft-pick-fv-v1", "draft-pick-fv-v2", "draft-pick-fv-v3",
+    "ktc-validation", "ktc-voter-balance", "legacy-prod-mult",
+    "model-history", "package-adjustment-production-candidate-v1",
+    "package-adjustment-shadow-v1", "package-adjustment-shadow-v2",
+    "package-adjustment-v0", "package-adjustment-v1",
+    "package-adjustment-v2", "package-adjustment-v3",
+    "package-adjustment-v4", "package-adjustment-v5",
+    "package-adjustment-v6", "roster-economics",
+    "team-utility-bench-weight-v1", "research-program-status-v1"
+}
+
+def sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def read(rel):
+    path = ROOT / rel
+    if not path.exists():
+        raise RuntimeError(f"missing evidence file: {rel}")
+    return path.read_text(encoding="utf-8")
+
+def git_log():
+    raw = subprocess.check_output(
+        ["git", "log", "--format=%H%x09%s", "-n", "500"],
+        cwd=ROOT, text=True
+    )
+    rows = []
+    for line in raw.splitlines():
+        if "\t" in line:
+            h, s = line.split("\t", 1)
+            rows.append((h, s))
+    return rows
+
+def observed_weeks(text):
+    pats = [
+        r"Completed consecutive weeks(?: used| available)?:\s*\*\*\[([^\]]*)\]\*\*",
+        r"Completed consecutive weeks:\s*\*\*(\d+)\*\*",
+        r"Completed weeks recognized:\s*\*\*\[([^\]]*)\]\*\*"
+    ]
+    for p in pats:
+        m = re.search(p, text, flags=re.I)
+        if m:
+            return [int(x) for x in re.findall(r"\d+", m.group(1))]
+    return []
+
+def verify():
+    ids = [r["id"] for r in REGISTRY]
+    if len(ids) != len(set(ids)):
+        raise RuntimeError("duplicate registry id")
+
+    logs = git_log()
+    rows = []
+    for order, spec in enumerate(REGISTRY):
+        if spec["classification"] not in VALID:
+            raise RuntimeError(f"{spec['id']}: invalid classification")
+        if spec["domain"] not in PRIORITY:
+            raise RuntimeError(f"{spec['id']}: invalid domain")
+
+        evid = []
+        texts = []
+        for rel, markers in spec["evidence"]:
+            text = read(rel)
+            texts.append(text)
+            missing = [m for m in markers if m not in text]
+            if missing:
+                raise RuntimeError(
+                    f"{spec['id']}: markers missing from {rel}: {missing}"
+                )
+            evid.append({
+                "path": rel,
+                "sha256": sha256(ROOT / rel),
+                "markers_verified": markers
+            })
+
+        commit = None
+        if spec.get("commit_marker"):
+            matches = [(h, s) for h, s in logs
+                       if spec["commit_marker"] in s]
+            if not matches:
+                raise RuntimeError(
+                    f"{spec['id']}: deployment commit not found"
+                )
+            commit = {"sha": matches[0][0], "subject": matches[0][1]}
+
+        weeks = []
+        for text in texts:
+            weeks = observed_weeks(text)
+            if weeks:
+                break
+
+        rows.append({
+            "registry_order": order,
+            "id": spec["id"],
+            "name": spec["name"],
+            "research_dir": spec["research_dir"],
+            "domain": spec["domain"],
+            "classification": spec["classification"],
+            "evidence": evid,
+            "commit_evidence": commit,
+            "completed_weeks_observed": weeks,
+            "next_legal_action": spec["next_action"],
+            "blocker_or_trigger": spec["trigger"],
+            "production_action_allowed": False
+        })
+    return rows
+
+def coverage(rows):
+    actual = sorted(
+        p.name for p in (ROOT / "research").iterdir() if p.is_dir()
+    )
+    canonical = {r["research_dir"] for r in rows}
+    unclassified = sorted(set(actual) - canonical - SUPPORT_OR_LEGACY)
+    return {
+        "actual_top_level_directory_count": len(actual),
+        "canonical_directories": sorted(canonical),
+        "support_or_legacy_directories":
+            sorted(set(actual) & SUPPORT_OR_LEGACY),
+        "unclassified_directories": unclassified,
+        "coverage_pass": not unclassified
+    }
+
+def build():
+    prereg = json.loads(PREREG.read_text(encoding="utf-8"))
+    if prereg["status"] != "FROZEN_GOVERNANCE_CLASSIFICATION_RULES":
+        raise RuntimeError("preregistration changed")
+    if prereg["production_change_authorized"] is not False:
+        raise RuntimeError("production guardrail changed")
+
+    rows = verify()
+    cov = coverage(rows)
+    queue = [r for r in rows if r["classification"] == "actionable-now"]
+    queue.sort(key=lambda r: (PRIORITY[r["domain"]], r["registry_order"]))
+    queue = [{
+        "id": r["id"],
+        "name": r["name"],
+        "domain": r["domain"],
+        "next_legal_action": r["next_legal_action"],
+        "production_action_allowed": False
+    } for r in queue]
+
+    counts = Counter(r["classification"] for r in rows)
+    decision = (
+        "REVIEW_REGISTRY_COVERAGE_BEFORE_NEXT_PROJECT"
+        if not cov["coverage_pass"] else
+        "ACTIONABLE_RESEARCH_AVAILABLE"
+        if queue else
+        "NO_UNBLOCKED_RESEARCH_BRANCH_CONTINUE_FROZEN_COLLECTION"
+    )
+
+    return {
+        "schema_version": 1,
+        "study_id": "research-program-status-v1",
+        "status": "CURRENT_STATE_AUDIT_COMPLETE",
+        "decision": decision,
+        "generated_at_utc":
+            datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "repo_commit_sha_evaluated":
+            subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+            ).strip(),
+        "research_only": True,
+        "production_change_authorized": False,
+        "classification_counts":
+            {k: counts.get(k, 0) for k in sorted(VALID)},
+        "workstreams": rows,
+        "actionable_queue": queue,
+        "highest_priority_actionable": queue[0] if queue else None,
+        "directory_coverage": cov,
+        "governance_locks": {
+            "week1_promotion_allowed": False,
+            "spent_evidence_retuning_allowed": False,
+            "team_utility_in_place_architecture_change_allowed": False,
+            "package_adjustment_nextgen_v2_reopen_allowed": False,
+            "production_mutation_by_this_audit_allowed": False
+        },
+        "interpretation":
+            "Actionable means clean research can begin now. It never means production deployment is authorized."
+    }
+
+def esc(s):
+    return str(s).replace("|", "\\|").replace("\n", " ")
+
+def render(r):
+    c = r["classification_counts"]
+    high = r["highest_priority_actionable"]
+    lines = [
+        "# Research Program Status V1 — Current-State Audit", "",
+        f"**Decision:** `{r['decision']}`", "",
+        "**Research only. No production change is authorized.**", "",
+        "## Portfolio summary", "",
+        f"- Completed: **{c['completed']}**",
+        f"- Collecting frozen: **{c['collecting-frozen']}**",
+        f"- Blocked: **{c['blocked']}**",
+        f"- Actionable now: **{c['actionable-now']}**", ""
+    ]
+    if high:
+        lines += [
+            "## Highest-priority actionable branch", "",
+            f"**{high['name']}** (`{high['id']}`)", "",
+            esc(high["next_legal_action"]), "",
+            "This is research-only; promotion remains unauthorized.", ""
+        ]
+
+    lines += [
+        "## Workstream map", "",
+        "| Workstream | Domain | Status | Weeks observed | Next legal action |",
+        "|---|---|---|---:|---|"
+    ]
+    for row in r["workstreams"]:
+        weeks = ",".join(map(str, row["completed_weeks_observed"])) or "—"
+        lines.append(
+            f"| {esc(row['name'])} | `{row['domain']}` | "
+            f"`{row['classification']}` | {weeks} | "
+            f"{esc(row['next_legal_action'])} |"
+        )
+
+    lines += ["", "## Actionable queue", ""]
+    for i, row in enumerate(r["actionable_queue"], 1):
+        lines.append(
+            f"{i}. **{row['name']}** — {esc(row['next_legal_action'])}"
+        )
+    if not r["actionable_queue"]:
+        lines.append("None.")
+
+    cov = r["directory_coverage"]
+    lines += [
+        "", "## Registry coverage", "",
+        f"- Coverage pass: **{cov['coverage_pass']}**",
+        f"- Top-level research directories: "
+        f"**{cov['actual_top_level_directory_count']}**",
+        f"- Unclassified directories: "
+        f"**{len(cov['unclassified_directories'])}**"
+    ]
+    if cov["unclassified_directories"]:
+        lines.append(
+            "- Review required: " +
+            ", ".join(f"`{x}`" for x in cov["unclassified_directories"])
+        )
+
+    lines += [
+        "", "## Governance locks", "",
+        "- No Week-1 promotion.",
+        "- No rescue tuning of closed Package Adjustment evidence.",
+        "- No in-place Team Utility architecture change.",
+        "- No continuation of the failed Draft Pick V4 MFL recovery path.",
+        "- No production mutation by this audit.", "",
+        "Every classification is backed by SHA256-hashed repository evidence."
+    ]
+    return "\n".join(lines) + "\n"
+
+def write():
+    r = build()
+    OUTJSON.write_text(
+        json.dumps(r, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8"
+    )
+    OUTMD.write_text(render(r), encoding="utf-8")
+    manifest = {
+        "schema_version": 1,
+        "study_id": "research-program-status-v1",
+        "decision": r["decision"],
+        "repo_commit_sha_evaluated": r["repo_commit_sha_evaluated"],
+        "production_change_authorized": False,
+        "preregistration_sha256": sha256(PREREG),
+        "evaluator_sha256": sha256(SCRIPT),
+        "status_json_sha256": sha256(OUTJSON),
+        "status_md_sha256": sha256(OUTMD),
+        "evidence_sha256": {
+            e["path"]: e["sha256"]
+            for row in r["workstreams"] for e in row["evidence"]
+        }
+    }
+    MANIFEST.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8"
+    )
+    print(json.dumps({
+        "decision": r["decision"],
+        "classification_counts": r["classification_counts"],
+        "highest_priority_actionable": r["highest_priority_actionable"],
+        "unclassified_directories":
+            r["directory_coverage"]["unclassified_directories"]
+    }, indent=2))
+
+def check():
+    r = json.loads(OUTJSON.read_text(encoding="utf-8"))
+    if r["production_change_authorized"] is not False:
+        raise RuntimeError("audit illegally authorizes production")
+    if any(x["production_action_allowed"] for x in r["workstreams"]):
+        raise RuntimeError("workstream illegally authorizes production")
+    if r["governance_locks"]["week1_promotion_allowed"]:
+        raise RuntimeError("Week-1 lock changed")
+    if r["directory_coverage"]["coverage_pass"]:
+        high = r["highest_priority_actionable"]
+        if not high or high["id"] != "identity_v2":
+            raise RuntimeError("frozen priority rule no longer selects Identity V2")
+    print("Research Program Status V1 checks PASS")
+
+def selftest():
+    assert len({x["id"] for x in REGISTRY}) == len(REGISTRY)
+    assert all(x["classification"] in VALID for x in REGISTRY)
+    assert all(x["domain"] in PRIORITY for x in REGISTRY)
+    print("Research Program Status V1 self-test PASS")
+
+def main():
+    p = argparse.ArgumentParser()
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--selftest", action="store_true")
+    g.add_argument("--write", action="store_true")
+    g.add_argument("--check", action="store_true")
+    a = p.parse_args()
+    if a.selftest:
+        selftest()
+    elif a.write:
+        write()
+    else:
+        check()
+
+if __name__ == "__main__":
+    main()
