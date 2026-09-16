@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse, copy, hashlib, json, math, re, statistics, subprocess, sys
+from pathlib import Path
+
+SCRIPT = Path(__file__).resolve()
+ROOT = Path.cwd()
+RESEARCH = ROOT / 'research' / 'offense-position-lineage-v1'
+INDEX = ROOT / 'index.html'
+ALL_PLAYERS = ROOT / 'scripts' / 'all_players.json'
+PPG = ROOT / 'scripts' / 'ppg_results.json'
+DURABILITY = ROOT / 'scripts' / 'durability_results.json'
+PROJECTIONS = ROOT / 'scripts' / 'fantasypros_2026_projections.json'
+PLAYER_POSITIONS = ROOT / 'scripts' / 'artifacts' / 'generated' / 'player_positions.json'
+LEAGUE_ROSTERS = ROOT / 'data' / 'league_rosters.json'
+SNAPSHOT_VALUES = ROOT / 'scripts' / 'validation' / 'snapshot_values.py'
+HISTORY_MODULE = ROOT / 'scripts' / 'model' / 'production_history_component.py'
+STARTER_AUDIT = ROOT / 'research' / 'team-utility' / 'team_utility_starter_objective_audit.py'
+
+PREREG_JSON = RESEARCH / 'phase1_preregistration.json'
+PREREG_MD = RESEARCH / 'phase1_preregistration.md'
+OUT_JSON = RESEARCH / 'offense_position_lineage_v1_phase1.json'
+OUT_MD = RESEARCH / 'offense_position_lineage_v1_phase1.md'
+APEX_JSON = RESEARCH / 'apex_cross_position_diagnostic.json'
+MANIFEST = RESEARCH / 'phase1_manifest.json'
+
+OFFENSE = {'QB','RB','WR','TE'}
+IDP = {'DL','LB','DB'}
+HW, PW = 0.45, 0.55
+RANK = 32
+PM_I, PM_S, PM_MIN, PM_MAX = -0.10, 0.75, 0.15, 1.55
+
+
+def read_json(p): return json.loads(Path(p).read_text(encoding='utf-8'))
+def sha256(p): return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+def clamp(x, lo, hi): return max(lo, min(hi, x))
+
+def finite(v):
+    if isinstance(v, bool): return None
+    try: x = float(v)
+    except (TypeError, ValueError): return None
+    return x if math.isfinite(x) else None
+
+def norm(s):
+    s = str(s or '').lower().strip().replace('’', "'")
+    s = re.sub(r"[.'\-]", '', s)
+    s = re.sub(r'\b(jr|sr|ii|iii|iv|v)\b$', '', s).strip()
+    return re.sub(r'\s+', ' ', s)
+
+def summarize(vals):
+    a = sorted(float(x) for x in vals if x is not None and math.isfinite(float(x)))
+    if not a: return {'n':0}
+    def pct(q):
+        if len(a)==1: return a[0]
+        x=(len(a)-1)*q; lo=math.floor(x); hi=math.ceil(x)
+        return a[lo] if lo==hi else a[lo]*(hi-x)+a[hi]*(x-lo)
+    return {'n':len(a),'mean':statistics.fmean(a),'median':statistics.median(a),
+            'p10':pct(.10),'p90':pct(.90),'p95':pct(.95),'min':a[0],'max':a[-1]}
+
+def preregister():
+    RESEARCH.mkdir(parents=True, exist_ok=True)
+    doc = {
+      'study_id':'offense-position-lineage-v1','phase':1,'status':'FROZEN_PRE_EVALUATION',
+      'scope':'RESEARCH_ONLY_NO_PRODUCTION_MUTATION',
+      'target_cohort_rule':'legacy scripts/all_players.json position differs from current generated position; both positions in QB/RB/WR/TE',
+      'held_fixed':['2025 true PPG','2026 player projection','history weight 0.45','projection weight 0.55','replacement rank 32','prod transform clamp(-0.10 + 0.75 * ratio, 0.15, 1.55)','position weights','age curves','roles','durability methodology','all IDP production multipliers','all non-target offense production multipliers'],
+      'candidate_method':['derive canonical history constants from frozen repository inputs','derive rank-32 legacy offense replacement baselines','recompute only target history at current offense position','preserve player 2026 projection','transport clean current-position minus legacy-position model multiplier delta onto deployed raw PROD_MULT','preserve exact-floor no-history rescue guard','round candidate raw PROD_MULT to 4 decimals'],
+      'apex_diagnostic':{'players':['brian burns','josh allen'],'purpose':'separate cross-position calibration diagnostic; cannot change lineage candidate','high_priority_rule':'Brian Burns FV >= 1.10 * Josh Allen FV'},
+      'hard_gates':['rank-32 baseline available for QB/RB/WR/TE','generated and live current positions agree for current-core targets','all targets classified candidate or hold','no unguarded floor rescue','candidate values valid','raw multiplier and FV direction monotonic','zero non-target FV changes','zero IDP FV changes','Burns/Allen diagnostic computable','index.html unchanged'],
+      'production_change_authorized':False
+    }
+    PREREG_JSON.write_text(json.dumps(doc, indent=2, sort_keys=True)+'\n', encoding='utf-8')
+    PREREG_MD.write_text("""# Offense Position Lineage V1 — Phase 1 Preregistration
+
+**Status:** `FROZEN_PRE_EVALUATION`
+
+Research-only. The cohort is mechanically defined from legacy `scripts/all_players.json` position versus current generated position, restricted to QB/RB/WR/TE on both sides.
+
+The audit holds PPG inputs, 2026 projections, durability, 45/55 history/projection weights, replacement rank 32, production transform, position weights, age curves, and roles fixed. Only the isolated position-lineage delta may move a target's raw production multiplier.
+
+Brian Burns versus Josh Allen is a separate apex cross-position diagnostic. It cannot alter the offense-lineage candidate and exists only to determine whether a later cross-position scaling study is warranted.
+
+Phase 1 cannot modify production.
+""", encoding='utf-8')
+    print('Preregistration frozen.')
+
+def load_modules():
+    sys.path.insert(0, str(ROOT/'scripts'/'validation'))
+    import snapshot_values
+    sys.path.insert(0, str(ROOT/'scripts'/'model'))
+    import production_history_component
+    sys.path.insert(0, str(ROOT/'research'/'team-utility'))
+    import team_utility_starter_objective_audit as starter
+    return snapshot_values, production_history_component, starter
+
+def current_cfg(snapshot, starter):
+    base = snapshot.load_from_html(INDEX)
+    cfg = starter.merge_live_league_into_cfg(base, read_json(LEAGUE_ROSTERS))
+    unresolved = cfg.get('live_merge_stats',{}).get('unresolved_positions') or []
+    if unresolved: raise RuntimeError('unresolved live positions: '+json.dumps(unresolved[:20]))
+    return cfg
+
+def projection_maps():
+    buckets={}
+    for r in read_json(PROJECTIONS):
+        v=finite(r.get('fantasypros_2026_proj')); k=norm(r.get('player'))
+        if k and v is not None: buckets.setdefault(k, []).append((v,r.get('pos'),r.get('player')))
+    unique={}; ambiguous={}
+    for k, vals in buckets.items():
+        ds={round(float(x[0]),8) for x in vals}
+        (unique if len(ds)==1 else ambiguous)[k]=vals[0] if len(ds)==1 else vals
+    text=INDEX.read_text(encoding='utf-8'); fallback={}
+    start=text.find('const PLAYER_DB = {'); end=text.find('\n};', start)
+    body=text[start:end if end>start else len(text)]
+    for k,v in re.findall(r"'([^']+)'\s*:\s*\{[^}\n]*?proj2026\s*:\s*([0-9.]+)", body): fallback[norm(k)]=float(v)
+    return unique, ambiguous, fallback
+
+def get_proj(key, unique, fallback):
+    n=norm(key)
+    if n in unique: return float(unique[n][0]), 'fantasypros_2026_projections'
+    if n in fallback: return float(fallback[n]), 'index_player_db_fallback'
+    return None, None
+
+def legacy_model(history):
+    allp=read_json(ALL_PLAYERS); ppg=read_json(PPG); dur=read_json(DURABILITY)
+    const=history.derive_history_constants(ppg,dur); ppg_by={str(r.get('player')):r for r in ppg}
+    unique, ambiguous, fallback=projection_maps(); rows={}; pools={p:[] for p in OFFENSE}; missing=[]
+    for p in allp:
+        key=str(p.get('key') or ''); pos=str(p.get('pos') or '')
+        if not key or pos not in OFFENSE: continue
+        proj,src=get_proj(key,unique,fallback)
+        if proj is None: missing.append(key); continue
+        h=history.compute_history_for_player(pos,ppg_by.get(key),const); hc=finite(h.get('history_component'))
+        if hc is None: continue
+        comb=HW*hc+PW*proj
+        rows[key]={'legacy_position':pos,'projection_2026':proj,'projection_source':src,'legacy_history':h,'legacy_combined':comb}
+        pools[pos].append((comb,key))
+    bases={}; counts={}
+    for pos in sorted(OFFENSE):
+        ordered=sorted(pools[pos], key=lambda x:(-x[0],x[1])); counts[pos]=len(ordered)
+        bases[pos]=float(ordered[RANK-1][0]) if len(ordered)>=RANK else None
+    return {'all_players':allp,'ppg_by':ppg_by,'constants':const,'rows':rows,'baselines':bases,'counts':counts,'missing':sorted(missing),'ambiguous':sorted(ambiguous)}
+
+def clean_pm(combined, baseline):
+    if combined is None or baseline is None or baseline<=0: return None
+    return clamp(PM_I+PM_S*(combined/baseline),PM_MIN,PM_MAX)
+
+def rank_of(values,key,pos=None):
+    ordered=sorted([(k,v) for k,v in values.items() if pos is None or v.get('pos')==pos], key=lambda kv:(-int(kv[1]['value']),kv[0]))
+    for i,(k,_) in enumerate(ordered,1):
+        if k==key:return i
+    return None
+
+def apex(cfg, values):
+    b='brian burns'; a='josh allen'
+    if b not in values or a not in values: return {'complete':False,'status':'UNAVAILABLE','missing':[k for k in (b,a) if k not in values]}
+    def d(k):
+        v=values[k]; info=cfg['player_db'].get(k) or {}; pos=v['pos']
+        return {'key':k,'position':pos,'age':v['age'],'role':v['role'],'fv':int(v['value']),'raw_prod_mult':finite(cfg['prod_mult'].get(k)),'effective_prod_mult':finite(v.get('prod_mult')),'age_mult':finite(v.get('age_mult')),'position_weight':finite(cfg['position_weight'].get(pos)),'overall_rank':rank_of(values,k),'position_rank':rank_of(values,k,pos),'team':info.get('team')}
+    bd,ad=d(b),d(a); ratio=bd['fv']/ad['fv'] if ad['fv'] else None; gap=bd['fv']-ad['fv']
+    high=ratio is not None and ratio>=1.10; ge=bd['fv']>=ad['fv']
+    status='HIGH_PRIORITY_CROSS_POSITION_CALIBRATION_REVIEW' if high else ('CROSS_POSITION_CALIBRATION_REVIEW' if ge else 'NO_BURNS_OVER_ALLEN_FLAG')
+    top=[{'rank':i+1,'key':k,'pos':v['pos'],'fv':int(v['value']),'prod_mult':finite(v.get('prod_mult')),'age_mult':finite(v.get('age_mult'))} for i,(k,v) in enumerate(sorted(values.items(),key=lambda kv:(-int(kv[1]['value']),kv[0]))[:20])]
+    return {'complete':True,'status':status,'purpose':'separate current-model cross-position calibration diagnostic; not a lineage candidate input','brian_burns':bd,'josh_allen':ad,'burns_minus_allen_fv':gap,'burns_to_allen_fv_ratio':ratio,'burns_fv_greater_or_equal':ge,'high_priority_threshold_ratio':1.10,'high_priority_flag':high,'top_20_overall_current_fv':top}
+
+def evaluate():
+    snapshot,history,starter=load_modules(); cfg=current_cfg(snapshot,starter); cur=snapshot.compute_all_values(cfg); positions=read_json(PLAYER_POSITIONS); legacy=legacy_model(history)
+    oldpos={str(r.get('key')):str(r.get('pos')) for r in legacy['all_players'] if r.get('key')}
+    targets=sorted([{'key':k,'legacy_position':lp,'current_position':str(positions.get(k) or '')} for k,lp in oldpos.items() if lp in OFFENSE and str(positions.get(k) or '') in OFFENSE and lp!=str(positions.get(k) or '')], key=lambda r:r['key'])
+    keys={r['key'] for r in targets}; baseline_ok=all(legacy['baselines'].get(p) is not None and legacy['counts'].get(p,0)>=RANK for p in OFFENSE)
+    pos_mismatch=[]
+    for r in targets:
+        if r['key'] in cur and cur[r['key']]['pos']!=r['current_position']: pos_mismatch.append({'key':r['key'],'generated':r['current_position'],'live':cur[r['key']]['pos']})
+    cand_prod=dict(cfg['prod_mult']); rows=[]; holds={}; guarded=[]; recomputed=0
+    for t in targets:
+        k,lp,cp=t['key'],t['legacy_position'],t['current_position']; scope='current_core' if k in cur else 'not_current_core'; live=finite(cfg['prod_mult'].get(k)); lm=legacy['rows'].get(k)
+        reason=None; ch=None; cc=None; oldpm=None; newpm=None; delta=None; proposed=live; final=live; guard=False
+        if scope!='current_core': reason='current_scope_hold_not_current_core'
+        elif lm is None: reason='missing_comparable_legacy_projection_or_history'
+        elif live is None: reason='missing_deployed_raw_prod_mult'
+        elif not baseline_ok: reason='replacement_baseline_integrity_failure'
+        else:
+            ch=history.compute_history_for_player(cp,legacy['ppg_by'].get(k),legacy['constants']); hc=finite(ch.get('history_component'))
+            if hc is None: reason='current_position_history_unavailable'
+            else:
+                cc=HW*hc+PW*float(lm['projection_2026']); oldpm=clean_pm(lm['legacy_combined'],legacy['baselines'][lp]); newpm=clean_pm(cc,legacy['baselines'][cp])
+                if oldpm is None or newpm is None: reason='clean_model_prod_mult_unavailable'
+                else:
+                    delta=newpm-oldpm; proposed=clamp(live+delta,PM_MIN,PM_MAX); info=cfg['player_db'].get(k)
+                    if info is None: reason='missing_current_production_player_db_row'
+                    else:
+                        role_est=float(cfg['role_mult'].get(info['role'],1.0)); nohist=k in cfg['no_real_history']
+                        if nohist and live<=PM_MIN+1e-12 and proposed>PM_MIN+1e-12 and proposed<role_est-1e-12:
+                            final=live; guard=True; reason='exact_floor_no_history_rescue_guard'; guarded.append(k)
+                        else: final=round(proposed,4); recomputed+=1
+        if reason: holds[reason]=holds.get(reason,0)+1
+        if scope=='current_core' and final is not None: cand_prod[k]=final
+        rows.append({'key':k,'legacy_model_position':lp,'current_valuation_position':cp,'current_scope':scope,'projection_2026':lm.get('projection_2026') if lm else None,'projection_source':lm.get('projection_source') if lm else None,'legacy_history_component':finite(lm['legacy_history'].get('history_component')) if lm else None,'current_position_history':ch,'legacy_combined':finite(lm.get('legacy_combined')) if lm else None,'current_combined':cc,'legacy_clean_model_prod_mult':oldpm,'current_clean_model_prod_mult':newpm,'position_lineage_delta_raw':delta,'deployed_raw_prod_mult':live,'proposed_raw_prod_mult_pre_guard':proposed,'candidate_raw_prod_mult':final,'status':'candidate' if reason is None else 'hold','hold_reason':reason,'floor_rescue_guarded':guard,'current_fv':None,'candidate_fv':None,'fv_delta':None,'fv_pct_change':None,'effective_current_prod_mult':None,'effective_candidate_prod_mult':None})
+    cand_cfg=copy.deepcopy(cfg); cand_cfg['prod_mult']=cand_prod; newvals=snapshot.compute_all_values(cand_cfg); by={r['key']:r for r in rows}; invalid=[]; direction=[]; nontarget=[]; idp=[]
+    for k,old in cur.items():
+        nv=newvals[k]
+        if old['value']!=nv['value']:
+            if k not in keys:nontarget.append({'key':k,'pos':old['pos'],'current_fv':old['value'],'candidate_fv':nv['value']})
+            if old['pos'] in IDP:idp.append({'key':k,'pos':old['pos'],'current_fv':old['value'],'candidate_fv':nv['value']})
+    for k in sorted(keys & set(cur)):
+        old,nv,row=cur[k],newvals[k],by[k]
+        if not isinstance(nv['value'],int) or nv['value']<=0:invalid.append(k)
+        cr,dr=finite(row['candidate_raw_prod_mult']),finite(row['deployed_raw_prod_mult']); rd=(cr-dr) if cr is not None and dr is not None else 0.0; fd=int(nv['value'])-int(old['value'])
+        if (rd>1e-12 and fd<0) or (rd<-1e-12 and fd>0):direction.append({'key':k,'raw_delta':rd,'fv_delta':fd})
+        row.update({'current_fv':int(old['value']),'candidate_fv':int(nv['value']),'fv_delta':fd,'fv_pct_change':fd/old['value'] if old['value'] else None,'effective_current_prod_mult':old['prod_mult'],'effective_candidate_prod_mult':nv['prod_mult']})
+    unguarded=[]
+    for r in rows:
+        k=r['key']; cr=finite(r['candidate_raw_prod_mult']); dr=finite(r['deployed_raw_prod_mult'])
+        if k not in cfg['player_db'] or cr is None or dr is None: continue
+        role_est=float(cfg['role_mult'].get(cfg['player_db'][k]['role'],1.0))
+        if k in cfg['no_real_history'] and dr<=PM_MIN+1e-12 and cr>PM_MIN+1e-12 and cr<role_est-1e-12:unguarded.append(k)
+    ap=apex(cfg,cur)
+    gates={'offense_replacement_baseline_rank32_available':{'pass':baseline_ok,'counts':legacy['counts'],'baselines':legacy['baselines']},'live_core_positions_match_generated_current_position':{'pass':not pos_mismatch,'mismatches':pos_mismatch},'classification_complete':{'pass':len(rows)==len(targets) and all(r['status'] in {'candidate','hold'} for r in rows)},'no_unguarded_floor_rescue_discontinuity':{'pass':not unguarded,'unguarded_keys':unguarded},'candidate_values_valid':{'pass':not invalid,'invalid_keys':invalid},'prod_direction_fv_monotonic':{'pass':not direction,'violations':direction},'zero_non_target_fv_changes':{'pass':not nontarget,'changes':nontarget[:25]},'zero_idp_fv_changes':{'pass':not idp,'changes':idp[:25]},'apex_diagnostic_complete':{'pass':bool(ap.get('complete')),'status':ap.get('status')}}
+    changed=sorted(k for k in keys if k in cur and cur[k]['value']!=newvals[k]['value']); allpass=all(g['pass'] for g in gates.values())
+    decision='STOP_OFFENSE_POSITION_LINEAGE_V1_PHASE1_INTEGRITY_FAILURE' if not allpass else ('STOP_OFFENSE_POSITION_LINEAGE_V1_NO_TARGETS' if not targets else ('STOP_OFFENSE_POSITION_LINEAGE_V1_NO_MATERIAL_CANDIDATE' if not changed else 'PASS_OFFENSE_POSITION_LINEAGE_V1_PHASE1_CANDIDATE_FREEZE'))
+    rawd=[]; fvd=[]; pct=[]
+    for r in rows:
+        c,d=finite(r.get('candidate_raw_prod_mult')),finite(r.get('deployed_raw_prod_mult'))
+        if c is not None and d is not None:rawd.append(c-d)
+        if r.get('fv_delta') is not None:fvd.append(r['fv_delta'])
+        if r.get('fv_pct_change') is not None:pct.append(r['fv_pct_change'])
+    result={'study_id':'offense-position-lineage-v1','phase':1,'status':'FROZEN_AUDIT_COMPLETE','decision':decision,'production_change_authorized':False,'repo_commit_sha_evaluated':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),'methodology':{'target_rule':'legacy all_players position != current generated position; both QB/RB/WR/TE','history_weight':HW,'projection_weight':PW,'replacement_rank':RANK,'replacement_baseline_by_legacy_position':legacy['baselines'],'replacement_pool_counts':legacy['counts'],'prod_transform':'clamp(-0.10 + 0.75 * ratio, 0.15, 1.55)','transport':'deployed raw PM + (clean current-position PM - clean legacy-position PM)'},'counts':{'target_mismatch_rows':len(targets),'current_core_target_rows':sum(r['current_scope']=='current_core' for r in rows),'recomputed_candidates':recomputed,'explicit_holds':len(rows)-recomputed,'floor_rescue_guarded':len(guarded),'changed_target_fv_rows':len(changed),'non_target_fv_changes':len(nontarget),'idp_fv_changes':len(idp),'missing_projection_rows_in_legacy_offense_pool':len(legacy['missing']),'ambiguous_projection_normalized_names':len(legacy['ambiguous']),'hold_reason_counts':dict(sorted(holds.items()))},'gates':gates,'movement':{'raw_prod_mult_delta':summarize(rawd),'fv_delta':summarize(fvd),'fv_pct_change':summarize(pct),'largest_absolute_fv_movers':sorted(rows,key=lambda r:(-abs(r.get('fv_delta') or 0),r['key']))[:25]},'apex_cross_position_diagnostic':ap,'rows':rows,'input_sha256':{str(p.relative_to(ROOT)):sha256(p) for p in [INDEX,ALL_PLAYERS,PPG,DURABILITY,PROJECTIONS,PLAYER_POSITIONS,SNAPSHOT_VALUES,HISTORY_MODULE,LEAGUE_ROSTERS,STARTER_AUDIT]}}
+    OUT_JSON.write_text(json.dumps(result,indent=2,sort_keys=True)+'\n',encoding='utf-8'); APEX_JSON.write_text(json.dumps(ap,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+    lines=['# Offense Position Lineage V1 — Phase 1 Audit','',f"**Decision:** `{decision}`",'','Research-only. Production is unchanged.','',f"- Offense position-lineage mismatches: **{len(targets)}**",f"- Current-core targets: **{result['counts']['current_core_target_rows']}**",f"- Recomputed candidates: **{recomputed}**",f"- Explicit holds: **{len(rows)-recomputed}**",f"- Target rows with changed FV: **{len(changed)}**",'','## Hard gates','','| Gate | Result |','|---|---|']
+    lines += [f"| `{k}` | {'PASS' if g['pass'] else 'FAIL'} |" for k,g in gates.items()]
+    lines += ['','## Brian Burns vs Josh Allen apex diagnostic','',f"- Diagnostic status: **`{ap.get('status')}`**"]
+    if ap.get('complete'):
+        b,a=ap['brian_burns'],ap['josh_allen']; ratio=ap['burns_to_allen_fv_ratio']
+        lines += [f"- Brian Burns: **{b['fv']} FV**, {b['position']} rank **#{b['position_rank']}**, overall **#{b['overall_rank']}**",f"- Josh Allen: **{a['fv']} FV**, {a['position']} rank **#{a['position_rank']}**, overall **#{a['overall_rank']}**",f"- Burns minus Allen: **{ap['burns_minus_allen_fv']:+d} FV**",f"- Burns / Allen FV ratio: **{ratio:.4f}x**",f"- Burns raw/effective PROD_MULT: **{b['raw_prod_mult']} / {b['effective_prod_mult']}**",f"- Allen raw/effective PROD_MULT: **{a['raw_prod_mult']} / {a['effective_prod_mult']}**",f"- Burns position weight / age multiplier: **{b['position_weight']} / {b['age_mult']}**",f"- Allen position weight / age multiplier: **{a['position_weight']} / {a['age_mult']}**",f"- High-priority >=1.10x flag: **{'YES' if ap['high_priority_flag'] else 'NO'}**"]
+    lines += ['','This apex diagnostic is separate from the lineage candidate. A flag supports a later cross-position calibration study; it does not justify reversing a lineage fix.','']
+    OUT_MD.write_text('\n'.join(lines),encoding='utf-8')
+    manifest={'study_id':result['study_id'],'phase':1,'decision':decision,'production_change_authorized':False,'repo_commit_sha_evaluated':result['repo_commit_sha_evaluated'],'preregistration_sha256':sha256(PREREG_JSON),'output_sha256':{str(p.relative_to(ROOT)):sha256(p) for p in [PREREG_JSON,PREREG_MD,SCRIPT,OUT_JSON,OUT_MD,APEX_JSON]}}
+    MANIFEST.write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+    print(json.dumps({'decision':decision,'target_mismatch_rows':len(targets),'recomputed_candidates':recomputed,'explicit_holds':len(rows)-recomputed,'changed_target_fv_rows':len(changed),'burns_vs_allen_status':ap.get('status'),'burns_minus_allen_fv':ap.get('burns_minus_allen_fv')},indent=2))
+
+def selftest():
+    assert norm('Amon-Ra St. Brown')=='amonra st brown'
+    assert norm('Brian Thomas Jr.')=='brian thomas'
+    assert abs(clean_pm(100,100)-0.65)<1e-12
+    assert clean_pm(1000,100)==1.55 and clean_pm(1,100)==0.15
+    print('Offense Position Lineage V1 Phase 1 self-test PASS')
+
+def main():
+    ap=argparse.ArgumentParser(); g=ap.add_mutually_exclusive_group(required=True); g.add_argument('--preregister',action='store_true'); g.add_argument('--selftest',action='store_true'); g.add_argument('--evaluate',action='store_true'); args=ap.parse_args()
+    if args.preregister: preregister()
+    elif args.selftest: selftest()
+    else: evaluate()
+
+if __name__=='__main__': main()
