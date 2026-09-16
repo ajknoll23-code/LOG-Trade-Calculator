@@ -1,0 +1,2141 @@
+name: Draft Pick FV V3 Harvest Identity Contract Repair
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Guard frozen preregistration and both prior STOP records
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          p = Path("research/draft-pick-fv-v3")
+          pre = p / "preregistration_v3.json"
+          pre_man = p / "preregistration_manifest_v3.json"
+          cat = p / "historical_draft_source_catalog_v3.json"
+          pooled = p / "mfl_pooled_design_v1.json"
+          old_man = p / "historical_draft_pick_harvest_manifest_v3.json"
+          repair_man = p / "historical_draft_pick_harvest_repair_manifest_v3.json"
+
+          sha = lambda x: hashlib.sha256(x.read_bytes()).hexdigest()
+
+          for x in (pre, pre_man, cat, pooled, old_man, repair_man):
+              assert x.exists(), x
+
+          pm = json.loads(pre_man.read_text())
+          om = json.loads(old_man.read_text())
+          rm = json.loads(repair_man.read_text())
+          po = json.loads(pooled.read_text())
+          pr = json.loads(pre.read_text())
+
+          assert pm["status"] == "FROZEN_PRE_OUTCOME"
+          assert pm["output_hashes"][pre.name] == sha(pre)
+          assert pm["output_hashes"][cat.name] == sha(cat)
+
+          assert po["result"]["decision"] == "ACCEPT_MFL_YEAR_BALANCED_POOLED_R1_R6_DESIGN"
+          assert om["decision"] == "STOP_PRE_OUTCOME_IDENTITY_OR_HARVEST_GATE"
+          assert rm["decision"] == "STOP_PRE_OUTCOME_REPAIR_GATE"
+          assert rm["transport_gate_pass"] is True
+          assert rm["source_sufficiency_pass"] is False
+          assert rm["identity_gate_pass"] is False
+
+          # Critical contract facts that motivate this implementation repair.
+          assert (
+              pr["frozen_scope_by_depth"]["rounds_1_4"]
+              == "Use the accepted pooled-design primary_r1_r4 catalog exactly as frozen. "
+                 "IDP-format sensitivity is reported separately."
+          )
+          assert (
+              pr["draft_harvest_contract"]["pick_rules"]["duplicate_player_within_same_league"]
+              == "exclude duplicate occurrence and flag source anomaly"
+          )
+          assert pr["draft_harvest_contract"]["pick_rules"]["nonempty_player_required"] is True
+          assert (
+              pr["identity_resolution"]["stable_identity_priority"]
+              == [
+                  "exact existing crosswalk to gsis_id",
+                  "exact existing crosswalk to sleeper_id",
+                  "unambiguous normalized name + position + draft class",
+              ]
+          )
+          assert pr["identity_resolution"]["minimum_resolution_coverage"] == 0.95
+
+          for obj in (pm, po, om, rm):
+              assert obj.get("historical_player_outcomes_read") is False
+              assert obj.get("candidate_fit_performed") is False
+              assert obj.get("validation_scored") is False
+              assert obj.get("production_change_authorized") is False
+
+          for name in (
+              "draft_pick_fv_v3_harvest_identity_contract_repair.py",
+              "historical_draft_pick_contract_repair_v3.jsonl",
+              "historical_draft_pick_contract_repair_summary_v3.json",
+              "historical_draft_pick_contract_repair_v3.md",
+              "historical_draft_pick_contract_repair_manifest_v3.json",
+          ):
+              assert not (p / name).exists(), name
+
+          print("PASS: preregistration and both prior STOP records are intact.")
+          PY
+
+      - name: Create contract-correct repair worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/v3-contract-worker"
+
+          cat > "${RUNNER_TEMP}/v3-contract-worker/draft_pick_fv_v3_harvest_identity_contract_repair.py" <<'PY'
+          #!/usr/bin/env python3
+          from __future__ import annotations
+
+          import argparse
+          import csv
+          import hashlib
+          import json
+          import math
+          import re
+          import statistics
+          import time
+          import unicodedata
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from typing import Any
+          from urllib.parse import urlencode
+
+          import requests
+
+          ROOT = Path.cwd()
+          V3 = ROOT / "research" / "draft-pick-fv-v3"
+
+          CATALOG = V3 / "historical_draft_source_catalog_v3.json"
+          PREREG = V3 / "preregistration_v3.json"
+          PREREG_MAN = V3 / "preregistration_manifest_v3.json"
+          POOLED = V3 / "mfl_pooled_design_v1.json"
+          ORIGINAL_MAN = V3 / "historical_draft_pick_harvest_manifest_v3.json"
+          REPAIR1_MAN = V3 / "historical_draft_pick_harvest_repair_manifest_v3.json"
+
+          SCRIPT_OUT = V3 / "draft_pick_fv_v3_harvest_identity_contract_repair.py"
+          PICKS_OUT = V3 / "historical_draft_pick_contract_repair_v3.jsonl"
+          SUMMARY_OUT = V3 / "historical_draft_pick_contract_repair_summary_v3.json"
+          MD_OUT = V3 / "historical_draft_pick_contract_repair_v3.md"
+          MAN_OUT = V3 / "historical_draft_pick_contract_repair_manifest_v3.json"
+
+          YEARS = [2018, 2019, 2020, 2021, 2022, 2023]
+          DEV_YEARS = {2018, 2019, 2020, 2021}
+          VAL_YEARS = {2022, 2023}
+
+          BASE = "https://api.myfantasyleague.com"
+          REQUEST_SLEEP_SECONDS = 1.20
+          REQUEST_RETRIES = 6
+          IDENTITY_MIN_COVERAGE = 0.95
+
+          DP_COMMIT = "692c23d639542d6e9e94ba3898ed978a0b772724"
+          DP_SHA256 = "0174ea890e71d33fa0afc1b846ce1c92273542278a287b6bd52c3a4aa5edce73"
+
+          NFLVERSE_PLAYERS_URL = (
+              "https://github.com/nflverse/nflverse-data/releases/download/players/players.csv"
+          )
+          NFLVERSE_PLAYERS_ASSET_ID = 565719859
+          NFLVERSE_PLAYERS_SHA256 = (
+              "507f8cf03ffc8a82b841212582000163eb713ced15c9f83f851afb42da0af259"
+          )
+          NFLVERSE_PLAYERS_UPDATED_AT = "2026-09-15T13:05:25Z"
+
+          SENTINEL_PLAYER_IDS = {
+              "", "0", "0000", "----", "NA", "N/A", "NULL", "NONE", "NAN",
+          }
+
+          DP_ALLOWED_COLUMNS = [
+              "mfl_id",
+              "gsis_id",
+              "sleeper_id",
+              "name",
+              "merge_name",
+              "position",
+              "draft_year",
+              "db_season",
+          ]
+
+          NFLVERSE_ALLOWED_COLUMNS = [
+              "gsis_id",
+              "display_name",
+              "position",
+              "rookie_season",
+          ]
+
+          SCOPES = {
+              "primary_r1_r4": 4,
+              "primary_r5": 5,
+              "primary_r6": 6,
+              "idp_sensitivity_r5": 5,
+              "idp_sensitivity_r6": 6,
+          }
+
+          class GateError(RuntimeError):
+              pass
+
+          def now() -> str:
+              return datetime.now(timezone.utc).isoformat()
+
+          def load(path: Path) -> dict[str, Any]:
+              return json.loads(path.read_text())
+
+          def sha256(path: Path) -> str:
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          def as_list(x: Any) -> list[Any]:
+              if x is None:
+                  return []
+              return x if isinstance(x, list) else [x]
+
+          def safe_int(x: Any) -> int | None:
+              try:
+                  s = str(x).strip()
+              except Exception:
+                  return None
+              if not re.fullmatch(r"[+-]?\d+", s):
+                  return None
+              try:
+                  return int(s)
+              except ValueError:
+                  return None
+
+          def stable_id(x: Any) -> str | None:
+              s = str(x or "").strip()
+              if not s or s.upper() in {"NA", "N/A", "NULL", "NONE", "NAN"}:
+                  return None
+              return s
+
+          def mfl_player_id(x: Any) -> str | None:
+              s = str(x or "").strip()
+              if s.upper() in SENTINEL_PLAYER_IDS:
+                  return None
+              return s or None
+
+          def clean_name(x: Any) -> str:
+              s = str(x or "").strip()
+              if "," in s:
+                  bits = [z.strip() for z in s.split(",", 1)]
+                  if len(bits) == 2 and bits[0] and bits[1]:
+                      s = bits[1] + " " + bits[0]
+              s = unicodedata.normalize("NFKD", s)
+              s = "".join(ch for ch in s if not unicodedata.combining(ch))
+              s = s.lower()
+              s = re.sub(r"\b(jr|sr|ii|iii|iv|v)\b\.?", " ", s)
+              s = s.replace("'", "").replace("’", "")
+              s = re.sub(r"[^a-z0-9]+", " ", s)
+              return re.sub(r"\s+", " ", s).strip()
+
+          def norm_position(x: Any) -> str:
+              s = str(x or "").strip().upper()
+              aliases = {
+                  "DE": "DL",
+                  "DT": "DL",
+                  "NT": "DL",
+                  "EDGE": "DL",
+                  "ILB": "LB",
+                  "OLB": "LB",
+                  "CB": "DB",
+                  "S": "DB",
+                  "FS": "DB",
+                  "SS": "DB",
+              }
+              return aliases.get(s, s)
+
+          def tier_for_within(within: int) -> str:
+              if 1 <= within <= 4:
+                  return "early"
+              if 5 <= within <= 8:
+                  return "mid"
+              if 9 <= within <= 12:
+                  return "late"
+              raise GateError(f"invalid within-round slot {within}")
+
+          def api_url(year: int, endpoint: str, **params: Any) -> str:
+              q = {"TYPE": endpoint, "JSON": 1}
+              q.update({k: v for k, v in params.items() if v is not None})
+              return f"{BASE}/{year}/export?" + urlencode(q)
+
+          def get_json(
+              session: requests.Session,
+              url: str,
+              retries: int = REQUEST_RETRIES,
+          ) -> dict[str, Any]:
+              last: Exception | None = None
+              for attempt in range(retries):
+                  try:
+                      r = session.get(url, timeout=45)
+                      r.raise_for_status()
+                      data = r.json()
+                      if not isinstance(data, dict):
+                          raise GateError("non-object JSON")
+                      time.sleep(REQUEST_SLEEP_SECONDS)
+                      return data
+                  except (
+                      requests.exceptions.RequestException,
+                      ValueError,
+                      GateError,
+                  ) as exc:
+                      last = exc
+                      if attempt + 1 < retries:
+                          time.sleep(min(30, 2 ** (attempt + 1)))
+              raise GateError(f"{url}: {type(last).__name__}: {last}")
+
+          def check_frozen_state() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+              cat = load(CATALOG)
+              pre = load(PREREG)
+              pm = load(PREREG_MAN)
+              pooled = load(POOLED)
+              om = load(ORIGINAL_MAN)
+              rm = load(REPAIR1_MAN)
+
+              if pm["status"] != "FROZEN_PRE_OUTCOME":
+                  raise GateError("preregistration no longer frozen")
+              if pm["output_hashes"][PREREG.name] != sha256(PREREG):
+                  raise GateError("preregistration hash drift")
+              if pm["output_hashes"][CATALOG.name] != sha256(CATALOG):
+                  raise GateError("catalog hash drift")
+
+              if pooled["result"]["decision"] != "ACCEPT_MFL_YEAR_BALANCED_POOLED_R1_R6_DESIGN":
+                  raise GateError("accepted pooled design drift")
+
+              if om["decision"] != "STOP_PRE_OUTCOME_IDENTITY_OR_HARVEST_GATE":
+                  raise GateError("original STOP drift")
+              if rm["decision"] != "STOP_PRE_OUTCOME_REPAIR_GATE":
+                  raise GateError("repair-1 STOP drift")
+
+              if (
+                  pre["draft_harvest_contract"]["pick_rules"][
+                      "duplicate_player_within_same_league"
+                  ]
+                  != "exclude duplicate occurrence and flag source anomaly"
+              ):
+                  raise GateError("duplicate-player rule drift")
+              if pre["draft_harvest_contract"]["pick_rules"]["nonempty_player_required"] is not True:
+                  raise GateError("nonempty-player rule drift")
+              if (
+                  pre["frozen_scope_by_depth"]["rounds_1_4"]
+                  != "Use the accepted pooled-design primary_r1_r4 catalog exactly as frozen. "
+                     "IDP-format sensitivity is reported separately."
+              ):
+                  raise GateError("frozen R1-R4 catalog rule drift")
+              if pre["identity_resolution"]["minimum_resolution_coverage"] != IDENTITY_MIN_COVERAGE:
+                  raise GateError("identity threshold drift")
+
+              for obj in (pm, pooled, om, rm):
+                  if obj.get("historical_player_outcomes_read") is not False:
+                      raise GateError("historical outcomes already read")
+                  if obj.get("production_change_authorized") is not False:
+                      raise GateError("unexpected production authorization")
+
+              # Verify frozen catalog counts still equal accepted pooled-design counts.
+              expected_counts = {
+                  "primary_r1_r4": 213,
+                  "primary_r5": 81,
+                  "primary_r6": 44,
+                  "idp_sensitivity_r6": 25,
+              }
+              for scope, n in expected_counts.items():
+                  got = sum(1 for r in cat["rows"] if r["scope"].get(scope))
+                  if got != n:
+                      raise GateError(f"frozen catalog {scope}: expected {n}, got {got}")
+
+              return cat, pre, pooled
+
+          def extract_units(data: dict[str, Any]) -> list[dict[str, Any]]:
+              root = data.get("draftResults")
+              if not isinstance(root, dict):
+                  return []
+              return [u for u in as_list(root.get("draftUnit")) if isinstance(u, dict)]
+
+          def unit_type(unit: dict[str, Any]) -> str:
+              return str(unit.get("type") or "").strip().upper()
+
+          def choose_leaguewide_unit(
+              units: list[dict[str, Any]],
+          ) -> tuple[dict[str, Any] | None, str, list[dict[str, Any]]]:
+              summary = []
+              for i, u in enumerate(units):
+                  picks = [p for p in as_list(u.get("draftPick")) if isinstance(p, dict)]
+                  summary.append({
+                      "unit_index": i,
+                      "type": unit_type(u) or None,
+                      "pick_n": len(picks),
+                  })
+
+              if len(units) == 1:
+                  return units[0], "single_draft_unit", summary
+
+              league_units = [u for u in units if unit_type(u) == "LEAGUE"]
+              if len(league_units) == 1:
+                  return league_units[0], "unique_LEAGUE_draft_unit", summary
+
+              return None, "ambiguous_multiple_draft_units", summary
+
+          def canonicalize_unit(
+              unit: dict[str, Any],
+              max_depth: int,
+          ) -> dict[str, Any]:
+              raw = [p for p in as_list(unit.get("draftPick")) if isinstance(p, dict)]
+
+              canonical: dict[int, dict[str, Any]] = {}
+              duplicate_slots = []
+              duplicate_players = []
+              out_of_grid_extras = []
+              parse_anomalies = []
+              raw_blank_slots = []
+
+              for row_index, p in enumerate(raw):
+                  rnd = safe_int(p.get("round"))
+                  pick = safe_int(p.get("pick"))
+
+                  if rnd is None or pick is None:
+                      parse_anomalies.append({
+                          "row_index": row_index,
+                          "round": p.get("round"),
+                          "pick": p.get("pick"),
+                          "kind": "missing_or_noninteger_round_pick",
+                      })
+                      continue
+
+                  if rnd < 1 or pick < 1:
+                      parse_anomalies.append({
+                          "row_index": row_index,
+                          "round": rnd,
+                          "pick": pick,
+                          "kind": "invalid_round_or_pick",
+                      })
+                      continue
+
+                  if rnd > max_depth:
+                      continue
+
+                  if pick > 12:
+                      out_of_grid_extras.append({
+                          "row_index": row_index,
+                          "round": rnd,
+                          "pick": pick,
+                          "player": str(p.get("player") or "").strip() or None,
+                      })
+                      continue
+
+                  slot = (rnd - 1) * 12 + pick
+                  if slot in canonical:
+                      duplicate_slots.append({
+                          "slot": slot,
+                          "first_raw_row_index": canonical[slot]["raw_row_index"],
+                          "duplicate_raw_row_index": row_index,
+                      })
+                      continue
+
+                  pid = mfl_player_id(p.get("player"))
+                  canonical[slot] = {
+                      "slot": slot,
+                      "round": rnd,
+                      "within_round_pick": pick,
+                      "mfl_player_id": pid,
+                      "franchise_id": stable_id(
+                          p.get("franchise")
+                          or p.get("franchise_id")
+                          or p.get("franchiseId")
+                      ),
+                      "raw_row_index": row_index,
+                  }
+                  if pid is None:
+                      raw_blank_slots.append(slot)
+
+              # Frozen rule: duplicate player -> exclude the later occurrence,
+              # flag it, but DO NOT reclassify the league or frozen scope.
+              seen: dict[str, int] = {}
+              for slot in sorted(canonical):
+                  rec = canonical[slot]
+                  pid = rec["mfl_player_id"]
+                  if not pid:
+                      continue
+                  if pid in seen:
+                      duplicate_players.append({
+                          "mfl_player_id": pid,
+                          "first_slot": seen[pid],
+                          "removed_slot": slot,
+                      })
+                      rec["mfl_player_id"] = None
+                  else:
+                      seen[pid] = slot
+
+              return {
+                  "raw_pick_n": len(raw),
+                  "canonical": canonical,
+                  "duplicate_slots": duplicate_slots,
+                  "duplicate_players": duplicate_players,
+                  "raw_blank_slots": sorted(set(raw_blank_slots)),
+                  "out_of_grid_extras": out_of_grid_extras,
+                  "parse_anomalies": parse_anomalies,
+              }
+
+          def required_max_depth(scope: dict[str, Any]) -> int:
+              depths = [SCOPES[k] for k, v in scope.items() if v and k in SCOPES]
+              if not depths:
+                  raise GateError("frozen catalog row has no recognized scope")
+              return max(depths)
+
+          def harvest_year(year: int, out_path: Path) -> None:
+              cat, pre, pooled = check_frozen_state()
+              rows = [r for r in cat["rows"] if int(r["draft_year"]) == year]
+              rows.sort(key=lambda r: int(r["league_id"]))
+              if not rows:
+                  raise GateError(f"{year}: no frozen catalog rows")
+
+              session = requests.Session()
+              session.headers.update({
+                  "User-Agent": f"LOG-Trade-Calculator-Draft-Pick-FV-V3-ContractRepair-{year}/1.0"
+              })
+
+              league_results = []
+
+              for idx, row in enumerate(rows, start=1):
+                  lid = str(row["league_id"])
+                  frozen_scope = dict(row["scope"])
+                  max_depth = required_max_depth(frozen_scope)
+
+                  fetch_error = None
+                  units = []
+                  try:
+                      data = get_json(session, api_url(year, "draftResults", L=lid))
+                      units = extract_units(data)
+                  except GateError as exc:
+                      fetch_error = str(exc)
+
+                  chosen = None
+                  unit_reason = "fetch_failed"
+                  unit_summary = []
+                  can = {
+                      "raw_pick_n": 0,
+                      "canonical": {},
+                      "duplicate_slots": [],
+                      "duplicate_players": [],
+                      "raw_blank_slots": [],
+                      "out_of_grid_extras": [],
+                      "parse_anomalies": [],
+                  }
+
+                  if fetch_error is None:
+                      chosen, unit_reason, unit_summary = choose_leaguewide_unit(units)
+                      if chosen is not None:
+                          can = canonicalize_unit(chosen, max_depth)
+
+                  picks = []
+                  invalid_by_scope = {}
+                  valid_by_scope = {}
+
+                  for scope_name, in_scope in frozen_scope.items():
+                      if not in_scope or scope_name not in SCOPES:
+                          continue
+                      depth = SCOPES[scope_name]
+                      expected = set(range(1, depth * 12 + 1))
+
+                      if fetch_error is not None or chosen is None:
+                          valid = set()
+                      else:
+                          valid = {
+                              slot
+                              for slot, rec in can["canonical"].items()
+                              if slot in expected and rec.get("mfl_player_id")
+                          }
+
+                      invalid_by_scope[scope_name] = sorted(expected - valid)
+                      valid_by_scope[scope_name] = len(valid)
+
+                  if fetch_error is None and chosen is not None:
+                      for slot in sorted(can["canonical"]):
+                          rec = can["canonical"][slot]
+                          pid = rec["mfl_player_id"]
+                          if not pid:
+                              continue
+
+                          rnd = int(rec["round"])
+                          pick_scope = {
+                              scope_name: bool(frozen_scope.get(scope_name))
+                              and rnd <= SCOPES[scope_name]
+                              for scope_name in SCOPES
+                          }
+                          if not any(pick_scope.values()):
+                              continue
+
+                          picks.append({
+                              "draft_year": year,
+                              "league_id": lid,
+                              "overall_slot": slot,
+                              "round": rnd,
+                              "within_round_pick": int(rec["within_round_pick"]),
+                              "tier": tier_for_within(int(rec["within_round_pick"])),
+                              "mfl_player_id": pid,
+                              "franchise_id": rec["franchise_id"],
+                              "pick_scope": pick_scope,
+                              "league_idp": bool(row.get("idp", False)),
+                              "split": (
+                                  "development"
+                                  if year in DEV_YEARS
+                                  else "locked_validation"
+                              ),
+                          })
+
+                  league_results.append({
+                      "draft_year": year,
+                      "league_id": lid,
+                      "league_name": row.get("league_name"),
+                      "idp": bool(row.get("idp", False)),
+                      "frozen_scope": frozen_scope,
+                      "transport_ok": fetch_error is None,
+                      "fetch_error": fetch_error,
+                      "draft_unit_n": len(units),
+                      "unit_selection_reason": unit_reason,
+                      "unit_summary": unit_summary,
+                      "raw_pick_n_selected_unit": can["raw_pick_n"],
+                      "out_of_grid_extra_n": len(can["out_of_grid_extras"]),
+                      "raw_blank_slot_n": len(can["raw_blank_slots"]),
+                      "raw_blank_slots": can["raw_blank_slots"],
+                      "duplicate_player_n": len(can["duplicate_players"]),
+                      "duplicate_players": can["duplicate_players"],
+                      "duplicate_slot_n": len(can["duplicate_slots"]),
+                      "duplicate_slots": can["duplicate_slots"],
+                      "parse_anomaly_n": len(can["parse_anomalies"]),
+                      "parse_anomalies": can["parse_anomalies"],
+                      "valid_pick_n_by_scope": valid_by_scope,
+                      "excluded_slot_n_by_scope": {
+                          k: len(v) for k, v in invalid_by_scope.items()
+                      },
+                      "excluded_slots_by_scope": invalid_by_scope,
+                      "picks": picks,
+                  })
+
+                  if idx % 10 == 0 or idx == len(rows):
+                      print(
+                          f"{year}: {idx}/{len(rows)} frozen leagues; "
+                          f"valid picks={sum(len(x['picks']) for x in league_results)}",
+                          flush=True,
+                      )
+
+              payload = {
+                  "schema_version": 1,
+                  "stage": "contract_correct_year",
+                  "year": year,
+                  "generated_at_utc": now(),
+                  "pre_outcome_stage": True,
+                  "research_only": True,
+                  "historical_player_outcomes_read": False,
+                  "market_or_ktc_values_read": False,
+                  "package_vote_data_read": False,
+                  "candidate_fit_performed": False,
+                  "candidate_scores_computed": False,
+                  "validation_scored": False,
+                  "production_change_authorized": False,
+                  "api_endpoints_used": ["draftResults"],
+                  "frozen_catalog_sha256": sha256(CATALOG),
+                  "frozen_preregistration_sha256": sha256(PREREG),
+                  "frozen_catalog_row_n": len(rows),
+                  "transport_failure_n": sum(
+                      1 for x in league_results if not x["transport_ok"]
+                  ),
+                  "ambiguous_unit_n": sum(
+                      1 for x in league_results
+                      if x["transport_ok"]
+                      and x["unit_selection_reason"] == "ambiguous_multiple_draft_units"
+                  ),
+                  "league_results": league_results,
+              }
+              out_path.parent.mkdir(parents=True, exist_ok=True)
+              out_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+              print(json.dumps({
+                  "year": year,
+                  "catalog_leagues": len(rows),
+                  "transport_failures": payload["transport_failure_n"],
+                  "ambiguous_units": payload["ambiguous_unit_n"],
+                  "valid_pick_rows": sum(len(x["picks"]) for x in league_results),
+              }, indent=2, sort_keys=True))
+
+          def load_dp(path: Path) -> dict[str, Any]:
+              by_mfl = {}
+              by_fallback = defaultdict(list)
+              by_gsis = defaultdict(list)
+              row_n = 0
+
+              with path.open(newline="", encoding="utf-8-sig") as f:
+                  reader = csv.reader(f)
+                  header = next(reader)
+                  idx = {c: i for i, c in enumerate(header)}
+                  missing = [c for c in DP_ALLOWED_COLUMNS if c not in idx]
+                  if missing:
+                      raise GateError(f"DynastyProcess source missing {missing}")
+
+                  for raw in reader:
+                      if len(raw) < len(header):
+                          raw += [""] * (len(header) - len(raw))
+                      rec = {c: raw[idx[c]] for c in DP_ALLOWED_COLUMNS}
+                      row_n += 1
+
+                      row = {
+                          "mfl_id": stable_id(rec["mfl_id"]),
+                          "gsis_id": stable_id(rec["gsis_id"]),
+                          "sleeper_id": stable_id(rec["sleeper_id"]),
+                          "name": stable_id(rec["name"]),
+                          "merge_name": stable_id(rec["merge_name"]),
+                          "position": stable_id(rec["position"]),
+                          "draft_year": safe_int(rec["draft_year"]),
+                          "db_season": safe_int(rec["db_season"]),
+                      }
+
+                      mid = row["mfl_id"]
+                      if mid:
+                          if mid in by_mfl:
+                              raise GateError(f"duplicate MFL id in crosswalk: {mid}")
+                          by_mfl[mid] = row
+
+                      nm = clean_name(row["merge_name"] or row["name"])
+                      pos = norm_position(row["position"])
+                      dy = row["draft_year"]
+                      if nm and pos and dy:
+                          by_fallback[(nm, pos, int(dy))].append(row)
+
+                      if row["gsis_id"]:
+                          by_gsis[row["gsis_id"]].append(row)
+
+              return {
+                  "by_mfl": by_mfl,
+                  "by_fallback": by_fallback,
+                  "by_gsis": by_gsis,
+                  "row_n": row_n,
+                  "header": header,
+              }
+
+          def load_nflverse(path: Path) -> dict[str, Any]:
+              by_fallback = defaultdict(list)
+              row_n = 0
+
+              with path.open(newline="", encoding="utf-8-sig") as f:
+                  reader = csv.reader(f)
+                  header = next(reader)
+                  idx = {c: i for i, c in enumerate(header)}
+                  missing = [c for c in NFLVERSE_ALLOWED_COLUMNS if c not in idx]
+                  if missing:
+                      raise GateError(f"nflverse players source missing {missing}")
+
+                  for raw in reader:
+                      if len(raw) < len(header):
+                          raw += [""] * (len(header) - len(raw))
+                      rec = {c: raw[idx[c]] for c in NFLVERSE_ALLOWED_COLUMNS}
+                      row_n += 1
+
+                      gsis = stable_id(rec["gsis_id"])
+                      nm = clean_name(rec["display_name"])
+                      pos = norm_position(rec["position"])
+                      rookie = safe_int(rec["rookie_season"])
+
+                      if gsis and nm and pos and rookie:
+                          by_fallback[(nm, pos, int(rookie))].append({
+                              "gsis_id": gsis,
+                              "display_name": stable_id(rec["display_name"]),
+                              "position": stable_id(rec["position"]),
+                              "rookie_season": rookie,
+                          })
+
+              return {
+                  "by_fallback": by_fallback,
+                  "row_n": row_n,
+                  "header": header,
+              }
+
+          def players_rows(data: dict[str, Any]) -> list[dict[str, Any]]:
+              root = data.get("players")
+              if not isinstance(root, dict):
+                  return []
+              return [
+                  x for x in as_list(root.get("player"))
+                  if isinstance(x, dict)
+              ]
+
+          def fetch_mfl_metadata(
+              session: requests.Session,
+              year: int,
+              player_ids: list[str],
+          ) -> tuple[dict[str, dict[str, Any]], list[str]]:
+              out = {}
+              errors = []
+              ids = sorted(set(player_ids), key=lambda x: (len(x), x))
+
+              for start in range(0, len(ids), 100):
+                  chunk = ids[start:start + 100]
+                  try:
+                      data = get_json(
+                          session,
+                          api_url(
+                              year,
+                              "players",
+                              PLAYERS=",".join(chunk),
+                              DETAILS=1,
+                          ),
+                          retries=4,
+                      )
+                  except GateError as exc:
+                      errors.append(str(exc))
+                      continue
+
+                  for row in players_rows(data):
+                      pid = mfl_player_id(row.get("id") or row.get("player_id"))
+                      if not pid or pid not in chunk:
+                          continue
+                      out[pid] = {
+                          "name": stable_id(row.get("name")),
+                          "position": stable_id(row.get("position")),
+                      }
+
+              return out, errors
+
+          def unique_stable_dp(
+              candidates: list[dict[str, Any]],
+          ) -> dict[str, Any] | None:
+              stable = {}
+              for c in candidates:
+                  if not (c["gsis_id"] or c["sleeper_id"]):
+                      continue
+                  stable[(c["gsis_id"], c["sleeper_id"])] = c
+              if len(stable) == 1:
+                  return next(iter(stable.values()))
+              return None
+
+          def unique_nflverse(
+              candidates: list[dict[str, Any]],
+          ) -> dict[str, Any] | None:
+              stable = {c["gsis_id"]: c for c in candidates if c["gsis_id"]}
+              if len(stable) == 1:
+                  return next(iter(stable.values()))
+              return None
+
+          def sleeper_for_gsis(
+              gsis_id: str | None,
+              dp_by_gsis: dict[str, list[dict[str, Any]]],
+          ) -> str | None:
+              if not gsis_id:
+                  return None
+              vals = {
+                  r["sleeper_id"]
+                  for r in dp_by_gsis.get(gsis_id, [])
+                  if r["sleeper_id"]
+              }
+              return next(iter(vals)) if len(vals) == 1 else None
+
+          def resolve_identities(
+              picks: list[dict[str, Any]],
+              dp_csv: Path,
+              nflverse_csv: Path,
+          ) -> dict[str, Any]:
+              dp = load_dp(dp_csv)
+              nv = load_nflverse(nflverse_csv)
+
+              unique_ids = sorted(
+                  {p["mfl_player_id"] for p in picks if p.get("mfl_player_id")},
+                  key=lambda x: (len(x), x),
+              )
+              years_for_mid = defaultdict(set)
+              scopes_for_mid = defaultdict(set)
+              for p in picks:
+                  mid = p["mfl_player_id"]
+                  years_for_mid[mid].add(int(p["draft_year"]))
+                  for scope, yes in p["pick_scope"].items():
+                      if yes:
+                          scopes_for_mid[mid].add(scope)
+
+              resolution = {}
+
+              # Frozen priority 1/2: exact existing crosswalk IDs.
+              for mid in unique_ids:
+                  row = dp["by_mfl"].get(mid)
+                  if row and (row["gsis_id"] or row["sleeper_id"]):
+                      resolution[mid] = {
+                          "resolved": True,
+                          "method": "exact_dynastyprocess_mfl_crosswalk",
+                          "gsis_id": row["gsis_id"],
+                          "sleeper_id": row["sleeper_id"],
+                          "name": row["name"],
+                          "position": row["position"],
+                          "draft_class": row["draft_year"],
+                      }
+
+              unresolved = [mid for mid in unique_ids if mid not in resolution]
+
+              session = requests.Session()
+              session.headers.update({
+                  "User-Agent": "LOG-Trade-Calculator-Draft-Pick-FV-V3-ContractRepair-Identity/1.0"
+              })
+
+              metadata = {}
+              metadata_errors = {}
+              for year in YEARS:
+                  ids = [mid for mid in unresolved if year in years_for_mid[mid]]
+                  if not ids:
+                      continue
+                  rows, errs = fetch_mfl_metadata(session, year, ids)
+                  for mid, row in rows.items():
+                      metadata[(year, mid)] = row
+                  if errs:
+                      metadata_errors[str(year)] = errs
+
+              # Frozen priority 3A: same normalized name+position+draft-class
+              # rule against the already-pinned DynastyProcess crosswalk.
+              dp_fallback_audit = []
+              for mid in list(unresolved):
+                  stable_across_years = {}
+                  exact = dp["by_mfl"].get(mid)
+
+                  for year in sorted(years_for_mid[mid]):
+                      name = exact["name"] if exact else None
+                      pos = exact["position"] if exact else None
+                      meta = metadata.get((year, mid))
+                      if meta:
+                          name = name or meta.get("name")
+                          pos = pos or meta.get("position")
+
+                      key = (clean_name(name), norm_position(pos), year)
+                      chosen = unique_stable_dp(dp["by_fallback"].get(key, []))
+
+                      dp_fallback_audit.append({
+                          "mfl_player_id": mid,
+                          "draft_year": year,
+                          "normalized_name": key[0],
+                          "normalized_position": key[1],
+                          "unique_candidate": chosen is not None,
+                      })
+
+                      if chosen is not None:
+                          stable_across_years[
+                              (chosen["gsis_id"], chosen["sleeper_id"])
+                          ] = chosen
+
+                  if len(stable_across_years) == 1:
+                      chosen = next(iter(stable_across_years.values()))
+                      resolution[mid] = {
+                          "resolved": True,
+                          "method": "dynastyprocess_name_position_draft_class",
+                          "gsis_id": chosen["gsis_id"],
+                          "sleeper_id": chosen["sleeper_id"],
+                          "name": chosen["name"],
+                          "position": chosen["position"],
+                          "draft_class": chosen["draft_year"],
+                      }
+
+              unresolved = [mid for mid in unique_ids if mid not in resolution]
+
+              # Frozen priority 3B: identical rule against a pinned nflverse
+              # player-identity table that existed before either harvest result.
+              nv_fallback_audit = []
+              for mid in list(unresolved):
+                  stable_across_years = {}
+                  exact = dp["by_mfl"].get(mid)
+
+                  for year in sorted(years_for_mid[mid]):
+                      name = exact["name"] if exact else None
+                      pos = exact["position"] if exact else None
+                      meta = metadata.get((year, mid))
+                      if meta:
+                          name = name or meta.get("name")
+                          pos = pos or meta.get("position")
+
+                      key = (clean_name(name), norm_position(pos), year)
+                      chosen = unique_nflverse(nv["by_fallback"].get(key, []))
+
+                      nv_fallback_audit.append({
+                          "mfl_player_id": mid,
+                          "draft_year": year,
+                          "normalized_name": key[0],
+                          "normalized_position": key[1],
+                          "unique_candidate": chosen is not None,
+                      })
+
+                      if chosen is not None:
+                          stable_across_years[chosen["gsis_id"]] = chosen
+
+                  if len(stable_across_years) == 1:
+                      chosen = next(iter(stable_across_years.values()))
+                      gsis = chosen["gsis_id"]
+                      resolution[mid] = {
+                          "resolved": True,
+                          "method": "nflverse_name_position_draft_class",
+                          "gsis_id": gsis,
+                          "sleeper_id": sleeper_for_gsis(gsis, dp["by_gsis"]),
+                          "name": chosen["display_name"],
+                          "position": chosen["position"],
+                          "draft_class": chosen["rookie_season"],
+                      }
+
+              # Preserve unresolved rows without manual adjudication.
+              for mid in unique_ids:
+                  if mid in resolution:
+                      continue
+
+                  exact = dp["by_mfl"].get(mid)
+                  sample_meta = None
+                  for year in sorted(years_for_mid[mid]):
+                      if (year, mid) in metadata:
+                          sample_meta = metadata[(year, mid)]
+                          break
+
+                  resolution[mid] = {
+                      "resolved": False,
+                      "method": "unresolved",
+                      "gsis_id": exact["gsis_id"] if exact else None,
+                      "sleeper_id": exact["sleeper_id"] if exact else None,
+                      "name": (
+                          exact["name"]
+                          if exact and exact["name"]
+                          else (sample_meta or {}).get("name")
+                      ),
+                      "position": (
+                          exact["position"]
+                          if exact and exact["position"]
+                          else (sample_meta or {}).get("position")
+                      ),
+                      "draft_class": exact["draft_year"] if exact else None,
+                  }
+
+              for p in picks:
+                  ident = resolution[p["mfl_player_id"]]
+                  p["identity_resolved"] = ident["resolved"]
+                  p["identity_resolution_method"] = ident["method"]
+                  p["gsis_id"] = ident["gsis_id"]
+                  p["sleeper_id"] = ident["sleeper_id"]
+                  p["name"] = ident["name"]
+                  p["position"] = ident["position"]
+                  p["identity_draft_class"] = ident["draft_class"]
+
+              resolved_n = sum(resolution[mid]["resolved"] for mid in unique_ids)
+              coverage = resolved_n / len(unique_ids) if unique_ids else 0.0
+
+              # Coverage by scope is diagnostic only; the frozen gate remains
+              # the all-eligible unique-identity denominator.
+              coverage_by_scope = {}
+              for scope in SCOPES:
+                  ids = {
+                      p["mfl_player_id"]
+                      for p in picks
+                      if p["pick_scope"].get(scope)
+                  }
+                  rn = sum(resolution[mid]["resolved"] for mid in ids)
+                  coverage_by_scope[scope] = {
+                      "unique_player_n": len(ids),
+                      "resolved_unique_player_n": rn,
+                      "coverage": rn / len(ids) if ids else None,
+                  }
+
+              unresolved_rows = []
+              for mid in unique_ids:
+                  ident = resolution[mid]
+                  if ident["resolved"]:
+                      continue
+                  unresolved_rows.append({
+                      "mfl_player_id": mid,
+                      "name": ident["name"],
+                      "position": ident["position"],
+                      "draft_years_seen": sorted(years_for_mid[mid]),
+                      "scopes_seen": sorted(scopes_for_mid[mid]),
+                      "has_gsis_id": bool(ident["gsis_id"]),
+                      "has_sleeper_id": bool(ident["sleeper_id"]),
+                  })
+
+              return {
+                  "pass": bool(unique_ids) and coverage >= IDENTITY_MIN_COVERAGE,
+                  "minimum_required": IDENTITY_MIN_COVERAGE,
+                  "denominator_definition": (
+                      "unique nonblank MFL player IDs across every valid pick "
+                      "occurrence in the frozen eligible source catalogs"
+                  ),
+                  "unique_player_n": len(unique_ids),
+                  "resolved_unique_player_n": int(resolved_n),
+                  "coverage": coverage,
+                  "resolution_method_counts": dict(Counter(
+                      resolution[mid]["method"] for mid in unique_ids
+                  )),
+                  "coverage_by_scope_diagnostic": coverage_by_scope,
+                  "unresolved_unique_player_n": len(unresolved_rows),
+                  "unresolved_players": unresolved_rows,
+                  "mfl_metadata_fetch_errors": metadata_errors,
+                  "dynastyprocess_row_n": dp["row_n"],
+                  "nflverse_row_n": nv["row_n"],
+                  "dynastyprocess_fallback_audit": dp_fallback_audit,
+                  "nflverse_fallback_audit": nv_fallback_audit,
+              }
+
+          def add_scope_weights(
+              picks: list[dict[str, Any]],
+              league_results: list[dict[str, Any]],
+          ) -> None:
+              # Natural missing-occurrence extension of frozen year/league balance:
+              # each draft class = 1/6 total weight; within class, every frozen
+              # eligible league in a scope receives equal total weight; each
+              # league's retained valid picks divide that league's weight equally.
+              league_counts = {}
+              valid_pick_counts = {}
+
+              for year in YEARS:
+                  for scope in SCOPES:
+                      lids = {
+                          str(lg["league_id"])
+                          for lg in league_results
+                          if int(lg["draft_year"]) == year
+                          and lg["frozen_scope"].get(scope)
+                      }
+                      league_counts[(year, scope)] = len(lids)
+
+              for p in picks:
+                  y = int(p["draft_year"])
+                  lid = str(p["league_id"])
+                  for scope, yes in p["pick_scope"].items():
+                      if yes:
+                          valid_pick_counts[(y, lid, scope)] = (
+                              valid_pick_counts.get((y, lid, scope), 0) + 1
+                          )
+
+              for p in picks:
+                  y = int(p["draft_year"])
+                  lid = str(p["league_id"])
+                  weights = {}
+                  for scope, yes in p["pick_scope"].items():
+                      if not yes:
+                          continue
+                      n_leagues = league_counts[(y, scope)]
+                      n_valid = valid_pick_counts[(y, lid, scope)]
+                      if n_leagues <= 0 or n_valid <= 0:
+                          raise GateError("invalid scope weight denominator")
+                      weights[scope] = (1.0 / len(YEARS)) / n_leagues / n_valid
+                  p["scope_weight"] = weights
+
+          def source_retention_diagnostics(
+              picks: list[dict[str, Any]],
+              league_results: list[dict[str, Any]],
+              cat: dict[str, Any],
+              pooled: dict[str, Any],
+          ) -> dict[str, Any]:
+              out = {}
+
+              for scope, depth in SCOPES.items():
+                  frozen_rows = [r for r in cat["rows"] if r["scope"].get(scope)]
+                  frozen_league_n = len(frozen_rows)
+                  expected = frozen_league_n * depth * 12
+
+                  scoped = [p for p in picks if p["pick_scope"].get(scope)]
+                  valid = len(scoped)
+
+                  slot_counts = Counter(int(p["overall_slot"]) for p in scoped)
+                  supports = [
+                      slot_counts.get(slot, 0)
+                      for slot in range(1, depth * 12 + 1)
+                  ]
+
+                  by_year = {}
+                  for year in YEARS:
+                      yr_rows = [
+                          r for r in frozen_rows
+                          if int(r["draft_year"]) == year
+                      ]
+                      yr_picks = [
+                          p for p in scoped
+                          if int(p["draft_year"]) == year
+                      ]
+                      yr_slot_counts = Counter(
+                          int(p["overall_slot"]) for p in yr_picks
+                      )
+                      yr_support = [
+                          yr_slot_counts.get(slot, 0)
+                          for slot in range(1, depth * 12 + 1)
+                      ]
+                      by_year[str(year)] = {
+                          "frozen_league_n": len(yr_rows),
+                          "expected_pick_occurrence_n": len(yr_rows) * depth * 12,
+                          "valid_pick_occurrence_n": len(yr_picks),
+                          "retention_fraction": (
+                              len(yr_picks) / (len(yr_rows) * depth * 12)
+                              if yr_rows else None
+                          ),
+                          "exact_slot_support_min": min(yr_support) if yr_support else 0,
+                          "exact_slot_support_median": (
+                              statistics.median(yr_support) if yr_support else 0
+                          ),
+                          "exact_slot_support_max": max(yr_support) if yr_support else 0,
+                      }
+
+                  min_support = min(supports) if supports else 0
+                  out[scope] = {
+                      "frozen_league_n": frozen_league_n,
+                      "expected_pick_occurrence_n": expected,
+                      "valid_pick_occurrence_n": valid,
+                      "excluded_pick_occurrence_n": expected - valid,
+                      "retention_fraction": valid / expected if expected else None,
+                      "pooled_exact_slot_support_min": min_support,
+                      "pooled_exact_slot_support_median": (
+                          statistics.median(supports) if supports else 0
+                      ),
+                      "pooled_exact_slot_support_max": max(supports) if supports else 0,
+                      "pooled_min_support_slots": [
+                          i + 1 for i, v in enumerate(supports)
+                          if v == min_support
+                      ],
+                      "by_year": by_year,
+                  }
+
+              out["contract_interpretation"] = {
+                  "frozen_catalog_is_requalified_after_pick_exclusions": False,
+                  "reason": (
+                      "Preregistration freezes the accepted source catalogs and "
+                      "specifies occurrence-level exclusion for duplicate players "
+                      "and a nonempty-player requirement. Invalid occurrences are "
+                      "therefore omitted and flagged without converting an entire "
+                      "frozen league scope into a post-hoc source failure."
+                  ),
+                  "accepted_pooled_design_decision": pooled["result"]["decision"],
+                  "accepted_frozen_counts": {
+                      "primary_r1_r4": 213,
+                      "primary_r5": 81,
+                      "primary_r6": 44,
+                      "idp_sensitivity_r6": 25,
+                  },
+              }
+              return out
+
+          def aggregate(
+              partial_dir: Path,
+              dp_csv: Path,
+              nflverse_csv: Path,
+          ) -> None:
+              cat, pre, pooled = check_frozen_state()
+
+              parts = []
+              for year in YEARS:
+                  p = partial_dir / f"year_{year}.json"
+                  if not p.exists():
+                      raise GateError(f"missing year artifact {p}")
+                  d = load(p)
+                  if d["year"] != year:
+                      raise GateError(f"wrong year in {p}")
+                  if d["historical_player_outcomes_read"] is not False:
+                      raise GateError("outcome firewall violated")
+                  if d["frozen_catalog_sha256"] != sha256(CATALOG):
+                      raise GateError("catalog hash mismatch")
+                  if d["frozen_preregistration_sha256"] != sha256(PREREG):
+                      raise GateError("prereg hash mismatch")
+                  parts.append(d)
+
+              league_results = [
+                  lg for part in parts for lg in part["league_results"]
+              ]
+
+              expected_keys = {
+                  (int(r["draft_year"]), str(r["league_id"]))
+                  for r in cat["rows"]
+              }
+              got_keys = {
+                  (int(lg["draft_year"]), str(lg["league_id"]))
+                  for lg in league_results
+              }
+              key_exact = expected_keys == got_keys and len(league_results) == len(expected_keys)
+
+              transport_failures = [
+                  {
+                      "draft_year": lg["draft_year"],
+                      "league_id": lg["league_id"],
+                      "error": lg["fetch_error"],
+                  }
+                  for lg in league_results
+                  if not lg["transport_ok"]
+              ]
+              ambiguous_units = [
+                  {
+                      "draft_year": lg["draft_year"],
+                      "league_id": lg["league_id"],
+                      "unit_summary": lg["unit_summary"],
+                  }
+                  for lg in league_results
+                  if lg["transport_ok"]
+                  and lg["unit_selection_reason"] == "ambiguous_multiple_draft_units"
+              ]
+              transport_pass = key_exact and not transport_failures and not ambiguous_units
+
+              picks = [
+                  dict(p)
+                  for lg in league_results
+                  for p in lg["picks"]
+              ]
+              picks.sort(
+                  key=lambda x: (
+                      int(x["draft_year"]),
+                      int(x["league_id"]),
+                      int(x["overall_slot"]),
+                  )
+              )
+
+              add_scope_weights(picks, league_results)
+              identity = resolve_identities(picks, dp_csv, nflverse_csv)
+              retention = source_retention_diagnostics(
+                  picks, league_results, cat, pooled
+              )
+
+              decision_pass = transport_pass and identity["pass"]
+              decision = (
+                  "PASS_CONTRACT_CORRECT_HARVEST_IDENTITY_GATE_OUTCOMES_AUTHORIZED_NEXT_STAGE"
+                  if decision_pass
+                  else "STOP_PRE_OUTCOME_CONTRACT_REPAIR_IDENTITY_GATE"
+              )
+
+              # Write compact canonical pick corpus as JSONL.
+              with PICKS_OUT.open("w", encoding="utf-8") as f:
+                  for p in picks:
+                      f.write(json.dumps(p, sort_keys=True, separators=(",", ":")) + "\n")
+
+              issue_summary = {
+                  "league_n_with_raw_blank_slots": sum(
+                      1 for lg in league_results if lg["raw_blank_slot_n"] > 0
+                  ),
+                  "league_n_with_duplicate_players": sum(
+                      1 for lg in league_results if lg["duplicate_player_n"] > 0
+                  ),
+                  "league_n_with_out_of_grid_extras": sum(
+                      1 for lg in league_results if lg["out_of_grid_extra_n"] > 0
+                  ),
+                  "league_n_with_duplicate_slots": sum(
+                      1 for lg in league_results if lg["duplicate_slot_n"] > 0
+                  ),
+                  "league_n_with_parse_anomalies": sum(
+                      1 for lg in league_results if lg["parse_anomaly_n"] > 0
+                  ),
+              }
+
+              summary = {
+                  "schema_version": 1,
+                  "study_id": "draft-pick-fv-v3-harvest-identity-contract-repair",
+                  "generated_at_utc": now(),
+                  "decision": decision,
+                  "status": (
+                      "PRE_OUTCOME_CONTRACT_REPAIR_PASSED"
+                      if decision_pass
+                      else "PRE_OUTCOME_CONTRACT_REPAIR_STOP"
+                  ),
+                  "research_only": True,
+                  "pre_outcome_stage": True,
+                  "historical_player_outcomes_read": False,
+                  "market_or_ktc_values_read": False,
+                  "package_vote_data_read": False,
+                  "candidate_fit_performed": False,
+                  "candidate_scores_computed": False,
+                  "validation_scored": False,
+                  "production_change_authorized": False,
+                  "contract_correction": {
+                      "frozen_source_catalog_changed": False,
+                      "source_eligibility_rules_changed": False,
+                      "identity_threshold_changed": False,
+                      "development_validation_split_changed": False,
+                      "outcome_definition_changed": False,
+                      "candidate_families_changed": False,
+                      "prior_stop_outputs_overwritten": False,
+                      "whole_league_requalification_removed": True,
+                      "invalid_pick_occurrences_are_excluded_and_flagged": True,
+                      "missing_occurrence_weighting": (
+                          "Each year retains total class weight 1/6. Within a "
+                          "frozen scope and year, every frozen eligible league "
+                          "receives equal total weight; each league's valid retained "
+                          "pick occurrences divide that league's weight equally."
+                      ),
+                  },
+                  "transport_gate": {
+                      "pass": transport_pass,
+                      "catalog_key_exact": key_exact,
+                      "frozen_catalog_league_n": len(expected_keys),
+                      "observed_league_n": len(league_results),
+                      "transport_failure_n": len(transport_failures),
+                      "transport_failures": transport_failures,
+                      "ambiguous_multiple_unit_n": len(ambiguous_units),
+                      "ambiguous_units": ambiguous_units,
+                  },
+                  "source_catalog_gate": {
+                      "pass": True,
+                      "basis": "already-frozen accepted pooled-design catalog",
+                      "decision": pooled["result"]["decision"],
+                      "post_hoc_whole_league_requalification_performed": False,
+                  },
+                  "pick_occurrence_retention_diagnostic": retention,
+                  "identity_gate": identity,
+                  "source_issue_summary": issue_summary,
+                  "identity_sources": {
+                      "dynastyprocess": {
+                          "commit": DP_COMMIT,
+                          "sha256": sha256(dp_csv),
+                          "allowed_columns": DP_ALLOWED_COLUMNS,
+                          "market_value_columns_accessed": False,
+                          "ktc_identifier_column_accessed": False,
+                      },
+                      "nflverse_players": {
+                          "asset_id": NFLVERSE_PLAYERS_ASSET_ID,
+                          "asset_updated_at": NFLVERSE_PLAYERS_UPDATED_AT,
+                          "sha256": sha256(nflverse_csv),
+                          "allowed_columns": NFLVERSE_ALLOWED_COLUMNS,
+                          "player_outcome_columns_accessed": False,
+                          "role": (
+                              "Only the already-frozen unambiguous normalized "
+                              "name + position + draft-class identity fallback; "
+                              "the asset predates both harvest gate results."
+                          ),
+                      },
+                  },
+                  "frozen_input_hashes": {
+                      CATALOG.name: sha256(CATALOG),
+                      PREREG.name: sha256(PREREG),
+                      PREREG_MAN.name: sha256(PREREG_MAN),
+                      POOLED.name: sha256(POOLED),
+                      ORIGINAL_MAN.name: sha256(ORIGINAL_MAN),
+                      REPAIR1_MAN.name: sha256(REPAIR1_MAN),
+                  },
+                  "pick_corpus": {
+                      "file": PICKS_OUT.name,
+                      "row_n": len(picks),
+                      "sha256": sha256(PICKS_OUT),
+                  },
+                  "split": {
+                      "development_years": sorted(DEV_YEARS),
+                      "locked_validation_years": sorted(VAL_YEARS),
+                      "locked_validation_scored": False,
+                  },
+                  "next_step": (
+                      "Run the separately isolated historical outcome availability "
+                      "and ingestion stage under the existing frozen preregistration. "
+                      "Do not score locked validation or change production in the "
+                      "harvest workflow."
+                      if decision_pass
+                      else
+                      "Stop before historical outcomes. The remaining failure is "
+                      "the frozen 95% identity gate; do not lower it or manually "
+                      "resolve identities after observing outcomes."
+                  ),
+              }
+              SUMMARY_OUT.write_text(
+                  json.dumps(summary, indent=2, sort_keys=True) + "\n"
+              )
+
+              cov = identity["coverage"] * 100.0
+              lines = [
+                  "# Draft Pick FV V3 — Contract-Correct Harvest & Identity Repair",
+                  "",
+                  f"**Decision:** `{decision}`",
+                  "",
+                  "This repair corrects one implementation error in Repair #1: "
+                  "a bad/blank duplicate pick occurrence must be excluded and "
+                  "flagged, but it does not retroactively remove the entire league "
+                  "from a source catalog that the preregistration says to use exactly as frozen.",
+                  "",
+                  "No historical NFL outcomes, KTC/market values, package votes, "
+                  "candidate fits, validation scores, or production changes were read or produced.",
+                  "",
+                  "## Source contract",
+                  "",
+                  "- Frozen primary R1-R4 leagues: **213**",
+                  "- Frozen primary R5 non-IDP leagues: **81**",
+                  "- Frozen primary R6 non-IDP leagues: **44**",
+                  "- Frozen R6 IDP sensitivity leagues: **25**",
+                  "- Whole-league post-hoc requalification: **No**",
+                  "",
+                  "## Valid-pick retention",
+                  "",
+              ]
+
+              for scope in (
+                  "primary_r1_r4",
+                  "primary_r5",
+                  "primary_r6",
+                  "idp_sensitivity_r6",
+              ):
+                  r = retention[scope]
+                  lines.append(
+                      f"- {scope}: **{r['valid_pick_occurrence_n']} / "
+                      f"{r['expected_pick_occurrence_n']} = "
+                      f"{100*r['retention_fraction']:.2f}%** valid; "
+                      f"pooled exact-slot support min/median/max "
+                      f"**{r['pooled_exact_slot_support_min']} / "
+                      f"{r['pooled_exact_slot_support_median']:.1f} / "
+                      f"{r['pooled_exact_slot_support_max']}**"
+                  )
+
+              lines += [
+                  "",
+                  "## Identity gate",
+                  "",
+                  f"- Eligible unique drafted MFL identities: **{identity['unique_player_n']}**",
+                  f"- Resolved: **{identity['resolved_unique_player_n']}**",
+                  f"- Coverage: **{cov:.2f}%**",
+                  f"- Required: **{IDENTITY_MIN_COVERAGE*100:.0f}%**",
+                  f"- Gate: **{'PASS' if identity['pass'] else 'FAIL'}**",
+                  "",
+                  "Resolution remains deterministic: exact DynastyProcess IDs first, "
+                  "then the frozen name+position+draft-class fallback. A pinned "
+                  "nflverse player-identity asset that existed before either harvest "
+                  "result is used only for that same fallback rule.",
+                  "",
+                  "## Outcome firewall",
+                  "",
+                  "- Historical outcomes read: **No**",
+                  "- Locked validation scored: **No**",
+                  "- Candidate fit performed: **No**",
+                  "- Production change authorized: **No**",
+                  "",
+                  "## Next step",
+                  "",
+                  summary["next_step"],
+              ]
+              MD_OUT.write_text("\n".join(lines) + "\n")
+
+              manifest = {
+                  "schema_version": 1,
+                  "study_id": summary["study_id"],
+                  "generated_at_utc": summary["generated_at_utc"],
+                  "decision": decision,
+                  "status": summary["status"],
+                  "historical_player_outcomes_read": False,
+                  "market_or_ktc_values_read": False,
+                  "package_vote_data_read": False,
+                  "candidate_fit_performed": False,
+                  "candidate_scores_computed": False,
+                  "validation_scored": False,
+                  "production_change_authorized": False,
+                  "transport_gate_pass": transport_pass,
+                  "source_catalog_gate_pass": True,
+                  "identity_gate_pass": identity["pass"],
+                  "identity_coverage": identity["coverage"],
+                  "identity_unique_player_n": identity["unique_player_n"],
+                  "identity_resolved_unique_player_n": identity[
+                      "resolved_unique_player_n"
+                  ],
+                  "dynastyprocess_sha256": sha256(dp_csv),
+                  "nflverse_players_sha256": sha256(nflverse_csv),
+                  "frozen_input_hashes": summary["frozen_input_hashes"],
+                  "output_hashes": {
+                      PICKS_OUT.name: sha256(PICKS_OUT),
+                      SUMMARY_OUT.name: sha256(SUMMARY_OUT),
+                      MD_OUT.name: sha256(MD_OUT),
+                  },
+              }
+              MAN_OUT.write_text(
+                  json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+              )
+
+              print(json.dumps({
+                  "decision": decision,
+                  "transport_gate_pass": transport_pass,
+                  "source_catalog_gate_pass": True,
+                  "identity_gate_pass": identity["pass"],
+                  "identity_coverage": identity["coverage"],
+                  "identity_resolved_unique_player_n": identity[
+                      "resolved_unique_player_n"
+                  ],
+                  "identity_unique_player_n": identity["unique_player_n"],
+                  "resolution_methods": identity["resolution_method_counts"],
+                  "retention": {
+                      scope: {
+                          "fraction": retention[scope]["retention_fraction"],
+                          "pooled_slot_min": retention[scope][
+                              "pooled_exact_slot_support_min"
+                          ],
+                      }
+                      for scope in (
+                          "primary_r1_r4",
+                          "primary_r5",
+                          "primary_r6",
+                          "idp_sensitivity_r6",
+                      )
+                  },
+                  "source_issue_summary": issue_summary,
+              }, indent=2, sort_keys=True))
+
+          def check_outputs() -> None:
+              s = load(SUMMARY_OUT)
+              m = load(MAN_OUT)
+
+              allowed = {
+                  "PASS_CONTRACT_CORRECT_HARVEST_IDENTITY_GATE_OUTCOMES_AUTHORIZED_NEXT_STAGE",
+                  "STOP_PRE_OUTCOME_CONTRACT_REPAIR_IDENTITY_GATE",
+              }
+              assert s["decision"] in allowed
+              assert m["decision"] == s["decision"]
+
+              for obj in (s, m):
+                  assert obj["historical_player_outcomes_read"] is False
+                  assert obj["market_or_ktc_values_read"] is False
+                  assert obj["package_vote_data_read"] is False
+                  assert obj["candidate_fit_performed"] is False
+                  assert obj["candidate_scores_computed"] is False
+                  assert obj["validation_scored"] is False
+                  assert obj["production_change_authorized"] is False
+
+              assert s["contract_correction"]["frozen_source_catalog_changed"] is False
+              assert s["contract_correction"]["source_eligibility_rules_changed"] is False
+              assert s["contract_correction"]["identity_threshold_changed"] is False
+              assert s["contract_correction"]["whole_league_requalification_removed"] is True
+              assert s["source_catalog_gate"]["pass"] is True
+              assert (
+                  s["identity_sources"]["dynastyprocess"]["sha256"]
+                  == DP_SHA256
+              )
+              assert (
+                  s["identity_sources"]["nflverse_players"]["sha256"]
+                  == NFLVERSE_PLAYERS_SHA256
+              )
+
+              # Validate JSONL corpus and hashes.
+              row_n = 0
+              seen = set()
+              with PICKS_OUT.open(encoding="utf-8") as f:
+                  for line in f:
+                      if not line.strip():
+                          continue
+                      p = json.loads(line)
+                      row_n += 1
+                      key = (
+                          int(p["draft_year"]),
+                          str(p["league_id"]),
+                          int(p["overall_slot"]),
+                      )
+                      assert key not in seen
+                      seen.add(key)
+
+                      slot = int(p["overall_slot"])
+                      rnd = ((slot - 1) // 12) + 1
+                      within = ((slot - 1) % 12) + 1
+                      assert int(p["round"]) == rnd
+                      assert int(p["within_round_pick"]) == within
+                      assert p["tier"] == tier_for_within(within)
+                      assert p["mfl_player_id"]
+                      assert p["mfl_player_id"].upper() not in SENTINEL_PLAYER_IDS
+                      assert any(p["pick_scope"].values())
+                      assert p["scope_weight"]
+
+              assert row_n == s["pick_corpus"]["row_n"]
+              assert s["pick_corpus"]["sha256"] == sha256(PICKS_OUT)
+              assert m["output_hashes"][PICKS_OUT.name] == sha256(PICKS_OUT)
+              assert m["output_hashes"][SUMMARY_OUT.name] == sha256(SUMMARY_OUT)
+              assert m["output_hashes"][MD_OUT.name] == sha256(MD_OUT)
+
+              if s["decision"].startswith("PASS_"):
+                  assert s["transport_gate"]["pass"] is True
+                  assert s["identity_gate"]["pass"] is True
+                  assert s["identity_gate"]["coverage"] >= IDENTITY_MIN_COVERAGE
+              else:
+                  assert (
+                      s["transport_gate"]["pass"] is False
+                      or s["identity_gate"]["pass"] is False
+                  )
+
+              print("PASS: contract-correct harvest/identity outputs validated.")
+
+          def selftest() -> None:
+              # One blank pick must not remove the rest of a frozen league.
+              unit = {
+                  "draftPick": [
+                      {
+                          "round": str(r),
+                          "pick": str(p),
+                          "player": (
+                              "----"
+                              if (r == 2 and p == 4)
+                              else str(r * 100 + p)
+                          ),
+                          "franchise": str(p),
+                      }
+                      for r in range(1, 5)
+                      for p in range(1, 13)
+                  ]
+              }
+              c = canonicalize_unit(unit, 4)
+              assert len(c["canonical"]) == 48
+              assert c["canonical"][16]["mfl_player_id"] is None
+              valid = [
+                  rec for rec in c["canonical"].values()
+                  if rec["mfl_player_id"]
+              ]
+              assert len(valid) == 47
+
+              # Duplicate player removes only later occurrence.
+              unit2 = {
+                  "draftPick": [
+                      {"round": "1", "pick": "1", "player": "55"},
+                      {"round": "1", "pick": "2", "player": "55"},
+                      {"round": "1", "pick": "3", "player": "56"},
+                  ]
+              }
+              c2 = canonicalize_unit(unit2, 1)
+              assert c2["canonical"][1]["mfl_player_id"] == "55"
+              assert c2["canonical"][2]["mfl_player_id"] is None
+              assert c2["canonical"][3]["mfl_player_id"] == "56"
+              assert len(c2["duplicate_players"]) == 1
+
+              # 13th source pick is an out-of-grid extra, not overall numbering.
+              unit3 = {
+                  "draftPick": [
+                      {"round": "1", "pick": str(i), "player": str(1000 + i)}
+                      for i in range(1, 14)
+                  ] + [
+                      {"round": "2", "pick": str(i), "player": str(2000 + i)}
+                      for i in range(1, 13)
+                  ]
+              }
+              c3 = canonicalize_unit(unit3, 2)
+              assert len(c3["canonical"]) == 24
+              assert len(c3["out_of_grid_extras"]) == 1
+              assert c3["canonical"][13]["mfl_player_id"] == "2001"
+
+              assert clean_name("Odell Beckham Jr.") == "odell beckham"
+              assert norm_position("CB") == "DB"
+              assert mfl_player_id("----") is None
+              assert tier_for_within(12) == "late"
+
+              print("PASS: contract-correct repair self-test")
+
+          def main() -> None:
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--selftest", action="store_true")
+              ap.add_argument("--harvest-year", type=int)
+              ap.add_argument("--out")
+              ap.add_argument("--aggregate-dir")
+              ap.add_argument("--dynastyprocess-csv")
+              ap.add_argument("--nflverse-csv")
+              ap.add_argument("--check", action="store_true")
+              args = ap.parse_args()
+
+              if args.selftest:
+                  selftest()
+                  return
+
+              if args.harvest_year is not None:
+                  if not args.out:
+                      raise SystemExit("--out required")
+                  harvest_year(args.harvest_year, Path(args.out))
+                  return
+
+              if args.aggregate_dir:
+                  if not args.dynastyprocess_csv or not args.nflverse_csv:
+                      raise SystemExit(
+                          "--dynastyprocess-csv and --nflverse-csv required"
+                      )
+                  aggregate(
+                      Path(args.aggregate_dir),
+                      Path(args.dynastyprocess_csv),
+                      Path(args.nflverse_csv),
+                  )
+                  check_outputs()
+                  return
+
+              if args.check:
+                  check_outputs()
+                  return
+
+              raise SystemExit(
+                  "choose --selftest, --harvest-year, --aggregate-dir, or --check"
+              )
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          chmod +x \
+            "${RUNNER_TEMP}/v3-contract-worker/draft_pick_fv_v3_harvest_identity_contract_repair.py"
+
+          python3 -m py_compile \
+            "${RUNNER_TEMP}/v3-contract-worker/draft_pick_fv_v3_harvest_identity_contract_repair.py"
+
+      - name: Run contract-repair self-test
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check requests
+          python3 \
+            "${RUNNER_TEMP}/v3-contract-worker/draft_pick_fv_v3_harvest_identity_contract_repair.py" \
+            --selftest
+
+      - name: Upload contract-repair worker
+        uses: actions/upload-artifact@v4
+        with:
+          name: draft-pick-fv-v3-contract-repair-worker
+          path: ${{ runner.temp }}/v3-contract-worker/draft_pick_fv_v3_harvest_identity_contract_repair.py
+          if-no-files-found: error
+          retention-days: 7
+
+  harvest:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        year: [2018, 2019, 2020, 2021, 2022, 2023]
+
+    steps:
+      - name: Check out frozen source state
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install transport dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check requests
+
+      - name: Download contract-repair worker
+        uses: actions/download-artifact@v4
+        with:
+          name: draft-pick-fv-v3-contract-repair-worker
+          path: ${{ runner.temp }}/v3-contract-worker
+
+      - name: Harvest valid occurrences from the frozen scopes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/contract-parts"
+
+          python3 \
+            "${RUNNER_TEMP}/v3-contract-worker/draft_pick_fv_v3_harvest_identity_contract_repair.py" \
+            --harvest-year "${{ matrix.year }}" \
+            --out "${RUNNER_TEMP}/contract-parts/year_${{ matrix.year }}.json"
+
+      - name: Validate year artifact firewall
+        shell: bash
+        env:
+          YEAR: ${{ matrix.year }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          y = int(os.environ["YEAR"])
+          p = Path(os.environ["RUNNER_TEMP"]) / "contract-parts" / f"year_{y}.json"
+          d = json.loads(p.read_text())
+
+          assert d["year"] == y
+          assert d["historical_player_outcomes_read"] is False
+          assert d["market_or_ktc_values_read"] is False
+          assert d["package_vote_data_read"] is False
+          assert d["candidate_fit_performed"] is False
+          assert d["candidate_scores_computed"] is False
+          assert d["validation_scored"] is False
+          assert d["production_change_authorized"] is False
+          assert d["api_endpoints_used"] == ["draftResults"]
+          assert d["frozen_catalog_row_n"] == len(d["league_results"])
+
+          print(
+              y,
+              "catalog=", d["frozen_catalog_row_n"],
+              "transport_fail=", d["transport_failure_n"],
+              "ambiguous=", d["ambiguous_unit_n"],
+          )
+          PY
+
+      - name: Upload year checkpoint
+        uses: actions/upload-artifact@v4
+        with:
+          name: draft-pick-fv-v3-contract-repair-${{ matrix.year }}
+          path: ${{ runner.temp }}/contract-parts/year_${{ matrix.year }}.json
+          if-no-files-found: error
+          retention-days: 7
+
+  aggregate:
+    needs: [prepare, harvest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check requests
+
+      - name: Download contract-repair worker
+        uses: actions/download-artifact@v4
+        with:
+          name: draft-pick-fv-v3-contract-repair-worker
+          path: ${{ runner.temp }}/v3-contract-worker
+
+      - name: Download six year checkpoints
+        uses: actions/download-artifact@v4
+        with:
+          pattern: draft-pick-fv-v3-contract-repair-*
+          path: ${{ runner.temp }}/contract-parts
+          merge-multiple: true
+
+      - name: Pin identity-only sources
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DP_URL="https://raw.githubusercontent.com/dynastyprocess/data/692c23d639542d6e9e94ba3898ed978a0b772724/files/db_playerids.csv"
+          DP_SHA="0174ea890e71d33fa0afc1b846ce1c92273542278a287b6bd52c3a4aa5edce73"
+
+          NFLVERSE_URL="https://github.com/nflverse/nflverse-data/releases/download/players/players.csv"
+          NFLVERSE_SHA="507f8cf03ffc8a82b841212582000163eb713ced15c9f83f851afb42da0af259"
+
+          curl -fL --retry 4 --retry-delay 3 \
+            "${DP_URL}" \
+            -o "${RUNNER_TEMP}/db_playerids.csv"
+
+          curl -fL --retry 4 --retry-delay 3 \
+            "${NFLVERSE_URL}" \
+            -o "${RUNNER_TEMP}/nflverse_players.csv"
+
+          test "$(sha256sum "${RUNNER_TEMP}/db_playerids.csv" | awk '{print $1}')" = "${DP_SHA}"
+          test "$(sha256sum "${RUNNER_TEMP}/nflverse_players.csv" | awk '{print $1}')" = "${NFLVERSE_SHA}"
+
+          python3 - <<'PY'
+          import csv
+          import os
+          from pathlib import Path
+
+          dp = Path(os.environ["RUNNER_TEMP"]) / "db_playerids.csv"
+          nv = Path(os.environ["RUNNER_TEMP"]) / "nflverse_players.csv"
+
+          with dp.open(newline="", encoding="utf-8-sig") as f:
+              dh = next(csv.reader(f))
+          with nv.open(newline="", encoding="utf-8-sig") as f:
+              nh = next(csv.reader(f))
+
+          assert {
+              "mfl_id", "gsis_id", "sleeper_id", "name", "merge_name",
+              "position", "draft_year", "db_season",
+          }.issubset(dh)
+
+          assert {
+              "gsis_id", "display_name", "position", "rookie_season",
+          }.issubset(nh)
+
+          print("PASS: both pinned identity-only sources match expected schemas.")
+          PY
+
+      - name: Re-guard frozen study immediately before aggregation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          p = Path("research/draft-pick-fv-v3")
+          pre = json.loads((p / "preregistration_manifest_v3.json").read_text())
+          old = json.loads((p / "historical_draft_pick_harvest_manifest_v3.json").read_text())
+          r1 = json.loads((p / "historical_draft_pick_harvest_repair_manifest_v3.json").read_text())
+
+          assert pre["status"] == "FROZEN_PRE_OUTCOME"
+          assert old["decision"] == "STOP_PRE_OUTCOME_IDENTITY_OR_HARVEST_GATE"
+          assert r1["decision"] == "STOP_PRE_OUTCOME_REPAIR_GATE"
+
+          for obj in (pre, old, r1):
+              assert obj["historical_player_outcomes_read"] is False
+              assert obj["validation_scored"] is False
+              assert obj["production_change_authorized"] is False
+
+          for name in (
+              "draft_pick_fv_v3_harvest_identity_contract_repair.py",
+              "historical_draft_pick_contract_repair_v3.jsonl",
+              "historical_draft_pick_contract_repair_summary_v3.json",
+              "historical_draft_pick_contract_repair_v3.md",
+              "historical_draft_pick_contract_repair_manifest_v3.json",
+          ):
+              assert not (p / name).exists(), name
+
+          print("PASS: frozen study and prior STOP audit trail remain intact.")
+          PY
+
+      - name: Aggregate contract-correct harvest and identity gate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cp \
+            "${RUNNER_TEMP}/v3-contract-worker/draft_pick_fv_v3_harvest_identity_contract_repair.py" \
+            research/draft-pick-fv-v3/draft_pick_fv_v3_harvest_identity_contract_repair.py
+
+          chmod +x \
+            research/draft-pick-fv-v3/draft_pick_fv_v3_harvest_identity_contract_repair.py
+
+          python3 \
+            research/draft-pick-fv-v3/draft_pick_fv_v3_harvest_identity_contract_repair.py \
+            --aggregate-dir "${RUNNER_TEMP}/contract-parts" \
+            --dynastyprocess-csv "${RUNNER_TEMP}/db_playerids.csv" \
+            --nflverse-csv "${RUNNER_TEMP}/nflverse_players.csv"
+
+      - name: Validate decision and hard outcome firewall
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 \
+            research/draft-pick-fv-v3/draft_pick_fv_v3_harvest_identity_contract_repair.py \
+            --check
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          p = Path("research/draft-pick-fv-v3")
+          d = json.loads(
+              (p / "historical_draft_pick_contract_repair_summary_v3.json").read_text()
+          )
+
+          print("Decision:", d["decision"])
+          print("Transport:", d["transport_gate"]["pass"])
+          print("Frozen source catalog:", d["source_catalog_gate"]["pass"])
+          print(
+              "Identity:",
+              d["identity_gate"]["resolved_unique_player_n"],
+              "/",
+              d["identity_gate"]["unique_player_n"],
+              f"({100*d['identity_gate']['coverage']:.2f}%)",
+          )
+          print("Methods:", d["identity_gate"]["resolution_method_counts"])
+
+          for scope in (
+              "primary_r1_r4",
+              "primary_r5",
+              "primary_r6",
+              "idp_sensitivity_r6",
+          ):
+              r = d["pick_occurrence_retention_diagnostic"][scope]
+              print(
+                  scope,
+                  f"retention={100*r['retention_fraction']:.2f}%",
+                  f"slot_min={r['pooled_exact_slot_support_min']}",
+                  f"slot_median={r['pooled_exact_slot_support_median']}",
+                  f"slot_max={r['pooled_exact_slot_support_max']}",
+              )
+
+          print("PASS: no outcome or validation leakage occurred.")
+          PY
+
+      - name: Run repository regression checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/repo_regression_checks.py
+
+      - name: Prove only five intended contract-repair files changed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import subprocess
+
+          expected = {
+              "research/draft-pick-fv-v3/draft_pick_fv_v3_harvest_identity_contract_repair.py",
+              "research/draft-pick-fv-v3/historical_draft_pick_contract_repair_v3.jsonl",
+              "research/draft-pick-fv-v3/historical_draft_pick_contract_repair_summary_v3.json",
+              "research/draft-pick-fv-v3/historical_draft_pick_contract_repair_v3.md",
+              "research/draft-pick-fv-v3/historical_draft_pick_contract_repair_manifest_v3.json",
+          }
+
+          out = subprocess.check_output(
+              ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+              text=True,
+          )
+
+          changed = set()
+          for line in out.splitlines():
+              if not line.strip():
+                  continue
+              path = line[3:]
+              if " -> " in path:
+                  path = path.split(" -> ", 1)[1]
+              changed.add(path)
+
+          if changed != expected:
+              raise SystemExit(
+                  "Unexpected changed-file set.\n"
+                  f"Expected: {sorted(expected)}\n"
+                  f"Actual:   {sorted(changed)}"
+              )
+
+          print("PASS: exactly five intended files changed; prior STOP records untouched.")
+          PY
+
+      - name: Commit contract-correct pre-outcome audit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            research/draft-pick-fv-v3/draft_pick_fv_v3_harvest_identity_contract_repair.py \
+            research/draft-pick-fv-v3/historical_draft_pick_contract_repair_v3.jsonl \
+            research/draft-pick-fv-v3/historical_draft_pick_contract_repair_summary_v3.json \
+            research/draft-pick-fv-v3/historical_draft_pick_contract_repair_v3.md \
+            research/draft-pick-fv-v3/historical_draft_pick_contract_repair_manifest_v3.json
+
+          git diff --cached --quiet && {
+            echo "No staged contract-repair changes."
+            exit 1
+          }
+
+          git pull --rebase --autostash origin main
+
+          python3 \
+            research/draft-pick-fv-v3/draft_pick_fv_v3_harvest_identity_contract_repair.py \
+            --check
+          python3 scripts/validation/repo_regression_checks.py
+
+          git commit -m "Correct V3 harvest scope and identity fallback"
+          git push origin HEAD:main
