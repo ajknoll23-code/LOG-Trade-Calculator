@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import time
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlencode
+
+import requests
+
+ROOT = Path(__file__).resolve().parents[2]
+OUT = ROOT / 'research' / 'draft-pick-fv-v3'
+PRIOR = OUT / 'mfl_2018_boundary_recovery_v1.json'
+JSON_OUT = OUT / 'mfl_2018_final_boundary_resolution_v1.json'
+MD_OUT = OUT / 'mfl_2018_final_boundary_resolution_v1.md'
+MAN_OUT = OUT / 'mfl_2018_final_boundary_resolution_manifest_v1.json'
+
+YEAR = 2018
+BASE = 'https://api.myfantasyleague.com'
+GATE = 25
+BASE_LOWER = 24
+TARGET_IDS = ['11669','12698','17617','23944','37391','37596','45733','55093','56046','71169']
+MAX_PASSES = 4
+BETWEEN_REQUESTS = 12
+BETWEEN_PASSES = 120
+
+class AuditError(RuntimeError):
+    pass
+
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def safe_int(x: Any) -> int | None:
+    try:
+        return int(str(x))
+    except (TypeError, ValueError):
+        return None
+
+def norm(x: Any) -> str:
+    return ' '.join(str(x or '').strip().lower().split())
+
+def as_list(x: Any) -> list[Any]:
+    if x is None:
+        return []
+    return x if isinstance(x, list) else [x]
+
+def api_url(endpoint: str, **params: Any) -> str:
+    q = {'TYPE': endpoint, 'JSON': 1}
+    q.update({k: v for k, v in params.items() if v is not None})
+    return f'{BASE}/{YEAR}/export?' + urlencode(q)
+
+def one_request(session: requests.Session, url: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    try:
+        r = session.get(url, timeout=30)
+        status = r.status_code
+        if status in {404, 410}:
+            return None, {'kind': 'permanent_http', 'status': status}
+        if status == 429:
+            return None, {'kind': 'rate_limited', 'status': 429, 'retry_after': r.headers.get('Retry-After')}
+        if 400 <= status < 500:
+            return None, {'kind': 'permanent_http', 'status': status}
+        if status >= 500:
+            return None, {'kind': 'server_error', 'status': status}
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, dict):
+            return None, {'kind': 'non_object_json'}
+        return data, None
+    except requests.exceptions.TooManyRedirects:
+        return None, {'kind': 'too_many_redirects'}
+    except requests.exceptions.Timeout:
+        return None, {'kind': 'timeout'}
+    except requests.exceptions.SSLError:
+        return None, {'kind': 'ssl_error'}
+    except requests.exceptions.RequestException as exc:
+        return None, {'kind': type(exc).__name__}
+    except ValueError as exc:
+        return None, {'kind': type(exc).__name__}
+
+def league_obj(data: dict[str, Any]) -> dict[str, Any] | None:
+    x = data.get('league')
+    return x if isinstance(x, dict) else None
+
+def franchise_count(lg: dict[str, Any]) -> int | None:
+    f = lg.get('franchises')
+    return safe_int(f.get('count')) if isinstance(f, dict) else None
+
+def qb_limit(lg: dict[str, Any]) -> str | None:
+    starters = lg.get('starters')
+    if not isinstance(starters, dict):
+        return None
+    for row in as_list(starters.get('position')):
+        if isinstance(row, dict) and str(row.get('name', '')).upper() == 'QB':
+            v = str(row.get('limit', '')).strip()
+            return v or None
+    return None
+
+def keeper_state(lg: dict[str, Any]) -> str:
+    if 'keeperType' not in lg or lg.get('keeperType') is None or norm(lg.get('keeperType')) == '':
+        return 'missing'
+    v = norm(lg.get('keeperType'))
+    if v == 'dynasty': return 'dynasty'
+    if v == 'keeper': return 'keeper'
+    if v in {'none','redraft'}: return 'none'
+    return f'other:{v}'
+
+def rookie_pool(lg: dict[str, Any]) -> bool:
+    return norm(lg.get('draftPlayerPool')).startswith('rook')
+
+def qualifier(lg: dict[str, Any]) -> tuple[bool, str]:
+    if franchise_count(lg) != 12: return False, 'not_12_team'
+    if qb_limit(lg) not in {'1-2','2'}: return False, 'not_superflex'
+    if not rookie_pool(lg): return False, 'not_rookie_pool'
+    ks = keeper_state(lg)
+    if ks == 'dynasty': return True, 'explicit_dynasty'
+    if ks == 'missing': return True, 'validated_missing_keeper_proxy'
+    return False, f'observed_non_dynasty:{ks}'
+
+def draft_picks(data: dict[str, Any]) -> list[dict[str, Any]]:
+    root = data.get('draftResults')
+    if not isinstance(root, dict):
+        return []
+    out = []
+    for unit in as_list(root.get('draftUnit')):
+        if isinstance(unit, dict):
+            out.extend(x for x in as_list(unit.get('draftPick')) if isinstance(x, dict))
+    return out
+
+def full4(picks: list[dict[str, Any]]) -> bool:
+    c = Counter()
+    for p in picks:
+        rnd = safe_int(p.get('round'))
+        if rnd and str(p.get('player') or '').strip():
+            c[rnd] += 1
+    return all(c.get(r, 0) >= 12 for r in range(1, 5))
+
+def guard_prior() -> dict[str, Any]:
+    d = json.loads(PRIOR.read_text())
+    ids = sorted(str(x['league_id']) for x in d['recovery']['still_unresolved_league_ids'])
+    assert d['result']['decision'] == 'MFL_2018_FULL4_GATE_UNRESOLVED_TRANSPORT'
+    assert d['result']['full4_lower_bound'] == BASE_LOWER
+    assert d['result']['gate'] == GATE
+    assert d['discovery_frame_replication']['shape_matches_prior'] is True
+    assert d['recovery']['still_unresolved_draft_n'] == 0
+    assert ids == TARGET_IDS
+    return d
+
+def run() -> dict[str, Any]:
+    prior = guard_prior()
+    session = requests.Session()
+    session.headers.update({'User-Agent': 'LOG-Trade-Calculator-MFL-2018-Final-Boundary/1.0'})
+
+    states: dict[str, dict[str, Any]] = {
+        lid: {'league_id': lid, 'status': 'unresolved_league', 'history': []}
+        for lid in TARGET_IDS
+    }
+    found_full4: list[str] = []
+    stop_early = False
+    stopped_on_pass = None
+
+    for pass_no in range(1, MAX_PASSES + 1):
+        print(f'--- pass {pass_no}/{MAX_PASSES} ---', flush=True)
+        pending = [lid for lid, s in states.items() if s['status'] in {'unresolved_league','unresolved_draft'}]
+        if not pending:
+            break
+
+        for lid in pending:
+            st = states[lid]
+            if st['status'] == 'unresolved_league':
+                data, err = one_request(session, api_url('league', L=lid))
+                st['history'].append({'pass': pass_no, 'endpoint': 'league', 'error': err})
+                time.sleep(BETWEEN_REQUESTS)
+                if err:
+                    if err['kind'] == 'permanent_http':
+                        st['status'] = 'permanent_unavailable'
+                    continue
+                lg = league_obj(data or {})
+                if not lg:
+                    st['status'] = 'league_missing'
+                    continue
+                ok, qkind = qualifier(lg)
+                st['qualifier_kind'] = qkind
+                st['league_name'] = lg.get('name')
+                st['keeper_state'] = keeper_state(lg)
+                st['qb_limit'] = qb_limit(lg)
+                st['draft_player_pool'] = lg.get('draftPlayerPool')
+                if not ok:
+                    st['status'] = 'resolved_not_qualifying'
+                    continue
+                st['status'] = 'unresolved_draft'
+
+            if st['status'] == 'unresolved_draft':
+                draft, derr = one_request(session, api_url('draftResults', L=lid))
+                st['history'].append({'pass': pass_no, 'endpoint': 'draftResults', 'error': derr})
+                time.sleep(BETWEEN_REQUESTS)
+                if derr:
+                    if derr['kind'] == 'permanent_http':
+                        st['status'] = 'qualified_draft_permanently_unavailable'
+                    continue
+                is_full4 = full4(draft_picks(draft or {}))
+                st['full4'] = is_full4
+                st['status'] = 'resolved_qualifying_full4' if is_full4 else 'resolved_qualifying_not_full4'
+                if is_full4:
+                    found_full4.append(lid)
+                    stop_early = True
+                    stopped_on_pass = pass_no
+                    print(f'PASS BOUNDARY FOUND: {lid} is qualifying and complete through round 4.', flush=True)
+                    break
+
+        if stop_early:
+            break
+        if pass_no < MAX_PASSES:
+            print(f'cooldown {BETWEEN_PASSES}s before next pass', flush=True)
+            time.sleep(BETWEEN_PASSES)
+
+    added = len(found_full4)
+    lower = BASE_LOWER + added
+    unresolved = [lid for lid, s in states.items() if s['status'] in {'unresolved_league','unresolved_draft'}]
+    permanent_or_missing = [lid for lid, s in states.items() if s['status'] in {'permanent_unavailable','league_missing','qualified_draft_permanently_unavailable'}]
+    untested_due_early_stop = []
+    if stop_early:
+        # Once lower bound reaches the frozen gate, remaining IDs cannot change the pass decision.
+        untested_due_early_stop = [lid for lid, s in states.items() if s['status'] in {'unresolved_league','unresolved_draft'}]
+
+    if lower >= GATE:
+        decision = 'MFL_2018_FULL4_GATE_CONFIRMED_PASS'
+    elif not unresolved:
+        decision = 'MFL_2018_FULL4_GATE_CONFIRMED_FAIL'
+    else:
+        decision = 'MFL_2018_FULL4_GATE_STILL_UNRESOLVED_TRANSPORT'
+
+    upper = lower + (0 if decision == 'MFL_2018_FULL4_GATE_CONFIRMED_PASS' else len(unresolved))
+    return {
+        'schema_version': 1,
+        'audit_id': 'draft-pick-fv-v3-mfl-2018-final-boundary-resolution',
+        'generated_at_utc': datetime.now(timezone.utc).isoformat(),
+        'research_only': True,
+        'pre_preregistration_source_research': True,
+        'historical_player_outcomes_read': False,
+        'market_or_ktc_data_read': False,
+        'package_vote_data_read': False,
+        'draft_results_read_for_source_feasibility_only': True,
+        'candidate_fit_performed': False,
+        'candidate_scores_computed': False,
+        'production_change_authorized': False,
+        'prior_recovery_sha256': sha256(PRIOR),
+        'frozen_boundary': {
+            'year': YEAR,
+            'base_full4_lower_bound': BASE_LOWER,
+            'gate': GATE,
+            'target_ids': TARGET_IDS,
+            'target_ids_n': len(TARGET_IDS),
+            'decision_only_early_stop_allowed_after_gate_crossing': True,
+        },
+        'pacing': {
+            'max_passes': MAX_PASSES,
+            'between_requests_seconds': BETWEEN_REQUESTS,
+            'between_passes_seconds': BETWEEN_PASSES,
+            'parallel_requests': False,
+        },
+        'result': {
+            'decision': decision,
+            'additional_confirmed_full4_n': added,
+            'additional_confirmed_full4_ids': found_full4,
+            'full4_lower_bound': lower,
+            'full4_upper_bound': upper,
+            'gate': GATE,
+            'stopped_early_after_confirmed_pass': stop_early,
+            'stopped_on_pass': stopped_on_pass,
+            'still_unresolved_n': len(unresolved),
+            'still_unresolved_ids': unresolved,
+            'untested_due_early_stop_ids': untested_due_early_stop,
+            'permanent_or_missing_ids': permanent_or_missing,
+        },
+        'target_results': [states[lid] for lid in TARGET_IDS],
+        'interpretation': (
+            'This audit is limited to the ten league IDs left unresolved by the prior 2018 boundary recovery. '
+            'It does not rediscover leagues, alter the validated dynasty proxy, change the 25-draft full4 gate, '
+            'read player outcomes, or fit any Draft Pick FV model.'
+        ),
+    }
+
+def write_outputs(d: dict[str, Any]) -> None:
+    JSON_OUT.write_text(json.dumps(d, indent=2, sort_keys=True) + '\n')
+    r = d['result']
+    lines = [
+        '# Draft Pick FV V3 — MFL 2018 Final Boundary Resolution', '',
+        f"**Decision:** `{r['decision']}`", '',
+        f"- Frozen starting lower bound: **{BASE_LOWER}**",
+        f"- Frozen gate: **{GATE}**",
+        f"- Additional confirmed full-4 drafts: **{r['additional_confirmed_full4_n']}**",
+        f"- Final lower bound: **{r['full4_lower_bound']}**",
+        f"- Remaining unresolved IDs: **{r['still_unresolved_n']}**",
+        '',
+        'Only the ten league IDs frozen as unresolved by the previous recovery audit were queried.',
+        'Requests were serialized and heavily paced to reduce MFL rate-limit pressure.',
+        'No historical player outcomes, market/KTC data, package votes, or model scores were read.',
+    ]
+    MD_OUT.write_text('\n'.join(lines) + '\n')
+    manifest = {
+        'schema_version': 1,
+        'audit_id': d['audit_id'],
+        'status': 'mfl_2018_final_boundary_resolution_complete',
+        'decision': r['decision'],
+        'files': {
+            str(JSON_OUT.relative_to(ROOT)): {'sha256': sha256(JSON_OUT)},
+            str(MD_OUT.relative_to(ROOT)): {'sha256': sha256(MD_OUT)},
+        },
+        'historical_player_outcomes_read': False,
+        'market_or_ktc_data_read': False,
+        'package_vote_data_read': False,
+        'candidate_fit_performed': False,
+        'production_change_authorized': False,
+    }
+    MAN_OUT.write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n')
+
+def selftest() -> None:
+    lg = {
+        'franchises': {'count':'12'},
+        'starters': {'position':[{'name':'QB','limit':'1-2'}]},
+        'draftPlayerPool': 'Rookie',
+    }
+    assert qualifier(lg) == (True, 'validated_missing_keeper_proxy')
+    picks = [{'round':str(r),'player':f'p{r}-{i}'} for r in range(1,5) for i in range(12)]
+    assert full4(picks)
+    assert len(TARGET_IDS) == 10 and len(set(TARGET_IDS)) == 10
+    print('PASS: final-boundary resolver self-test')
+
+def check() -> None:
+    d = json.loads(JSON_OUT.read_text())
+    m = json.loads(MAN_OUT.read_text())
+    assert d['frozen_boundary']['base_full4_lower_bound'] == 24
+    assert d['frozen_boundary']['gate'] == 25
+    assert d['frozen_boundary']['target_ids'] == TARGET_IDS
+    assert d['historical_player_outcomes_read'] is False
+    assert d['market_or_ktc_data_read'] is False
+    assert d['package_vote_data_read'] is False
+    assert d['candidate_fit_performed'] is False
+    assert d['candidate_scores_computed'] is False
+    assert d['production_change_authorized'] is False
+    assert d['result']['decision'] in {
+        'MFL_2018_FULL4_GATE_CONFIRMED_PASS',
+        'MFL_2018_FULL4_GATE_CONFIRMED_FAIL',
+        'MFL_2018_FULL4_GATE_STILL_UNRESOLVED_TRANSPORT',
+    }
+    if d['result']['decision'] == 'MFL_2018_FULL4_GATE_CONFIRMED_PASS':
+        assert d['result']['full4_lower_bound'] >= 25
+        assert d['result']['additional_confirmed_full4_n'] >= 1
+    if d['result']['decision'] == 'MFL_2018_FULL4_GATE_CONFIRMED_FAIL':
+        assert d['result']['full4_lower_bound'] < 25
+        assert d['result']['still_unresolved_n'] == 0
+    for rel, rec in m['files'].items():
+        assert sha256(ROOT / rel) == rec['sha256']
+    print('PASS:', d['result']['decision'])
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--selftest', action='store_true')
+    ap.add_argument('--check', action='store_true')
+    args = ap.parse_args()
+    if args.selftest:
+        selftest(); return
+    if args.check:
+        check(); return
+    d = run()
+    write_outputs(d)
+    print(json.dumps(d['result'], indent=2, sort_keys=True))
+
+if __name__ == '__main__':
+    main()
