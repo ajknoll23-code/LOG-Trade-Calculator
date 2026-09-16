@@ -1,0 +1,802 @@
+name: Draft Pick FV V3 Catalog and Preregistration Freeze
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  freeze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Guard accepted source design and outcome firewall
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+          test -f research/draft-pick-fv-v3/mfl_validated_proxy_feasibility_v1.json
+          test -f research/draft-pick-fv-v3/mfl_pooled_design_v1.json
+          test -f research/draft-pick-fv-v2/preregistration_v2.json
+          test -f scripts/validation/repo_regression_checks.py
+
+          test ! -e research/draft-pick-fv-v3/draft_pick_fv_v3_catalog_prereg.py
+          test ! -e research/draft-pick-fv-v3/historical_draft_source_catalog_v3.json
+          test ! -e research/draft-pick-fv-v3/preregistration_v3.json
+          test ! -e research/draft-pick-fv-v3/preregistration_v3.md
+          test ! -e research/draft-pick-fv-v3/preregistration_manifest_v3.json
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          b = Path("research/draft-pick-fv-v3")
+          pooled = json.loads((b / "mfl_pooled_design_v1.json").read_text())
+          feas = json.loads((b / "mfl_validated_proxy_feasibility_v1.json").read_text())
+          v2 = json.loads(Path("research/draft-pick-fv-v2/preregistration_v2.json").read_text())
+
+          assert pooled["result"]["decision"] == "ACCEPT_MFL_YEAR_BALANCED_POOLED_R1_R6_DESIGN"
+          assert pooled["result"]["core_pass"] is True
+          assert pooled["historical_player_outcomes_read"] is False
+          assert pooled["market_or_ktc_data_read"] is False
+          assert pooled["package_vote_data_read"] is False
+          assert pooled["candidate_fit_performed"] is False
+          assert pooled["production_change_authorized"] is False
+
+          assert feas["historical_player_outcomes_read"] is False
+          assert feas["market_or_ktc_data_read"] is False
+          assert feas["package_vote_data_read"] is False
+          assert feas["candidate_fit_performed"] is False
+
+          assert v2["historical_player_outcomes_read_before_freeze"] is False
+          assert v2["ktc_or_market_data_allowed_as_fit_target"] is False
+          assert v2["package_vote_data_allowed"] is False
+          assert v2["production_change_authorized"] is False
+
+          print("PASS: accepted pooled design is intact and historical outcomes remain unopened.")
+          PY
+
+      - name: Create V3 catalog and preregistration freezer
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > research/draft-pick-fv-v3/draft_pick_fv_v3_catalog_prereg.py <<'PY'
+          #!/usr/bin/env python3
+          from __future__ import annotations
+
+          import argparse
+          import hashlib
+          import json
+          import subprocess
+          from collections import Counter
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from typing import Any
+
+          ROOT = Path(__file__).resolve().parents[2]
+          V3 = ROOT / "research" / "draft-pick-fv-v3"
+          V2 = ROOT / "research" / "draft-pick-fv-v2"
+
+          FEAS = V3 / "mfl_validated_proxy_feasibility_v1.json"
+          POOLED = V3 / "mfl_pooled_design_v1.json"
+          V2_PREREG = V2 / "preregistration_v2.json"
+
+          SCRIPT_OUT = V3 / "draft_pick_fv_v3_catalog_prereg.py"
+          CATALOG_OUT = V3 / "historical_draft_source_catalog_v3.json"
+          PREREG_OUT = V3 / "preregistration_v3.json"
+          MD_OUT = V3 / "preregistration_v3.md"
+          MAN_OUT = V3 / "preregistration_manifest_v3.json"
+
+          YEARS = [2018, 2019, 2020, 2021, 2022, 2023]
+          DEV_YEARS = [2018, 2019, 2020, 2021]
+          LOCKED_VALIDATION_YEARS = [2022, 2023]
+
+          class FreezeError(RuntimeError):
+              pass
+
+          def load(path: Path) -> dict[str, Any]:
+              return json.loads(path.read_text())
+
+          def sha256(path: Path) -> str:
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          def git_head() -> str:
+              return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+
+          def build_catalog(feas: dict[str, Any], pooled: dict[str, Any]) -> dict[str, Any]:
+              rows: list[dict[str, Any]] = []
+
+              for yr in feas["year_results"]:
+                  year = int(yr["year"])
+                  if year not in YEARS:
+                      continue
+                  for q in yr["qualifying_leagues"]:
+                      depth = q["depth"]
+                      mock = bool(q.get("obvious_mock_name", False))
+                      idp = bool(q.get("idp", False))
+
+                      # Preserve the accepted pooled design exactly:
+                      # - R1-R4: all qualifying non-mock complete-four drafts
+                      # - R5/R6 primary: non-IDP, non-mock, complete to depth
+                      # - IDP deep rounds: sensitivity only.
+                      scope = {
+                          "primary_r1_r4": (not mock) and bool(depth.get("full4", False)),
+                          "primary_r5": (not mock) and (not idp) and bool(depth.get("full5", False)),
+                          "primary_r6": (not mock) and (not idp) and bool(depth.get("full6", False)),
+                          "idp_sensitivity_r5": (not mock) and idp and bool(depth.get("full5", False)),
+                          "idp_sensitivity_r6": (not mock) and idp and bool(depth.get("full6", False)),
+                      }
+
+                      if not any(scope.values()):
+                          continue
+
+                      rows.append({
+                          "draft_year": year,
+                          "league_id": str(q["league_id"]),
+                          "league_name": q.get("name"),
+                          "source": "MFL",
+                          "teams": 12,
+                          "qb_limit": q.get("qb_limit"),
+                          "draft_player_pool": q.get("draft_player_pool"),
+                          "keeper_state": q.get("keeper_state"),
+                          "qualifier_kind": q.get("qualifier_kind"),
+                          "idp": idp,
+                          "obvious_mock_name": mock,
+                          "draft_kind": q.get("draft_kind"),
+                          "filled_by_round": {
+                              str(k): int(v)
+                              for k, v in depth["filled_by_round"].items()
+                          },
+                          "full4": bool(depth.get("full4", False)),
+                          "full5": bool(depth.get("full5", False)),
+                          "full6": bool(depth.get("full6", False)),
+                          "scope": scope,
+                      })
+
+              rows.sort(key=lambda x: (x["draft_year"], int(x["league_id"])))
+
+              # No duplicate source league within a year.
+              keys = [(x["draft_year"], x["league_id"]) for x in rows]
+              if len(keys) != len(set(keys)):
+                  raise FreezeError("duplicate (draft_year, league_id) in frozen catalog")
+
+              counts_by_year: dict[str, dict[str, int]] = {}
+              for y in YEARS:
+                  yc = {}
+                  for scope in [
+                      "primary_r1_r4",
+                      "primary_r5",
+                      "primary_r6",
+                      "idp_sensitivity_r5",
+                      "idp_sensitivity_r6",
+                  ]:
+                      yc[scope] = sum(
+                          1 for r in rows
+                          if r["draft_year"] == y and r["scope"][scope]
+                      )
+                  counts_by_year[str(y)] = yc
+
+              totals = {
+                  scope: sum(counts_by_year[str(y)][scope] for y in YEARS)
+                  for scope in [
+                      "primary_r1_r4",
+                      "primary_r5",
+                      "primary_r6",
+                      "idp_sensitivity_r5",
+                      "idp_sensitivity_r6",
+                  ]
+              }
+
+              expected = pooled["result"]
+              if totals["primary_r1_r4"] != expected["criteria"]["r1_r4_nonmock_total"]["value"]:
+                  raise FreezeError("R1-R4 catalog count disagrees with accepted pooled design")
+              if totals["primary_r5"] != expected["criteria"]["r5_nonidp_nonmock_total"]["value"]:
+                  raise FreezeError("R5 catalog count disagrees with accepted pooled design")
+              if totals["primary_r6"] != expected["criteria"]["r6_nonidp_nonmock_total"]["value"]:
+                  raise FreezeError("R6 catalog count disagrees with accepted pooled design")
+              if totals["idp_sensitivity_r6"] != expected["criteria"]["r6_idp_total_sensitivity_only"]["value"]:
+                  raise FreezeError("IDP R6 catalog count disagrees with accepted pooled design")
+
+              expected_r6 = {
+                  str(k): int(v)
+                  for k, v in expected["analysis"]["r6_nonidp_nonmock_by_year"].items()
+              }
+              got_r6 = {str(y): counts_by_year[str(y)]["primary_r6"] for y in YEARS}
+              if got_r6 != expected_r6:
+                  raise FreezeError(f"R6 year distribution drift: {got_r6} != {expected_r6}")
+
+              return {
+                  "schema_version": 1,
+                  "catalog_id": "draft-pick-fv-v3-historical-draft-source-catalog",
+                  "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+                  "source": "MFL",
+                  "years": YEARS,
+                  "research_only": True,
+                  "contains_player_outcomes": False,
+                  "contains_market_or_ktc_values": False,
+                  "contains_package_votes": False,
+                  "contains_draft_pick_results": False,
+                  "note": (
+                      "This is the frozen source-league catalog only. Exact MFL draft picks "
+                      "will be harvested after preregistration is committed."
+                  ),
+                  "accepted_source_design_sha256": sha256(POOLED),
+                  "source_feasibility_sha256": sha256(FEAS),
+                  "eligibility_rules": {
+                      "base_qualifier": (
+                          "12 teams; QB limit 1-2 or 2; Rookie-only draft pool; "
+                          "explicit dynasty or validated missing-keeper proxy"
+                      ),
+                      "obvious_mock_exclusion": "frozen obvious_mock_name == true is excluded",
+                      "primary_r1_r4": "non-mock and complete rounds 1-4",
+                      "primary_r5": "non-mock, non-IDP, complete rounds 1-5",
+                      "primary_r6": "non-mock, non-IDP, complete rounds 1-6",
+                      "idp_sensitivity_r5": "non-mock, IDP, complete rounds 1-5",
+                      "idp_sensitivity_r6": "non-mock, IDP, complete rounds 1-6",
+                  },
+                  "counts_by_year": counts_by_year,
+                  "totals": totals,
+                  "rows": rows,
+              }
+
+          def build_prereg(
+              catalog: dict[str, Any],
+              pooled: dict[str, Any],
+              v2: dict[str, Any],
+          ) -> dict[str, Any]:
+              # V3 deliberately inherits the already-frozen V2 football outcome definition
+              # and scale bridge, rather than inventing a new target after seeing source counts.
+              inherited_outcome_contract = v2["historical_outcome_contract"]
+              inherited_primary_outcomes = v2["primary_outcomes"]
+              inherited_scale_bridge = v2["frozen_scale_bridge"]
+              inherited_replacement_ranks = v2["frozen_replacement_ranks"]
+              deployed_baseline = v2["frozen_deployed_baseline"]
+
+              return {
+                  "schema_version": 3,
+                  "study_id": "draft-pick-fv-v3-real-sf-rookie-drafts",
+                  "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+                  "preregistered_at_head_sha": git_head(),
+                  "research_only": True,
+                  "production_change_authorized": False,
+                  "historical_player_outcomes_read_before_freeze": False,
+                  "market_or_ktc_data_allowed_as_fit_target": False,
+                  "package_vote_data_allowed": False,
+                  "2026_realized_outcomes_allowed": False,
+                  "question": (
+                      "Using real historical 12-team Superflex/2QB rookie drafts, do realized "
+                      "first-three-season football outcomes support a more accurate absolute scale "
+                      "and round/tier shape for Draft Pick Fundamental Values than the deployed baseline?"
+                  ),
+                  "reason_for_v3": {
+                      "v2_status": "INSUFFICIENT_BROAD_COHORT_EVIDENCE / STOP_NO_OUTCOME_INGESTION",
+                      "v2_rules_relaxed": False,
+                      "change": (
+                          "V3 uses validated real MFL 12-team SF/2QB rookie drafts and actual draft slots "
+                          "instead of broad external archive rookie ADP. The football outcome definition "
+                          "and scale bridge are inherited from the preregistered V2 contract."
+                      ),
+                      "accepted_source_design": pooled["result"]["decision"],
+                  },
+                  "source_population": {
+                      "provider": "MyFantasyLeague",
+                      "draft_years": YEARS,
+                      "team_count": 12,
+                      "format": "Superflex/2QB",
+                      "draft_pool": "Rookie-only",
+                      "dynasty_rule": (
+                          "keeperType=dynasty OR missing keeperType under the separately validated "
+                          "historical dynasty proxy"
+                      ),
+                      "actual_draft_slot_used": True,
+                      "mock_rule": "exclude frozen obvious_mock_name == true",
+                      "catalog_sha256": sha256(CATALOG_OUT),
+                      "catalog_totals": catalog["totals"],
+                      "2018_formal_boundary_note": (
+                          "The historical source-feasibility record remains a 24/25 transport-limited "
+                          "near-pass. V3 does not retroactively relabel that old gate."
+                      ),
+                  },
+                  "frozen_scope_by_depth": {
+                      "rounds_1_4": (
+                          "Use the accepted pooled-design primary_r1_r4 catalog exactly as frozen. "
+                          "IDP-format sensitivity is reported separately."
+                      ),
+                      "round_5": (
+                          "Primary inference uses primary_r5 non-IDP catalog; IDP rows are sensitivity only."
+                      ),
+                      "round_6": (
+                          "Primary inference uses primary_r6 non-IDP catalog; IDP rows are sensitivity only."
+                      ),
+                      "year_weighting": (
+                          "Each draft class receives total weight 1/6. Within a year, each eligible league "
+                          "in the relevant depth scope receives equal share of that year's weight."
+                      ),
+                      "deep_round_constraint": (
+                          "R5-R6 require pooled shrinkage/smoothing across adjacent slots and years; "
+                          "no unsmoothed per-year deep-slot production curve is eligible."
+                      ),
+                  },
+                  "development_and_validation": {
+                      "development_years": DEV_YEARS,
+                      "locked_validation_years": LOCKED_VALIDATION_YEARS,
+                      "validation_is_never_used_for": [
+                          "candidate parameter fitting",
+                          "shrinkage hyperparameter selection",
+                          "identity-rule changes",
+                          "outcome-definition changes",
+                          "source-rule changes",
+                      ],
+                      "selection_requires_both_validation_years": True,
+                  },
+                  "historical_outcome_contract": inherited_outcome_contract,
+                  "primary_outcomes": inherited_primary_outcomes,
+                  "frozen_scale_bridge": inherited_scale_bridge,
+                  "frozen_replacement_ranks": inherited_replacement_ranks,
+                  "frozen_deployed_baseline": deployed_baseline,
+                  "identity_resolution": {
+                      "source_identity": "MFL player id from draftResults",
+                      "name_position_source": (
+                          "season-appropriate MFL player metadata may be used only for identity resolution"
+                      ),
+                      "stable_identity_priority": [
+                          "exact existing crosswalk to gsis_id",
+                          "exact existing crosswalk to sleeper_id",
+                          "unambiguous normalized name + position + draft class",
+                      ],
+                      "ambiguous_name_match": "exclude and report; never choose manually after outcomes are visible",
+                      "minimum_resolution_coverage": 0.95,
+                      "coverage_denominator": "unique drafted player identities in the eligible harvested catalog",
+                  },
+                  "draft_harvest_contract": {
+                      "allowed_mfl_endpoints": ["draftResults", "players"],
+                      "allowed_purpose": "draft slot and identity resolution only",
+                      "forbidden_during_harvest": [
+                          "historical NFL player outcomes",
+                          "KTC or other market values",
+                          "package votes",
+                          "candidate fit",
+                          "candidate scoring",
+                          "production changes",
+                      ],
+                      "pick_rules": {
+                          "slot": "round-major actual pick order; slots 1-72 for 12-team six-round mapping",
+                          "nonempty_player_required": True,
+                          "duplicate_player_within_same_league": "exclude duplicate occurrence and flag source anomaly",
+                          "out_of_scope_rounds": "ignore",
+                      },
+                  },
+                  "cell_mapping": {
+                      "team_count": 12,
+                      "round_formula": "round = floor((slot-1)/12)+1",
+                      "tier_formula": {
+                          "early": "slots 1-4 within round",
+                          "mid": "slots 5-8 within round",
+                          "late": "slots 9-12 within round",
+                      },
+                      "production_schema": "6 rounds x 3 tiers; 18 cells",
+                  },
+                  "candidate_families": {
+                      "C0_DEPLOYED": {
+                          "eligible": True,
+                          "parameters": 0,
+                          "definition": "exact deployed 6x3 PICK_BASE inherited from V2 freeze",
+                          "fit_status": "baseline_only_never_refit",
+                      },
+                      "C1_GLOBAL_RESCALE": {
+                          "eligible": True,
+                          "parameters": 1,
+                          "definition": "k * C0",
+                          "bounds": {"k": [0.5, 1.5]},
+                      },
+                      "C2_LOW_PARAMETER_ROUND_TIER": {
+                          "eligible": True,
+                          "parameters": 5,
+                          "definition": (
+                              "A*exp(-b1*I(round>=2)-b2*max(round-2,0)-tier_penalty[tier])"
+                          ),
+                          "bounds": {
+                              "A": [3000.0, 10000.0],
+                              "b1": [0.0, 1.5],
+                              "b2": [0.0, 0.75],
+                              "m": [0.0, 0.6],
+                              "l": [0.0, 0.9],
+                          },
+                          "constraint": "0 <= m <= l",
+                          "tier_penalty": {"early": 0.0, "mid": "m", "late": "l"},
+                      },
+                      "C3_SHRUNK_MONOTONE_SLOT_CURVE": {
+                          "eligible": True,
+                          "definition": (
+                              "Fit C2 on development data; compute year-balanced development O2 means "
+                              "for exact slots; shrink each slot mean toward its C2 slot prediction using "
+                              "alpha pseudo-drafts; enforce non-increasing slot values with weighted PAVA; "
+                              "aggregate slots 1-4,5-8,9-12 within each round to the production 18-cell schema."
+                          ),
+                          "alpha_grid": [6, 12, 24, 48],
+                          "alpha_selection": (
+                              "development-only leave-one-draft-year-out macro MAE; choose smallest alpha "
+                              "within 1% relative MAE of the best to favor less shrinkage when statistically tied"
+                          ),
+                          "deep_round_rule": (
+                              "R5-R6 are estimated only from their frozen depth-eligible catalogs and are "
+                              "smoothed jointly across adjacent exact slots by PAVA after shrinkage."
+                          ),
+                          "validation_data_used_for_alpha": False,
+                      },
+                      "C4_RAW_SLOT_ISOTONIC_DIAGNOSTIC": {
+                          "eligible": False,
+                          "definition": (
+                              "year-balanced raw exact-slot O2 means followed by weighted PAVA with no shrinkage; "
+                              "diagnostic only because deep-slot effective N is lower"
+                          ),
+                      },
+                  },
+                  "fit_weighting": {
+                      "league_market_weight": (
+                          "Each draft class contributes equal total weight. Within class and eligible depth, "
+                          "leagues are equally weighted."
+                      ),
+                      "player_outcome_independence": (
+                          "Repeated league selections of the same player are not independent outcome observations."
+                      ),
+                      "player_clustering": (
+                          "Outcome loss and uncertainty must collapse/cluster repeated selections by stable player "
+                          "identity within draft class before computing inferential uncertainty."
+                      ),
+                  },
+                  "selection": {
+                      "baseline": "C0_DEPLOYED",
+                      "primary_metric": (
+                          "locked-validation equal-cell macro MAE on O2 three_year_player_equivalent_fv"
+                      ),
+                      "winner_pool": ["C1_GLOBAL_RESCALE", "C2_LOW_PARAMETER_ROUND_TIER", "C3_SHRUNK_MONOTONE_SLOT_CURVE"],
+                      "eligibility_gates": [
+                          "validation macro MAE improvement vs C0 >= 5%",
+                          "candidate must improve O2 macro MAE vs C0 in BOTH 2022 and 2023 validation classes",
+                          "O1 normalized-shape error regression vs C0 <= 2%",
+                          "H2 O2 macro-MAE regression vs candidate primary horizon <= 2% relative to its H3 standing",
+                          "mature H4 O2 macro-MAE regression vs candidate primary horizon <= 2% relative to its H3 standing",
+                          "all 18 production cells positive",
+                          "18 production cells monotone non-increasing with later draft slot",
+                          "identity resolution coverage >= 95%",
+                          "no forbidden data read before locked validation scoring",
+                      ],
+                      "winner_rule": (
+                          "Lowest locked-validation O2 macro MAE among eligible candidates; if within 1% relative "
+                          "MAE choose the candidate with fewer effective fitted degrees of freedom in order "
+                          "C1, C2, C3."
+                      ),
+                      "none_eligible": "STOP_NO_V3_PICK_FV_CANDIDATE",
+                  },
+                  "format_sensitivity": {
+                      "idp": (
+                          "IDP-format draft rows never enter primary R5-R6 fitting. Report IDP deep-round "
+                          "sensitivity separately. R1-R4 must also report non-IDP-only sensitivity against the "
+                          "accepted all-nonmock primary catalog."
+                      ),
+                      "idp_production_authorization": False,
+                      "one_qb": "out of scope; no 1QB fallback",
+                  },
+                  "robustness": {
+                      "H2": "first two NFL seasons",
+                      "H3": "primary first three NFL seasons",
+                      "H4": "first four NFL seasons where fully mature",
+                      "r1_r4_nonidp_only": "required sensitivity report",
+                      "idp_deep_round": "required sensitivity report, never primary fit",
+                  },
+                  "forbidden": [
+                      "KTC/current market values as fit targets",
+                      "package-adjustment votes",
+                      "current named-rookie tuning",
+                      "2026 realized NFL outcomes",
+                      "1QB fallback",
+                      "post-outcome source or mock-rule changes",
+                      "post-outcome outcome-definition changes",
+                      "post-validation candidate-family changes",
+                      "future-year discount changes",
+                      "multi-pick package inference",
+                      "salary/contract/team-utility tuning",
+                      "production changes from catalog, harvest, fit, or validation workflows",
+                  ],
+                  "stage_gates": {
+                      "after_this_freeze": (
+                          "Harvest exact draft picks and source identities only. Do not read historical NFL outcomes."
+                      ),
+                      "after_draft_harvest": (
+                          "Validate catalog counts, exact slot completeness, duplicate anomalies, and >=95% identity "
+                          "resolution. If these fail, stop before outcomes."
+                      ),
+                      "after_identity_gate_passes": (
+                          "Historical outcomes may be ingested under the frozen provider/scoring contract."
+                      ),
+                      "after_fit": (
+                          "Score locked 2022-2023 validation exactly once under the frozen candidate/selection rules."
+                      ),
+                      "after_selection": (
+                          "Freeze results. Production remains unchanged until a separate confirmation workflow."
+                      ),
+                  },
+              }
+
+          def write_outputs() -> None:
+              feas = load(FEAS)
+              pooled = load(POOLED)
+              v2 = load(V2_PREREG)
+
+              if pooled["result"]["decision"] != "ACCEPT_MFL_YEAR_BALANCED_POOLED_R1_R6_DESIGN":
+                  raise FreezeError("pooled design is not accepted")
+              if pooled["historical_player_outcomes_read"] is not False:
+                  raise FreezeError("outcome firewall already violated")
+
+              catalog = build_catalog(feas, pooled)
+              CATALOG_OUT.write_text(json.dumps(catalog, indent=2, sort_keys=True) + "\n")
+
+              prereg = build_prereg(catalog, pooled, v2)
+              PREREG_OUT.write_text(json.dumps(prereg, indent=2, sort_keys=True) + "\n")
+
+              md = f"""# Draft Pick FV V3 — Catalog & Outcome Preregistration
+
+          **Status:** `FROZEN_PRE_OUTCOME`
+
+          This freeze authorizes the next stage to harvest exact MFL draft picks and resolve player identities only.
+          It does **not** authorize historical NFL outcome ingestion, model fitting, validation scoring, or production changes.
+
+          ## Frozen source catalog
+
+          - R1-R4 primary source drafts: **{catalog['totals']['primary_r1_r4']}**
+          - R5 primary non-IDP drafts: **{catalog['totals']['primary_r5']}**
+          - R6 primary non-IDP drafts: **{catalog['totals']['primary_r6']}**
+          - R5 IDP sensitivity drafts: **{catalog['totals']['idp_sensitivity_r5']}**
+          - R6 IDP sensitivity drafts: **{catalog['totals']['idp_sensitivity_r6']}**
+          - Development classes: **2018-2021**
+          - Locked validation classes: **2022-2023**
+
+          ## Outcome target
+
+          V3 inherits V2's frozen three-season football-outcome contract and player-equivalent FV scale bridge.
+          The source population changes to validated real 12-team SF/2QB MFL rookie drafts and actual draft slots.
+
+          ## Candidate families
+
+          `C0` deployed baseline, `C1` global rescale, `C2` low-parameter round/tier curve,
+          and `C3` a development-tuned shrunk monotone exact-slot curve.
+          `C4` raw isotonic is diagnostic only.
+
+          ## Leakage firewall
+
+          No KTC/current market values, package votes, 2026 outcomes, named-rookie tuning, validation-driven
+          rule changes, or production modifications are allowed.
+          """
+              MD_OUT.write_text(textwrap_dedent(md).strip() + "\n")
+
+              manifest = {
+                  "schema_version": 1,
+                  "study_id": prereg["study_id"],
+                  "generated_at_utc": prereg["generated_at_utc"],
+                  "status": "FROZEN_PRE_OUTCOME",
+                  "head_sha_before_freeze_commit": prereg["preregistered_at_head_sha"],
+                  "historical_player_outcomes_read": False,
+                  "market_or_ktc_data_read": False,
+                  "package_vote_data_read": False,
+                  "candidate_fit_performed": False,
+                  "validation_scored": False,
+                  "production_change_authorized": False,
+                  "source_hashes": {
+                      FEAS.name: sha256(FEAS),
+                      POOLED.name: sha256(POOLED),
+                      V2_PREREG.name: sha256(V2_PREREG),
+                  },
+                  "output_hashes": {
+                      CATALOG_OUT.name: sha256(CATALOG_OUT),
+                      PREREG_OUT.name: sha256(PREREG_OUT),
+                      MD_OUT.name: sha256(MD_OUT),
+                  },
+              }
+              MAN_OUT.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+          def textwrap_dedent(s: str) -> str:
+              import textwrap
+              return textwrap.dedent(s)
+
+          def selftest() -> None:
+              # Tie-break behavior is deliberately simple and deterministic.
+              alpha_grid = [6, 12, 24, 48]
+              assert alpha_grid == sorted(alpha_grid)
+              slots = list(range(1, 73))
+              assert len(slots) == 72
+              assert ((72 - 1) // 12) + 1 == 6
+              assert ((13 - 1) // 12) + 1 == 2
+              print("PASS: V3 catalog/prereg freezer self-test")
+
+          def check() -> None:
+              cat = load(CATALOG_OUT)
+              pre = load(PREREG_OUT)
+              man = load(MAN_OUT)
+
+              assert cat["contains_player_outcomes"] is False
+              assert cat["contains_market_or_ktc_values"] is False
+              assert cat["totals"]["primary_r1_r4"] == 213
+              assert cat["totals"]["primary_r5"] == 81
+              assert cat["totals"]["primary_r6"] == 44
+              assert cat["totals"]["idp_sensitivity_r6"] == 25
+
+              assert pre["historical_player_outcomes_read_before_freeze"] is False
+              assert pre["market_or_ktc_data_allowed_as_fit_target"] is False
+              assert pre["package_vote_data_allowed"] is False
+              assert pre["production_change_authorized"] is False
+              assert pre["development_and_validation"]["locked_validation_years"] == [2022, 2023]
+
+              assert man["status"] == "FROZEN_PRE_OUTCOME"
+              assert man["historical_player_outcomes_read"] is False
+              assert man["output_hashes"][CATALOG_OUT.name] == sha256(CATALOG_OUT)
+              assert man["output_hashes"][PREREG_OUT.name] == sha256(PREREG_OUT)
+              assert man["output_hashes"][MD_OUT.name] == sha256(MD_OUT)
+
+              print("PASS: V3 catalog and preregistration outputs validated")
+
+          def main() -> None:
+              p = argparse.ArgumentParser()
+              p.add_argument("--selftest", action="store_true")
+              p.add_argument("--check", action="store_true")
+              args = p.parse_args()
+
+              if args.selftest:
+                  selftest()
+                  return
+              if args.check:
+                  check()
+                  return
+
+              write_outputs()
+              check()
+
+              cat = load(CATALOG_OUT)
+              print(json.dumps({
+                  "status": "FROZEN_PRE_OUTCOME",
+                  "catalog_totals": cat["totals"],
+                  "next_stage": "draft-pick harvest + identity resolution only",
+              }, indent=2, sort_keys=True))
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          chmod +x research/draft-pick-fv-v3/draft_pick_fv_v3_catalog_prereg.py
+          python3 research/draft-pick-fv-v3/draft_pick_fv_v3_catalog_prereg.py --selftest
+
+      - name: Freeze V3 source catalog and preregistration
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 research/draft-pick-fv-v3/draft_pick_fv_v3_catalog_prereg.py
+
+      - name: Validate frozen outputs and leakage firewall
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 research/draft-pick-fv-v3/draft_pick_fv_v3_catalog_prereg.py --check
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          p = Path("research/draft-pick-fv-v3")
+          cat = json.loads((p / "historical_draft_source_catalog_v3.json").read_text())
+          pre = json.loads((p / "preregistration_v3.json").read_text())
+          man = json.loads((p / "preregistration_manifest_v3.json").read_text())
+
+          assert cat["contains_player_outcomes"] is False
+          assert cat["contains_market_or_ktc_values"] is False
+          assert pre["historical_player_outcomes_read_before_freeze"] is False
+          assert pre["market_or_ktc_data_allowed_as_fit_target"] is False
+          assert pre["package_vote_data_allowed"] is False
+          assert pre["production_change_authorized"] is False
+          assert man["candidate_fit_performed"] is False
+          assert man["validation_scored"] is False
+
+          print("PASS: V3 is frozen before any historical outcome ingestion.")
+          print("Catalog totals:", cat["totals"])
+          print("Development:", pre["development_and_validation"]["development_years"])
+          print("Locked validation:", pre["development_and_validation"]["locked_validation_years"])
+          PY
+
+      - name: Install regression dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check requests
+
+      - name: Run repository regression checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/repo_regression_checks.py
+
+      - name: Prove only V3 freeze files changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import subprocess
+
+          expected = {
+              "research/draft-pick-fv-v3/draft_pick_fv_v3_catalog_prereg.py",
+              "research/draft-pick-fv-v3/historical_draft_source_catalog_v3.json",
+              "research/draft-pick-fv-v3/preregistration_v3.json",
+              "research/draft-pick-fv-v3/preregistration_v3.md",
+              "research/draft-pick-fv-v3/preregistration_manifest_v3.json",
+          }
+
+          out = subprocess.check_output(
+              ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+              text=True,
+          )
+
+          changed = set()
+          for line in out.splitlines():
+              if not line.strip():
+                  continue
+              path = line[3:]
+              if " -> " in path:
+                  path = path.split(" -> ", 1)[1]
+              changed.add(path)
+
+          if changed != expected:
+              raise SystemExit(
+                  "Unexpected changed-file set.\n"
+                  f"Expected: {sorted(expected)}\n"
+                  f"Actual:   {sorted(changed)}"
+              )
+
+          print("PASS: exactly five intended V3 freeze files changed.")
+          PY
+
+      - name: Commit V3 catalog and preregistration freeze
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            research/draft-pick-fv-v3/draft_pick_fv_v3_catalog_prereg.py \
+            research/draft-pick-fv-v3/historical_draft_source_catalog_v3.json \
+            research/draft-pick-fv-v3/preregistration_v3.json \
+            research/draft-pick-fv-v3/preregistration_v3.md \
+            research/draft-pick-fv-v3/preregistration_manifest_v3.json
+
+          git diff --cached --quiet && {
+            echo "No staged changes to commit."
+            exit 1
+          }
+
+          git pull --rebase --autostash origin main
+
+          # Revalidate after the rebase so the freeze is attached to current main.
+          python3 research/draft-pick-fv-v3/draft_pick_fv_v3_catalog_prereg.py --check
+          python3 scripts/validation/repo_regression_checks.py
+
+          git commit -m "Freeze Draft Pick FV V3 catalog and outcome protocol"
+          git push origin HEAD:main
