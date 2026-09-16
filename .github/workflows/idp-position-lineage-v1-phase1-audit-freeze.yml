@@ -50,6 +50,9 @@ jobs:
             model/releases/idp-v1/idp_v1_final_deployment_validation.json
             scripts/validation/snapshot_values.py
             scripts/validation/repo_regression_checks.py
+            research/team-utility/team_utility_starter_objective_audit.py
+            data/league_rosters.json
+            scripts/artifacts/generated/player_positions.json
           )
           for f in "${required[@]}"; do
             test -f "$f" || { echo "Missing required input: $f"; exit 1; }
@@ -102,7 +105,7 @@ jobs:
             ],
             "target_cohort": "exact frozen rows where legacy_model_position != current_valuation_position",
             "expected_target_count": 46,
-            "target_position_authority": "frozen IDP V1 current_valuation_position, verified against current PLAYER_DB before evaluation",
+            "target_position_authority": "frozen IDP V1 current_valuation_position, verified against the production-parity current universe (baked PLAYER_DB plus live league-roster merge) before evaluation",
             "held_fixed": [
               "2025 true PPG inputs",
               "IDP V1 2026 projection",
@@ -167,7 +170,9 @@ jobs:
           refreshes are deliberately excluded.
 
           For each mismatch, Phase 1 recomputes the frozen history component using
-          the player's frozen current valuation position, preserves the frozen V1
+          the player's frozen current valuation position, verifies that position
+          against the production-parity current universe (static PLAYER_DB plus the
+          same live league-roster merge used by production), preserves the frozen V1
           forward projection, evaluates against the already-frozen V1 replacement
           baseline for that current position, and transports only the resulting clean
           position-lineage model delta onto the actual deployed raw production
@@ -210,6 +215,14 @@ jobs:
           FINAL_V1_VALIDATION = RELEASE_DIR / "idp_v1_final_deployment_validation.json"
           INDEX = ROOT / "index.html"
           SNAPSHOT_VALUES = ROOT / "scripts" / "validation" / "snapshot_values.py"
+          LEAGUE_ROSTERS = ROOT / "data" / "league_rosters.json"
+          PLAYER_POSITIONS = (
+              ROOT / "scripts" / "artifacts" / "generated" / "player_positions.json"
+          )
+          STARTER_AUDIT = (
+              ROOT / "research" / "team-utility"
+              / "team_utility_starter_objective_audit.py"
+          )
 
           PREREG_JSON = RESEARCH / "phase1_preregistration.json"
           PREREG_MD = RESEARCH / "phase1_preregistration.md"
@@ -276,6 +289,33 @@ jobs:
               sys.path.insert(0, str(ROOT / "scripts" / "validation"))
               import snapshot_values
               return snapshot_values
+
+          def load_current_production_cfg(snapshot_values):
+              """Mirror the production valuation universe, including live rosters.
+
+              index.html is the baked source of truth, but the browser also merges
+              current league-roster rows at runtime. Some frozen IDP V1 lineage
+              targets (for example Bradley Chubb) are legitimate current roster
+              players whose key is not baked into static PLAYER_DB. Phase 1 must
+              therefore evaluate the same merged universe rather than crashing or
+              silently dropping those rows.
+              """
+              sys.path.insert(0, str(ROOT / "research" / "team-utility"))
+              import team_utility_starter_objective_audit as starter_audit
+
+              base_cfg = snapshot_values.load_from_html(INDEX)
+              roster_doc = read_json(LEAGUE_ROSTERS)
+              cfg = starter_audit.merge_live_league_into_cfg(base_cfg, roster_doc)
+
+              unresolved = (
+                  cfg.get("live_merge_stats", {}).get("unresolved_positions") or []
+              )
+              if unresolved:
+                  raise RuntimeError(
+                      "production-parity live roster merge has unresolved positions: "
+                      + json.dumps(unresolved[:20], sort_keys=True)
+                  )
+              return cfg
 
           def recompute_history(current_pos, old_history, frozen_history_doc):
               n = int(old_history.get("games_played_2025") or 0)
@@ -376,7 +416,7 @@ jobs:
               frozen = read_json(FROZEN_CANDIDATE)
               history = read_json(FROZEN_HISTORY)
               final_v1 = read_json(FINAL_V1_VALIDATION)
-              cfg = snapshot_values.load_from_html(INDEX)
+              cfg = load_current_production_cfg(snapshot_values)
               current_values = snapshot_values.compute_all_values(cfg)
 
               hash_mismatches = verify_frozen_release_hashes(release_manifest)
@@ -519,12 +559,21 @@ jobs:
                               PM_MAX,
                           )
 
-                          info = cfg["player_db"][key]
-                          role = info["role"]
-                          role_estimate = float(cfg["role_mult"].get(role, 1.0))
-                          no_history = key in cfg["no_real_history"]
+                          info = cfg["player_db"].get(key)
+                          if info is None:
+                              reason = "missing_current_production_player_db_row"
+                              proposed_raw = live_raw
+                              final_raw = live_raw
+                          else:
+                              role = info["role"]
+                              role_estimate = float(
+                                  cfg["role_mult"].get(role, 1.0)
+                              )
+                              no_history = key in cfg["no_real_history"]
 
                           if (
+                              info is not None
+                              and
                               no_history
                               and live_raw <= PM_MIN + 1e-12
                               and proposed_raw > PM_MIN + 1e-12
@@ -688,7 +737,10 @@ jobs:
                       and float(r["candidate_raw_prod_mult"])
                           < float(
                               cfg["role_mult"].get(
-                                  cfg["player_db"][r["key"]]["role"], 1.0
+                                  (
+                                      cfg["player_db"].get(r["key"]) or {}
+                                  ).get("role"),
+                                  1.0,
                               )
                           ) - 1e-12
                   )
@@ -707,6 +759,14 @@ jobs:
                   "current_positions_match_frozen_target": {
                       "pass": not current_position_mismatches,
                       "mismatches": current_position_mismatches,
+                  },
+                  "live_roster_merge_resolved": {
+                      "pass": not (
+                          cfg.get("live_merge_stats", {}).get(
+                              "unresolved_positions"
+                          ) or []
+                      ),
+                      "merge_stats": cfg.get("live_merge_stats", {}),
                   },
                   "deployed_raw_matches_frozen_v1": {
                       "pass": not deployed_raw_mismatches,
@@ -853,6 +913,15 @@ jobs:
                       str(INDEX.relative_to(ROOT)): sha256(INDEX),
                       str(SNAPSHOT_VALUES.relative_to(ROOT)): sha256(
                           SNAPSHOT_VALUES
+                      ),
+                      str(LEAGUE_ROSTERS.relative_to(ROOT)): sha256(
+                          LEAGUE_ROSTERS
+                      ),
+                      str(PLAYER_POSITIONS.relative_to(ROOT)): sha256(
+                          PLAYER_POSITIONS
+                      ),
+                      str(STARTER_AUDIT.relative_to(ROOT)): sha256(
+                          STARTER_AUDIT
                       ),
                   },
               }
@@ -1029,6 +1098,49 @@ jobs:
           python3 -m py_compile research/idp-position-lineage-v1/idp_position_lineage_v1_phase1.py
           python3 research/idp-position-lineage-v1/idp_position_lineage_v1_phase1.py --selftest
           python3 scripts/validation/snapshot_values.py --selftest
+
+      - name: Preflight production-parity live roster merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          root = Path.cwd()
+          sys.path.insert(0, str(root / "scripts" / "validation"))
+          sys.path.insert(0, str(root / "research" / "team-utility"))
+
+          import snapshot_values
+          import team_utility_starter_objective_audit as starter_audit
+
+          base = snapshot_values.load_from_html(root / "index.html")
+          rosters = json.loads(
+              (root / "data" / "league_rosters.json").read_text()
+          )
+          merged = starter_audit.merge_live_league_into_cfg(base, rosters)
+
+          unresolved = (
+              merged.get("live_merge_stats", {}).get("unresolved_positions") or []
+          )
+          assert not unresolved, unresolved
+          assert "bradley chubb" in merged["player_db"]
+          assert merged["player_db"]["bradley chubb"]["pos"] == "DL"
+          assert merged["prod_mult"].get("bradley chubb") is not None
+
+          values = snapshot_values.compute_all_values(merged)
+          assert "bradley chubb" in values
+          assert values["bradley chubb"]["value"] > 0
+
+          print(
+              "PASS live merge:",
+              merged["live_merge_stats"],
+              "Bradley Chubb:",
+              merged["player_db"]["bradley chubb"],
+              values["bradley chubb"],
+          )
+          PY
 
       - name: Run frozen Phase 1 audit
         shell: bash
