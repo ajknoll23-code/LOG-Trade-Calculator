@@ -1,7 +1,7 @@
 # Replacement Level / Positional Scale V2 — Phase 5 Prospective Evaluator
 
 Method: `replacement-level-v2-phase5-prospective-v1`  
-Status: **`READY_WAITING_FOR_COMPLETED_WEEK_1`**
+Status: **`COLLECTION_ONLY`**
 
 ## Guardrail
 
@@ -10,10 +10,10 @@ Status: **`READY_WAITING_FOR_COMPLETED_WEEK_1`**
 - Frozen candidate SHA256: `ab24d5d1a1483ada04c6ce44154dc58bba6b1ba16c520fbeaf71e199851297e6`
 - Frozen at: **2026-09-05T22:16:28.841347Z**
 - First eligible future week: **1**
-- Completed consecutive weeks used: **none**
+- Completed consecutive weeks used: **[1]**
 - Full frozen candidate universe: **518**
 - Primary real-history cohort: **426**
-- Primary players with an active game: **0**
+- Primary players with an active game: **372**
 
 ## Frozen replacement-rank families
 
@@ -34,22 +34,22 @@ The future replacement point is derived from the realized future data itself via
 
 | Family | Pos-balanced MAE | Pos-balanced RMSE | Pooled MAE | Δ MAE vs control | Positions available |
 |---|---:|---:|---:|---:|---:|
-| `legacy_control` | — | — | — | — | 0 |
-| `prior_limited_evidence` | — | — | — | — | 0 |
-| `stable_positions_only` | — | — | — | — | 0 |
-| `full_phase2_leaders` | — | — | — | — | 0 |
+| `legacy_control` | 0.4909 | 0.5841 | 0.5014 | — | 7 |
+| `prior_limited_evidence` | 0.4688 | 0.5564 | 0.4757 | -0.0221 | 7 |
+| `stable_positions_only` | 0.4526 | 0.5390 | 0.4558 | -0.0382 | 7 |
+| `full_phase2_leaders` | 0.4654 | 0.5519 | 0.4635 | -0.0255 | 7 |
 
 ## Future-only replacement structure
 
 | Pos | Future split rank | Replacement player | Active PPG at split |
 |---|---:|---|---:|
-| QB | — | — | — |
-| RB | — | — | — |
-| WR | — | — | — |
-| TE | — | — | — |
-| DL | — | — | — |
-| LB | — | — | — |
-| DB | — | — | — |
+| QB | 11 | brock purdy | 22.1000 |
+| RB | 12 | kyle monangai | 23.4000 |
+| WR | 10 | ladd mcconkey | 16.7000 |
+| TE | 7 | juwan johnson | 12.9000 |
+| DL | 8 | alex highsmith | 19.7500 |
+| LB | 24 | sonny styles | 14.2500 |
+| DB | 19 | budda baker | 10.2500 |
 
 ## Secondary availability-inclusive metric
 
@@ -57,10 +57,10 @@ The same candidate-independent future-relative-production test using cumulative 
 
 | Family | Pos-balanced MAE | Δ MAE vs control | Pooled MAE |
 |---|---:|---:|---:|
-| `legacy_control` | — | — | — |
-| `prior_limited_evidence` | — | — | — |
-| `stable_positions_only` | — | — | — |
-| `full_phase2_leaders` | — | — | — |
+| `legacy_control` | 0.5415 | — | 0.5399 |
+| `prior_limited_evidence` | 0.5202 | -0.0212 | 0.5135 |
+| `stable_positions_only` | 0.5035 | -0.0379 | 0.4937 |
+| `full_phase2_leaders` | 0.4920 | -0.0495 | 0.4866 |
 
 ## Readiness ladder
 
