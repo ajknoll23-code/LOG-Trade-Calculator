@@ -132,13 +132,25 @@ jobs:
               assert path.exists(), rel
               assert sha(path) == expected, f"Phase 2 frozen output drift: {rel}"
 
-          for rel in ("free-agent-board.html", "index.html", "data/free_agents.json"):
+          # The valuation engine and historical FA production table must remain
+          # the exact frozen Phase-1 bytes. data/free_agents.json is intentionally
+          # NOT frozen here: it is a live Sleeper snapshot and may refresh between
+          # research freeze and deployment. A dedicated current-snapshot transport
+          # validation below proves the frozen candidate is still safe on today's
+          # rendered population.
+          for rel in ("free-agent-board.html", "index.html"):
               expected = p1["input_sha256"][rel]
               actual = sha(root / rel)
               assert actual == expected, (
-                  f"Production/input drift since Phase 1 freeze: {rel}: "
+                  f"Frozen valuation/input drift since Phase 1: {rel}: "
                   f"{actual} != {expected}"
               )
+
+          current_fa_sha = sha(root / "data/free_agents.json")
+          frozen_fa_sha = p1["input_sha256"]["data/free_agents.json"]
+          print("Frozen free_agents.json SHA:", frozen_fa_sha)
+          print("Current free_agents.json SHA:", current_fa_sha)
+          print("Live Sleeper snapshot drift allowed; transport validation required.")
 
           assert p1["counts"]["active_non_k_deployed_entries"] == 364
           assert p1["counts"]["reproducible_candidates"] == 333
@@ -147,6 +159,236 @@ jobs:
           assert p2["phase1"]["unresolved_held_count"] == 31
 
           print("PASS: frozen Phase 1/2 lineage and production inputs are intact.")
+          PY
+
+      - name: Revalidate frozen V2 candidate on current Sleeper snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import importlib.util
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          root = Path(".")
+          scripts = root / "scripts"
+          validation = scripts / "validation"
+          if str(scripts) not in sys.path:
+              sys.path.insert(0, str(scripts))
+          if str(validation) not in sys.path:
+              sys.path.insert(0, str(validation))
+
+          import validate_free_agent_valuation_parity as fa_validator
+          from sync import sync_free_agent_valuation as sync_mod
+
+          research = root / "research" / "free-agent-production-v2"
+          phase1 = json.loads(
+              (research / "free_agent_production_v2_phase1.json").read_text()
+          )
+          phase2 = json.loads(
+              (research / "free_agent_production_v2_phase2_shadow.json").read_text()
+          )
+          free_doc = json.loads((root / "data/free_agents.json").read_text())
+          board_text = (root / "free-agent-board.html").read_text()
+
+          # Load the frozen Phase-2 helpers. Do not modify the frozen evaluator.
+          phase2_script = research / "free_agent_production_v2_phase2_shadow.py"
+          spec = importlib.util.spec_from_file_location(
+              "fa_v2_phase2_transport", phase2_script
+          )
+          assert spec is not None and spec.loader is not None
+          mod = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = mod
+          spec.loader.exec_module(mod)
+
+          frozen_rows = list(phase1["rows"])
+          frozen_active_ids = {str(r["sleeper_id"]) for r in frozen_rows}
+          candidates = [
+              r for r in frozen_rows if r.get("candidate_prod") is not None
+          ]
+          candidate_ids = {str(r["sleeper_id"]) for r in candidates}
+          frozen_held_ids = frozen_active_ids - candidate_ids
+
+          assert len(frozen_active_ids) == 364
+          assert len(candidate_ids) == 333
+          assert len(frozen_held_ids) == 31
+
+          # Current board/parity must be healthy before transport.
+          parity = fa_validator.validate()
+          assert parity["status"] == "PASS"
+          assert int(parity["roster_overlap"]) == 0
+
+          current_runtime = fa_validator._board_runtime_rows(board_text, free_doc)
+          current_by_id = mod.attach_sleeper_ids(
+              current_runtime["rows"], free_doc, fa_validator
+          )
+
+          # Apply the exact frozen candidate in memory to today's board + today's
+          # free-agent population. The underlying FA table/engine is still frozen.
+          shadow_board = mod.inject_shadow_overrides(
+              board_text, candidates, sync_mod
+          )
+          shadow_runtime = fa_validator._board_runtime_rows(shadow_board, free_doc)
+          shadow_by_id = mod.attach_sleeper_ids(
+              shadow_runtime["rows"], free_doc, fa_validator
+          )
+
+          current_sources = {
+              str(k): str(v)
+              for k, v in current_runtime["production_source_by_id"].items()
+          }
+          shadow_sources = {
+              str(k): str(v)
+              for k, v in shadow_runtime["production_source_by_id"].items()
+          }
+          assert current_sources == shadow_sources, (
+              "Current-snapshot shadow changed production-source classification"
+          )
+
+          tracked = {"QB", "RB", "WR", "TE", "DL", "LB", "DB"}
+          current_active_fa_specific = {
+              sid
+              for sid, source in current_sources.items()
+              if source == "fa_specific_prod"
+              and current_by_id.get(sid, {}).get("pos") in tracked
+          }
+
+          removed_from_current_active = sorted(
+              frozen_active_ids - current_active_fa_specific
+          )
+          added_to_current_active = sorted(
+              current_active_fa_specific - frozen_active_ids
+          )
+
+          # Only currently-rendered frozen candidates can affect today's board.
+          rendered_candidate_ids = candidate_ids & set(current_by_id)
+          rendered_held_ids = frozen_held_ids & set(current_by_id)
+
+          candidate_by_id = {
+              str(r["sleeper_id"]): r for r in candidates
+          }
+
+          metadata_fields = ("name", "pos", "team", "age", "role", "hasRealData")
+          metadata_violations = []
+          monotonicity_violations = []
+          invalid_values = []
+          noncandidate_changed = []
+
+          for sid in sorted(current_by_id):
+              old = current_by_id[sid]
+              new = shadow_by_id[sid]
+
+              if sid not in rendered_candidate_ids:
+                  if int(old["val"]) != int(new["val"]):
+                      noncandidate_changed.append({
+                          "sleeper_id": sid,
+                          "name": old["name"],
+                          "pos": old["pos"],
+                          "current_fv": int(old["val"]),
+                          "shadow_fv": int(new["val"]),
+                      })
+                  continue
+
+              changed_meta = [
+                  field for field in metadata_fields
+                  if old.get(field) != new.get(field)
+              ]
+              if changed_meta:
+                  metadata_violations.append({
+                      "sleeper_id": sid,
+                      "fields": changed_meta,
+                  })
+
+              if not isinstance(new.get("val"), int) or int(new["val"]) <= 0:
+                  invalid_values.append(sid)
+
+              frozen = candidate_by_id[sid]
+              prod_delta = (
+                  float(frozen["candidate_prod"])
+                  - float(frozen["deployed_prod"])
+              )
+              fv_delta = int(new["val"]) - int(old["val"])
+              eps = 1e-12
+              if (
+                  (prod_delta > eps and fv_delta < 0)
+                  or (prod_delta < -eps and fv_delta > 0)
+              ):
+                  monotonicity_violations.append({
+                      "sleeper_id": sid,
+                      "prod_delta": prod_delta,
+                      "fv_delta": fv_delta,
+                  })
+
+          assert not noncandidate_changed, (
+              "Frozen candidate caused current-snapshot spillover to non-candidates: "
+              + json.dumps(noncandidate_changed[:20], indent=2)
+          )
+          assert not metadata_violations, (
+              "Current-snapshot shadow changed candidate metadata: "
+              + json.dumps(metadata_violations[:20], indent=2)
+          )
+          assert not invalid_values, (
+              "Current-snapshot shadow produced invalid FVs: "
+              + json.dumps(invalid_values[:20], indent=2)
+          )
+          assert not monotonicity_violations, (
+              "Current-snapshot shadow violated production/FV monotonicity: "
+              + json.dumps(monotonicity_violations[:20], indent=2)
+          )
+
+          # Frozen held rows that are still rendered must remain exactly unchanged.
+          held_changed = [
+              sid for sid in rendered_held_ids
+              if int(current_by_id[sid]["val"]) != int(shadow_by_id[sid]["val"])
+          ]
+          assert not held_changed, (
+              "Frozen unresolved/held rows changed in current shadow: "
+              + json.dumps(held_changed[:20])
+          )
+
+          # Save the complete expected CURRENT shadow runtime. After deployment,
+          # every currently rendered row must reproduce this exactly.
+          expected_rows = {
+              sid: {
+                  "val": int(row["val"]),
+                  "name": row["name"],
+                  "pos": row["pos"],
+                  "team": row.get("team"),
+                  "age": row.get("age"),
+                  "role": row.get("role"),
+                  "hasRealData": row.get("hasRealData"),
+              }
+              for sid, row in shadow_by_id.items()
+          }
+
+          transport = {
+              "frozen_active_count": len(frozen_active_ids),
+              "frozen_candidate_count": len(candidate_ids),
+              "frozen_held_count": len(frozen_held_ids),
+              "current_rendered_count": len(current_by_id),
+              "current_active_fa_specific_count": len(current_active_fa_specific),
+              "rendered_frozen_candidate_count": len(rendered_candidate_ids),
+              "rendered_frozen_held_count": len(rendered_held_ids),
+              "removed_from_frozen_active_ids": removed_from_current_active,
+              "added_current_active_ids": added_to_current_active,
+              "current_production_source_counts": current_runtime[
+                  "production_source_counts"
+              ],
+              "expected_shadow_rows": expected_rows,
+          }
+
+          out = Path(os.environ["RUNNER_TEMP"]) / "fa-v2-current-transport.json"
+          out.write_text(json.dumps(transport, indent=2, sort_keys=True) + "\n")
+
+          print("PASS: frozen V2 candidate transported safely to current Sleeper snapshot.")
+          print("Current rendered rows:", len(current_by_id))
+          print("Current active FA-specific rows:", len(current_active_fa_specific))
+          print("Frozen candidates currently rendered:", len(rendered_candidate_ids))
+          print("Frozen held rows currently rendered:", len(rendered_held_ids))
+          print("Frozen active IDs no longer active:", len(removed_from_current_active))
+          print("New active FA-specific IDs since freeze:", len(added_to_current_active))
           PY
 
       - name: Write approved Free-Agent Production V2 release
@@ -438,13 +680,14 @@ jobs:
           python3 scripts/model/apply_free_agent_production_v2_release.py --write
           python3 scripts/model/apply_free_agent_production_v2_release.py --check
 
-      - name: Confirm deployed board exactly reproduces Phase 2 shadow
+      - name: Confirm deployed board exactly reproduces current transport shadow
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           import importlib.util
           import json
+          import os
           import sys
           from pathlib import Path
 
@@ -458,62 +701,90 @@ jobs:
 
           import validate_free_agent_valuation_parity as fa_validator
 
-          phase2_path = root / "research" / "free-agent-production-v2" / "free_agent_production_v2_phase2_shadow.json"
-          phase2 = json.loads(phase2_path.read_text())
+          research = root / "research" / "free-agent-production-v2"
           release = json.loads(
-              (root / "model" / "releases" / "free-agent-production-v2" / "release.json").read_text()
+              (
+                  root
+                  / "model"
+                  / "releases"
+                  / "free-agent-production-v2"
+                  / "release.json"
+              ).read_text()
           )
-          free_doc = json.loads((root / "data" / "free_agents.json").read_text())
+          free_doc = json.loads((root / "data/free_agents.json").read_text())
           board_text = (root / "free-agent-board.html").read_text()
+          transport = json.loads(
+              (
+                  Path(os.environ["RUNNER_TEMP"])
+                  / "fa-v2-current-transport.json"
+              ).read_text()
+          )
 
-          p2_script = root / "research" / "free-agent-production-v2" / "free_agent_production_v2_phase2_shadow.py"
-          spec = importlib.util.spec_from_file_location("fa_v2_phase2_frozen", p2_script)
+          p2_script = (
+              research / "free_agent_production_v2_phase2_shadow.py"
+          )
+          spec = importlib.util.spec_from_file_location(
+              "fa_v2_phase2_frozen_confirm", p2_script
+          )
           assert spec is not None and spec.loader is not None
           mod = importlib.util.module_from_spec(spec)
           sys.modules[spec.name] = mod
           spec.loader.exec_module(mod)
 
           runtime = fa_validator._board_runtime_rows(board_text, free_doc)
-          by_id = mod.attach_sleeper_ids(runtime["rows"], free_doc, fa_validator)
+          actual_by_id = mod.attach_sleeper_ids(
+              runtime["rows"], free_doc, fa_validator
+          )
+          expected = transport["expected_shadow_rows"]
 
-          candidate_by_id = {
-              str(r["sleeper_id"]): r
-              for r in phase2["candidate_rows"]
-          }
-          assert len(candidate_by_id) == 333
+          assert set(actual_by_id) == set(expected), (
+              "Rendered Sleeper-ID population changed during Phase 3"
+          )
 
           mismatches = []
-          for sid, shadow in candidate_by_id.items():
-              actual = int(by_id[sid]["val"])
-              expected = int(shadow["shadow_fv"])
-              if actual != expected:
+          fields = ("val", "name", "pos", "team", "age", "role", "hasRealData")
+          for sid in sorted(expected):
+              actual = actual_by_id[sid]
+              exp = expected[sid]
+              changed = {
+                  field: {"expected": exp.get(field), "actual": actual.get(field)}
+                  for field in fields
+                  if actual.get(field) != exp.get(field)
+              }
+              if changed:
                   mismatches.append({
                       "sleeper_id": sid,
-                      "name": shadow["name"],
-                      "expected_shadow_fv": expected,
-                      "actual_deployed_fv": actual,
+                      "changes": changed,
                   })
 
           if mismatches:
               raise SystemExit(
-                  "Deployed board does not reproduce Phase 2 shadow: "
+                  "Deployed board does not exactly reproduce current transport shadow: "
                   + json.dumps(mismatches[:20], indent=2)
               )
 
-          candidate_ids = set(candidate_by_id)
-          held_ids = {
-              str(r["sleeper_id"]) for r in release["held_active_legacy"]
+          candidate_ids = {
+              str(r["sleeper_id"])
+              for r in release["candidate_overrides"]
           }
+          held_ids = {
+              str(r["sleeper_id"])
+              for r in release["held_active_legacy"]
+          }
+          assert len(candidate_ids) == 333
           assert len(held_ids) == 31
           assert not (candidate_ids & held_ids)
 
-          for sid in candidate_ids:
-              assert runtime["production_source_by_id"][sid] == "fa_specific_prod"
-          for sid in held_ids:
-              assert runtime["production_source_by_id"][sid] == "fa_specific_prod"
-
-          print("PASS: all 333 deployed candidate FVs exactly reproduce Phase 2 shadow.")
-          print("PASS: all 31 unresolved active rows remain FA-specific and held.")
+          print(
+              "PASS: deployed board exactly reproduces the pre-deploy "
+              "current-snapshot shadow for all",
+              len(expected),
+              "rendered rows.",
+          )
+          print(
+              "Frozen release remains exactly 333 candidate overrides + "
+              "31 held active legacy rows."
+          )
           PY
 
       - name: Validate free-agent parity after deployment
@@ -535,6 +806,7 @@ jobs:
           python3 - <<'PY'
           import hashlib
           import json
+          import os
           import subprocess
           from pathlib import Path
 
@@ -552,6 +824,13 @@ jobs:
           )
           release = json.loads(release_path.read_text())
 
+          transport = json.loads(
+              (
+                  Path(os.environ["RUNNER_TEMP"])
+                  / "fa-v2-current-transport.json"
+              ).read_text()
+          )
+
           result = {
               "study_id": "free-agent-production-v2",
               "phase": 3,
@@ -564,6 +843,28 @@ jobs:
               "kickers": "unchanged",
               "phase2_decision": p2["decision"],
               "phase2_shadow_exact_reproduction_required": True,
+              "current_snapshot_transport_exact_reproduction_required": True,
+              "current_snapshot_transport": {
+                  "current_rendered_count": transport["current_rendered_count"],
+                  "current_active_fa_specific_count": transport[
+                      "current_active_fa_specific_count"
+                  ],
+                  "rendered_frozen_candidate_count": transport[
+                      "rendered_frozen_candidate_count"
+                  ],
+                  "rendered_frozen_held_count": transport[
+                      "rendered_frozen_held_count"
+                  ],
+                  "removed_from_frozen_active_ids": transport[
+                      "removed_from_frozen_active_ids"
+                  ],
+                  "added_current_active_ids": transport[
+                      "added_current_active_ids"
+                  ],
+              },
+              "current_free_agents_sha256": sha(
+                  root / "data/free_agents.json"
+              ),
               "canonical_prod_mult_data_changed": False,
               "role_age_team_identity_changed": False,
               "deployment_mechanism": (
@@ -610,7 +911,7 @@ jobs:
           - Kickers changed: **0**
           - Canonical `PROD_MULT_DATA` changed: **No**
           - Role/age/team/identity logic changed: **No**
-          - Phase 2 shadow FV reproduced exactly for all candidates: **Yes**
+          - Current-snapshot transported shadow reproduced exactly for every rendered FA: **Yes**
           - Full free-agent parity validation: **PASS**
           - Full repository regression suite after deployment: **PASS**
 
