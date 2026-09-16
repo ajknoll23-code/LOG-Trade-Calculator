@@ -44,10 +44,13 @@ jobs:
 
           required=(
             index.html
+            free-agent-board.html
             data/league_rosters.json
             scripts/artifacts/generated/player_positions.json
+            scripts/sync/sync_free_agent_valuation.py
             scripts/validation/snapshot_values.py
             scripts/validation/repo_regression_checks.py
+            scripts/validation/validate_free_agent_valuation_parity.py
             research/team-utility/team_utility_starter_objective_audit.py
             research/idp-position-lineage-v1/phase1b_current_core_cohort.json
             research/idp-position-lineage-v1/idp_position_lineage_v1_phase1b.json
@@ -84,6 +87,9 @@ jobs:
             data/league_rosters.json \
             scripts/artifacts/generated/player_positions.json \
             > "${RUNNER_TEMP}/phase3-live-inputs.sha256"
+
+          cp free-agent-board.html \
+            "${RUNNER_TEMP}/free-agent-board.pre-position-lineage-sync.html"
 
       - name: Preflight full repository regression suite
         shell: bash
@@ -857,6 +863,70 @@ jobs:
           python3 scripts/model/apply_idp_position_lineage_v1_release.py --write
           python3 scripts/model/apply_idp_position_lineage_v1_release.py --check
 
+      - name: Synchronize free-agent board canonical valuation mirror
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Prove the repo-owned generator is internally safe/idempotent before
+          # using it. Its self-test explicitly protects FA_PROD_MULT_DATA.
+          python3 scripts/sync/sync_free_agent_valuation.py --selftest
+
+          # Synchronize only canonical valuation regions from the newly updated
+          # index.html into the free-agent board.
+          python3 scripts/sync/sync_free_agent_valuation.py --write
+          python3 scripts/sync/sync_free_agent_valuation.py --check
+
+          # Stronger transaction guard: starting from the exact pre-deployment
+          # board, the current board must equal *exactly* what the canonical
+          # synchronizer renders against the newly deployed index. Therefore
+          # every board-specific byte outside the synchronizer-owned regions,
+          # including the deployed FA Production V2 mechanisms, is preserved.
+          python3 - <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          root = Path(".").resolve()
+          sys.path.insert(0, str(root / "scripts"))
+
+          from sync import sync_free_agent_valuation as sync_mod
+
+          before_path = (
+              Path(os.environ["RUNNER_TEMP"])
+              / "free-agent-board.pre-position-lineage-sync.html"
+          )
+          before = before_path.read_text(encoding="utf-8")
+          index_text = (root / "index.html").read_text(encoding="utf-8")
+          actual = (root / "free-agent-board.html").read_text(encoding="utf-8")
+
+          expected = sync_mod.render_synced(index_text, before)
+          assert actual == expected, (
+              "free-agent-board.html differs from the exact canonical "
+              "render of the preserved pre-deployment board"
+          )
+
+          parity = sync_mod.parity_regions(index_text, actual)
+          assert all(parity.values()), parity
+
+          # The generator self-test already proves FA_PROD_MULT_DATA preservation.
+          # Also ensure the separate deployed FA V2 mechanism still exists at all.
+          assert "FA_PROD_MULT_DATA" in actual
+          assert "FA_PROD_MULT_V2_RELEASE" in actual, (
+              "deployed Free-Agent Production V2 release mechanism disappeared "
+              "during canonical board synchronization"
+          )
+
+          print(
+              "PASS: free-agent board canonical mirror synchronized exactly; "
+              "all board-specific regions preserved."
+          )
+          PY
+
+          # Execute the full board runtime/source-precedence/parity validator
+          # before the broader repository regression suite.
+          python3 scripts/validation/validate_free_agent_valuation_parity.py
+
       - name: Confirm deployed calculator exactly reproduces current shadow
         shell: bash
         run: |
@@ -1010,7 +1080,7 @@ jobs:
               "production_change_applied": True,
               "candidate_count_deployed": len(release["candidate_overrides"]),
               "held_count": len(release["held_rows"]),
-              "production_scope": "index.html PROD_MULT_DATA only",
+              "production_scope": "24 core PROD_MULT_DATA changes in index.html plus deterministic canonical mirror synchronization to free-agent-board.html",
               "noncohort_prod_mult_changed": 0,
               "offense_prod_mult_changed": 0,
               "phase2b_decision": p2b["decision"],
@@ -1019,8 +1089,12 @@ jobs:
                   "24 Phase1B/Phase2B-approved current-core candidates"
               ),
               "legacy_idp_v1_validator_upgraded_for_successor_layering": True,
+              "free_agent_board_canonical_sync_applied": True,
+              "free_agent_board_full_parity_passed": True,
+              "fa_production_v2_mechanism_preserved": True,
               "sha256": {
                   "index.html": sha(root / "index.html"),
+                  "free-agent-board.html": sha(root / "free-agent-board.html"),
                   "release.json": sha(release_path),
                   "apply_script": sha(apply_path),
                   "phase1b_manifest": sha(r / "phase1b_manifest.json"),
@@ -1047,6 +1121,9 @@ jobs:
           - Non-cohort production changes: **0**
           - Offense production changes: **0**
           - Current-snapshot shadow reproduced exactly: **Yes**
+          - Free-agent canonical mirror synchronized: **Yes**
+          - Free-agent full parity/source-precedence validation: **PASS**
+          - Free-Agent Production V2 board-specific mechanism preserved: **Yes**
           - Post-deployment repository regression suite: **PASS**
 
           ## Carried-forward Phase 2B evidence
@@ -1059,10 +1136,13 @@ jobs:
 
           ## Deployment architecture
 
-          The deployment modifies only the 24 approved existing keys inside
-          `PROD_MULT_DATA` in `index.html`. It does not alter positions, ages,
-          roles, position weights, age curves, no-history lineage, Team Utility,
-          offense values, or free-agent production logic.
+          The scientific deployment modifies only the 24 approved existing keys
+          inside `PROD_MULT_DATA` in `index.html`. The repository-owned canonical
+          synchronizer then mirrors that updated valuation engine into
+          `free-agent-board.html` while preserving all board-specific/free-agent
+          production regions. It does not alter positions, ages, roles, position
+          weights, age curves, no-history lineage, Team Utility, offense values,
+          or Free-Agent Production V2 logic.
 
           The deterministic applicator/checker is:
           `scripts/model/apply_idp_position_lineage_v1_release.py`.
@@ -1078,6 +1158,7 @@ jobs:
               "production_change_applied": True,
               "release_sha256": sha(release_path),
               "index_sha256": sha(root / "index.html"),
+              "free_agent_board_sha256": sha(root / "free-agent-board.html"),
               "apply_script_sha256": sha(apply_path),
               "phase3_result_sha256": sha(json_path),
               "phase3_markdown_sha256": sha(md_path)
@@ -1106,6 +1187,7 @@ jobs:
 
           expected = {
               "index.html",
+              "free-agent-board.html",
               "model/releases/idp-position-lineage-v1/release.json",
               "scripts/model/apply_idp_position_lineage_v1_release.py",
               "scripts/validation/validate_idp_v1_final_deployment.py",
@@ -1134,7 +1216,7 @@ jobs:
                   f"Actual:   {sorted(actual)}"
               )
 
-          print("PASS: exact seven-file Phase 3 deployment diff.")
+          print("PASS: exact eight-file Phase 3 deployment diff.")
           PY
 
       - name: Commit confirmed IDP Position Lineage V1 deployment
@@ -1147,6 +1229,7 @@ jobs:
 
           git add \
             index.html \
+            free-agent-board.html \
             model/releases/idp-position-lineage-v1/release.json \
             scripts/model/apply_idp_position_lineage_v1_release.py \
             scripts/validation/validate_idp_v1_final_deployment.py \
