@@ -1,0 +1,334 @@
+name: 4for4 IDP V1 - Phase 1C Identity Impact Triage
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  private-identity-impact-triage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      FOURFORFOUR_DL_GZ_B64: ${{ secrets.FOURFORFOUR_DL_GZ_B64 }}
+      FOURFORFOUR_LB_GZ_B64: ${{ secrets.FOURFORFOUR_LB_GZ_B64 }}
+      FOURFORFOUR_DB_GZ_B64: ${{ secrets.FOURFORFOUR_DB_GZ_B64 }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install regression dependencies
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check requests
+
+      - name: Decode private 4for4 inputs outside repository
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for var in FOURFORFOUR_DL_GZ_B64 FOURFORFOUR_LB_GZ_B64 FOURFORFOUR_DB_GZ_B64; do
+            if [ -z "${!var:-}" ]; then
+              echo "ERROR: required GitHub Actions secret ${var} is missing or empty." >&2
+              exit 1
+            fi
+          done
+
+          install -d -m 700 /tmp/log-fourforfour-idp-v1/input
+          install -d -m 700 /tmp/log-fourforfour-idp-v1/output
+
+          printf '%s' "$FOURFORFOUR_DL_GZ_B64" | base64 --decode | gzip -dc \
+            > /tmp/log-fourforfour-idp-v1/input/dl.csv
+          printf '%s' "$FOURFORFOUR_LB_GZ_B64" | base64 --decode | gzip -dc \
+            > /tmp/log-fourforfour-idp-v1/input/lb.csv
+          printf '%s' "$FOURFORFOUR_DB_GZ_B64" | base64 --decode | gzip -dc \
+            > /tmp/log-fourforfour-idp-v1/input/db.csv
+
+          chmod 600 /tmp/log-fourforfour-idp-v1/input/*.csv
+
+      - name: Validate frozen private input population
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import csv
+          from pathlib import Path
+
+          expected = {'dl.csv': 250, 'lb.csv': 136, 'db.csv': 262}
+          root = Path('/tmp/log-fourforfour-idp-v1/input')
+          total = 0
+
+          for name, expected_count in expected.items():
+              with (root / name).open(encoding='utf-8-sig', newline='') as f:
+                  rows = list(csv.DictReader(f))
+              if len(rows) != expected_count:
+                  raise RuntimeError(
+                      f'{name}: expected {expected_count} rows, found {len(rows)}'
+                  )
+              total += len(rows)
+
+          if total != 648:
+              raise RuntimeError(f'expected 648 total rows, found {total}')
+
+          print('PASS: frozen private input population is exactly 648 rows.')
+          PY
+
+      - name: Run current 4for4 pipeline on private real data
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/projections/fourforfour_projection_pipeline.py \
+            --dl /tmp/log-fourforfour-idp-v1/input/dl.csv \
+            --lb /tmp/log-fourforfour-idp-v1/input/lb.csv \
+            --db /tmp/log-fourforfour-idp-v1/input/db.csv \
+            --output-dir /tmp/log-fourforfour-idp-v1/output/private \
+            --public-summary /tmp/log-fourforfour-idp-v1/output/aggregate-summary.json \
+            > /tmp/log-fourforfour-idp-v1/output/pipeline.stdout.txt
+
+      - name: Build aggregate-only unresolved impact triage
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import math
+          import statistics
+          from collections import Counter, defaultdict
+          from pathlib import Path
+
+          private_dir = Path('/tmp/log-fourforfour-idp-v1/output/private')
+          norm_path = private_dir / 'fourforfour_2026_idp_normalized_private.json'
+          summary_path = Path('/tmp/log-fourforfour-idp-v1/output/aggregate-summary.json')
+
+          if not norm_path.exists():
+              raise RuntimeError(f'missing private normalized output: {norm_path}')
+          if not summary_path.exists():
+              raise RuntimeError(f'missing aggregate summary: {summary_path}')
+
+          normalized = json.loads(norm_path.read_text(encoding='utf-8'))
+          if isinstance(normalized, dict):
+              rows = normalized.get('rows') or normalized.get('players') or normalized.get('data')
+          else:
+              rows = normalized
+
+          if not isinstance(rows, list):
+              raise RuntimeError('unexpected normalized-private JSON shape')
+
+          summary = json.loads(summary_path.read_text(encoding='utf-8'))
+          if summary.get('research_only') is not True:
+              raise RuntimeError('research_only guard missing')
+          if summary.get('production_changes') is not False:
+              raise RuntimeError('production_changes guard failed')
+          if summary.get('row_level_provider_data_written_to_public_repo') is not False:
+              raise RuntimeError('row-level public-repo guard failed')
+
+          if len(rows) != 648:
+              raise RuntimeError(f'expected 648 normalized rows, found {len(rows)}')
+
+          SCORE_KEY = 'log_base_points_excluding_weekly_bonuses_and_blocked_kicks'
+          buckets = defaultdict(list)
+          for row in rows:
+              bucket = row.get('source_bucket')
+              if bucket not in {'DL', 'LB', 'DB'}:
+                  raise RuntimeError(f'unexpected source bucket: {bucket!r}')
+              ident = row.get('identity') or {}
+              score = row.get(SCORE_KEY)
+              if not isinstance(score, (int, float)) or not math.isfinite(float(score)):
+                  raise RuntimeError('missing/non-finite LOG base-points value')
+              buckets[bucket].append({
+                  'resolved': bool(ident.get('resolved')),
+                  'method': str(ident.get('match_method') or 'unknown'),
+                  'score': float(score),
+              })
+
+          def quantile(values, q):
+              if not values:
+                  return None
+              vals = sorted(values)
+              if len(vals) == 1:
+                  return vals[0]
+              pos = (len(vals) - 1) * q
+              lo = int(math.floor(pos))
+              hi = int(math.ceil(pos))
+              if lo == hi:
+                  return vals[lo]
+              return vals[lo] + (vals[hi] - vals[lo]) * (pos - lo)
+
+          def score_summary(values):
+              if not values:
+                  return {
+                      'count': 0,
+                      'mean': None,
+                      'median': None,
+                      'min': None,
+                      'max': None,
+                      'p25': None,
+                      'p75': None,
+                  }
+              return {
+                  'count': len(values),
+                  'mean': round(statistics.mean(values), 6),
+                  'median': round(statistics.median(values), 6),
+                  'min': round(min(values), 6),
+                  'max': round(max(values), 6),
+                  'p25': round(quantile(values, 0.25), 6),
+                  'p75': round(quantile(values, 0.75), 6),
+              }
+
+          overall_methods = Counter()
+          overall_bands = Counter()
+          bucket_output = {}
+
+          for bucket in ('DL', 'LB', 'DB'):
+              group = buckets[bucket]
+              ordered = sorted(group, key=lambda r: r['score'], reverse=True)
+              n = len(ordered)
+              top10_cut = max(1, math.ceil(n * 0.10))
+              top25_cut = max(top10_cut, math.ceil(n * 0.25))
+              top50_cut = max(top25_cut, math.ceil(n * 0.50))
+
+              unresolved = [r for r in ordered if not r['resolved']]
+              resolved = [r for r in ordered if r['resolved']]
+
+              method_counts = Counter(r['method'] for r in unresolved)
+              overall_methods.update(method_counts)
+
+              band_counts = Counter()
+              method_band_counts = defaultdict(Counter)
+
+              for idx, row in enumerate(ordered, start=1):
+                  if row['resolved']:
+                      continue
+                  if idx <= top10_cut:
+                      band = 'top_10_pct'
+                  elif idx <= top25_cut:
+                      band = '10_to_25_pct'
+                  elif idx <= top50_cut:
+                      band = '25_to_50_pct'
+                  else:
+                      band = 'bottom_50_pct'
+                  band_counts[band] += 1
+                  method_band_counts[row['method']][band] += 1
+                  overall_bands[band] += 1
+
+              bucket_output[bucket] = {
+                  'total_rows': n,
+                  'resolved_rows': len(resolved),
+                  'unresolved_rows': len(unresolved),
+                  'resolved_rate': round(len(resolved) / n, 6) if n else 0.0,
+                  'unresolved_match_methods': dict(sorted(method_counts.items())),
+                  'unresolved_rank_bands': {
+                      'top_10_pct': band_counts['top_10_pct'],
+                      '10_to_25_pct': band_counts['10_to_25_pct'],
+                      '25_to_50_pct': band_counts['25_to_50_pct'],
+                      'bottom_50_pct': band_counts['bottom_50_pct'],
+                  },
+                  'unresolved_method_by_rank_band': {
+                      method: {
+                          'top_10_pct': counts['top_10_pct'],
+                          '10_to_25_pct': counts['10_to_25_pct'],
+                          '25_to_50_pct': counts['25_to_50_pct'],
+                          'bottom_50_pct': counts['bottom_50_pct'],
+                      }
+                      for method, counts in sorted(method_band_counts.items())
+                  },
+                  'resolved_score_distribution': score_summary([r['score'] for r in resolved]),
+                  'unresolved_score_distribution': score_summary([r['score'] for r in unresolved]),
+                  'rank_band_row_cutoffs': {
+                      'top_10_pct_rows': top10_cut,
+                      'top_25_pct_rows': top25_cut,
+                      'top_50_pct_rows': top50_cut,
+                  },
+              }
+
+          identity = summary.get('identity') or {}
+          unresolved_total = identity.get('unresolved_rows')
+          if unresolved_total != 53:
+              raise RuntimeError(
+                  f'Phase 1B unresolved population changed: expected 53, got {unresolved_total}'
+              )
+
+          triage = {
+              'schema_version': 1,
+              'study': 'fourforfour-idp-v1-phase1c-identity-impact-triage',
+              'research_only': True,
+              'production_changes': False,
+              'private_row_level_output_persisted': False,
+              'input_total_rows': 648,
+              'resolved_rows': identity.get('resolved_rows'),
+              'unresolved_rows': unresolved_total,
+              'resolved_rate': identity.get('resolved_rate'),
+              'same_sleeper_id_divergent_row_collisions':
+                  identity.get('same_sleeper_id_divergent_row_collisions'),
+              'unresolved_match_methods': dict(sorted(overall_methods.items())),
+              'unresolved_rank_bands_overall': {
+                  'top_10_pct': overall_bands['top_10_pct'],
+                  '10_to_25_pct': overall_bands['10_to_25_pct'],
+                  '25_to_50_pct': overall_bands['25_to_50_pct'],
+                  'bottom_50_pct': overall_bands['bottom_50_pct'],
+              },
+              'buckets': bucket_output,
+              'interpretation_note': (
+                  'Rank bands are computed independently within DL/LB/DB from '
+                  'Trade Desk LOG base points. No player names, teams, Sleeper IDs, '
+                  'source row numbers, or row-level provider projections are emitted.'
+              ),
+          }
+
+          # Explicit privacy guard: only aggregate-safe keys may appear in the JSON.
+          forbidden_tokens = (
+              'source_player_name',
+              'source_team',
+              'sleeper_id',
+              'source_row_number',
+              'raw_category_season_totals',
+              'provider_ff_pts_reference_only',
+          )
+          rendered = json.dumps(triage, indent=2, sort_keys=True)
+          for token in forbidden_tokens:
+              if token in rendered:
+                  raise RuntimeError(f'aggregate triage leaked forbidden token: {token}')
+
+          out = Path('/tmp/log-fourforfour-idp-v1/output/phase1c-aggregate-triage.json')
+          out.write_text(rendered + '\n', encoding='utf-8')
+
+          print('PASS: Phase 1C aggregate-only identity impact triage complete.')
+          print(rendered)
+          PY
+
+      - name: Run repository regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/repo_regression_checks.py
+
+      - name: Prove triage made no repository changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git diff --quiet -- .; then
+            echo 'ERROR: Phase 1C triage modified tracked repository files.' >&2
+            git diff -- .
+            exit 1
+          fi
+          if ! git diff --cached --quiet -- .; then
+            echo 'ERROR: Phase 1C triage staged repository changes.' >&2
+            git diff --cached -- .
+            exit 1
+          fi
+          echo 'PASS: Phase 1C triage and regressions left the repository unchanged.'
+
+      - name: Destroy private 4for4 inputs and row-level outputs
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/log-fourforfour-idp-v1
+          echo 'PASS: private provider inputs and all row-level outputs removed from runner.'
