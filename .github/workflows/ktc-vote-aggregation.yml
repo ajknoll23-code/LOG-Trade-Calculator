@@ -1,13 +1,12 @@
 name: KTC Vote Aggregation
 
-# Manual fallback for KTC aggregation.
+# Manual end-to-end refresh/proof for the deployed Market Value V2 path.
 #
-# This workflow now refreshes:
-#   KTC ratings -> voter-balance research -> deployed league Market Value V1
-#   -> blended Market Value V2 shadow research.
+# Live KTC votes -> canonical KTC ratings -> voter-balance audit ->
+# deployed Market Value V2.
 #
-# Market Value V2 remains research-only and does not alter FV, Team Utility,
-# the live verdict, or the deployed Market Value V1 consumer.
+# This workflow does NOT alter Fundamental Value, Team Utility, Trade Verdict,
+# Market Edge preregistration/baseline, or any frozen prospective-study rules.
 on:
   workflow_dispatch:
 
@@ -18,30 +17,79 @@ concurrency:
   group: trade-desk-data-writes
   cancel-in-progress: false
 
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
 jobs:
   run-ktc-pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
-      - name: Check out repo
+      - name: Check out current main
         uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests
+        run: python3 -m pip install --disable-pip-version-check --no-cache-dir "requests>=2.32,<3"
+
+      - name: Guard clean tree and frozen research inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git branch --show-current)" = "main"
+          test -z "$(git status --porcelain --untracked-files=all)"
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          market = json.loads(
+              Path("scripts/artifacts/generated/market_values.json")
+              .read_text(encoding="utf-8")
+          )
+          assert market["method_version"] == "market-value-v2-balanced-blended-v1"
+          assert market["scale_semantics"] == "league_rank_quantile_mapped_to_trade_desk_points_v1"
+          assert len(market["players"]) >= 500
+
+          prereg = json.loads(
+              Path("research/market-edge-v1/market_edge_v1_preregistration.json")
+              .read_text(encoding="utf-8")
+          )
+          baseline = json.loads(
+              Path("research/market-edge-v1/market_edge_v1_baseline.json")
+              .read_text(encoding="utf-8")
+          )
+          assert prereg["study_id"] == "market-edge-v1-prospective"
+          assert baseline["study_id"] == "market-edge-v1-prospective"
+
+          print(
+              "PASS: deployed Market Value V2 present; "
+              f"{len(market['players'])} covered players."
+          )
+          PY
+
+          sha256sum             index.html             scripts/market/build_market_value.py             research/market-edge-v1/market_edge_v1_preregistration.json             research/market-edge-v1/market_edge_v1_baseline.json             > "${RUNNER_TEMP}/protected.sha256"
+
+          cp scripts/artifacts/generated/market_values.json             "${RUNNER_TEMP}/market_values.before.json"
+
+      - name: Preflight repository regression suite
+        run: python3 scripts/validation/repo_regression_checks.py
+
+      - name: Player-position map self-test
+        run: python3 scripts/utilities/generate_player_positions.py --selftest
 
       - name: Regenerate canonical player-position lookup
         run: python3 scripts/utilities/generate_player_positions.py
 
-      - name: Run KTC pipeline
+      - name: Refresh canonical KTC vote ratings
         run: python3 scripts/market/ktc_pipeline.py
 
       - name: KTC voter-balance analysis self-test
@@ -53,26 +101,202 @@ jobs:
       - name: Verify KTC voter-balance research analysis
         run: python3 scripts/market/analyze_ktc_voter_balance.py --check
 
-      - name: Market Value V1 self-test
+      - name: Market Value V2 builder self-test
         run: python3 scripts/market/build_market_value.py --selftest
 
-      - name: Rebuild deployed league Market Value V1
+      - name: Rebuild deployed Market Value V2 from live votes
         run: python3 scripts/market/build_market_value.py --write
 
-      - name: Market Value V2 shadow self-test
-        run: python3 scripts/market/build_market_value_v2_shadow.py --selftest
-
-      - name: Build blended Market Value V2 shadow
-        run: python3 scripts/market/build_market_value_v2_shadow.py --write
-
-      - name: Verify Market Value V2 shadow
-        run: python3 scripts/market/build_market_value_v2_shadow.py --check
-
-      - name: Commit results back to repo
+      - name: Verify deployed Market Value V2 operational refresh
         shell: bash
         run: |
+          set -euo pipefail
+          mkdir -p research/market-value-v2
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          before_path = Path(os.environ["RUNNER_TEMP"]) / "market_values.before.json"
+          after_path = Path("scripts/artifacts/generated/market_values.json")
+
+          before = json.loads(before_path.read_text(encoding="utf-8"))
+          after = json.loads(after_path.read_text(encoding="utf-8"))
+
+          expected_method = "market-value-v2-balanced-blended-v1"
+          expected_scale = "league_rank_quantile_mapped_to_trade_desk_points_v1"
+
+          assert after["schema_version"] == 1
+          assert after["method_version"] == expected_method
+          assert after["scale_semantics"] == expected_scale
+
+          source = after.get("source") or {}
+          quality = after.get("market_quality") or {}
+          counts = after.get("counts") or {}
+          policy = after.get("policy") or {}
+          players = after.get("players") or {}
+
+          assert source.get("mode") == "live_sheet", source
+          assert isinstance(source.get("sheet_url"), str) and source["sheet_url"]
+          assert len(players) >= 500
+          assert counts.get("resolved_market_players") == len(players)
+          assert int(quality.get("raw_votes") or 0) > 0
+          assert float(quality.get("total_effective_votes") or 0) > 0
+
+          assert float(policy["league_group_multiplier"]) == 1.0
+          assert float(policy["guest_group_multiplier"]) == 0.5
+          assert float(policy["per_voter_effective_lifetime_cap"]) == 30.0
+          assert policy["package_vote_rows"] == "excluded before market processing"
+
+          for key, row in players.items():
+              assert row["market_value"] >= 0, key
+              assert row["fundamental_value"] >= 0, key
+              pct = float(row["market_percentile"])
+              assert 0.0 <= pct <= 1.0, key
+
+          def sha(path: Path) -> str:
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          before_sha = sha(before_path)
+          after_sha = sha(after_path)
+
+          result = {
+              "schema_version": 1,
+              "study_id": "market-value-v2-operational-refresh-proof",
+              "decision": "PASS_MARKET_VALUE_V2_LIVE_REFRESH_OPERATIONAL_PROOF",
+              "generated_at_utc":
+                  datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+              "production_method_version": after["method_version"],
+              "scale_semantics": after["scale_semantics"],
+              "source_mode": source["mode"],
+              "raw_sheet_row_count": source.get("raw_sheet_row_count"),
+              "package_rows_excluded": source.get("package_rows_excluded"),
+              "raw_votes_after_daily_cap": quality.get("raw_votes"),
+              "league_raw_votes": quality.get("league_raw_votes"),
+              "guest_raw_votes": quality.get("guest_raw_votes"),
+              "total_effective_votes": quality.get("total_effective_votes"),
+              "league_effective_votes": quality.get("league_effective_votes"),
+              "guest_effective_votes": quality.get("guest_effective_votes"),
+              "largest_effective_voter_share_pct":
+                  quality.get("largest_effective_voter_share_pct"),
+              "resolved_market_players": len(players),
+              "market_coverage_pct_of_model":
+                  counts.get("market_coverage_pct_of_model"),
+              "before_market_values_sha256": before_sha,
+              "after_market_values_sha256": after_sha,
+              "artifact_bytes_changed": before_sha != after_sha,
+              "before_generated_at_utc": before.get("generated_at_utc"),
+              "after_generated_at_utc": after.get("generated_at_utc"),
+              "market_edge_preregistration_changed": False,
+              "market_edge_baseline_changed": False,
+              "fundamental_value_changed_by_this_workflow": False,
+              "team_utility_changed_by_this_workflow": False,
+              "trade_verdict_changed_by_this_workflow": False,
+              "obsolete_v2_shadow_builder_run": False,
+          }
+
+          out_json = Path(
+              "research/market-value-v2/"
+              "market_value_v2_operational_refresh_confirmation.json"
+          )
+          out_md = Path(
+              "research/market-value-v2/"
+              "market_value_v2_operational_refresh_confirmation.md"
+          )
+
+          out_json.write_text(
+              json.dumps(result, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          out_md.write_text(
+              "\n".join([
+                  "# Market Value V2 — Live Refresh Operational Proof",
+                  "",
+                  f"**Decision:** `{result['decision']}`",
+                  "",
+                  f"- Method: `{result['production_method_version']}`",
+                  f"- Source mode: `{result['source_mode']}`",
+                  f"- Covered players: **{result['resolved_market_players']}**",
+                  f"- Raw votes after daily cap: **{result['raw_votes_after_daily_cap']}**",
+                  f"- Effective votes: **{result['total_effective_votes']}**",
+                  f"- Largest effective voter share: **{result['largest_effective_voter_share_pct']}%**",
+                  f"- Artifact bytes changed: **{'YES' if result['artifact_bytes_changed'] else 'NO'}**",
+                  "- Frozen Market Edge preregistration changed: **NO**",
+                  "- Frozen Market Edge baseline changed: **NO**",
+                  "- Fundamental Value changed by this workflow: **NO**",
+                  "- Team Utility changed by this workflow: **NO**",
+                  "- Trade Verdict changed by this workflow: **NO**",
+                  "- Obsolete V2 shadow builder executed: **NO**",
+              ]).rstrip() + "\n",
+              encoding="utf-8",
+          )
+
+          print(json.dumps(result, indent=2, sort_keys=True))
+          PY
+
+          cat research/market-value-v2/market_value_v2_operational_refresh_confirmation.md
+
+      - name: Prove frozen studies and production model logic unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum -c "${RUNNER_TEMP}/protected.sha256"
+          echo "PASS: Market Edge frozen baseline/preregistration and core model files unchanged."
+
+      - name: Post-refresh repository regression suite
+        run: python3 scripts/validation/repo_regression_checks.py
+
+      - name: Verify exact refresh scope
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import subprocess
+
+          allowed = {
+              "scripts/artifacts/generated/ktc_ratings.json",
+              "scripts/artifacts/generated/player_positions.json",
+              "scripts/artifacts/generated/ktc_voter_balance_analysis.json",
+              "scripts/artifacts/reports/ktc_voter_balance_analysis.md",
+              "scripts/artifacts/generated/market_values.json",
+              "scripts/artifacts/reports/market_value_report.md",
+              "research/market-value-v2/market_value_v2_operational_refresh_confirmation.json",
+              "research/market-value-v2/market_value_v2_operational_refresh_confirmation.md",
+          }
+
+          actual = {
+              line[3:]
+              for line in subprocess.check_output(
+                  ["git", "status", "--porcelain", "--untracked-files=all"],
+                  text=True,
+              ).splitlines()
+              if line.strip()
+          }
+
+          unexpected = actual - allowed
+          if unexpected:
+              raise SystemExit(
+                  "Unexpected KTC/Market Value V2 refresh changes: "
+                  + ", ".join(sorted(unexpected))
+              )
+
+          print("PASS: exact KTC + deployed Market Value V2 refresh scope.")
+          PY
+
+          git diff --check
+
+      - name: Commit refreshed KTC and deployed Market Value V2
+        shell: bash
+        run: |
+          set -euo pipefail
+
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add scripts/artifacts/generated/ktc_ratings.json
           git add scripts/artifacts/generated/player_positions.json
@@ -80,14 +304,22 @@ jobs:
           git add scripts/artifacts/reports/ktc_voter_balance_analysis.md
           git add scripts/artifacts/generated/market_values.json
           git add scripts/artifacts/reports/market_value_report.md
-          git add research/market-value-v2/market_value_v2_shadow.json
-          git add research/market-value-v2/market_value_v2_shadow.md
+          git add research/market-value-v2/market_value_v2_operational_refresh_confirmation.json
+          git add research/market-value-v2/market_value_v2_operational_refresh_confirmation.md
 
-          if git diff --staged --quiet; then
-            echo "No KTC/Market Value changes."
+          if git diff --cached --quiet; then
+            echo "No KTC/Market Value V2 changes to commit."
             exit 0
           fi
 
-          git commit -m "Update KTC and blended market value research"
+          git diff --cached --check
+          git commit -m "Refresh live KTC and deployed Market Value V2"
           git pull --rebase origin main
           git push origin main
+
+      - name: Final clean-tree proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain --untracked-files=all)"
+          echo "PASS: KTC Vote Aggregation -> deployed Market Value V2 operational path is clean."
