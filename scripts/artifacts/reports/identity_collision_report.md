@@ -3,8 +3,8 @@
 Production resolver covering QB / RB / WR / TE / DL / LB / DB.
 
 - FantasyPros tracked rows: **1083**
-- Authoritative stable-ID matches: **963**
-- Manual-review rows: **22**
+- Authoritative stable-ID matches: **966**
+- Manual-review rows: **19**
 
 ## Coverage by position
 
@@ -15,15 +15,16 @@ Production resolver covering QB / RB / WR / TE / DL / LB / DB.
 | WR | 203 | 176 | 86.7% | 184 | 8 |
 | TE | 130 | 120 | 92.3% | 125 | 5 |
 | DL | 177 | 159 | 89.8% | 159 | 0 |
-| LB | 159 | 143 | 89.9% | 144 | 4 |
-| DB | 202 | 174 | 86.1% | 174 | 1 |
+| LB | 159 | 145 | 91.2% | 146 | 2 |
+| DB | 202 | 175 | 86.6% | 175 | 0 |
 
 ## Match methods
 
 - `name_collision_resolved_by_position_team`: **4**
-- `name_found_position_incompatible`: **4**
+- `name_found_position_incompatible`: **1**
 - `name_position_team_confirmed`: **949**
 - `no_sleeper_name_candidate`: **98**
+- `phase5_explicit_evidence_backed_position_override`: **3**
 - `previous_authoritative_stable_id_preserved`: **9**
 - `previous_authoritative_stable_id_preserved_position_changed`: **1**
 - `unique_name_position_team_unavailable`: **18**
@@ -51,8 +52,5 @@ These remain deliberately unresolved; downstream consumers must use existing fal
 | John FitzPatrick | TE |  | 8500 |  | unique_name_position_team_unavailable |
 | Jack Stoll | TE |  | 7946 |  | unique_name_position_team_unavailable |
 | Devin Culp | TE |  | 11820 | TB | unique_name_position_team_unavailable |
-| Austin Booker | LB | CHI |  |  | name_found_position_incompatible |
 | Jonah Elliss | LB | DEN |  |  | name_found_position_incompatible |
-| Gabe Jacas | LB | NE |  |  | name_found_position_incompatible |
-| Kendal Daniels | DB | ATL |  |  | name_found_position_incompatible |
 | Elandon Roberts | LB |  | 3369 |  | unique_name_position_team_unavailable |
