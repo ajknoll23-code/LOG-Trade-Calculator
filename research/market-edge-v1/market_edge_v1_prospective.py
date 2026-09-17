@@ -1,0 +1,1060 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+from statistics import mean
+
+ROOT = Path(__file__).resolve().parents[2]
+OUTDIR = Path(__file__).resolve().parent
+
+PREREG = OUTDIR / "market_edge_v1_preregistration.json"
+BASELINE = OUTDIR / "market_edge_v1_baseline.json"
+BASELINE_MD = OUTDIR / "market_edge_v1_baseline.md"
+EVAL = OUTDIR / "market_edge_v1_evaluation.json"
+EVAL_MD = OUTDIR / "market_edge_v1_evaluation.md"
+MANIFEST = OUTDIR / "market_edge_v1_manifest.json"
+
+MARKET = ROOT / "scripts/artifacts/generated/market_values.json"
+OUTCOMES = ROOT / "research/model-history/outcomes/2026.json"
+SNAPSHOT_DIR = ROOT / "research/model-history/snapshots"
+
+MV2_METHOD = "market-value-v2-balanced-blended-v1"
+POSITIONS = ("QB", "RB", "WR", "TE", "DL", "LB", "DB")
+
+
+def sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def read(path: Path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def parse_utc(value: str) -> datetime:
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def rankdata(values: list[float]) -> list[float]:
+    indexed = sorted(enumerate(values), key=lambda x: x[1])
+    ranks = [0.0] * len(values)
+    i = 0
+    while i < len(indexed):
+        j = i + 1
+        while (
+            j < len(indexed)
+            and indexed[j][1] == indexed[i][1]
+        ):
+            j += 1
+        avg_rank = (i + 1 + j) / 2.0
+        for k in range(i, j):
+            ranks[indexed[k][0]] = avg_rank
+        i = j
+    return ranks
+
+
+def percentile_scores(values: list[float]) -> list[float]:
+    if not values:
+        return []
+    if len(values) == 1:
+        return [0.5]
+    ranks = rankdata(values)
+    return [
+        (rank - 1.0) / (len(values) - 1.0)
+        for rank in ranks
+    ]
+
+
+def pearson(xs: list[float], ys: list[float]):
+    if len(xs) != len(ys) or len(xs) < 2:
+        return None
+    mx = sum(xs) / len(xs)
+    my = sum(ys) / len(ys)
+    vx = sum((x - mx) ** 2 for x in xs)
+    vy = sum((y - my) ** 2 for y in ys)
+    if vx <= 1e-15 or vy <= 1e-15:
+        return None
+    return (
+        sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+        / math.sqrt(vx * vy)
+    )
+
+
+def spearman(xs: list[float], ys: list[float]):
+    if len(xs) != len(ys) or len(xs) < 2:
+        return None
+    return pearson(rankdata(xs), rankdata(ys))
+
+
+def classify(gap: float, prereg: dict) -> str:
+    c = prereg["cohorts"]
+    if gap >= float(c["strong_buy_threshold"]):
+        return "strong_buy"
+    if gap >= float(c["buy_threshold"]):
+        return "buy"
+    if gap <= float(c["strong_sell_threshold"]):
+        return "strong_sell"
+    if gap <= float(c["sell_threshold"]):
+        return "sell"
+    return "neutral"
+
+
+def position_percentiles(
+    players: dict[str, dict],
+    field: str,
+) -> dict[str, float]:
+    by_pos = defaultdict(list)
+    for key, row in players.items():
+        pos = str(row.get("pos") or "")
+        if pos not in POSITIONS:
+            continue
+        value = row.get(field)
+        if value is None:
+            continue
+        by_pos[pos].append((key, float(value)))
+
+    out = {}
+    for pos, rows in by_pos.items():
+        values = [v for _, v in rows]
+        pcts = percentile_scores(values)
+        for (key, _), pct in zip(rows, pcts):
+            out[key] = pct
+    return out
+
+
+def initialize() -> None:
+    prereg = read(PREREG)
+
+    if BASELINE.exists():
+        baseline = read(BASELINE)
+        if (
+            baseline["preregistration_sha256"]
+            != sha(PREREG)
+        ):
+            raise RuntimeError(
+                "Existing Market Edge baseline prereg hash drifted"
+            )
+        print(
+            "Market Edge V1 baseline already frozen; "
+            "initialization is idempotent."
+        )
+        return
+
+    market = read(MARKET)
+    if market.get("method_version") != MV2_METHOD:
+        raise RuntimeError("Market Value V2 is not deployed")
+
+    players = market.get("players") or {}
+    if len(players) < 500:
+        raise RuntimeError("Market Value V2 coverage below 500")
+
+    keys = sorted(
+        key for key, row in players.items()
+        if row.get("fundamental_value") is not None
+        and row.get("market_percentile") is not None
+        and str(row.get("pos") or "") in POSITIONS
+    )
+    if len(keys) < 500:
+        raise RuntimeError(
+            f"Eligible Market Edge baseline below 500: {len(keys)}"
+        )
+
+    fv_values = [
+        float(players[k]["fundamental_value"])
+        for k in keys
+    ]
+    fv_pcts = percentile_scores(fv_values)
+    fv_pct = dict(zip(keys, fv_pcts))
+
+    pos_fv_pct = position_percentiles(
+        {k: players[k] for k in keys},
+        "fundamental_value",
+    )
+
+    # Market percentile already has "higher is better" semantics.
+    # Build a within-position equivalent from market_value.
+    pos_market_pct = position_percentiles(
+        {k: players[k] for k in keys},
+        "market_value",
+    )
+
+    outcomes = read(OUTCOMES)
+    completed_weeks = sorted(
+        int(w) for w in (outcomes.get("weeks") or {})
+        if str(w).isdigit()
+    )
+    baseline_nfl_week = (
+        max(completed_weeks) if completed_weeks else 0
+    )
+
+    rows = {}
+    cohort_counts = defaultdict(int)
+    pos_counts = defaultdict(int)
+
+    for key in keys:
+        row = players[key]
+        global_gap = (
+            float(fv_pct[key])
+            - float(row["market_percentile"])
+        )
+        position_gap = (
+            float(pos_fv_pct[key])
+            - float(pos_market_pct[key])
+        )
+        cohort = classify(global_gap, prereg)
+        cohort_counts[cohort] += 1
+        pos_counts[str(row["pos"])] += 1
+
+        rows[key] = {
+            "pos": row["pos"],
+            "fundamental_value": int(
+                row["fundamental_value"]
+            ),
+            "market_value": int(row["market_value"]),
+            "fv_percentile": round(fv_pct[key], 8),
+            "market_percentile": round(
+                float(row["market_percentile"]), 8
+            ),
+            "global_gap": round(global_gap, 8),
+            "cohort": cohort,
+            "position_fv_percentile": round(
+                pos_fv_pct[key], 8
+            ),
+            "position_market_percentile": round(
+                pos_market_pct[key], 8
+            ),
+            "position_gap": round(position_gap, 8),
+        }
+
+    now = datetime.now(timezone.utc)
+    baseline = {
+        "schema_version": 1,
+        "study_id": "market-edge-v1-prospective",
+        "status": "BASELINE_FROZEN",
+        "captured_at_utc":
+            now.isoformat().replace("+00:00", "Z"),
+        "preregistration_sha256": sha(PREREG),
+        "market_values_sha256": sha(MARKET),
+        "outcomes_sha256_at_baseline": sha(OUTCOMES),
+        "market_method_version": market["method_version"],
+        "market_policy_sha256": market.get("policy_sha256"),
+        "baseline_nfl_week": baseline_nfl_week,
+        "eligible_player_count": len(rows),
+        "cohort_counts": dict(
+            sorted(cohort_counts.items())
+        ),
+        "position_counts": dict(sorted(pos_counts.items())),
+        "players": rows,
+    }
+    BASELINE.write_text(
+        json.dumps(
+            baseline,
+            indent=2,
+            sort_keys=True,
+        ) + "\n",
+        encoding="utf-8",
+    )
+
+    buys = sorted(
+        (
+            (k, r)
+            for k, r in rows.items()
+            if r["global_gap"] >= 0.10
+        ),
+        key=lambda kv: (-kv[1]["global_gap"], kv[0]),
+    )
+    sells = sorted(
+        (
+            (k, r)
+            for k, r in rows.items()
+            if r["global_gap"] <= -0.10
+        ),
+        key=lambda kv: (kv[1]["global_gap"], kv[0]),
+    )
+
+    lines = [
+        "# Market Edge V1 — Frozen Prospective Baseline",
+        "",
+        "**RESEARCH ONLY. These are hypotheses, not trade recommendations.**",
+        "",
+        f"- Baseline players: **{len(rows)}**",
+        f"- Baseline NFL completed week: **{baseline_nfl_week}**",
+        f"- Market method: `{market['method_version']}`",
+        "",
+        "## Cohorts",
+        "",
+    ]
+    for cohort, count in sorted(
+        cohort_counts.items()
+    ):
+        lines.append(
+            f"- `{cohort}`: **{count}**"
+        )
+
+    lines += [
+        "",
+        "## Largest FV-over-market gaps",
+        "",
+        "| Player | Pos | FV | Market | Gap |",
+        "|---|---|---:|---:|---:|",
+    ]
+    for key, r in buys[:25]:
+        lines.append(
+            f"| {key} | {r['pos']} | "
+            f"{r['fundamental_value']} | "
+            f"{r['market_value']} | "
+            f"{r['global_gap']:+.3f} |"
+        )
+
+    lines += [
+        "",
+        "## Largest market-over-FV gaps",
+        "",
+        "| Player | Pos | FV | Market | Gap |",
+        "|---|---|---:|---:|---:|",
+    ]
+    for key, r in sells[:25]:
+        lines.append(
+            f"| {key} | {r['pos']} | "
+            f"{r['fundamental_value']} | "
+            f"{r['market_value']} | "
+            f"{r['global_gap']:+.3f} |"
+        )
+
+    lines += [
+        "",
+        "The baseline is frozen. Future results cannot "
+        "change these cohorts, thresholds, or signals.",
+        "",
+    ]
+    BASELINE_MD.write_text(
+        "\n".join(lines),
+        encoding="utf-8",
+    )
+    print(
+        f"Market Edge V1 baseline frozen: {len(rows)} players."
+    )
+
+
+def eligible_future_snapshots(
+    baseline: dict,
+    prereg: dict,
+) -> list[dict]:
+    if not SNAPSHOT_DIR.exists():
+        return []
+
+    origin = parse_utc(baseline["captured_at_utc"])
+    candidates = []
+
+    for path in sorted(SNAPSHOT_DIR.glob("*.json")):
+        try:
+            snap = read(path)
+        except Exception:
+            continue
+        if snap.get("refresh_mode") != "full":
+            continue
+
+        mv = (
+            (snap.get("sources") or {})
+            .get("market_value") or {}
+        )
+        if mv.get("method_version") != MV2_METHOD:
+            continue
+
+        captured = snap.get("captured_at_utc")
+        if not captured:
+            continue
+        dt = parse_utc(captured)
+        if dt <= origin:
+            continue
+
+        candidates.append({
+            "path": path,
+            "snapshot": snap,
+            "captured_at_utc": captured,
+            "elapsed_days":
+                (dt - origin).total_seconds() / 86400.0,
+        })
+
+    return candidates
+
+
+def select_snapshot(
+    candidates: list[dict],
+    target_days: int,
+    tolerance_days: int,
+):
+    eligible = [
+        c for c in candidates
+        if abs(c["elapsed_days"] - target_days)
+        <= tolerance_days
+    ]
+    if not eligible:
+        return None
+    eligible.sort(
+        key=lambda c: (
+            abs(c["elapsed_days"] - target_days),
+            -parse_utc(
+                c["captured_at_utc"]
+            ).timestamp(),
+        )
+    )
+    return eligible[0]
+
+
+def directional_accuracy(
+    origin_rows: dict,
+    future_change: dict[str, float],
+    threshold: float,
+):
+    comparable = 0
+    correct = 0
+    for key, change in future_change.items():
+        gap = float(origin_rows[key]["global_gap"])
+        if abs(gap) < threshold or change == 0:
+            continue
+        comparable += 1
+        if (gap > 0) == (change > 0):
+            correct += 1
+    return (
+        correct / comparable if comparable else None,
+        comparable,
+    )
+
+
+def market_horizon_result(
+    baseline: dict,
+    chosen: dict,
+    prereg: dict,
+) -> dict:
+    origin_rows = baseline["players"]
+    future_mv = (
+        (chosen["snapshot"].get("sources") or {})
+        .get("market_value") or {}
+    )
+    future_players = future_mv.get("players") or {}
+
+    common = sorted(
+        set(origin_rows) & set(future_players)
+    )
+    gaps = []
+    changes = []
+    meanrev = []
+    future_change = {}
+
+    by_pos = defaultdict(
+        lambda: {"gaps": [], "changes": []}
+    )
+
+    for key in common:
+        future_pct = future_players[key].get(
+            "market_percentile"
+        )
+        if future_pct is None:
+            continue
+        origin = origin_rows[key]
+        change = (
+            float(future_pct)
+            - float(origin["market_percentile"])
+        )
+        gap = float(origin["global_gap"])
+        gaps.append(gap)
+        changes.append(change)
+        meanrev.append(
+            0.5 - float(origin["market_percentile"])
+        )
+        future_change[key] = change
+
+        pos = str(origin["pos"])
+        by_pos[pos]["gaps"].append(gap)
+        by_pos[pos]["changes"].append(change)
+
+    signal_rho = spearman(gaps, changes)
+    benchmark_rho = spearman(meanrev, changes)
+    incremental = (
+        signal_rho - benchmark_rho
+        if (
+            signal_rho is not None
+            and benchmark_rho is not None
+        )
+        else None
+    )
+
+    threshold = float(
+        prereg["cohorts"]["buy_threshold"]
+    )
+    directional, comparable = directional_accuracy(
+        origin_rows,
+        future_change,
+        threshold,
+    )
+
+    buys = [
+        change
+        for key, change in future_change.items()
+        if float(origin_rows[key]["global_gap"])
+        >= threshold
+    ]
+    sells = [
+        change
+        for key, change in future_change.items()
+        if float(origin_rows[key]["global_gap"])
+        <= -threshold
+    ]
+    spread = (
+        mean(buys) - mean(sells)
+        if buys and sells else None
+    )
+
+    position_results = {}
+    positive_positions = 0
+    for pos in POSITIONS:
+        d = by_pos.get(pos) or {
+            "gaps": [],
+            "changes": [],
+        }
+        n = len(d["gaps"])
+        rho = (
+            spearman(d["gaps"], d["changes"])
+            if n >= 25 else None
+        )
+        if rho is not None and rho > 0:
+            positive_positions += 1
+        position_results[pos] = {
+            "n": n,
+            "spearman": rho,
+        }
+
+    return {
+        "future_snapshot_file":
+            chosen["path"].name,
+        "future_captured_at_utc":
+            chosen["captured_at_utc"],
+        "elapsed_days": round(
+            chosen["elapsed_days"], 3
+        ),
+        "common_players": len(future_change),
+        "gap_change_spearman": signal_rho,
+        "mean_reversion_spearman": benchmark_rho,
+        "incremental_spearman_vs_mean_reversion":
+            incremental,
+        "directional_accuracy": directional,
+        "directional_comparable_players": comparable,
+        "buy_count": len(buys),
+        "sell_count": len(sells),
+        "buy_mean_future_change":
+            mean(buys) if buys else None,
+        "sell_mean_future_change":
+            mean(sells) if sells else None,
+        "buy_minus_sell_mean_change": spread,
+        "positions_with_positive_spearman":
+            positive_positions,
+        "position_results": position_results,
+    }
+
+
+def future_production_result(
+    baseline: dict,
+    horizon_weeks: int,
+):
+    outcomes = read(OUTCOMES)
+    weeks = outcomes.get("weeks") or {}
+    start = int(baseline["baseline_nfl_week"]) + 1
+    needed = list(
+        range(start, start + horizon_weeks)
+    )
+    if not all(str(w) in weeks for w in needed):
+        return {
+            "status": "pending",
+            "needed_weeks": needed,
+            "available_weeks": sorted(
+                int(w)
+                for w in weeks
+                if str(w).isdigit()
+            ),
+        }
+
+    totals = defaultdict(float)
+    for week in needed:
+        seen = set()
+        for row in (
+            weeks[str(week)].get("players") or []
+        ):
+            keys = row.get("model_keys") or []
+            points = float(
+                row.get("fantasy_points") or 0.0
+            )
+            for key in keys:
+                if key in baseline["players"]:
+                    totals[key] += points
+                    seen.add(key)
+        # Missing players implicitly remain at zero.
+
+    by_pos = defaultdict(list)
+    for key, origin in baseline["players"].items():
+        pos = str(origin["pos"])
+        by_pos[pos].append(
+            (key, float(totals.get(key, 0.0)))
+        )
+
+    prod_pct = {}
+    for pos, rows in by_pos.items():
+        vals = [v for _, v in rows]
+        pcts = percentile_scores(vals)
+        for (key, _), pct in zip(rows, pcts):
+            prod_pct[key] = pct
+
+    x = []
+    y = []
+    by_pos_result = {}
+    for pos in POSITIONS:
+        px = []
+        py = []
+        for key, origin in baseline["players"].items():
+            if origin["pos"] != pos:
+                continue
+            if key not in prod_pct:
+                continue
+            gap = float(origin["position_gap"])
+            surprise = (
+                float(prod_pct[key])
+                - float(
+                    origin[
+                        "position_market_percentile"
+                    ]
+                )
+            )
+            x.append(gap)
+            y.append(surprise)
+            px.append(gap)
+            py.append(surprise)
+        by_pos_result[pos] = {
+            "n": len(px),
+            "spearman":
+                spearman(px, py)
+                if len(px) >= 20 else None,
+        }
+
+    return {
+        "status": "evaluated",
+        "weeks": needed,
+        "n": len(x),
+        "position_gap_to_production_surprise_spearman":
+            spearman(x, y),
+        "position_results": by_pos_result,
+    }
+
+
+def evaluate() -> None:
+    prereg = read(PREREG)
+    baseline = read(BASELINE)
+
+    if (
+        baseline["preregistration_sha256"]
+        != sha(PREREG)
+    ):
+        raise RuntimeError(
+            "Market Edge preregistration changed "
+            "after baseline freeze"
+        )
+
+    candidates = eligible_future_snapshots(
+        baseline, prereg
+    )
+    horizons = {}
+    horizon_config = prereg[
+        "prospective_horizons"
+    ]
+
+    for label, cfg in horizon_config.items():
+        chosen = select_snapshot(
+            candidates,
+            int(cfg["target_days"]),
+            int(cfg["tolerance_days"]),
+        )
+        if chosen is None:
+            horizons[label] = {
+                "status": "pending",
+                "target_days":
+                    int(cfg["target_days"]),
+                "tolerance_days":
+                    int(cfg["tolerance_days"]),
+            }
+        else:
+            horizons[label] = {
+                "status": "evaluated",
+                **market_horizon_result(
+                    baseline,
+                    chosen,
+                    prereg,
+                ),
+            }
+
+    production = {
+        "2w": future_production_result(
+            baseline, 2
+        ),
+        "4w": future_production_result(
+            baseline, 4
+        ),
+    }
+
+    primary = horizons["4w_primary"]
+    gates = None
+
+    if primary["status"] == "evaluated":
+        g = prereg["four_week_hard_gates"]
+        gates = {
+            "minimum_common_players":
+                primary["common_players"]
+                >= int(g["minimum_common_players"]),
+            "minimum_gap_change_spearman":
+                primary["gap_change_spearman"]
+                is not None
+                and primary[
+                    "gap_change_spearman"
+                ] >= float(
+                    g[
+                        "minimum_gap_change_spearman"
+                    ]
+                ),
+            "minimum_incremental_spearman_vs_mean_reversion":
+                primary[
+                    "incremental_spearman_vs_mean_reversion"
+                ] is not None
+                and primary[
+                    "incremental_spearman_vs_mean_reversion"
+                ] >= float(
+                    g[
+                        "minimum_incremental_spearman_vs_mean_reversion"
+                    ]
+                ),
+            "minimum_directional_accuracy":
+                primary["directional_accuracy"]
+                is not None
+                and primary[
+                    "directional_accuracy"
+                ] >= float(
+                    g[
+                        "minimum_directional_accuracy"
+                    ]
+                ),
+            "minimum_directional_comparable_players":
+                primary[
+                    "directional_comparable_players"
+                ] >= int(
+                    g[
+                        "minimum_directional_comparable_players"
+                    ]
+                ),
+            "minimum_buy_minus_sell_mean_change":
+                primary[
+                    "buy_minus_sell_mean_change"
+                ] is not None
+                and primary[
+                    "buy_minus_sell_mean_change"
+                ] >= float(
+                    g[
+                        "minimum_buy_minus_sell_mean_change"
+                    ]
+                ),
+            "minimum_positions_with_positive_spearman":
+                primary[
+                    "positions_with_positive_spearman"
+                ] >= int(
+                    g[
+                        "minimum_positions_with_positive_spearman"
+                    ]
+                ),
+        }
+        decision = (
+            "ACTIONABLE_FOR_MARKET_EDGE_V1_SHADOW"
+            if all(gates.values())
+            else
+            "HOLD_MARKET_EDGE_V1_NO_VALIDATED_EDGE"
+        )
+    else:
+        decision = (
+            "COLLECTING_PROSPECTIVE_MARKET_EDGE_V1"
+        )
+
+    result = {
+        "schema_version": 1,
+        "study_id": "market-edge-v1-prospective",
+        "status":
+            "PROSPECTIVE_EVALUATION_CURRENT",
+        "decision": decision,
+        "generated_at_utc":
+            datetime.now(timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z"),
+        "research_only": True,
+        "production_change_authorized": False,
+        "baseline_captured_at_utc":
+            baseline["captured_at_utc"],
+        "baseline_player_count":
+            baseline["eligible_player_count"],
+        "horizons": horizons,
+        "secondary_realized_production":
+            production,
+        "four_week_hard_gates": gates,
+        "next_step_rule": (
+            "Only ACTIONABLE_FOR_MARKET_EDGE_V1_SHADOW "
+            "permits a separate shadow implementation. "
+            "COLLECTING waits for the frozen target window. "
+            "HOLD closes this exact signal without tuning "
+            "against the spent prospective evidence."
+        ),
+    }
+    EVAL.write_text(
+        json.dumps(
+            result,
+            indent=2,
+            sort_keys=True,
+        ) + "\n",
+        encoding="utf-8",
+    )
+
+    lines = [
+        "# Market Edge V1 — Prospective Evaluation",
+        "",
+        f"**Decision:** `{decision}`",
+        "",
+        f"- Baseline players: **{baseline['eligible_player_count']}**",
+        f"- Baseline: **{baseline['captured_at_utc']}**",
+        "",
+        "## Market-movement horizons",
+        "",
+        "| Horizon | Status | N | Gap→change ρ | Mean-reversion ρ | Incremental Δ | Directional | Buy−sell spread |",
+        "|---|---|---:|---:|---:|---:|---:|---:|",
+    ]
+
+    for label in (
+        "1w_diagnostic",
+        "2w_supportive",
+        "4w_primary",
+    ):
+        row = horizons[label]
+        if row["status"] != "evaluated":
+            lines.append(
+                f"| {label} | pending | — | — | — | — | — | — |"
+            )
+            continue
+
+        def fmt(v, digits=3):
+            return (
+                "—"
+                if v is None
+                else f"{v:.{digits}f}"
+            )
+
+        lines.append(
+            f"| {label} | evaluated | "
+            f"{row['common_players']} | "
+            f"{fmt(row['gap_change_spearman'])} | "
+            f"{fmt(row['mean_reversion_spearman'])} | "
+            f"{fmt(row['incremental_spearman_vs_mean_reversion'])} | "
+            f"{fmt(row['directional_accuracy'])} | "
+            f"{fmt(row['buy_minus_sell_mean_change'])} |"
+        )
+
+    if gates is not None:
+        lines += [
+            "",
+            "## Frozen 4-week hard gates",
+            "",
+        ]
+        for gate, passed in gates.items():
+            lines.append(
+                f"- `{gate}`: "
+                f"**{'PASS' if passed else 'FAIL'}**"
+            )
+
+    lines += [
+        "",
+        "## Secondary realized-production test",
+        "",
+        "This is descriptive only and cannot rescue a "
+        "failed market-movement result.",
+        "",
+    ]
+    for label, row in production.items():
+        if row["status"] == "evaluated":
+            rho = row[
+                "position_gap_to_production_surprise_spearman"
+            ]
+            rho_text = (
+                "—" if rho is None
+                else f"{rho:.3f}"
+            )
+            lines.append(
+                f"- {label}: n={row['n']}, "
+                f"position-gap→production-surprise "
+                f"Spearman **{rho_text}**"
+            )
+        else:
+            lines.append(
+                f"- {label}: **pending** "
+                f"(needs weeks {row['needed_weeks']})"
+            )
+
+    lines += [
+        "",
+        "## Governance",
+        "",
+        "- No thresholds or gates are re-fit from these results.",
+        "- No player recommendation is deployed from this study.",
+        "- FV, Market Value V2, Team Utility, and verdict math are unchanged.",
+        "",
+    ]
+
+    EVAL_MD.write_text(
+        "\n".join(lines),
+        encoding="utf-8",
+    )
+
+    manifest = {
+        "schema_version": 1,
+        "study_id": result["study_id"],
+        "decision": decision,
+        "production_change_authorized": False,
+        "preregistration_sha256": sha(PREREG),
+        "baseline_sha256": sha(BASELINE),
+        "baseline_md_sha256": sha(BASELINE_MD),
+        "evaluation_sha256": sha(EVAL),
+        "evaluation_md_sha256": sha(EVAL_MD),
+        "evaluator_sha256":
+            sha(Path(__file__).resolve()),
+    }
+    MANIFEST.write_text(
+        json.dumps(
+            manifest,
+            indent=2,
+            sort_keys=True,
+        ) + "\n",
+        encoding="utf-8",
+    )
+
+    print(json.dumps({
+        "decision": decision,
+        "baseline_players":
+            baseline["eligible_player_count"],
+        "horizon_status": {
+            k: v["status"]
+            for k, v in horizons.items()
+        },
+    }, indent=2))
+
+
+def check() -> None:
+    prereg = read(PREREG)
+    baseline = read(BASELINE)
+    result = read(EVAL)
+
+    assert (
+        baseline["preregistration_sha256"]
+        == sha(PREREG)
+    )
+    assert (
+        baseline["market_method_version"]
+        == MV2_METHOD
+    )
+    assert baseline["eligible_player_count"] >= 500
+    assert result[
+        "production_change_authorized"
+    ] is False
+
+    allowed = {
+        "COLLECTING_PROSPECTIVE_MARKET_EDGE_V1",
+        "ACTIONABLE_FOR_MARKET_EDGE_V1_SHADOW",
+        "HOLD_MARKET_EDGE_V1_NO_VALIDATED_EDGE",
+    }
+    assert result["decision"] in allowed
+
+    if (
+        result["decision"]
+        == "ACTIONABLE_FOR_MARKET_EDGE_V1_SHADOW"
+    ):
+        gates = result["four_week_hard_gates"]
+        assert gates is not None
+        assert all(gates.values())
+
+    if (
+        result["decision"]
+        == "HOLD_MARKET_EDGE_V1_NO_VALIDATED_EDGE"
+    ):
+        gates = result["four_week_hard_gates"]
+        assert gates is not None
+        assert not all(gates.values())
+
+    print("Market Edge V1 checks PASS")
+
+
+def selftest() -> None:
+    assert percentile_scores([1, 2, 3]) == [
+        0.0, 0.5, 1.0
+    ]
+    rho = spearman([1, 2, 3], [1, 2, 3])
+    assert rho is not None
+    assert abs(rho - 1.0) < 1e-12
+
+    p = {
+        "cohorts": {
+            "strong_buy_threshold": 0.15,
+            "buy_threshold": 0.10,
+            "sell_threshold": -0.10,
+            "strong_sell_threshold": -0.15,
+        }
+    }
+    assert classify(0.20, p) == "strong_buy"
+    assert classify(0.11, p) == "buy"
+    assert classify(0.00, p) == "neutral"
+    assert classify(-0.11, p) == "sell"
+    assert classify(-0.20, p) == "strong_sell"
+
+    print("Market Edge V1 self-test PASS")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    group = parser.add_mutually_exclusive_group(
+        required=True
+    )
+    group.add_argument(
+        "--selftest",
+        action="store_true",
+    )
+    group.add_argument(
+        "--initialize",
+        action="store_true",
+    )
+    group.add_argument(
+        "--evaluate",
+        action="store_true",
+    )
+    group.add_argument(
+        "--check",
+        action="store_true",
+    )
+    args = parser.parse_args()
+
+    if args.selftest:
+        selftest()
+    elif args.initialize:
+        initialize()
+    elif args.evaluate:
+        evaluate()
+    else:
+        check()
+
+
+if __name__ == "__main__":
+    main()
