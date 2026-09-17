@@ -1,4 +1,6 @@
-name: Identity V2 Phase 2 Manual Adjudication Freeze
+name: Identity V2 Phase 2 Manual Adjudication Freeze - Source Drift Patch V2
+
+# PATCH_VERSION: SOURCE_DRIFT_V2
 
 on:
   workflow_dispatch:
@@ -78,6 +80,7 @@ jobs:
               "unique_candidate_missing_team": "HOLD_MISSING_TEAM_CORROBORATION",
               "team_mismatch": "HOLD_TEAM_CONFLICT",
               "position_incompatible": "HOLD_POSITION_TAXONOMY_CONFLICT",
+              "source_row_disappeared": "HOLD_SOURCE_ROW_DISAPPEARED",
               "ambiguous_or_missing_candidate": "HOLD_IDENTITY_AMBIGUITY"
             },
             "collision_rule": "No two approved FantasyPros IDs may map to the same Sleeper ID. Any collision is a hard stop.",
@@ -102,7 +105,10 @@ jobs:
              production crosswalk and current positions remain compatible.
 
           Name alone never qualifies. Missing/free-agent team state does not count
-          as corroboration. Position conflicts remain holds.
+          as corroboration. Position conflicts remain holds. If a frozen Phase 1
+          FantasyPros row has disappeared from the current normalized source, it is
+          frozen as `HOLD_SOURCE_ROW_DISAPPEARED`; disappearance is never treated as
+          evidence for an identity match.
 
           This phase writes research artifacts only. It cannot change or promote
           `scripts/identity_crosswalk.json`.
@@ -254,6 +260,7 @@ jobs:
                   "name": baseline.get("name"),
                   "fp_position": fp_pos,
                   "fp_team": fp_team,
+                  "current_source_row_present": True,
                   "phase1_match_method": baseline.get("match_method"),
                   "phase1_candidate_sleeper_id": baseline_candidate_sid,
                   "phase1_sleeper_team": baseline.get("sleeper_team"),
@@ -268,6 +275,55 @@ jobs:
                   "adjudication_basis": basis,
                   "production_change_authorized": False
               }
+
+          def adjudicate_disappeared_source_row(
+              mod, baseline, sleeper_by_sid, sleeper_by_name, prod_map
+          ):
+              """Freeze source drift as a hold; never infer authority from disappearance."""
+              fpid = str(baseline["fantasypros_id"])
+              normalized_name = baseline.get("normalized_name") or mod.normalize_name(
+                  baseline.get("name")
+              )
+              fp_pos = baseline.get("fp_position")
+              fp_team = mod.normalize_team(baseline.get("fp_team"))
+
+              name_candidates = list(sleeper_by_name.get(normalized_name, ()))
+              position_candidates = []
+              if fp_pos in mod.FP_COMPATIBLE_SLEEPER:
+                  position_candidates = [
+                      c for c in name_candidates
+                      if mod.is_position_compatible(fp_pos, c)
+                  ]
+
+              baseline_candidate_sid = baseline.get("candidate_sleeper_id")
+              baseline_candidate = (
+                  sleeper_by_sid.get(str(baseline_candidate_sid))
+                  if baseline_candidate_sid not in (None, "")
+                  else None
+              )
+
+              return {
+                  "fantasypros_id": fpid,
+                  "name": baseline.get("name"),
+                  "fp_position": fp_pos,
+                  "fp_team": fp_team,
+                  "phase1_match_method": baseline.get("match_method"),
+                  "phase1_candidate_sleeper_id": baseline_candidate_sid,
+                  "phase1_sleeper_team": baseline.get("sleeper_team"),
+                  "phase1_sleeper_positions": baseline.get("sleeper_positions"),
+                  "current_source_row_present": False,
+                  "current_name_candidate_count": len(name_candidates),
+                  "current_position_candidate_count": len(position_candidates),
+                  "current_team_match_count": 0,
+                  "current_phase1_candidate": candidate_summary(baseline_candidate),
+                  "existing_production_authoritative_sid": prod_map.get(fpid),
+                  "disposition": "HOLD_SOURCE_ROW_DISAPPEARED",
+                  "approved_sleeper_id": None,
+                  "adjudication_basis":
+                      "frozen_phase1_fpid_absent_from_current_fantasypros_source",
+                  "production_change_authorized": False
+              }
+
 
           def build_result():
               prereg = json.loads(PREREG.read_text(encoding="utf-8"))
@@ -292,11 +348,19 @@ jobs:
               prod_map = production_authoritative_map(prod_rows)
 
               adjudicated = []
+              disappeared_fpids = []
               for baseline in manual:
                   fpid = str(baseline["fantasypros_id"])
                   fp = fp_by_fpid.get(fpid)
                   if fp is None:
-                      raise RuntimeError(f"manual FPID disappeared from current source: {fpid}")
+                      disappeared_fpids.append(fpid)
+                      adjudicated.append(
+                          adjudicate_disappeared_source_row(
+                              mod, baseline, sleeper_by_sid, sleeper_by_name, prod_map
+                          )
+                      )
+                      continue
+
                   adjudicated.append(
                       adjudicate_row(
                           mod, baseline, fp, sleeper_by_sid, sleeper_by_name, prod_map
@@ -336,6 +400,8 @@ jobs:
                   "reviewed_row_count": len(adjudicated),
                   "approved_row_count": approved_count,
                   "held_row_count": hold_count,
+                  "source_disappeared_row_count": len(disappeared_fpids),
+                  "source_disappeared_fpids": disappeared_fpids,
                   "disposition_counts": dict(sorted(counts.items())),
                   "duplicate_approved_sleeper_assignment_groups": 0,
                   "rows": adjudicated,
@@ -361,6 +427,7 @@ jobs:
                   f"- Rows reviewed: **{result['reviewed_row_count']}**",
                   f"- Research-authoritative approvals: **{result['approved_row_count']}**",
                   f"- Explicit holds: **{result['held_row_count']}**",
+                  f"- Frozen Phase 1 rows absent from current FantasyPros source: **{result['source_disappeared_row_count']}**",
                   f"- Approved SID collision groups: **{result['duplicate_approved_sleeper_assignment_groups']}**",
                   "",
                   "## Dispositions",
@@ -390,6 +457,7 @@ jobs:
                   "- Name alone was never accepted as authority.",
                   "- Missing/free-agent team state was not treated as team corroboration.",
                   "- Position-incompatible candidates were not force-matched.",
+                  "- Frozen Phase 1 rows missing from the current FantasyPros source were held as source drift, never guessed.",
                   "- No new aliases or compatibility rules were introduced.",
                   "- `scripts/identity_crosswalk.json` was not changed.",
                   "- This phase cannot promote the unified resolver.",
@@ -447,6 +515,22 @@ jobs:
                   raise RuntimeError("promotion illegally authorized")
               if result["duplicate_approved_sleeper_assignment_groups"] != 0:
                   raise RuntimeError("approved identity collision detected")
+
+              disappeared = [
+                  row for row in result["rows"]
+                  if row.get("current_source_row_present") is False
+              ]
+              if len(disappeared) != result["source_disappeared_row_count"]:
+                  raise RuntimeError("source-disappearance accounting mismatch")
+              if any(
+                  row["disposition"] != "HOLD_SOURCE_ROW_DISAPPEARED"
+                  or row.get("approved_sleeper_id") is not None
+                  for row in disappeared
+              ):
+                  raise RuntimeError(
+                      "a disappeared source row was not preserved as a non-authoritative hold"
+                  )
+
               if not result["decision"].startswith("PASS_IDENTITY_V2_PHASE2_REVIEW_FREEZE"):
                   raise RuntimeError("unexpected Phase 2 decision")
               print("Identity V2 Phase 2 output checks PASS")
@@ -474,6 +558,25 @@ jobs:
           if __name__ == "__main__":
               main()
           PY
+
+      - name: Prove Source Drift Patch V2 is loaded
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "PATCH_VERSION=SOURCE_DRIFT_V2"
+          grep -q 'HOLD_SOURCE_ROW_DISAPPEARED' \
+            research/identity-v2/identity_v2_phase2_manual_adjudication.py
+
+          if grep -q 'manual FPID disappeared from current source' \
+            research/identity-v2/identity_v2_phase2_manual_adjudication.py; then
+            echo "ERROR: old hard-stop evaluator is still present"
+            exit 1
+          fi
+
+          grep -q '"source_row_disappeared": "HOLD_SOURCE_ROW_DISAPPEARED"' \
+            research/identity-v2/identity_v2_phase2_preregistration.json
+
+          echo "PASS: Source Drift Patch V2 evaluator is loaded."
 
       - name: Run Phase 2 adjudication
         shell: bash
