@@ -1,0 +1,850 @@
+name: 4for4 IDP V1 - Phase 1J Identity Closure Freeze
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  identity-closure-freeze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      FOURFORFOUR_DL_GZ_B64: ${{ secrets.FOURFORFOUR_DL_GZ_B64 }}
+      FOURFORFOUR_LB_GZ_B64: ${{ secrets.FOURFORFOUR_LB_GZ_B64 }}
+      FOURFORFOUR_DB_GZ_B64: ${{ secrets.FOURFORFOUR_DB_GZ_B64 }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check requests
+
+      - name: Decode private 4for4 inputs outside repository
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for var in FOURFORFOUR_DL_GZ_B64 FOURFORFOUR_LB_GZ_B64 FOURFORFOUR_DB_GZ_B64; do
+            if [ -z "${!var:-}" ]; then
+              echo "ERROR: required GitHub Actions secret ${var} is missing or empty." >&2
+              exit 1
+            fi
+          done
+
+          install -d -m 700 /tmp/log-fourforfour-idp-v1/input
+          install -d -m 700 /tmp/log-fourforfour-idp-v1/output
+
+          printf '%s' "$FOURFORFOUR_DL_GZ_B64" | base64 --decode | gzip -dc \
+            > /tmp/log-fourforfour-idp-v1/input/dl.csv
+          printf '%s' "$FOURFORFOUR_LB_GZ_B64" | base64 --decode | gzip -dc \
+            > /tmp/log-fourforfour-idp-v1/input/lb.csv
+          printf '%s' "$FOURFORFOUR_DB_GZ_B64" | base64 --decode | gzip -dc \
+            > /tmp/log-fourforfour-idp-v1/input/db.csv
+
+          chmod 600 /tmp/log-fourforfour-idp-v1/input/*.csv
+
+      - name: Run current 4for4 pipeline on private real data
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/projections/fourforfour_projection_pipeline.py \
+            --dl /tmp/log-fourforfour-idp-v1/input/dl.csv \
+            --lb /tmp/log-fourforfour-idp-v1/input/lb.csv \
+            --db /tmp/log-fourforfour-idp-v1/input/db.csv \
+            --output-dir /tmp/log-fourforfour-idp-v1/output/private \
+            --public-summary /tmp/log-fourforfour-idp-v1/output/aggregate-summary.json \
+            > /tmp/log-fourforfour-idp-v1/output/pipeline.stdout.txt
+
+      - name: Reconstruct and freeze final validated identity cohort
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import csv
+          import hashlib
+          import io
+          import json
+          import math
+          import re
+          from collections import Counter, defaultdict
+          from difflib import SequenceMatcher
+          from pathlib import Path
+
+          import requests
+
+          EXPECTED_PHASE1E_FP = (
+              'a3ed571084339bb938c5288a8a959145702a13d7c876f957ea2541197f0cbc6a'
+          )
+          EXPECTED_PHASE1F_FP = (
+              '860f93be86c9a1b5c5a8bfe8ed4af6a01b49187e04a5e0a0769ce95a0d3458ee'
+          )
+          EXPECTED_PHASE1H_COMBINED_FP = (
+              'c1a41bc34e305bf1b63fe9956aad87ae0d17f388771ef42a7e2a15fa49d00917'
+          )
+
+          root = Path('/tmp/log-fourforfour-idp-v1/output')
+          private = root / 'private'
+          repo = Path('.')
+
+          normalized = json.loads(
+              (private / 'fourforfour_2026_idp_normalized_private.json')
+              .read_text(encoding='utf-8')
+          )
+          rows = (
+              normalized.get('rows')
+              or normalized.get('players')
+              or normalized.get('data')
+              if isinstance(normalized, dict)
+              else normalized
+          )
+          if not isinstance(rows, list) or len(rows) != 648:
+              raise RuntimeError('unexpected normalized-private JSON shape/count')
+
+          summary = json.loads(
+              (root / 'aggregate-summary.json').read_text(encoding='utf-8')
+          )
+          identity = summary.get('identity') or {}
+          if identity.get('resolved_rows') != 595 or identity.get('unresolved_rows') != 53:
+              raise RuntimeError('Phase 1B baseline changed')
+
+          def norm_team(value):
+              if value in (None, '', 'FA'):
+                  return None
+              t = str(value).strip().upper()
+              return {
+                  'JAC': 'JAX', 'WSH': 'WAS', 'OAK': 'LV',
+                  'SD': 'LAC', 'STL': 'LAR', 'LA': 'LAR',
+              }.get(t, t)
+
+          def norm_name(value):
+              s = str(value or '').strip().lower()
+              s = re.sub(r"[.'’\-]", '', s)
+              return re.sub(r'\s+', ' ', s).strip()
+
+          suffixes = {'jr', 'sr', 'ii', 'iii', 'iv', 'v'}
+
+          def tokens_without_suffix(value):
+              parts = norm_name(value).split()
+              if parts and parts[-1] in suffixes:
+                  parts = parts[:-1]
+              return parts
+
+          def norm_name_no_suffix(value):
+              return ' '.join(tokens_without_suffix(value))
+
+          def first_token(value):
+              parts = tokens_without_suffix(value)
+              return parts[0] if parts else ''
+
+          def surname(value):
+              parts = tokens_without_suffix(value)
+              return parts[-1] if parts else ''
+
+          def pos_buckets(values):
+              if not isinstance(values, (list, tuple, set)):
+                  values = [values]
+              out = set()
+              for value in values:
+                  p = str(value or '').strip().upper()
+                  if p in {'DL', 'DE', 'DT', 'NT'}:
+                      out.add('DL')
+                  elif p in {'LB', 'ILB', 'MLB', 'OLB'}:
+                      out.add('LB')
+                  elif p in {'DB', 'CB', 'S', 'SS', 'FS', 'SAF'}:
+                      out.add('DB')
+                  elif p == 'EDGE':
+                      out.update({'DL', 'LB'})
+              return out
+
+          # Sleeper full player universe.
+          sleeper_response = requests.get(
+              'https://api.sleeper.app/v1/players/nfl',
+              timeout=60,
+          )
+          sleeper_response.raise_for_status()
+          universe = sleeper_response.json()
+          if not isinstance(universe, dict) or len(universe) < 1000:
+              raise RuntimeError('Sleeper full-player response unexpectedly small')
+
+          full_index = defaultdict(list)
+          suffixless_index = defaultdict(list)
+          team_bucket_candidates = defaultdict(list)
+          sleeper_by_sid = {}
+
+          for sid, player in universe.items():
+              if not isinstance(player, dict):
+                  continue
+              full_name = (
+                  player.get('full_name')
+                  or ' '.join(
+                      x for x in [player.get('first_name'), player.get('last_name')] if x
+                  ).strip()
+              )
+              if not full_name:
+                  continue
+
+              team = norm_team(player.get('team'))
+              buckets = pos_buckets(
+                  list(player.get('fantasy_positions') or [])
+                  + [player.get('position')]
+              )
+              candidate = {
+                  'sid': str(sid),
+                  'name': full_name,
+                  'team': team,
+                  'buckets': buckets,
+                  'gsis_id': str(player.get('gsis_id') or '').strip() or None,
+              }
+              sleeper_by_sid[str(sid)] = candidate
+
+              if not buckets:
+                  continue
+              full_index[norm_name(full_name)].append(candidate)
+              suffixless_index[norm_name_no_suffix(full_name)].append(candidate)
+              for bucket in buckets:
+                  if team:
+                      team_bucket_candidates[(team, bucket)].append(candidate)
+
+          unresolved = [r for r in rows if not (r.get('identity') or {}).get('resolved')]
+          resolved = [r for r in rows if (r.get('identity') or {}).get('resolved')]
+          if len(unresolved) != 53 or len(resolved) != 595:
+              raise RuntimeError('baseline row partition changed')
+
+          baseline_sids = {
+              str((r.get('identity') or {}).get('sleeper_id'))
+              for r in resolved
+              if (r.get('identity') or {}).get('sleeper_id') not in (None, '')
+          }
+
+          # Reconstruct Phase 1E.
+          phase1e = []
+          for row in unresolved:
+              name = row.get('source_player_name')
+              team = norm_team(row.get('source_team'))
+              bucket = row.get('source_bucket')
+
+              def eligible(cands):
+                  out = {}
+                  for c in cands:
+                      if bucket not in c['buckets']:
+                          continue
+                      if not team or not c['team'] or c['team'] != team:
+                          continue
+                      out[c['sid']] = c
+                  return out
+
+              exact = eligible(full_index.get(norm_name(name), []))
+              suffixless = eligible(
+                  suffixless_index.get(norm_name_no_suffix(name), [])
+              )
+
+              sid = None
+              if len(exact) == 1:
+                  sid = next(iter(exact))
+              elif len(exact) == 0 and len(suffixless) == 1:
+                  sid = next(iter(suffixless))
+
+              if sid is not None:
+                  phase1e.append({
+                      'source_row_sha256': row['source_row_sha256'],
+                      'sleeper_id': str(sid),
+                  })
+
+          if len(phase1e) != 27:
+              raise RuntimeError(f'expected 27 Phase 1E recoveries, got {len(phase1e)}')
+
+          phase1e_payload = sorted(
+              [[r['source_row_sha256'], r['sleeper_id']] for r in phase1e]
+          )
+          phase1e_fp = hashlib.sha256(
+              json.dumps(phase1e_payload, separators=(',', ':')).encode()
+          ).hexdigest()
+          if phase1e_fp != EXPECTED_PHASE1E_FP:
+              raise RuntimeError('Phase 1E fingerprint drifted')
+
+          phase1e_hashes = {r['source_row_sha256'] for r in phase1e}
+          phase1e_sids = {r['sleeper_id'] for r in phase1e}
+          remaining = [
+              r for r in unresolved
+              if r['source_row_sha256'] not in phase1e_hashes
+          ]
+
+          # Reconstruct Phase 1F.
+          phase1f = []
+          for row in remaining:
+              name = row.get('source_player_name')
+              team = norm_team(row.get('source_team'))
+              bucket = row.get('source_bucket')
+              src_first = first_token(name)
+              src_surname = surname(name)
+
+              candidates = []
+              for c in team_bucket_candidates.get((team, bucket), []):
+                  if surname(c['name']) != src_surname:
+                      continue
+                  cand_first = first_token(c['name'])
+                  full_sim = SequenceMatcher(
+                      None,
+                      norm_name_no_suffix(name),
+                      norm_name_no_suffix(c['name']),
+                  ).ratio()
+                  first_sim = SequenceMatcher(
+                      None,
+                      src_first,
+                      cand_first,
+                  ).ratio() if src_first and cand_first else 0.0
+                  same_initial = bool(
+                      src_first and cand_first and src_first[0] == cand_first[0]
+                  )
+                  candidates.append({
+                      'sid': c['sid'],
+                      'full_similarity': full_sim,
+                      'first_similarity': first_sim,
+                      'same_initial': same_initial,
+                  })
+
+              candidates = list({c['sid']: c for c in candidates}.values())
+              chosen_sid = None
+
+              if len(candidates) > 1:
+                  strong = [
+                      c for c in candidates
+                      if c['same_initial'] and c['full_similarity'] >= 0.72
+                  ]
+                  if len(strong) == 1:
+                      chosen_sid = strong[0]['sid']
+              elif len(candidates) == 1:
+                  c = candidates[0]
+                  if c['same_initial'] and (
+                      c['full_similarity'] >= 0.72
+                      or c['first_similarity'] >= 0.60
+                  ):
+                      chosen_sid = c['sid']
+                  elif c['full_similarity'] >= 0.84:
+                      chosen_sid = c['sid']
+
+              if chosen_sid is not None:
+                  phase1f.append({
+                      'source_row_sha256': row['source_row_sha256'],
+                      'sleeper_id': str(chosen_sid),
+                      '_private_source_name': name,
+                      '_private_source_team': team,
+                      '_private_source_bucket': bucket,
+                  })
+
+          if len(phase1f) != 14:
+              raise RuntimeError(f'expected 14 Phase 1F candidates, got {len(phase1f)}')
+
+          phase1f_payload = sorted(
+              [[r['source_row_sha256'], r['sleeper_id']] for r in phase1f]
+          )
+          phase1f_fp = hashlib.sha256(
+              json.dumps(phase1f_payload, separators=(',', ':')).encode()
+          ).hexdigest()
+          if phase1f_fp != EXPECTED_PHASE1F_FP:
+              raise RuntimeError('Phase 1F fingerprint drifted')
+
+          # Reconstruct Phase 1G + 1H using nflverse.
+          nflverse_response = requests.get(
+              'https://github.com/nflverse/nflverse-data/'
+              'releases/download/players/players.csv',
+              timeout=60,
+          )
+          nflverse_response.raise_for_status()
+          reader = csv.DictReader(io.StringIO(nflverse_response.text))
+          nflverse_rows = list(reader)
+
+          nflverse_by_gsis = defaultdict(list)
+          nflverse_by_team_bucket = defaultdict(list)
+          for nv in nflverse_rows:
+              gsis = str(nv.get('gsis_id') or '').strip()
+              if gsis:
+                  nflverse_by_gsis[gsis].append(nv)
+              team = norm_team(nv.get('latest_team'))
+              name = nv.get('display_name')
+              for bucket in pos_buckets(nv.get('position')):
+                  if team and name:
+                      nflverse_by_team_bucket[(team, bucket)].append(nv)
+
+          confirmed = []
+
+          for rec in phase1f:
+              sleeper = sleeper_by_sid[rec['sleeper_id']]
+              source_name = rec['_private_source_name']
+              source_team = rec['_private_source_team']
+              source_bucket = rec['_private_source_bucket']
+
+              if sleeper.get('gsis_id'):
+                  gsis_rows = nflverse_by_gsis.get(sleeper['gsis_id'], [])
+                  if len(gsis_rows) == 1:
+                      nv = gsis_rows[0]
+                      nv_name = nv.get('display_name')
+                      nv_team = norm_team(nv.get('latest_team'))
+                      nv_buckets = pos_buckets(nv.get('position'))
+                      sleeper_nv_sim = SequenceMatcher(
+                          None,
+                          norm_name_no_suffix(sleeper['name']),
+                          norm_name_no_suffix(nv_name),
+                      ).ratio()
+                      source_nv_sim = SequenceMatcher(
+                          None,
+                          norm_name_no_suffix(source_name),
+                          norm_name_no_suffix(nv_name),
+                      ).ratio()
+                      same_initial = bool(
+                          first_token(source_name)
+                          and first_token(nv_name)
+                          and first_token(source_name)[0] == first_token(nv_name)[0]
+                      )
+                      name_ok = (
+                          surname(source_name) == surname(nv_name)
+                          and (
+                              (same_initial and source_nv_sim >= 0.72)
+                              or source_nv_sim >= 0.84
+                          )
+                      )
+                      if (
+                          sleeper_nv_sim >= 0.90
+                          and name_ok
+                          and source_team == nv_team
+                          and source_bucket in nv_buckets
+                      ):
+                          confirmed.append(
+                              [rec['source_row_sha256'], rec['sleeper_id']]
+                          )
+                  continue
+
+              nv_candidates = []
+              for nv in nflverse_by_team_bucket.get(
+                  (source_team, source_bucket), []
+              ):
+                  nv_name = nv.get('display_name')
+                  if surname(nv_name) != surname(source_name):
+                      continue
+                  source_nv_sim = SequenceMatcher(
+                      None,
+                      norm_name_no_suffix(source_name),
+                      norm_name_no_suffix(nv_name),
+                  ).ratio()
+                  sleeper_nv_sim = SequenceMatcher(
+                      None,
+                      norm_name_no_suffix(sleeper['name']),
+                      norm_name_no_suffix(nv_name),
+                  ).ratio()
+                  same_initial = bool(
+                      first_token(source_name)
+                      and first_token(nv_name)
+                      and first_token(source_name)[0] == first_token(nv_name)[0]
+                  )
+                  if (
+                      ((same_initial and source_nv_sim >= 0.72)
+                       or source_nv_sim >= 0.84)
+                      and sleeper_nv_sim >= 0.90
+                  ):
+                      nv_candidates.append(nv)
+
+              if len(nv_candidates) == 1:
+                  confirmed.append(
+                      [rec['source_row_sha256'], rec['sleeper_id']]
+                  )
+
+          confirmed = sorted(confirmed)
+          if len(confirmed) != 9:
+              raise RuntimeError(
+                  f'expected 9 Phase 1G+1H confirmations, got {len(confirmed)}'
+              )
+
+          combined_fp = hashlib.sha256(
+              json.dumps(confirmed, separators=(',', ':')).encode()
+          ).hexdigest()
+          if combined_fp != EXPECTED_PHASE1H_COMBINED_FP:
+              raise RuntimeError(
+                  f'Phase 1H combined fingerprint drifted: {combined_fp}'
+              )
+
+          confirmed_hashes = {h for h, _ in confirmed}
+          phase1f_failures = [
+              rec for rec in phase1f
+              if rec['source_row_sha256'] not in confirmed_hashes
+          ]
+          if len(phase1f_failures) != 5:
+              raise RuntimeError(
+                  f'expected 5 Phase 1F failures after Phase 1H, got '
+                  f'{len(phase1f_failures)}'
+              )
+
+          # Rank bands.
+          score_key = 'log_base_points_excluding_weekly_bonuses_and_blocked_kicks'
+          by_bucket = defaultdict(list)
+          for row in rows:
+              score = row.get(score_key)
+              if not isinstance(score, (int, float)) or not math.isfinite(float(score)):
+                  raise RuntimeError('missing/non-finite LOG score')
+              by_bucket[row['source_bucket']].append(
+                  (float(score), row['source_row_sha256'])
+              )
+
+          rank_band = {}
+          for bucket, vals in by_bucket.items():
+              ordered = sorted(vals, reverse=True)
+              n = len(ordered)
+              t10 = max(1, math.ceil(n * 0.10))
+              t25 = max(t10, math.ceil(n * 0.25))
+              t50 = max(t25, math.ceil(n * 0.50))
+              for idx, (_, row_hash) in enumerate(ordered, 1):
+                  if idx <= t10:
+                      band = 'top_10_pct'
+                  elif idx <= t25:
+                      band = '10_to_25_pct'
+                  elif idx <= t50:
+                      band = '25_to_50_pct'
+                  else:
+                      band = 'bottom_50_pct'
+                  rank_band[row_hash] = band
+
+          # Crosswalk is the repo's existing FantasyPros<->Sleeper identity bridge.
+          crosswalk_path = repo / 'scripts/identity_crosswalk.json'
+          crosswalk_bytes = crosswalk_path.read_bytes()
+          crosswalk = json.loads(crosswalk_bytes.decode('utf-8'))
+          if not isinstance(crosswalk, list):
+              raise RuntimeError('identity_crosswalk.json shape changed')
+
+          by_sid = defaultdict(list)
+          for entry in crosswalk:
+              if not isinstance(entry, dict):
+                  continue
+              for key in ('sleeper_id', 'candidate_sleeper_id'):
+                  sid = entry.get(key)
+                  if sid not in (None, ''):
+                      by_sid[str(sid)].append(entry)
+
+          outcomes = Counter()
+          outcomes_by_rank_band = defaultdict(Counter)
+          outcomes_by_bucket = defaultdict(Counter)
+          crosswalk_confirmed = []
+
+          for rec in phase1f_failures:
+              sid = rec['sleeper_id']
+              source_name = rec['_private_source_name']
+              source_team = rec['_private_source_team']
+              source_bucket = rec['_private_source_bucket']
+              sleeper = sleeper_by_sid[sid]
+              band = rank_band[rec['source_row_sha256']]
+
+              entries = by_sid.get(sid, [])
+              if not entries:
+                  outcome = 'no_crosswalk_entry_for_candidate'
+              else:
+                  eligible = []
+                  for entry in entries:
+                      if entry.get('requires_manual_review') is True:
+                          continue
+                      if str(entry.get('match_confidence') or '').lower() not in {
+                          'high', 'medium'
+                      }:
+                          continue
+
+                      x_name = entry.get('name')
+                      x_team_values = {
+                          norm_team(entry.get('fp_team')),
+                          norm_team(entry.get('sleeper_team')),
+                      }
+                      x_team_values.discard(None)
+
+                      x_buckets = pos_buckets(
+                          [
+                              entry.get('fp_position'),
+                              entry.get('sleeper_pos'),
+                          ]
+                          + list(entry.get('sleeper_fantasy_positions') or [])
+                      )
+
+                      source_x_sim = SequenceMatcher(
+                          None,
+                          norm_name_no_suffix(source_name),
+                          norm_name_no_suffix(x_name),
+                      ).ratio()
+                      sleeper_x_sim = SequenceMatcher(
+                          None,
+                          norm_name_no_suffix(sleeper['name']),
+                          norm_name_no_suffix(x_name),
+                      ).ratio()
+
+                      same_initial = bool(
+                          first_token(source_name)
+                          and first_token(x_name)
+                          and first_token(source_name)[0] == first_token(x_name)[0]
+                      )
+
+                      source_name_ok = (
+                          surname(source_name) == surname(x_name)
+                          and (
+                              (same_initial and source_x_sim >= 0.72)
+                              or source_x_sim >= 0.84
+                          )
+                      )
+                      sleeper_name_ok = sleeper_x_sim >= 0.90
+                      team_ok = source_team in x_team_values
+                      position_ok = source_bucket in x_buckets
+
+                      if (
+                          source_name_ok
+                          and sleeper_name_ok
+                          and team_ok
+                          and position_ok
+                      ):
+                          eligible.append(entry)
+
+                  # Deduplicate equivalent crosswalk rows by FantasyPros ID + Sleeper ID.
+                  deduped = {}
+                  for entry in eligible:
+                      key = (
+                          str(entry.get('fantasypros_id') or ''),
+                          str(entry.get('sleeper_id')
+                              or entry.get('candidate_sleeper_id')
+                              or ''),
+                      )
+                      deduped[key] = entry
+                  eligible = list(deduped.values())
+
+                  if len(eligible) == 1:
+                      outcome = 'crosswalk_independently_corroborated'
+                      crosswalk_confirmed.append(
+                          [rec['source_row_sha256'], sid]
+                      )
+                  elif len(eligible) > 1:
+                      outcome = 'ambiguous_crosswalk_corroboration'
+                  else:
+                      outcome = 'crosswalk_present_but_not_corroborated'
+
+              outcomes[outcome] += 1
+              outcomes_by_rank_band[band][outcome] += 1
+              outcomes_by_bucket[source_bucket][outcome] += 1
+
+          crosswalk_confirmed = sorted(crosswalk_confirmed)
+          crosswalk_confirmed_fp = hashlib.sha256(
+              json.dumps(
+                  crosswalk_confirmed,
+                  separators=(',', ':'),
+              ).encode()
+          ).hexdigest()
+
+          all_new_confirmed = sorted(confirmed + crosswalk_confirmed)
+          all_new_hashes = {h for h, _ in all_new_confirmed}
+          all_new_sids = [sid for _, sid in all_new_confirmed]
+
+          if len(all_new_sids) != len(set(all_new_sids)):
+              raise RuntimeError('combined recovered Sleeper IDs are not unique')
+          if set(all_new_sids) & baseline_sids:
+              raise RuntimeError('combined recoveries overlap baseline Sleeper IDs')
+          if set(all_new_sids) & phase1e_sids:
+              raise RuntimeError('combined recoveries overlap Phase 1E Sleeper IDs')
+
+          final_remaining = [
+              r for r in remaining
+              if r['source_row_sha256'] not in all_new_hashes
+          ]
+          remaining_bands = Counter(
+              rank_band[r['source_row_sha256']]
+              for r in final_remaining
+          )
+          remaining_buckets = Counter(
+              r['source_bucket']
+              for r in final_remaining
+          )
+
+          resolved_after = 622 + len(all_new_confirmed)
+
+          # Phase 1 identity closure: baseline 595 + 40 validated recoveries.
+          validated_recovery_pairs = sorted(
+              [[r['source_row_sha256'], r['sleeper_id']] for r in phase1e]
+              + all_new_confirmed
+          )
+          if len(validated_recovery_pairs) != 40:
+              raise RuntimeError(
+                  f'expected 40 total validated recoveries, got '
+                  f'{len(validated_recovery_pairs)}'
+              )
+
+          validated_recovery_sids = [sid for _, sid in validated_recovery_pairs]
+          if len(validated_recovery_sids) != len(set(validated_recovery_sids)):
+              raise RuntimeError('validated recovery Sleeper IDs are not unique')
+          if set(validated_recovery_sids) & baseline_sids:
+              raise RuntimeError(
+                  'validated recovery Sleeper IDs overlap baseline resolved identities'
+              )
+
+          closure_recovery_fingerprint = hashlib.sha256(
+              json.dumps(
+                  validated_recovery_pairs,
+                  separators=(',', ':'),
+              ).encode()
+          ).hexdigest()
+
+          excluded_hashes = sorted(
+              r['source_row_sha256']
+              for r in final_remaining
+          )
+          if len(excluded_hashes) != 13:
+              raise RuntimeError(
+                  f'expected 13 frozen exclusions, got {len(excluded_hashes)}'
+              )
+
+          exclusion_fingerprint = hashlib.sha256(
+              json.dumps(
+                  excluded_hashes,
+                  separators=(',', ':'),
+              ).encode()
+          ).hexdigest()
+
+          # Closure gate: no top-quartile player may remain unresolved.
+          if remaining_bands.get('top_10_pct', 0) != 0:
+              raise RuntimeError('identity closure failed: top-10% row unresolved')
+          if remaining_bands.get('10_to_25_pct', 0) != 0:
+              raise RuntimeError('identity closure failed: 10-25% row unresolved')
+          if remaining_bands.get('25_to_50_pct', 0) != 2:
+              raise RuntimeError(
+                  'identity closure drifted: expected exactly 2 unresolved 25-50% rows'
+              )
+          if remaining_bands.get('bottom_50_pct', 0) != 11:
+              raise RuntimeError(
+                  'identity closure drifted: expected exactly 11 bottom-half exclusions'
+              )
+
+          if resolved_after != 635:
+              raise RuntimeError(
+                  f'identity closure drifted: expected 635 resolved, got {resolved_after}'
+              )
+
+          result = {
+              'schema_version': 1,
+              'study': 'fourforfour-idp-v1-phase1j-identity-closure-freeze',
+              'research_only': True,
+              'production_changes': False,
+              'phase1e_fingerprint_verified': True,
+              'phase1f_fingerprint_verified': True,
+              'phase1h_combined_fingerprint_verified': True,
+              'phase1h_confirmed_rows': 9,
+              'phase1f_failures_audited': 5,
+              'crosswalk': {
+                  'repo_path': 'scripts/identity_crosswalk.json',
+                  'sha256': hashlib.sha256(crosswalk_bytes).hexdigest(),
+                  'row_count': len(crosswalk),
+              },
+              'crosswalk_policy': {
+                  'existing_sleeper_id_link_required': True,
+                  'manual_review_rows_rejected': True,
+                  'exact_source_team_corroboration_required': True,
+                  'compatible_position_required': True,
+                  'source_name_corroboration_required': True,
+                  'sleeper_to_crosswalk_name_agreement_required': True,
+                  'unique_crosswalk_identity_required': True,
+                  'automatic_adoption_authorized': False,
+              },
+              'outcomes': dict(sorted(outcomes.items())),
+              'outcomes_by_rank_band': {
+                  k: dict(sorted(v.items()))
+                  for k, v in sorted(outcomes_by_rank_band.items())
+              },
+              'outcomes_by_bucket': {
+                  k: dict(sorted(v.items()))
+                  for k, v in sorted(outcomes_by_bucket.items())
+              },
+              'crosswalk_confirmed_rows': len(crosswalk_confirmed),
+              'crosswalk_confirmed_fingerprint_sha256':
+                  crosswalk_confirmed_fp,
+              'identity_closure': {
+                  'baseline_resolved_rows': 595,
+                  'validated_recovery_rows': 40,
+                  'frozen_resolved_rows': 635,
+                  'frozen_resolved_rate': round(635 / 648, 6),
+                  'frozen_exclusion_rows': 13,
+                  'top_25_pct_unresolved_rows': 0,
+                  'validated_recovery_fingerprint_sha256':
+                      closure_recovery_fingerprint,
+                  'frozen_exclusion_fingerprint_sha256':
+                      exclusion_fingerprint,
+                  'calibration_identity_gate_passed': True,
+              },
+              'post_crosswalk_resolved_rows': resolved_after,
+              'post_crosswalk_resolved_rate':
+                  round(resolved_after / 648, 6),
+              'remaining_unresolved_rows': len(final_remaining),
+              'remaining_unresolved_rank_bands':
+                  dict(sorted(remaining_bands.items())),
+              'remaining_unresolved_buckets':
+                  dict(sorted(remaining_buckets.items())),
+              'private_mapping_persisted': False,
+          }
+
+          forbidden_keys = {
+              'source_player_name',
+              'source_team',
+              'sleeper_id',
+              'fantasypros_id',
+              'source_row_number',
+              'raw_category_season_totals',
+              'provider_ff_pts_reference_only',
+          }
+
+          def assert_no_forbidden_keys(value, path='$'):
+              if isinstance(value, dict):
+                  for key, child in value.items():
+                      if key in forbidden_keys:
+                          raise RuntimeError(
+                              f'aggregate Phase 1J output leaked forbidden key: '
+                              f'{path}.{key}'
+                          )
+                      assert_no_forbidden_keys(child, f'{path}.{key}')
+              elif isinstance(value, list):
+                  for i, child in enumerate(value):
+                      assert_no_forbidden_keys(child, f'{path}[{i}]')
+
+          assert_no_forbidden_keys(result)
+
+          print('PASS: Phase 1J identity closure freeze complete.')
+          print(json.dumps(result, indent=2, sort_keys=True))
+          PY
+
+      - name: Run repository regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/repo_regression_checks.py
+
+      - name: Prove validation made no repository changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! git diff --quiet -- .; then
+            echo 'ERROR: Phase 1J modified tracked repository files.' >&2
+            git diff -- .
+            exit 1
+          fi
+
+          if ! git diff --cached --quiet -- .; then
+            echo 'ERROR: Phase 1J staged repository changes.' >&2
+            git diff --cached -- .
+            exit 1
+          fi
+
+          echo 'PASS: Phase 1J and regressions left the repository unchanged.'
+
+      - name: Destroy private 4for4 inputs and row-level outputs
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/log-fourforfour-idp-v1
+          echo 'PASS: private provider inputs and row-level outputs removed from runner.'
