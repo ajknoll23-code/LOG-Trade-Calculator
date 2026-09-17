@@ -1,0 +1,707 @@
+name: Trade Robustness V1 Phase 1B Live Verdict Alignment
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  trade-robustness-v1-phase1b:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install regression dependency
+        run: python3 -m pip install --disable-pip-version-check --no-cache-dir "requests>=2.32,<3"
+
+      - name: Verify Phase 1 anchor and production verdict thresholds
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test "$(git branch --show-current)" = "main"
+          test -z "$(git status --porcelain --untracked-files=all)"
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          result = json.loads(
+              Path("research/trade-robustness-v1/trade_robustness_v1_phase1_shadow.json")
+              .read_text(encoding="utf-8")
+          )
+          if result.get("decision") != "PASS_TRADE_ROBUSTNESS_V1_PHASE1_SHADOW":
+              raise SystemExit("Phase 1 Trade Robustness anchor is not PASS")
+          if result["universe"]["total_cases"] != 28776:
+              raise SystemExit("Phase 1 universe drifted")
+
+          text = Path("index.html").read_text(encoding="utf-8")
+          if "if(diffPct < 0.07)" not in text:
+              raise SystemExit("Live Fair Trade threshold is no longer 7%")
+          if "} else if(diffPct < 0.20){" not in text:
+              raise SystemExit("Live Slight/Strong threshold is no longer 20%")
+
+          print("PASS: Phase 1 anchored and live verdict thresholds are 7% / 20%.")
+          PY
+
+          sha256sum \
+            index.html \
+            data/league_rosters.json \
+            scripts/artifacts/generated/value_uncertainty.json \
+            research/trade-robustness-v1/trade_robustness_v1_phase1_shadow.py \
+            research/trade-robustness-v1/trade_robustness_v1_phase1_shadow.json \
+            research/trade-robustness-v1/trade_robustness_v1_phase1_manifest.json \
+            > "${RUNNER_TEMP}/immutable.sha256"
+
+      - name: Preflight repository regression suite
+        run: python3 scripts/validation/repo_regression_checks.py
+
+      - name: Write live-verdict-aligned evaluator
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > research/trade-robustness-v1/trade_robustness_v1_phase1b_live_verdict_alignment.py <<'PY'
+          #!/usr/bin/env python3
+          from __future__ import annotations
+
+          import argparse
+          import hashlib
+          import importlib.util
+          import json
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          ROOT = Path(__file__).resolve().parents[2]
+          OUTDIR = Path(__file__).resolve().parent
+
+          PHASE1 = OUTDIR / "trade_robustness_v1_phase1_shadow.py"
+          PHASE1_JSON = OUTDIR / "trade_robustness_v1_phase1_shadow.json"
+
+          OUTJSON = (
+              OUTDIR /
+              "trade_robustness_v1_phase1b_live_verdict_alignment.json"
+          )
+          OUTMD = (
+              OUTDIR /
+              "trade_robustness_v1_phase1b_live_verdict_alignment.md"
+          )
+          MANIFEST = (
+              OUTDIR /
+              "trade_robustness_v1_phase1b_manifest.json"
+          )
+
+          FAIR_THRESHOLD = 0.07
+          STRONG_THRESHOLD = 0.20
+
+
+          def sha(path: Path) -> str:
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+          def read(path: Path):
+              return json.loads(path.read_text(encoding="utf-8"))
+
+
+          def load_phase1_module():
+              spec = importlib.util.spec_from_file_location(
+                  "trade_robustness_phase1",
+                  PHASE1,
+              )
+              if spec is None or spec.loader is None:
+                  raise RuntimeError("Cannot import Phase 1 evaluator")
+              mod = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(mod)
+              return mod
+
+
+          def verdict_class(a: float, b: float) -> dict:
+              a = float(a)
+              b = float(b)
+              grand_max = max(a, b, 1.0)
+              diff = a - b
+              diff_pct = abs(diff) / grand_max
+
+              if diff_pct < FAIR_THRESHOLD:
+                  label = "fair"
+                  side = None
+                  strength = "fair"
+              elif diff_pct < STRONG_THRESHOLD:
+                  side = "A" if diff > 0 else "B"
+                  strength = "slight"
+                  label = f"slight_{side.lower()}"
+              else:
+                  side = "A" if diff > 0 else "B"
+                  strength = "strong"
+                  label = f"strong_{side.lower()}"
+
+              return {
+                  "label": label,
+                  "side": side,
+                  "strength": strength,
+                  "diff": diff,
+                  "diff_pct": diff_pct,
+              }
+
+
+          def analyze() -> dict:
+              p1 = read(PHASE1_JSON)
+              if (
+                  p1.get("decision")
+                  != "PASS_TRADE_ROBUSTNESS_V1_PHASE1_SHADOW"
+              ):
+                  raise RuntimeError("Phase 1 result is not PASS")
+
+              mod = load_phase1_module()
+              pools, roster_audit = mod.build_roster_pools()
+              cases = mod.build_cases(pools)
+
+              if len(cases) != p1["universe"]["total_cases"]:
+                  raise RuntimeError(
+                      f"Rebuilt universe drift: {len(cases)} "
+                      f"!= {p1['universe']['total_cases']}"
+                  )
+
+              by_id = {c["case_id"]: c for c in cases}
+              js_results = mod.run_live_js(cases)
+
+              transitions = Counter()
+              by_structure = defaultdict(
+                  lambda: {
+                      "cases": 0,
+                      "center_fair": 0,
+                      "directional": 0,
+                      "direction_robust": 0,
+                      "softened_to_fair": 0,
+                      "flipped_direction": 0,
+                      "same_exact_live_label": 0,
+                  }
+              )
+              by_margin = defaultdict(
+                  lambda: {
+                      "directional": 0,
+                      "direction_robust": 0,
+                      "softened_to_fair": 0,
+                      "flipped_direction": 0,
+                  }
+              )
+
+              examples = {
+                  "robust": [],
+                  "softened_to_fair": [],
+                  "flipped_direction": [],
+              }
+
+              directional_count = 0
+              robust_count = 0
+              softened_count = 0
+              flipped_count = 0
+              exact_label_stable = 0
+              center_fair_count = 0
+
+              def margin_bucket(pct: float) -> str:
+                  if pct < 0.10:
+                      return "7_to_10pct"
+                  if pct < 0.20:
+                      return "10_to_20pct"
+                  if pct < 0.30:
+                      return "20_to_30pct"
+                  if pct < 0.50:
+                      return "30_to_50pct"
+                  return "50pct_plus"
+
+              for result in js_results:
+                  case = by_id[result["case_id"]]
+                  center_raw = result["center"]
+                  center = verdict_class(
+                      center_raw["A"],
+                      center_raw["B"],
+                  )
+                  s = by_structure[case["structure"]]
+                  s["cases"] += 1
+
+                  if center["side"] is None:
+                      center_fair_count += 1
+                      s["center_fair"] += 1
+                      transitions[(center["label"], "not_tested")] += 1
+                      continue
+
+                  directional_count += 1
+                  s["directional"] += 1
+                  mb = margin_bucket(center["diff_pct"])
+                  by_margin[mb]["directional"] += 1
+
+                  if center["side"] == "A":
+                      adverse_raw = result["a_low_b_high"]
+                  else:
+                      adverse_raw = result["a_high_b_low"]
+
+                  adverse = verdict_class(
+                      adverse_raw["A"],
+                      adverse_raw["B"],
+                  )
+                  transitions[(center["label"], adverse["label"])] += 1
+
+                  if adverse["label"] == center["label"]:
+                      exact_label_stable += 1
+                      s["same_exact_live_label"] += 1
+
+                  if adverse["side"] == center["side"]:
+                      outcome = "robust"
+                      robust_count += 1
+                      s["direction_robust"] += 1
+                      by_margin[mb]["direction_robust"] += 1
+                  elif adverse["side"] is None:
+                      outcome = "softened_to_fair"
+                      softened_count += 1
+                      s["softened_to_fair"] += 1
+                      by_margin[mb]["softened_to_fair"] += 1
+                  else:
+                      outcome = "flipped_direction"
+                      flipped_count += 1
+                      s["flipped_direction"] += 1
+                      by_margin[mb]["flipped_direction"] += 1
+
+                  if len(examples[outcome]) < 30:
+                      examples[outcome].append({
+                          "case_id": case["case_id"],
+                          "structure": case["structure"],
+                          "roster_a": case["roster_a"],
+                          "roster_b": case["roster_b"],
+                          "A": [x["key"] for x in case["A"]],
+                          "B": [x["key"] for x in case["B"]],
+                          "center": {
+                              **center,
+                              "A_total": center_raw["A"],
+                              "B_total": center_raw["B"],
+                          },
+                          "adverse": {
+                              **adverse,
+                              "A_total": adverse_raw["A"],
+                              "B_total": adverse_raw["B"],
+                          },
+                          "package_status": result["package_status"],
+                          "package_tier": result.get("package_tier"),
+                      })
+
+              if (
+                  robust_count + softened_count + flipped_count
+                  != directional_count
+              ):
+                  raise RuntimeError("Directional outcome accounting mismatch")
+
+              return {
+                  "schema_version": 1,
+                  "study_id":
+                      "trade-robustness-v1-phase1b-live-verdict-alignment",
+                  "status": "LIVE_VERDICT_ALIGNMENT_COMPLETE",
+                  "decision":
+                      "PASS_TRADE_ROBUSTNESS_V1_PHASE1B_LIVE_VERDICT_ALIGNMENT",
+                  "generated_at_utc":
+                      datetime.now(timezone.utc)
+                      .isoformat()
+                      .replace("+00:00", "Z"),
+                  "research_only": True,
+                  "production_change_authorized": False,
+                  "production_thresholds": {
+                      "fair_trade_diff_pct_lt": FAIR_THRESHOLD,
+                      "slightly_favors_diff_pct_lt":
+                          STRONG_THRESHOLD,
+                      "strongly_favors_diff_pct_gte":
+                          STRONG_THRESHOLD,
+                  },
+                  "alignment_correction": (
+                      "Phase 1 treated any nonzero center delta as a "
+                      "directional winner. Phase 1B aligns the robustness "
+                      "question to the already-deployed 7% Fair Trade "
+                      "threshold and 20% Slight/Strong threshold. These "
+                      "thresholds are not estimated from Phase 1 results."
+                  ),
+                  "universe": {
+                      "total_cases": len(cases),
+                      "roster_audit": roster_audit,
+                      "center_fair_cases": center_fair_count,
+                      "directional_center_verdict_cases":
+                          directional_count,
+                  },
+                  "summary": {
+                      "direction_robust": robust_count,
+                      "softened_to_fair": softened_count,
+                      "flipped_direction": flipped_count,
+                      "direction_robust_share": round(
+                          robust_count / max(1, directional_count),
+                          6,
+                      ),
+                      "softened_to_fair_share": round(
+                          softened_count / max(1, directional_count),
+                          6,
+                      ),
+                      "flipped_direction_share": round(
+                          flipped_count / max(1, directional_count),
+                          6,
+                      ),
+                      "same_exact_live_label": exact_label_stable,
+                      "same_exact_live_label_share": round(
+                          exact_label_stable
+                          / max(1, directional_count),
+                          6,
+                      ),
+                  },
+                  "by_structure": {
+                      k: v
+                      for k, v in sorted(by_structure.items())
+                  },
+                  "by_center_margin_bucket": {
+                      k: v
+                      for k, v in sorted(by_margin.items())
+                  },
+                  "transition_matrix": [
+                      {
+                          "center_label": a,
+                          "adverse_label": b,
+                          "count": n,
+                      }
+                      for (a, b), n in sorted(
+                          transitions.items()
+                      )
+                  ],
+                  "examples": examples,
+                  "recommended_ui_semantics": {
+                      "center_fair":
+                          "Do not show a directional robustness label; "
+                          "the live verdict is already Fair Trade.",
+                      "direction_robust":
+                          "Sensitivity Robust — the same side remains "
+                          "favored by at least the live 7% threshold in "
+                          "the deterministic adverse corner.",
+                      "softened_to_fair":
+                          "Sensitivity Fragile — the current favored side "
+                          "falls back into the live Fair Trade band.",
+                      "flipped_direction":
+                          "Sensitivity Fragile — the adverse corner changes "
+                          "which side is favored by at least 7%.",
+                      "not_probability":
+                          "Never display a probability or confidence "
+                          "percentage from this sensitivity envelope.",
+                  },
+              }
+
+
+          def render(result: dict) -> str:
+              u = result["universe"]
+              s = result["summary"]
+
+              lines = [
+                  "# Trade Robustness V1 Phase 1B — Live Verdict Alignment",
+                  "",
+                  f"**Decision:** `{result['decision']}`",
+                  "",
+                  "**RESEARCH ONLY. No calculator behavior changed.**",
+                  "",
+                  "## Why Phase 1B exists",
+                  "",
+                  "Phase 1 correctly exercised the live package-adjustment "
+                  "math, but it called every nonzero delta a winner. The "
+                  "production calculator instead calls differences below 7% "
+                  "`Fair Trade`. Phase 1B uses the existing production "
+                  "thresholds without refitting them.",
+                  "",
+                  "## Universe",
+                  "",
+                  f"- Total synthetic real-roster cases: **{u['total_cases']}**",
+                  f"- Center verdict already Fair Trade: "
+                  f"**{u['center_fair_cases']}**",
+                  f"- Directional center verdicts evaluated: "
+                  f"**{u['directional_center_verdict_cases']}**",
+                  "",
+                  "## Directional verdict survival",
+                  "",
+                  f"- **Sensitivity Robust:** {s['direction_robust']} "
+                  f"({100*s['direction_robust_share']:.1f}%)",
+                  f"- **Fragile → Fair Trade:** "
+                  f"{s['softened_to_fair']} "
+                  f"({100*s['softened_to_fair_share']:.1f}%)",
+                  f"- **Fragile → Opposite side favored:** "
+                  f"{s['flipped_direction']} "
+                  f"({100*s['flipped_direction_share']:.1f}%)",
+                  f"- Exact Slight/Strong label unchanged: "
+                  f"{s['same_exact_live_label']} "
+                  f"({100*s['same_exact_live_label_share']:.1f}%)",
+                  "",
+                  "## By trade structure",
+                  "",
+                  "| Structure | Cases | Center fair | Directional | Robust | → Fair | Flipped |",
+                  "|---|---:|---:|---:|---:|---:|---:|",
+              ]
+
+              for key, row in result["by_structure"].items():
+                  lines.append(
+                      f"| {key} | {row['cases']} | "
+                      f"{row['center_fair']} | "
+                      f"{row['directional']} | "
+                      f"{row['direction_robust']} | "
+                      f"{row['softened_to_fair']} | "
+                      f"{row['flipped_direction']} |"
+                  )
+
+              lines += [
+                  "",
+                  "## By center verdict margin",
+                  "",
+                  "| Margin | Directional | Robust | → Fair | Flipped |",
+                  "|---|---:|---:|---:|---:|",
+              ]
+
+              for key, row in result[
+                  "by_center_margin_bucket"
+              ].items():
+                  lines.append(
+                      f"| {key} | {row['directional']} | "
+                      f"{row['direction_robust']} | "
+                      f"{row['softened_to_fair']} | "
+                      f"{row['flipped_direction']} |"
+                  )
+
+              lines += [
+                  "",
+                  "## UI rule if promoted",
+                  "",
+                  "- Fair Trade center verdict: no directional robustness badge.",
+                  "- Directional verdict survives adverse corner at ≥7%: "
+                  "`Sensitivity Robust`.",
+                  "- Directional verdict falls into Fair Trade or flips: "
+                  "`Sensitivity Fragile`.",
+                  "- No probability/confidence percentage.",
+                  "",
+                  "## Guardrails",
+                  "",
+                  "- Fundamental Value unchanged.",
+                  "- Value Uncertainty unchanged.",
+                  "- Package Adjustment unchanged.",
+                  "- Trade Verdict unchanged.",
+                  "- Market Value V2 unchanged.",
+                  "- Team Utility unchanged.",
+                  "",
+              ]
+              return "\n".join(lines)
+
+
+          def write() -> None:
+              result = analyze()
+
+              OUTJSON.write_text(
+                  json.dumps(
+                      result,
+                      indent=2,
+                      sort_keys=True,
+                  ) + "\n",
+                  encoding="utf-8",
+              )
+              OUTMD.write_text(
+                  render(result),
+                  encoding="utf-8",
+              )
+
+              manifest = {
+                  "schema_version": 1,
+                  "study_id": result["study_id"],
+                  "decision": result["decision"],
+                  "production_change_authorized": False,
+                  "phase1_evaluator_sha256": sha(PHASE1),
+                  "phase1_result_sha256": sha(PHASE1_JSON),
+                  "index_sha256": sha(ROOT / "index.html"),
+                  "uncertainty_sha256": sha(
+                      ROOT /
+                      "scripts/artifacts/generated/value_uncertainty.json"
+                  ),
+                  "output_json_sha256": sha(OUTJSON),
+                  "output_md_sha256": sha(OUTMD),
+                  "evaluator_sha256":
+                      sha(Path(__file__).resolve()),
+              }
+              MANIFEST.write_text(
+                  json.dumps(
+                      manifest,
+                      indent=2,
+                      sort_keys=True,
+                  ) + "\n",
+                  encoding="utf-8",
+              )
+
+              print(json.dumps({
+                  "decision": result["decision"],
+                  "directional_cases":
+                      result["universe"][
+                          "directional_center_verdict_cases"
+                      ],
+                  "direction_robust_share":
+                      result["summary"]["direction_robust_share"],
+                  "softened_to_fair_share":
+                      result["summary"]["softened_to_fair_share"],
+                  "flipped_direction_share":
+                      result["summary"]["flipped_direction_share"],
+              }, indent=2))
+
+
+          def check() -> None:
+              result = read(OUTJSON)
+              assert (
+                  result["decision"]
+                  == "PASS_TRADE_ROBUSTNESS_V1_PHASE1B_LIVE_VERDICT_ALIGNMENT"
+              )
+              assert result["production_change_authorized"] is False
+              assert (
+                  result["production_thresholds"][
+                      "fair_trade_diff_pct_lt"
+                  ]
+                  == 0.07
+              )
+              assert (
+                  result["production_thresholds"][
+                      "slightly_favors_diff_pct_lt"
+                  ]
+                  == 0.20
+              )
+              u = result["universe"]
+              s = result["summary"]
+              assert (
+                  s["direction_robust"]
+                  + s["softened_to_fair"]
+                  + s["flipped_direction"]
+                  == u["directional_center_verdict_cases"]
+              )
+              assert u["total_cases"] == 28776
+              print("Trade Robustness V1 Phase 1B checks PASS")
+
+
+          def selftest() -> None:
+              assert verdict_class(100, 96)["label"] == "fair"
+              assert verdict_class(107, 100)["label"] == "fair"
+              assert verdict_class(108, 100)["label"] == "slight_a"
+              assert verdict_class(100, 108)["label"] == "slight_b"
+              assert verdict_class(121, 100)["label"] == "strong_a"
+              assert verdict_class(100, 121)["label"] == "strong_b"
+              print("Trade Robustness V1 Phase 1B self-test PASS")
+
+
+          def main() -> None:
+              parser = argparse.ArgumentParser()
+              group = parser.add_mutually_exclusive_group(
+                  required=True
+              )
+              group.add_argument("--selftest", action="store_true")
+              group.add_argument("--write", action="store_true")
+              group.add_argument("--check", action="store_true")
+              args = parser.parse_args()
+
+              if args.selftest:
+                  selftest()
+              elif args.write:
+                  write()
+              else:
+                  check()
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+      - name: Run Phase 1B live-verdict alignment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 research/trade-robustness-v1/trade_robustness_v1_phase1b_live_verdict_alignment.py --selftest
+          python3 research/trade-robustness-v1/trade_robustness_v1_phase1b_live_verdict_alignment.py --write
+          python3 research/trade-robustness-v1/trade_robustness_v1_phase1b_live_verdict_alignment.py --check
+
+          cat research/trade-robustness-v1/trade_robustness_v1_phase1b_live_verdict_alignment.md
+
+      - name: Prove production unchanged and exact research scope
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sha256sum -c "${RUNNER_TEMP}/immutable.sha256"
+
+          python3 - <<'PY'
+          import subprocess
+
+          allowed = {
+              "research/trade-robustness-v1/trade_robustness_v1_phase1b_live_verdict_alignment.py",
+              "research/trade-robustness-v1/trade_robustness_v1_phase1b_live_verdict_alignment.json",
+              "research/trade-robustness-v1/trade_robustness_v1_phase1b_live_verdict_alignment.md",
+              "research/trade-robustness-v1/trade_robustness_v1_phase1b_manifest.json",
+          }
+
+          actual = {
+              line[3:]
+              for line in subprocess.check_output(
+                  [
+                      "git",
+                      "status",
+                      "--porcelain",
+                      "--untracked-files=all",
+                  ],
+                  text=True,
+              ).splitlines()
+              if line.strip()
+          }
+
+          unexpected = actual - allowed
+          if unexpected:
+              raise SystemExit(
+                  "Unexpected Trade Robustness Phase 1B changes: "
+                  + ", ".join(sorted(unexpected))
+              )
+
+          print(
+              "PASS: Phase 1B changed research artifacts only."
+          )
+          PY
+
+          git diff --check
+
+      - name: Postflight repository regression suite
+        run: python3 scripts/validation/repo_regression_checks.py
+
+      - name: Commit Phase 1B research
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add research/trade-robustness-v1/
+
+          git diff --cached --check
+          git commit -m "research: align Trade Robustness V1 to live verdict thresholds"
+          git push origin main
+
+      - name: Final clean-tree proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain --untracked-files=all)"
+          echo "PASS: Trade Robustness V1 Phase 1B committed cleanly."
