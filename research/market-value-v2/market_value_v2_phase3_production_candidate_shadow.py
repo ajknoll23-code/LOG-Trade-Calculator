@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.util
+import json
+import math
+from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+from statistics import median
+
+SCRIPT = Path(__file__).resolve()
+ROOT = SCRIPT.parents[2]
+OUTDIR = SCRIPT.parent
+
+PHASE2 = OUTDIR / "market_value_v2_phase2_voter_policy_robustness.json"
+SNAPSHOT = OUTDIR / "market_value_v2_phase2_vote_snapshot.json"
+MV1_PY = ROOT / "scripts/market/build_market_value.py"
+KTC_PY = ROOT / "scripts/market/ktc_pipeline.py"
+PROD = ROOT / "scripts/artifacts/generated/market_values.json"
+
+CAND = OUTDIR / "market_value_v2_phase3_candidate_market_values.json"
+CAND_MD = OUTDIR / "market_value_v2_phase3_candidate_market_value_report.md"
+OUTJSON = OUTDIR / "market_value_v2_phase3_production_candidate_shadow.json"
+OUTMD = OUTDIR / "market_value_v2_phase3_production_candidate_shadow.md"
+MANIFEST = OUTDIR / "market_value_v2_phase3_manifest.json"
+
+METHOD = "market-value-v2-balanced-blended-v1"
+SCALE = "league_rank_quantile_mapped_to_trade_desk_points_v1"
+GUEST_WEIGHT = 0.50
+CAP = 30.0
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def load(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+def q(vals, quantile):
+    vals = sorted(float(x) for x in vals)
+    if not vals:
+        return None
+    pos = (len(vals)-1)*quantile
+    lo, hi = math.floor(pos), math.ceil(pos)
+    if lo == hi:
+        return vals[lo]
+    f = pos-lo
+    return vals[lo]*(1-f)+vals[hi]*f
+
+def corr(xs, ys):
+    if len(xs) < 2 or len(xs) != len(ys):
+        return None
+    mx, my = sum(xs)/len(xs), sum(ys)/len(ys)
+    vx = sum((x-mx)**2 for x in xs)
+    vy = sum((y-my)**2 for y in ys)
+    if vx <= 0 or vy <= 0:
+        return None
+    return sum((x-mx)*(y-my) for x,y in zip(xs,ys))/math.sqrt(vx*vy)
+
+def weights(rows, ktc):
+    counts = defaultdict(int)
+    for r in rows:
+        counts[str(r["voter_roster_id"])] += 1
+    out = {}
+    for voter, n in counts.items():
+        group = "league" if ktc.is_league_voter(voter) else "guest"
+        mult = 1.0 if group == "league" else GUEST_WEIGHT
+        ballot = min(1.0, CAP/float(n))*mult
+        out[voter] = {
+            "group": group,
+            "raw_votes": n,
+            "ballot_weight": ballot,
+            "effective_votes": n*ballot
+        }
+    total = sum(v["effective_votes"] for v in out.values())
+    for v in out.values():
+        v["effective_share_pct"] = (
+            100*v["effective_votes"]/total if total else 0
+        )
+    return out
+
+def pairwise(rows, voter_weights):
+    out = []
+    for r in rows:
+        w = voter_weights[str(r["voter_roster_id"])]["ballot_weight"]
+        if w <= 0:
+            continue
+        k,t,c = r["keep"],r["trade"],r["cut"]
+        if k and t and c:
+            out.extend([(k,t,w),(k,c,w),(t,c,w)])
+    return out
+
+def validate(candidate, model_values):
+    assert candidate["schema_version"] == 1
+    assert candidate["method_version"] == METHOD
+    assert candidate["scale_semantics"] == SCALE
+    players = candidate["players"]
+    if len(players) < 500:
+        raise RuntimeError(f"candidate coverage too small: {len(players)}")
+
+    for key,row in players.items():
+        if int(row["fundamental_value"]) != int(model_values[key]["value"]):
+            raise RuntimeError(f"FV changed inside market candidate: {key}")
+
+    fundamentals = sorted(int(r["fundamental_value"]) for r in players.values())
+    markets = sorted(int(r["market_value"]) for r in players.values())
+    if fundamentals != markets:
+        raise RuntimeError("covered FV distribution not exactly preserved")
+
+    ordered = sorted(
+        players.items(),
+        key=lambda kv: (-float(kv[1]["market_rating"]),kv[0])
+    )
+    prior_rating = prior_value = None
+    for key,row in ordered:
+        rating = float(row["market_rating"])
+        value = int(row["market_value"])
+        if prior_rating is not None and rating < prior_rating and value > prior_value:
+            raise RuntimeError(f"market ordering drift at {key}")
+        prior_rating, prior_value = rating, value
+
+def build():
+    phase2 = json.loads(PHASE2.read_text())
+    snapshot = json.loads(SNAPSHOT.read_text())
+    prod = json.loads(PROD.read_text())
+
+    if phase2["decision"] != "ACTIONABLE_FOR_PROMOTION_SHADOW":
+        raise RuntimeError("Phase 2 no longer actionable")
+    if not phase2["all_primary_gates_pass"]:
+        raise RuntimeError("Phase 2 gates no longer pass")
+
+    mv1 = load(MV1_PY, "mv1")
+    ktc = load(KTC_PY, "ktc")
+
+    cfg = mv1.snapshot_values.load_from_html(mv1.INDEX_PATH)
+    model_values = mv1.snapshot_values.compute_all_values(cfg)
+
+    rows = snapshot["rows"]
+    vw = weights(rows, ktc)
+    pairs = pairwise(rows, vw)
+    ratings = ktc.weighted_bradley_terry(pairs)
+    resolved, audit = mv1.resolve_league_ratings(model_values, ratings)
+    calibrated = mv1.quantile_calibrate(model_values, resolved)
+
+    total_eff = sum(v["effective_votes"] for v in vw.values())
+    group_eff = {"league":0.0,"guest":0.0}
+    group_raw = {"league":0,"guest":0}
+    group_voters = {"league":0,"guest":0}
+    for v in vw.values():
+        g = v["group"]
+        group_eff[g] += v["effective_votes"]
+        group_raw[g] += v["raw_votes"]
+        group_voters[g] += 1
+    largest_voter, largest_info = max(
+        vw.items(), key=lambda kv: kv[1]["effective_share_pct"]
+    )
+
+    players = {
+        key: {
+            **row,
+            "evidence": {
+                "largest_effective_voter_share_pct":
+                    round(largest_info["effective_share_pct"],4),
+                "phase2_robustness_passed": True
+            }
+        }
+        for key,row in calibrated.items()
+    }
+
+    policy = {
+        "method_version": METHOD,
+        "league_group_multiplier": 1.0,
+        "guest_group_multiplier": GUEST_WEIGHT,
+        "per_voter_effective_lifetime_cap": CAP,
+        "daily_cap": int(ktc.MAX_VOTES_PER_VOTER_PER_DAY),
+        "source": "Phase 2 frozen counted vote snapshot",
+        "scale_semantics": SCALE,
+        "fundamental_formula_policy": "unchanged",
+        "team_utility_policy": "unchanged",
+        "live_trade_verdict_policy": "unchanged"
+    }
+    policy_hash = hashlib.sha256(
+        json.dumps(policy,sort_keys=True,separators=(",",":")).encode()
+    ).hexdigest()
+
+    candidate = {
+        "schema_version": 1,
+        "method_version": METHOD,
+        "scale_semantics": SCALE,
+        "generated_at_utc":
+            datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
+        "policy": policy,
+        "policy_sha256": policy_hash,
+        "source_file_sha256": {
+            "index_html": sha(mv1.INDEX_PATH),
+            "phase2_vote_snapshot": sha(SNAPSHOT),
+            "phase2_result": sha(PHASE2)
+        },
+        "market_quality": {
+            "raw_votes": len(rows),
+            "league_raw_votes": group_raw["league"],
+            "guest_raw_votes": group_raw["guest"],
+            "league_voters": group_voters["league"],
+            "guest_voters": group_voters["guest"],
+            "total_effective_votes": round(total_eff,6),
+            "league_effective_votes": round(group_eff["league"],6),
+            "guest_effective_votes": round(group_eff["guest"],6),
+            "largest_effective_voter_id": largest_voter,
+            "largest_effective_voter_share_pct":
+                round(largest_info["effective_share_pct"],4)
+        },
+        "counts": {
+            "fundamental_model_players": len(model_values),
+            "raw_market_ratings": len(ratings),
+            "resolved_market_players": len(players),
+            "market_coverage_pct_of_model":
+                round(100*len(players)/max(1,len(model_values)),2)
+        },
+        "identity_audit": audit,
+        "players": players
+    }
+
+    validate(candidate, model_values)
+    CAND.write_text(json.dumps(candidate,indent=2,sort_keys=True)+"\n")
+
+    v1 = prod.get("players") or {}
+    common = sorted(set(players)&set(v1))
+    added = sorted(set(players)-set(v1))
+    dropped = sorted(set(v1)-set(players))
+
+    abs_delta=[]
+    r2=[]
+    r1=[]
+    movers=[]
+    for key in common:
+        a,b = players[key],v1[key]
+        d = int(a["market_value"])-int(b["market_value"])
+        abs_delta.append(abs(d))
+        r2.append(float(a["market_rank"]))
+        r1.append(float(b["market_rank"]))
+        movers.append({
+            "player":key,
+            "pos":a.get("pos"),
+            "v1":int(b["market_value"]),
+            "v2":int(a["market_value"]),
+            "delta":d,
+            "v1_rank":float(b["market_rank"]),
+            "v2_rank":float(a["market_rank"])
+        })
+    movers.sort(key=lambda x:(-abs(x["delta"]),x["player"]))
+
+    top2 = {k for k,_ in sorted(
+        players.items(),key=lambda kv:(float(kv[1]["market_rank"]),kv[0])
+    )[:50]}
+    top1 = {k for k,_ in sorted(
+        v1.items(),key=lambda kv:(float(kv[1]["market_rank"]),kv[0])
+    )[:50]}
+
+    result = {
+        "schema_version":1,
+        "study_id":"market-value-v2-phase3-production-candidate-shadow",
+        "decision":"PASS_MARKET_VALUE_V2_PHASE3_PRODUCTION_CANDIDATE_SHADOW",
+        "research_only":True,
+        "production_change_authorized":False,
+        "deployment_authorized":False,
+        "candidate":{
+            "resolved_players":len(players),
+            "raw_votes":len(rows),
+            "effective_votes":round(total_eff,6),
+            "candidate_sha256":sha(CAND)
+        },
+        "vs_deployed_v1":{
+            "common_players":len(common),
+            "added_players":added,
+            "added_count":len(added),
+            "dropped_players":dropped,
+            "dropped_count":len(dropped),
+            "rank_correlation":round(corr(r2,r1),6),
+            "top50_overlap":len(top2&top1)/50.0,
+            "median_abs_value_delta":float(median(abs_delta)),
+            "p90_abs_value_delta":float(q(abs_delta,0.90)),
+            "max_abs_value_delta":max(abs_delta),
+            "top_movers":movers[:30]
+        },
+        "integrity_gates":{
+            "phase2_robustness_passed":True,
+            "production_compatible_schema":True,
+            "coverage_at_least_500":len(players)>=500,
+            "fundamental_values_unchanged":True,
+            "covered_value_distribution_preserved":True,
+            "market_order_monotonic":True
+        },
+        "next_step_rule":(
+            "A green temporary consumer rehearsal with this exact candidate "
+            "authorizes a separate deployment workflow. Deployment must change "
+            "only the Market Value builder/artifacts required to reproduce V2."
+        )
+    }
+    OUTJSON.write_text(json.dumps(result,indent=2,sort_keys=True)+"\n")
+
+    lines=[
+        "# Market Value V2 Phase 3 — Production-Candidate Shadow","",
+        f"**Decision:** `{result['decision']}`","",
+        "**RESEARCH ONLY. Market Value V1 remains deployed.**","",
+        "## Candidate",
+        f"- Resolved players: **{len(players)}**",
+        f"- Raw frozen ballots: **{len(rows)}**",
+        f"- Effective vote mass: **{total_eff:.1f}**","",
+        "## V2 candidate vs deployed V1",
+        f"- Common players: **{len(common)}**",
+        f"- Added players: **{len(added)}**",
+        f"- Dropped players: **{len(dropped)}**",
+        f"- Rank correlation: **{result['vs_deployed_v1']['rank_correlation']:.6f}**",
+        f"- Top-50 overlap: **{100*result['vs_deployed_v1']['top50_overlap']:.1f}%**",
+        f"- Median absolute value delta: **{result['vs_deployed_v1']['median_abs_value_delta']:.1f}**",
+        f"- P90 absolute value delta: **{result['vs_deployed_v1']['p90_abs_value_delta']:.1f}**",
+        f"- Max absolute value delta: **{result['vs_deployed_v1']['max_abs_value_delta']:.0f}**","",
+        "## Largest changes","",
+        "| Player | Pos | V1 | V2 | Δ |",
+        "|---|---|---:|---:|---:|"
+    ]
+    for m in movers[:30]:
+        lines.append(
+            f"| {m['player']} | {m['pos']} | {m['v1']} | {m['v2']} | {m['delta']:+} |"
+        )
+    lines += ["","## Integrity gates",""]
+    for gate,passed in result["integrity_gates"].items():
+        lines.append(f"- `{gate}`: **{'PASS' if passed else 'FAIL'}**")
+    OUTMD.write_text("\n".join(lines)+"\n")
+
+    CAND_MD.write_text(
+        "# Trade Desk Market Value V2 Candidate\n\n"
+        "**Candidate only; not deployed by this phase.**\n\n"
+        f"- Resolved players: **{len(players)}**\n"
+        f"- Frozen ballots: **{len(rows)}**\n"
+        f"- Effective ballots: **{total_eff:.1f}**\n"
+    )
+
+    return result
+
+def write():
+    result=build()
+    manifest={
+        "schema_version":1,
+        "study_id":result["study_id"],
+        "decision":result["decision"],
+        "production_change_authorized":False,
+        "deployment_authorized":False,
+        "phase2_result_sha256":sha(PHASE2),
+        "phase2_snapshot_sha256":sha(SNAPSHOT),
+        "production_market_v1_sha256":sha(PROD),
+        "candidate_market_values_sha256":sha(CAND),
+        "candidate_report_sha256":sha(CAND_MD),
+        "output_json_sha256":sha(OUTJSON),
+        "output_md_sha256":sha(OUTMD),
+        "evaluator_sha256":sha(SCRIPT)
+    }
+    MANIFEST.write_text(json.dumps(manifest,indent=2,sort_keys=True)+"\n")
+    print(json.dumps({
+        "decision":result["decision"],
+        "resolved_players":result["candidate"]["resolved_players"],
+        "rank_correlation":result["vs_deployed_v1"]["rank_correlation"],
+        "top50_overlap":result["vs_deployed_v1"]["top50_overlap"],
+        "median_abs_delta":result["vs_deployed_v1"]["median_abs_value_delta"]
+    },indent=2))
+
+def check():
+    result=json.loads(OUTJSON.read_text())
+    assert result["decision"]=="PASS_MARKET_VALUE_V2_PHASE3_PRODUCTION_CANDIDATE_SHADOW"
+    assert result["production_change_authorized"] is False
+    assert result["deployment_authorized"] is False
+    assert all(result["integrity_gates"].values())
+    assert result["candidate"]["resolved_players"]>=500
+    print("Market Value V2 Phase 3 checks PASS")
+
+def selftest():
+    assert GUEST_WEIGHT==0.50
+    assert CAP==30.0
+    assert SCALE=="league_rank_quantile_mapped_to_trade_desk_points_v1"
+    print("Market Value V2 Phase 3 self-test PASS")
+
+def main():
+    ap=argparse.ArgumentParser()
+    g=ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--selftest",action="store_true")
+    g.add_argument("--write",action="store_true")
+    g.add_argument("--check",action="store_true")
+    args=ap.parse_args()
+    if args.selftest:selftest()
+    elif args.write:write()
+    else:check()
+
+if __name__=="__main__":
+    main()
