@@ -10354,6 +10354,62 @@ function tradeRobustnessVerdictClass(totals){
   return {label:`strong_${side.toLowerCase()}`, side, strength:'strong', diffPct};
 }
 
+function tradeRobustnessPickEnvelope(asset){
+  if(!asset || asset.type !== 'pick') return null;
+
+  const match = String(asset.name || '').match(
+    /^(\d{4})\s+Rd\s+(\d+)\s+\((early|mid|late)\)$/i
+  );
+  if(!match) return null;
+
+  const season = match[1];
+  const round = Number(match[2]);
+  const slot = match[3].toLowerCase();
+
+  if(
+    !Number.isInteger(round) ||
+    round < 1 ||
+    round > 4 ||
+    !Array.isArray(PICK_SEASONS) ||
+    !PICK_SEASONS.includes(season)
+  ){
+    return null;
+  }
+
+  const center = Number(asset.value);
+  const expectedCenter = Number(pickValue(round, slot, season));
+  if(
+    !Number.isFinite(center) ||
+    !Number.isFinite(expectedCenter) ||
+    center !== expectedCenter
+  ){
+    return null;
+  }
+
+  const slotValues = ['early','mid','late'].map(
+    s => Number(pickValue(round, s, season))
+  );
+  if(slotValues.some(v => !Number.isFinite(v))){
+    return null;
+  }
+
+  const rangeLow = Math.min(...slotValues);
+  const rangeHigh = Math.max(...slotValues);
+  if(!(rangeLow <= center && center <= rangeHigh && rangeLow < rangeHigh)){
+    return null;
+  }
+
+  return {
+    center_value:center,
+    range_low:rangeLow,
+    range_high:rangeHigh,
+    round,
+    season,
+    slot,
+    range_semantics:'draft_slot_early_late_same_round_year',
+  };
+}
+
 function tradeRobustnessAssessment(){
   const centerTotals = tradeVerdictTotals();
   const centerVerdict = tradeRobustnessVerdictClass(centerTotals);
@@ -10366,16 +10422,43 @@ function tradeRobustnessAssessment(){
   }
 
   const allAssets = [...(state.A || []), ...(state.B || [])];
-  if(!allAssets.length || allAssets.some(a => a.type !== 'player')){
-    return {status:'unavailable', reason:'player_only_complete_coverage_required'};
+  if(
+    !allAssets.length ||
+    allAssets.some(a => a.type !== 'player' && a.type !== 'pick')
+  ){
+    return {
+      status:'unavailable',
+      reason:'supported_player_or_round_1_4_pick_assets_required',
+    };
   }
 
   const rowsByAsset = new Map();
+  let containsPick = false;
+  const pickRounds = [];
+
   for(const asset of allAssets){
-    const row = valueUncertaintyForPlayer(asset.name, asset.value);
-    if(!row){
-      return {status:'unavailable', reason:'missing_or_stale_uncertainty'};
+    let row = null;
+
+    if(asset.type === 'player'){
+      row = valueUncertaintyForPlayer(asset.name, asset.value);
+      if(!row){
+        return {
+          status:'unavailable',
+          reason:'missing_or_stale_player_uncertainty',
+        };
+      }
+    } else {
+      row = tradeRobustnessPickEnvelope(asset);
+      if(!row){
+        return {
+          status:'unavailable',
+          reason:'unsupported_or_stale_pick_sensitivity',
+        };
+      }
+      containsPick = true;
+      pickRounds.push(Number(row.round));
     }
+
     rowsByAsset.set(asset, row);
   }
 
@@ -10402,7 +10485,9 @@ function tradeRobustnessAssessment(){
   const robust = adverseVerdict.side === favoredSide;
   let outcome = 'robust';
   if(!robust){
-    outcome = adverseVerdict.side ? 'flipped_direction' : 'softened_to_fair';
+    outcome = adverseVerdict.side
+      ? 'flipped_direction'
+      : 'softened_to_fair';
   }
 
   return {
@@ -10410,12 +10495,20 @@ function tradeRobustnessAssessment(){
     favoredSide,
     outcome,
     robust,
+    containsPick,
+    pickRounds:[...new Set(pickRounds)].sort((a,b) => a-b),
+    sensitivityMode:containsPick
+      ? 'player_and_draft_slot'
+      : 'player_only',
     centerTotals,
     centerVerdict,
     adverseTotals,
     adverseVerdict,
   };
 }
+
+
+
 
 function renderTradeRobustness(){
   const anchor =
@@ -10441,10 +10534,18 @@ function renderTradeRobustness(){
   el.style.display = 'block';
   const a = Math.round(Number(result.adverseTotals.A) || 0).toLocaleString();
   const b = Math.round(Number(result.adverseTotals.B) || 0).toLocaleString();
-  const tooltip =
-    'Deterministic sensitivity-envelope stress test — NOT a probability or confidence interval. ' +
-    'Favored-side players are moved to their stored low values, the other side to stored highs, ' +
-    'then the live Trade Verdict and Package Adjustment are rerun.';
+  const containsPick = Boolean(result.containsPick);
+  const tooltip = containsPick
+    ? (
+        'Deterministic player-value + draft-slot sensitivity stress test — NOT a probability or confidence interval. ' +
+        'Players use their stored sensitivity-envelope extremes; eligible Round 1–4 picks use the late-to-early ' +
+        'slot range for the same round and year. The live Trade Verdict and Package Adjustment are then rerun.'
+      )
+    : (
+        'Deterministic sensitivity-envelope stress test — NOT a probability or confidence interval. ' +
+        'Favored-side players are moved to their stored low values, the other side to stored highs, ' +
+        'then the live Trade Verdict and Package Adjustment are rerun.'
+      );
 
   let stateClass = 'is-fragile';
   let icon = '!';
@@ -10463,6 +10564,8 @@ function renderTradeRobustness(){
     mainCopy = `Adverse case favors Side ${escapeHtml(flipped || '?')}`;
   }
 
+  const modeSuffix = containsPick ? ' · draft-slot stress' : '';
+
   el.innerHTML = `
     <div class="trade-robustness-card ${stateClass}" title="${escapeHtml(tooltip)}">
       <div class="trade-robustness-badge">
@@ -10471,11 +10574,13 @@ function renderTradeRobustness(){
       </div>
       <div class="trade-robustness-copy">
         <span class="trade-robustness-copy-main">${mainCopy}</span>
-        <span class="trade-robustness-copy-values">A ${a} / B ${b}</span>
+        <span class="trade-robustness-copy-values">A ${a} / B ${b}${modeSuffix}</span>
       </div>
     </div>
   `;
 }
+
+
 
 function syncValueUncertaintyFromGitHub(){
   fetch(VALUE_UNCERTAINTY_URL)
