@@ -1,6 +1,6 @@
 # Trade Robustness V1 Phase 3 — Pick Slot Sensitivity Shadow
 
-**Decision:** `HOLD_TRADE_ROBUSTNESS_V1_PHASE3_PICK_SLOT_SENSITIVITY_SHADOW`
+**Decision:** `PASS_TRADE_ROBUSTNESS_V1_PHASE3_PICK_SLOT_SENSITIVITY_SHADOW`
 
 **RESEARCH ONLY. No calculator behavior changed.**
 
@@ -38,7 +38,10 @@
 - rounds_5_6_explicitly_fail_closed: **PASS**
 - mixed_live_package_adjustment_exercised: **PASS**
 - year_discount_not_reestimated: **PASS**
-- production_change_authorized: **FAIL**
+
+## Guardrail
+
+- production_change_authorized: **NO**
 
 ## By trade structure
 

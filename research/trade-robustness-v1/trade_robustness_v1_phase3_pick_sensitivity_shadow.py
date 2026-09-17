@@ -589,9 +589,11 @@ def analyze() -> dict:
                 for c in cases
             ),
         "year_discount_not_reestimated": True,
-        "production_change_authorized": False,
     }
 
+    # Feasibility gates answer whether the pick-sensitivity method is
+    # supportable for a later promotion phase. Production authorization
+    # is intentionally FALSE here and is a guardrail, not a gate.
     passed = all(gates.values())
     decision = (
         "PASS_TRADE_ROBUSTNESS_V1_PHASE3_PICK_SLOT_SENSITIVITY_SHADOW"
@@ -736,6 +738,10 @@ def render(result: dict) -> str:
         )
 
     lines += [
+        "",
+        "## Guardrail",
+        "",
+        "- production_change_authorized: **NO**",
         "",
         "## By trade structure",
         "",
