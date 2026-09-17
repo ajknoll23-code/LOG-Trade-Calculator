@@ -1,0 +1,654 @@
+name: Identity V2 Phase 6 Exact-Scope Deployment
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  identity-v2-phase6:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install regression dependency
+        run: python3 -m pip install --disable-pip-version-check --no-cache-dir "requests>=2.32,<3"
+
+      - name: Freeze deployment baseline and verify Phase 5 anchor
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test "$(git branch --show-current)" = "main"
+          test -z "$(git status --porcelain --untracked-files=all)"
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          root = Path(".")
+          phase5_manifest = json.loads(
+              (root / "research/identity-v2/identity_v2_phase5_manifest.json")
+              .read_text(encoding="utf-8")
+          )
+          phase5_result = json.loads(
+              (root / "research/identity-v2/identity_v2_phase5_production_candidate_shadow.json")
+              .read_text(encoding="utf-8")
+          )
+
+          def sha(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          crosswalk = root / "scripts/identity_crosswalk.json"
+          resolver = root / "scripts/projections/resolve_fantasypros_sleeper_identity.py"
+          candidate = root / "research/identity-v2/identity_v2_phase5_direct_candidate_crosswalk.json"
+
+          if phase5_manifest["decision"] != "PASS_IDENTITY_V2_PHASE5_PRODUCTION_CANDIDATE_SHADOW":
+              raise SystemExit("Phase 5 manifest is not PASS")
+          if phase5_result["decision"] != "PASS_IDENTITY_V2_PHASE5_PRODUCTION_CANDIDATE_SHADOW":
+              raise SystemExit("Phase 5 result is not PASS")
+          if phase5_manifest["production_change_authorized"] is not False:
+              raise SystemExit("unexpected Phase 5 production authorization state")
+          if phase5_manifest["deployment_authorized"] is not False:
+              raise SystemExit("unexpected Phase 5 deployment authorization state")
+
+          checks = [
+              ("production crosswalk",
+               sha(crosswalk),
+               phase5_manifest["production_crosswalk_sha256"]),
+              ("production resolver",
+               sha(resolver),
+               phase5_manifest["production_resolver_sha256"]),
+              ("direct candidate",
+               sha(candidate),
+               phase5_manifest["direct_shadow_sha256"]),
+          ]
+          bad = [
+              (label, actual, expected)
+              for label, actual, expected in checks
+              if actual != expected
+          ]
+          if bad:
+              raise SystemExit(f"Phase 5 deployment anchor drifted: {bad}")
+
+          expected = {
+              "26313": ("Austin Booker", "11760"),
+              "27959": ("Gabe Jacas", "13457"),
+              "28290": ("Kendal Daniels", "13482"),
+          }
+          actual = {
+              str(k): (v["name"], str(v["sleeper_id"]))
+              for k, v in phase5_result["candidate_mappings"].items()
+          }
+          if actual != expected:
+              raise SystemExit(
+                  f"Phase 5 candidate mapping drift: expected={expected}, actual={actual}"
+              )
+
+          print("PASS: Phase 5 deployment anchor is byte-for-byte current.")
+          PY
+
+          cp scripts/identity_crosswalk.json \
+            "${RUNNER_TEMP}/identity_crosswalk.predeploy.json"
+
+          sha256sum \
+            index.html \
+            scripts/projections/resolve_fantasypros_sleeper_identity.py \
+            research/identity-v2/identity_v2_phase5_manifest.json \
+            research/identity-v2/identity_v2_phase5_production_candidate_shadow.json \
+            research/identity-v2/identity_v2_phase5_direct_candidate_crosswalk.json \
+            > "${RUNNER_TEMP}/immutable.sha256"
+
+          if test -f free-agent-board.html; then
+            sha256sum free-agent-board.html >> "${RUNNER_TEMP}/immutable.sha256"
+          fi
+
+      - name: Preflight full repository regression suite
+        run: python3 scripts/validation/repo_regression_checks.py
+
+      - name: Apply exact three-mapping production candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          import shutil
+          from collections import defaultdict
+          from pathlib import Path
+
+          root = Path(".")
+          current_path = root / "scripts/identity_crosswalk.json"
+          candidate_path = (
+              root / "research/identity-v2/"
+              "identity_v2_phase5_direct_candidate_crosswalk.json"
+          )
+
+          current = json.loads(current_path.read_text(encoding="utf-8"))
+          candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+
+          expected = {
+              "26313": ("Austin Booker", "11760"),
+              "27959": ("Gabe Jacas", "13457"),
+              "28290": ("Kendal Daniels", "13482"),
+          }
+          targets = set(expected)
+          hold = "26157"  # Jonah Elliss
+
+          def index(rows, label):
+              out = {}
+              for row in rows:
+                  fpid = row.get("fantasypros_id")
+                  if fpid in (None, ""):
+                      continue
+                  fpid = str(fpid)
+                  if fpid in out:
+                      raise SystemExit(f"{label}: duplicate FPID {fpid}")
+                  out[fpid] = row
+              return out
+
+          def canon(row):
+              return json.dumps(row, sort_keys=True, separators=(",", ":"))
+
+          a = index(current, "current")
+          b = index(candidate, "candidate")
+
+          if set(a) != set(b):
+              raise SystemExit("candidate/current FPID universe differs")
+
+          changed = sorted(
+              fpid for fpid in a
+              if canon(a[fpid]) != canon(b[fpid])
+          )
+          if set(changed) != targets or len(changed) != 3:
+              raise SystemExit(
+                  f"candidate scope is not exactly three frozen FPIDs: {changed}"
+              )
+
+          for fpid, (name, sid) in expected.items():
+              row = b[fpid]
+              if str(row.get("name") or "") != name:
+                  raise SystemExit(f"name mismatch for {fpid}")
+              if str(row.get("sleeper_id") or "") != sid:
+                  raise SystemExit(f"Sleeper ID mismatch for {fpid}")
+              if str(row.get("candidate_sleeper_id") or "") != sid:
+                  raise SystemExit(f"candidate SID mismatch for {fpid}")
+              if row.get("requires_manual_review") is not False:
+                  raise SystemExit(f"{fpid} still requires manual review")
+              if str(row.get("match_confidence")) != "high":
+                  raise SystemExit(f"{fpid} is not high confidence")
+
+          if canon(a.get(hold)) != canon(b.get(hold)):
+              raise SystemExit("Jonah Elliss changed in deployment candidate")
+
+          by_sid = defaultdict(list)
+          for row in candidate:
+              sid = row.get("sleeper_id")
+              fpid = row.get("fantasypros_id")
+              if sid in (None, "") or fpid in (None, ""):
+                  continue
+              if row.get("requires_manual_review"):
+                  continue
+              by_sid[str(sid)].append(str(fpid))
+
+          collisions = {
+              sid: fpids for sid, fpids in by_sid.items()
+              if len(fpids) > 1
+          }
+          if collisions:
+              raise SystemExit(
+                  f"authoritative Sleeper-ID collision(s): {collisions}"
+              )
+
+          shutil.copyfile(candidate_path, current_path)
+          print(
+              "PASS: installed exact three-mapping Identity V2 production candidate: "
+              + ", ".join(changed)
+          )
+          PY
+
+      - name: Regenerate identity and Team Utility dependent artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import importlib.util
+          import json
+          from pathlib import Path
+
+          root = Path(".")
+          resolver_path = (
+              root / "scripts/projections/resolve_fantasypros_sleeper_identity.py"
+          )
+          spec = importlib.util.spec_from_file_location(
+              "identity_prod_resolver", resolver_path
+          )
+          if spec is None or spec.loader is None:
+              raise SystemExit("cannot load production identity resolver")
+          mod = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+
+          rows = json.loads(
+              (root / "scripts/identity_crosswalk.json").read_text(encoding="utf-8")
+          )
+          report = mod.build_production_report(rows)
+          report_path = (
+              root / "scripts/artifacts/reports/identity_collision_report.md"
+          )
+          report_path.parent.mkdir(parents=True, exist_ok=True)
+          report_path.write_text(report, encoding="utf-8")
+          print("PASS: regenerated unified identity report from deployed candidate.")
+          PY
+
+          python3 scripts/projections/build_team_utility_lineup_projections.py --write
+          python3 scripts/projections/build_team_utility_lineup_projections.py --check
+
+      - name: Prove successor resolver preserves only the three new mappings
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import importlib.util
+          import json
+          from collections import defaultdict
+          from pathlib import Path
+
+          root = Path(".")
+          resolver_path = (
+              root / "scripts/projections/resolve_fantasypros_sleeper_identity.py"
+          )
+          spec = importlib.util.spec_from_file_location(
+              "identity_prod_resolver", resolver_path
+          )
+          if spec is None or spec.loader is None:
+              raise SystemExit("cannot load production identity resolver")
+          mod = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+
+          baseline = json.loads(
+              Path("/tmp/identity_crosswalk.predeploy.json").read_text(
+                  encoding="utf-8"
+              )
+          ) if Path("/tmp/identity_crosswalk.predeploy.json").exists() else None
+
+          # RUNNER_TEMP is not guaranteed to be /tmp; resolve from environment.
+          import os
+          if baseline is None:
+              baseline_path = (
+                  Path(os.environ["RUNNER_TEMP"]) /
+                  "identity_crosswalk.predeploy.json"
+              )
+              baseline = json.loads(
+                  baseline_path.read_text(encoding="utf-8")
+              )
+
+          deployed = json.loads(
+              (root / "scripts/identity_crosswalk.json").read_text(encoding="utf-8")
+          )
+
+          fp_doc = mod.read_json(mod.FP_PATH)
+          totals = mod.read_json(mod.SLEEPER_TOTAL_PATH)
+          raw = mod.read_json(mod.SLEEPER_RAW_PATH)
+          teams = mod.read_json(mod.TEAM_REFRESH_PATH)
+
+          control = mod.build_production_crosswalk(
+              fp_doc, totals, raw, teams, baseline
+          )
+          seeded = mod.build_production_crosswalk(
+              fp_doc, totals, raw, teams, deployed
+          )
+
+          expected = {
+              "26313": "11760",
+              "27959": "13457",
+              "28290": "13482",
+          }
+          targets = set(expected)
+          hold = "26157"
+
+          def index(rows, label):
+              out = {}
+              for row in rows:
+                  fpid = row.get("fantasypros_id")
+                  if fpid in (None, ""):
+                      continue
+                  fpid = str(fpid)
+                  if fpid in out:
+                      raise SystemExit(f"{label}: duplicate FPID {fpid}")
+                  out[fpid] = row
+              return out
+
+          def canon(row):
+              return json.dumps(row, sort_keys=True, separators=(",", ":"))
+
+          c = index(control, "control")
+          s = index(seeded, "seeded")
+          if set(c) != set(s):
+              raise SystemExit("successor control/seeded universes differ")
+
+          changed = sorted(
+              fpid for fpid in c
+              if canon(c[fpid]) != canon(s[fpid])
+          )
+          if set(changed) != targets or len(changed) != 3:
+              raise SystemExit(
+                  f"successor seeded-vs-control scope mismatch: {changed}"
+              )
+
+          for fpid, sid in expected.items():
+              row = s[fpid]
+              if str(row.get("sleeper_id") or "") != sid:
+                  raise SystemExit(
+                      f"successor lost frozen pair {fpid}->{sid}"
+                  )
+              if row.get("requires_manual_review") is not False:
+                  raise SystemExit(
+                      f"successor returned {fpid} to manual review"
+                  )
+
+          if canon(c.get(hold)) != canon(s.get(hold)):
+              raise SystemExit("Jonah Elliss changed in successor resolver")
+
+          by_sid = defaultdict(list)
+          for row in seeded:
+              sid = row.get("sleeper_id")
+              fpid = row.get("fantasypros_id")
+              if sid in (None, "") or fpid in (None, ""):
+                  continue
+              if row.get("requires_manual_review"):
+                  continue
+              by_sid[str(sid)].append(str(fpid))
+          collisions = {
+              sid: fpids for sid, fpids in by_sid.items()
+              if len(fpids) > 1
+          }
+          if collisions:
+              raise SystemExit(
+                  f"successor authoritative SID collision(s): {collisions}"
+              )
+
+          print(
+              "PASS: successor resolver preserves exactly the three deployed "
+              "Identity V2 mappings and leaves Jonah Elliss held."
+          )
+          PY
+
+      - name: Full post-deployment repository regression suite
+        run: python3 scripts/validation/repo_regression_checks.py
+
+      - name: Write Identity V2 deployment confirmation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          root = Path(".")
+          outdir = root / "research/identity-v2"
+          out_json = outdir / "identity_v2_phase6_deployment_confirmation.json"
+          out_md = outdir / "identity_v2_phase6_deployment_confirmation.md"
+          manifest_path = outdir / "identity_v2_phase6_manifest.json"
+
+          pre_path = (
+              Path(os.environ["RUNNER_TEMP"]) /
+              "identity_crosswalk.predeploy.json"
+          )
+          pre = json.loads(pre_path.read_text(encoding="utf-8"))
+          post_path = root / "scripts/identity_crosswalk.json"
+          post = json.loads(post_path.read_text(encoding="utf-8"))
+
+          def sha(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          def index(rows):
+              return {
+                  str(r["fantasypros_id"]): r
+                  for r in rows
+                  if r.get("fantasypros_id") not in (None, "")
+              }
+
+          def canon(row):
+              return json.dumps(row, sort_keys=True, separators=(",", ":"))
+
+          a, b = index(pre), index(post)
+          changed = sorted(
+              fpid for fpid in a
+              if canon(a[fpid]) != canon(b[fpid])
+          )
+
+          expected = {
+              "26313": {
+                  "name": "Austin Booker",
+                  "sleeper_id": "11760",
+              },
+              "27959": {
+                  "name": "Gabe Jacas",
+                  "sleeper_id": "13457",
+              },
+              "28290": {
+                  "name": "Kendal Daniels",
+                  "sleeper_id": "13482",
+              },
+          }
+          if set(changed) != set(expected) or len(changed) != 3:
+              raise SystemExit(
+                  f"deployment confirmation scope mismatch: {changed}"
+              )
+
+          result = {
+              "schema_version": 1,
+              "study_id": "identity-v2-phase6-exact-scope-deployment",
+              "status": "DEPLOYED_VALIDATED",
+              "decision": "PASS_IDENTITY_V2_PHASE6_DEPLOYED",
+              "generated_at_utc":
+                  datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+              "repo_commit_sha_before_deployment":
+                  subprocess.check_output(
+                      ["git", "rev-parse", "HEAD"], text=True
+                  ).strip(),
+              "production_change_applied": True,
+              "deployed_mapping_count": 3,
+              "deployed_mappings": expected,
+              "changed_fpids": changed,
+              "jonah_elliss_remains_held": True,
+              "generic_position_override_deployed": False,
+              "production_resolver_source_changed": False,
+              "predeploy_crosswalk_sha256": sha(pre_path),
+              "postdeploy_crosswalk_sha256": sha(post_path),
+              "identity_report_sha256": sha(
+                  root / "scripts/artifacts/reports/identity_collision_report.md"
+              ),
+              "team_utility_projection_sha256": sha(
+                  root / "scripts/artifacts/generated/"
+                  "team_utility_lineup_projections.json"
+              ),
+              "team_utility_report_sha256": sha(
+                  root / "scripts/artifacts/reports/"
+                  "team_utility_lineup_projection_report.md"
+              ),
+              "phase5_manifest_sha256": sha(
+                  outdir / "identity_v2_phase5_manifest.json"
+              ),
+              "full_repo_regression_passed": True,
+              "successor_resolver_exact_scope_passed": True
+          }
+
+          out_json.write_text(
+              json.dumps(result, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8"
+          )
+
+          lines = [
+              "# Identity V2 Phase 6 — Deployment Confirmation",
+              "",
+              f"**Decision:** `{result['decision']}`",
+              "",
+              "**Identity V2 exact-scope candidate is deployed.**",
+              "",
+              "## Production changes",
+              "",
+              "- Deployed authoritative identity mappings: **3**",
+              "- Austin Booker: FPID `26313` → Sleeper `11760`",
+              "- Gabe Jacas: FPID `27959` → Sleeper `13457`",
+              "- Kendal Daniels: FPID `28290` → Sleeper `13482`",
+              "- Jonah Elliss remains held.",
+              "- No generic LB↔DL or DB↔LB override was deployed.",
+              "- Production resolver source code was not changed.",
+              "",
+              "## Validation",
+              "",
+              "- Exact production crosswalk diff: **3 FPIDs only**",
+              "- Authoritative Sleeper-ID collisions: **0**",
+              "- Successor resolver exact-scope check: **PASS**",
+              "- Team Utility identity-dependent artifacts regenerated: **PASS**",
+              "- Full repository regression suite: **PASS**",
+              "",
+              "Identity V2 is complete for this reviewed candidate set.",
+              ""
+          ]
+          out_md.write_text("\n".join(lines), encoding="utf-8")
+
+          manifest = {
+              "schema_version": 1,
+              "study_id": result["study_id"],
+              "decision": result["decision"],
+              "production_change_applied": True,
+              "deployed_mapping_count": 3,
+              "predeploy_crosswalk_sha256":
+                  result["predeploy_crosswalk_sha256"],
+              "postdeploy_crosswalk_sha256":
+                  result["postdeploy_crosswalk_sha256"],
+              "phase5_manifest_sha256":
+                  result["phase5_manifest_sha256"],
+              "deployment_confirmation_json_sha256": sha(out_json),
+              "deployment_confirmation_md_sha256": sha(out_md),
+              "identity_report_sha256": result["identity_report_sha256"],
+              "team_utility_projection_sha256":
+                  result["team_utility_projection_sha256"],
+              "team_utility_report_sha256":
+                  result["team_utility_report_sha256"]
+          }
+          manifest_path.write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8"
+          )
+
+          print(json.dumps({
+              "decision": result["decision"],
+              "changed_fpids": changed,
+              "postdeploy_crosswalk_sha256":
+                  result["postdeploy_crosswalk_sha256"]
+          }, indent=2))
+          PY
+
+      - name: Prove exact deployment file scope
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sha256sum -c "${RUNNER_TEMP}/immutable.sha256"
+
+          python3 - <<'PY'
+          import subprocess
+
+          allowed = {
+              "scripts/identity_crosswalk.json",
+              "scripts/artifacts/reports/identity_collision_report.md",
+              "scripts/artifacts/generated/team_utility_lineup_projections.json",
+              "scripts/artifacts/reports/team_utility_lineup_projection_report.md",
+              "research/identity-v2/identity_v2_phase6_deployment_confirmation.json",
+              "research/identity-v2/identity_v2_phase6_deployment_confirmation.md",
+              "research/identity-v2/identity_v2_phase6_manifest.json",
+          }
+
+          actual = {
+              line[3:]
+              for line in subprocess.check_output(
+                  ["git", "status", "--porcelain", "--untracked-files=all"],
+                  text=True
+              ).splitlines()
+              if line.strip()
+          }
+
+          unexpected = actual - allowed
+          if unexpected:
+              raise SystemExit(
+                  "Unexpected deployment file changes: "
+                  + ", ".join(sorted(unexpected))
+              )
+
+          required = {
+              "scripts/identity_crosswalk.json",
+              "research/identity-v2/identity_v2_phase6_deployment_confirmation.json",
+              "research/identity-v2/identity_v2_phase6_deployment_confirmation.md",
+              "research/identity-v2/identity_v2_phase6_manifest.json",
+          }
+          missing = required - actual
+          if missing:
+              raise SystemExit(
+                  "Required deployment files did not change: "
+                  + ", ".join(sorted(missing))
+              )
+
+          print(
+              "PASS: deployment changed only approved production/derived/release files."
+          )
+          PY
+
+          git diff --check
+
+      - name: Final regression proof before commit
+        run: python3 scripts/validation/repo_regression_checks.py
+
+      - name: Commit Identity V2 deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            scripts/identity_crosswalk.json \
+            scripts/artifacts/reports/identity_collision_report.md \
+            scripts/artifacts/generated/team_utility_lineup_projections.json \
+            scripts/artifacts/reports/team_utility_lineup_projection_report.md \
+            research/identity-v2/identity_v2_phase6_deployment_confirmation.json \
+            research/identity-v2/identity_v2_phase6_deployment_confirmation.md \
+            research/identity-v2/identity_v2_phase6_manifest.json
+
+          git diff --cached --check
+          git commit -m "Deploy Unified Identity V2 exact-scope mappings"
+          git push origin main
+
+      - name: Final clean-tree proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain --untracked-files=all)"
+          echo "PASS: Unified Identity V2 exact-scope deployment committed cleanly."
