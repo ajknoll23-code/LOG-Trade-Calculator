@@ -1,0 +1,389 @@
+name: 4for4 IDP V1 - Phase 1D Full Sleeper Universe Recovery
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  private-full-sleeper-recovery-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      FOURFORFOUR_DL_GZ_B64: ${{ secrets.FOURFORFOUR_DL_GZ_B64 }}
+      FOURFORFOUR_LB_GZ_B64: ${{ secrets.FOURFORFOUR_LB_GZ_B64 }}
+      FOURFORFOUR_DB_GZ_B64: ${{ secrets.FOURFORFOUR_DB_GZ_B64 }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check requests
+
+      - name: Decode private 4for4 inputs outside repository
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for var in FOURFORFOUR_DL_GZ_B64 FOURFORFOUR_LB_GZ_B64 FOURFORFOUR_DB_GZ_B64; do
+            if [ -z "${!var:-}" ]; then
+              echo "ERROR: required GitHub Actions secret ${var} is missing or empty." >&2
+              exit 1
+            fi
+          done
+
+          install -d -m 700 /tmp/log-fourforfour-idp-v1/input
+          install -d -m 700 /tmp/log-fourforfour-idp-v1/output
+
+          printf '%s' "$FOURFORFOUR_DL_GZ_B64" | base64 --decode | gzip -dc \
+            > /tmp/log-fourforfour-idp-v1/input/dl.csv
+          printf '%s' "$FOURFORFOUR_LB_GZ_B64" | base64 --decode | gzip -dc \
+            > /tmp/log-fourforfour-idp-v1/input/lb.csv
+          printf '%s' "$FOURFORFOUR_DB_GZ_B64" | base64 --decode | gzip -dc \
+            > /tmp/log-fourforfour-idp-v1/input/db.csv
+
+          chmod 600 /tmp/log-fourforfour-idp-v1/input/*.csv
+
+      - name: Run current 4for4 pipeline on private real data
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/projections/fourforfour_projection_pipeline.py \
+            --dl /tmp/log-fourforfour-idp-v1/input/dl.csv \
+            --lb /tmp/log-fourforfour-idp-v1/input/lb.csv \
+            --db /tmp/log-fourforfour-idp-v1/input/db.csv \
+            --output-dir /tmp/log-fourforfour-idp-v1/output/private \
+            --public-summary /tmp/log-fourforfour-idp-v1/output/aggregate-summary.json \
+            > /tmp/log-fourforfour-idp-v1/output/pipeline.stdout.txt
+
+      - name: Audit unresolved rows against full Sleeper NFL universe
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import math
+          import re
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import requests
+
+          ROOT = Path('/tmp/log-fourforfour-idp-v1/output')
+          PRIVATE = ROOT / 'private'
+          NORM = PRIVATE / 'fourforfour_2026_idp_normalized_private.json'
+          SUMMARY = ROOT / 'aggregate-summary.json'
+
+          normalized = json.loads(NORM.read_text(encoding='utf-8'))
+          rows = (
+              normalized.get('rows')
+              or normalized.get('players')
+              or normalized.get('data')
+              if isinstance(normalized, dict)
+              else normalized
+          )
+          if not isinstance(rows, list) or len(rows) != 648:
+              raise RuntimeError('unexpected normalized-private JSON shape/count')
+
+          summary = json.loads(SUMMARY.read_text(encoding='utf-8'))
+          identity = summary.get('identity') or {}
+          if identity.get('unresolved_rows') != 53:
+              raise RuntimeError(
+                  f"expected frozen unresolved cohort of 53, got {identity.get('unresolved_rows')}"
+              )
+          if summary.get('production_changes') is not False:
+              raise RuntimeError('production safety guard failed')
+          if summary.get('research_only') is not True:
+              raise RuntimeError('research-only guard failed')
+
+          def norm_team(value):
+              if value in (None, '', 'FA'):
+                  return None
+              team = str(value).strip().upper()
+              return {
+                  'JAC': 'JAX',
+                  'WSH': 'WAS',
+                  'OAK': 'LV',
+                  'SD': 'LAC',
+                  'STL': 'LAR',
+              }.get(team, team)
+
+          def norm_name(value):
+              s = str(value or '').strip().lower()
+              s = re.sub(r"[.'’\-]", '', s)
+              s = re.sub(r'\s+', ' ', s).strip()
+              return s
+
+          SUFFIXES = {'jr', 'sr', 'ii', 'iii', 'iv', 'v'}
+
+          def norm_name_no_suffix(value):
+              parts = norm_name(value).split()
+              if parts and parts[-1] in SUFFIXES:
+                  parts = parts[:-1]
+              return ' '.join(parts)
+
+          def sleeper_buckets(player):
+              labels = set()
+              raw_labels = []
+              raw_labels.extend(player.get('fantasy_positions') or [])
+              if player.get('position'):
+                  raw_labels.append(player.get('position'))
+
+              for raw in raw_labels:
+                  p = str(raw or '').strip().upper()
+                  if p in {'DL', 'DE', 'DT', 'NT'}:
+                      labels.add('DL')
+                  elif p in {'LB', 'ILB', 'MLB', 'OLB'}:
+                      labels.add('LB')
+                  elif p in {'DB', 'CB', 'S', 'SS', 'FS'}:
+                      labels.add('DB')
+                  elif p == 'EDGE':
+                      labels.update({'DL', 'LB'})
+              return labels
+
+          url = 'https://api.sleeper.app/v1/players/nfl'
+          response = requests.get(url, timeout=60)
+          response.raise_for_status()
+          raw_bytes = response.content
+          universe = response.json()
+          if not isinstance(universe, dict) or len(universe) < 1000:
+              raise RuntimeError('Sleeper NFL player universe response is unexpectedly small')
+
+          full_index = defaultdict(list)
+          suffixless_index = defaultdict(list)
+
+          for sid, player in universe.items():
+              if not isinstance(player, dict):
+                  continue
+
+              full_name = (
+                  player.get('full_name')
+                  or ' '.join(
+                      x for x in [player.get('first_name'), player.get('last_name')] if x
+                  ).strip()
+              )
+              if not full_name:
+                  continue
+
+              team = norm_team(player.get('team'))
+              buckets = sleeper_buckets(player)
+              if not buckets:
+                  continue
+
+              candidate = {
+                  'sid': str(sid),
+                  'team': team,
+                  'buckets': buckets,
+                  'active': player.get('active'),
+              }
+
+              full_index[norm_name(full_name)].append(candidate)
+              suffixless_index[norm_name_no_suffix(full_name)].append(candidate)
+
+          SCORE_KEY = 'log_base_points_excluding_weekly_bonuses_and_blocked_kicks'
+          bucket_rows = defaultdict(list)
+          for row in rows:
+              bucket = row.get('source_bucket')
+              score = row.get(SCORE_KEY)
+              ident = row.get('identity') or {}
+              if bucket not in {'DL', 'LB', 'DB'}:
+                  raise RuntimeError(f'unexpected source bucket: {bucket!r}')
+              if not isinstance(score, (int, float)) or not math.isfinite(float(score)):
+                  raise RuntimeError('missing/non-finite LOG score')
+              bucket_rows[bucket].append({
+                  'row': row,
+                  'score': float(score),
+                  'resolved': bool(ident.get('resolved')),
+              })
+
+          # Compute within-position rank band once, using the full source population.
+          rank_band_by_hash = {}
+          for bucket, group in bucket_rows.items():
+              ordered = sorted(group, key=lambda x: x['score'], reverse=True)
+              n = len(ordered)
+              t10 = max(1, math.ceil(n * 0.10))
+              t25 = max(t10, math.ceil(n * 0.25))
+              t50 = max(t25, math.ceil(n * 0.50))
+              for idx, item in enumerate(ordered, start=1):
+                  if idx <= t10:
+                      band = 'top_10_pct'
+                  elif idx <= t25:
+                      band = '10_to_25_pct'
+                  elif idx <= t50:
+                      band = '25_to_50_pct'
+                  else:
+                      band = 'bottom_50_pct'
+                  rank_band_by_hash[item['row']['source_row_sha256']] = band
+
+          unresolved = [r for r in rows if not (r.get('identity') or {}).get('resolved')]
+          if len(unresolved) != 53:
+              raise RuntimeError(f'expected 53 unresolved rows, got {len(unresolved)}')
+
+          outcomes = Counter()
+          outcomes_by_bucket = defaultdict(Counter)
+          outcomes_by_band = defaultdict(Counter)
+          original_method_outcomes = defaultdict(Counter)
+
+          for row in unresolved:
+              player_name = row.get('source_player_name')
+              team = norm_team(row.get('source_team'))
+              bucket = row.get('source_bucket')
+              original_method = str((row.get('identity') or {}).get('match_method') or 'unknown')
+              band = rank_band_by_hash[row['source_row_sha256']]
+
+              def eligible(cands):
+                  out = []
+                  for c in cands:
+                      if bucket not in c['buckets']:
+                          continue
+                      # Strict team corroboration. Null/null never confirms identity.
+                      if not team or not c['team'] or c['team'] != team:
+                          continue
+                      out.append(c)
+                  # Deduplicate by Sleeper ID.
+                  return {c['sid']: c for c in out}
+
+              exact = eligible(full_index.get(norm_name(player_name), []))
+              suffixless = eligible(suffixless_index.get(norm_name_no_suffix(player_name), []))
+
+              if len(exact) == 1:
+                  outcome = 'safe_exact_full_universe_match'
+              elif len(exact) > 1:
+                  outcome = 'ambiguous_exact_full_universe_match'
+              elif len(suffixless) == 1:
+                  outcome = 'safe_suffix_tolerant_full_universe_match'
+              elif len(suffixless) > 1:
+                  outcome = 'ambiguous_suffix_tolerant_full_universe_match'
+              else:
+                  # Diagnostics only; never authorize by name alone or team alone.
+                  full_name_any = full_index.get(norm_name(player_name), [])
+                  suffix_any = suffixless_index.get(norm_name_no_suffix(player_name), [])
+                  if full_name_any or suffix_any:
+                      outcome = 'name_exists_but_team_or_position_not_corroborated'
+                  else:
+                      outcome = 'still_no_full_universe_name_candidate'
+
+              outcomes[outcome] += 1
+              outcomes_by_bucket[bucket][outcome] += 1
+              outcomes_by_band[band][outcome] += 1
+              original_method_outcomes[original_method][outcome] += 1
+
+          safe_recovered = (
+              outcomes['safe_exact_full_universe_match']
+              + outcomes['safe_suffix_tolerant_full_universe_match']
+          )
+          projected_resolved = 595 + safe_recovered
+
+          aggregate = {
+              'schema_version': 1,
+              'study': 'fourforfour-idp-v1-phase1d-full-sleeper-universe-recovery',
+              'research_only': True,
+              'production_changes': False,
+              'input_total_rows': 648,
+              'baseline_resolved_rows': 595,
+              'baseline_unresolved_rows': 53,
+              'sleeper_full_universe': {
+                  'endpoint': 'Sleeper /v1/players/nfl',
+                  'fetched_at_utc': datetime.now(timezone.utc).isoformat(),
+                  'response_sha256': hashlib.sha256(raw_bytes).hexdigest(),
+                  'player_record_count': len(universe),
+              },
+              'candidate_policy': {
+                  'safe_requires_unique_sleeper_id': True,
+                  'safe_requires_exact_team_match': True,
+                  'safe_requires_compatible_idp_bucket': True,
+                  'suffix_tolerance_only_removes_terminal_generation_suffix': True,
+                  'name_only_matching_authorized': False,
+                  'team_only_matching_authorized': False,
+              },
+              'outcomes': dict(sorted(outcomes.items())),
+              'outcomes_by_bucket': {
+                  bucket: dict(sorted(counts.items()))
+                  for bucket, counts in sorted(outcomes_by_bucket.items())
+              },
+              'outcomes_by_rank_band': {
+                  band: dict(sorted(counts.items()))
+                  for band, counts in sorted(outcomes_by_band.items())
+              },
+              'original_unresolved_method_to_outcome': {
+                  method: dict(sorted(counts.items()))
+                  for method, counts in sorted(original_method_outcomes.items())
+              },
+              'safe_recovered_rows': safe_recovered,
+              'projected_resolved_rows_if_safe_recoveries_adopted': projected_resolved,
+              'projected_resolved_rate_if_safe_recoveries_adopted':
+                  round(projected_resolved / 648, 6),
+              'row_level_provider_data_persisted': False,
+          }
+
+          forbidden_keys = {
+              'source_player_name',
+              'source_team',
+              'sleeper_id',
+              'source_row_number',
+              'raw_category_season_totals',
+              'provider_ff_pts_reference_only',
+          }
+
+          def assert_no_forbidden_keys(value, path='$'):
+              if isinstance(value, dict):
+                  for key, child in value.items():
+                      if key in forbidden_keys:
+                          raise RuntimeError(
+                              f'aggregate recovery audit leaked forbidden key: {path}.{key}'
+                          )
+                      assert_no_forbidden_keys(child, f'{path}.{key}')
+              elif isinstance(value, list):
+                  for idx, child in enumerate(value):
+                      assert_no_forbidden_keys(child, f'{path}[{idx}]')
+
+          assert_no_forbidden_keys(aggregate)
+          rendered = json.dumps(aggregate, indent=2, sort_keys=True)
+
+          out = ROOT / 'phase1d-aggregate-recovery.json'
+          out.write_text(rendered + '\n', encoding='utf-8')
+
+          print('PASS: Phase 1D full-Sleeper-universe recovery audit complete.')
+          print(rendered)
+          PY
+
+      - name: Run repository regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/repo_regression_checks.py
+
+      - name: Prove audit made no repository changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git diff --quiet -- .; then
+            echo 'ERROR: Phase 1D modified tracked repository files.' >&2
+            git diff -- .
+            exit 1
+          fi
+          if ! git diff --cached --quiet -- .; then
+            echo 'ERROR: Phase 1D staged repository changes.' >&2
+            git diff --cached -- .
+            exit 1
+          fi
+          echo 'PASS: Phase 1D and regressions left the repository unchanged.'
+
+      - name: Destroy private 4for4 inputs and row-level outputs
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/log-fourforfour-idp-v1
+          echo 'PASS: private provider inputs and all row-level outputs removed from runner.'
