@@ -1,0 +1,674 @@
+name: Identity V2 Phase 5 Production-Candidate Shadow
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  identity-v2-phase5:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install regression dependency
+        run: python3 -m pip install --disable-pip-version-check --no-cache-dir "requests>=2.32,<3"
+
+      - name: Guard clean tree and freeze production baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git branch --show-current)" = "main"
+          test -z "$(git status --porcelain --untracked-files=all)"
+
+          sha256sum index.html > "${RUNNER_TEMP}/production.sha256"
+          sha256sum scripts/identity_crosswalk.json > "${RUNNER_TEMP}/crosswalk.sha256"
+          sha256sum scripts/projections/resolve_fantasypros_sleeper_identity.py \
+            > "${RUNNER_TEMP}/resolver.sha256"
+
+          if test -f free-agent-board.html; then
+            sha256sum free-agent-board.html >> "${RUNNER_TEMP}/production.sha256"
+          fi
+
+          sha256sum \
+            research/identity-v2/identity_v2_phase4_position_conflict_policy_audit.json \
+            research/identity-v2/identity_v2_phase4_manifest.json \
+            > "${RUNNER_TEMP}/phase4.sha256"
+
+      - name: Preflight full repository regression suite
+        run: python3 scripts/validation/repo_regression_checks.py
+
+      - name: Freeze Phase 5 candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > research/identity-v2/identity_v2_phase5_preregistration.json <<'JSON'
+          {
+            "schema_version": 1,
+            "study_id": "identity-v2-phase5-production-candidate-shadow",
+            "status": "FROZEN_THREE_MAPPING_CANDIDATE",
+            "research_only": true,
+            "production_change_authorized": false,
+            "candidate_mappings": {
+              "26313": {
+                "name": "Austin Booker",
+                "sleeper_id": "11760"
+              },
+              "27959": {
+                "name": "Gabe Jacas",
+                "sleeper_id": "13457"
+              },
+              "28290": {
+                "name": "Kendal Daniels",
+                "sleeper_id": "13482"
+              }
+            },
+            "explicit_hold_fpids": {
+              "26157": "Jonah Elliss"
+            },
+            "direct_shadow_hard_gates": [
+              "Current production crosswalk contains all three FantasyPros IDs exactly once.",
+              "Each target row name matches the frozen candidate.",
+              "Direct candidate changes exactly the three frozen FPIDs and no others.",
+              "Each target receives exactly the frozen Sleeper ID.",
+              "Each target becomes authoritative and non-manual in the candidate shadow.",
+              "Jonah Elliss remains byte-for-byte unchanged in the direct candidate shadow.",
+              "No authoritative Sleeper-ID collision is introduced."
+            ],
+            "successor_resolver_hard_gates": [
+              "Using identical current source inputs, seeded-vs-control resolver output differs only on the three frozen target FPIDs.",
+              "All three seeded target mappings survive the current production resolver.",
+              "Jonah Elliss remains unchanged between seeded and control resolver outputs.",
+              "No authoritative Sleeper-ID collision is introduced."
+            ],
+            "temporary_regression_rule": "The candidate crosswalk may be copied into scripts/identity_crosswalk.json only temporarily inside the workflow to run regressions; it must be restored byte-for-byte before commit.",
+            "promotion_rule": "A full PASS authorizes only a separate deployment workflow. This workflow never commits production changes.",
+            "promotion_authorized": false
+          }
+          JSON
+
+      - name: Write Phase 5 shadow evaluator
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > research/identity-v2/identity_v2_phase5_production_candidate_shadow.py <<'PY'
+          #!/usr/bin/env python3
+          from __future__ import annotations
+
+          import argparse
+          import copy
+          import hashlib
+          import importlib.util
+          import json
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          SCRIPT = Path(__file__).resolve()
+          ROOT = SCRIPT.parents[2]
+          OUTDIR = SCRIPT.parent
+
+          PREREG = OUTDIR / "identity_v2_phase5_preregistration.json"
+          PHASE4 = OUTDIR / "identity_v2_phase4_position_conflict_policy_audit.json"
+          PROD_CROSSWALK = ROOT / "scripts" / "identity_crosswalk.json"
+          RESOLVER_PY = ROOT / "scripts" / "projections" / "resolve_fantasypros_sleeper_identity.py"
+
+          DIRECT_SHADOW = OUTDIR / "identity_v2_phase5_direct_candidate_crosswalk.json"
+          CONTROL_REFRESH = OUTDIR / "identity_v2_phase5_control_refresh_crosswalk.json"
+          SEEDED_REFRESH = OUTDIR / "identity_v2_phase5_seeded_refresh_crosswalk.json"
+          OUTJSON = OUTDIR / "identity_v2_phase5_production_candidate_shadow.json"
+          OUTMD = OUTDIR / "identity_v2_phase5_production_candidate_shadow.md"
+          MANIFEST = OUTDIR / "identity_v2_phase5_manifest.json"
+
+          def sha256(path: Path) -> str:
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          def load_resolver():
+              spec = importlib.util.spec_from_file_location("identity_prod_resolver", RESOLVER_PY)
+              if spec is None or spec.loader is None:
+                  raise RuntimeError("cannot load production identity resolver")
+              mod = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(mod)
+              return mod
+
+          def row_key(row):
+              fpid = row.get("fantasypros_id")
+              return str(fpid) if fpid not in (None, "") else None
+
+          def index_unique(rows, label):
+              out = {}
+              for row in rows:
+                  fpid = row_key(row)
+                  if fpid is None:
+                      continue
+                  if fpid in out:
+                      raise RuntimeError(f"{label}: duplicate FPID {fpid}")
+                  out[fpid] = row
+              return out
+
+          def canonical_row(row):
+              return json.dumps(row, sort_keys=True, separators=(",", ":"))
+
+          def diff_fpids(a_rows, b_rows):
+              a = index_unique(a_rows, "A")
+              b = index_unique(b_rows, "B")
+              keys = sorted(set(a) | set(b))
+              return [
+                  k for k in keys
+                  if canonical_row(a.get(k)) != canonical_row(b.get(k))
+              ]
+
+          def authoritative_sid_collisions(rows):
+              by_sid = defaultdict(list)
+              for row in rows:
+                  sid = row.get("sleeper_id")
+                  fpid = row_key(row)
+                  if not sid or not fpid:
+                      continue
+                  if row.get("requires_manual_review"):
+                      continue
+                  by_sid[str(sid)].append(fpid)
+              return {
+                  sid: fpids
+                  for sid, fpids in by_sid.items()
+                  if len(fpids) > 1
+              }
+
+          def make_direct_candidate(prod_rows, mappings):
+              rows = copy.deepcopy(prod_rows)
+              by_fpid = index_unique(rows, "production")
+
+              for fpid, spec in mappings.items():
+                  row = by_fpid.get(fpid)
+                  if row is None:
+                      raise RuntimeError(f"production crosswalk missing target FPID {fpid}")
+                  if str(row.get("name") or "") != spec["name"]:
+                      raise RuntimeError(
+                          f"target name mismatch for {fpid}: "
+                          f"{row.get('name')!r} != {spec['name']!r}"
+                      )
+
+                  sid = str(spec["sleeper_id"])
+                  row["sleeper_id"] = sid
+                  row["candidate_sleeper_id"] = sid
+                  row["requires_manual_review"] = False
+                  row["match_confidence"] = "high"
+                  row["match_method"] = "phase5_explicit_evidence_backed_position_override"
+
+              return rows
+
+          def build_refresh(resolver, previous_rows):
+              fp_doc = resolver.read_json(resolver.FP_PATH)
+              totals = resolver.read_json(resolver.SLEEPER_TOTAL_PATH)
+              raw = resolver.read_json(resolver.SLEEPER_RAW_PATH)
+              teams = resolver.read_json(resolver.TEAM_REFRESH_PATH)
+              return resolver.build_production_crosswalk(
+                  fp_doc, totals, raw, teams, previous_rows
+              )
+
+          def build():
+              prereg = json.loads(PREREG.read_text(encoding="utf-8"))
+              phase4 = json.loads(PHASE4.read_text(encoding="utf-8"))
+              prod_rows = json.loads(PROD_CROSSWALK.read_text(encoding="utf-8"))
+
+              if prereg["status"] != "FROZEN_THREE_MAPPING_CANDIDATE":
+                  raise RuntimeError("Phase 5 preregistration changed")
+              if prereg["production_change_authorized"] is not False:
+                  raise RuntimeError("Phase 5 illegally authorizes production")
+              if phase4["decision"] != "PASS_EXPLICIT_EVIDENCE_BACKED_POSITION_OVERRIDE_CANDIDATE":
+                  raise RuntimeError("Phase 4 did not authorize this shadow")
+              if not phase4["explicit_evidence_backed_policy"]["all_hard_gates_pass"]:
+                  raise RuntimeError("Phase 4 explicit hard gates did not all pass")
+
+              mappings = {
+                  str(k): {
+                      "name": v["name"],
+                      "sleeper_id": str(v["sleeper_id"])
+                  }
+                  for k, v in prereg["candidate_mappings"].items()
+              }
+              target_fpids = set(mappings)
+              hold_fpids = set(str(k) for k in prereg["explicit_hold_fpids"])
+
+              phase4_map = {
+                  str(k): str(v)
+                  for k, v in phase4["explicit_evidence_backed_policy"]["candidate_fpids"].items()
+              }
+              expected_map = {k: v["sleeper_id"] for k, v in mappings.items()}
+              if phase4_map != expected_map:
+                  raise RuntimeError(
+                      f"Phase 4 candidate drift: expected={expected_map}, actual={phase4_map}"
+                  )
+
+              prod_idx = index_unique(prod_rows, "production")
+              gates_direct = {}
+
+              gates_direct["all_three_targets_present_once"] = (
+                  all(fpid in prod_idx for fpid in target_fpids)
+              )
+              gates_direct["all_three_target_names_match"] = all(
+                  str(prod_idx[fpid].get("name") or "") == mappings[fpid]["name"]
+                  for fpid in target_fpids
+              )
+
+              direct_rows = make_direct_candidate(prod_rows, mappings)
+              direct_idx = index_unique(direct_rows, "direct candidate")
+              direct_changed = diff_fpids(prod_rows, direct_rows)
+
+              gates_direct["exactly_three_changed_fpids"] = (
+                  set(direct_changed) == target_fpids
+                  and len(direct_changed) == 3
+              )
+              gates_direct["frozen_sids_applied"] = all(
+                  str(direct_idx[fpid].get("sleeper_id")) == mappings[fpid]["sleeper_id"]
+                  for fpid in target_fpids
+              )
+              gates_direct["targets_authoritative_nonmanual"] = all(
+                  direct_idx[fpid].get("requires_manual_review") is False
+                  and direct_idx[fpid].get("match_confidence") == "high"
+                  for fpid in target_fpids
+              )
+              gates_direct["jonah_elliss_byte_identical"] = all(
+                  canonical_row(prod_idx.get(fpid)) == canonical_row(direct_idx.get(fpid))
+                  for fpid in hold_fpids
+              )
+              direct_collisions = authoritative_sid_collisions(direct_rows)
+              gates_direct["no_authoritative_sid_collision"] = not direct_collisions
+
+              DIRECT_SHADOW.write_text(
+                  json.dumps(direct_rows, indent=2, sort_keys=True) + "\n",
+                  encoding="utf-8"
+              )
+
+              resolver = load_resolver()
+              control_refresh = build_refresh(resolver, prod_rows)
+              seeded_refresh = build_refresh(resolver, direct_rows)
+
+              CONTROL_REFRESH.write_text(
+                  json.dumps(control_refresh, indent=2, sort_keys=True) + "\n",
+                  encoding="utf-8"
+              )
+              SEEDED_REFRESH.write_text(
+                  json.dumps(seeded_refresh, indent=2, sort_keys=True) + "\n",
+                  encoding="utf-8"
+              )
+
+              control_idx = index_unique(control_refresh, "control refresh")
+              seeded_idx = index_unique(seeded_refresh, "seeded refresh")
+              successor_changed = diff_fpids(control_refresh, seeded_refresh)
+
+              gates_successor = {}
+              gates_successor["seeded_vs_control_exactly_three_fpids"] = (
+                  set(successor_changed) == target_fpids
+                  and len(successor_changed) == 3
+              )
+              gates_successor["all_three_seeded_pairs_survive"] = all(
+                  str(seeded_idx[fpid].get("sleeper_id")) == mappings[fpid]["sleeper_id"]
+                  and seeded_idx[fpid].get("requires_manual_review") is False
+                  for fpid in target_fpids
+              )
+              gates_successor["jonah_elliss_unchanged_vs_control"] = all(
+                  canonical_row(control_idx.get(fpid)) == canonical_row(seeded_idx.get(fpid))
+                  for fpid in hold_fpids
+              )
+              seeded_collisions = authoritative_sid_collisions(seeded_refresh)
+              gates_successor["no_authoritative_sid_collision"] = not seeded_collisions
+
+              all_direct = all(gates_direct.values())
+              all_successor = all(gates_successor.values())
+
+              decision = (
+                  "PASS_IDENTITY_V2_PHASE5_PRODUCTION_CANDIDATE_SHADOW"
+                  if all_direct and all_successor
+                  else "STOP_IDENTITY_V2_PHASE5_CANDIDATE_FAILED_GATES"
+              )
+
+              # Diagnostic only: current-source control may differ from the
+              # checked-in production crosswalk because sources are live.
+              production_vs_control = diff_fpids(prod_rows, control_refresh)
+
+              return {
+                  "schema_version": 1,
+                  "study_id": "identity-v2-phase5-production-candidate-shadow",
+                  "status": "PRODUCTION_CANDIDATE_SHADOW_COMPLETE",
+                  "decision": decision,
+                  "generated_at_utc":
+                      datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                  "research_only": True,
+                  "production_change_authorized": False,
+                  "deployment_authorized": False,
+                  "candidate_mappings": mappings,
+                  "direct_shadow": {
+                      "changed_fpids": direct_changed,
+                      "changed_count": len(direct_changed),
+                      "authoritative_sid_collisions": direct_collisions,
+                      "hard_gates": gates_direct,
+                      "all_hard_gates_pass": all_direct
+                  },
+                  "successor_resolver_shadow": {
+                      "seeded_vs_control_changed_fpids": successor_changed,
+                      "seeded_vs_control_changed_count": len(successor_changed),
+                      "authoritative_sid_collisions": seeded_collisions,
+                      "hard_gates": gates_successor,
+                      "all_hard_gates_pass": all_successor
+                  },
+                  "live_source_drift_diagnostic": {
+                      "production_vs_control_refresh_changed_count":
+                          len(production_vs_control),
+                      "production_vs_control_refresh_changed_fpids":
+                          production_vs_control
+                  },
+                  "next_step_rule": (
+                      "A PASS authorizes only a separate deployment workflow that "
+                      "applies the three frozen mappings, proves exactly three "
+                      "production crosswalk changes, runs the production resolver "
+                      "successor check, runs the full regression suite, and commits "
+                      "only the intended production/release artifacts."
+                  )
+              }
+
+          def render(r):
+              direct = r["direct_shadow"]
+              succ = r["successor_resolver_shadow"]
+              drift = r["live_source_drift_diagnostic"]
+
+              lines = [
+                  "# Identity V2 Phase 5 — Production-Candidate Shadow",
+                  "",
+                  f"**Decision:** `{r['decision']}`",
+                  "",
+                  "**RESEARCH ONLY. Production crosswalk and resolver source remain unchanged.**",
+                  "",
+                  "## Candidate",
+                  "",
+              ]
+              for fpid, spec in r["candidate_mappings"].items():
+                  lines.append(
+                      f"- **{spec['name']}**: FPID `{fpid}` → Sleeper `{spec['sleeper_id']}`"
+                  )
+
+              lines += [
+                  "",
+                  "## Direct candidate shadow",
+                  "",
+                  f"- Changed FPIDs: **{direct['changed_count']}**",
+                  f"- Changed set: `{direct['changed_fpids']}`",
+                  f"- SID collision groups: **{len(direct['authoritative_sid_collisions'])}**",
+                  f"- All hard gates pass: **{direct['all_hard_gates_pass']}**",
+                  ""
+              ]
+              for gate, passed in direct["hard_gates"].items():
+                  lines.append(f"- `{gate}`: **{'PASS' if passed else 'FAIL'}**")
+
+              lines += [
+                  "",
+                  "## Successor resolver shadow",
+                  "",
+                  "Both arms use identical current source inputs. The only difference "
+                  "is whether the three explicit mappings are pre-seeded as prior "
+                  "authoritative stable-ID pairs.",
+                  "",
+                  f"- Seeded-vs-control changed FPIDs: "
+                  f"**{succ['seeded_vs_control_changed_count']}**",
+                  f"- Changed set: `{succ['seeded_vs_control_changed_fpids']}`",
+                  f"- SID collision groups: **{len(succ['authoritative_sid_collisions'])}**",
+                  f"- All hard gates pass: **{succ['all_hard_gates_pass']}**",
+                  ""
+              ]
+              for gate, passed in succ["hard_gates"].items():
+                  lines.append(f"- `{gate}`: **{'PASS' if passed else 'FAIL'}**")
+
+              lines += [
+                  "",
+                  "## Live-source drift diagnostic",
+                  "",
+                  f"- Checked-in production vs current-source control refresh changed "
+                  f"FPIDs: **{drift['production_vs_control_refresh_changed_count']}**",
+                  "",
+                  "This count is diagnostic only and is not used to approve the candidate; "
+                  "the causal successor comparison is seeded-vs-control under identical inputs.",
+                  "",
+                  "## Governance",
+                  "",
+                  "- Jonah Elliss remains held.",
+                  "- No generic LB↔DL or DB↔LB compatibility rule is added.",
+                  "- No production file is committed by this phase.",
+                  "- A PASS only permits a separate exact-scope deployment workflow.",
+                  "",
+                  "## Next-step rule",
+                  "",
+                  r["next_step_rule"],
+                  ""
+              ]
+              return "\n".join(lines)
+
+          def write():
+              r = build()
+              OUTJSON.write_text(
+                  json.dumps(r, indent=2, sort_keys=True) + "\n",
+                  encoding="utf-8"
+              )
+              OUTMD.write_text(render(r).rstrip() + "\n", encoding="utf-8")
+
+              manifest = {
+                  "schema_version": 1,
+                  "study_id": "identity-v2-phase5-production-candidate-shadow",
+                  "decision": r["decision"],
+                  "production_change_authorized": False,
+                  "deployment_authorized": False,
+                  "phase4_sha256": sha256(PHASE4),
+                  "preregistration_sha256": sha256(PREREG),
+                  "production_crosswalk_sha256": sha256(PROD_CROSSWALK),
+                  "production_resolver_sha256": sha256(RESOLVER_PY),
+                  "direct_shadow_sha256": sha256(DIRECT_SHADOW),
+                  "control_refresh_sha256": sha256(CONTROL_REFRESH),
+                  "seeded_refresh_sha256": sha256(SEEDED_REFRESH),
+                  "output_json_sha256": sha256(OUTJSON),
+                  "output_md_sha256": sha256(OUTMD),
+                  "evaluator_sha256": sha256(SCRIPT)
+              }
+              MANIFEST.write_text(
+                  json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                  encoding="utf-8"
+              )
+
+              print(json.dumps({
+                  "decision": r["decision"],
+                  "direct_changed_fpids": r["direct_shadow"]["changed_fpids"],
+                  "direct_all_gates_pass":
+                      r["direct_shadow"]["all_hard_gates_pass"],
+                  "successor_changed_fpids":
+                      r["successor_resolver_shadow"]["seeded_vs_control_changed_fpids"],
+                  "successor_all_gates_pass":
+                      r["successor_resolver_shadow"]["all_hard_gates_pass"],
+                  "production_vs_control_refresh_changed_count":
+                      r["live_source_drift_diagnostic"][
+                          "production_vs_control_refresh_changed_count"
+                      ]
+              }, indent=2))
+
+          def check():
+              r = json.loads(OUTJSON.read_text(encoding="utf-8"))
+              expected = {"26313", "27959", "28290"}
+
+              if r["production_change_authorized"] is not False:
+                  raise RuntimeError("production change illegally authorized")
+              if r["deployment_authorized"] is not False:
+                  raise RuntimeError("deployment illegally authorized")
+
+              if r["decision"] == "PASS_IDENTITY_V2_PHASE5_PRODUCTION_CANDIDATE_SHADOW":
+                  if set(r["direct_shadow"]["changed_fpids"]) != expected:
+                      raise RuntimeError("PASS direct shadow scope mismatch")
+                  if set(
+                      r["successor_resolver_shadow"]["seeded_vs_control_changed_fpids"]
+                  ) != expected:
+                      raise RuntimeError("PASS successor shadow scope mismatch")
+                  if not r["direct_shadow"]["all_hard_gates_pass"]:
+                      raise RuntimeError("PASS with failed direct hard gate")
+                  if not r["successor_resolver_shadow"]["all_hard_gates_pass"]:
+                      raise RuntimeError("PASS with failed successor hard gate")
+
+              print("Identity V2 Phase 5 output checks PASS")
+
+          def selftest():
+              p = json.loads(PREREG.read_text(encoding="utf-8"))
+              assert set(p["candidate_mappings"]) == {"26313", "27959", "28290"}
+              assert set(p["explicit_hold_fpids"]) == {"26157"}
+              assert p["promotion_authorized"] is False
+              print("Identity V2 Phase 5 self-test PASS")
+
+          def main():
+              ap = argparse.ArgumentParser()
+              g = ap.add_mutually_exclusive_group(required=True)
+              g.add_argument("--selftest", action="store_true")
+              g.add_argument("--write", action="store_true")
+              g.add_argument("--check", action="store_true")
+              args = ap.parse_args()
+
+              if args.selftest:
+                  selftest()
+              elif args.write:
+                  write()
+              else:
+                  check()
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+      - name: Run Phase 5 candidate shadow
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 research/identity-v2/identity_v2_phase5_production_candidate_shadow.py --selftest
+          python3 research/identity-v2/identity_v2_phase5_production_candidate_shadow.py --write
+          python3 research/identity-v2/identity_v2_phase5_production_candidate_shadow.py --check
+          cat research/identity-v2/identity_v2_phase5_production_candidate_shadow.md
+
+      - name: Run full regression suite against temporary direct candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cp scripts/identity_crosswalk.json "${RUNNER_TEMP}/identity_crosswalk.production.json"
+
+          cleanup() {
+            cp "${RUNNER_TEMP}/identity_crosswalk.production.json" scripts/identity_crosswalk.json
+          }
+          trap cleanup EXIT
+
+          cp \
+            research/identity-v2/identity_v2_phase5_direct_candidate_crosswalk.json \
+            scripts/identity_crosswalk.json
+
+          python3 scripts/validation/repo_regression_checks.py
+
+          cleanup
+          trap - EXIT
+
+          sha256sum -c "${RUNNER_TEMP}/crosswalk.sha256"
+          echo "PASS: temporary candidate regression suite passed and production crosswalk restored."
+
+      - name: Prove production, resolver, and Phase 4 unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sha256sum -c "${RUNNER_TEMP}/production.sha256"
+          sha256sum -c "${RUNNER_TEMP}/crosswalk.sha256"
+          sha256sum -c "${RUNNER_TEMP}/resolver.sha256"
+          sha256sum -c "${RUNNER_TEMP}/phase4.sha256"
+
+          python3 - <<'PY'
+          import subprocess
+
+          allowed = {
+              "research/identity-v2/identity_v2_phase5_preregistration.json",
+              "research/identity-v2/identity_v2_phase5_production_candidate_shadow.py",
+              "research/identity-v2/identity_v2_phase5_direct_candidate_crosswalk.json",
+              "research/identity-v2/identity_v2_phase5_control_refresh_crosswalk.json",
+              "research/identity-v2/identity_v2_phase5_seeded_refresh_crosswalk.json",
+              "research/identity-v2/identity_v2_phase5_production_candidate_shadow.json",
+              "research/identity-v2/identity_v2_phase5_production_candidate_shadow.md",
+              "research/identity-v2/identity_v2_phase5_manifest.json"
+          }
+
+          actual = {
+              line[3:]
+              for line in subprocess.check_output(
+                  ["git", "status", "--porcelain", "--untracked-files=all"],
+                  text=True
+              ).splitlines()
+              if line.strip()
+          }
+
+          unexpected = actual - allowed
+          if unexpected:
+              raise SystemExit(
+                  "Unexpected changed files: " + ", ".join(sorted(unexpected))
+              )
+
+          required = {
+              "research/identity-v2/identity_v2_phase5_direct_candidate_crosswalk.json",
+              "research/identity-v2/identity_v2_phase5_production_candidate_shadow.json",
+              "research/identity-v2/identity_v2_phase5_production_candidate_shadow.md",
+              "research/identity-v2/identity_v2_phase5_manifest.json"
+          }
+          missing = required - actual
+          if missing:
+              raise SystemExit(
+                  "Expected Phase 5 outputs not changed: " + ", ".join(sorted(missing))
+              )
+
+          print("PASS: only Identity V2 Phase 5 research artifacts changed.")
+          PY
+
+      - name: Postflight production regression suite
+        run: python3 scripts/validation/repo_regression_checks.py
+
+      - name: Commit Identity V2 Phase 5
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            research/identity-v2/identity_v2_phase5_preregistration.json \
+            research/identity-v2/identity_v2_phase5_production_candidate_shadow.py \
+            research/identity-v2/identity_v2_phase5_direct_candidate_crosswalk.json \
+            research/identity-v2/identity_v2_phase5_control_refresh_crosswalk.json \
+            research/identity-v2/identity_v2_phase5_seeded_refresh_crosswalk.json \
+            research/identity-v2/identity_v2_phase5_production_candidate_shadow.json \
+            research/identity-v2/identity_v2_phase5_production_candidate_shadow.md \
+            research/identity-v2/identity_v2_phase5_manifest.json
+
+          git diff --cached --check
+          git commit -m "research: validate Identity V2 production candidate shadow"
+          git push origin main
+
+      - name: Final clean-tree proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain --untracked-files=all)"
+          echo "PASS: Identity V2 Phase 5 committed with production unchanged."
