@@ -1,0 +1,490 @@
+name: 4for4 IDP V1 - Phase 1F Conservative Alias Recovery Audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  conservative-alias-recovery-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      FOURFORFOUR_DL_GZ_B64: ${{ secrets.FOURFORFOUR_DL_GZ_B64 }}
+      FOURFORFOUR_LB_GZ_B64: ${{ secrets.FOURFORFOUR_LB_GZ_B64 }}
+      FOURFORFOUR_DB_GZ_B64: ${{ secrets.FOURFORFOUR_DB_GZ_B64 }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check requests
+
+      - name: Decode private 4for4 inputs outside repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          for var in FOURFORFOUR_DL_GZ_B64 FOURFORFOUR_LB_GZ_B64 FOURFORFOUR_DB_GZ_B64; do
+            if [ -z "${!var:-}" ]; then
+              echo "ERROR: required GitHub Actions secret ${var} is missing or empty." >&2
+              exit 1
+            fi
+          done
+
+          install -d -m 700 /tmp/log-fourforfour-idp-v1/input
+          install -d -m 700 /tmp/log-fourforfour-idp-v1/output
+
+          printf '%s' "$FOURFORFOUR_DL_GZ_B64" | base64 --decode | gzip -dc \
+            > /tmp/log-fourforfour-idp-v1/input/dl.csv
+          printf '%s' "$FOURFORFOUR_LB_GZ_B64" | base64 --decode | gzip -dc \
+            > /tmp/log-fourforfour-idp-v1/input/lb.csv
+          printf '%s' "$FOURFORFOUR_DB_GZ_B64" | base64 --decode | gzip -dc \
+            > /tmp/log-fourforfour-idp-v1/input/db.csv
+
+          chmod 600 /tmp/log-fourforfour-idp-v1/input/*.csv
+
+      - name: Run current 4for4 pipeline on private real data
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/projections/fourforfour_projection_pipeline.py \
+            --dl /tmp/log-fourforfour-idp-v1/input/dl.csv \
+            --lb /tmp/log-fourforfour-idp-v1/input/lb.csv \
+            --db /tmp/log-fourforfour-idp-v1/input/db.csv \
+            --output-dir /tmp/log-fourforfour-idp-v1/output/private \
+            --public-summary /tmp/log-fourforfour-idp-v1/output/aggregate-summary.json \
+            > /tmp/log-fourforfour-idp-v1/output/pipeline.stdout.txt
+
+      - name: Audit remaining cohort for conservative aliases
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import math
+          import re
+          from collections import Counter, defaultdict
+          from difflib import SequenceMatcher
+          from pathlib import Path
+
+          import requests
+
+          EXPECTED_RECOVERY_FINGERPRINT = (
+              'a3ed571084339bb938c5288a8a959145702a13d7c876f957ea2541197f0cbc6a'
+          )
+
+          root = Path('/tmp/log-fourforfour-idp-v1/output')
+          private = root / 'private'
+
+          normalized = json.loads(
+              (private / 'fourforfour_2026_idp_normalized_private.json')
+              .read_text(encoding='utf-8')
+          )
+          rows = (
+              normalized.get('rows')
+              or normalized.get('players')
+              or normalized.get('data')
+              if isinstance(normalized, dict)
+              else normalized
+          )
+          if not isinstance(rows, list) or len(rows) != 648:
+              raise RuntimeError('unexpected normalized-private JSON shape/count')
+
+          summary = json.loads(
+              (root / 'aggregate-summary.json').read_text(encoding='utf-8')
+          )
+          identity = summary.get('identity') or {}
+          if identity.get('resolved_rows') != 595 or identity.get('unresolved_rows') != 53:
+              raise RuntimeError('Phase 1B baseline changed')
+
+          def norm_team(value):
+              if value in (None, '', 'FA'):
+                  return None
+              t = str(value).strip().upper()
+              return {
+                  'JAC': 'JAX', 'WSH': 'WAS', 'OAK': 'LV',
+                  'SD': 'LAC', 'STL': 'LAR',
+              }.get(t, t)
+
+          def norm_name(value):
+              s = str(value or '').strip().lower()
+              s = re.sub(r"[.'’\-]", '', s)
+              return re.sub(r'\s+', ' ', s).strip()
+
+          suffixes = {'jr', 'sr', 'ii', 'iii', 'iv', 'v'}
+
+          def tokens_without_suffix(value):
+              parts = norm_name(value).split()
+              if parts and parts[-1] in suffixes:
+                  parts = parts[:-1]
+              return parts
+
+          def norm_name_no_suffix(value):
+              return ' '.join(tokens_without_suffix(value))
+
+          def first_token(value):
+              parts = tokens_without_suffix(value)
+              return parts[0] if parts else ''
+
+          def surname(value):
+              parts = tokens_without_suffix(value)
+              return parts[-1] if parts else ''
+
+          def sleeper_buckets(player):
+              labels = set()
+              raw = list(player.get('fantasy_positions') or [])
+              if player.get('position'):
+                  raw.append(player.get('position'))
+              for x in raw:
+                  p = str(x or '').strip().upper()
+                  if p in {'DL', 'DE', 'DT', 'NT'}:
+                      labels.add('DL')
+                  elif p in {'LB', 'ILB', 'MLB', 'OLB'}:
+                      labels.add('LB')
+                  elif p in {'DB', 'CB', 'S', 'SS', 'FS'}:
+                      labels.add('DB')
+                  elif p == 'EDGE':
+                      labels.update({'DL', 'LB'})
+              return labels
+
+          response = requests.get('https://api.sleeper.app/v1/players/nfl', timeout=60)
+          response.raise_for_status()
+          universe = response.json()
+          if not isinstance(universe, dict) or len(universe) < 1000:
+              raise RuntimeError('Sleeper full-player response unexpectedly small')
+
+          full_index = defaultdict(list)
+          suffixless_index = defaultdict(list)
+          team_bucket_candidates = defaultdict(list)
+
+          for sid, player in universe.items():
+              if not isinstance(player, dict):
+                  continue
+              full_name = (
+                  player.get('full_name')
+                  or ' '.join(
+                      x for x in [player.get('first_name'), player.get('last_name')] if x
+                  ).strip()
+              )
+              if not full_name:
+                  continue
+
+              team = norm_team(player.get('team'))
+              buckets = sleeper_buckets(player)
+              if not buckets:
+                  continue
+
+              candidate = {
+                  'sid': str(sid),
+                  'name': full_name,
+                  'team': team,
+                  'buckets': buckets,
+              }
+              full_index[norm_name(full_name)].append(candidate)
+              suffixless_index[norm_name_no_suffix(full_name)].append(candidate)
+              for bucket in buckets:
+                  if team:
+                      team_bucket_candidates[(team, bucket)].append(candidate)
+
+          unresolved = [r for r in rows if not (r.get('identity') or {}).get('resolved')]
+          resolved = [r for r in rows if (r.get('identity') or {}).get('resolved')]
+          if len(unresolved) != 53 or len(resolved) != 595:
+              raise RuntimeError('baseline row partition changed')
+
+          baseline_sids = {
+              str((r.get('identity') or {}).get('sleeper_id'))
+              for r in resolved
+              if (r.get('identity') or {}).get('sleeper_id') not in (None, '')
+          }
+          if len(baseline_sids) != 595:
+              raise RuntimeError('baseline Sleeper IDs not one-to-one')
+
+          # Reconstruct the exact Phase 1E 27-row recovery cohort.
+          recoveries = []
+          for row in unresolved:
+              name = row.get('source_player_name')
+              team = norm_team(row.get('source_team'))
+              bucket = row.get('source_bucket')
+
+              def eligible(cands):
+                  matched = {}
+                  for c in cands:
+                      if bucket not in c['buckets']:
+                          continue
+                      if not team or not c['team'] or c['team'] != team:
+                          continue
+                      matched[c['sid']] = c
+                  return matched
+
+              exact = eligible(full_index.get(norm_name(name), []))
+              suffixless = eligible(
+                  suffixless_index.get(norm_name_no_suffix(name), [])
+              )
+
+              sid = None
+              if len(exact) == 1:
+                  sid = next(iter(exact))
+              elif len(exact) == 0 and len(suffixless) == 1:
+                  sid = next(iter(suffixless))
+
+              if sid is not None:
+                  recoveries.append({
+                      'source_row_sha256': row['source_row_sha256'],
+                      'sleeper_id': str(sid),
+                  })
+
+          if len(recoveries) != 27:
+              raise RuntimeError(f'expected 27 Phase 1E recoveries, got {len(recoveries)}')
+
+          fingerprint_payload = [
+              [r['source_row_sha256'], r['sleeper_id']]
+              for r in sorted(recoveries, key=lambda x: x['source_row_sha256'])
+          ]
+          recovery_fingerprint = hashlib.sha256(
+              json.dumps(
+                  fingerprint_payload,
+                  separators=(',', ':'),
+                  ensure_ascii=False,
+              ).encode('utf-8')
+          ).hexdigest()
+
+          if recovery_fingerprint != EXPECTED_RECOVERY_FINGERPRINT:
+              raise RuntimeError(
+                  'Phase 1E recovery fingerprint drifted: '
+                  f'{recovery_fingerprint}'
+              )
+
+          recovered_hashes = {r['source_row_sha256'] for r in recoveries}
+          remaining = [
+              r for r in unresolved
+              if r['source_row_sha256'] not in recovered_hashes
+          ]
+          if len(remaining) != 26:
+              raise RuntimeError(f'expected 26 remaining rows, got {len(remaining)}')
+
+          # Position rank bands from the full 648-row 4for4 pool.
+          score_key = 'log_base_points_excluding_weekly_bonuses_and_blocked_kicks'
+          by_bucket = defaultdict(list)
+          for row in rows:
+              score = row.get(score_key)
+              if not isinstance(score, (int, float)) or not math.isfinite(float(score)):
+                  raise RuntimeError('missing/non-finite LOG score')
+              by_bucket[row['source_bucket']].append(
+                  (float(score), row['source_row_sha256'])
+              )
+
+          rank_band = {}
+          for bucket, vals in by_bucket.items():
+              ordered = sorted(vals, reverse=True)
+              n = len(ordered)
+              t10 = max(1, math.ceil(n * 0.10))
+              t25 = max(t10, math.ceil(n * 0.25))
+              t50 = max(t25, math.ceil(n * 0.50))
+              for idx, (_, row_hash) in enumerate(ordered, 1):
+                  if idx <= t10:
+                      band = 'top_10_pct'
+                  elif idx <= t25:
+                      band = '10_to_25_pct'
+                  elif idx <= t50:
+                      band = '25_to_50_pct'
+                  else:
+                      band = 'bottom_50_pct'
+                  rank_band[row_hash] = band
+
+          outcomes = Counter()
+          outcomes_by_band = defaultdict(Counter)
+          outcomes_by_bucket = defaultdict(Counter)
+          high_confidence_candidates = []
+
+          for row in remaining:
+              name = row.get('source_player_name')
+              team = norm_team(row.get('source_team'))
+              bucket = row.get('source_bucket')
+              band = rank_band[row['source_row_sha256']]
+
+              src_first = first_token(name)
+              src_surname = surname(name)
+
+              candidates = []
+              for c in team_bucket_candidates.get((team, bucket), []):
+                  if surname(c['name']) != src_surname:
+                      continue
+                  cand_first = first_token(c['name'])
+                  full_similarity = SequenceMatcher(
+                      None,
+                      norm_name_no_suffix(name),
+                      norm_name_no_suffix(c['name']),
+                  ).ratio()
+                  first_similarity = SequenceMatcher(
+                      None,
+                      src_first,
+                      cand_first,
+                  ).ratio() if src_first and cand_first else 0.0
+                  same_initial = bool(
+                      src_first and cand_first and src_first[0] == cand_first[0]
+                  )
+                  candidates.append({
+                      'sid': c['sid'],
+                      'full_similarity': full_similarity,
+                      'first_similarity': first_similarity,
+                      'same_initial': same_initial,
+                  })
+
+              unique_by_sid = {c['sid']: c for c in candidates}
+              candidates = list(unique_by_sid.values())
+
+              if not candidates:
+                  outcome = 'no_exact_surname_same_team_bucket_candidate'
+              elif len(candidates) > 1:
+                  strong = [
+                      c for c in candidates
+                      if c['same_initial'] and c['full_similarity'] >= 0.72
+                  ]
+                  if len(strong) == 1:
+                      outcome = 'one_strong_candidate_among_surname_collision'
+                      high_confidence_candidates.append(
+                          (row['source_row_sha256'], strong[0]['sid'])
+                      )
+                  else:
+                      outcome = 'ambiguous_exact_surname_same_team_bucket'
+              else:
+                  c = candidates[0]
+                  if c['same_initial'] and (
+                      c['full_similarity'] >= 0.72
+                      or c['first_similarity'] >= 0.60
+                  ):
+                      outcome = 'unique_conservative_alias_candidate'
+                      high_confidence_candidates.append(
+                          (row['source_row_sha256'], c['sid'])
+                      )
+                  elif c['full_similarity'] >= 0.84:
+                      outcome = 'unique_high_name_similarity_candidate'
+                      high_confidence_candidates.append(
+                          (row['source_row_sha256'], c['sid'])
+                      )
+                  else:
+                      outcome = 'unique_surname_candidate_weak_first_name_support'
+
+              outcomes[outcome] += 1
+              outcomes_by_band[band][outcome] += 1
+              outcomes_by_bucket[bucket][outcome] += 1
+
+          # This phase is discovery only. Validate candidate uniqueness but do not adopt.
+          candidate_hashes = [x[0] for x in high_confidence_candidates]
+          candidate_sids = [x[1] for x in high_confidence_candidates]
+          if len(candidate_hashes) != len(set(candidate_hashes)):
+              raise RuntimeError('candidate source-row collision')
+          if len(candidate_sids) != len(set(candidate_sids)):
+              raise RuntimeError('candidate Sleeper-ID collision')
+          if set(candidate_sids) & baseline_sids:
+              raise RuntimeError('candidate Sleeper IDs overlap baseline resolved identities')
+          if set(candidate_sids) & {r['sleeper_id'] for r in recoveries}:
+              raise RuntimeError('candidate Sleeper IDs overlap Phase 1E recoveries')
+
+          high_confidence_fingerprint = hashlib.sha256(
+              json.dumps(
+                  sorted([list(x) for x in high_confidence_candidates]),
+                  separators=(',', ':'),
+              ).encode('utf-8')
+          ).hexdigest()
+
+          result = {
+              'schema_version': 1,
+              'study': 'fourforfour-idp-v1-phase1f-conservative-alias-recovery-audit',
+              'research_only': True,
+              'production_changes': False,
+              'phase1e_recovery_fingerprint_verified': True,
+              'phase1e_recovered_rows': 27,
+              'remaining_rows_audited': 26,
+              'candidate_policy': {
+                  'exact_team_required': True,
+                  'compatible_idp_bucket_required': True,
+                  'exact_surname_required': True,
+                  'unique_sleeper_id_required': True,
+                  'same_first_initial_preferred': True,
+                  'automatic_adoption_authorized': False,
+              },
+              'outcomes': dict(sorted(outcomes.items())),
+              'outcomes_by_rank_band': {
+                  k: dict(sorted(v.items()))
+                  for k, v in sorted(outcomes_by_band.items())
+              },
+              'outcomes_by_bucket': {
+                  k: dict(sorted(v.items()))
+                  for k, v in sorted(outcomes_by_bucket.items())
+              },
+              'high_confidence_candidate_rows': len(high_confidence_candidates),
+              'high_confidence_candidate_fingerprint_sha256':
+                  high_confidence_fingerprint,
+              'candidate_source_hashes_unique': True,
+              'candidate_sleeper_ids_unique': True,
+              'candidate_overlap_with_resolved_or_phase1e': 0,
+              'private_mapping_persisted': False,
+          }
+
+          forbidden_keys = {
+              'source_player_name',
+              'source_team',
+              'sleeper_id',
+              'source_row_number',
+              'raw_category_season_totals',
+              'provider_ff_pts_reference_only',
+          }
+
+          def assert_no_forbidden_keys(value, path='$'):
+              if isinstance(value, dict):
+                  for key, child in value.items():
+                      if key in forbidden_keys:
+                          raise RuntimeError(
+                              f'aggregate alias audit leaked forbidden key: {path}.{key}'
+                          )
+                      assert_no_forbidden_keys(child, f'{path}.{key}')
+              elif isinstance(value, list):
+                  for i, child in enumerate(value):
+                      assert_no_forbidden_keys(child, f'{path}[{i}]')
+
+          assert_no_forbidden_keys(result)
+
+          print('PASS: Phase 1F conservative alias recovery audit complete.')
+          print(json.dumps(result, indent=2, sort_keys=True))
+          PY
+
+      - name: Run repository regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/repo_regression_checks.py
+
+      - name: Prove audit made no repository changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git diff --quiet -- .; then
+            echo 'ERROR: Phase 1F modified tracked repository files.' >&2
+            git diff -- .
+            exit 1
+          fi
+          if ! git diff --cached --quiet -- .; then
+            echo 'ERROR: Phase 1F staged repository changes.' >&2
+            git diff --cached -- .
+            exit 1
+          fi
+          echo 'PASS: Phase 1F and regressions left the repository unchanged.'
+
+      - name: Destroy private 4for4 inputs and row-level outputs
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/log-fourforfour-idp-v1
+          echo 'PASS: private provider inputs and row-level outputs removed from runner.'
