@@ -1,0 +1,405 @@
+name: 4for4 IDP V1 - Phase 1E Recovery Freeze Validation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-recovery-freeze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      FOURFORFOUR_DL_GZ_B64: ${{ secrets.FOURFORFOUR_DL_GZ_B64 }}
+      FOURFORFOUR_LB_GZ_B64: ${{ secrets.FOURFORFOUR_LB_GZ_B64 }}
+      FOURFORFOUR_DB_GZ_B64: ${{ secrets.FOURFORFOUR_DB_GZ_B64 }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check requests
+
+      - name: Decode private 4for4 inputs outside repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          for var in FOURFORFOUR_DL_GZ_B64 FOURFORFOUR_LB_GZ_B64 FOURFORFOUR_DB_GZ_B64; do
+            if [ -z "${!var:-}" ]; then
+              echo "ERROR: required GitHub Actions secret ${var} is missing or empty." >&2
+              exit 1
+            fi
+          done
+
+          install -d -m 700 /tmp/log-fourforfour-idp-v1/input
+          install -d -m 700 /tmp/log-fourforfour-idp-v1/output
+
+          printf '%s' "$FOURFORFOUR_DL_GZ_B64" | base64 --decode | gzip -dc \
+            > /tmp/log-fourforfour-idp-v1/input/dl.csv
+          printf '%s' "$FOURFORFOUR_LB_GZ_B64" | base64 --decode | gzip -dc \
+            > /tmp/log-fourforfour-idp-v1/input/lb.csv
+          printf '%s' "$FOURFORFOUR_DB_GZ_B64" | base64 --decode | gzip -dc \
+            > /tmp/log-fourforfour-idp-v1/input/db.csv
+
+          chmod 600 /tmp/log-fourforfour-idp-v1/input/*.csv
+
+      - name: Run current 4for4 pipeline on private real data
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/projections/fourforfour_projection_pipeline.py \
+            --dl /tmp/log-fourforfour-idp-v1/input/dl.csv \
+            --lb /tmp/log-fourforfour-idp-v1/input/lb.csv \
+            --db /tmp/log-fourforfour-idp-v1/input/db.csv \
+            --output-dir /tmp/log-fourforfour-idp-v1/output/private \
+            --public-summary /tmp/log-fourforfour-idp-v1/output/aggregate-summary.json \
+            > /tmp/log-fourforfour-idp-v1/output/pipeline.stdout.txt
+
+      - name: Freeze and validate safe recovery cohort
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import importlib.util
+          import json
+          import re
+          from collections import Counter, defaultdict
+          from pathlib import Path
+
+          import requests
+
+          repo = Path.cwd()
+          root = Path('/tmp/log-fourforfour-idp-v1/output')
+          private = root / 'private'
+
+          normalized = json.loads(
+              (private / 'fourforfour_2026_idp_normalized_private.json')
+              .read_text(encoding='utf-8')
+          )
+          rows = (
+              normalized.get('rows')
+              or normalized.get('players')
+              or normalized.get('data')
+              if isinstance(normalized, dict)
+              else normalized
+          )
+          if not isinstance(rows, list) or len(rows) != 648:
+              raise RuntimeError('unexpected normalized-private JSON shape/count')
+
+          summary = json.loads(
+              (root / 'aggregate-summary.json').read_text(encoding='utf-8')
+          )
+          identity = summary.get('identity') or {}
+          if identity.get('resolved_rows') != 595 or identity.get('unresolved_rows') != 53:
+              raise RuntimeError(
+                  'Phase 1B baseline changed; expected 595 resolved / 53 unresolved'
+              )
+
+          def norm_team(value):
+              if value in (None, '', 'FA'):
+                  return None
+              t = str(value).strip().upper()
+              return {
+                  'JAC': 'JAX', 'WSH': 'WAS', 'OAK': 'LV',
+                  'SD': 'LAC', 'STL': 'LAR',
+              }.get(t, t)
+
+          def norm_name(value):
+              s = str(value or '').strip().lower()
+              s = re.sub(r"[.'’\-]", '', s)
+              return re.sub(r'\s+', ' ', s).strip()
+
+          suffixes = {'jr', 'sr', 'ii', 'iii', 'iv', 'v'}
+
+          def norm_name_no_suffix(value):
+              parts = norm_name(value).split()
+              if parts and parts[-1] in suffixes:
+                  parts = parts[:-1]
+              return ' '.join(parts)
+
+          def sleeper_buckets(player):
+              labels = set()
+              raw = list(player.get('fantasy_positions') or [])
+              if player.get('position'):
+                  raw.append(player.get('position'))
+              for x in raw:
+                  p = str(x or '').strip().upper()
+                  if p in {'DL', 'DE', 'DT', 'NT'}:
+                      labels.add('DL')
+                  elif p in {'LB', 'ILB', 'MLB', 'OLB'}:
+                      labels.add('LB')
+                  elif p in {'DB', 'CB', 'S', 'SS', 'FS'}:
+                      labels.add('DB')
+                  elif p == 'EDGE':
+                      labels.update({'DL', 'LB'})
+              return labels
+
+          response = requests.get('https://api.sleeper.app/v1/players/nfl', timeout=60)
+          response.raise_for_status()
+          universe = response.json()
+          if not isinstance(universe, dict) or len(universe) < 1000:
+              raise RuntimeError('Sleeper full-player response unexpectedly small')
+
+          full_index = defaultdict(list)
+          suffixless_index = defaultdict(list)
+          by_sid = {}
+
+          for sid, player in universe.items():
+              if not isinstance(player, dict):
+                  continue
+              full_name = (
+                  player.get('full_name')
+                  or ' '.join(
+                      x for x in [player.get('first_name'), player.get('last_name')] if x
+                  ).strip()
+              )
+              if not full_name:
+                  continue
+
+              candidate = {
+                  'sid': str(sid),
+                  'team': norm_team(player.get('team')),
+                  'buckets': sleeper_buckets(player),
+              }
+              by_sid[str(sid)] = candidate
+
+              if not candidate['buckets']:
+                  continue
+              full_index[norm_name(full_name)].append(candidate)
+              suffixless_index[norm_name_no_suffix(full_name)].append(candidate)
+
+          unresolved = [r for r in rows if not (r.get('identity') or {}).get('resolved')]
+          resolved = [r for r in rows if (r.get('identity') or {}).get('resolved')]
+          if len(unresolved) != 53 or len(resolved) != 595:
+              raise RuntimeError('baseline row partition changed')
+
+          baseline_sids = [
+              str((r.get('identity') or {}).get('sleeper_id'))
+              for r in resolved
+              if (r.get('identity') or {}).get('sleeper_id') not in (None, '')
+          ]
+          if len(baseline_sids) != 595:
+              raise RuntimeError('baseline resolved row missing Sleeper ID')
+          if len(set(baseline_sids)) != len(baseline_sids):
+              raise RuntimeError('baseline resolved Sleeper IDs are not one-to-one')
+
+          recoveries = []
+          outcomes = Counter()
+
+          for row in unresolved:
+              player_name = row.get('source_player_name')
+              team = norm_team(row.get('source_team'))
+              bucket = row.get('source_bucket')
+
+              def eligible(cands):
+                  matched = {}
+                  for c in cands:
+                      if bucket not in c['buckets']:
+                          continue
+                      if not team or not c['team'] or c['team'] != team:
+                          continue
+                      matched[c['sid']] = c
+                  return matched
+
+              exact = eligible(full_index.get(norm_name(player_name), []))
+              suffixless = eligible(
+                  suffixless_index.get(norm_name_no_suffix(player_name), [])
+              )
+
+              if len(exact) == 1:
+                  outcome = 'safe_exact_full_universe_match'
+                  sid = next(iter(exact))
+              elif len(exact) > 1:
+                  outcome = 'ambiguous_exact_full_universe_match'
+                  sid = None
+              elif len(suffixless) == 1:
+                  outcome = 'safe_suffix_tolerant_full_universe_match'
+                  sid = next(iter(suffixless))
+              elif len(suffixless) > 1:
+                  outcome = 'ambiguous_suffix_tolerant_full_universe_match'
+                  sid = None
+              else:
+                  any_name = (
+                      full_index.get(norm_name(player_name), [])
+                      or suffixless_index.get(norm_name_no_suffix(player_name), [])
+                  )
+                  outcome = (
+                      'name_exists_but_team_or_position_not_corroborated'
+                      if any_name
+                      else 'still_no_full_universe_name_candidate'
+                  )
+                  sid = None
+
+              outcomes[outcome] += 1
+              if sid is not None:
+                  recoveries.append({
+                      'source_row_sha256': row['source_row_sha256'],
+                      'sleeper_id': str(sid),
+                      'source_bucket': bucket,
+                      '_private_source_name': player_name,
+                      '_private_source_team': team,
+                      '_private_canonical_position': row.get('canonical_position'),
+                  })
+
+          expected_outcomes = {
+              'name_exists_but_team_or_position_not_corroborated': 10,
+              'safe_suffix_tolerant_full_universe_match': 27,
+              'still_no_full_universe_name_candidate': 16,
+          }
+          if dict(sorted(outcomes.items())) != expected_outcomes:
+              raise RuntimeError(
+                  f'Phase 1D recovery outcomes drifted: {dict(sorted(outcomes.items()))}'
+              )
+          if len(recoveries) != 27:
+              raise RuntimeError(f'expected 27 safe recoveries, got {len(recoveries)}')
+
+          recovery_hashes = [r['source_row_sha256'] for r in recoveries]
+          recovery_sids = [r['sleeper_id'] for r in recoveries]
+          if len(set(recovery_hashes)) != 27:
+              raise RuntimeError('recovery source-row hashes are not unique')
+          if len(set(recovery_sids)) != 27:
+              raise RuntimeError('two recovery rows collapse onto the same Sleeper ID')
+          overlap = sorted(set(recovery_sids) & set(baseline_sids))
+          if overlap:
+              raise RuntimeError(
+                  f'recovery Sleeper IDs overlap baseline resolved IDs: count={len(overlap)}'
+              )
+
+          # Crosswalk contradiction check using the exact current project resolver semantics.
+          resolver_path = repo / 'scripts/projections/resolve_fantasypros_sleeper_identity.py'
+          spec = importlib.util.spec_from_file_location('td_resolver', resolver_path)
+          resolver = importlib.util.module_from_spec(spec)
+          assert spec and spec.loader
+          spec.loader.exec_module(resolver)
+
+          pipeline_path = repo / 'scripts/projections/fourforfour_projection_pipeline.py'
+          pspec = importlib.util.spec_from_file_location('fourforfour_pipeline', pipeline_path)
+          pipeline = importlib.util.module_from_spec(pspec)
+          assert pspec and pspec.loader
+          pspec.loader.exec_module(pipeline)
+
+          crosswalk = json.loads(
+              (repo / 'scripts/identity_crosswalk.json').read_text(encoding='utf-8')
+          )
+
+          contradictions = 0
+          for rec in recoveries:
+              name = rec['_private_source_name']
+              team = rec['_private_source_team']
+              canonical_position = rec['_private_canonical_position']
+              sid = rec['sleeper_id']
+
+              for cw in crosswalk:
+                  cwsid = cw.get('sleeper_id')
+                  if cwsid in (None, ''):
+                      continue
+                  if not resolver.stable_authoritative_name_equivalent(name, cw.get('name')):
+                      continue
+                  if pipeline.normalize_team(
+                      cw.get('sleeper_team') or cw.get('fp_team')
+                  ) != team:
+                      continue
+                  if not pipeline.crosswalk_position_compatible(canonical_position, cw):
+                      continue
+                  if str(cwsid) != sid:
+                      contradictions += 1
+
+          if contradictions:
+              raise RuntimeError(
+                  f'authoritative crosswalk contradictions in recovery cohort: {contradictions}'
+              )
+
+          # Freeze only non-private identifiers into a cryptographic fingerprint.
+          fingerprint_payload = [
+              [r['source_row_sha256'], r['sleeper_id']]
+              for r in sorted(recoveries, key=lambda x: x['source_row_sha256'])
+          ]
+          fingerprint_json = json.dumps(
+              fingerprint_payload,
+              separators=(',', ':'),
+              ensure_ascii=False,
+          )
+          recovery_fingerprint = hashlib.sha256(
+              fingerprint_json.encode('utf-8')
+          ).hexdigest()
+
+          remaining_unresolved_hashes = sorted(
+              r['source_row_sha256']
+              for r in unresolved
+              if r['source_row_sha256'] not in set(recovery_hashes)
+          )
+          remainder_fingerprint = hashlib.sha256(
+              json.dumps(
+                  remaining_unresolved_hashes,
+                  separators=(',', ':'),
+              ).encode('utf-8')
+          ).hexdigest()
+
+          final = {
+              'schema_version': 1,
+              'study': 'fourforfour-idp-v1-phase1e-recovery-freeze-validation',
+              'research_only': True,
+              'production_changes': False,
+              'baseline_resolved_rows': 595,
+              'baseline_unresolved_rows': 53,
+              'safe_recovered_rows': 27,
+              'post_recovery_resolved_rows': 622,
+              'post_recovery_unresolved_rows': 26,
+              'post_recovery_resolved_rate': round(622 / 648, 6),
+              'recovery_outcomes': expected_outcomes,
+              'recovery_source_hashes_unique': True,
+              'recovery_sleeper_ids_unique': True,
+              'recovery_overlap_with_baseline_resolved_ids': 0,
+              'authoritative_crosswalk_contradictions': 0,
+              'recovery_fingerprint_sha256': recovery_fingerprint,
+              'remaining_unresolved_fingerprint_sha256': remainder_fingerprint,
+              'fingerprint_definition': (
+                  'SHA256 of canonical sorted [private_source_row_sha256, sleeper_id] '
+                  'pairs; pair contents are not emitted.'
+              ),
+              'private_mapping_persisted': False,
+          }
+
+          print('PASS: Phase 1E safe recovery cohort frozen and validated.')
+          print(json.dumps(final, indent=2, sort_keys=True))
+          PY
+
+      - name: Run repository regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/repo_regression_checks.py
+
+      - name: Prove validation made no repository changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git diff --quiet -- .; then
+            echo 'ERROR: Phase 1E modified tracked repository files.' >&2
+            git diff -- .
+            exit 1
+          fi
+          if ! git diff --cached --quiet -- .; then
+            echo 'ERROR: Phase 1E staged repository changes.' >&2
+            git diff --cached -- .
+            exit 1
+          fi
+          echo 'PASS: Phase 1E and regressions left the repository unchanged.'
+
+      - name: Destroy private 4for4 inputs and row-level outputs
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/log-fourforfour-idp-v1
+          echo 'PASS: private provider inputs and row-level outputs removed from runner.'
