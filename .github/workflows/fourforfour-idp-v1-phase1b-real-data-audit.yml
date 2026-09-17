@@ -1,0 +1,171 @@
+name: 4for4 IDP V1 - Phase 1B Real-Data Audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  private-real-data-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      FOURFORFOUR_DL_GZ_B64: ${{ secrets.FOURFORFOUR_DL_GZ_B64 }}
+      FOURFORFOUR_LB_GZ_B64: ${{ secrets.FOURFORFOUR_LB_GZ_B64 }}
+      FOURFORFOUR_DB_GZ_B64: ${{ secrets.FOURFORFOUR_DB_GZ_B64 }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install regression dependencies
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check requests
+
+      - name: Decode private 4for4 inputs outside repository
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for var in FOURFORFOUR_DL_GZ_B64 FOURFORFOUR_LB_GZ_B64 FOURFORFOUR_DB_GZ_B64; do
+            if [ -z "${!var:-}" ]; then
+              echo "ERROR: required GitHub Actions secret ${var} is missing or empty." >&2
+              exit 1
+            fi
+          done
+
+          install -d -m 700 /tmp/log-fourforfour-idp-v1/input
+          install -d -m 700 /tmp/log-fourforfour-idp-v1/output
+
+          printf '%s' "$FOURFORFOUR_DL_GZ_B64" | base64 --decode | gzip -dc \
+            > /tmp/log-fourforfour-idp-v1/input/dl.csv
+          printf '%s' "$FOURFORFOUR_LB_GZ_B64" | base64 --decode | gzip -dc \
+            > /tmp/log-fourforfour-idp-v1/input/lb.csv
+          printf '%s' "$FOURFORFOUR_DB_GZ_B64" | base64 --decode | gzip -dc \
+            > /tmp/log-fourforfour-idp-v1/input/db.csv
+
+          chmod 600 /tmp/log-fourforfour-idp-v1/input/*.csv
+
+      - name: Validate private input shape and frozen row counts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import csv
+          from pathlib import Path
+
+          expected_columns = {
+              'Player', 'Team', 'Bye', 'Position', 'FF Pts', 'Snap %',
+              'Tackles', 'Assists', 'Sacks', 'TFL', 'QBH', 'INT', 'PD',
+              'FFum', 'FR', 'Safety', 'DefTD',
+          }
+          expected_counts = {'dl.csv': 250, 'lb.csv': 136, 'db.csv': 262}
+          root = Path('/tmp/log-fourforfour-idp-v1/input')
+
+          total = 0
+          for name, expected_count in expected_counts.items():
+              path = root / name
+              with path.open(encoding='utf-8-sig', newline='') as f:
+                  reader = csv.DictReader(f)
+                  headers = set(reader.fieldnames or [])
+                  missing = sorted(expected_columns - headers)
+                  if missing:
+                      raise RuntimeError(f'{name}: missing required columns: {missing}')
+                  rows = list(reader)
+              if len(rows) != expected_count:
+                  raise RuntimeError(
+                      f'{name}: expected {expected_count} rows, found {len(rows)}'
+                  )
+              total += len(rows)
+              print(f'PASS: {name} has {len(rows)} rows and the required schema.')
+
+          if total != 648:
+              raise RuntimeError(f'expected 648 total rows, found {total}')
+          print('PASS: frozen real-data input population is exactly 648 rows.')
+          PY
+
+      - name: Run current 4for4 Phase 1 pipeline on private real data
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/projections/fourforfour_projection_pipeline.py \
+            --dl /tmp/log-fourforfour-idp-v1/input/dl.csv \
+            --lb /tmp/log-fourforfour-idp-v1/input/lb.csv \
+            --db /tmp/log-fourforfour-idp-v1/input/db.csv \
+            --output-dir /tmp/log-fourforfour-idp-v1/output/private \
+            --public-summary /tmp/log-fourforfour-idp-v1/output/aggregate-summary.json
+
+      - name: Validate and show aggregate-only audit summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path('/tmp/log-fourforfour-idp-v1/output/aggregate-summary.json')
+          data = json.loads(path.read_text(encoding='utf-8'))
+
+          if data.get('research_only') is not True:
+              raise RuntimeError('aggregate summary lost research_only=true guard')
+          if data.get('production_authorized') is not False:
+              raise RuntimeError('aggregate summary unexpectedly authorizes production')
+
+          inputs = data.get('inputs') or {}
+          if inputs.get('total_rows') != 648:
+              raise RuntimeError(f"aggregate total_rows != 648: {inputs.get('total_rows')}")
+          if inputs.get('rows_by_bucket') != {'DB': 262, 'DL': 250, 'LB': 136}:
+              raise RuntimeError(
+                  f"unexpected rows_by_bucket: {inputs.get('rows_by_bucket')}"
+              )
+
+          ident = data.get('identity') or {}
+          resolved = ident.get('resolved_rows')
+          unresolved = ident.get('unresolved_rows')
+          if not isinstance(resolved, int) or not isinstance(unresolved, int):
+              raise RuntimeError('identity summary missing resolved/unresolved counts')
+          if resolved + unresolved != 648:
+              raise RuntimeError(
+                  f'identity accounting does not sum to 648: {resolved}+{unresolved}'
+              )
+
+          print('PASS: aggregate audit integrity guards passed.')
+          print(json.dumps(data, indent=2, sort_keys=True))
+          PY
+
+      - name: Run repository regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/repo_regression_checks.py
+
+      - name: Prove audit made no repository changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git diff --quiet -- .; then
+            echo 'ERROR: private 4for4 audit modified tracked repository files.' >&2
+            git diff -- .
+            exit 1
+          fi
+          if ! git diff --cached --quiet -- .; then
+            echo 'ERROR: private 4for4 audit staged repository changes.' >&2
+            git diff --cached -- .
+            exit 1
+          fi
+          echo 'PASS: real-data audit and regressions left the repository unchanged.'
+
+      - name: Destroy private 4for4 inputs and row-level outputs
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/log-fourforfour-idp-v1
+          echo 'PASS: private provider inputs and row-level audit outputs removed from runner.'
