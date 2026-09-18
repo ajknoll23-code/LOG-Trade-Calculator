@@ -6,7 +6,7 @@ Policy SHA256: `f40340a475829d6b0d5b3f63ab25dcf9be976749a307710fd0fc67f602702959
 **Market Value V2 is a separate market-opinion layer. It does not change Fundamental Value, Team Utility, or live trade verdict math.**
 
 - Market-covered players: **504**
-- Raw counted votes: **920**
+- Raw counted votes: **940**
 - Effective votes: **388.0**
 - League effective votes: **192.0**
 - Guest effective votes: **196.0**
@@ -16,36 +16,36 @@ Policy SHA256: `f40340a475829d6b0d5b3f63ab25dcf9be976749a307710fd0fc67f602702959
 
 | Player | Pos | Fundamental | Market | Δ | Market rank |
 |---|---|---:|---:|---:|---:|
-| fernando mendoza | QB | 2,150 | 8,834 | +6,684 | 1.0 |
-| sonny styles | LB | 3,273 | 8,502 | +5,229 | 2.0 |
-| bijan robinson | RB | 8,502 | 3,416 | -5,086 | 166.0 |
-| arvell reese | LB | 2,465 | 6,626 | +4,161 | 7.0 |
-| malik davis | RB | 805 | 4,795 | +3,990 | 51.0 |
-| jahmyr gibbs | RB | 8,834 | 4,855 | -3,979 | 45.0 |
-| brian burns | DL | 7,391 | 3,561 | -3,830 | 148.0 |
-| dorian williams | LB | 2,297 | 5,972 | +3,675 | 10.0 |
-| kenyon sadiq | TE | 1,303 | 4,975 | +3,672 | 38.0 |
-| dj giddens | RB | 734 | 4,258 | +3,524 | 83.0 |
-| ashton jeanty | RB | 7,140 | 3,671 | -3,469 | 131.0 |
-| ty simpson | QB | 1,169 | 4,604 | +3,435 | 63.0 |
-| malik willis | QB | 3,711 | 7,140 | +3,429 | 4.0 |
-| kc concepcion | WR | 2,115 | 5,538 | +3,423 | 18.0 |
-| chris olave | WR | 5,445 | 2,048 | -3,397 | 341.0 |
-| odafe oweh | DL | 4,258 | 864 | -3,394 | 473.0 |
-| christian watson | WR | 4,493 | 1,102 | -3,391 | 431.0 |
-| xavier worthy | WR | 2,810 | 6,123 | +3,313 | 9.0 |
-| devin singletary | RB | 685 | 3,974 | +3,289 | 103.0 |
-| kaelon black | RB | 896 | 4,156 | +3,260 | 91.0 |
-| drake london | WR | 5,852 | 2,611 | -3,241 | 276.0 |
-| tyrel dodson | LB | 4,295 | 1,077 | -3,218 | 437.0 |
-| alex highsmith | DL | 5,219 | 2,004 | -3,215 | 349.0 |
-| jihaad campbell | LB | 2,473 | 5,655 | +3,182 | 15.0 |
-| elijah arroyo | TE | 680 | 3,852 | +3,172 | 116.0 |
-| kendrick bourne | WR | 1,074 | 4,230 | +3,156 | 86.0 |
-| jake golday | LB | 1,162 | 4,276 | +3,114 | 82.0 |
-| nick bolton | LB | 5,351 | 2,338 | -3,013 | 314.0 |
-| devin lloyd | LB | 4,363 | 1,412 | -2,951 | 394.0 |
-| trevon moehrig | DB | 3,636 | 685 | -2,951 | 494.0 |
+| fernando mendoza | QB | 2,182 | 8,726 | +6,544 | 1.0 |
+| sonny styles | LB | 3,293 | 8,443 | +5,150 | 2.0 |
+| bijan robinson | RB | 8,443 | 3,368 | -5,075 | 173.0 |
+| dorian williams | LB | 2,302 | 7,030 | +4,728 | 5.0 |
+| arvell reese | LB | 2,514 | 6,568 | +4,054 | 8.0 |
+| brian burns | DL | 7,441 | 3,440 | -4,001 | 162.0 |
+| malik davis | RB | 855 | 4,849 | +3,994 | 47.0 |
+| jahmyr gibbs | RB | 8,726 | 4,916 | -3,810 | 42.0 |
+| malik willis | QB | 3,697 | 7,441 | +3,744 | 3.0 |
+| kenyon sadiq | TE | 1,328 | 5,066 | +3,738 | 34.0 |
+| dj giddens | RB | 737 | 4,340 | +3,603 | 80.0 |
+| ty simpson | QB | 1,169 | 4,644 | +3,475 | 62.0 |
+| kc concepcion | WR | 2,111 | 5,578 | +3,467 | 17.0 |
+| ashton jeanty | RB | 7,105 | 3,663 | -3,442 | 134.0 |
+| odafe oweh | DL | 4,307 | 870 | -3,437 | 472.0 |
+| devin singletary | RB | 679 | 4,028 | +3,349 | 101.0 |
+| alex highsmith | DL | 5,304 | 1,980 | -3,324 | 353.0 |
+| christian watson | WR | 4,480 | 1,168 | -3,312 | 426.0 |
+| jihaad campbell | LB | 2,502 | 5,770 | +3,268 | 15.0 |
+| kaelon black | RB | 894 | 4,161 | +3,267 | 91.0 |
+| xavier worthy | WR | 2,767 | 6,028 | +3,261 | 10.0 |
+| drake london | WR | 5,847 | 2,592 | -3,255 | 279.0 |
+| chris olave | WR | 5,406 | 2,156 | -3,250 | 337.0 |
+| tyrel dodson | LB | 4,295 | 1,083 | -3,212 | 439.0 |
+| elijah arroyo | TE | 683 | 3,844 | +3,161 | 119.0 |
+| kendrick bourne | WR | 1,093 | 4,239 | +3,146 | 86.0 |
+| jake golday | LB | 1,162 | 4,295 | +3,133 | 82.0 |
+| devin lloyd | LB | 4,395 | 1,335 | -3,060 | 403.0 |
+| nick bolton | LB | 5,357 | 2,333 | -3,024 | 314.0 |
+| trevon moehrig | DB | 3,685 | 683 | -3,002 | 494.0 |
 
 ## Deployed policy
 

@@ -8,7 +8,7 @@ Policy SHA256: `bafc53164f6d98448965c5d0b531b14be31a3d744f0e4a44d6cdac71b6c05247
 **These ranges are not probability confidence intervals.** They are deterministic sensitivity envelopes around the deployed point value using currently observable projection disagreement, historical sampling noise, and availability-history signal.
 
 - Players: **565**
-- Width quartiles: Q25 **18.9%**, median **24.6%**, Q75 **32.0%**
+- Width quartiles: Q25 **18.8%**, median **24.7%**, Q75 **31.6%**
 - Provider coverage (0/1/2): **{'0': 47, '1': 90, '2': 428}**
 - History coverage: **{'insufficient': 126, 'with_2plus_games': 439}**
 
@@ -18,7 +18,7 @@ Policy SHA256: `bafc53164f6d98448965c5d0b531b14be31a3d744f0e4a44d6cdac71b6c05247
 |---|---:|---:|---:|---:|---:|
 | QB | 64 | 37.5% | 2.7% | 17.2% | 28.9% |
 | RB | 97 | 24.0% | 5.9% | 18.5% | 4.3% |
-| WR | 114 | 25.7% | 6.8% | 22.5% | 6.9% |
+| WR | 114 | 25.7% | 6.3% | 22.5% | 6.9% |
 | TE | 44 | 24.0% | 4.9% | 19.2% | 7.1% |
 | DL | 86 | 25.1% | 10.1% | 21.0% | 5.2% |
 | LB | 79 | 22.4% | 16.1% | 14.7% | 1.7% |
@@ -29,15 +29,15 @@ Policy SHA256: `bafc53164f6d98448965c5d0b531b14be31a3d744f0e4a44d6cdac71b6c05247
 
 | Player | Pos | Center | Low | High | Half-width | Tier |
 |---|---|---:|---:|---:|---:|---|
-| jordan james | RB | 772 | 0 | 1544 | 100.0% | very_high |
+| jordan james | RB | 770 | 0 | 1540 | 100.0% | very_high |
 | tyrel dodson | LB | 4295 | 0 | 8590 | 100.0% | very_high |
 | zion young | DL | 1013 | 20 | 2006 | 98.0% | very_high |
 | malik nabers | WR | 4083 | 172 | 7994 | 95.8% | very_high |
 | keandre lambertsmith | WR | 825 | 35 | 1615 | 95.7% | very_high |
-| malik benson | WR | 1037 | 48 | 2026 | 95.3% | very_high |
-| cedric gray | LB | 4509 | 242 | 8776 | 94.6% | very_high |
-| dezhaun stribling | WR | 2167 | 182 | 4152 | 91.6% | very_high |
-| dylan sampson | RB | 1509 | 147 | 2871 | 90.3% | very_high |
+| cedric gray | LB | 4509 | 235 | 8783 | 94.8% | very_high |
+| malik benson | WR | 1037 | 73 | 2001 | 93.0% | very_high |
+| dezhaun stribling | WR | 2190 | 184 | 4196 | 91.6% | very_high |
+| dylan sampson | RB | 1519 | 148 | 2890 | 90.3% | very_high |
 | adam randall | RB | 888 | 117 | 1659 | 86.9% | very_high |
 | tua tagovailoa | QB | 2682 | 418 | 4946 | 84.4% | very_high |
 | jameis winston | QB | 1086 | 182 | 1990 | 83.2% | very_high |
