@@ -12,8 +12,8 @@ This evaluation freezes a KTC rating snapshot, then scores raw and voter-balance
 
 ## Evidence volume
 
-- Distinct rating snapshots: **15**
-- Eligible future ballots: **75**
+- Distinct rating snapshots: **16**
+- Eligible future ballots: **89**
 - Distinct future voters: **5**
 - Evidence threshold: **30 ballots** and **4 voters**
 
@@ -21,10 +21,10 @@ This evaluation freezes a KTC rating snapshot, then scores raw and voter-balance
 
 | Target | Model | Log loss ↓ | Brier ↓ | Pairwise accuracy ↑ |
 |---|---|---:|---:|---:|
-| Raw future stream | Raw KTC | 0.613112 | 0.212324 | 67.56% |
-| Raw future stream | Balanced KTC | 0.668299 | 0.237656 | 59.11% |
-| Equal-voter future consensus | Raw KTC | 0.626157 | 0.21845 | 67.19% |
-| Equal-voter future consensus | Balanced KTC | 0.678565 | 0.242598 | 55.55% |
+| Raw future stream | Raw KTC | 0.600033 | 0.206353 | 68.92% |
+| Raw future stream | Balanced KTC | 0.652983 | 0.230281 | 63.29% |
+| Equal-voter future consensus | Raw KTC | 0.614133 | 0.212939 | 68.31% |
+| Equal-voter future consensus | Balanced KTC | 0.665111 | 0.23612 | 59.32% |
 
 Negative `balanced_minus_raw` log-loss/Brier deltas favor the balanced model.
 
@@ -46,7 +46,8 @@ Negative `balanced_minus_raw` log-loss/Brier deltas favor the balanced model.
 | 2026-09-14T19:30:18.363370Z | 2026-09-15T18:30:44.556269Z | 18 | 1 | 0.050201 | 0.024852 |
 | 2026-09-15T18:30:44.556269Z | 2026-09-16T18:15:57.488399Z | 0 | 0 | — | — |
 | 2026-09-16T18:15:57.488399Z | 2026-09-17T18:22:26.338025Z | 0 | 0 | — | — |
-| 2026-09-17T18:22:26.338025Z | current | 0 | 0 | — | — |
+| 2026-09-17T18:22:26.338025Z | 2026-09-18T17:44:31.705144Z | 14 | 1 | 0.040964 | 0.016406 |
+| 2026-09-18T17:44:31.705144Z | current | 0 | 0 | — | — |
 
 ## Decision rule
 
