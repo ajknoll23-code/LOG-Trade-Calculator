@@ -10,6 +10,7 @@ using the immutable pre-V1 baseline.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import statistics
@@ -25,6 +26,7 @@ BASELINE = REPO_ROOT / "model" / "releases" / "idp-v1" / "prod_mult_pre_v1_basel
 CANDIDATE = REPO_ROOT / "model" / "releases" / "idp-v1" / "idp_v1_model_delta_transport_candidate.json"
 PATCH = REPO_ROOT / "model" / "releases" / "idp-v1" / "idp_v1_prod_mult_patch.json"
 POSITION_LINEAGE_RELEASE = REPO_ROOT / "model" / "releases" / "idp-position-lineage-v1" / "release.json"
+FOURFORFOUR_PROVISIONAL_RELEASE = REPO_ROOT / "model" / "releases" / "fourforfour-idp-provisional-10pct-v1" / "release.json"
 JSON_OUT = SCRIPT_DIR / "idp_v1_final_deployment_validation.json"
 REPORT = SCRIPT_DIR / "idp_v1_final_deployment_validation.md"
 IDP_POSITIONS = ("LB", "DL", "DB")
@@ -77,6 +79,15 @@ def rank_map(values):
 def fmt_value(v):
     s = f"{float(v):.4f}".rstrip("0").rstrip(".")
     return float(s if "." in s else s + ".0")
+
+
+def canonical_prod_mult_hash(values):
+    payload = json.dumps(
+        {k: float(values[k]) for k in sorted(values)},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def validate_deployment():
@@ -199,15 +210,57 @@ def validate_deployment():
                     f"release={base}, reconstructed_v1={v1_expected[key]}"
                 )
 
-    current_mismatches = []
-    for key in baseline:
-        if abs(current[key] - expected_current[key]) > 1e-12:
-            current_mismatches.append((key, expected_current[key], current[key]))
-    if current_mismatches:
-        raise AssertionError(
-            "live PROD_MULT does not match V1 + approved successor stack: "
-            f"{current_mismatches[:10]}"
+    provisional_release = None
+    if FOURFORFOUR_PROVISIONAL_RELEASE.exists():
+        provisional_release = json.load(
+            open(FOURFORFOUR_PROVISIONAL_RELEASE, encoding="utf-8")
         )
+        if provisional_release.get("release_id") != "fourforfour-idp-provisional-10pct-v1":
+            raise AssertionError(
+                "unexpected provisional 4for4 release_id: "
+                f"{provisional_release.get('release_id')}"
+            )
+        expected_policy_fp = (
+            "8cf918c3c1d254ebf84dbff3a755375ceae9b7afe095233a921f7579180863d7"
+        )
+        if provisional_release.get("policy_fingerprint_sha256") != expected_policy_fp:
+            raise AssertionError("provisional 4for4 policy fingerprint drifted")
+        if provisional_release.get("outcome_data_used") is not False:
+            raise AssertionError("provisional 4for4 release used outcome data")
+        if provisional_release.get("week2_realized_outcomes_read") is not False:
+            raise AssertionError("provisional 4for4 release read Week 2 outcomes")
+
+        reconstructed_base_hash = canonical_prod_mult_hash(expected_current)
+        if (
+            provisional_release.get("base_prod_mult_canonical_sha256")
+            != reconstructed_base_hash
+        ):
+            raise AssertionError(
+                "provisional 4for4 base hash does not match reconstructed V1 + Position Lineage stack"
+            )
+
+        live_hash = canonical_prod_mult_hash(current)
+        if (
+            provisional_release.get("deployed_prod_mult_canonical_sha256")
+            != live_hash
+        ):
+            raise AssertionError(
+                "live PROD_MULT does not match frozen provisional 4for4 successor hash"
+            )
+        if int(provisional_release.get("prod_mult_entry_count", -1)) != len(current):
+            raise AssertionError("provisional 4for4 PROD_MULT entry count drifted")
+        if int(provisional_release.get("raw_prod_mult_changed_count", 0)) <= 0:
+            raise AssertionError("provisional 4for4 release has no recorded production changes")
+    else:
+        current_mismatches = []
+        for key in baseline:
+            if abs(current[key] - expected_current[key]) > 1e-12:
+                current_mismatches.append((key, expected_current[key], current[key]))
+        if current_mismatches:
+            raise AssertionError(
+                "live PROD_MULT does not match V1 + approved successor stack: "
+                f"{current_mismatches[:10]}"
+            )
 
     lineage_changed = {
         key for key in v1_expected
@@ -351,6 +404,15 @@ def validate_deployment():
         "actual_changed_entry_count": len(actual_changed),
         "current_stack_changed_entry_count": len(current_stack_changed),
         "position_lineage_overlay_active": lineage_release is not None,
+        "provisional_4for4_overlay_active": provisional_release is not None,
+        "provisional_4for4_policy_fingerprint_sha256": (
+            provisional_release.get("policy_fingerprint_sha256")
+            if provisional_release is not None else None
+        ),
+        "provisional_4for4_changed_entry_count": (
+            int(provisional_release.get("raw_prod_mult_changed_count", 0))
+            if provisional_release is not None else 0
+        ),
         "position_lineage_overlay_candidate_count": len(lineage_candidates),
         "position_lineage_overlay_hold_count": len(lineage_holds),
         "position_lineage_overlay_changed_entry_count": len(lineage_changed),
@@ -392,7 +454,7 @@ def build_report(result):
         "",
         "## Verdict",
         "",
-        "**PASS — the live `index.html` PROD_MULT table exactly matches the approved model-delta transport deployment.**",
+        "**PASS — the live `index.html` PROD_MULT table exactly matches the approved IDP V1 release and all recognized successor layers.**",
         "",
         f"- Deployment method: `{result['deployment_method']}`",
         f"- Immutable pre-V1 PROD_MULT entries: **{result['pre_v1_prod_mult_entry_count']}**",
@@ -403,6 +465,8 @@ def build_report(result):
         f"- Non-IDP final-value changes: **{result['non_idp_final_value_changes']}**",
         f"- Frozen V1 legacy/current position mismatches: **{result['position_lineage_mismatch_count']}**",
         f"- Position Lineage V1 successor active: **{result['position_lineage_overlay_active']}**",
+        f"- Provisional 4for4 10% successor active: **{result['provisional_4for4_overlay_active']}**",
+        f"- Provisional 4for4 changed PROD_MULT entries: **{result['provisional_4for4_changed_entry_count']}**",
         f"- Position Lineage V1 approved overrides: **{result['position_lineage_overlay_candidate_count']}**",
         f"- Position Lineage V1 explicit holds: **{result['position_lineage_overlay_hold_count']}**",
         f"- Current stacked changed PROD_MULT entries vs pre-V1: **{result['current_stack_changed_entry_count']}**",
