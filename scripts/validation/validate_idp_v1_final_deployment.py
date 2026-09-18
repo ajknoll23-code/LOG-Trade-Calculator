@@ -28,6 +28,7 @@ PATCH = REPO_ROOT / "model" / "releases" / "idp-v1" / "idp_v1_prod_mult_patch.js
 POSITION_LINEAGE_RELEASE = REPO_ROOT / "model" / "releases" / "idp-position-lineage-v1" / "release.json"
 FOURFORFOUR_PROVISIONAL_RELEASE = REPO_ROOT / "model" / "releases" / "fourforfour-idp-provisional-10pct-v1" / "release.json"
 FOURFORFOUR_OFFENSE_RELEASE = REPO_ROOT / "model" / "releases" / "fourforfour-offense-provisional-10pct-v1" / "release.json"
+FOURFORFOUR_LIVE_ROLE_R1_RELEASE = REPO_ROOT / "model" / "releases" / "fourforfour-offense-live-role-r1-v1" / "release.json"
 JSON_OUT = SCRIPT_DIR / "idp_v1_final_deployment_validation.json"
 REPORT = SCRIPT_DIR / "idp_v1_final_deployment_validation.md"
 IDP_POSITIONS = ("LB", "DL", "DB")
@@ -214,6 +215,7 @@ def validate_deployment():
 
     provisional_release = None
     offense_release = None
+    live_role_r1_release = None
     if FOURFORFOUR_PROVISIONAL_RELEASE.exists():
         provisional_release = json.load(
             open(FOURFORFOUR_PROVISIONAL_RELEASE, encoding="utf-8")
@@ -278,10 +280,9 @@ def validate_deployment():
                 raise AssertionError(
                     "offense successor base hash does not chain from deployed IDP successor"
                 )
-            if offense_release.get("deployed_prod_mult_canonical_sha256") != live_hash:
-                raise AssertionError(
-                    "live PROD_MULT does not match frozen offense successor hash"
-                )
+            offense_deployed_hash = offense_release.get(
+                "deployed_prod_mult_canonical_sha256"
+            )
             if int(offense_release.get("prod_mult_entry_count", -1)) != len(current):
                 raise AssertionError("offense successor PROD_MULT entry count drifted")
             if int(offense_release.get("eligible_count", -1)) != 274:
@@ -290,6 +291,60 @@ def validate_deployment():
                 raise AssertionError("offense successor changed count drifted")
             if set(offense_release.get("scope") or []) != set(OFFENSE_POSITIONS):
                 raise AssertionError("offense successor scope drifted")
+
+            if FOURFORFOUR_LIVE_ROLE_R1_RELEASE.exists():
+                live_role_r1_release = json.load(
+                    open(FOURFORFOUR_LIVE_ROLE_R1_RELEASE, encoding="utf-8")
+                )
+                if (
+                    live_role_r1_release.get("release_id")
+                    != "fourforfour-offense-live-role-r1-v1"
+                ):
+                    raise AssertionError(
+                        "unexpected 4for4 offense live-role R1 release_id"
+                    )
+                if (
+                    live_role_r1_release.get("private_row_level_4for4_output_persisted")
+                    is not False
+                ):
+                    raise AssertionError("live-role R1 persisted private 4for4 rows")
+                if (
+                    live_role_r1_release.get("row_level_snap_output_persisted")
+                    is not False
+                ):
+                    raise AssertionError("live-role R1 persisted row-level snap data")
+                if (
+                    live_role_r1_release.get("frozen_opportunity_v2_modified")
+                    is not False
+                ):
+                    raise AssertionError("live-role R1 modified frozen Opportunity V2")
+                if (
+                    live_role_r1_release.get("base_prod_mult_canonical_sha256")
+                    != offense_deployed_hash
+                ):
+                    raise AssertionError(
+                        "live-role R1 base does not chain from offense 10% successor"
+                    )
+                if (
+                    live_role_r1_release.get("deployed_prod_mult_canonical_sha256")
+                    != live_hash
+                ):
+                    raise AssertionError(
+                        "live PROD_MULT does not match live-role R1 successor hash"
+                    )
+                if int(live_role_r1_release.get("signal_count", -1)) != 22:
+                    raise AssertionError("live-role R1 signal count drifted")
+                if int(live_role_r1_release.get("raw_prod_mult_changed_count", -1)) != 22:
+                    raise AssertionError("live-role R1 changed count drifted")
+                if set(live_role_r1_release.get("scope") or []) != set(OFFENSE_POSITIONS):
+                    raise AssertionError("live-role R1 scope drifted")
+                policy = live_role_r1_release.get("policy") or {}
+                if abs(float(policy.get("raw_prod_mult_cap", -1)) - 0.005) > 1e-12:
+                    raise AssertionError("live-role R1 cap drifted")
+            elif offense_deployed_hash != live_hash:
+                raise AssertionError(
+                    "live PROD_MULT does not match frozen offense successor hash"
+                )
         elif idp_deployed_hash != live_hash:
             raise AssertionError(
                 "live PROD_MULT does not match frozen provisional 4for4 IDP successor hash"
@@ -477,6 +532,15 @@ def validate_deployment():
             offense_release.get("green_shadow_aggregate_contract_sha256")
             if offense_release is not None else None
         ),
+        "fourforfour_live_role_r1_active": live_role_r1_release is not None,
+        "fourforfour_live_role_r1_signal_count": (
+            int(live_role_r1_release.get("signal_count", 0))
+            if live_role_r1_release is not None else 0
+        ),
+        "fourforfour_live_role_r1_changed_entry_count": (
+            int(live_role_r1_release.get("raw_prod_mult_changed_count", 0))
+            if live_role_r1_release is not None else 0
+        ),
         "offense_successor_final_value_changes": offense_successor_value_changes,
         "position_lineage_overlay_candidate_count": len(lineage_candidates),
         "position_lineage_overlay_hold_count": len(lineage_holds),
@@ -536,6 +600,9 @@ def build_report(result):
         f"- Provisional 4for4 offense eligible players: **{result['provisional_4for4_offense_eligible_count']}**",
         f"- Provisional 4for4 offense changed PROD_MULT entries: **{result['provisional_4for4_offense_changed_entry_count']}**",
         f"- Provisional 4for4 offense final-value changes: **{result['offense_successor_final_value_changes']}**",
+        f"- 4for4 offense live-role R1 active: **{result['fourforfour_live_role_r1_active']}**",
+        f"- 4for4 offense live-role R1 signals: **{result['fourforfour_live_role_r1_signal_count']}**",
+        f"- 4for4 offense live-role R1 changed PROD_MULT entries: **{result['fourforfour_live_role_r1_changed_entry_count']}**",
         f"- Position Lineage V1 approved overrides: **{result['position_lineage_overlay_candidate_count']}**",
         f"- Position Lineage V1 explicit holds: **{result['position_lineage_overlay_hold_count']}**",
         f"- Current stacked changed PROD_MULT entries vs pre-V1: **{result['current_stack_changed_entry_count']}**",
