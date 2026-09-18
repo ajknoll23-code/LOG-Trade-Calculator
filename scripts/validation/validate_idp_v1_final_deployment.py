@@ -29,6 +29,7 @@ POSITION_LINEAGE_RELEASE = REPO_ROOT / "model" / "releases" / "idp-position-line
 FOURFORFOUR_PROVISIONAL_RELEASE = REPO_ROOT / "model" / "releases" / "fourforfour-idp-provisional-10pct-v1" / "release.json"
 FOURFORFOUR_OFFENSE_RELEASE = REPO_ROOT / "model" / "releases" / "fourforfour-offense-provisional-10pct-v1" / "release.json"
 FOURFORFOUR_LIVE_ROLE_R1_RELEASE = REPO_ROOT / "model" / "releases" / "fourforfour-offense-live-role-r1-v1" / "release.json"
+FOURFORFOUR_CONFIDENCE_C2_RELEASE = REPO_ROOT / "model" / "releases" / "fourforfour-offense-confidence-c2-v1" / "release.json"
 JSON_OUT = SCRIPT_DIR / "idp_v1_final_deployment_validation.json"
 REPORT = SCRIPT_DIR / "idp_v1_final_deployment_validation.md"
 IDP_POSITIONS = ("LB", "DL", "DB")
@@ -216,6 +217,7 @@ def validate_deployment():
     provisional_release = None
     offense_release = None
     live_role_r1_release = None
+    confidence_c2_release = None
     if FOURFORFOUR_PROVISIONAL_RELEASE.exists():
         provisional_release = json.load(
             open(FOURFORFOUR_PROVISIONAL_RELEASE, encoding="utf-8")
@@ -325,13 +327,9 @@ def validate_deployment():
                     raise AssertionError(
                         "live-role R1 base does not chain from offense 10% successor"
                     )
-                if (
-                    live_role_r1_release.get("deployed_prod_mult_canonical_sha256")
-                    != live_hash
-                ):
-                    raise AssertionError(
-                        "live PROD_MULT does not match live-role R1 successor hash"
-                    )
+                r1_deployed_hash = live_role_r1_release.get(
+                    "deployed_prod_mult_canonical_sha256"
+                )
                 if int(live_role_r1_release.get("signal_count", -1)) != 22:
                     raise AssertionError("live-role R1 signal count drifted")
                 if int(live_role_r1_release.get("raw_prod_mult_changed_count", -1)) != 22:
@@ -341,6 +339,40 @@ def validate_deployment():
                 policy = live_role_r1_release.get("policy") or {}
                 if abs(float(policy.get("raw_prod_mult_cap", -1)) - 0.005) > 1e-12:
                     raise AssertionError("live-role R1 cap drifted")
+
+                if FOURFORFOUR_CONFIDENCE_C2_RELEASE.exists():
+                    confidence_c2_release = json.load(
+                        open(FOURFORFOUR_CONFIDENCE_C2_RELEASE, encoding="utf-8")
+                    )
+                    if confidence_c2_release.get("release_id") != "fourforfour-offense-confidence-c2-v1":
+                        raise AssertionError("unexpected confidence C2 release_id")
+                    if confidence_c2_release.get("base_prod_mult_canonical_sha256") != r1_deployed_hash:
+                        raise AssertionError("confidence C2 base hash mismatch")
+                    if confidence_c2_release.get("deployed_prod_mult_canonical_sha256") != live_hash:
+                        raise AssertionError("live PROD_MULT does not match confidence C2 hash")
+                    if confidence_c2_release.get("private_row_level_4for4_output_persisted") is not False:
+                        raise AssertionError("confidence C2 persisted private rows")
+                    if confidence_c2_release.get("confidence_is_standalone_value_signal") is not False:
+                        raise AssertionError("confidence C2 became standalone value signal")
+                    if int(confidence_c2_release.get("eligible_three_source", -1)) != 227:
+                        raise AssertionError("confidence C2 eligible count drifted")
+                    if int(confidence_c2_release.get("low_confidence_player_count", -1)) != 17:
+                        raise AssertionError("confidence C2 low count drifted")
+                    if int(confidence_c2_release.get("raw_prod_mult_changed_count", -1)) != 14:
+                        raise AssertionError("confidence C2 changed count drifted")
+                    cpolicy = confidence_c2_release.get("policy") or {}
+                    if abs(float(cpolicy.get("nominal_forward_weight", -1)) - 0.55) > 1e-12:
+                        raise AssertionError("confidence C2 nominal weight drifted")
+                    if abs(float(cpolicy.get("low_confidence_forward_weight", -1)) - 0.50) > 1e-12:
+                        raise AssertionError("confidence C2 low weight drifted")
+                    if abs(float(cpolicy.get("transport_strength", -1)) - 0.25) > 1e-12:
+                        raise AssertionError("confidence C2 transport drifted")
+                    if abs(float(cpolicy.get("raw_prod_mult_delta_cap", -1)) - 0.005) > 1e-12:
+                        raise AssertionError("confidence C2 cap drifted")
+                elif r1_deployed_hash != live_hash:
+                    raise AssertionError(
+                        "live PROD_MULT does not match live-role R1 successor hash"
+                    )
             elif offense_deployed_hash != live_hash:
                 raise AssertionError(
                     "live PROD_MULT does not match frozen offense successor hash"
