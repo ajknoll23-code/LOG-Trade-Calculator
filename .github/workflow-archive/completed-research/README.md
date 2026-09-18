@@ -6,9 +6,9 @@ Archived files are preserved byte-for-byte. Their original paths, Git blob SHAs,
 
 A very small number of files may be deleted instead of archived only when they are exact SHA-pinned obsolete duplicates with an identified successor. Those deletions are also recorded in the manifest.
 
-Archive refreshed: 2026-09-18T19:39:45.261890+00:00
+Archive refreshed: 2026-09-18T21:03:18.154683+00:00
 
-Archived workflow count: **85**
+Archived workflow count: **90**
 
 - draft-pick-fv-mathematical-audit.yml
 - draft-pick-fv-v1-historical-draft-catalog.yml
@@ -61,6 +61,11 @@ Archived workflow count: **85**
 - free-agent-production-v2-lineage-audit-freeze.yml
 - free-agent-production-v2-phase2-shadow-validation.yml
 - free-agent-production-v2-phase3-production-confirm-and-deploy.yml
+- free-agent-utility-v1-deploy.yml
+- free-agent-utility-v1-phase1-private-shadow.yml
+- free-agent-utility-v1-phase2-delta-transport-shadow.yml
+- free-agent-utility-v1-phase3-bounded-candidate.yml
+- free-agent-utility-v1-phase4-production-candidate-shadow.yml
 - fundamental-value-structural-outlier-audit.yml
 - identity-v2-phase2-manual-adjudication-freeze.yml
 - identity-v2-phase3-independent-corroboration-freeze.yml
