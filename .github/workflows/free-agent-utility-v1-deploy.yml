@@ -1,0 +1,101 @@
+name: Free Agent Utility V1 - Deploy
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FOURFORFOUR_OFFENSE_GZ_B64_PART1: ${{ secrets.FOURFORFOUR_OFFENSE_GZ_B64_PART1 }}
+      FOURFORFOUR_OFFENSE_GZ_B64_PART2: ${{ secrets.FOURFORFOUR_OFFENSE_GZ_B64_PART2 }}
+      FOURFORFOUR_OFFENSE_GZ_B64_PART3: ${{ secrets.FOURFORFOUR_OFFENSE_GZ_B64_PART3 }}
+      FOURFORFOUR_DL_GZ_B64: ${{ secrets.FOURFORFOUR_DL_GZ_B64 }}
+      FOURFORFOUR_LB_GZ_B64: ${{ secrets.FOURFORFOUR_LB_GZ_B64 }}
+      FOURFORFOUR_DB_GZ_B64: ${{ secrets.FOURFORFOUR_DB_GZ_B64 }}
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python3 -m pip install --disable-pip-version-check --no-cache-dir requests
+      - name: Pin reviewed deployment lineage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git hash-object free-agent-board.html)" = "a442ee5dfab51b0214977a7b64e91203bdce3a36"
+          test "$(git hash-object research/free-agent-utility-v1/phase4_production_candidate_shadow_summary.json)" = "2492711ce73eb0203025a5fe20c2a5b88a5887c1"
+          test "$(git hash-object scripts/projections/build_free_agent_utility_v1.py)" = "343270f4357adfc5b450f83cc879055119d8c91f"
+          test "$(git hash-object scripts/validation/validate_free_agent_utility_v1.py)" = "7385ba1fa2297ef98477c5b6beaf6eb66e04a775"
+          test "$(git hash-object .github/workflows/free-agent-utility-v1-refresh.yml)" = "56115465c115b7bb69e2f49d8868ed39271623a4"
+          test ! -e data/free_agent_utility_v1.json
+      - name: Self-test production code
+        run: |
+          python3 scripts/projections/build_free_agent_utility_v1.py --selftest
+          python3 scripts/validation/validate_free_agent_utility_v1.py --selftest
+      - name: Decode private 4for4 inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          for var in FOURFORFOUR_OFFENSE_GZ_B64_PART1 FOURFORFOUR_OFFENSE_GZ_B64_PART2 FOURFORFOUR_OFFENSE_GZ_B64_PART3 FOURFORFOUR_DL_GZ_B64 FOURFORFOUR_LB_GZ_B64 FOURFORFOUR_DB_GZ_B64; do
+            test -n "${!var:-}" || { echo "Missing $var" >&2; exit 1; }
+          done
+          install -d -m 700 /tmp/log-fa-utility-v1/input
+          printf '%s%s%s' "$FOURFORFOUR_OFFENSE_GZ_B64_PART1" "$FOURFORFOUR_OFFENSE_GZ_B64_PART2" "$FOURFORFOUR_OFFENSE_GZ_B64_PART3" | base64 --decode | gzip -dc > /tmp/log-fa-utility-v1/input/offense.csv
+          printf '%s' "$FOURFORFOUR_DL_GZ_B64" | base64 --decode | gzip -dc > /tmp/log-fa-utility-v1/input/dl.csv
+          printf '%s' "$FOURFORFOUR_LB_GZ_B64" | base64 --decode | gzip -dc > /tmp/log-fa-utility-v1/input/lb.csv
+          printf '%s' "$FOURFORFOUR_DB_GZ_B64" | base64 --decode | gzip -dc > /tmp/log-fa-utility-v1/input/db.csv
+          chmod 600 /tmp/log-fa-utility-v1/input/*.csv
+      - name: Build artifact and patch board
+        run: |
+          python3 scripts/projections/build_free_agent_utility_v1.py             --offense /tmp/log-fa-utility-v1/input/offense.csv             --dl /tmp/log-fa-utility-v1/input/dl.csv             --lb /tmp/log-fa-utility-v1/input/lb.csv             --db /tmp/log-fa-utility-v1/input/db.csv             --write-artifact             --patch-board
+      - name: Validate before commit
+        run: |
+          python3 scripts/projections/build_free_agent_utility_v1.py --check
+          python3 scripts/validation/validate_free_agent_utility_v1.py
+          python3 scripts/sync/sync_free_agent_valuation.py --check
+          python3 scripts/validation/repo_regression_checks.py
+      - name: Guard exact deployment scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import subprocess
+          allowed = {"data/free_agent_utility_v1.json", "free-agent-board.html"}
+          out = subprocess.check_output(["git","status","--porcelain=v1","--untracked-files=all"], text=True)
+          touched = {line[3:] for line in out.splitlines() if line.strip()}
+          if touched != allowed:
+              raise SystemExit(f"Unexpected deploy scope: {sorted(touched)}")
+          print("PASS: exact deployment scope.")
+          PY
+      - name: Commit deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/free_agent_utility_v1.json free-agent-board.html
+          git pull --rebase --autostash origin main
+          python3 scripts/projections/build_free_agent_utility_v1.py --check
+          python3 scripts/validation/validate_free_agent_utility_v1.py
+          python3 scripts/sync/sync_free_agent_valuation.py --check
+          python3 scripts/validation/repo_regression_checks.py
+          git commit -m "Deploy Free Agent Utility V1"
+          git push origin HEAD:main
+      - name: Destroy private inputs
+        if: always()
+        run: rm -rf /tmp/log-fa-utility-v1
