@@ -27,9 +27,11 @@ CANDIDATE = REPO_ROOT / "model" / "releases" / "idp-v1" / "idp_v1_model_delta_tr
 PATCH = REPO_ROOT / "model" / "releases" / "idp-v1" / "idp_v1_prod_mult_patch.json"
 POSITION_LINEAGE_RELEASE = REPO_ROOT / "model" / "releases" / "idp-position-lineage-v1" / "release.json"
 FOURFORFOUR_PROVISIONAL_RELEASE = REPO_ROOT / "model" / "releases" / "fourforfour-idp-provisional-10pct-v1" / "release.json"
+FOURFORFOUR_OFFENSE_RELEASE = REPO_ROOT / "model" / "releases" / "fourforfour-offense-provisional-10pct-v1" / "release.json"
 JSON_OUT = SCRIPT_DIR / "idp_v1_final_deployment_validation.json"
 REPORT = SCRIPT_DIR / "idp_v1_final_deployment_validation.md"
 IDP_POSITIONS = ("LB", "DL", "DB")
+OFFENSE_POSITIONS = ("QB", "RB", "WR", "TE")
 ANCHORS = (
     "bradley chubb", "aidan hutchinson", "myles garrett", "fred warner",
     "roquan smith", "ej speed", "isaiah mcduffie", "christian izien",
@@ -211,6 +213,7 @@ def validate_deployment():
                 )
 
     provisional_release = None
+    offense_release = None
     if FOURFORFOUR_PROVISIONAL_RELEASE.exists():
         provisional_release = json.load(
             open(FOURFORFOUR_PROVISIONAL_RELEASE, encoding="utf-8")
@@ -239,18 +242,58 @@ def validate_deployment():
                 "provisional 4for4 base hash does not match reconstructed V1 + Position Lineage stack"
             )
 
-        live_hash = canonical_prod_mult_hash(current)
-        if (
-            provisional_release.get("deployed_prod_mult_canonical_sha256")
-            != live_hash
-        ):
-            raise AssertionError(
-                "live PROD_MULT does not match frozen provisional 4for4 successor hash"
-            )
+        idp_deployed_hash = provisional_release.get(
+            "deployed_prod_mult_canonical_sha256"
+        )
         if int(provisional_release.get("prod_mult_entry_count", -1)) != len(current):
             raise AssertionError("provisional 4for4 PROD_MULT entry count drifted")
         if int(provisional_release.get("raw_prod_mult_changed_count", 0)) <= 0:
             raise AssertionError("provisional 4for4 release has no recorded production changes")
+
+        live_hash = canonical_prod_mult_hash(current)
+        if FOURFORFOUR_OFFENSE_RELEASE.exists():
+            offense_release = json.load(
+                open(FOURFORFOUR_OFFENSE_RELEASE, encoding="utf-8")
+            )
+            if (
+                offense_release.get("release_id")
+                != "fourforfour-offense-provisional-10pct-v1"
+            ):
+                raise AssertionError(
+                    "unexpected offense 4for4 release_id: "
+                    f"{offense_release.get('release_id')}"
+                )
+            if offense_release.get("realized_outcomes_used") is not False:
+                raise AssertionError("offense 4for4 successor used realized outcomes")
+            if offense_release.get("private_row_level_4for4_output_persisted") is not False:
+                raise AssertionError("offense 4for4 successor persisted private row-level data")
+            if abs(float((offense_release.get("policy") or {}).get("fourforfour_weight", -1)) - 0.10) > 1e-12:
+                raise AssertionError("offense 4for4 successor weight drifted")
+            if (
+                offense_release.get("green_shadow_aggregate_contract_sha256")
+                != "17396075883e56f4eff39d574fd0c2011e742a787b91404b37b7470133b143a5"
+            ):
+                raise AssertionError("offense green-shadow aggregate fingerprint drifted")
+            if offense_release.get("base_prod_mult_canonical_sha256") != idp_deployed_hash:
+                raise AssertionError(
+                    "offense successor base hash does not chain from deployed IDP successor"
+                )
+            if offense_release.get("deployed_prod_mult_canonical_sha256") != live_hash:
+                raise AssertionError(
+                    "live PROD_MULT does not match frozen offense successor hash"
+                )
+            if int(offense_release.get("prod_mult_entry_count", -1)) != len(current):
+                raise AssertionError("offense successor PROD_MULT entry count drifted")
+            if int(offense_release.get("eligible_count", -1)) != 274:
+                raise AssertionError("offense successor eligible count drifted")
+            if int(offense_release.get("raw_prod_mult_changed_count", -1)) != 237:
+                raise AssertionError("offense successor changed count drifted")
+            if set(offense_release.get("scope") or []) != set(OFFENSE_POSITIONS):
+                raise AssertionError("offense successor scope drifted")
+        elif idp_deployed_hash != live_hash:
+            raise AssertionError(
+                "live PROD_MULT does not match frozen provisional 4for4 IDP successor hash"
+            )
     else:
         current_mismatches = []
         for key in baseline:
@@ -291,18 +334,26 @@ def validate_deployment():
     current_values = snapshot_values.compute_all_values(cfg)
     old_ranks, new_ranks = rank_map(old_values), rank_map(new_values)
 
-    # Non-IDP final values must be completely unchanged by this deployment.
+    # After the approved offense successor, QB/RB/WR/TE may move.
+    # K and all other non-IDP positions remain strict exact holds.
     non_idp_diffs = []
+    offense_successor_value_changes = 0
     for key, old in old_values.items():
-        if (
-            old["pos"] not in IDP_POSITIONS
-            and current_values[key]["value"] != old["value"]
-        ):
-            non_idp_diffs.append(
-                (key, old["value"], current_values[key]["value"])
-            )
+        if old["pos"] in IDP_POSITIONS:
+            continue
+        if current_values[key]["value"] == old["value"]:
+            continue
+        if offense_release is not None and old["pos"] in OFFENSE_POSITIONS:
+            offense_successor_value_changes += 1
+            continue
+        non_idp_diffs.append(
+            (key, old["value"], current_values[key]["value"])
+        )
     if non_idp_diffs:
-        raise AssertionError(f"non-IDP final values changed: {non_idp_diffs[:10]}")
+        raise AssertionError(
+            f"unexpected non-IDP final values changed outside approved offense successor: "
+            f"{non_idp_diffs[:10]}"
+        )
 
     rows = []
     final_changes_by_pos = defaultdict(list)
@@ -413,6 +464,20 @@ def validate_deployment():
             int(provisional_release.get("raw_prod_mult_changed_count", 0))
             if provisional_release is not None else 0
         ),
+        "provisional_4for4_offense_overlay_active": offense_release is not None,
+        "provisional_4for4_offense_changed_entry_count": (
+            int(offense_release.get("raw_prod_mult_changed_count", 0))
+            if offense_release is not None else 0
+        ),
+        "provisional_4for4_offense_eligible_count": (
+            int(offense_release.get("eligible_count", 0))
+            if offense_release is not None else 0
+        ),
+        "provisional_4for4_offense_green_shadow_sha256": (
+            offense_release.get("green_shadow_aggregate_contract_sha256")
+            if offense_release is not None else None
+        ),
+        "offense_successor_final_value_changes": offense_successor_value_changes,
         "position_lineage_overlay_candidate_count": len(lineage_candidates),
         "position_lineage_overlay_hold_count": len(lineage_holds),
         "position_lineage_overlay_changed_entry_count": len(lineage_changed),
@@ -467,6 +532,10 @@ def build_report(result):
         f"- Position Lineage V1 successor active: **{result['position_lineage_overlay_active']}**",
         f"- Provisional 4for4 10% successor active: **{result['provisional_4for4_overlay_active']}**",
         f"- Provisional 4for4 changed PROD_MULT entries: **{result['provisional_4for4_changed_entry_count']}**",
+        f"- Provisional 4for4 offense 10% successor active: **{result['provisional_4for4_offense_overlay_active']}**",
+        f"- Provisional 4for4 offense eligible players: **{result['provisional_4for4_offense_eligible_count']}**",
+        f"- Provisional 4for4 offense changed PROD_MULT entries: **{result['provisional_4for4_offense_changed_entry_count']}**",
+        f"- Provisional 4for4 offense final-value changes: **{result['offense_successor_final_value_changes']}**",
         f"- Position Lineage V1 approved overrides: **{result['position_lineage_overlay_candidate_count']}**",
         f"- Position Lineage V1 explicit holds: **{result['position_lineage_overlay_hold_count']}**",
         f"- Current stacked changed PROD_MULT entries vs pre-V1: **{result['current_stack_changed_entry_count']}**",
@@ -536,7 +605,7 @@ def build_report(result):
         "- The OLD side is reconstructed from the immutable pre-V1 `PROD_MULT_DATA` snapshot.",
         "- The NEW side is the actual deployed `index.html`.",
         "- All other valuation constants, age curves, role-floor behavior, and position weights are held identical.",
-        "- Offense values are confirmed unchanged.",
+        "- Offense values are unchanged through IDP V1/Position Lineage/IDP 4for4; when the approved 4for4 offense successor is active, its full-table hash and aggregate release contract are validated separately.",
         "- The 46 legacy/current IDP position mismatches remain explicitly isolated from this V1 projection release.",
     ]
     return "\n".join(lines) + "\n"
