@@ -8,47 +8,47 @@ Policy SHA256: `bafc53164f6d98448965c5d0b531b14be31a3d744f0e4a44d6cdac71b6c05247
 **These ranges are not probability confidence intervals.** They are deterministic sensitivity envelopes around the deployed point value using currently observable projection disagreement, historical sampling noise, and availability-history signal.
 
 - Players: **565**
-- Width quartiles: Q25 **18.7%**, median **24.7%**, Q75 **31.0%**
-- Provider coverage (0/1/2): **{'0': 53, '1': 95, '2': 417}**
+- Width quartiles: Q25 **18.9%**, median **24.6%**, Q75 **32.0%**
+- Provider coverage (0/1/2): **{'0': 47, '1': 90, '2': 428}**
 - History coverage: **{'insufficient': 126, 'with_2plus_games': 439}**
 
 ## Position summary
 
 | Pos | N | Median half-width | Median provider component | Median history component | Median availability component |
 |---|---:|---:|---:|---:|---:|
-| QB | 64 | 37.5% | 2.3% | 17.2% | 28.9% |
-| RB | 97 | 24.1% | 5.2% | 18.5% | 4.3% |
-| WR | 114 | 25.5% | 5.7% | 22.5% | 6.9% |
-| TE | 44 | 24.5% | 6.4% | 19.2% | 7.1% |
-| DL | 86 | 25.0% | 9.1% | 21.0% | 5.2% |
-| LB | 79 | 21.7% | 15.0% | 14.7% | 1.7% |
-| DB | 65 | 21.0% | 12.1% | 14.4% | 1.9% |
-| K | 16 | 29.1% | 17.4% | 20.9% | 10.4% |
+| QB | 64 | 37.5% | 2.7% | 17.2% | 28.9% |
+| RB | 97 | 24.0% | 5.9% | 18.5% | 4.3% |
+| WR | 114 | 25.7% | 6.8% | 22.5% | 6.9% |
+| TE | 44 | 24.0% | 4.9% | 19.2% | 7.1% |
+| DL | 86 | 25.1% | 10.1% | 21.0% | 5.2% |
+| LB | 79 | 22.4% | 16.1% | 14.7% | 1.7% |
+| DB | 65 | 19.6% | 11.8% | 14.4% | 1.9% |
+| K | 16 | 29.4% | 18.0% | 20.9% | 10.4% |
 
 ## Widest current envelopes
 
 | Player | Pos | Center | Low | High | Half-width | Tier |
 |---|---|---:|---:|---:|---:|---|
-| jordan james | RB | 773 | 0 | 1546 | 100.0% | very_high |
-| malik benson | WR | 1037 | 9 | 2065 | 99.2% | very_high |
-| malik nabers | WR | 4088 | 172 | 8004 | 95.8% | very_high |
-| kaden elliss | LB | 2990 | 266 | 5714 | 91.1% | very_high |
-| isiah pacheco | RB | 1552 | 144 | 2960 | 90.7% | very_high |
-| devin white | LB | 3475 | 417 | 6533 | 88.0% | very_high |
-| adam randall | RB | 886 | 116 | 1656 | 86.9% | very_high |
-| jameis winston | QB | 1073 | 180 | 1966 | 83.2% | very_high |
-| nick bosa | DL | 3980 | 723 | 7237 | 81.8% | very_high |
-| bryce boettcher | LB | 1355 | 299 | 2411 | 77.9% | very_high |
-| skyler bell | WR | 1210 | 369 | 2051 | 69.5% | very_high |
-| kendre miller | RB | 734 | 230 | 1238 | 68.7% | very_high |
-| dj giddens | RB | 734 | 247 | 1221 | 66.3% | very_high |
-| malik willis | QB | 3711 | 1257 | 6165 | 66.1% | very_high |
-| kimani vidal | RB | 1941 | 716 | 3166 | 63.1% | very_high |
-| tank dell | WR | 2030 | 754 | 3306 | 62.8% | very_high |
-| eli stowers | TE | 578 | 216 | 940 | 62.6% | very_high |
-| nnamdi madubuike | DL | 2696 | 1121 | 4271 | 58.4% | very_high |
-| travis hunter | WR | 2338 | 989 | 3687 | 57.7% | very_high |
-| kaleb elarmsorr | LB | 968 | 412 | 1524 | 57.4% | very_high |
+| jordan james | RB | 772 | 0 | 1544 | 100.0% | very_high |
+| tyrel dodson | LB | 4295 | 0 | 8590 | 100.0% | very_high |
+| zion young | DL | 1013 | 20 | 2006 | 98.0% | very_high |
+| malik nabers | WR | 4083 | 172 | 7994 | 95.8% | very_high |
+| keandre lambertsmith | WR | 825 | 35 | 1615 | 95.7% | very_high |
+| malik benson | WR | 1037 | 48 | 2026 | 95.3% | very_high |
+| cedric gray | LB | 4509 | 242 | 8776 | 94.6% | very_high |
+| dezhaun stribling | WR | 2167 | 182 | 4152 | 91.6% | very_high |
+| dylan sampson | RB | 1509 | 147 | 2871 | 90.3% | very_high |
+| adam randall | RB | 888 | 117 | 1659 | 86.9% | very_high |
+| tua tagovailoa | QB | 2682 | 418 | 4946 | 84.4% | very_high |
+| jameis winston | QB | 1086 | 182 | 1990 | 83.2% | very_high |
+| jake tonges | TE | 1108 | 199 | 2017 | 82.0% | very_high |
+| nick bosa | DL | 4020 | 730 | 7310 | 81.8% | very_high |
+| bryce boettcher | LB | 1355 | 300 | 2410 | 77.9% | very_high |
+| jalyx hunt | DL | 3638 | 923 | 6353 | 74.6% | very_high |
+| eli heidenreich | RB | 1077 | 276 | 1878 | 74.4% | very_high |
+| sirvocea dennis | LB | 3521 | 957 | 6085 | 72.8% | very_high |
+| derick hall | DL | 2021 | 564 | 3478 | 72.1% | very_high |
+| skyler bell | WR | 1210 | 352 | 2068 | 70.9% | very_high |
 
 ## V1 guardrails
 
