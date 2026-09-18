@@ -4242,9 +4242,17 @@ function escapeHtml(str){
 }
 /* ---------- Free agent board logic ---------- */
 let FREE_AGENTS = [];
+let FREE_AGENT_UTILITY = new Map();
+let FREE_AGENT_UTILITY_ACTIVE = false;
 let state = { dataOnly: true };
 
+/* FREE_AGENT_UTILITY_V1_BOARD_INTEGRATION
+   Derived waiver-priority ranks are position-local only. They never replace
+   LOG/Fundamental Value and never control the ALL section. The artifact is
+   fail-closed: stale, missing, malformed, or incomplete data falls back to
+   the existing LOG order automatically. */
 const FREE_AGENTS_URL = 'https://raw.githubusercontent.com/ajknoll23-code/LOG-Trade-Calculator/main/data/free_agents.json?t=' + Date.now();
+const FREE_AGENT_UTILITY_URL = 'https://raw.githubusercontent.com/ajknoll23-code/LOG-Trade-Calculator/main/data/free_agent_utility_v1.json?t=' + Date.now();
 
 async function loadFreeAgents(){
   const statusEl = document.getElementById('syncStatus');
@@ -4253,6 +4261,46 @@ async function loadFreeAgents(){
     if(!resp.ok) throw new Error('HTTP ' + resp.status);
     const data = await resp.json();
     const raw = data.free_agents || [];
+
+    let utilityDoc = null;
+    try {
+      const utilityResp = await fetch(FREE_AGENT_UTILITY_URL);
+      if(utilityResp.ok) utilityDoc = await utilityResp.json();
+    } catch(_) {
+      utilityDoc = null;
+    }
+
+    FREE_AGENT_UTILITY = new Map();
+    FREE_AGENT_UTILITY_ACTIVE = !!(
+      utilityDoc &&
+      utilityDoc.schema_version === 1 &&
+      utilityDoc.policy_id === 'phase3-selected-15pct-cap040' &&
+      utilityDoc.source &&
+      utilityDoc.source.league_id === data.league_id &&
+      utilityDoc.source.free_agents_synced_at === data.synced_at &&
+      utilityDoc.source.free_agents_count === data.count &&
+      Array.isArray(utilityDoc.players)
+    );
+
+    if(FREE_AGENT_UTILITY_ACTIVE){
+      let valid = true;
+      for(const row of utilityDoc.players){
+        const sid = String(row && row.player_id || '');
+        const pos = String(row && row.pos || '');
+        const rank = row && row.priority_rank;
+        const mapKey = sid + '|' + pos;
+        if(!sid || !['QB','RB','WR','TE','DL','LB','DB'].includes(pos) ||
+           !Number.isInteger(rank) || rank < 1 || FREE_AGENT_UTILITY.has(mapKey)){
+          valid = false;
+          break;
+        }
+        FREE_AGENT_UTILITY.set(mapKey, rank);
+      }
+      if(!valid){
+        FREE_AGENT_UTILITY.clear();
+        FREE_AGENT_UTILITY_ACTIVE = false;
+      }
+    }
 
     /* Manually excluded free agents, per real request 2026-08-20 -- kept
        as an explicit filter (not a one-time delete) since this list is
@@ -4377,13 +4425,28 @@ async function loadFreeAgents(){
         valueKey = key + '_fa_' + fa.player_id;
       }
       const val = playerValue(pos, age, role, valueKey);
+      const playerId = String(fa.player_id || '');
+      const utilityKey = playerId + '|' + pos;
+      const utilityRank = (
+        FREE_AGENT_UTILITY_ACTIVE &&
+        hasRealData &&
+        FREE_AGENT_UTILITY.has(utilityKey)
+      ) ? FREE_AGENT_UTILITY.get(utilityKey) : null;
       return {
-        key, name: fa.name, pos, age, role, val, hasRealData,
-        team: fa.team, injuryStatus: fa.injury_status,
+        key, playerId, name: fa.name, pos, age, role, val, hasRealData,
+        utilityRank, team: fa.team, injuryStatus: fa.injury_status,
       };
     }).filter(fa => fa.pos && fa.val > 0);
 
     const dataCount = FREE_AGENTS.filter(fa => fa.hasRealData).length;
+    const utilityCoveredCount = FREE_AGENTS.filter(
+      fa => fa.hasRealData && Number.isInteger(fa.utilityRank)
+    ).length;
+    if(FREE_AGENT_UTILITY_ACTIVE && utilityCoveredCount !== dataCount){
+      FREE_AGENT_UTILITY_ACTIVE = false;
+      FREE_AGENT_UTILITY.clear();
+      FREE_AGENTS.forEach(fa => { fa.utilityRank = null; });
+    }
     statusEl.className = 'status ok';
     statusEl.textContent = `Loaded ${FREE_AGENTS.length} free agents (${dataCount} with real production data) · synced ${new Date(data.synced_at * 1000).toLocaleDateString()}`;
     renderBoard();
@@ -4405,7 +4468,7 @@ function buildRows(list){
     const tag = fa.hasRealData ? '<span class="tag-data">data</span>' : '<span class="tag-est">est.</span>';
     const injury = fa.injuryStatus ? ' · ' + escapeHtml(fa.injuryStatus) : '';
     return `
-      <div class="row ${fa.hasRealData ? 'has-data' : ''}">
+      <div class="row ${fa.hasRealData ? 'has-data' : ''}" data-player-id="${escapeHtml(fa.playerId)}">
         <div class="row-info">
           <div class="row-title">${escapeHtml(fa.name)}</div>
           <div class="row-meta">${fa.pos} · Age ${fa.age} · ${fa.role} · ${tag}${fa.team ? ' · ' + escapeHtml(fa.team) : ''}${injury}</div>
@@ -4422,7 +4485,21 @@ function renderBoard(){
   wrap.innerHTML = positions.map((pos, i) => {
     let list = pos === 'ALL' ? FREE_AGENTS.slice() : FREE_AGENTS.filter(fa => fa.pos === pos);
     if(state.dataOnly) list = list.filter(fa => fa.hasRealData);
-    list.sort((a,b) => (b.hasRealData - a.hasRealData) || (b.val - a.val));
+    if(pos === 'ALL'){
+      list.sort((a,b) => (b.hasRealData - a.hasRealData) || (b.val - a.val));
+    } else {
+      list.sort((a,b) =>
+        (b.hasRealData - a.hasRealData) ||
+        (
+          a.hasRealData && b.hasRealData
+            ? (
+                (Number.isInteger(a.utilityRank) ? a.utilityRank : Number.MAX_SAFE_INTEGER) -
+                (Number.isInteger(b.utilityRank) ? b.utilityRank : Number.MAX_SAFE_INTEGER)
+              ) || (b.val - a.val)
+            : (b.val - a.val)
+        )
+      );
+    }
 
     const rows = buildRows(list);
 
