@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 
 SCRIPT = Path(__file__).resolve()
 ROOT = SCRIPT.parents[2]
@@ -36,7 +37,18 @@ def load_module(path: Path, name: str):
 
 
 def run_node(js: str):
-    p = subprocess.run(["node", "-e", js], capture_output=True, text=True)
+    # The free-agent board runtime is large enough that passing the harness
+    # through `node -e <huge-string>` can exceed Linux ARG_MAX on GitHub
+    # runners. Execute a temporary .js file instead so validation is not
+    # constrained by command-line argument length.
+    with tempfile.TemporaryDirectory(prefix="fa-utility-v1-node-") as tmp:
+        script_path = Path(tmp) / "board_runtime_validation.js"
+        script_path.write_text(js, encoding="utf-8")
+        p = subprocess.run(
+            ["node", str(script_path)],
+            capture_output=True,
+            text=True,
+        )
     if p.returncode != 0:
         raise RuntimeError(f"node failed: {p.stderr[:3000]}")
     return json.loads(p.stdout)
