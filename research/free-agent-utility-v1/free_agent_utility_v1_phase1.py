@@ -206,6 +206,13 @@ def top_overlap(a: dict[str, int], b: dict[str, int], n: int) -> dict:
 
 
 def load_validator():
+    # validate_free_agent_valuation_parity.py imports snapshot_values as a
+    # flat sibling module, so scripts/validation must be importable before
+    # executing the validator module.
+    validation_dir = VALIDATOR.parent
+    if str(validation_dir) not in sys.path:
+        sys.path.insert(0, str(validation_dir))
+
     spec = importlib.util.spec_from_file_location("fa_utility_v1_validator", VALIDATOR)
     if spec is None or spec.loader is None:
         raise RuntimeError("unable to import free-agent valuation validator")
