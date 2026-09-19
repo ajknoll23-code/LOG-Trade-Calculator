@@ -1,6 +1,6 @@
 # Package Adjustment — Exact-Live Prospective/OOS Monitor (V1.6)
 
-Generated: 2026-09-18T19:27:02.575194+00:00
+Generated: 2026-09-19T19:11:51.390476+00:00
 
 ## Release
 
@@ -18,7 +18,7 @@ Generated: 2026-09-18T19:27:02.575194+00:00
 - Distinct concentrated targets: **0**
 - Size2 OOS trades: **0**
 - Size3 OOS trades: **0**
-- Evidence stream age: **0.33 hours**
+- Evidence stream age: **0.43 hours**
 
 ## Evidence maturity gates
 
