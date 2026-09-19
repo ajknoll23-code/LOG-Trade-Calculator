@@ -466,19 +466,42 @@ def patch_index(source_commit: str, valid_after_utc: str) -> None:
             f"Expected exactly one current V6 constants block; replaced {n}"
         )
 
-    functions_pattern = re.compile(
-        r"function packageVoteTodayKey\(\)\{.*?\n\}\nfunction render\(\)\{",
-        re.S,
+    # Replace by exact live-file boundary markers rather than a whitespace-
+    # sensitive regex. The current index has a blank line between the end of
+    # renderPackageVote() and function render(), so the old regex could not
+    # match even though both anchors were present exactly once.
+    start_marker = "function packageVoteTodayKey(){"
+    end_marker = "function render(){"
+
+    start = text2.find(start_marker)
+    if start < 0:
+        raise RuntimeError("packageVoteTodayKey start marker not found")
+    if text2.find(start_marker, start + 1) >= 0:
+        raise RuntimeError("packageVoteTodayKey start marker is not unique")
+
+    end = text2.find(end_marker, start)
+    if end < 0:
+        raise RuntimeError("function render() end marker not found")
+    if text2.find(end_marker, end + 1) >= 0:
+        raise RuntimeError("function render() end marker is not unique")
+
+    if end <= start:
+        raise RuntimeError("package-vote function boundaries are inverted")
+
+    text3 = (
+        text2[:start]
+        + browser_function_block()
+        + "\n\n"
+        + text2[end:]
     )
-    text3, n = functions_pattern.subn(
-        browser_function_block() + "\nfunction render(){",
-        text2,
-        count=1,
-    )
-    if n != 1:
-        raise RuntimeError(
-            f"Expected exactly one package-vote function block; replaced {n}"
-        )
+
+    # Post-patch structural proof before touching disk.
+    if text3.count("function packageVoteTodayKey(){") != 1:
+        raise RuntimeError("patched packageVoteTodayKey count is not exactly one")
+    if text3.count("function render(){") != 1:
+        raise RuntimeError("patched render() count is not exactly one")
+    if "PACKAGE_VOTE_V3C1_EXACT_CELL_SAMPLING_V1" not in text3:
+        raise RuntimeError("V3C1 sampling marker missing after browser patch")
 
     INDEX.write_text(text3, encoding="utf-8")
 
@@ -652,6 +675,29 @@ def selftest() -> None:
 
     check = regression_check_block()
     compile(check, "<regression-check>", "exec")
+
+    # Regression test for the exact live index boundary shape:
+    # closing brace, blank line, then function render().
+    sample = (
+        "prefix\n"
+        "function packageVoteTodayKey(){\nreturn 1;\n}\n\n"
+        "function render(){\nreturn 2;\n}\n"
+        "suffix\n"
+    )
+    start_marker = "function packageVoteTodayKey(){"
+    end_marker = "function render(){"
+    start = sample.find(start_marker)
+    end = sample.find(end_marker, start)
+    assert start >= 0 and end > start
+    patched = (
+        sample[:start]
+        + browser_function_block()
+        + "\n\n"
+        + sample[end:]
+    )
+    assert patched.count(start_marker) == 1
+    assert patched.count(end_marker) == 1
+    assert "PACKAGE_VOTE_V3C1_EXACT_CELL_SAMPLING_V1" in patched
 
     print("Package Adjustment V3 Phase 3C activation self-test PASS")
 
