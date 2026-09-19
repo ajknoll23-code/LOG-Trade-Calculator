@@ -571,6 +571,10 @@ def check_package_sampling_contract():
     end = text.index("\nfunction render(){", start)
     block = text[start:end]
 
+    assert "const PACKAGE_VOTE_V3C1_RESEARCH_CLOSED = true;" in text
+    assert "PACKAGE_VOTE_V3C1_RESEARCH_CLOSED_V1" in block
+    assert "if(PACKAGE_VOTE_V3C1_RESEARCH_CLOSED) return;" in block
+    assert "Package Adjustment V3 research is closed." in block
     assert "PACKAGE_VOTE_V3C1_EXACT_CELL_SAMPLING_V1" in block
     assert "function packageVoteOwnPlayers()" not in block
     assert "function packageVoteEligibleChallenges()" not in block
@@ -603,8 +607,8 @@ def check_package_sampling_contract():
     assert "bandCounts.get('g201_vs_g215') !== 120" in block
 
     print(
-        "PASS V3C1 exact 24-cell fresh-confirmation sampling contract: "
-        "10 challenges/cell; recent-memory post-cell only; display randomized"
+        "PASS V3C1 closed research contract: voting disabled; frozen "
+        "24-cell sampler retained for provenance"
     )
 
 
