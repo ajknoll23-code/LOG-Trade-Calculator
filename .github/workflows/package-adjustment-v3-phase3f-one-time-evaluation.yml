@@ -1,0 +1,237 @@
+name: Package Adjustment V3 - Phase 3F One-Time Confirmation Evaluation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install frozen evaluation dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir             "scipy==1.16.2" "requests==2.34.2"
+
+      - name: Guard exact evaluator and immutable evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          D="research/package-adjustment-v3-ktc-style"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+          test "$(git hash-object "$D/package_adjustment_v3_phase3f_evaluate.py")" = "f49a890afeb4e6b28ef701dcee27122dd40e5467"
+          test "$(git hash-object "$D/phase3_confirmation_preregistration.json")" = "19966121899d41bdbc754a6a260758cf175b12e2"
+          test "$(git hash-object "$D/phase3_confirmation_catalog.json")" = "3d4615e590697341ee8c27785d8b22e16b82ac44"
+          test "$(git hash-object "$D/phase3_exact_600_frozen.json")" = "bf4779cadbfefdb694c1d028d876b2bad819ee88"
+          test "$(git hash-object "$D/phase3_exact_600_freeze_manifest.json")" = "99e6cfcde0cfd28e0c7f486eba00b22bc24edef6"
+          test "$(git hash-object "$D/phase2_candidate_family.json")" = "a43f4998a0f2dc80eb50078d9a599c2bea77464c"
+
+          test ! -e "$D/phase3_confirmation_evaluation.json"
+          test ! -e "$D/phase3_confirmation_evaluation_manifest.json"
+
+      - name: Verify production remains V1.6 before evaluation
+        run: python3 scripts/validation/check_package_adjustment_live.py
+
+      - name: Self-test frozen evaluator
+        run: python3 research/package-adjustment-v3-ktc-style/package_adjustment_v3_phase3f_evaluate.py --selftest
+
+      - name: Run one-time frozen confirmation evaluation
+        run: python3 research/package-adjustment-v3-ktc-style/package_adjustment_v3_phase3f_evaluate.py
+
+      - name: Verify aggregate evaluation output
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          d = Path("research/package-adjustment-v3-ktc-style")
+          result_path = d / "phase3_confirmation_evaluation.json"
+          manifest_path = d / "phase3_confirmation_evaluation_manifest.json"
+
+          result = json.loads(result_path.read_text())
+          manifest = json.loads(manifest_path.read_text())
+
+          allowed = {
+              "CONFIRMATION_PASSED_PRODUCTION_CANDIDATE_ELIGIBLE",
+              "CONFIRMATION_FAILED_RESEARCH_ONLY",
+              "CONFIRMATION_UNRESOLVED_GAMMA_SELECTION_RESEARCH_ONLY",
+          }
+          assert result["status"] in allowed
+          assert result["frozen"] is True
+          assert result["research_only"] is True
+          assert result["evaluation_occurs_once"] is True
+          assert result["production_change_authorized"] is False
+          assert result["automatic_production_promotion_allowed"] is False
+          assert result["production_revision_unchanged"] == "v1.6-v5-size2-composition-overlay"
+          assert result["source_evidence"]["effective_votes"] == 600.0
+          assert result["source_evidence"]["voter_clusters"] == 30
+          assert result["source_evidence"]["distinct_challenges"] == 218
+          assert result["source_evidence"]["required_cells"] == 24
+          assert len(result["models"]) == 4
+          assert len(result["deployment_gates"]["topology_x_asset_mix"]) == 12
+          assert result["implementation"]["gamma_refit_or_tuning_performed"] is False
+          assert result["implementation"]["row_predictions_persisted"] is False
+
+          selection = result["candidate_selection"]
+          assert selection["selected_candidate_id"] in {
+              "power-g2.01", "power-g2.15", "power-g2.30"
+          }
+          assert selection["development_ktc_examples_used_as_tiebreaker"] is False
+
+          assert manifest["status"] == "FROZEN_ONE_TIME_PHASE3F_EVALUATION_MANIFEST"
+          assert manifest["one_time_evaluation_consumed"] is True
+          assert manifest["production_change_authorized"] is False
+          assert manifest["automatic_production_promotion_allowed"] is False
+          assert manifest["evaluation_status"] == result["status"]
+
+          result_text = result_path.read_text()
+          manifest_text = manifest_path.read_text()
+
+          # Aggregate-only evaluation outputs: no ballot-level records or voter ids.
+          for banned in (
+              '"ballots"',
+              '"human_choice"',
+              '"display_left"',
+              '"canonical_a_displayed_left"',
+              '"voter_cluster"',
+              '"source_row_number"',
+              '"timestamp_utc"',
+          ):
+              assert banned not in result_text
+              assert banned not in manifest_text
+
+          assert hashlib.sha256(result_path.read_bytes()).hexdigest() == os.environ["PHASE3F_RESULT_SHA256"]
+          assert hashlib.sha256(manifest_path.read_bytes()).hexdigest() == os.environ["PHASE3F_MANIFEST_SHA256"]
+
+          print("PASS: one-time aggregate confirmation evaluation verified.")
+          print("STATUS=" + result["status"])
+          print("SELECTED=" + selection["selected_candidate_id"])
+          PY
+
+      - name: Guard exact two-file research change
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import subprocess
+
+          expected = {
+              "research/package-adjustment-v3-ktc-style/phase3_confirmation_evaluation.json",
+              "research/package-adjustment-v3-ktc-style/phase3_confirmation_evaluation_manifest.json",
+          }
+          rows = subprocess.check_output(
+              ["git", "status", "--porcelain=v1"], text=True
+          ).splitlines()
+          changed = {row[3:] for row in rows if len(row) >= 4}
+          if changed != expected:
+              raise RuntimeError(f"Unexpected repository changes: {sorted(changed)}")
+          print("PASS: exactly two Phase 3F research files changed.")
+          PY
+
+      - name: Run repository regressions after evaluation
+        run: python3 scripts/validation/repo_regression_checks.py
+
+      - name: Verify production remains V1.6 after evaluation
+        run: python3 scripts/validation/check_package_adjustment_live.py
+
+      - name: Upload one-time evaluation proof
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-adjustment-v3-phase3f-one-time-evaluation
+          retention-days: 90
+          if-no-files-found: error
+          path: |
+            research/package-adjustment-v3-ktc-style/phase3_confirmation_evaluation.json
+            research/package-adjustment-v3-ktc-style/phase3_confirmation_evaluation_manifest.json
+            /tmp/package-adjustment-v3-phase3f-evaluation-report.md
+
+      - name: Commit immutable one-time evaluation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          D="research/package-adjustment-v3-ktc-style"
+          RESULT="$D/phase3_confirmation_evaluation.json"
+          MANIFEST="$D/phase3_confirmation_evaluation_manifest.json"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add "$RESULT" "$MANIFEST"
+          git diff --cached --check
+
+          python3 - <<'PY'
+          import subprocess
+          expected = {
+              "research/package-adjustment-v3-ktc-style/phase3_confirmation_evaluation.json",
+              "research/package-adjustment-v3-ktc-style/phase3_confirmation_evaluation_manifest.json",
+          }
+          changed = set(subprocess.check_output(
+              ["git", "diff", "--cached", "--name-only"], text=True
+          ).splitlines())
+          if changed != expected:
+              raise RuntimeError(f"Unexpected staged files: {sorted(changed)}")
+          print("PASS: exactly two Phase 3F evaluation files staged.")
+          PY
+
+          git commit -m "Evaluate Package Adjustment V3 fresh confirmation"
+          git pull --rebase origin main
+
+          test "$(git hash-object "$D/phase3_confirmation_preregistration.json")" = "19966121899d41bdbc754a6a260758cf175b12e2"
+          test "$(git hash-object "$D/phase3_confirmation_catalog.json")" = "3d4615e590697341ee8c27785d8b22e16b82ac44"
+          test "$(git hash-object "$D/phase3_exact_600_frozen.json")" = "bf4779cadbfefdb694c1d028d876b2bad819ee88"
+          test "$(git hash-object "$D/phase3_exact_600_freeze_manifest.json")" = "99e6cfcde0cfd28e0c7f486eba00b22bc24edef6"
+          test "$(git hash-object "$D/phase2_candidate_family.json")" = "a43f4998a0f2dc80eb50078d9a599c2bea77464c"
+
+          test "$(sha256sum "$RESULT" | awk '{print $1}')" = "$PHASE3F_RESULT_SHA256"
+          test "$(sha256sum "$MANIFEST" | awk '{print $1}')" = "$PHASE3F_MANIFEST_SHA256"
+
+          python3 - <<'PY'
+          import subprocess
+          expected = {
+              "research/package-adjustment-v3-ktc-style/phase3_confirmation_evaluation.json",
+              "research/package-adjustment-v3-ktc-style/phase3_confirmation_evaluation_manifest.json",
+          }
+          changed = set(subprocess.check_output(
+              ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
+              text=True,
+          ).splitlines())
+          if changed != expected:
+              raise RuntimeError(f"Rebased commit touched unexpected files: {sorted(changed)}")
+          print("PASS: rebased Phase 3F commit remains exact two-file scope.")
+          PY
+
+          python3 scripts/validation/repo_regression_checks.py
+          python3 scripts/validation/check_package_adjustment_live.py
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+          git push origin main
+          echo "PHASE3F_STATUS=$PHASE3F_STATUS"
+          echo "PHASE3F_SELECTED_CANDIDATE=$PHASE3F_SELECTED_CANDIDATE"
+          git log --oneline -1
