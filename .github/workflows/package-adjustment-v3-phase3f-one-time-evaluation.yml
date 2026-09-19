@@ -4,16 +4,12 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-
-concurrency:
-  group: trade-desk-data-writes
-  cancel-in-progress: false
+  contents: read
 
 jobs:
-  evaluate:
+  verify-frozen-evaluation:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
 
     steps:
       - name: Check out current main
@@ -27,47 +23,32 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install frozen evaluation dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 -m pip install --disable-pip-version-check --no-cache-dir             "scipy==1.16.2" "requests==2.34.2"
-
-      - name: Guard exact evaluator and immutable evidence
+      - name: Verify immutable Phase 3F one-time result
         shell: bash
         run: |
           set -euo pipefail
 
           D="research/package-adjustment-v3-ktc-style"
+          RESULT="$D/phase3_confirmation_evaluation.json"
+          MANIFEST="$D/phase3_confirmation_evaluation_manifest.json"
+
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
 
-          test "$(git hash-object "$D/package_adjustment_v3_phase3f_evaluate.py")" = "f49a890afeb4e6b28ef701dcee27122dd40e5467"
+          # Frozen research inputs remain byte-identical.
           test "$(git hash-object "$D/phase3_confirmation_preregistration.json")" = "19966121899d41bdbc754a6a260758cf175b12e2"
           test "$(git hash-object "$D/phase3_confirmation_catalog.json")" = "3d4615e590697341ee8c27785d8b22e16b82ac44"
           test "$(git hash-object "$D/phase3_exact_600_frozen.json")" = "bf4779cadbfefdb694c1d028d876b2bad819ee88"
           test "$(git hash-object "$D/phase3_exact_600_freeze_manifest.json")" = "99e6cfcde0cfd28e0c7f486eba00b22bc24edef6"
           test "$(git hash-object "$D/phase2_candidate_family.json")" = "a43f4998a0f2dc80eb50078d9a599c2bea77464c"
 
-          test ! -e "$D/phase3_confirmation_evaluation.json"
-          test ! -e "$D/phase3_confirmation_evaluation_manifest.json"
+          # The one-time evaluation already committed before the prior run's
+          # final cosmetic shell failure. Never evaluate it a second time.
+          test "$(git hash-object "$RESULT")" = "0f3eba0172c3765009ea5e266ef3f84994a7caa6"
+          test "$(git hash-object "$MANIFEST")" = "7bf4a96758fa08fa293b08e1b578f661b120fcf6"
 
-      - name: Verify production remains V1.6 before evaluation
-        run: python3 scripts/validation/check_package_adjustment_live.py
-
-      - name: Self-test frozen evaluator
-        run: python3 research/package-adjustment-v3-ktc-style/package_adjustment_v3_phase3f_evaluate.py --selftest
-
-      - name: Run one-time frozen confirmation evaluation
-        run: python3 research/package-adjustment-v3-ktc-style/package_adjustment_v3_phase3f_evaluate.py
-
-      - name: Verify aggregate evaluation output
-        shell: bash
-        run: |
-          set -euo pipefail
           python3 - <<'PY'
           import hashlib
           import json
-          import os
           from pathlib import Path
 
           d = Path("research/package-adjustment-v3-ktc-style")
@@ -77,161 +58,94 @@ jobs:
           result = json.loads(result_path.read_text())
           manifest = json.loads(manifest_path.read_text())
 
-          allowed = {
-              "CONFIRMATION_PASSED_PRODUCTION_CANDIDATE_ELIGIBLE",
-              "CONFIRMATION_FAILED_RESEARCH_ONLY",
-              "CONFIRMATION_UNRESOLVED_GAMMA_SELECTION_RESEARCH_ONLY",
-          }
-          assert result["status"] in allowed
-          assert result["frozen"] is True
-          assert result["research_only"] is True
+          assert result["status"] == "CONFIRMATION_UNRESOLVED_GAMMA_SELECTION_RESEARCH_ONLY"
           assert result["evaluation_occurs_once"] is True
+          assert result["research_only"] is True
           assert result["production_change_authorized"] is False
           assert result["automatic_production_promotion_allowed"] is False
+          assert result["production_candidate_eligible"] is False
           assert result["production_revision_unchanged"] == "v1.6-v5-size2-composition-overlay"
-          assert result["source_evidence"]["effective_votes"] == 600.0
-          assert result["source_evidence"]["voter_clusters"] == 30
-          assert result["source_evidence"]["distinct_challenges"] == 218
-          assert result["source_evidence"]["required_cells"] == 24
-          assert len(result["models"]) == 4
-          assert len(result["deployment_gates"]["topology_x_asset_mix"]) == 12
-          assert result["implementation"]["gamma_refit_or_tuning_performed"] is False
-          assert result["implementation"]["row_predictions_persisted"] is False
 
           selection = result["candidate_selection"]
-          assert selection["selected_candidate_id"] in {
-              "power-g2.01", "power-g2.15", "power-g2.30"
-          }
+          assert selection["selected_candidate_id"] == "power-g2.15"
+          assert selection["runner_up_candidate_id"] == "power-g2.01"
+          assert selection["gamma_selection_resolved"] is False
+          assert abs(selection["best_vs_runner_up_log_loss_gap"] - 0.000229994661) < 1e-15
+          assert selection["runner_up_resolution_threshold"] == 0.002
           assert selection["development_ktc_examples_used_as_tiebreaker"] is False
 
+          gates = result["deployment_gates"]
+          assert gates["all_24_frozen_cells_coverage_gate_pass"] is True
+          assert gates["bootstrap_gate_pass"] is True
+          assert gates["group_safety_gate_pass"] is True
+          assert gates["improvement_gate_pass"] is False
+          assert gates["all_deployment_gates_pass"] is False
+          assert abs(gates["improvement_raw_minus_candidate"] - 0.000260423094) < 1e-15
+          assert gates["minimum_required_improvement"] == 0.005
+          assert abs(
+              gates["challenge_cluster_bootstrap"]["favorable_fraction"] - 0.9664
+          ) < 1e-15
+          assert abs(gates["maximum_observed_group_regression"] - 0.000393596075) < 1e-15
+
+          expected_losses = {
+              "raw-additive-control-g1.00": 0.690887203745,
+              "power-g2.01": 0.690856775312,
+              "power-g2.15": 0.690626780651,
+              "power-g2.30": 0.691671154135,
+          }
+          got = {m["id"]: m["mean_held_out_log_loss"] for m in result["models"]}
+          assert got == expected_losses
+
           assert manifest["status"] == "FROZEN_ONE_TIME_PHASE3F_EVALUATION_MANIFEST"
+          assert manifest["evaluation_status"] == result["status"]
+          assert manifest["selected_candidate_id"] == "power-g2.15"
+          assert manifest["production_candidate_eligible"] is False
           assert manifest["one_time_evaluation_consumed"] is True
           assert manifest["production_change_authorized"] is False
           assert manifest["automatic_production_promotion_allowed"] is False
-          assert manifest["evaluation_status"] == result["status"]
 
-          result_text = result_path.read_text()
-          manifest_text = manifest_path.read_text()
+          assert (
+              hashlib.sha256(result_path.read_bytes()).hexdigest()
+              == "aeb65cb9082e5348443ec28268a66c02f4439fae1de2772ab118da566a2f8422"
+          )
 
-          # Aggregate-only evaluation outputs: no ballot-level records or voter ids.
-          for banned in (
-              '"ballots"',
-              '"human_choice"',
-              '"display_left"',
-              '"canonical_a_displayed_left"',
-              '"voter_cluster"',
-              '"source_row_number"',
-              '"timestamp_utc"',
-          ):
-              assert banned not in result_text
-              assert banned not in manifest_text
-
-          assert hashlib.sha256(result_path.read_bytes()).hexdigest() == os.environ["PHASE3F_RESULT_SHA256"]
-          assert hashlib.sha256(manifest_path.read_bytes()).hexdigest() == os.environ["PHASE3F_MANIFEST_SHA256"]
-
-          print("PASS: one-time aggregate confirmation evaluation verified.")
-          print("STATUS=" + result["status"])
-          print("SELECTED=" + selection["selected_candidate_id"])
+          print("PASS: immutable Phase 3F one-time evaluation verified.")
+          print("PHASE3F_STATUS=CONFIRMATION_UNRESOLVED_GAMMA_SELECTION_RESEARCH_ONLY")
+          print("PHASE3F_SELECTED_CANDIDATE=power-g2.15")
+          print("PHASE3F_PRODUCTION_CANDIDATE_ELIGIBLE=false")
           PY
 
-      - name: Guard exact two-file research change
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import subprocess
-
-          expected = {
-              "research/package-adjustment-v3-ktc-style/phase3_confirmation_evaluation.json",
-              "research/package-adjustment-v3-ktc-style/phase3_confirmation_evaluation_manifest.json",
-          }
-          rows = subprocess.check_output(
-              ["git", "status", "--porcelain=v1"], text=True
-          ).splitlines()
-          changed = {row[3:] for row in rows if len(row) >= 4}
-          if changed != expected:
-              raise RuntimeError(f"Unexpected repository changes: {sorted(changed)}")
-          print("PASS: exactly two Phase 3F research files changed.")
-          PY
-
-      - name: Run repository regressions after evaluation
+      - name: Run repository regressions
         run: python3 scripts/validation/repo_regression_checks.py
 
-      - name: Verify production remains V1.6 after evaluation
+      - name: Verify production remains V1.6
         run: python3 scripts/validation/check_package_adjustment_live.py
 
-      - name: Upload one-time evaluation proof
-        uses: actions/upload-artifact@v4
-        with:
-          name: package-adjustment-v3-phase3f-one-time-evaluation
-          retention-days: 90
-          if-no-files-found: error
-          path: |
-            research/package-adjustment-v3-ktc-style/phase3_confirmation_evaluation.json
-            research/package-adjustment-v3-ktc-style/phase3_confirmation_evaluation_manifest.json
-            /tmp/package-adjustment-v3-phase3f-evaluation-report.md
-
-      - name: Commit immutable one-time evaluation
+      - name: Write recovery summary
         shell: bash
         run: |
           set -euo pipefail
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          # Package Adjustment V3 — Phase 3F Recovery Verification
 
-          D="research/package-adjustment-v3-ktc-style"
-          RESULT="$D/phase3_confirmation_evaluation.json"
-          MANIFEST="$D/phase3_confirmation_evaluation_manifest.json"
+          **Status:** `CONFIRMATION_UNRESOLVED_GAMMA_SELECTION_RESEARCH_ONLY`
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          The prior Phase 3F run completed its one-time evaluation and pushed the
+          immutable result before a cosmetic final-shell error.
 
-          git add "$RESULT" "$MANIFEST"
-          git diff --cached --check
+          - Selected candidate by held-out log loss: `power-g2.15`
+          - Runner-up: `power-g2.01`
+          - Best-vs-runner-up gap: `0.000229994661` (< required `0.002`)
+          - Improvement vs raw control: `0.000260423094` (< required `0.005`)
+          - Bootstrap favorable fraction: `0.9664` (PASS)
+          - Maximum topology×asset-mix regression: `0.000393596075` (PASS)
+          - Frozen coverage: `24/24` (PASS)
+          - Production candidate eligible: **false**
+          - Production remains `v1.6-v5-size2-composition-overlay`
 
-          python3 - <<'PY'
-          import subprocess
-          expected = {
-              "research/package-adjustment-v3-ktc-style/phase3_confirmation_evaluation.json",
-              "research/package-adjustment-v3-ktc-style/phase3_confirmation_evaluation_manifest.json",
-          }
-          changed = set(subprocess.check_output(
-              ["git", "diff", "--cached", "--name-only"], text=True
-          ).splitlines())
-          if changed != expected:
-              raise RuntimeError(f"Unexpected staged files: {sorted(changed)}")
-          print("PASS: exactly two Phase 3F evaluation files staged.")
-          PY
+          No second evaluation was performed.
+          EOF
 
-          git commit -m "Evaluate Package Adjustment V3 fresh confirmation"
-          git pull --rebase origin main
-
-          test "$(git hash-object "$D/phase3_confirmation_preregistration.json")" = "19966121899d41bdbc754a6a260758cf175b12e2"
-          test "$(git hash-object "$D/phase3_confirmation_catalog.json")" = "3d4615e590697341ee8c27785d8b22e16b82ac44"
-          test "$(git hash-object "$D/phase3_exact_600_frozen.json")" = "bf4779cadbfefdb694c1d028d876b2bad819ee88"
-          test "$(git hash-object "$D/phase3_exact_600_freeze_manifest.json")" = "99e6cfcde0cfd28e0c7f486eba00b22bc24edef6"
-          test "$(git hash-object "$D/phase2_candidate_family.json")" = "a43f4998a0f2dc80eb50078d9a599c2bea77464c"
-
-          test "$(sha256sum "$RESULT" | awk '{print $1}')" = "$PHASE3F_RESULT_SHA256"
-          test "$(sha256sum "$MANIFEST" | awk '{print $1}')" = "$PHASE3F_MANIFEST_SHA256"
-
-          python3 - <<'PY'
-          import subprocess
-          expected = {
-              "research/package-adjustment-v3-ktc-style/phase3_confirmation_evaluation.json",
-              "research/package-adjustment-v3-ktc-style/phase3_confirmation_evaluation_manifest.json",
-          }
-          changed = set(subprocess.check_output(
-              ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
-              text=True,
-          ).splitlines())
-          if changed != expected:
-              raise RuntimeError(f"Rebased commit touched unexpected files: {sorted(changed)}")
-          print("PASS: rebased Phase 3F commit remains exact two-file scope.")
-          PY
-
-          python3 scripts/validation/repo_regression_checks.py
-          python3 scripts/validation/check_package_adjustment_live.py
-          test -z "$(git status --porcelain=v1 --untracked-files=all)"
-
-          git push origin main
-          echo "PHASE3F_STATUS=$PHASE3F_STATUS"
-          echo "PHASE3F_SELECTED_CANDIDATE=$PHASE3F_SELECTED_CANDIDATE"
-          git log --oneline -1
+          echo "PHASE3F_STATUS=CONFIRMATION_UNRESOLVED_GAMMA_SELECTION_RESEARCH_ONLY"
+          echo "PHASE3F_SELECTED_CANDIDATE=power-g2.15"
+          echo "PHASE3F_PRODUCTION_CANDIDATE_ELIGIBLE=false"
