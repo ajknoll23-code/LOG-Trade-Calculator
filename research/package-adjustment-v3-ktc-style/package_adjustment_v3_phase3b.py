@@ -10,6 +10,7 @@ Fresh namespace reserved by Phase 3A: __pkgv3c1__
 from __future__ import annotations
 
 import argparse
+import bisect
 import hashlib
 import importlib.util
 import json
@@ -42,6 +43,8 @@ import snapshot_values  # noqa: E402
 RNG_SEED = 202609183
 MAX_ATTEMPTS_PER_TOPOLOGY_MIX = 900_000
 POOL_TARGET_PER_BAND = 60
+TARGETED_1V3_ATTEMPTS_PER_BAND = 500_000
+TARGETED_1V3_Z_NEIGHBORS = 10
 EPS = 1e-12
 
 KNOWN_KTC_NAME_SIGNATURES = [
@@ -447,6 +450,164 @@ def candidate_record(
     }
 
 
+
+def third_asset_boundary_value(a_value, x_value, y_value, gamma):
+    remaining = (
+        float(a_value) ** gamma
+        - float(x_value) ** gamma
+        - float(y_value) ** gamma
+    )
+    if remaining <= 0:
+        return None
+    return remaining ** (1.0 / gamma)
+
+
+def targeted_1v3_fill(
+    *,
+    asset_mix,
+    band,
+    players,
+    picks,
+    apex,
+    forbidden_history,
+    cell_candidates,
+    rng,
+):
+    """Construct rare 1v3 crossings without changing the frozen cell contract."""
+    cell = f"1v3|{asset_mix}|{band}"
+    if len(cell_candidates[cell]) >= POOL_TARGET_PER_BAND:
+        return {
+            "attempts": 0,
+            "accepted": 0,
+            "final_pool_size": len(cell_candidates[cell]),
+        }
+
+    if asset_mix == "players_only":
+        universe = list(players)
+        z_pool = list(players)
+    elif asset_mix == "includes_picks":
+        universe = list(players) + list(picks)
+        z_pool = list(players) + list(picks)
+    else:
+        raise ValueError(asset_mix)
+
+    a_pool = sorted(
+        universe,
+        key=lambda asset: (-float(asset["fv"]), asset["id"]),
+    )
+    a_pool = a_pool[: max(80, int(len(a_pool) * 0.60))]
+
+    z_sorted = sorted(
+        z_pool,
+        key=lambda asset: (float(asset["fv"]), asset["id"]),
+    )
+    z_values = [float(asset["fv"]) for asset in z_sorted]
+
+    accepted = 0
+    attempts = 0
+
+    for attempts in range(1, TARGETED_1V3_ATTEMPTS_PER_BAND + 1):
+        if len(cell_candidates[cell]) >= POOL_TARGET_PER_BAND:
+            break
+
+        a = a_pool[rng.randrange(len(a_pool))]
+        a_value = float(a["fv"])
+
+        pair_pool = [
+            asset
+            for asset in universe
+            if asset["id"] != a["id"]
+            and float(asset["fv"]) < a_value * 0.98
+            and float(asset["fv"]) > a_value * 0.08
+        ]
+        if len(pair_pool) < 2:
+            continue
+
+        if asset_mix == "includes_picks" and attempts % 2 == 0:
+            pick_pair = [x for x in pair_pool if x["kind"] == "pick"]
+            player_pair = [x for x in pair_pool if x["kind"] == "player"]
+            if not pick_pair or not player_pair:
+                continue
+            x = pick_pair[rng.randrange(len(pick_pair))]
+            y = player_pair[rng.randrange(len(player_pair))]
+        else:
+            x, y = rng.sample(pair_pool, 2)
+
+        if len({a["id"], x["id"], y["id"]}) != 3:
+            continue
+
+        if band == "g201_vs_g215":
+            low_gamma, high_gamma = 2.01, 2.15
+        elif band == "g215_vs_g230":
+            low_gamma, high_gamma = 2.15, 2.30
+        else:
+            raise ValueError(band)
+
+        z_low = third_asset_boundary_value(
+            a_value, float(x["fv"]), float(y["fv"]), low_gamma
+        )
+        z_high = third_asset_boundary_value(
+            a_value, float(x["fv"]), float(y["fv"]), high_gamma
+        )
+        if z_low is None or z_high is None:
+            continue
+
+        lo = min(z_low, z_high)
+        hi = max(z_low, z_high)
+        if not (hi > lo + EPS):
+            continue
+
+        start = bisect.bisect_right(z_values, lo + EPS)
+        if start >= len(z_sorted):
+            continue
+
+        for idx in range(
+            start,
+            min(len(z_sorted), start + TARGETED_1V3_Z_NEIGHBORS),
+        ):
+            z = z_sorted[idx]
+            z_value = float(z["fv"])
+            if z_value >= hi - EPS:
+                break
+            if z["id"] in {a["id"], x["id"], y["id"]}:
+                continue
+
+            side_a = [a]
+            side_b = [x, y, z]
+
+            if asset_mix == "players_only":
+                if any(asset["kind"] != "player" for asset in side_a + side_b):
+                    continue
+            else:
+                kinds = {asset["kind"] for asset in side_a + side_b}
+                if kinds != {"player", "pick"}:
+                    continue
+
+            if is_known_ktc_trade(side_a, side_b):
+                continue
+            if generic_historical_signature(side_a, side_b) in forbidden_history:
+                continue
+
+            candidate = candidate_record(
+                "1v3", asset_mix, side_a, side_b, apex
+            )
+            if candidate is None or candidate["band"] != band:
+                continue
+
+            sig = repr(candidate["trade_signature"])
+            old = cell_candidates[cell].get(sig)
+            if old is None or candidate["disagreement_margin"] > old["disagreement_margin"]:
+                if old is None:
+                    accepted += 1
+                cell_candidates[cell][sig] = candidate
+
+    return {
+        "attempts": attempts,
+        "accepted": accepted,
+        "final_pool_size": len(cell_candidates[cell]),
+    }
+
+
 def asset_public(asset):
     row = {
         "id": asset["id"],
@@ -495,6 +656,18 @@ def selftest():
         normalize_name("De'Von Achane")
         == "devon achane"
     )
+
+    target_value = 10000.0
+    x_value = 6000.0
+    y_value = 3500.0
+    z201 = third_asset_boundary_value(
+        target_value, x_value, y_value, 2.01
+    )
+    z215 = third_asset_boundary_value(
+        target_value, x_value, y_value, 2.15
+    )
+    assert z201 is not None and z215 is not None
+    assert abs(z201 - z215) > EPS
 
     apex = 10000.0
     for gamma in (2.01, 2.15, 2.30):
@@ -579,10 +752,13 @@ def generate():
             group = f"{topology}|{asset_mix}"
             attempts = 0
 
-            while (
-                attempts
-                < MAX_ATTEMPTS_PER_TOPOLOGY_MIX
-            ):
+            random_attempt_limit = (
+                min(MAX_ATTEMPTS_PER_TOPOLOGY_MIX, 100_000)
+                if topology == "1v3"
+                else MAX_ATTEMPTS_PER_TOPOLOGY_MIX
+            )
+
+            while attempts < random_attempt_limit:
                 attempts += 1
 
                 side_a, side_b = sample_trade(
@@ -647,6 +823,21 @@ def generate():
                     break
 
             attempts_by_group[group] = attempts
+
+    targeted_1v3_diagnostics = {}
+    for asset_mix in prereg["catalog_design"]["asset_mix_groups"]:
+        for band in prereg["catalog_design"]["disagreement_bands"]:
+            key = f"1v3|{asset_mix}|{band}"
+            targeted_1v3_diagnostics[key] = targeted_1v3_fill(
+                asset_mix=asset_mix,
+                band=band,
+                players=players,
+                picks=picks,
+                apex=apex,
+                forbidden_history=forbidden_history,
+                cell_candidates=cell_candidates,
+                rng=rng,
+            )
 
     expected_cells = set(
         prereg["catalog_design"]["research_cells"]
@@ -943,6 +1134,8 @@ def generate():
                     expected_cells
                 )
             },
+            "targeted_1v3_boundary_search":
+                targeted_1v3_diagnostics,
         },
         "challenges": selected,
     }
