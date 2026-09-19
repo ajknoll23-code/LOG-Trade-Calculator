@@ -332,6 +332,7 @@ def check_aliases_and_ktc_positions():
         "__pkgnv2p1__|",
         "__pkgv6__|",
         "__pkgv3c1__|",
+        "__pkgv4c1__|",
     )
     assert package_prefixes == expected_package_prefixes, (
         "KTC/package-vote transport isolation drift: "
@@ -571,45 +572,41 @@ def check_package_sampling_contract():
     end = text.index("\nfunction render(){", start)
     block = text[start:end]
 
-    assert "const PACKAGE_VOTE_V3C1_RESEARCH_CLOSED = true;" in text
-    assert "PACKAGE_VOTE_V3C1_RESEARCH_CLOSED_V1" in block
-    assert "if(PACKAGE_VOTE_V3C1_RESEARCH_CLOSED) return;" in block
-    assert "Package Adjustment V3 research is closed." in block
-    assert "PACKAGE_VOTE_V3C1_EXACT_CELL_SAMPLING_V1" in block
+    assert "PACKAGE_VOTE_V4C1_EXACT_CELL_SAMPLING_V1" in block
+    assert "PACKAGE_VOTE_V3C1_RESEARCH_CLOSED" not in block
     assert "function packageVoteOwnPlayers()" not in block
     assert "function packageVoteEligibleChallenges()" not in block
     assert "own.has(" not in block
     assert "const byCell = new Map();" in block
-    assert "if(!byCell.has(c.research_cell)) byCell.set(c.research_cell, []);" in block
     assert "const cells = Array.from(byCell.keys()).sort();" in block
     assert "if(cells.length !== 24) return null;" in block
     assert "if(!cellPool || cellPool.length !== 10) return null;" in block
     assert "const selectedCell = cells[Math.floor(Math.random() * cells.length)];" in block
     assert "let challengePool = cellPool.filter(c => !recent.has(c.id));" in block
-    assert "if(!challengePool.length) challengePool = cellPool;" in block
     assert "left: Math.random() < 0.5 ? 'A' : 'B'" in block
     assert "Date.now() < Date.parse(PACKAGE_VOTE_VALID_AFTER_UTC)" in block
+    assert block.index("const selectedCell =") < block.index("const recent = new Set(packageVoteRecent());")
 
-    cell_idx = block.index("const selectedCell =")
-    recent_idx = block.index("const recent = new Set(packageVoteRecent());")
-    assert cell_idx < recent_idx
-
-    assert "Package Adjustment V3 Fresh Confirmation: frozen all-asset disagreement catalog." in text
+    assert "Package Adjustment V4 Fresh Confirmation: frozen 24-cell catalog." in text
     assert "const PACKAGE_VOTE_DAILY_LIMIT = 20;" in text
-    assert "__pkgv3c1__|" in text
-    assert "__pkgv3c1_meta__|" in text
-    assert "__pkgv3c1_schema__|1" in text
+    assert "__pkgv4c1__|" in text
+    assert "__pkgv4c1_meta__|" in text
+    assert "__pkgv4c1_schema__|1" in text
+    assert "package_votes_v4c1_" in block
+    assert "package_vote_recent_v4c1" in block
     assert "doc.challenges.length !== 240" in block
     assert "cells.size !== 24" in block
     assert "n !== 10" in block
     assert "topologyCounts.size !== 6" in block
     assert "mixCounts.get('players_only') !== 120" in block
-    assert "bandCounts.get('g201_vs_g215') !== 120" in block
+    assert "stratumCounts.get('candidate_vs_raw_disagreement') !== 120" in block
+    assert "stratumCounts.get('balanced_broad') !== 120" in block
+    assert "Number(doc.catalog_diagnostics.joe_mixon_occurrences) !== 0" in block
+    assert "Number(doc.catalog_diagnostics.invalid_pick_year_occurrences) !== 0" in block
+    assert "a.name.toLowerCase() !== 'joe mixon'" in block
+    assert "[2027,2028].includes(Number(a.year))" in block
 
-    print(
-        "PASS V3C1 closed research contract: voting disabled; frozen "
-        "24-cell sampler retained for provenance"
-    )
+    print("PASS V4C1 exact 24-cell fresh-confirmation sampling contract")
 
 
 def check_index_js_syntax():
