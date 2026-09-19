@@ -331,6 +331,7 @@ def check_aliases_and_ktc_positions():
         "__pkgnv2__|",
         "__pkgnv2p1__|",
         "__pkgv6__|",
+        "__pkgv3c1__|",
     )
     assert package_prefixes == expected_package_prefixes, (
         "KTC/package-vote transport isolation drift: "
@@ -570,7 +571,7 @@ def check_package_sampling_contract():
     end = text.index("\nfunction render(){", start)
     block = text[start:end]
 
-    assert "PACKAGE_VOTE_V6_EXACT_CELL_SAMPLING_V1" in block
+    assert "PACKAGE_VOTE_V3C1_EXACT_CELL_SAMPLING_V1" in block
     assert "function packageVoteOwnPlayers()" not in block
     assert "function packageVoteEligibleChallenges()" not in block
     assert "own.has(" not in block
@@ -578,25 +579,32 @@ def check_package_sampling_contract():
     assert "if(!byCell.has(c.research_cell)) byCell.set(c.research_cell, []);" in block
     assert "const cells = Array.from(byCell.keys()).sort();" in block
     assert "if(cells.length !== 24) return null;" in block
+    assert "if(!cellPool || cellPool.length !== 10) return null;" in block
     assert "const selectedCell = cells[Math.floor(Math.random() * cells.length)];" in block
     assert "let challengePool = cellPool.filter(c => !recent.has(c.id));" in block
     assert "if(!challengePool.length) challengePool = cellPool;" in block
-    assert "left: Math.random() < 0.5 ? 'T' : 'P'" in block
+    assert "left: Math.random() < 0.5 ? 'A' : 'B'" in block
     assert "Date.now() < Date.parse(PACKAGE_VOTE_VALID_AFTER_UTC)" in block
 
     cell_idx = block.index("const selectedCell =")
     recent_idx = block.index("const recent = new Set(packageVoteRecent());")
-    assert cell_idx < recent_idx, "recent filtering must occur only after cell selection"
+    assert cell_idx < recent_idx
 
-    assert "Package Adjustment V6 Development: frozen 1-vs-3 composition catalog." in text
+    assert "Package Adjustment V3 Fresh Confirmation: frozen all-asset disagreement catalog." in text
     assert "const PACKAGE_VOTE_DAILY_LIMIT = 20;" in text
-    assert "__pkgv6__|" in text
-    assert "__pkgv6_meta__|" in text
-    assert "__pkgv6_schema__|6" in text
+    assert "__pkgv3c1__|" in text
+    assert "__pkgv3c1_meta__|" in text
+    assert "__pkgv3c1_schema__|1" in text
+    assert "doc.challenges.length !== 240" in block
+    assert "cells.size !== 24" in block
+    assert "n !== 10" in block
+    assert "topologyCounts.size !== 6" in block
+    assert "mixCounts.get('players_only') !== 120" in block
+    assert "bandCounts.get('g201_vs_g215') !== 120" in block
 
     print(
-        "PASS V6 exact 24-cell sampling contract: no voter-roster filtering; "
-        "recent-memory post-cell only; display side randomized"
+        "PASS V3C1 exact 24-cell fresh-confirmation sampling contract: "
+        "10 challenges/cell; recent-memory post-cell only; display randomized"
     )
 
 
