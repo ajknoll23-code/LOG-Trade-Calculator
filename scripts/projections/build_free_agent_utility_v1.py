@@ -38,6 +38,7 @@ SHIFT_CAP = 0.04
 POLICY_ID = "phase3-selected-15pct-cap040"
 
 EXPECTED_PHASE4_BLOB = "2492711ce73eb0203025a5fe20c2a5b88a5887c1"
+EXPECTED_PHASE4_FREE_AGENTS_BLOB = "2a007c0b2febd47cb29543fbe191959c8234f0dd"
 EXPECTED_ARTIFACT_SHA_PHASE4 = "ca0445c3f6826aa28d76846c8a5904c7f5ec406ead6db62da6f9849eb7ebb3a5"
 
 BOARD_MARKER = "FREE_AGENT_UTILITY_V1_BOARD_INTEGRATION"
@@ -183,7 +184,23 @@ def build_artifact(offense: Path, dl: Path, lb: Path, db: Path) -> dict:
         "players": players,
     }
 
-    if phase4["source_integrity"].get("data_backed_free_agent_count") == len(players) == 408:
+    # Exact Phase 4 reproduction is a historical-source proof, not a rule
+    # for every later refresh. The original guard used "408 data-backed free
+    # agents" as a proxy for the frozen Phase 4 snapshot. That cardinality can
+    # legitimately recur after free-agent membership/sync data change.
+    #
+    # Run the byte-for-byte Phase 4 proof only when the public free-agent
+    # source is the exact historical Phase 4 source. The private 4for4 inputs
+    # are independently SHA-pinned by the frozen Phase 1 reader.
+    current_free_agents_blob = git_blob_sha(FREE_AGENTS)
+    if current_free_agents_blob == EXPECTED_PHASE4_FREE_AGENTS_BLOB:
+        if phase4["source_integrity"].get("data_backed_free_agent_count") != 408:
+            raise RuntimeError("frozen Phase 4 data-backed cohort count drifted")
+        if len(players) != 408:
+            raise RuntimeError(
+                "production builder does not reproduce frozen Phase 4 cohort size"
+            )
+
         phase4_shape = {
             "schema_version": 1,
             "study_id": "free-agent-utility-v1",
@@ -425,6 +442,16 @@ def run_selftest():
     validate_artifact(sample)
     assert clamp(0.1, -SHIFT_CAP, SHIFT_CAP) == SHIFT_CAP
     assert clamp(-0.1, -SHIFT_CAP, SHIFT_CAP) == -SHIFT_CAP
+
+    # Historical reproduction must be bound to the exact source snapshot,
+    # never to a row-count coincidence.
+    assert EXPECTED_PHASE4_FREE_AGENTS_BLOB == (
+        "2a007c0b2febd47cb29543fbe191959c8234f0dd"
+    )
+    assert EXPECTED_PHASE4_FREE_AGENTS_BLOB != (
+        "baca3c506f90e4373639932ebdb15cb5f58f141c"
+    )
+
     print("build_free_agent_utility_v1 self-test passed")
 
 
