@@ -587,7 +587,10 @@ def check_package_sampling_contract():
     assert "Date.now() < Date.parse(PACKAGE_VOTE_VALID_AFTER_UTC)" in block
     assert block.index("const selectedCell =") < block.index("const recent = new Set(packageVoteRecent());")
 
-    assert "Package Adjustment V4 Fresh Confirmation: frozen 24-cell catalog." in text
+    assert "Package Adjustment V4 Fresh Confirmation: exact-600 evidence frozen; voting closed." in text
+    assert "const PACKAGE_VOTE_V4C1_RESEARCH_CLOSED = true;" in text
+    assert "if(PACKAGE_VOTE_V4C1_RESEARCH_CLOSED) return;" in block
+    assert "Package Adjustment V4 confirmation voting is closed." in block
     assert "const PACKAGE_VOTE_DAILY_LIMIT = 20;" in text
     assert "__pkgv4c1__|" in text
     assert "__pkgv4c1_meta__|" in text
@@ -606,7 +609,7 @@ def check_package_sampling_contract():
     assert "a.name.toLowerCase() !== 'joe mixon'" in block
     assert "[2027,2028].includes(Number(a.year))" in block
 
-    print("PASS V4C1 exact 24-cell fresh-confirmation sampling contract")
+    print("PASS V4C1 frozen exact-600 research contract: sampling preserved; voting closed")
 
 
 def check_index_js_syntax():
