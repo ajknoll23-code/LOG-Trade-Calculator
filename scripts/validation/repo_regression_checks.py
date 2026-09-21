@@ -572,44 +572,34 @@ def check_package_sampling_contract():
     end = text.index("\nfunction render(){", start)
     block = text[start:end]
 
-    assert "PACKAGE_VOTE_V4C1_EXACT_CELL_SAMPLING_V1" in block
-    assert "PACKAGE_VOTE_V3C1_RESEARCH_CLOSED" not in block
+    assert "PACKAGE_VOTE_V6_EXACT_CELL_SAMPLING_V1" in block
     assert "function packageVoteOwnPlayers()" not in block
     assert "function packageVoteEligibleChallenges()" not in block
     assert "own.has(" not in block
     assert "const byCell = new Map();" in block
+    assert "if(!byCell.has(c.research_cell)) byCell.set(c.research_cell, []);" in block
     assert "const cells = Array.from(byCell.keys()).sort();" in block
     assert "if(cells.length !== 24) return null;" in block
-    assert "if(!cellPool || cellPool.length !== 10) return null;" in block
     assert "const selectedCell = cells[Math.floor(Math.random() * cells.length)];" in block
     assert "let challengePool = cellPool.filter(c => !recent.has(c.id));" in block
-    assert "left: Math.random() < 0.5 ? 'A' : 'B'" in block
+    assert "if(!challengePool.length) challengePool = cellPool;" in block
+    assert "left: Math.random() < 0.5 ? 'T' : 'P'" in block
     assert "Date.now() < Date.parse(PACKAGE_VOTE_VALID_AFTER_UTC)" in block
-    assert block.index("const selectedCell =") < block.index("const recent = new Set(packageVoteRecent());")
 
-    assert "Package Adjustment V4 Fresh Confirmation: exact-600 evidence frozen; voting closed." in text
-    assert "const PACKAGE_VOTE_V4C1_RESEARCH_CLOSED = true;" in text
-    assert "if(PACKAGE_VOTE_V4C1_RESEARCH_CLOSED) return;" in block
-    assert "Package Adjustment V4 confirmation voting is closed." in block
+    cell_idx = block.index("const selectedCell =")
+    recent_idx = block.index("const recent = new Set(packageVoteRecent());")
+    assert cell_idx < recent_idx, "recent filtering must occur only after cell selection"
+
+    assert "Package Adjustment V6 Development: frozen 1-vs-3 composition catalog." in text
     assert "const PACKAGE_VOTE_DAILY_LIMIT = 20;" in text
-    assert "__pkgv4c1__|" in text
-    assert "__pkgv4c1_meta__|" in text
-    assert "__pkgv4c1_schema__|1" in text
-    assert "package_votes_v4c1_" in block
-    assert "package_vote_recent_v4c1" in block
-    assert "doc.challenges.length !== 240" in block
-    assert "cells.size !== 24" in block
-    assert "n !== 10" in block
-    assert "topologyCounts.size !== 6" in block
-    assert "mixCounts.get('players_only') !== 120" in block
-    assert "stratumCounts.get('candidate_vs_raw_disagreement') !== 120" in block
-    assert "stratumCounts.get('balanced_broad') !== 120" in block
-    assert "Number(doc.catalog_diagnostics.joe_mixon_occurrences) !== 0" in block
-    assert "Number(doc.catalog_diagnostics.invalid_pick_year_occurrences) !== 0" in block
-    assert "a.name.toLowerCase() !== 'joe mixon'" in block
-    assert "[2027,2028].includes(Number(a.year))" in block
+    assert "__pkgv6__|" in text
+    assert "__pkgv6_meta__|" in text
+    assert "__pkgv6_schema__|6" in text
 
-    print("PASS V4C1 frozen exact-600 research contract: sampling preserved; voting closed")
+    print(
+        "PASS V6 exact 24-cell sampling contract: no voter-roster filtering; "
+        "recent-memory post-cell only; display side randomized"
+    )
 
 
 def check_index_js_syntax():
