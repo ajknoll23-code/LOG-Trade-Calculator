@@ -1,0 +1,1561 @@
+name: Package Adjustment V6 Development Evaluation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13.15'
+
+      - name: Install frozen evaluation dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install \
+            "numpy==2.3.3" \
+            "scipy==1.16.2" \
+            "requests==2.34.2"
+
+      - name: Guard frozen V6 preregistration and exact-700 evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          D="research/package-adjustment-v6"
+
+          test -z "$(git status --porcelain=v1)"
+
+          test "$(git hash-object "$D/development_preregistration_v1.json")" = \
+            "81f20cb8afd78f624153c3337377f56ebf8115ae"
+          test "$(git hash-object "$D/development_vote_release_v1.json")" = \
+            "5e53ff9fdb795fff30ab6235a3a5ee969f313fd2"
+          test "$(git hash-object "$D/package_vote_challenges_v6.json")" = \
+            "afc3f4e5a75f3599c11482361073c4bd9559e342"
+          test "$(git hash-object "$D/development_exact_700_frozen_v1.json")" = \
+            "fd7097335bebae209bb380c121f44debf7d0cb82"
+          test "$(git hash-object "$D/development_exact_700_freeze_manifest_v1.json")" = \
+            "38d6cc6fc8e58bdaa216f120a224eafd583dff8a"
+
+          test "$(sha256sum "$D/development_exact_700_frozen_v1.json" | awk '{print $1}')" = \
+            "3407b6e93e2726e18715d43bbde83e10027668a82c8d6154d64518b5dbb4a281"
+
+          for p in \
+            "$D/development_evaluation_v1.json" \
+            "$D/development_evaluation_v1.md" \
+            "$D/development_evaluation_manifest_v1.json" \
+            "$D/development_candidate_v1.json" \
+            "$D/development_candidate_v1.md"
+          do
+            test ! -e "$p"
+          done
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          d = Path("research/package-adjustment-v6")
+          cfg = json.loads((d / "development_preregistration_v1.json").read_text())
+          freeze = json.loads((d / "development_exact_700_frozen_v1.json").read_text())
+          man = json.loads((d / "development_exact_700_freeze_manifest_v1.json").read_text())
+
+          assert cfg["status"] == "frozen_v6_development_preregistration"
+          assert cfg["frozen"] is True
+          assert cfg["research_only"] is True
+          assert cfg["production_change_authorized"] is False
+          assert cfg["production_revision_must_remain"] == "v1.6-v5-size2-composition-overlay"
+
+          assert cfg["development_cross_validation"]["fold_count"] == 5
+          assert cfg["development_cross_validation"]["method"] == \
+              "deterministic_stratified_grouped_challenge_5_fold"
+          assert cfg["development_cross_validation"]["fit_objective"] == \
+              "equal_cell_macro_mean_weighted_negative_log_likelihood"
+
+          selection = cfg["development_selection"]
+          assert selection["eligible_challengers"] == ["C2", "C4", "C5"]
+          assert selection["production_baseline"] == "C1"
+          assert selection["raw_control"] == "C0"
+          assert selection["minimum_combined_cv_improvement_vs_C1"] == 0.003
+          assert selection["maximum_anchor_profile_cv_regression_vs_C1"] == 0.003
+          assert selection["maximum_any_profile_cv_regression_vs_C1"] == 0.005
+          assert selection["minimum_folds_with_positive_improvement_vs_C1"] == 3
+
+          assert freeze["status"] == "frozen_exact_700_v6_development_evidence"
+          assert freeze["frozen"] is True
+          assert freeze["checkpoint_selection_outcome_blind"] is True
+          assert freeze["model_evaluation_performed"] is False
+          assert freeze["frozen_effective_votes"] == 700.0
+          assert freeze["raw_checkpoint_ballot_count"] == 730
+          assert freeze["distinct_voter_clusters"] == 34
+
+          assert man["status"] == "frozen_exact_700_v6_development_evidence_manifest"
+          assert man["checkpoint_600"]["coverage_gates_pass"] is False
+          assert man["checkpoint_700"]["coverage_gates_pass"] is True
+          assert man["checkpoint_700"]["cells_passing_both_gates"] == 24
+          assert man["dataset"]["sha256"] == \
+              "3407b6e93e2726e18715d43bbde83e10027668a82c8d6154d64518b5dbb4a281"
+
+          print("PASS: V6 exact-700 evidence and preregistered model-selection contract are frozen.")
+          PY
+
+      - name: Verify production remains V1.6 before evaluation
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 \
+            python3 scripts/validation/check_package_adjustment_live.py
+
+      - name: Run one-million-vector preregistered property tests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import json
+          import math
+          from pathlib import Path
+
+          import numpy as np
+
+          OUT = Path("/tmp/v6_property_tests.json")
+          rng = np.random.default_rng(20260921)
+          n_total = 1_000_000
+          batch = 100_000
+          checked = 0
+
+          A0_BOUNDS = (-0.2876820724517809, 0.13976194237515863)
+          APHI_VALUES = (0.0, 0.25, 0.5)
+          Q_VALUES = (1.0, 1.5, 3.0, 6.0)
+          LAMBDA_VALUES = (0.0, 0.25, 0.7, 1.0)
+          PHI_REF = 0.6402
+
+          max_monotonic_violation = {"C2": 0.0, "C4": 0.0, "C5": 0.0}
+          max_permutation_error = {"C2": 0.0, "C4": 0.0}
+          max_split_violation_c2 = 0.0
+          max_hhi_split_violation = 0.0
+
+          def c2(v, q):
+              return np.power(np.sum(np.power(v, q), axis=1), 1.0 / q)
+
+          def c4(v, lam):
+              s = np.sort(v, axis=1)[:, ::-1]
+              return s[:, 0] + lam * s[:, 1] + (lam ** 2) * s[:, 2]
+
+          def phi(v):
+              S = np.sum(v, axis=1)
+              shares = v / S[:, None]
+              return 1.0 - np.sum(shares * shares, axis=1)
+
+          def c5(v, a0, aphi):
+              S = np.sum(v, axis=1)
+              ph = phi(v)
+              m = 1.0 + np.exp(a0 + aphi * (ph - PHI_REF))
+              return S / m
+
+          while checked < n_total:
+              m = min(batch, n_total - checked)
+              target = np.exp(rng.uniform(np.log(750.0), np.log(9000.0), size=m))
+              v = target[:, None] * rng.uniform(0.05, 0.99, size=(m, 3))
+
+              idx = rng.integers(0, 3, size=m)
+              v2 = v.copy()
+              room = target - v[np.arange(m), idx]
+              inc = room * rng.uniform(1e-6, 0.999, size=m)
+              v2[np.arange(m), idx] += inc
+
+              perm = v[:, [2, 0, 1]]
+
+              for q in Q_VALUES:
+                  s1 = c2(v, q)
+                  s2 = c2(v2, q)
+                  sp = c2(perm, q)
+                  max_monotonic_violation["C2"] = max(
+                      max_monotonic_violation["C2"],
+                      float(np.max(s1 - s2)),
+                  )
+                  max_permutation_error["C2"] = max(
+                      max_permutation_error["C2"],
+                      float(np.max(np.abs(s1 - sp))),
+                  )
+                  assert np.all(s2 + 1e-9 >= s1)
+                  assert np.all(s1 >= 0)
+                  assert np.max(np.abs(s1 - sp)) < 1e-8
+
+                  x = target
+                  frac = rng.uniform(0.01, 0.99, size=m)
+                  split = np.stack([x * frac, x * (1.0 - frac)], axis=1)
+                  split_score = np.power(
+                      np.sum(np.power(split, q), axis=1), 1.0 / q
+                  )
+                  violation = split_score - x
+                  max_split_violation_c2 = max(
+                      max_split_violation_c2,
+                      float(np.max(violation)),
+                  )
+                  if q == 1.0:
+                      assert np.max(np.abs(split_score - x)) < 1e-8
+                  else:
+                      assert np.all(split_score < x + 1e-9)
+
+              for lam in LAMBDA_VALUES:
+                  s1 = c4(v, lam)
+                  s2 = c4(v2, lam)
+                  sp = c4(perm, lam)
+                  max_monotonic_violation["C4"] = max(
+                      max_monotonic_violation["C4"],
+                      float(np.max(s1 - s2)),
+                  )
+                  max_permutation_error["C4"] = max(
+                      max_permutation_error["C4"],
+                      float(np.max(np.abs(s1 - sp))),
+                  )
+                  assert np.all(s2 + 1e-9 >= s1)
+                  assert np.all(s1 >= 0)
+                  assert np.max(np.abs(s1 - sp)) < 1e-8
+                  assert 1.0 >= lam >= lam ** 2 >= 0.0
+
+              for a0 in A0_BOUNDS:
+                  for aphi in APHI_VALUES:
+                      s1 = c5(v, a0, aphi)
+                      s2 = c5(v2, a0, aphi)
+                      max_monotonic_violation["C5"] = max(
+                          max_monotonic_violation["C5"],
+                          float(np.max(s1 - s2)),
+                      )
+                      assert np.all(s2 + 2e-8 >= s1)
+                      assert np.all(s1 >= 0)
+
+                      ph = phi(v)
+                      mult = 1.0 + np.exp(a0 + aphi * (ph - PHI_REF))
+                      assert np.all(mult > 1.0)
+
+              # HHI strictly decreases when one positive piece is nontrivially split.
+              S = np.sum(v, axis=1)
+              shares = v / S[:, None]
+              h_before = np.sum(shares * shares, axis=1)
+              r = rng.uniform(0.01, 0.99, size=m)
+              split_first = np.stack(
+                  [shares[:, 0] * r, shares[:, 0] * (1.0 - r),
+                   shares[:, 1], shares[:, 2]],
+                  axis=1,
+              )
+              h_after = np.sum(split_first * split_first, axis=1)
+              max_hhi_split_violation = max(
+                  max_hhi_split_violation,
+                  float(np.max(h_after - h_before)),
+              )
+              assert np.all(h_after < h_before + 1e-12)
+
+              # Singleton identities / finite continuity sanity checks.
+              for q in Q_VALUES:
+                  singleton = np.power(np.power(target, q), 1.0 / q)
+                  assert np.max(np.abs(singleton - target)) < 1e-8
+
+              checked += m
+
+          result = {
+              "status": "PASS",
+              "deterministic_seed": 20260921,
+              "randomized_vectors_checked": checked,
+              "C2": {
+                  "q_values_checked": Q_VALUES,
+                  "singleton_identity": True,
+                  "coordinatewise_monotonicity": True,
+                  "permutation_invariance": True,
+                  "split_penalty_for_q_gt_1": True,
+              },
+              "C4": {
+                  "lambda_values_checked": LAMBDA_VALUES,
+                  "permutation_invariance_after_sorting": True,
+                  "coordinatewise_monotonicity": True,
+                  "nonincreasing_rank_weights": True,
+              },
+              "C5": {
+                  "a0_bounds_checked": A0_BOUNDS,
+                  "a_phi_values_checked": APHI_VALUES,
+                  "hhi_strictly_decreases_under_nontrivial_split": True,
+                  "phi_strictly_increases_under_nontrivial_split": True,
+                  "multiplier_positive_and_continuous": True,
+                  "package_sufficiency_coordinatewise_monotonicity": True,
+              },
+              "all_challengers": {
+                  "non_negative_scores": True,
+                  "same_formula_regardless_of_display_side": True,
+                  "no_named_player_or_challenge_id_feature": True,
+              },
+              "diagnostics": {
+                  "max_monotonic_violation": max_monotonic_violation,
+                  "max_permutation_error": max_permutation_error,
+                  "max_split_violation_C2": max_split_violation_c2,
+                  "max_hhi_split_violation": max_hhi_split_violation,
+              },
+          }
+          OUT.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+          print(json.dumps(result, indent=2, sort_keys=True))
+          PY
+
+      - name: Run preregistered V6 development evaluation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import math
+          from collections import defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import numpy as np
+          from scipy.optimize import minimize
+
+          D = Path("research/package-adjustment-v6")
+          CFG_PATH = D / "development_preregistration_v1.json"
+          RELEASE_PATH = D / "development_vote_release_v1.json"
+          DATA_PATH = D / "development_exact_700_frozen_v1.json"
+          FREEZE_MANIFEST_PATH = D / "development_exact_700_freeze_manifest_v1.json"
+          CATALOG_PATH = D / "package_vote_challenges_v6.json"
+
+          RESULTS_PATH = D / "development_evaluation_v1.json"
+          SUMMARY_PATH = D / "development_evaluation_v1.md"
+          MANIFEST_PATH = D / "development_evaluation_manifest_v1.json"
+          CANDIDATE_PATH = D / "development_candidate_v1.json"
+          CANDIDATE_MD_PATH = D / "development_candidate_v1.md"
+
+          PROPERTY_PATH = Path("/tmp/v6_property_tests.json")
+
+          def sha256(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          cfg = json.loads(CFG_PATH.read_text())
+          release = json.loads(RELEASE_PATH.read_text())
+          data = json.loads(DATA_PATH.read_text())
+          freeze_manifest = json.loads(FREEZE_MANIFEST_PATH.read_text())
+          catalog_doc = json.loads(CATALOG_PATH.read_text())
+          property_result = json.loads(PROPERTY_PATH.read_text())
+
+          assert property_result["status"] == "PASS"
+          assert property_result["randomized_vectors_checked"] >= 1_000_000
+
+          ballots = list(data["ballots"])
+          challenges = {c["id"]: c for c in catalog_doc["challenges"]}
+
+          assert len(ballots) == 730
+          assert len(challenges) == 504
+          assert abs(sum(float(b["frozen_ballot_weight"]) for b in ballots) - 700.0) < 1e-8
+          assert len({b["voter_cluster"] for b in ballots}) == 34
+          assert len({b["challenge_id"] for b in ballots}) == 384
+
+          V_REF = float(cfg["shared_probability_layer"]["v_ref"])
+          assert V_REF == 5401.0
+          LOG_BETA_BOUNDS = tuple(map(float, cfg["shared_probability_layer"]["log_beta_bounds"]))
+          DELTA_BOUNDS = tuple(map(float, cfg["shared_probability_layer"]["delta_left_bounds"]))
+
+          SIZE3_MULT = 2.0512371846911357
+          ENV = {
+              "largestMin": 0.41991319353657897,
+              "largestMax": 0.4696171986399035,
+              "middleMin": 0.30827026434134036,
+              "middleMax": 0.36725409193118236,
+              "smallestMin": 0.2120186203977994,
+              "smallestMax": 0.2247276896617619,
+          }
+
+          MODEL_ORDER = ["C0", "C1", "C2", "C4", "C5"]
+          CHALLENGERS = ["C2", "C4", "C5"]
+          PROFILES = ["45/33/22", "50/30/20", "50/25/25", "55/30/15", "60/25/15", "60/20/20"]
+          ANCHOR_PROFILE = "45/33/22"
+          FOLDS = 5
+          BOUNDARY_TOL = 1e-5
+          MULTISTART = 16
+          DIAGNOSTIC_MULTISTART = 6
+
+          model_specs = cfg["models"]
+
+          def vals(c):
+              return np.array([float(x["fv"]) for x in c["package"]], dtype=float)
+
+          def c1_supported(v):
+              ordered = np.sort(v)[::-1]
+              shares = ordered / np.sum(ordered)
+              return (
+                  shares[0] >= ENV["largestMin"] - 1e-12
+                  and shares[0] <= ENV["largestMax"] + 1e-12
+                  and shares[1] >= ENV["middleMin"] - 1e-12
+                  and shares[1] <= ENV["middleMax"] + 1e-12
+                  and shares[2] >= ENV["smallestMin"] - 1e-12
+                  and shares[2] <= ENV["smallestMax"] + 1e-12
+              )
+
+          feats = {}
+          cells_to_challenges = defaultdict(list)
+          for cid, c in challenges.items():
+              v = vals(c)
+              S = float(np.sum(v))
+              target = float(c["target_fv"])
+              shares = v / S
+              hhi = float(np.sum(shares * shares))
+              ph = 1.0 - hhi
+              profile = str(c["component_profile"]["label"])
+              target_key = str(c["target"]["key"])
+              cell = str(c["research_cell"])
+
+              assert len(v) == 3
+              assert all(x > 0 for x in v)
+              assert all(x < target for x in v)
+              assert profile in PROFILES
+
+              feats[cid] = {
+                  "challenge_id": cid,
+                  "cell": cell,
+                  "profile": profile,
+                  "target_key": target_key,
+                  "target_position": str(c["target"]["pos"]),
+                  "v": v,
+                  "S": S,
+                  "target": target,
+                  "phi": ph,
+                  "c1_supported": c1_supported(v),
+              }
+              cells_to_challenges[cell].append(cid)
+
+          assert len(cells_to_challenges) == 24
+          assert set(f["profile"] for f in feats.values()) == set(PROFILES)
+
+          # Deterministic stratified grouped challenge folds exactly as preregistered.
+          challenge_fold = {}
+          salt = "pkgv6-dev-cv-v1|"
+          for cell in sorted(cells_to_challenges):
+              ordered = sorted(
+                  cells_to_challenges[cell],
+                  key=lambda cid: hashlib.sha256((salt + cid).encode()).hexdigest(),
+              )
+              assert len(ordered) == 21
+              for i, cid in enumerate(ordered):
+                  challenge_fold[cid] = i % FOLDS
+
+          rows = []
+          for b in ballots:
+              cid = b["challenge_id"]
+              f = feats[cid]
+              rows.append({
+                  "ordinal": int(b["ordinal"]),
+                  "challenge_id": cid,
+                  "fold": int(challenge_fold[cid]),
+                  "cell": f["cell"],
+                  "profile": f["profile"],
+                  "target_key": f["target_key"],
+                  "voter_cluster": str(b["voter_cluster"]),
+                  "weight": float(b["frozen_ballot_weight"]),
+                  "left": 1.0 if bool(b["package_displayed_left"]) else 0.0,
+                  "y": 1.0 if bool(b["package_preferred"]) else 0.0,
+              })
+
+          # The preregistered equal-cell validation loss requires every fold to
+          # have observed ballots in all 24 cells. Fail rather than silently
+          # redefine the metric if that condition is not met.
+          fold_observed_cell_counts = {}
+          for fold in range(FOLDS):
+              val_cells = {r["cell"] for r in rows if r["fold"] == fold}
+              train_cells = {r["cell"] for r in rows if r["fold"] != fold}
+              fold_observed_cell_counts[str(fold)] = {
+                  "validation": len(val_cells),
+                  "training": len(train_cells),
+              }
+              if len(val_cells) != 24:
+                  missing = sorted(set(cells_to_challenges) - val_cells)
+                  raise RuntimeError(f"validation fold {fold} missing ballot cells: {missing}")
+              if len(train_cells) != 24:
+                  missing = sorted(set(cells_to_challenges) - train_cells)
+                  raise RuntimeError(f"training fold {fold} missing ballot cells: {missing}")
+
+          def structural_dim(model):
+              return {"C0": 0, "C1": 0, "C2": 1, "C4": 1, "C5": 2}[model]
+
+          def bounds_for(model):
+              if model in {"C0", "C1"}:
+                  return [LOG_BETA_BOUNDS, DELTA_BOUNDS]
+              if model == "C2":
+                  return [
+                      tuple(map(float, model_specs["C2"]["q_bounds"])),
+                      LOG_BETA_BOUNDS,
+                      DELTA_BOUNDS,
+                  ]
+              if model == "C4":
+                  return [
+                      tuple(map(float, model_specs["C4"]["lambda_bounds"])),
+                      LOG_BETA_BOUNDS,
+                      DELTA_BOUNDS,
+                  ]
+              if model == "C5":
+                  return [
+                      tuple(map(float, model_specs["C5"]["a0_bounds"])),
+                      tuple(map(float, model_specs["C5"]["a_phi_bounds"])),
+                      LOG_BETA_BOUNDS,
+                      DELTA_BOUNDS,
+                  ]
+              raise KeyError(model)
+
+          def initial_points(model, token, count):
+              bounds = bounds_for(model)
+              pts = []
+
+              if model in {"C0", "C1"}:
+                  pts.extend([
+                      np.array([0.0, 0.0]),
+                      np.array([math.log(2.0), 0.0]),
+                      np.array([math.log(5.0), 0.0]),
+                  ])
+              elif model == "C2":
+                  pts.extend([
+                      np.array([1.0, 0.0, 0.0]),
+                      np.array([2.0, 0.0, 0.0]),
+                      np.array([4.0, 0.0, 0.0]),
+                  ])
+              elif model == "C4":
+                  pts.extend([
+                      np.array([1.0, 0.0, 0.0]),
+                      np.array([0.70, 0.0, 0.0]),
+                      np.array([0.35, 0.0, 0.0]),
+                  ])
+              elif model == "C5":
+                  v4_a0 = math.log(SIZE3_MULT - 1.0)
+                  pts.extend([
+                      np.array([v4_a0, 0.0, 0.0, 0.0]),
+                      np.array([v4_a0, 0.20, 0.0, 0.0]),
+                      np.array([sum(model_specs["C5"]["a0_bounds"]) / 2.0, 0.35, 0.0, 0.0]),
+                  ])
+
+              seed = int.from_bytes(
+                  hashlib.sha256(f"pkgv6-eval-v1|{model}|{token}".encode()).digest()[:8],
+                  "big",
+              )
+              rng = np.random.default_rng(seed)
+              while len(pts) < count:
+                  pts.append(np.array([rng.uniform(lo, hi) for lo, hi in bounds], dtype=float))
+              return pts[:count]
+
+          def score_pair(model, theta, f):
+              v = f["v"]
+              S = f["S"]
+              T = f["target"]
+
+              if model == "C0":
+                  return S, T
+
+              if model == "C1":
+                  return S, T * SIZE3_MULT if f["c1_supported"] else T
+
+              if model == "C2":
+                  q = float(theta[0])
+                  sp = float(np.power(np.sum(np.power(v, q)), 1.0 / q))
+                  return sp, T
+
+              if model == "C4":
+                  lam = float(theta[0])
+                  vv = np.sort(v)[::-1]
+                  sp = float(vv[0] + lam * vv[1] + (lam ** 2) * vv[2])
+                  return sp, T
+
+              if model == "C5":
+                  a0 = float(theta[0])
+                  aphi = float(theta[1])
+                  mult = 1.0 + math.exp(a0 + aphi * (f["phi"] - 0.6402))
+                  return S, T * mult
+
+              raise KeyError(model)
+
+          def row_eta(row, model, theta):
+              sd = structural_dim(model)
+              log_beta = float(theta[sd])
+              delta_left = float(theta[sd + 1])
+              sp, st = score_pair(model, theta, feats[row["challenge_id"]])
+              return math.exp(log_beta) * ((sp - st) / V_REF) + delta_left * row["left"]
+
+          def row_pred_loss(row, model, theta):
+              eta = row_eta(row, model, theta)
+              p = 1.0 / (1.0 + math.exp(-eta)) if eta >= 0 else math.exp(eta) / (1.0 + math.exp(eta))
+              loss = float(np.logaddexp(0.0, eta) - row["y"] * eta)
+              return p, loss
+
+          def macro_loss(rows_subset, model, theta):
+              by_cell = defaultdict(list)
+              for r in rows_subset:
+                  by_cell[r["cell"]].append(r)
+              if len(by_cell) != 24:
+                  raise RuntimeError(f"macro loss requires 24 cells, got {len(by_cell)}")
+              cell_losses = []
+              for cell in sorted(by_cell):
+                  rr = by_cell[cell]
+                  den = sum(x["weight"] for x in rr)
+                  if den <= 0:
+                      raise RuntimeError("zero cell weight")
+                  num = 0.0
+                  for x in rr:
+                      _, loss = row_pred_loss(x, model, theta)
+                      num += x["weight"] * loss
+                  cell_losses.append(num / den)
+              return float(sum(cell_losses) / 24.0)
+
+          def structural_boundary_hits(model, theta):
+              sd = structural_dim(model)
+              if sd == 0:
+                  return []
+              bounds = bounds_for(model)[:sd]
+              hits = []
+              for i, (x, (lo, hi)) in enumerate(zip(theta[:sd], bounds)):
+                  x = float(x)
+                  if abs(x - lo) <= BOUNDARY_TOL:
+                      allowed = (
+                          (model == "C2" and i == 0 and abs(lo - 1.0) < 1e-12)
+                          or (model == "C5" and i == 1 and abs(lo - 0.0) < 1e-12)
+                      )
+                      hits.append({
+                          "index": i, "side": "lower", "value": x,
+                          "bound": lo, "allowed": allowed,
+                      })
+                  if abs(x - hi) <= BOUNDARY_TOL:
+                      allowed = (
+                          model == "C4" and i == 0 and abs(hi - 1.0) < 1e-12
+                      )
+                      hits.append({
+                          "index": i, "side": "upper", "value": x,
+                          "bound": hi, "allowed": allowed,
+                      })
+              return hits
+
+          def fit_model(model, train_rows, token, starts=MULTISTART):
+              bounds = bounds_for(model)
+              attempts = []
+              best = None
+
+              for si, x0 in enumerate(initial_points(model, token, starts)):
+                  res = minimize(
+                      lambda x: macro_loss(train_rows, model, x),
+                      x0,
+                      method="L-BFGS-B",
+                      bounds=bounds,
+                      options={
+                          "maxiter": 4000,
+                          "ftol": 1e-13,
+                          "gtol": 1e-8,
+                          "maxls": 60,
+                      },
+                  )
+                  finite = math.isfinite(float(res.fun))
+                  attempts.append({
+                      "start_index": si,
+                      "success": bool(res.success),
+                      "status": int(res.status),
+                      "objective": float(res.fun) if finite else None,
+                      "nit": int(res.nit),
+                  })
+                  if res.success and finite:
+                      key = (float(res.fun), tuple(float(v) for v in res.x))
+                      if best is None or key < best["key"]:
+                          best = {"key": key, "res": res}
+
+              if best is None:
+                  return {
+                      "success": False,
+                      "best": None,
+                      "attempt_count": len(attempts),
+                      "successful_attempt_count": sum(a["success"] for a in attempts),
+                      "structural_boundary_hits": [],
+                      "disallowed_structural_boundary": True,
+                  }
+
+              res = best["res"]
+              theta = [float(v) for v in res.x]
+              hits = structural_boundary_hits(model, theta)
+              return {
+                  "success": True,
+                  "best": {
+                      "objective": float(res.fun),
+                      "parameters": theta,
+                      "nit": int(res.nit),
+                  },
+                  "attempt_count": len(attempts),
+                  "successful_attempt_count": sum(a["success"] for a in attempts),
+                  "structural_boundary_hits": hits,
+                  "disallowed_structural_boundary": any(not h["allowed"] for h in hits),
+              }
+
+          def predictions(rows_subset, model, theta):
+              out = []
+              for r in rows_subset:
+                  p, loss = row_pred_loss(r, model, theta)
+                  out.append({
+                      **r,
+                      "prediction": p,
+                      "loss": loss,
+                  })
+              return out
+
+          cv_fit = {m: {} for m in MODEL_ORDER}
+          fold_metrics = {m: {} for m in MODEL_ORDER}
+          oof = {m: [] for m in MODEL_ORDER}
+
+          for fold in range(FOLDS):
+              train = [r for r in rows if r["fold"] != fold]
+              val = [r for r in rows if r["fold"] == fold]
+
+              for model in MODEL_ORDER:
+                  fit_out = fit_model(model, train, f"cv{fold}")
+                  cv_fit[model][str(fold)] = fit_out
+                  if not fit_out["success"]:
+                      continue
+                  theta = fit_out["best"]["parameters"]
+                  pp = predictions(val, model, theta)
+                  oof[model].extend(pp)
+
+                  by_cell = defaultdict(list)
+                  for x in pp:
+                      by_cell[x["cell"]].append(x)
+                  assert len(by_cell) == 24
+                  cell_losses = {}
+                  for cell, rr in by_cell.items():
+                      den = sum(x["weight"] for x in rr)
+                      cell_losses[cell] = sum(x["weight"] * x["loss"] for x in rr) / den
+
+                  fold_metrics[model][str(fold)] = {
+                      "validation_equal_cell_macro_log_loss": float(
+                          sum(cell_losses.values()) / 24.0
+                      ),
+                      "validation_ballot_count": len(val),
+                      "validation_cell_count": 24,
+                      "structural_boundary_hits": fit_out["structural_boundary_hits"],
+                      "disallowed_structural_boundary": fit_out["disallowed_structural_boundary"],
+                  }
+
+          for model in MODEL_ORDER:
+              if len(oof[model]) != len(rows):
+                  raise RuntimeError(f"{model} missing OOF predictions")
+
+          def summarize_oof(preds):
+              by_cell = defaultdict(list)
+              for x in preds:
+                  by_cell[x["cell"]].append(x)
+
+              cell = {}
+              for key, rr in sorted(by_cell.items()):
+                  den = sum(x["weight"] for x in rr)
+                  cell[key] = {
+                      "log_loss": float(sum(x["weight"] * x["loss"] for x in rr) / den),
+                      "effective_weight": float(den),
+                      "profile": rr[0]["profile"],
+                  }
+
+              combined = float(sum(v["log_loss"] for v in cell.values()) / 24.0)
+              profile_losses = {}
+              for profile in PROFILES:
+                  vv = [v["log_loss"] for v in cell.values() if v["profile"] == profile]
+                  assert len(vv) == 4
+                  profile_losses[profile] = float(sum(vv) / 4.0)
+
+              return {
+                  "combined": combined,
+                  "profiles": profile_losses,
+                  "cells": cell,
+              }
+
+          cv_summary = {m: summarize_oof(oof[m]) for m in MODEL_ORDER}
+          baseline = cv_summary["C1"]
+
+          def c5_residual_gate():
+              preds = oof["C5"]
+              by_profile = defaultdict(list)
+              for x in preds:
+                  by_profile[x["profile"]].append(x)
+
+              residual_mean = {}
+              for profile, rr in by_profile.items():
+                  den = sum(x["weight"] for x in rr)
+                  residual_mean[profile] = float(
+                      sum(x["weight"] * (x["y"] - x["prediction"]) for x in rr) / den
+                  )
+
+              pairs = [
+                  ("50/30/20", "50/25/25"),
+                  ("60/25/15", "60/20/20"),
+              ]
+              pair_results = {}
+              passes = True
+              for a, b in pairs:
+                  diff = abs(residual_mean[a] - residual_mean[b])
+                  pair_results[f"{a}__vs__{b}"] = {
+                      "profile_a_residual": residual_mean[a],
+                      "profile_b_residual": residual_mean[b],
+                      "absolute_residual_difference": float(diff),
+                      "pass_le_0_10": bool(diff <= 0.10 + 1e-15),
+                  }
+                  passes = passes and diff <= 0.10 + 1e-15
+              return {
+                  "method": (
+                      "OOF weighted mean residual y-p by composition profile; "
+                      "prediction p conditions on the held-out fitted score margin "
+                      "and display-side term"
+                  ),
+                  "profile_residuals": residual_mean,
+                  "pairs": pair_results,
+                  "pass": bool(passes),
+              }
+
+          c5_resid = c5_residual_gate()
+
+          selection = {}
+          eligible = []
+
+          for model in CHALLENGERS:
+              s = cv_summary[model]
+              improvement = baseline["combined"] - s["combined"]
+              profile_reg = {
+                  p: s["profiles"][p] - baseline["profiles"][p]
+                  for p in PROFILES
+              }
+              positive_folds = sum(
+                  1 for fold in range(FOLDS)
+                  if (
+                      fold_metrics["C1"][str(fold)]["validation_equal_cell_macro_log_loss"]
+                      - fold_metrics[model][str(fold)]["validation_equal_cell_macro_log_loss"]
+                  ) > 0
+              )
+              all_fit_success = all(cv_fit[model][str(f)]["success"] for f in range(FOLDS))
+              disallowed_boundary = any(
+                  cv_fit[model][str(f)]["disallowed_structural_boundary"]
+                  for f in range(FOLDS)
+              )
+
+              gates = {
+                  "combined_improvement_at_least_0_003": improvement >= 0.003 - 1e-15,
+                  "anchor_profile_regression_at_most_0_003": (
+                      profile_reg[ANCHOR_PROFILE] <= 0.003 + 1e-15
+                  ),
+                  "maximum_any_profile_regression_at_most_0_005": (
+                      max(profile_reg.values()) <= 0.005 + 1e-15
+                  ),
+                  "at_least_3_of_5_folds_positive": positive_folds >= 3,
+                  "all_fold_fits_successful": all_fit_success,
+                  "no_disallowed_structural_boundary": not disallowed_boundary,
+              }
+              if model == "C5":
+                  gates["paired_shape_HHI_residual_gate"] = bool(c5_resid["pass"])
+
+              is_eligible = all(gates.values())
+              selection[model] = {
+                  "cv_loss": s["combined"],
+                  "cv_improvement_vs_C1": improvement,
+                  "profile_regression_vs_C1": profile_reg,
+                  "anchor_profile_regression_vs_C1": profile_reg[ANCHOR_PROFILE],
+                  "maximum_profile_regression_vs_C1": max(profile_reg.values()),
+                  "positive_fold_count": positive_folds,
+                  "free_structural_parameters": int(model_specs[model]["free_structural_parameters"]),
+                  "gates": gates,
+                  "eligible": is_eligible,
+              }
+              if is_eligible:
+                  eligible.append(model)
+
+          selected = None
+          if eligible:
+              best = min(eligible, key=lambda m: (selection[m]["cv_loss"], m))
+              best_loss = selection[best]["cv_loss"]
+              within = [
+                  m for m in eligible
+                  if selection[m]["cv_loss"] <= best_loss + 0.001 + 1e-15
+              ]
+              selected = min(
+                  within,
+                  key=lambda m: (
+                      selection[m]["free_structural_parameters"],
+                      selection[m]["cv_loss"],
+                      m,
+                  ),
+              )
+
+          # Crossed/two-way cluster resampling of paired OOF loss differences.
+          # Both voter and challenge clusters are independently resampled with
+          # replacement; multiplicities are multiplied at ballot level.
+          def crossed_bootstrap(model, reps=2000):
+              base_by_ord = {x["ordinal"]: x for x in oof["C1"]}
+              cand_by_ord = {x["ordinal"]: x for x in oof[model]}
+              ords = sorted(base_by_ord)
+              assert ords == sorted(cand_by_ord)
+
+              voters = sorted({base_by_ord[o]["voter_cluster"] for o in ords})
+              challenges_u = sorted({base_by_ord[o]["challenge_id"] for o in ords})
+              cells = sorted({base_by_ord[o]["cell"] for o in ords})
+              assert len(cells) == 24
+
+              vi = {v: i for i, v in enumerate(voters)}
+              ci = {c: i for i, c in enumerate(challenges_u)}
+              celli = {c: i for i, c in enumerate(cells)}
+
+              voter_idx = np.array([vi[base_by_ord[o]["voter_cluster"]] for o in ords], dtype=int)
+              chal_idx = np.array([ci[base_by_ord[o]["challenge_id"]] for o in ords], dtype=int)
+              cell_idx = np.array([celli[base_by_ord[o]["cell"]] for o in ords], dtype=int)
+              weight = np.array([base_by_ord[o]["weight"] for o in ords], dtype=float)
+              diff = np.array(
+                  [cand_by_ord[o]["loss"] - base_by_ord[o]["loss"] for o in ords],
+                  dtype=float,
+              )
+
+              seed = int.from_bytes(
+                  hashlib.sha256(f"pkgv6-crossed-bootstrap-v1|{model}".encode()).digest()[:8],
+                  "big",
+              )
+              rng = np.random.default_rng(seed)
+              draws = []
+              attempts = 0
+              while len(draws) < reps and attempts < reps * 10:
+                  attempts += 1
+                  vm = rng.multinomial(len(voters), [1.0 / len(voters)] * len(voters))
+                  cm = rng.multinomial(
+                      len(challenges_u),
+                      [1.0 / len(challenges_u)] * len(challenges_u),
+                  )
+                  ww = weight * vm[voter_idx] * cm[chal_idx]
+                  den = np.bincount(cell_idx, weights=ww, minlength=24)
+                  if np.any(den <= 0):
+                      continue
+                  num = np.bincount(cell_idx, weights=ww * diff, minlength=24)
+                  draws.append(float(np.mean(num / den)))
+
+              if len(draws) != reps:
+                  raise RuntimeError(
+                      f"crossed bootstrap for {model} produced only {len(draws)} valid reps"
+                  )
+
+              a = np.array(draws, dtype=float)
+              point = cv_summary[model]["combined"] - cv_summary["C1"]["combined"]
+              return {
+                  "method": (
+                      "two-way crossed voter/challenge cluster bootstrap with "
+                      "independent with-replacement cluster multiplicities; "
+                      "paired candidate-minus-C1 OOF equal-cell macro log-loss difference"
+                  ),
+                  "replicates": reps,
+                  "valid_draw_attempts": attempts,
+                  "point_difference_candidate_minus_C1": float(point),
+                  "bootstrap_mean": float(np.mean(a)),
+                  "bootstrap_sd": float(np.std(a, ddof=1)),
+                  "ci_95_percentile": [
+                      float(np.quantile(a, 0.025)),
+                      float(np.quantile(a, 0.975)),
+                  ],
+                  "fraction_candidate_better": float(np.mean(a < 0.0)),
+              }
+
+          uncertainty = {m: crossed_bootstrap(m) for m in CHALLENGERS}
+
+          # Refit selected class on all spent development evidence, then run the
+          # preregistered stability diagnostics. These do not alter model selection.
+          full_fit = None
+          candidate_written = False
+          candidate_status = None
+          loo_profile = None
+          loo_target = None
+
+          if selected is not None:
+              full_fit = fit_model(selected, rows, "full", starts=MULTISTART)
+
+              if not full_fit["success"]:
+                  candidate_status = "selected_class_full_refit_failed_unresolved"
+              elif full_fit["disallowed_structural_boundary"]:
+                  candidate_status = "selected_class_full_refit_boundary_unresolved"
+              else:
+                  theta_full = full_fit["best"]["parameters"]
+
+                  # Leave-one-composition-profile-out diagnostic.
+                  loo_profile = {}
+                  for profile in PROFILES:
+                      train = [r for r in rows if r["profile"] != profile]
+                      hold = [r for r in rows if r["profile"] == profile]
+                      assert len({r["cell"] for r in hold}) == 4
+
+                      f_c = fit_model(
+                          selected, train, f"loo-profile-{profile}",
+                          starts=DIAGNOSTIC_MULTISTART,
+                      )
+                      f_b = fit_model(
+                          "C1", train, f"loo-profile-{profile}-C1",
+                          starts=DIAGNOSTIC_MULTISTART,
+                      )
+                      if not f_c["success"] or not f_b["success"]:
+                          raise RuntimeError(f"LOO profile fit failed: {profile}")
+
+                      pc = predictions(hold, selected, f_c["best"]["parameters"])
+                      pb = predictions(hold, "C1", f_b["best"]["parameters"])
+
+                      def four_cell_loss(preds):
+                          by = defaultdict(list)
+                          for x in preds:
+                              by[x["cell"]].append(x)
+                          assert len(by) == 4
+                          ll = []
+                          for rr in by.values():
+                              den = sum(x["weight"] for x in rr)
+                              ll.append(sum(x["weight"] * x["loss"] for x in rr) / den)
+                          return float(sum(ll) / 4.0)
+
+                      cand_loss = four_cell_loss(pc)
+                      base_loss = four_cell_loss(pb)
+                      loo_profile[profile] = {
+                          "candidate_holdout_log_loss": cand_loss,
+                          "C1_holdout_log_loss": base_loss,
+                          "improvement_C1_minus_candidate": base_loss - cand_loss,
+                          "candidate_structural_parameters": (
+                              f_c["best"]["parameters"][: structural_dim(selected)]
+                          ),
+                          "candidate_disallowed_structural_boundary": (
+                              f_c["disallowed_structural_boundary"]
+                          ),
+                      }
+
+                  # Leave-one-target-out parameter stability.
+                  targets = sorted({f["target_key"] for f in feats.values()})
+                  assert len(targets) == 21
+                  loo_target_detail = {}
+                  structural_vectors = []
+
+                  for target_key in targets:
+                      train = [r for r in rows if r["target_key"] != target_key]
+                      f_c = fit_model(
+                          selected, train, f"loo-target-{target_key}",
+                          starts=DIAGNOSTIC_MULTISTART,
+                      )
+                      if not f_c["success"]:
+                          raise RuntimeError(f"LOO target fit failed: {target_key}")
+                      sv = f_c["best"]["parameters"][: structural_dim(selected)]
+                      structural_vectors.append(sv)
+                      loo_target_detail[target_key] = {
+                          "structural_parameters": sv,
+                          "disallowed_structural_boundary": f_c["disallowed_structural_boundary"],
+                      }
+
+                  arr = np.array(structural_vectors, dtype=float)
+                  loo_target = {
+                      "target_count": len(targets),
+                      "details": loo_target_detail,
+                      "full_fit_structural_parameters": theta_full[: structural_dim(selected)],
+                      "parameter_min": np.min(arr, axis=0).tolist(),
+                      "parameter_max": np.max(arr, axis=0).tolist(),
+                      "parameter_mean": np.mean(arr, axis=0).tolist(),
+                      "parameter_sd": np.std(arr, axis=0, ddof=1).tolist(),
+                      "any_disallowed_structural_boundary": any(
+                          v["disallowed_structural_boundary"]
+                          for v in loo_target_detail.values()
+                      ),
+                  }
+
+                  candidate_status = "v6_frozen_development_candidate"
+                  sd = structural_dim(selected)
+                  candidate = {
+                      "schema_version": 1,
+                      "candidate_id": f"package-adjustment-v6-{selected.lower()}-development-v1",
+                      "status": "v6_frozen_development_candidate",
+                      "frozen": True,
+                      "research_only": True,
+                      "production_candidate": False,
+                      "production_change_authorized": False,
+                      "automatic_production_promotion_allowed": False,
+                      "production_revision_unchanged": "v1.6-v5-size2-composition-overlay",
+                      "selected_model_class": selected,
+                      "selected_model_name": model_specs[selected]["name"],
+                      "model_definition": model_specs[selected],
+                      "frozen_parameters": {
+                          "structural_parameters": theta_full[:sd],
+                          "log_beta": float(theta_full[sd]),
+                          "beta": float(math.exp(theta_full[sd])),
+                          "delta_left": float(theta_full[sd + 1]),
+                          "v_ref": V_REF,
+                      },
+                      "development_evidence": {
+                          "spent_only": True,
+                          "frozen_dataset_git_blob_sha": "fd7097335bebae209bb380c121f44debf7d0cb82",
+                          "frozen_dataset_sha256": sha256(DATA_PATH),
+                          "effective_votes": 700.0,
+                          "raw_ballots": 730,
+                          "distinct_voter_clusters": 34,
+                          "distinct_challenges": 384,
+                          "cell_count": 24,
+                      },
+                      "development_cv": {
+                          "C1_combined_log_loss": baseline["combined"],
+                          "candidate_combined_log_loss": cv_summary[selected]["combined"],
+                          "improvement_C1_minus_candidate": (
+                              baseline["combined"] - cv_summary[selected]["combined"]
+                          ),
+                          "profile_log_loss": cv_summary[selected]["profiles"],
+                          "positive_fold_count": selection[selected]["positive_fold_count"],
+                      },
+                      "crossed_cluster_uncertainty": uncertainty[selected],
+                      "leave_one_profile_out_diagnostic": loo_profile,
+                      "leave_one_target_out_stability": loo_target,
+                      "fresh_prospective_confirmation_required": True,
+                      "parameters_may_not_change_after_freeze": True,
+                      "development_votes_are_spent": True,
+                      "next_action": (
+                          "Run the frozen Monte Carlo power analysis required by the "
+                          "V6 preregistration, then preregister a completely fresh "
+                          "prospective confirmation test before generating its catalog."
+                      ),
+                  }
+                  CANDIDATE_PATH.write_text(
+                      json.dumps(candidate, indent=2, sort_keys=True) + "\n",
+                      encoding="utf-8",
+                  )
+
+                  candidate_md = "\n".join([
+                      "# Frozen Package Adjustment V6 Development Candidate",
+                      "",
+                      "**Status:** `v6_frozen_development_candidate`",
+                      "",
+                      f"- Selected class: **{selected}**",
+                      f"- C1 development CV loss: **{baseline['combined']:.6f}**",
+                      f"- Candidate development CV loss: **{cv_summary[selected]['combined']:.6f}**",
+                      f"- CV improvement: **{(baseline['combined'] - cv_summary[selected]['combined']):.6f}**",
+                      f"- Positive folds: **{selection[selected]['positive_fold_count']} / 5**",
+                      "",
+                      "This candidate is frozen from **spent development evidence only**. "
+                      "It is not production eligible and production remains V1.6.",
+                      "",
+                      "Its structural and probability-layer parameters may not be changed. "
+                      "A frozen Monte Carlo power analysis and completely fresh prospective "
+                      "confirmation are required next.",
+                      "",
+                  ])
+                  CANDIDATE_MD_PATH.write_text(candidate_md, encoding="utf-8")
+                  candidate_written = True
+
+          result_status = (
+              "v6_candidate_frozen_research_only"
+              if candidate_written
+              else (
+                  candidate_status
+                  if candidate_status is not None
+                  else "no_v6_candidate_qualified_under_frozen_rules"
+              )
+          )
+
+          generated = datetime.now(timezone.utc).isoformat()
+
+          results = {
+              "schema_version": 1,
+              "evaluation_id": "package-adjustment-v6-development-evaluation-v1",
+              "status": result_status,
+              "generated_at_utc": generated,
+              "research_only": True,
+              "production_change_authorized": False,
+              "automatic_production_promotion_allowed": False,
+              "production_revision_unchanged": "v1.6-v5-size2-composition-overlay",
+              "source_fingerprints": {
+                  "preregistration_git_blob_sha": "81f20cb8afd78f624153c3337377f56ebf8115ae",
+                  "vote_release_git_blob_sha": "5e53ff9fdb795fff30ab6235a3a5ee969f313fd2",
+                  "catalog_git_blob_sha": "afc3f4e5a75f3599c11482361073c4bd9559e342",
+                  "frozen_dataset_git_blob_sha": "fd7097335bebae209bb380c121f44debf7d0cb82",
+                  "freeze_manifest_git_blob_sha": "38d6cc6fc8e58bdaa216f120a224eafd583dff8a",
+                  "frozen_dataset_sha256": sha256(DATA_PATH),
+              },
+              "property_tests": property_result,
+              "fold_assignment": {
+                  "method": cfg["development_cross_validation"]["method"],
+                  "salt": salt,
+                  "fold_count": FOLDS,
+                  "observed_ballot_cell_counts_by_fold": fold_observed_cell_counts,
+                  "challenge_to_fold": {k: challenge_fold[k] for k in sorted(challenge_fold)},
+              },
+              "C1_exact_production_semantics": {
+                  "size3_multiplier": SIZE3_MULT,
+                  "size3_composition_envelope": ENV,
+                  "inside_envelope": "target score = target_fv * size3_multiplier",
+                  "outside_envelope_fail_closed": "target score = raw target_fv; package score remains raw package sum",
+              },
+              "optimizer_implementation": {
+                  "method": "scipy_L-BFGS-B",
+                  "multistart_count_per_CV_or_full_fit": MULTISTART,
+                  "multistart_count_per_stability_fit": DIAGNOSTIC_MULTISTART,
+                  "deterministic_seed_by_sha256_token": True,
+                  "structural_boundary_tolerance": BOUNDARY_TOL,
+                  "calibration_parameters_not_used_for_structural_boundary_disqualification": True,
+              },
+              "cv": {
+                  "C0": cv_summary["C0"],
+                  "C1": cv_summary["C1"],
+                  "C2": cv_summary["C2"],
+                  "C4": cv_summary["C4"],
+                  "C5": cv_summary["C5"],
+                  "fold_metrics": fold_metrics,
+                  "fit_details": cv_fit,
+              },
+              "C5_paired_shape_residual_diagnostic": c5_resid,
+              "selection": {
+                  "candidate_results": selection,
+                  "eligible_candidates": eligible,
+                  "selected_model_class": selected,
+                  "selection_rule_applied": True,
+              },
+              "crossed_cluster_uncertainty": uncertainty,
+              "full_refit": full_fit,
+              "leave_one_composition_profile_out": loo_profile,
+              "leave_one_target_out_stability": loo_target,
+              "candidate_written": candidate_written,
+              "candidate_status": candidate_status,
+              "fresh_prospective_confirmation_required": candidate_written,
+              "development_votes_spent_after_selection": True,
+              "next_action": (
+                  "If a frozen V6 candidate exists, run the preregistered frozen Monte "
+                  "Carlo power analysis and preregister fresh prospective confirmation. "
+                  "If no candidate exists, stop V6 development with production unchanged."
+              ),
+          }
+          RESULTS_PATH.write_text(
+              json.dumps(results, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          lines = [
+              "# Package Adjustment V6 Development Evaluation",
+              "",
+              f"**Status:** `{result_status}`",
+              "",
+              "Production remains `v1.6-v5-size2-composition-overlay`.",
+              "",
+              "## Cross-validated development results",
+              "",
+              "| Model | CV loss | Improvement vs C1 | Positive folds | Eligible |",
+              "|---|---:|---:|---:|---|",
+              f"| C0 raw control | {cv_summary['C0']['combined']:.6f} | {(baseline['combined'] - cv_summary['C0']['combined']):.6f} | — | control |",
+              f"| C1 production | {baseline['combined']:.6f} | — | — | baseline |",
+          ]
+
+          for model in CHALLENGERS:
+              s = selection[model]
+              lines.append(
+                  f"| {model} | {s['cv_loss']:.6f} | {s['cv_improvement_vs_C1']:.6f} | "
+                  f"{s['positive_fold_count']} / 5 | {'YES' if s['eligible'] else 'NO'} |"
+              )
+
+          lines += [
+              "",
+              "## Profile regressions versus C1",
+              "",
+          ]
+          for model in CHALLENGERS:
+              rr = selection[model]["profile_regression_vs_C1"]
+              lines.append(
+                  f"- **{model}:** "
+                  + "; ".join(f"{p} {rr[p]:+.6f}" for p in PROFILES)
+              )
+
+          lines += [
+              "",
+              "## C5 near-HHI residual gate",
+              "",
+          ]
+          for pair, x in c5_resid["pairs"].items():
+              lines.append(
+                  f"- **{pair}:** |Δ residual| = {x['absolute_residual_difference']:.6f} "
+                  f"({'PASS' if x['pass_le_0_10'] else 'FAIL'})"
+              )
+
+          lines += [
+              "",
+              "## Frozen selection",
+              "",
+          ]
+
+          if candidate_written:
+              lines += [
+                  f"Selected **{selected}** under the preregistered rules and refit it on all "
+                  "spent exact-700 development evidence.",
+                  "",
+                  "Its parameters are frozen in `development_candidate_v1.json`. "
+                  "No production change is authorized.",
+                  "",
+                  "Next: frozen Monte Carlo power analysis, then preregistered fresh prospective confirmation.",
+              ]
+          elif selected is None:
+              lines += [
+                  "No C2/C4/C5 candidate qualified under the frozen V6 development rules.",
+                  "",
+                  "V6 development stops here. Production remains V1.6 and no rescue patch is allowed.",
+              ]
+          else:
+              lines += [
+                  f"{selected} qualified in CV, but its full refit was unresolved: `{candidate_status}`.",
+                  "",
+                  "No frozen candidate was created and production remains V1.6.",
+              ]
+
+          SUMMARY_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+          outputs = {
+              "results": {
+                  "path": str(RESULTS_PATH),
+                  "sha256": sha256(RESULTS_PATH),
+              },
+              "summary": {
+                  "path": str(SUMMARY_PATH),
+                  "sha256": sha256(SUMMARY_PATH),
+              },
+          }
+          if candidate_written:
+              outputs["candidate"] = {
+                  "path": str(CANDIDATE_PATH),
+                  "sha256": sha256(CANDIDATE_PATH),
+              }
+              outputs["candidate_summary"] = {
+                  "path": str(CANDIDATE_MD_PATH),
+                  "sha256": sha256(CANDIDATE_MD_PATH),
+              }
+
+          manifest = {
+              "schema_version": 1,
+              "status": "package_adjustment_v6_development_evaluation_manifest",
+              "generated_at_utc": generated,
+              "research_only": True,
+              "production_change_authorized": False,
+              "production_revision_unchanged": "v1.6-v5-size2-composition-overlay",
+              "model_evaluation_performed": True,
+              "candidate_selected": selected is not None,
+              "candidate_frozen": candidate_written,
+              "selected_model_class": selected,
+              "result_status": result_status,
+              "property_test_vectors": property_result["randomized_vectors_checked"],
+              "source_artifacts": {
+                  "preregistration": {
+                      "path": str(CFG_PATH),
+                      "git_blob_sha": "81f20cb8afd78f624153c3337377f56ebf8115ae",
+                      "sha256": sha256(CFG_PATH),
+                  },
+                  "vote_release": {
+                      "path": str(RELEASE_PATH),
+                      "git_blob_sha": "5e53ff9fdb795fff30ab6235a3a5ee969f313fd2",
+                      "sha256": sha256(RELEASE_PATH),
+                  },
+                  "catalog": {
+                      "path": str(CATALOG_PATH),
+                      "git_blob_sha": "afc3f4e5a75f3599c11482361073c4bd9559e342",
+                      "sha256": sha256(CATALOG_PATH),
+                  },
+                  "frozen_exact_700_dataset": {
+                      "path": str(DATA_PATH),
+                      "git_blob_sha": "fd7097335bebae209bb380c121f44debf7d0cb82",
+                      "sha256": sha256(DATA_PATH),
+                  },
+                  "freeze_manifest": {
+                      "path": str(FREEZE_MANIFEST_PATH),
+                      "git_blob_sha": "38d6cc6fc8e58bdaa216f120a224eafd583dff8a",
+                      "sha256": sha256(FREEZE_MANIFEST_PATH),
+                  },
+              },
+              "outputs": outputs,
+              "next_action": results["next_action"],
+          }
+
+          MANIFEST_PATH.write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          print(SUMMARY_PATH.read_text())
+          PY
+
+      - name: Verify frozen selection/result integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          d = Path("research/package-adjustment-v6")
+          results_path = d / "development_evaluation_v1.json"
+          summary_path = d / "development_evaluation_v1.md"
+          manifest_path = d / "development_evaluation_manifest_v1.json"
+          candidate_path = d / "development_candidate_v1.json"
+          candidate_md_path = d / "development_candidate_v1.md"
+
+          r = json.loads(results_path.read_text())
+          m = json.loads(manifest_path.read_text())
+
+          assert r["research_only"] is True
+          assert r["production_change_authorized"] is False
+          assert r["production_revision_unchanged"] == "v1.6-v5-size2-composition-overlay"
+          assert r["property_tests"]["status"] == "PASS"
+          assert r["property_tests"]["randomized_vectors_checked"] >= 1_000_000
+          assert r["fold_assignment"]["fold_count"] == 5
+          assert all(
+              x["validation"] == 24 and x["training"] == 24
+              for x in r["fold_assignment"]["observed_ballot_cell_counts_by_fold"].values()
+          )
+
+          assert m["status"] == "package_adjustment_v6_development_evaluation_manifest"
+          assert m["model_evaluation_performed"] is True
+          assert m["production_change_authorized"] is False
+          assert m["property_test_vectors"] >= 1_000_000
+          assert m["outputs"]["results"]["sha256"] == hashlib.sha256(results_path.read_bytes()).hexdigest()
+          assert m["outputs"]["summary"]["sha256"] == hashlib.sha256(summary_path.read_bytes()).hexdigest()
+
+          if r["candidate_written"]:
+              assert candidate_path.exists()
+              assert candidate_md_path.exists()
+              c = json.loads(candidate_path.read_text())
+              assert c["status"] == "v6_frozen_development_candidate"
+              assert c["frozen"] is True
+              assert c["production_candidate"] is False
+              assert c["production_change_authorized"] is False
+              assert c["fresh_prospective_confirmation_required"] is True
+              assert c["parameters_may_not_change_after_freeze"] is True
+              assert m["candidate_frozen"] is True
+              assert m["outputs"]["candidate"]["sha256"] == hashlib.sha256(candidate_path.read_bytes()).hexdigest()
+              assert m["outputs"]["candidate_summary"]["sha256"] == hashlib.sha256(candidate_md_path.read_bytes()).hexdigest()
+          else:
+              assert not candidate_path.exists()
+              assert not candidate_md_path.exists()
+              assert m["candidate_frozen"] is False
+
+          print("PASS: V6 development evaluation obeys frozen selection and production-isolation rules.")
+          PY
+
+      - name: Run repository regression checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 \
+            python3 scripts/validation/repo_regression_checks.py
+
+      - name: Verify production still remains V1.6 after evaluation
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 \
+            python3 scripts/validation/check_package_adjustment_live.py
+
+      - name: Prove only intended V6 research outputs changed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+
+          d = Path("research/package-adjustment-v6")
+          results = json.loads((d / "development_evaluation_v1.json").read_text())
+
+          expected = {
+              "research/package-adjustment-v6/development_evaluation_v1.json",
+              "research/package-adjustment-v6/development_evaluation_v1.md",
+              "research/package-adjustment-v6/development_evaluation_manifest_v1.json",
+          }
+          if results["candidate_written"]:
+              expected |= {
+                  "research/package-adjustment-v6/development_candidate_v1.json",
+                  "research/package-adjustment-v6/development_candidate_v1.md",
+              }
+
+          lines = subprocess.check_output(
+              ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+              text=True,
+          ).splitlines()
+          actual = {line[3:] for line in lines if line.strip()}
+
+          if actual != expected:
+              raise SystemExit(
+                  "unexpected repository change surface: "
+                  f"expected={sorted(expected)} actual={sorted(actual)}"
+              )
+          print("PASS: only intended V6 development evaluation outputs changed.")
+          PY
+
+      - name: Upload V6 development evaluation proof
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-adjustment-v6-development-evaluation-proof
+          path: |
+            research/package-adjustment-v6/development_evaluation_v1.json
+            research/package-adjustment-v6/development_evaluation_v1.md
+            research/package-adjustment-v6/development_evaluation_manifest_v1.json
+            research/package-adjustment-v6/development_candidate_v1.json
+            research/package-adjustment-v6/development_candidate_v1.md
+            /tmp/v6_property_tests.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Commit V6 development evaluation to main
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          D="research/package-adjustment-v6"
+
+          python3 - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+
+          d = Path("research/package-adjustment-v6")
+          results = json.loads((d / "development_evaluation_v1.json").read_text())
+
+          paths = [
+              d / "development_evaluation_v1.json",
+              d / "development_evaluation_v1.md",
+              d / "development_evaluation_manifest_v1.json",
+          ]
+          if results["candidate_written"]:
+              paths += [
+                  d / "development_candidate_v1.json",
+                  d / "development_candidate_v1.md",
+              ]
+
+          subprocess.run(["git", "add", *map(str, paths)], check=True)
+          PY
+
+          git config user.name "trade-desk-research-bot"
+          git config user.email "actions@users.noreply.github.com"
+
+          git commit -m "Evaluate Package Adjustment V6 development evidence"
+          git pull --rebase origin main
+
+          test "$(git hash-object "$D/development_preregistration_v1.json")" = \
+            "81f20cb8afd78f624153c3337377f56ebf8115ae"
+          test "$(git hash-object "$D/development_vote_release_v1.json")" = \
+            "5e53ff9fdb795fff30ab6235a3a5ee969f313fd2"
+          test "$(git hash-object "$D/package_vote_challenges_v6.json")" = \
+            "afc3f4e5a75f3599c11482361073c4bd9559e342"
+          test "$(git hash-object "$D/development_exact_700_frozen_v1.json")" = \
+            "fd7097335bebae209bb380c121f44debf7d0cb82"
+          test "$(git hash-object "$D/development_exact_700_freeze_manifest_v1.json")" = \
+            "38d6cc6fc8e58bdaa216f120a224eafd583dff8a"
+
+          git push origin main
+          echo "PASS: V6 development evaluation committed; production remains V1.6."
