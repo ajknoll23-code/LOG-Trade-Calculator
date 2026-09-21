@@ -331,6 +331,7 @@ def check_aliases_and_ktc_positions():
         "__pkgnv2__|",
         "__pkgnv2p1__|",
         "__pkgv6__|",
+        "__pkgv6p1__|",
         "__pkgv3c1__|",
         "__pkgv4c1__|",
     )
@@ -572,7 +573,7 @@ def check_package_sampling_contract():
     end = text.index("\nfunction render(){", start)
     block = text[start:end]
 
-    assert "PACKAGE_VOTE_V6_EXACT_CELL_SAMPLING_V1" in block
+    assert "PACKAGE_VOTE_V6P1_EXACT_CELL_SAMPLING_V1" in block
     assert "function packageVoteOwnPlayers()" not in block
     assert "function packageVoteEligibleChallenges()" not in block
     assert "own.has(" not in block
@@ -590,14 +591,16 @@ def check_package_sampling_contract():
     recent_idx = block.index("const recent = new Set(packageVoteRecent());")
     assert cell_idx < recent_idx, "recent filtering must occur only after cell selection"
 
-    assert "Package Adjustment V6 Development: frozen 1-vs-3 composition catalog." in text
-    assert "const PACKAGE_VOTE_DAILY_LIMIT = 20;" in text
-    assert "__pkgv6__|" in text
-    assert "__pkgv6_meta__|" in text
-    assert "__pkgv6_schema__|6" in text
+    assert "Package Adjustment V6P1 Prospective Confirmation:" in text
+    assert "const PACKAGE_VOTE_DAILY_LIMIT = 40;" in text
+    assert "const PACKAGE_VOTE_CATALOG_SHA256 = '2739a0f0728b422cce632fec2381c5a4d35a572dbfabc46c97c0591bb2f5a3fc';" in text
+    assert "3f1e3d265265453e5356b93a34a3737e367c7990/research/package-adjustment-v6/package_vote_challenges_v6_prospective_v1.json" in text
+    assert "__pkgv6p1__|" in text
+    assert "__pkgv6p1_meta__|" in text
+    assert "__pkgv6p1_schema__|1" in text
 
     print(
-        "PASS V6 exact 24-cell sampling contract: no voter-roster filtering; "
+        "PASS V6P1 exact 24-cell sampling contract: no voter-roster filtering; "
         "recent-memory post-cell only; display side randomized"
     )
 
