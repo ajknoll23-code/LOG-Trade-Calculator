@@ -1,0 +1,942 @@
+name: Package Adjustment V6 Prospective Power Analysis
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  power:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13.15'
+
+      - name: Install frozen power-analysis dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install \
+            "numpy==2.3.3" \
+            "scipy==1.16.2"
+
+      - name: Guard frozen V6 candidate and spent development evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          D="research/package-adjustment-v6"
+
+          test -z "$(git status --porcelain=v1)"
+
+          test "$(git hash-object "$D/development_preregistration_v1.json")" = \
+            "81f20cb8afd78f624153c3337377f56ebf8115ae"
+          test "$(git hash-object "$D/package_vote_challenges_v6.json")" = \
+            "afc3f4e5a75f3599c11482361073c4bd9559e342"
+          test "$(git hash-object "$D/development_exact_700_frozen_v1.json")" = \
+            "fd7097335bebae209bb380c121f44debf7d0cb82"
+          test "$(git hash-object "$D/development_evaluation_v1.json")" = \
+            "adfc1f289e7d12c74749eadc9d5b63f8651165d3"
+          test "$(git hash-object "$D/development_evaluation_manifest_v1.json")" = \
+            "2771d2f6c7dc230aa68d8df6e543301c24f127e3"
+          test "$(git hash-object "$D/development_candidate_v1.json")" = \
+            "446a176757919be3deef0659ac01e05884be4007"
+
+          for p in \
+            "$D/prospective_power_analysis_v1.json" \
+            "$D/prospective_power_analysis_v1.md" \
+            "$D/prospective_power_analysis_manifest_v1.json"
+          do
+            test ! -e "$p"
+          done
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          d = Path("research/package-adjustment-v6")
+          cfg = json.loads((d / "development_preregistration_v1.json").read_text())
+          ev = json.loads((d / "development_evaluation_v1.json").read_text())
+          man = json.loads((d / "development_evaluation_manifest_v1.json").read_text())
+          cand = json.loads((d / "development_candidate_v1.json").read_text())
+
+          assert cfg["status"] == "frozen_v6_development_preregistration"
+          fresh = cfg["fresh_confirmation_requirement"]
+          assert fresh["candidate_class_and_all_parameters_must_be_frozen_first"] is True
+          assert fresh["development_votes_are_spent_after_model_selection"] is True
+          assert fresh["new_votes_required"] is True
+          assert fresh["no_refitting_on_prospective_votes"] is True
+          assert fresh["one_time_evaluation"] is True
+          assert fresh["primary_minimum_practical_improvement_vs_C1_log_loss"] == 0.005
+          assert fresh["sample_size_not_guessed_now"] is True
+          assert fresh["sample_size_rule"] == (
+              "After development candidate freeze, run a frozen Monte Carlo power "
+              "analysis using observed development voter/challenge variance and the "
+              "preregistered minimum worthwhile effect to choose the first prospective checkpoint."
+          )
+
+          assert ev["status"] == "v6_candidate_frozen_research_only"
+          assert ev["candidate_written"] is True
+          assert ev["selection"]["selected_model_class"] == "C2"
+          assert man["candidate_frozen"] is True
+          assert man["selected_model_class"] == "C2"
+
+          assert cand["status"] == "v6_frozen_development_candidate"
+          assert cand["frozen"] is True
+          assert cand["selected_model_class"] == "C2"
+          assert cand["production_change_authorized"] is False
+          assert cand["fresh_prospective_confirmation_required"] is True
+          assert cand["parameters_may_not_change_after_freeze"] is True
+          assert abs(cand["frozen_parameters"]["structural_parameters"][0] - 2.9897594788655337) < 1e-15
+
+          print("PASS: frozen V6 C2 candidate is eligible for power planning only.")
+          PY
+
+      - name: Verify production remains V1.6 before power analysis
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 \
+            python3 scripts/validation/check_package_adjustment_live.py
+
+      - name: Run frozen Monte Carlo prospective power analysis
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import math
+          from collections import defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import numpy as np
+          from scipy.optimize import minimize
+
+          D = Path("research/package-adjustment-v6")
+          CFG_PATH = D / "development_preregistration_v1.json"
+          DATA_PATH = D / "development_exact_700_frozen_v1.json"
+          CATALOG_PATH = D / "package_vote_challenges_v6.json"
+          EVAL_PATH = D / "development_evaluation_v1.json"
+          EVAL_MANIFEST_PATH = D / "development_evaluation_manifest_v1.json"
+          CANDIDATE_PATH = D / "development_candidate_v1.json"
+
+          OUT_JSON = D / "prospective_power_analysis_v1.json"
+          OUT_MD = D / "prospective_power_analysis_v1.md"
+          OUT_MANIFEST = D / "prospective_power_analysis_manifest_v1.json"
+
+          def sha256(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          cfg = json.loads(CFG_PATH.read_text())
+          data = json.loads(DATA_PATH.read_text())
+          catalog_doc = json.loads(CATALOG_PATH.read_text())
+          evaluation = json.loads(EVAL_PATH.read_text())
+          candidate = json.loads(CANDIDATE_PATH.read_text())
+
+          ballots = list(data["ballots"])
+          challenges = {c["id"]: c for c in catalog_doc["challenges"]}
+
+          assert len(ballots) == 730
+          assert len(challenges) == 504
+          assert abs(sum(float(b["frozen_ballot_weight"]) for b in ballots) - 700.0) < 1e-8
+          assert candidate["selected_model_class"] == "C2"
+
+          V_REF = 5401.0
+          Q = float(candidate["frozen_parameters"]["structural_parameters"][0])
+          C2_LOG_BETA = float(candidate["frozen_parameters"]["log_beta"])
+          C2_DELTA = float(candidate["frozen_parameters"]["delta_left"])
+
+          LOG_BETA_BOUNDS = tuple(
+              map(float, cfg["shared_probability_layer"]["log_beta_bounds"])
+          )
+          DELTA_BOUNDS = tuple(
+              map(float, cfg["shared_probability_layer"]["delta_left_bounds"])
+          )
+
+          SIZE3_MULT = 2.0512371846911357
+          ENV = {
+              "largestMin": 0.41991319353657897,
+              "largestMax": 0.4696171986399035,
+              "middleMin": 0.30827026434134036,
+              "middleMax": 0.36725409193118236,
+              "smallestMin": 0.2120186203977994,
+              "smallestMax": 0.2247276896617619,
+          }
+
+          PROFILES = [
+              "45/33/22",
+              "50/30/20",
+              "50/25/25",
+              "55/30/15",
+              "60/25/15",
+              "60/20/20",
+          ]
+          ANCHOR_PROFILE = "45/33/22"
+
+          # Power-analysis design frozen now, before any prospective catalog or votes.
+          TARGET_JOINT_POWER = 0.80
+          POWER_TRIALS = 50_000
+          BOOTSTRAP_DRAWS = 5_000
+          BOOTSTRAP_MAX_ATTEMPTS = 50_000
+          POWER_SEED = 20260921
+          BOOTSTRAP_SEED = 20260922
+          ONE_SIDED_Z95 = 1.6448536269514722
+          PRIMARY_MIN_IMPROVEMENT = float(
+              cfg["fresh_confirmation_requirement"][
+                  "primary_minimum_practical_improvement_vs_C1_log_loss"
+              ]
+          )
+          assert PRIMARY_MIN_IMPROVEMENT == 0.005
+
+          # Fresh safety-family margins inherit the already-frozen development
+          # safety tolerances: 0.003 for the V4 anchor profile and 0.005 for each
+          # composition-extension profile. These margins are not fit to outcomes.
+          FAMILY_MARGINS = {
+              p: (
+                  float(cfg["development_selection"][
+                      "maximum_anchor_profile_cv_regression_vs_C1"
+                  ])
+                  if p == ANCHOR_PROFILE
+                  else float(cfg["development_selection"][
+                      "maximum_any_profile_cv_regression_vs_C1"
+                  ])
+              )
+              for p in PROFILES
+          }
+          assert FAMILY_MARGINS[ANCHOR_PROFILE] == 0.003
+          assert all(
+              FAMILY_MARGINS[p] == 0.005
+              for p in PROFILES
+              if p != ANCHOR_PROFILE
+          )
+
+          # Candidate grid: first exact checkpoint is the smallest multiple of 100
+          # from 700 through 20,000 reaching target joint power. If still unresolved,
+          # continue in 500-vote increments through 100,000. No checkpoint is guessed.
+          CHECKPOINT_GRID = (
+              list(range(700, 20_001, 100))
+              + list(range(20_500, 100_001, 500))
+          )
+          assert CHECKPOINT_GRID == sorted(set(CHECKPOINT_GRID))
+
+          def c1_supported(v):
+              ordered = np.sort(v)[::-1]
+              s = ordered / np.sum(ordered)
+              return (
+                  s[0] >= ENV["largestMin"] - 1e-12
+                  and s[0] <= ENV["largestMax"] + 1e-12
+                  and s[1] >= ENV["middleMin"] - 1e-12
+                  and s[1] <= ENV["middleMax"] + 1e-12
+                  and s[2] >= ENV["smallestMin"] - 1e-12
+                  and s[2] <= ENV["smallestMax"] + 1e-12
+              )
+
+          feats = {}
+          for cid, c in challenges.items():
+              v = np.array([float(x["fv"]) for x in c["package"]], dtype=float)
+              S = float(np.sum(v))
+              T = float(c["target_fv"])
+              profile = str(c["component_profile"]["label"])
+              feats[cid] = {
+                  "v": v,
+                  "S": S,
+                  "T": T,
+                  "profile": profile,
+                  "cell": str(c["research_cell"]),
+                  "c1_supported": c1_supported(v),
+              }
+
+          rows = []
+          for b in ballots:
+              cid = b["challenge_id"]
+              f = feats[cid]
+              rows.append({
+                  "ordinal": int(b["ordinal"]),
+                  "challenge_id": cid,
+                  "cell": f["cell"],
+                  "profile": f["profile"],
+                  "voter": str(b["voter_cluster"]),
+                  "weight": float(b["frozen_ballot_weight"]),
+                  "left": 1.0 if bool(b["package_displayed_left"]) else 0.0,
+                  "y": 1.0 if bool(b["package_preferred"]) else 0.0,
+              })
+
+          assert len({r["cell"] for r in rows}) == 24
+          assert set(r["profile"] for r in rows) == set(PROFILES)
+
+          def score_pair_c1(f):
+              return (
+                  f["S"],
+                  f["T"] * SIZE3_MULT if f["c1_supported"] else f["T"],
+              )
+
+          def score_pair_c2(f):
+              sp = float(
+                  np.power(np.sum(np.power(f["v"], Q)), 1.0 / Q)
+              )
+              return sp, f["T"]
+
+          def eta_loss(row, score_pair, log_beta, delta_left):
+              sp, st = score_pair(feats[row["challenge_id"]])
+              eta = (
+                  math.exp(float(log_beta)) * ((sp - st) / V_REF)
+                  + float(delta_left) * row["left"]
+              )
+              loss = float(np.logaddexp(0.0, eta) - row["y"] * eta)
+              return eta, loss
+
+          def macro_loss_c1(theta):
+              by_cell = defaultdict(list)
+              for r in rows:
+                  by_cell[r["cell"]].append(r)
+              assert len(by_cell) == 24
+              cell_losses = []
+              for cell in sorted(by_cell):
+                  rr = by_cell[cell]
+                  den = sum(x["weight"] for x in rr)
+                  num = sum(
+                      x["weight"] * eta_loss(
+                          x, score_pair_c1, theta[0], theta[1]
+                      )[1]
+                      for x in rr
+                  )
+                  cell_losses.append(num / den)
+              return float(sum(cell_losses) / 24.0)
+
+          # Freeze a full-development C1 probability layer for later prospective
+          # comparison. C1's scoring formula itself remains exact V1.6.
+          c1_starts = [
+              np.array([0.0, 0.0]),
+              np.array([math.log(2.0), 0.0]),
+              np.array([math.log(5.0), 0.0]),
+          ]
+          rng_starts = np.random.default_rng(20260923)
+          while len(c1_starts) < 16:
+              c1_starts.append(np.array([
+                  rng_starts.uniform(*LOG_BETA_BOUNDS),
+                  rng_starts.uniform(*DELTA_BOUNDS),
+              ]))
+
+          best = None
+          attempts = []
+          for i, x0 in enumerate(c1_starts):
+              res = minimize(
+                  macro_loss_c1,
+                  x0,
+                  method="L-BFGS-B",
+                  bounds=[LOG_BETA_BOUNDS, DELTA_BOUNDS],
+                  options={
+                      "maxiter": 4000,
+                      "ftol": 1e-13,
+                      "gtol": 1e-8,
+                      "maxls": 60,
+                  },
+              )
+              attempts.append({
+                  "start_index": i,
+                  "success": bool(res.success),
+                  "objective": (
+                      float(res.fun)
+                      if math.isfinite(float(res.fun))
+                      else None
+                  ),
+                  "nit": int(res.nit),
+              })
+              if res.success and math.isfinite(float(res.fun)):
+                  key = (float(res.fun), tuple(float(x) for x in res.x))
+                  if best is None or key < best["key"]:
+                      best = {"key": key, "res": res}
+
+          if best is None:
+              raise RuntimeError("C1 full-development calibration fit failed")
+
+          c1_theta = [float(x) for x in best["res"].x]
+          c1_log_beta, c1_delta = c1_theta
+          c1_beta = math.exp(c1_log_beta)
+
+          # Per-ballot paired D = LL_C2 - LL_C1 using the fully frozen C2
+          # candidate and the just-frozen development-only C1 calibration.
+          for r in rows:
+              _, l1 = eta_loss(r, score_pair_c1, c1_log_beta, c1_delta)
+              _, l2 = eta_loss(r, score_pair_c2, C2_LOG_BETA, C2_DELTA)
+              r["loss_C1"] = l1
+              r["loss_C2"] = l2
+              r["D"] = l2 - l1
+
+          cells = sorted({r["cell"] for r in rows})
+          cell_index = {c: i for i, c in enumerate(cells)}
+          profile_cells = {
+              p: [cell_index[c] for c in cells if c.startswith(p + "|")]
+              for p in PROFILES
+          }
+          assert all(len(v) == 4 for v in profile_cells.values())
+
+          def vector_stat(weight_multiplier=None):
+              num = np.zeros(24, dtype=float)
+              den = np.zeros(24, dtype=float)
+
+              for i, r in enumerate(rows):
+                  mult = 1.0 if weight_multiplier is None else weight_multiplier[i]
+                  w = r["weight"] * mult
+                  if w <= 0:
+                      continue
+                  j = cell_index[r["cell"]]
+                  num[j] += w * r["D"]
+                  den[j] += w
+
+              if np.any(den <= 0):
+                  return None
+
+              cell_d = num / den
+              overall = float(np.mean(cell_d))
+              profile_d = [
+                  float(np.mean(cell_d[profile_cells[p]]))
+                  for p in PROFILES
+              ]
+              return np.array([overall, *profile_d], dtype=float)
+
+          point_vector = vector_stat()
+          assert point_vector is not None
+
+          voters = sorted({r["voter"] for r in rows})
+          chals = sorted({r["challenge_id"] for r in rows})
+          vi = {v: i for i, v in enumerate(voters)}
+          ci = {c: i for i, c in enumerate(chals)}
+          row_vi = np.array([vi[r["voter"]] for r in rows], dtype=int)
+          row_ci = np.array([ci[r["challenge_id"]] for r in rows], dtype=int)
+
+          # Crossed voter/challenge cluster bootstrap required by the frozen V6
+          # uncertainty contract. Multiplicities multiply original frozen weights.
+          rng_boot = np.random.default_rng(BOOTSTRAP_SEED)
+          boot_vectors = []
+          attempts_boot = 0
+
+          while (
+              len(boot_vectors) < BOOTSTRAP_DRAWS
+              and attempts_boot < BOOTSTRAP_MAX_ATTEMPTS
+          ):
+              attempts_boot += 1
+              vm = rng_boot.multinomial(
+                  len(voters),
+                  [1.0 / len(voters)] * len(voters),
+              )
+              cm = rng_boot.multinomial(
+                  len(chals),
+                  [1.0 / len(chals)] * len(chals),
+              )
+              mult = vm[row_vi] * cm[row_ci]
+              stat = vector_stat(mult)
+              if stat is not None:
+                  boot_vectors.append(stat)
+
+          if len(boot_vectors) != BOOTSTRAP_DRAWS:
+              raise RuntimeError(
+                  f"only {len(boot_vectors)} valid crossed bootstrap draws"
+              )
+
+          boot = np.vstack(boot_vectors)
+          boot_mean = np.mean(boot, axis=0)
+          boot_cov = np.cov(boot, rowvar=False, ddof=1)
+          boot_sd = np.sqrt(np.diag(boot_cov))
+
+          # The power Monte Carlo uses the observed development effect vector as
+          # the planning alternative and the observed crossed-cluster covariance
+          # as the variance estimate. The prospective acceptance gates themselves
+          # include the already-preregistered minimum worthwhile primary effect.
+          #
+          # Primary future gates:
+          #   D_overall <= -0.005 (at least minimum worthwhile improvement)
+          #   one-sided 95% UCB(D_overall) < 0 (evidence of improvement)
+          #
+          # Safety future gates:
+          #   one-sided 95% UCB(D_profile) < frozen practical margin
+          #
+          # Actual prospective UCBs will be obtained from crossed resampling;
+          # this planning simulation uses the normal approximation induced by the
+          # empirical crossed-cluster covariance solely to size the checkpoint.
+          planning_mean = point_vector.copy()
+
+          rng_power = np.random.default_rng(POWER_SEED)
+          base_noise = rng_power.multivariate_normal(
+              mean=np.zeros(7),
+              cov=boot_cov,
+              size=POWER_TRIALS,
+              check_valid="raise",
+          )
+
+          power_table = []
+          selected_checkpoint = None
+
+          for n in CHECKPOINT_GRID:
+              scale = math.sqrt(700.0 / float(n))
+              draws = planning_mean[None, :] + scale * base_noise
+              se = boot_sd * scale
+
+              primary_point = draws[:, 0] <= -PRIMARY_MIN_IMPROVEMENT
+              primary_ucb = (
+                  draws[:, 0] + ONE_SIDED_Z95 * se[0]
+              ) < 0.0
+              primary_pass = primary_point & primary_ucb
+
+              family_passes = []
+              family_power = {}
+              for j, profile in enumerate(PROFILES, start=1):
+                  passed = (
+                      draws[:, j] + ONE_SIDED_Z95 * se[j]
+                  ) < FAMILY_MARGINS[profile]
+                  family_passes.append(passed)
+                  family_power[profile] = float(np.mean(passed))
+
+              all_family = np.logical_and.reduce(family_passes)
+              joint = primary_pass & all_family
+
+              entry = {
+                  "effective_vote_checkpoint": n,
+                  "primary_gate_power": float(np.mean(primary_pass)),
+                  "all_safety_families_power": float(np.mean(all_family)),
+                  "joint_pass_power": float(np.mean(joint)),
+                  "family_power": family_power,
+              }
+              power_table.append(entry)
+
+              if (
+                  selected_checkpoint is None
+                  and entry["joint_pass_power"] >= TARGET_JOINT_POWER
+              ):
+                  selected_checkpoint = n
+                  break
+
+          if selected_checkpoint is None:
+              status = "POWER_CHECKPOINT_UNRESOLVED_THROUGH_100000"
+              next_action = (
+                  "Do not generate a prospective catalog. The frozen power plan "
+                  "did not reach 80% joint power through 100,000 effective votes. "
+                  "V6 prospective confirmation is operationally unresolved under "
+                  "the current frozen design."
+              )
+          else:
+              status = "PROSPECTIVE_CHECKPOINT_SELECTED"
+              next_action = (
+                  "Preregister the fresh V6 prospective confirmation using the "
+                  f"frozen first checkpoint of {selected_checkpoint} effective votes "
+                  "before generating any prospective challenge catalog."
+              )
+
+          labels = ["overall", *PROFILES]
+          point = {labels[i]: float(point_vector[i]) for i in range(7)}
+          means = {labels[i]: float(boot_mean[i]) for i in range(7)}
+          sds = {labels[i]: float(boot_sd[i]) for i in range(7)}
+
+          generated = datetime.now(timezone.utc).isoformat()
+
+          result = {
+              "schema_version": 1,
+              "status": status,
+              "generated_at_utc": generated,
+              "research_only": True,
+              "production_change_authorized": False,
+              "production_revision_unchanged": (
+                  "v1.6-v5-size2-composition-overlay"
+              ),
+              "prospective_catalog_generated": False,
+              "prospective_votes_exist_or_read": False,
+              "candidate": {
+                  "candidate_id": candidate["candidate_id"],
+                  "selected_model_class": "C2",
+                  "q": Q,
+                  "log_beta": C2_LOG_BETA,
+                  "beta": math.exp(C2_LOG_BETA),
+                  "delta_left": C2_DELTA,
+                  "git_blob_sha": (
+                      "446a176757919be3deef0659ac01e05884be4007"
+                  ),
+                  "sha256": sha256(CANDIDATE_PATH),
+              },
+              "frozen_C1_prospective_baseline_calibration": {
+                  "scoring_semantics": (
+                      "exact V1.6 size3 scoring; V4 multiplier only inside frozen "
+                      "composition envelope, raw fail-closed outside"
+                  ),
+                  "log_beta": c1_log_beta,
+                  "beta": c1_beta,
+                  "delta_left": c1_delta,
+                  "fit_objective": (
+                      "equal_cell_macro_mean_weighted_negative_log_likelihood "
+                      "on spent exact-700 development evidence"
+                  ),
+                  "development_only": True,
+                  "prospective_refit_allowed": False,
+                  "fit_attempts": attempts,
+              },
+              "power_design": {
+                  "target_joint_power": TARGET_JOINT_POWER,
+                  "power_trials": POWER_TRIALS,
+                  "power_seed": POWER_SEED,
+                  "crossed_bootstrap_draws": BOOTSTRAP_DRAWS,
+                  "crossed_bootstrap_seed": BOOTSTRAP_SEED,
+                  "crossed_bootstrap_valid_attempts": attempts_boot,
+                  "development_effective_votes": 700,
+                  "minimum_worthwhile_primary_improvement": (
+                      PRIMARY_MIN_IMPROVEMENT
+                  ),
+                  "one_sided_confidence_level": 0.95,
+                  "one_sided_normal_z_for_planning": ONE_SIDED_Z95,
+                  "primary_future_gate_for_power": (
+                      "D_overall <= -0.005 AND one-sided 95% UCB(D_overall) < 0"
+                  ),
+                  "safety_future_gate_for_power": (
+                      "for each composition profile, one-sided 95% UCB(D_profile) "
+                      "< frozen practical margin"
+                  ),
+                  "family_margins": FAMILY_MARGINS,
+                  "planning_effect_source": (
+                      "observed full-development fixed-prediction paired "
+                      "candidate-minus-C1 log-loss vector"
+                  ),
+                  "variance_source": (
+                      "crossed voter/challenge cluster bootstrap covariance on "
+                      "spent exact-700 development evidence"
+                  ),
+                  "sample_size_variance_scaling": "covariance * 700 / N",
+                  "checkpoint_search": {
+                      "700_through_20000": "increments of 100",
+                      "20500_through_100000": "increments of 500",
+                  },
+              },
+              "development_paired_loss_difference": {
+                  "definition": "D = LL_C2 - LL_C1; lower is better",
+                  "point_estimates": point,
+                  "crossed_bootstrap_means": means,
+                  "crossed_bootstrap_sd": sds,
+                  "crossed_bootstrap_covariance": boot_cov.tolist(),
+              },
+              "power_table_until_selection_or_cap": power_table,
+              "selected_first_prospective_effective_vote_checkpoint": (
+                  selected_checkpoint
+              ),
+              "next_action": next_action,
+          }
+
+          OUT_JSON.write_text(
+              json.dumps(result, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          lines = [
+              "# Package Adjustment V6 Prospective Power Analysis",
+              "",
+              f"**Status:** `{status}`",
+              "",
+              f"- Frozen candidate: **C2**, q = **{Q:.6f}**",
+              f"- Development overall D (C2 - C1): **{point['overall']:.6f}**",
+              f"- Minimum worthwhile primary improvement: **{PRIMARY_MIN_IMPROVEMENT:.3f}**",
+              f"- Target joint power: **{TARGET_JOINT_POWER:.0%}**",
+              f"- Monte Carlo trials per checkpoint: **{POWER_TRIALS:,}**",
+              f"- Crossed bootstrap draws: **{BOOTSTRAP_DRAWS:,}**",
+              "",
+              "## Frozen C1 prospective baseline calibration",
+              "",
+              f"- beta: **{c1_beta:.6f}**",
+              f"- delta_left: **{c1_delta:.6f}**",
+              "",
+              "## Development paired loss difference by safety family",
+              "",
+              "| Family | D = C2 - C1 | Bootstrap SD | Future NI margin |",
+              "|---|---:|---:|---:|",
+          ]
+
+          for p in PROFILES:
+              lines.append(
+                  f"| {p} | {point[p]:.6f} | {sds[p]:.6f} | "
+                  f"{FAMILY_MARGINS[p]:.3f} |"
+              )
+
+          lines += [
+              "",
+              "## Prospective checkpoint",
+              "",
+          ]
+
+          if selected_checkpoint is not None:
+              chosen = next(
+                  x for x in power_table
+                  if x["effective_vote_checkpoint"] == selected_checkpoint
+              )
+              lines += [
+                  f"Selected first exact checkpoint: **{selected_checkpoint:,} effective votes**.",
+                  "",
+                  f"- Estimated primary gate power: **{chosen['primary_gate_power']:.1%}**",
+                  f"- Estimated all-family safety power: **{chosen['all_safety_families_power']:.1%}**",
+                  f"- Estimated joint power: **{chosen['joint_pass_power']:.1%}**",
+                  "",
+                  "This is a planning result only. No prospective catalog has been generated "
+                  "and no prospective votes have been read.",
+              ]
+          else:
+              last = power_table[-1]
+              lines += [
+                  "No checkpoint through **100,000 effective votes** reached the frozen "
+                  "80% joint-power target.",
+                  "",
+                  f"- Joint power at 100,000: **{last['joint_pass_power']:.1%}**",
+                  "",
+                  "Do not generate prospective challenges. The branch is operationally "
+                  "unresolved under the current frozen design.",
+              ]
+
+          lines += [
+              "",
+              "## Next action",
+              "",
+              next_action,
+              "",
+          ]
+
+          OUT_MD.write_text("\n".join(lines), encoding="utf-8")
+
+          manifest = {
+              "schema_version": 1,
+              "status": "package_adjustment_v6_prospective_power_analysis_manifest",
+              "generated_at_utc": generated,
+              "research_only": True,
+              "production_change_authorized": False,
+              "production_revision_unchanged": (
+                  "v1.6-v5-size2-composition-overlay"
+              ),
+              "prospective_catalog_generated": False,
+              "prospective_outcomes_read": False,
+              "selected_first_prospective_effective_vote_checkpoint": (
+                  selected_checkpoint
+              ),
+              "result_status": status,
+              "source_artifacts": {
+                  "development_preregistration": {
+                      "path": str(CFG_PATH),
+                      "git_blob_sha": (
+                          "81f20cb8afd78f624153c3337377f56ebf8115ae"
+                      ),
+                      "sha256": sha256(CFG_PATH),
+                  },
+                  "frozen_development_evidence": {
+                      "path": str(DATA_PATH),
+                      "git_blob_sha": (
+                          "fd7097335bebae209bb380c121f44debf7d0cb82"
+                      ),
+                      "sha256": sha256(DATA_PATH),
+                  },
+                  "development_catalog": {
+                      "path": str(CATALOG_PATH),
+                      "git_blob_sha": (
+                          "afc3f4e5a75f3599c11482361073c4bd9559e342"
+                      ),
+                      "sha256": sha256(CATALOG_PATH),
+                  },
+                  "development_evaluation": {
+                      "path": str(EVAL_PATH),
+                      "git_blob_sha": (
+                          "adfc1f289e7d12c74749eadc9d5b63f8651165d3"
+                      ),
+                      "sha256": sha256(EVAL_PATH),
+                  },
+                  "development_evaluation_manifest": {
+                      "path": str(EVAL_MANIFEST_PATH),
+                      "git_blob_sha": (
+                          "2771d2f6c7dc230aa68d8df6e543301c24f127e3"
+                      ),
+                      "sha256": sha256(EVAL_MANIFEST_PATH),
+                  },
+                  "frozen_candidate": {
+                      "path": str(CANDIDATE_PATH),
+                      "git_blob_sha": (
+                          "446a176757919be3deef0659ac01e05884be4007"
+                      ),
+                      "sha256": sha256(CANDIDATE_PATH),
+                  },
+              },
+              "outputs": {
+                  "power_analysis": {
+                      "path": str(OUT_JSON),
+                      "sha256": sha256(OUT_JSON),
+                  },
+                  "summary": {
+                      "path": str(OUT_MD),
+                      "sha256": sha256(OUT_MD),
+                  },
+              },
+              "next_action": next_action,
+          }
+
+          OUT_MANIFEST.write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          print(OUT_MD.read_text())
+          PY
+
+      - name: Verify power result and prospective-data isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          d = Path("research/package-adjustment-v6")
+          p = d / "prospective_power_analysis_v1.json"
+          md = d / "prospective_power_analysis_v1.md"
+          m = d / "prospective_power_analysis_manifest_v1.json"
+
+          r = json.loads(p.read_text())
+          man = json.loads(m.read_text())
+
+          assert r["research_only"] is True
+          assert r["production_change_authorized"] is False
+          assert r["prospective_catalog_generated"] is False
+          assert r["prospective_votes_exist_or_read"] is False
+          assert r["candidate"]["selected_model_class"] == "C2"
+          assert abs(r["candidate"]["q"] - 2.9897594788655337) < 1e-15
+          assert r["power_design"]["target_joint_power"] == 0.80
+          assert r["power_design"]["minimum_worthwhile_primary_improvement"] == 0.005
+          assert r["power_design"]["crossed_bootstrap_draws"] == 5000
+          assert r["power_design"]["power_trials"] == 50000
+
+          assert man["prospective_catalog_generated"] is False
+          assert man["prospective_outcomes_read"] is False
+          assert man["production_change_authorized"] is False
+          assert man["outputs"]["power_analysis"]["sha256"] == hashlib.sha256(
+              p.read_bytes()
+          ).hexdigest()
+          assert man["outputs"]["summary"]["sha256"] == hashlib.sha256(
+              md.read_bytes()
+          ).hexdigest()
+
+          selected = r["selected_first_prospective_effective_vote_checkpoint"]
+          if r["status"] == "PROSPECTIVE_CHECKPOINT_SELECTED":
+              assert selected is not None
+              chosen = [
+                  x for x in r["power_table_until_selection_or_cap"]
+                  if x["effective_vote_checkpoint"] == selected
+              ]
+              assert len(chosen) == 1
+              assert chosen[0]["joint_pass_power"] >= 0.80
+          else:
+              assert r["status"] == "POWER_CHECKPOINT_UNRESOLVED_THROUGH_100000"
+              assert selected is None
+
+          print("PASS: V6 power result is frozen and contains no prospective evidence.")
+          PY
+
+      - name: Run repository regression checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 \
+            python3 scripts/validation/repo_regression_checks.py
+
+      - name: Verify production still remains V1.6 after power analysis
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 \
+            python3 scripts/validation/check_package_adjustment_live.py
+
+      - name: Prove exactly three intended research files changed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import subprocess
+
+          expected = {
+              "research/package-adjustment-v6/prospective_power_analysis_v1.json",
+              "research/package-adjustment-v6/prospective_power_analysis_v1.md",
+              "research/package-adjustment-v6/prospective_power_analysis_manifest_v1.json",
+          }
+
+          lines = subprocess.check_output(
+              ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+              text=True,
+          ).splitlines()
+          actual = {line[3:] for line in lines if line.strip()}
+
+          if actual != expected:
+              raise SystemExit(
+                  "unexpected repository change surface: "
+                  f"expected={sorted(expected)} actual={sorted(actual)}"
+              )
+
+          print("PASS: only the three intended V6 power-analysis files changed.")
+          PY
+
+      - name: Upload V6 prospective power-analysis proof
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-adjustment-v6-prospective-power-analysis-proof
+          path: |
+            research/package-adjustment-v6/prospective_power_analysis_v1.json
+            research/package-adjustment-v6/prospective_power_analysis_v1.md
+            research/package-adjustment-v6/prospective_power_analysis_manifest_v1.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Commit frozen V6 power analysis to main
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          D="research/package-adjustment-v6"
+          P="$D/prospective_power_analysis_v1.json"
+          M="$D/prospective_power_analysis_v1.md"
+          MAN="$D/prospective_power_analysis_manifest_v1.json"
+
+          git config user.name "trade-desk-research-bot"
+          git config user.email "actions@users.noreply.github.com"
+
+          git add "$P" "$M" "$MAN"
+
+          mapfile -t STAGED < <(git diff --cached --name-only | sort)
+          EXPECTED=("$P" "$M" "$MAN")
+          mapfile -t EXPECTED_SORTED < <(
+            printf '%s\n' "${EXPECTED[@]}" | sort
+          )
+
+          test "${#STAGED[@]}" -eq 3
+          test "$(printf '%s\n' "${STAGED[@]}")" = \
+            "$(printf '%s\n' "${EXPECTED_SORTED[@]}")"
+
+          git commit -m "Freeze Package Adjustment V6 prospective power analysis"
+          git pull --rebase origin main
+
+          test "$(git hash-object "$D/development_preregistration_v1.json")" = \
+            "81f20cb8afd78f624153c3337377f56ebf8115ae"
+          test "$(git hash-object "$D/development_exact_700_frozen_v1.json")" = \
+            "fd7097335bebae209bb380c121f44debf7d0cb82"
+          test "$(git hash-object "$D/development_candidate_v1.json")" = \
+            "446a176757919be3deef0659ac01e05884be4007"
+
+          git push origin main
+          echo "PASS: V6 prospective power analysis frozen; production remains V1.6."
