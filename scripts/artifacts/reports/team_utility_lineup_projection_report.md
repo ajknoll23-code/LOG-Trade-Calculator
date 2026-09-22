@@ -24,7 +24,7 @@
 - Teams checked: **12**
 - Teams with all 17 legal slots fillable: **12 / 12**
 - Teams with a projection-complete non-K starting lineup: **12 / 12**
-- Active non-K roster projection coverage: **97.88%**
+- Active non-K roster projection coverage: **97.86%**
 - Selected non-K players needing fallback: **0**
 
 ## Team detail
@@ -36,7 +36,7 @@
 | Narroway Farms M714 | 100.0% | 17/17 | 0 |
 | Landry's Hat | 100.0% | 17/17 | 0 |
 | Pullham Bluecocks  | 97.1% | 17/17 | 0 |
-| Cock Mchorse 🐴 | 94.4% | 17/17 | 0 |
+| Cock Mchorse 🐴 | 94.3% | 17/17 | 0 |
 | Jersey Bagels | 87.9% | 17/17 | 0 |
 | Apex Predators | 97.2% | 17/17 | 0 |
 | Toddy2times | 100.0% | 17/17 | 0 |
