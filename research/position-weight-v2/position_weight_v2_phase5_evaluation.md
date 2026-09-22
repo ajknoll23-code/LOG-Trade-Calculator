@@ -9,7 +9,7 @@ Status: **`COLLECTION_ONLY`**
 
 - Frozen at: **2026-09-06T01:51:36.482597Z**
 - Frozen prediction SHA256: `bfe708b0aa991a2cfbafbb008b60944349fc040134e4bcd67f8d3cf79691ca47`
-- Completed consecutive weeks used: **[1]**
+- Completed consecutive weeks used: **[1, 2]**
 - Full structural-allocation universe: **549**
 - Primary real-history cohort: **441**
 
@@ -28,25 +28,26 @@ Same-position pairs are excluded. A common global scale cannot change this metri
 
 | Variant | Players | Pairwise accuracy | Comparable cross-position pairs |
 |---|---:|---:|---:|
-| `deployed_control` | 374 | 0.6876 | 42182 |
-| `bridge_50` | 374 | 0.6942 | 42182 |
+| `deployed_control` | 389 | 0.7036 | 56465 |
+| `bridge_50` | 389 | 0.7062 | 56465 |
 
-Bridge-50 pairwise accuracy delta vs control: **+0.0066**
+Bridge-50 pairwise accuracy delta vs control: **+0.0026**
 
 ## Secondary normalized-error metric
 
 | Variant | Min-max MAE | Min-max RMSE |
 |---|---:|---:|
-| `deployed_control` | 0.2435 | 0.2989 |
-| `bridge_50` | 0.2012 | 0.2475 |
+| `deployed_control` | 0.2143 | 0.2618 |
+| `bridge_50` | 0.1624 | 0.2070 |
 
-Bridge-50 normalized MAE delta vs control: **-0.0422**
+Bridge-50 normalized MAE delta vs control: **-0.0519**
 
 ## Weekly structural allocation audit
 
 | Week | Usable | QB | RB | WR | TE | DL | LB | DB |
 |---:|---|---:|---:|---:|---:|---:|---:|---:|
 | 1 | Yes | 24 | 34 | 26 | 12 | 29 | 42 | 25 |
+| 2 | Yes | 24 | 33 | 27 | 12 | 30 | 40 | 26 |
 
 ## Readiness ladder
 
