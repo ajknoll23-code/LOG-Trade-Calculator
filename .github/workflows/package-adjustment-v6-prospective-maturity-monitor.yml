@@ -1,0 +1,720 @@
+name: Package Adjustment V6 Prospective Maturity Monitor
+
+"on":
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13.15'
+
+      - name: Install monitor dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install "requests==2.34.2"
+
+      - name: Guard frozen V6P1 prospective contract
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          D="research/package-adjustment-v6"
+          test -z "$(git status --porcelain=v1)"
+
+          test "$(git hash-object "$D/package_vote_challenges_v6_prospective_v1.json")" = \
+            "dd12608b1b5fee03da5965458d6e59284657dce3"
+          test "$(git hash-object "$D/prospective_feasibility_amendment_v1.json")" = \
+            "48cafa8ca85c9488f864e8eca6a8882f3e09b3ed"
+          test "$(git hash-object "$D/prospective_feasibility_amendment_manifest_v1.json")" = \
+            "6fb69d64b31c104b43666734b46599f9ed49abcd"
+          test "$(git hash-object "$D/prospective_voting_activation_manifest_v1.json")" = \
+            "faf5a5153d2bf2e7bd867aec5d4a96ec227ac679"
+
+          test "$(sha256sum "$D/package_vote_challenges_v6_prospective_v1.json" | awk '{print $1}')" = \
+            "2739a0f0728b422cce632fec2381c5a4d35a572dbfabc46c97c0591bb2f5a3fc"
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          d = Path("research/package-adjustment-v6")
+          a = json.loads((d / "prospective_feasibility_amendment_v1.json").read_text())
+          act = json.loads((d / "prospective_voting_activation_manifest_v1.json").read_text())
+          cat = json.loads((d / "package_vote_challenges_v6_prospective_v1.json").read_text())
+
+          assert a["status"] == "frozen_v6p1_pre_activation_feasibility_amendment"
+          assert a["frozen"] is True
+          assert a["production_change_authorized"] is False
+
+          rules = a["prospective_evidence_maturity_and_stopping_v2"]
+          assert rules["monitor_must_be_outcome_blind"] is True
+          assert rules["exact_checkpoints_effective_votes"] == [1800, 2000]
+          assert rules["first_checkpoint_effective_votes"] == 1800
+          assert rules["hard_cap_effective_votes"] == 2000
+          assert rules["minimum_distinct_voters"] == 45
+          assert rules["minimum_effective_votes_per_cell"] == 48.0
+          assert rules["minimum_distinct_voters_per_cell"] == 27
+          assert rules["required_cell_count"] == 24
+
+          recruitment = a["feasible_recruitment_contract"]
+          assert recruitment["daily_valid_ballot_cap_per_voter"] == 40
+          assert recruitment["effective_lifetime_cap_per_voter"] == 40.0
+          assert recruitment["one_session_completion_allowed"] is True
+
+          assert act["status"] == "v6p1_feasible_prospective_voting_activated"
+          assert act["production_change_authorized"] is False
+          assert act["transport"]["vote_prefix"] == "__pkgv6p1__|"
+          assert act["transport"]["meta_prefix"] == "__pkgv6p1_meta__|"
+          assert act["transport"]["schema_marker"] == "__pkgv6p1_schema__|1"
+          assert act["transport"]["daily_valid_ballot_cap_per_voter"] == 40
+          assert act["transport"]["effective_lifetime_cap_per_voter"] == 40
+          assert act["maturity_contract"]["exact_effective_vote_checkpoints"] == [1800, 2000]
+
+          assert cat["status"] == "frozen_v6p1_prospective_catalog"
+          assert cat["frozen"] is True
+          assert len(cat["challenges"]) == 504
+          assert len(cat["targets"]) == 21
+          assert len({c["research_cell"] for c in cat["challenges"]}) == 24
+
+          html = Path("index.html").read_text(encoding="utf-8")
+          assert "Package Adjustment V6P1 Prospective Confirmation:" in html
+          assert "const PACKAGE_VOTE_DAILY_LIMIT = 40;" in html
+          assert (
+              f"const PACKAGE_VOTE_VALID_AFTER_UTC = "
+              f"'{act['valid_ballot_start_utc']}';"
+          ) in html
+          assert "__pkgv6p1__|${id}|${choice}" in html
+          assert "__pkgv6p1_meta__|${left}" in html
+          assert "__pkgv6p1_schema__|1" in html
+          assert "PACKAGE_VOTE_V6P1_EXACT_CELL_SAMPLING_V1" in html
+
+          ktc = Path("scripts/market/ktc_pipeline.py").read_text(encoding="utf-8")
+          assert '"__pkgv6p1__|"' in ktc
+
+          print(
+              "PASS: frozen V6P1 feasible prospective contract and active "
+              "transport confirmed."
+          )
+          PY
+
+      - name: Verify production remains V1.6
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 \
+            python3 scripts/validation/check_package_adjustment_live.py
+
+      - name: Self-test outcome-blind checkpoint arithmetic
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from collections import Counter
+
+          DAILY_CAP = 40
+          LIFETIME_CAP = 40
+
+          def daily_cap(rows):
+              counts = Counter()
+              out = []
+              for row in rows:
+                  key = (row["voter"], row["day"])
+                  if counts[key] >= DAILY_CAP:
+                      continue
+                  counts[key] += 1
+                  out.append(row)
+              return out
+
+          def effective_prefix(rows, threshold):
+              lifetime = Counter()
+              effective = 0
+              accepted = []
+              for row in rows:
+                  voter = row["voter"]
+                  accepted.append(row)
+                  if lifetime[voter] < LIFETIME_CAP:
+                      lifetime[voter] += 1
+                      effective += 1
+                  if effective == threshold:
+                      return accepted
+                  if effective > threshold:
+                      raise AssertionError("integer checkpoint skipped")
+              return None
+
+          rows = []
+          for voter in range(50):
+              for i in range(40):
+                  rows.append({
+                      "voter": f"v{voter:02d}",
+                      "day": "2026-09-21",
+                      "ordinal": i,
+                  })
+
+          valid = daily_cap(rows)
+          assert len(valid) == 2000
+          assert effective_prefix(valid, 1800) is not None
+          assert effective_prefix(valid, 2000) is not None
+
+          # 41st same-day ballot is removed by the daily cap.
+          valid2 = daily_cap(rows + [{
+              "voter": "v00",
+              "day": "2026-09-21",
+              "ordinal": 40,
+          }])
+          assert len(valid2) == 2000
+
+          # A later-day 41st lifetime ballot remains structurally valid but
+          # contributes zero additional effective weight.
+          later = valid + [{
+              "voter": "v00",
+              "day": "2026-09-22",
+              "ordinal": 40,
+          }]
+          p2000 = effective_prefix(later, 2000)
+          assert p2000 is not None
+          assert len(p2000) == 2000
+
+          print(
+              "PASS: V6P1 40/day, 40/lifetime, 1800/2000 "
+              "outcome-blind checkpoint arithmetic."
+          )
+          PY
+
+      - name: Build outcome-blind V6P1 maturity report
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OUT="/tmp/package-adjustment-v6-prospective-maturity"
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import io
+          import json
+          import os
+          from collections import Counter
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import requests
+
+          D = Path("research/package-adjustment-v6")
+          OUT = Path("/tmp/package-adjustment-v6-prospective-maturity")
+
+          SHEET_URL = (
+              "https://docs.google.com/spreadsheets/d/e/"
+              "2PACX-1vTuKORGumlKJmUmBdeNWPstkj8VRjPoVkylbqHv1KqwoyziJYOUlkZUKRsSxzB3qHXmyjjLpGpH6W03/"
+              "pub?gid=458294959&single=true&output=csv"
+          )
+
+          amendment = json.loads(
+              (D / "prospective_feasibility_amendment_v1.json").read_text()
+          )
+          activation = json.loads(
+              (D / "prospective_voting_activation_manifest_v1.json").read_text()
+          )
+          catalog_doc = json.loads(
+              (D / "package_vote_challenges_v6_prospective_v1.json").read_text()
+          )
+
+          rules = amendment["prospective_evidence_maturity_and_stopping_v2"]
+          transport = activation["transport"]
+
+          VOTE_PREFIX = transport["vote_prefix"]
+          META_PREFIX = transport["meta_prefix"]
+          SCHEMA_MARKER = transport["schema_marker"]
+
+          DAILY_CAP = int(transport["daily_valid_ballot_cap_per_voter"])
+          LIFETIME_CAP = int(transport["effective_lifetime_cap_per_voter"])
+
+          MIN_VOTERS = int(rules["minimum_distinct_voters"])
+          MIN_CELL_EFFECTIVE = float(rules["minimum_effective_votes_per_cell"])
+          MIN_CELL_VOTERS = int(rules["minimum_distinct_voters_per_cell"])
+          REQUIRED_CELL_COUNT = int(rules["required_cell_count"])
+          CHECKPOINTS = [
+              int(x) for x in rules["exact_checkpoints_effective_votes"]
+          ]
+          FIRST_CHECKPOINT = int(rules["first_checkpoint_effective_votes"])
+          HARD_CAP = int(rules["hard_cap_effective_votes"])
+
+          assert CHECKPOINTS == [1800, 2000]
+          assert DAILY_CAP == 40
+          assert LIFETIME_CAP == 40
+          assert MIN_VOTERS == 45
+          assert MIN_CELL_EFFECTIVE == 48.0
+          assert MIN_CELL_VOTERS == 27
+          assert REQUIRED_CELL_COUNT == 24
+          assert FIRST_CHECKPOINT == 1800
+          assert HARD_CAP == 2000
+
+          def parse_utc(value):
+              s = str(value or "").strip()
+              if not s:
+                  return None
+              if s.endswith("Z"):
+                  s = s[:-1] + "+00:00"
+              try:
+                  dt = datetime.fromisoformat(s)
+              except ValueError:
+                  return None
+              if dt.tzinfo is None:
+                  dt = dt.replace(tzinfo=timezone.utc)
+              return dt.astimezone(timezone.utc)
+
+          cutoff = parse_utc(activation["valid_ballot_start_utc"])
+          assert cutoff is not None
+
+          challenges = {c["id"]: c for c in catalog_doc["challenges"]}
+          assert len(challenges) == 504
+
+          cell_meta = {}
+          for challenge in challenges.values():
+              key = challenge["research_cell"]
+              meta = {
+                  "research_cell": key,
+                  "composition_profile": challenge["component_profile"]["label"],
+                  "apex_piece_to_target_target": float(
+                      challenge["apex_piece_to_target_target"]
+                  ),
+              }
+              if key in cell_meta:
+                  assert cell_meta[key] == meta
+              else:
+                  cell_meta[key] = meta
+
+          assert len(cell_meta) == REQUIRED_CELL_COUNT
+
+          generated_at = datetime.now(timezone.utc)
+          response = requests.get(SHEET_URL, timeout=30)
+          response.raise_for_status()
+          sheet_sha256 = hashlib.sha256(response.content).hexdigest()
+          rows = list(csv.DictReader(io.StringIO(response.text)))
+
+          excluded = Counter()
+          raw_namespace_rows = 0
+          structurally_valid = []
+
+          for source_index, row in enumerate(rows):
+              keep = str(row.get("keep") or "")
+              if not keep.startswith(VOTE_PREFIX):
+                  continue
+
+              raw_namespace_rows += 1
+
+              ts = parse_utc(row.get("timestamp"))
+              if ts is None:
+                  excluded["invalid_timestamp"] += 1
+                  continue
+              if ts <= cutoff:
+                  excluded["pre_activation_or_at_cutoff"] += 1
+                  continue
+              if ts > generated_at:
+                  excluded["future_timestamp"] += 1
+                  continue
+
+              voter = str(row.get("voter_roster_id") or "").strip()
+              if not voter:
+                  excluded["missing_voter_id"] += 1
+                  continue
+
+              # OUTCOME-BLIND BY CONSTRUCTION:
+              # consume only the challenge ID before the first separator.
+              # The choice token after that separator is never assigned,
+              # validated, counted, summarized, compared, or emitted.
+              payload = keep[len(VOTE_PREFIX):]
+              if "|" not in payload:
+                  excluded["malformed_vote_transport"] += 1
+                  continue
+              challenge_id = payload.split("|", 1)[0].strip()
+              if challenge_id not in challenges:
+                  excluded["unknown_challenge_id"] += 1
+                  continue
+
+              # Validate only the metadata namespace. The randomized left-side
+              # orientation token is deliberately never parsed.
+              meta = str(row.get("trade") or "")
+              if not meta.startswith(META_PREFIX):
+                  excluded["invalid_meta_namespace"] += 1
+                  continue
+
+              if str(row.get("cut") or "") != SCHEMA_MARKER:
+                  excluded["invalid_schema_marker"] += 1
+                  continue
+
+              structurally_valid.append({
+                  "timestamp": ts,
+                  "source_index": source_index,
+                  "voter": voter,
+                  "challenge_id": challenge_id,
+              })
+
+          structurally_valid.sort(
+              key=lambda r: (r["timestamp"], r["source_index"])
+          )
+
+          # Frozen 40-ballot per voter per UTC day cap.
+          daily_counts = Counter()
+          post_daily_cap = []
+          for row in structurally_valid:
+              day = row["timestamp"].date().isoformat()
+              key = (row["voter"], day)
+              if daily_counts[key] >= DAILY_CAP:
+                  excluded["daily_cap_excess"] += 1
+                  continue
+              daily_counts[key] += 1
+              post_daily_cap.append(row)
+
+          # Frozen effective rule: first 40 valid V6P1 ballots per voter count
+          # 1.0 each; all later lifetime ballots count zero.
+          lifetime_counts = Counter()
+          effective_rows = []
+          lifetime_zero_weight_rows = 0
+          for row in post_daily_cap:
+              voter = row["voter"]
+              if lifetime_counts[voter] >= LIFETIME_CAP:
+                  lifetime_zero_weight_rows += 1
+                  continue
+              lifetime_counts[voter] += 1
+              effective_rows.append(row)
+
+          excluded["lifetime_cap_zero_weight"] = lifetime_zero_weight_rows
+
+          def snapshot(rows_subset):
+              voter_counts = Counter(r["voter"] for r in rows_subset)
+              per_cell_count = {key: 0 for key in cell_meta}
+              per_cell_voters = {key: set() for key in cell_meta}
+              challenge_ids = set()
+
+              for row in rows_subset:
+                  challenge = challenges[row["challenge_id"]]
+                  key = challenge["research_cell"]
+                  per_cell_count[key] += 1
+                  per_cell_voters[key].add(row["voter"])
+                  challenge_ids.add(row["challenge_id"])
+
+              cells = []
+              for key in sorted(cell_meta):
+                  eff = float(per_cell_count[key])
+                  voters = len(per_cell_voters[key])
+                  meta = cell_meta[key]
+                  cells.append({
+                      **meta,
+                      "effective_votes": eff,
+                      "distinct_voters": voters,
+                      "effective_vote_gate_pass": (
+                          eff + 1e-12 >= MIN_CELL_EFFECTIVE
+                      ),
+                      "voter_gate_pass": voters >= MIN_CELL_VOTERS,
+                      "cell_gate_pass": (
+                          eff + 1e-12 >= MIN_CELL_EFFECTIVE
+                          and voters >= MIN_CELL_VOTERS
+                      ),
+                  })
+
+              distinct_voters = len(voter_counts)
+              coverage_pass = (
+                  len(rows_subset) in CHECKPOINTS
+                  and distinct_voters >= MIN_VOTERS
+                  and all(c["cell_gate_pass"] for c in cells)
+              )
+
+              return {
+                  "effective_votes": float(len(rows_subset)),
+                  "distinct_voters": distinct_voters,
+                  "distinct_challenges": len(challenge_ids),
+                  "cells_observed": sum(
+                      c["effective_votes"] > 0 for c in cells
+                  ),
+                  "cells_passing_both_gates": sum(
+                      c["cell_gate_pass"] for c in cells
+                  ),
+                  "minimum_cell_effective_votes": min(
+                      c["effective_votes"] for c in cells
+                  ),
+                  "minimum_cell_distinct_voters": min(
+                      c["distinct_voters"] for c in cells
+                  ),
+                  "coverage_gates_pass": coverage_pass,
+                  "cells": cells,
+              }
+
+          def exact_checkpoint_prefix(threshold):
+              if len(effective_rows) < threshold:
+                  return None
+              return effective_rows[:threshold]
+
+          current = snapshot(effective_rows)
+
+          checkpoint_reports = {}
+          for checkpoint in CHECKPOINTS:
+              prefix = exact_checkpoint_prefix(checkpoint)
+              checkpoint_reports[str(checkpoint)] = (
+                  None if prefix is None else snapshot(prefix)
+              )
+
+          cp1800 = checkpoint_reports["1800"]
+          cp2000 = checkpoint_reports["2000"]
+
+          if cp1800 is not None and cp1800["coverage_gates_pass"]:
+              status = "STOP_AND_FREEZE_AT_1800"
+              selected_checkpoint = 1800
+              action = (
+                  "Stop collecting V6P1 votes. Freeze the exact first 1,800 "
+                  "effective ballots before any outcome evaluation."
+              )
+          elif cp2000 is not None:
+              if cp2000["coverage_gates_pass"]:
+                  status = "STOP_AND_FREEZE_AT_2000"
+                  selected_checkpoint = 2000
+                  action = (
+                      "Stop collecting V6P1 votes. The 1,800 checkpoint did "
+                      "not qualify; freeze exact 2,000 effective ballots before "
+                      "any outcome evaluation."
+                  )
+              else:
+                  status = "HARD_CAP_UNRESOLVED"
+                  selected_checkpoint = None
+                  action = (
+                      "Do not evaluate C2 versus C1. The 2,000 hard cap was "
+                      "reached without satisfying frozen coverage gates."
+                  )
+          elif cp1800 is not None:
+              status = "CONTINUE_TO_2000_FOR_COVERAGE"
+              selected_checkpoint = None
+              action = (
+                  "Continue outcome-blind collection toward exact 2,000. "
+                  "The 1,800 checkpoint exists but failed at least one frozen "
+                  "coverage gate."
+              )
+          else:
+              status = "COLLECTING_TO_1800"
+              selected_checkpoint = None
+              action = (
+                  "Continue collecting V6P1 votes. Do not evaluate vote "
+                  "direction or model performance."
+              )
+
+          report = {
+              "schema_version": 1,
+              "status": status,
+              "generated_at_utc": generated_at.isoformat(),
+              "research_only": True,
+              "outcome_blind": True,
+              "vote_choice_direction_read": False,
+              "display_orientation_read": False,
+              "model_predictions_read": False,
+              "model_performance_computed": False,
+              "selected_checkpoint_effective_votes": selected_checkpoint,
+              "next_action": action,
+              "frozen_contract": {
+                  "activation_commit": (
+                      "c4e20d2b5f4c36f6c80ceca33892352ee48a5936"
+                  ),
+                  "activation_manifest_git_blob_sha": (
+                      "faf5a5153d2bf2e7bd867aec5d4a96ec227ac679"
+                  ),
+                  "valid_ballot_start_utc": activation["valid_ballot_start_utc"],
+                  "catalog_sha256": (
+                      "2739a0f0728b422cce632fec2381c5a4d35a572dbfabc46c97c0591bb2f5a3fc"
+                  ),
+                  "daily_valid_ballot_cap_per_voter": DAILY_CAP,
+                  "effective_lifetime_cap_per_voter": LIFETIME_CAP,
+                  "exact_checkpoints_effective_votes": CHECKPOINTS,
+                  "minimum_distinct_voters": MIN_VOTERS,
+                  "minimum_effective_votes_per_cell": MIN_CELL_EFFECTIVE,
+                  "minimum_distinct_voters_per_cell": MIN_CELL_VOTERS,
+                  "required_cell_count": REQUIRED_CELL_COUNT,
+              },
+              "source_sheet": {
+                  "sha256_at_fetch": sheet_sha256,
+                  "total_csv_data_rows": len(rows),
+                  "raw_v6p1_namespace_rows": raw_namespace_rows,
+                  "structurally_valid_post_cutoff_rows": len(
+                      structurally_valid
+                  ),
+                  "post_daily_cap_rows": len(post_daily_cap),
+                  "lifetime_zero_weight_rows": lifetime_zero_weight_rows,
+                  "effective_rows_available": len(effective_rows),
+                  "excluded_row_counts": dict(sorted(excluded.items())),
+              },
+              "current": current,
+              "checkpoints": checkpoint_reports,
+          }
+
+          out_json = OUT / "prospective_maturity_report_v1.json"
+          out_md = OUT / "prospective_maturity_report_v1.md"
+          out_json.write_text(
+              json.dumps(report, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          def cp_line(n):
+              cp = checkpoint_reports[str(n)]
+              if cp is None:
+                  return f"- {n:,}: **not yet reached**"
+              return (
+                  f"- {n:,}: voters **{cp['distinct_voters']}**, "
+                  f"cells passing **{cp['cells_passing_both_gates']}/24**, "
+                  f"weakest cell **{cp['minimum_cell_effective_votes']:.0f}** "
+                  f"effective / **{cp['minimum_cell_distinct_voters']}** voters, "
+                  f"coverage **{'PASS' if cp['coverage_gates_pass'] else 'FAIL'}**"
+              )
+
+          md = "\n".join([
+              "# Package Adjustment V6P1 Prospective Maturity Monitor",
+              "",
+              f"**Status:** `{status}`",
+              "",
+              "This report is outcome-blind. It did not parse vote choice "
+              "direction, display orientation, C1/C2 predictions, losses, "
+              "confidence intervals, or significance.",
+              "",
+              "## Current collection",
+              "",
+              f"- Effective votes available: **{len(effective_rows):,} / 2,000**",
+              f"- Distinct voters: **{current['distinct_voters']}**",
+              f"- Distinct challenges: **{current['distinct_challenges']} / 504**",
+              f"- Cells observed: **{current['cells_observed']} / 24**",
+              f"- Cells currently passing both gates: "
+              f"**{current['cells_passing_both_gates']} / 24**",
+              f"- Weakest cell effective votes: "
+              f"**{current['minimum_cell_effective_votes']:.0f}**",
+              f"- Weakest cell distinct voters: "
+              f"**{current['minimum_cell_distinct_voters']}**",
+              "",
+              "## Frozen exact checkpoints",
+              "",
+              cp_line(1800),
+              cp_line(2000),
+              "",
+              "## Action",
+              "",
+              action,
+              "",
+          ])
+          out_md.write_text(md, encoding="utf-8")
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+              with open(summary_path, "a", encoding="utf-8") as f:
+                  f.write(md)
+
+          print(md)
+          PY
+
+      - name: Verify monitor remained outcome-blind
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          p = Path(
+              "/tmp/package-adjustment-v6-prospective-maturity/"
+              "prospective_maturity_report_v1.json"
+          )
+          report = json.loads(p.read_text())
+
+          assert report["outcome_blind"] is True
+          assert report["vote_choice_direction_read"] is False
+          assert report["display_orientation_read"] is False
+          assert report["model_predictions_read"] is False
+          assert report["model_performance_computed"] is False
+
+          assert report["frozen_contract"]["daily_valid_ballot_cap_per_voter"] == 40
+          assert report["frozen_contract"]["effective_lifetime_cap_per_voter"] == 40
+          assert report["frozen_contract"]["exact_checkpoints_effective_votes"] == [1800, 2000]
+          assert report["frozen_contract"]["minimum_distinct_voters"] == 45
+          assert report["frozen_contract"]["minimum_effective_votes_per_cell"] == 48.0
+          assert report["frozen_contract"]["minimum_distinct_voters_per_cell"] == 27
+
+          allowed_status = {
+              "COLLECTING_TO_1800",
+              "CONTINUE_TO_2000_FOR_COVERAGE",
+              "STOP_AND_FREEZE_AT_1800",
+              "STOP_AND_FREEZE_AT_2000",
+              "HARD_CAP_UNRESOLVED",
+          }
+          assert report["status"] in allowed_status
+
+          text = p.read_text(encoding="utf-8").lower()
+          forbidden_output_keys = [
+              '"human_choice"',
+              '"package_preferred"',
+              '"display_left"',
+              '"c1_prediction"',
+              '"c2_prediction"',
+              '"log_loss"',
+              '"bootstrap"',
+              '"confidence_bound"',
+              '"significance"',
+          ]
+          for token in forbidden_output_keys:
+              assert token not in text, token
+
+          for cp_name, cp in report["checkpoints"].items():
+              if cp is None:
+                  continue
+              assert int(cp_name) in {1800, 2000}
+              assert cp["effective_votes"] == float(int(cp_name))
+
+          print(
+              "PASS: V6P1 maturity artifact contains coverage/count metadata "
+              "only; no outcome/model evaluation fields."
+          )
+          PY
+
+      - name: Run repository regression checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 \
+            python3 scripts/validation/repo_regression_checks.py
+
+      - name: Verify production still remains V1.6 after monitor
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 \
+            python3 scripts/validation/check_package_adjustment_live.py
+
+      - name: Prove monitor wrote nothing to repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1)"
+          echo "PASS: maturity monitor wrote nothing to the repository."
+
+      - name: Upload V6P1 outcome-blind maturity report
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-adjustment-v6-prospective-maturity-report
+          path: |
+            /tmp/package-adjustment-v6-prospective-maturity/prospective_maturity_report_v1.json
+            /tmp/package-adjustment-v6-prospective-maturity/prospective_maturity_report_v1.md
+          if-no-files-found: error
+          retention-days: 30
