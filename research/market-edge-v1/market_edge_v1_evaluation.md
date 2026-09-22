@@ -9,7 +9,7 @@
 
 | Horizon | Status | N | Gap→change ρ | Mean-reversion ρ | Incremental Δ | Directional | Buy−sell spread |
 |---|---|---:|---:|---:|---:|---:|---:|
-| 1w_diagnostic | pending | — | — | — | — | — | — |
+| 1w_diagnostic | evaluated | 503 | 0.040 | 0.141 | -0.102 | 0.505 | 0.003 |
 | 2w_supportive | pending | — | — | — | — | — | — |
 | 4w_primary | pending | — | — | — | — | — | — |
 
