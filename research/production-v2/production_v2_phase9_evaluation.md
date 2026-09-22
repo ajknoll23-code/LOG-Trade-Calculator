@@ -7,7 +7,7 @@
 - Production files mutated: **0**
 - Deployment authorized: **No**
 - Frozen candidate matrix: **120 V2 variants + deployed control**
-- Completed consecutive weeks: **1**
+- Completed consecutive weeks: **2**
 
 ## Frozen protocol
 
@@ -27,29 +27,29 @@
 
 ## Completed outcome state
 
-- Outcome refresh: `2026-09-18T21:46:13.721512Z`
-- Completed weeks recognized: **[1]**
-- Consecutive prefix used: **[1]**
+- Outcome refresh: `2026-09-22T12:34:43.109923Z`
+- Completed weeks recognized: **[1, 2]**
+- Consecutive prefix used: **[1, 2]**
 
-## weeks_1_to_1_early
+## weeks_1_to_2_early
 
-Weeks: **[1]**  
-Active normal-candidate players: **435**  
+Weeks: **[1, 2]**  
+Active normal-candidate players: **456**  
 Deployed control rank: **121 / 121**  
-Phase-8 monitoring reference rank: **72 / 121**
+Phase-8 monitoring reference rank: **64 / 121**
 
 | Rank | Variant | FP wt | History wt | Ranks | Floor | Primary Spearman | Δ vs deployed | Pairwise |
 |---:|---|---:|---:|---|---:|---:|---:|---:|
-| 1 | `fp_1.00__history_0.25__documented__floor_0.15` | 100% | 25% | documented | 0.15 | 0.499052 | 0.051554 | 0.678246 |
-| 2 | `fp_0.75__history_0.25__documented__floor_0.15` | 75% | 25% | documented | 0.15 | 0.498656 | 0.051158 | 0.678197 |
-| 3 | `fp_1.00__history_0.25__documented__floor_0.05` | 100% | 25% | documented | 0.05 | 0.498546 | 0.051048 | 0.677718 |
-| 4 | `fp_0.75__history_0.25__documented__floor_0.05` | 75% | 25% | documented | 0.05 | 0.498317 | 0.050819 | 0.677826 |
-| 5 | `fp_0.75__history_0.25__documented__floor_0.10` | 75% | 25% | documented | 0.10 | 0.49818 | 0.050682 | 0.677936 |
-| 6 | `fp_1.00__history_0.25__documented__floor_0.20` | 100% | 25% | documented | 0.20 | 0.498158 | 0.05066 | 0.678317 |
-| 7 | `fp_1.00__history_0.25__documented__floor_0.10` | 100% | 25% | documented | 0.10 | 0.498145 | 0.050647 | 0.677706 |
-| 8 | `fp_0.75__history_0.25__documented__floor_0.20` | 75% | 25% | documented | 0.20 | 0.498033 | 0.050535 | 0.678481 |
-| 9 | `fp_0.75__history_0.25__evidence_hybrid__floor_0.15` | 75% | 25% | evidence_hybrid | 0.15 | 0.497913 | 0.050415 | 0.67878 |
-| 10 | `fp_0.00__history_0.25__documented__floor_0.15` | 0% | 25% | documented | 0.15 | 0.497745 | 0.050247 | 0.677819 |
+| 1 | `fp_0.00__history_0.25__documented__floor_0.15` | 0% | 25% | documented | 0.15 | 0.594252 | 0.048572 | 0.712569 |
+| 2 | `fp_0.00__history_0.25__documented__floor_0.20` | 0% | 25% | documented | 0.20 | 0.593962 | 0.048282 | 0.713796 |
+| 3 | `fp_0.00__history_0.25__documented__floor_0.05` | 0% | 25% | documented | 0.05 | 0.593726 | 0.048046 | 0.711706 |
+| 4 | `fp_0.00__history_0.25__documented__floor_0.10` | 0% | 25% | documented | 0.10 | 0.593487 | 0.047807 | 0.71184 |
+| 5 | `fp_0.25__history_0.25__documented__floor_0.20` | 25% | 25% | documented | 0.20 | 0.593312 | 0.047632 | 0.713684 |
+| 6 | `fp_0.25__history_0.25__documented__floor_0.15` | 25% | 25% | documented | 0.15 | 0.593233 | 0.047553 | 0.712574 |
+| 7 | `fp_0.25__history_0.25__documented__floor_0.05` | 25% | 25% | documented | 0.05 | 0.592371 | 0.046691 | 0.71157 |
+| 8 | `fp_0.25__history_0.25__documented__floor_0.10` | 25% | 25% | documented | 0.10 | 0.592319 | 0.046639 | 0.711732 |
+| 9 | `fp_0.75__history_0.25__documented__floor_0.15` | 75% | 25% | documented | 0.15 | 0.591324 | 0.045644 | 0.712091 |
+| 10 | `fp_0.75__history_0.25__evidence_hybrid__floor_0.15` | 75% | 25% | evidence_hybrid | 0.15 | 0.5911 | 0.04542 | 0.712445 |
 
 ## Stability
 
