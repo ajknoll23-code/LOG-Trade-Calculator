@@ -2,9 +2,9 @@
 
 **Status: RESEARCH ONLY — no production consumer changed.**
 
-- Captured evidence snapshots: `17`
-- Current-league completed trades logged: `15`
-- Numerically eligible trades: `0`
+- Captured evidence snapshots: `18`
+- Current-league completed trades logged: `16`
+- Numerically eligible trades: `1`
 - Excluded trades: `15`
 
 A trade is numerically eligible only when a stored evidence snapshot predates the Sleeper transaction timestamp. Current or post-trade values are never substituted.
@@ -12,6 +12,12 @@ A trade is numerically eligible only when a stored evidence snapshot predates th
 ## Exclusions
 
 - `no_snapshot_captured_before_trade`: 15
+
+## Pre-trade snapshot age
+
+- Minimum hours: `22.24`
+- Median hours: `22.24`
+- Maximum hours: `22.24`
 
 ## Scope
 
