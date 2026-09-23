@@ -26,7 +26,7 @@
 
 ## Exclusions
 
-- `pick_or_nonplayer_asset_present`: 1
+- `pick_or_nonplayer_asset_present`: 2
 - `trade_not_strictly_after_candidate_freeze`: 15
 
 ## Production status
