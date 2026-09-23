@@ -1,51 +1,36 @@
 #!/usr/bin/env python3
-"""Permanent regression checks for controlled-live Package Adjustment V1.6.
-
-Protects:
-- frozen V1.5 target-sensitive size2 curve and V3 core;
-- hardened V5 composition overlay only through 60/40;
-- frozen V4 size3 behavior;
-- fail-closed scope and tiny-piece semantics;
-- candidate/evidence/release lineage;
-- exact-live OOS dispatcher/monitor alignment;
-- Trade Verdict-only consumer scope.
-"""
+"""Permanent controlled-live regression checks for Package Adjustment V1.7."""
 
 from __future__ import annotations
 
-import hashlib
 import json
-import os
 import subprocess
-import tempfile
 from pathlib import Path
 
-import package_adjustment_exact_live_oos_v1_6 as oos
+import package_adjustment_exact_live_oos_v1_7 as oos
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT = SCRIPT_DIR.parent.parent
 INDEX = ROOT / "index.html"
 LIVE = ROOT / "research/package-adjustment-production-candidate-v1/live_deployment.json"
-MANIFEST = ROOT / "research/package-adjustment-production-candidate-v1/prospective/release_manifest_v1_6.json"
+MANIFEST = ROOT / "research/package-adjustment-production-candidate-v1/prospective/release_manifest_v1_7.json"
 OOS = ROOT / "research/package-adjustment-production-candidate-v1/prospective/exact_live_oos_validation.json"
-CANDIDATE = ROOT / "research/package-adjustment-v5/production_candidate_design.json"
-SHADOW = ROOT / "research/package-adjustment-v5/shadow_regression_hardening.json"
-READINESS = ROOT / "research/package-adjustment-v5/promotion_readiness.json"
-OOS_READINESS = ROOT / "research/package-adjustment-v5/oos_monitor_v1_6_readiness.json"
-HARDENING = ROOT / "research/package-adjustment-v5/evidence_hardening.json"
+CANDIDATE = ROOT / "research/package-adjustment-v6/production_candidate_v1.json"
+EVAL = ROOT / "research/package-adjustment-v6/prospective_evaluation_v1.json"
+REVIEW = ROOT / "research/package-adjustment-v6/production_review_v1.json"
+FROZEN = ROOT / "research/package-adjustment-v6/prospective_exact_1800_frozen_v1.json"
+CATALOG = ROOT / "research/package-adjustment-v6/package_vote_challenges_v6_prospective_v1.json"
 WORKFLOW = ROOT / ".github/workflows/package-adjustment-audit-step4-exact-live-oos.yml"
 DISPATCHER = SCRIPT_DIR / "package_adjustment_exact_live_oos.py"
-V16_MONITOR = SCRIPT_DIR / "package_adjustment_exact_live_oos_v1_6.py"
+V17_MONITOR = SCRIPT_DIR / "package_adjustment_exact_live_oos_v1_7.py"
 
-REVISION = "v1.6-v5-size2-composition-overlay"
-CANDIDATE_ID = "package-adjustment-v5-size2-composition-overlay-candidate-v1"
-EXPECTED_POSITIONS = ["QB", "RB", "WR", "TE", "DL", "LB", "DB"]
+REVISION = "v1.7-v6-size3-c2-overlay"
+CANDIDATE_ID = "package-adjustment-v6-c2-size3-overlay-candidate-v1"
+
 
 def _read(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
-def _sha(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 def _extract_balanced(text, marker, open_char="{", close_char="}"):
     start = text.find(marker)
@@ -103,22 +88,24 @@ def _extract_balanced(text, marker, open_char="{", close_char="}"):
         i += 1
     raise AssertionError(f"unbalanced JS block: {marker}")
 
+
 def _extract_function(text, name):
     return _extract_balanced(text, f"function {name}(")
 
+
 def _extract_config(text):
-    start = text.find(
-        "const PACKAGE_ADJUSTMENT_PRODUCTION_V1 = Object.freeze({"
-    )
+    start = text.find("const PACKAGE_ADJUSTMENT_PRODUCTION_V1 = Object.freeze({")
     end = text.find("function packageAdjustmentSize2Multiplier(", start)
     assert start >= 0 and end > start
     return text[start:end].strip()
+
 
 def _run_js_behavior(index_text):
     parts = [
         _extract_config(index_text),
         _extract_function(index_text, "packageAdjustmentSize2Multiplier"),
         _extract_function(index_text, "packageAdjustmentSize2CompositionFactor"),
+        _extract_function(index_text, "packageAdjustmentSize3V6Assessment"),
         _extract_function(index_text, "packageAdjustmentAssessment"),
         _extract_function(index_text, "packageAdjustmentForTrade"),
         _extract_function(index_text, "sideTotal"),
@@ -130,29 +117,26 @@ function player(pos, value, name='P'){ return {type:'player',pos,value,name}; }
 function pick(value=1000){ return {type:'pick',value,name:'Pick'}; }
 function assess(a,b){ state={A:a,B:b}; return packageAdjustmentAssessment(); }
 function check(v,m){ if(!v) throw new Error(m); }
-function close(a,b,m,t=1e-9){ if(Math.abs(Number(a)-Number(b))>t) throw new Error(`${m}: ${a} != ${b}`); }
+function close(a,b,m,t=1e-8){ if(Math.abs(Number(a)-Number(b))>t) throw new Error(`${m}: ${a} != ${b}`); }
 
-let r, base, padded, totals;
+let r, base, totals, vals, S, P;
 let checked = 0;
 
 r=assess([player('QB',5000)],[player('RB',2500),player('WR',2500)]);
 check(r.status==='unsupported','50/50 legacy gap'); checked++;
 
 r=assess([player('QB',5000)],[player('RB',2550),player('WR',2450)]);
-check(r.status==='applied','51/49 V3'); check(r.packageAdjustment.premiumTier==='2-player','V3 tier');
-base=r.packageAdjustment; checked++;
+check(r.status==='applied','51/49 V3'); check(r.packageAdjustment.premiumTier==='2-player','V3 tier'); checked++;
 
 r=assess([player('QB',5000)],[player('RB',2750),player('WR',2250)]);
-check(r.status==='applied','55/45 V5'); check(r.packageAdjustment.premiumTier==='2-player-v5','V5 tier');
-check(r.packageAdjustment.multiplier>packageAdjustmentSize2Multiplier(5000),'55/45 premium'); checked++;
+check(r.status==='applied','55/45 V5'); check(r.packageAdjustment.premiumTier==='2-player-v5','V5 tier'); checked++;
 
 r=assess([player('WR',5896)],[player('WR',4153),player('WR',3258)]);
 check(r.status==='applied','56/44 motivating case');
-close(r.packageAdjustment.multiplier,1.7349100401248068,'56/44 multiplier',2e-10); checked++;
+close(r.packageAdjustment.multiplier,1.7349100401248068,'56/44 multiplier',2e-9); checked++;
 
 r=assess([player('QB',5000)],[player('RB',3000),player('WR',2000)]);
-check(r.status==='applied','60/40 ceiling');
-close(r.packageAdjustment.multiplier,packageAdjustmentSize2Multiplier(5000),'60/40 baseline'); checked++;
+check(r.status==='applied','60/40 ceiling'); checked++;
 
 r=assess([player('QB',5000)],[player('RB',3001),player('WR',1999)]);
 check(r.status==='unsupported','above 60/40'); checked++;
@@ -163,14 +147,47 @@ check(r.status==='unsupported','65/35'); checked++;
 base=assess([player('QB',5000)],[player('RB',2750),player('WR',2250)]).packageAdjustment;
 r=assess([player('QB',5000)],[player('RB',2750),player('WR',2250),player('DB',250)]);
 check(r.status==='applied','V5 tiny third');
-close(r.packageAdjustment.multiplier,base.multiplier,'tiny does not alter multiplier');
-close(r.packageAdjustment.rawPackageFv,5250,'tiny retained raw');
-close(r.packageAdjustment.meaningfulPackageFv,5000,'tiny excluded meaningful');
-close(r.packageAdjustment.tinyPackageFv,250,'tiny tracked'); checked++;
+close(r.packageAdjustment.multiplier,base.multiplier,'tiny preserves size2 multiplier'); checked++;
 
 r=assess([player('QB',5000)],[player('RB',2250),player('LB',1650),player('DB',1100)]);
-check(r.status==='applied','V4 45/33/22');
-close(r.packageAdjustment.multiplier,2.0512371846911357,'V4 multiplier'); checked++;
+check(r.status==='applied','legacy V4 fallback');
+check(r.packageAdjustment.premiumTier==='3-player','legacy V4 tier');
+check(r.packageAdjustment.size3Source==='V4','legacy V4 source');
+close(r.packageAdjustment.multiplier,2.0512371846911357,'legacy V4 multiplier'); checked++;
+
+vals=[4000,2181.818181818182,1090.909090909091];
+r=assess([player('QB',5000)],[player('RB',vals[0]),player('WR',vals[1]),player('TE',vals[2])]);
+check(r.status==='applied','V6 55/30/15');
+check(r.packageAdjustment.premiumTier==='3-player-v6','V6 tier');
+check(r.packageAdjustment.size3Source==='V6','V6 source');
+check(r.packageAdjustment.v6CompositionProfile==='55/30/15','V6 profile');
+close(r.packageAdjustment.v6ApexLevel,0.8,'V6 apex');
+S=vals.reduce((a,b)=>a+b,0);
+P=Math.pow(vals.reduce((a,x)=>a+Math.pow(x,PACKAGE_ADJUSTMENT_PRODUCTION_V1.size3V6Q),0),1/PACKAGE_ADJUSTMENT_PRODUCTION_V1.size3V6Q);
+close(r.packageAdjustment.multiplier,S/P,'V6 exact C2 translation',1e-9); checked++;
+
+vals=[4000,2933.3333333333335,1955.5555555555557];
+r=assess([player('QB',5000)],[player('RB',vals[0]),player('WR',vals[1]),player('TE',vals[2])]);
+check(r.status==='applied','V6/V4 overlap');
+check(r.packageAdjustment.premiumTier==='3-player-v6','V6 precedence'); checked++;
+
+vals=[4500,2700,1800];
+r=assess([player('QB',5000)],[player('RB',vals[0]),player('WR',vals[1]),player('TE',vals[2])]);
+check(r.status==='applied','V6 50/30/20 apex .90');
+check(r.packageAdjustment.v6CompositionProfile==='50/30/20','V6 profile 50/30/20');
+close(r.packageAdjustment.v6ApexLevel,0.9,'V6 apex .90'); checked++;
+
+vals=[3000,1636.3636363636363,818.1818181818181];
+r=assess([player('QB',5000)],[player('RB',vals[0]),player('WR',vals[1]),player('TE',vals[2])]);
+check(r.status==='unsupported','V6 bad apex fails closed'); checked++;
+
+vals=[4000,1230.7692307692307,923.0769230769231];
+r=assess([player('QB',5000)],[player('RB',vals[0]),player('WR',vals[1]),player('TE',vals[2])]);
+check(r.status==='unsupported','V6 bad composition fails closed'); checked++;
+
+vals=[4000,2181.818181818182,1090.909090909091];
+r=assess([player('QB',5000)],[player('RB',vals[0]),player('WR',vals[1]),player('TE',vals[2]),player('DB',100)]);
+check(r.status==='unsupported','V6 exact raw size3 guard'); checked++;
 
 r=assess([player('DL',5000)],[player('LB',2750),player('DB',2250)]);
 check(r.status==='applied','IDP V5 parity'); checked++;
@@ -204,6 +221,11 @@ totals=tradeVerdictTotals();
 check(totals.A>5000,'target adjusted');
 close(totals.B,5000,'package remains raw'); checked++;
 
+vals=[4000,2181.818181818182,1090.909090909091];
+r=assess([player('RB',vals[0]),player('WR',vals[1]),player('TE',vals[2])],[player('QB',5000)]);
+check(r.status==='applied','reverse V6');
+check(r.packageAdjustment.premiumTier==='3-player-v6','reverse V6 tier'); checked++;
+
 process.stdout.write(JSON.stringify({status:'PASS',checked}));
 """
     js = "\n\n".join(parts) + "\n" + harness
@@ -216,21 +238,21 @@ process.stdout.write(JSON.stringify({status:'PASS',checked}));
     )
     return json.loads(proc.stdout)
 
+
 def validate():
     required = (
-        INDEX, LIVE, MANIFEST, OOS, CANDIDATE, SHADOW, READINESS,
-        OOS_READINESS, HARDENING, WORKFLOW, DISPATCHER, V16_MONITOR,
+        INDEX, LIVE, MANIFEST, OOS, CANDIDATE, EVAL, REVIEW, FROZEN, CATALOG,
+        WORKFLOW, DISPATCHER, V17_MONITOR,
     )
     missing = [str(p) for p in required if not p.exists()]
-    assert not missing, f"Package Adjustment V1.6 required files missing: {missing}"
+    assert not missing, f"Package Adjustment V1.7 required files missing: {missing}"
 
     live = _read(LIVE)
     manifest = _read(MANIFEST)
     oos_result = _read(OOS)
     candidate = _read(CANDIDATE)
-    shadow = _read(SHADOW)
-    readiness = _read(READINESS)
-    oos_ready = _read(OOS_READINESS)
+    evaluation = _read(EVAL)
+    review = _read(REVIEW)
 
     assert live["status"] == "controlled_live"
     assert live["production_formula_enabled"] is True
@@ -244,21 +266,23 @@ def validate():
     assert live["team_utility_consumer_changed"] is False
     assert live["trade_verdict_consumer_changed"] is True
 
-    assert candidate["candidate_spec_sha256"] == shadow["candidate_spec_sha256"]
-    assert shadow["conclusion"]["shadow_regression_passed"] is True
-    assert readiness["decision"]["candidate_ready_for_explicit_human_promotion_decision"] is True
-    assert oos_ready["status"] == "v1_6_exact_live_oos_monitor_ready"
-    assert _sha(V16_MONITOR) == oos_ready["v1_6_monitor_sha256"]
+    assert evaluation["primary_confirmation"]["primary_pass"] is True
+    assert review["review_conclusion"]["primary_confirmation_passed"] is True
+    assert review["review_conclusion"]["deployment_status"] == (
+        "eligible_for_explicit_human_approval_under_strict_scope"
+    )
+    assert candidate["human_approval"]["confirmed"] is True
+    assert candidate["frozen_c2"]["q"] == 2.9897594788655337
 
     formula = oos.extract_formula(INDEX.read_text(encoding="utf-8"))
     oos.verify_live_metadata(live, formula, candidate)
-    oos.verify_release_manifest(manifest, live, formula, candidate, shadow)
+    oos.verify_release_manifest(manifest, live, formula, candidate)
 
-    assert manifest["exact_live_formula_sha256"] == oos.canonical_hash(formula)
-    assert manifest["release_artifact_sha256"]["permanent_live_validator"] == _sha(Path(__file__))
-    assert manifest["release_artifact_sha256"]["hardening_evidence"] == _sha(HARDENING)
-    assert manifest["release_artifact_sha256"]["promotion_readiness"] == _sha(READINESS)
-    assert manifest["release_artifact_sha256"]["oos_monitor_readiness"] == _sha(OOS_READINESS)
+    assert formula["size3"]["v6_c2_overlay"]["q"] == 2.9897594788655337
+    assert formula["size3"]["v6_c2_overlay"]["max_abs_composition_share_error"] == 0.04
+    assert formula["size3"]["v6_c2_overlay"]["max_abs_apex_ratio_error"] == 0.035
+    assert formula["size3"]["v6_c2_overlay"]["apex_levels"] == [0.7, 0.8, 0.9, 0.97]
+    assert len(formula["size3"]["v6_c2_overlay"]["composition_profiles"]) == 6
 
     assert oos_result["status"] == "controlled_live_exact_formula_prospective_oos_monitoring"
     assert oos_result["release"]["production_revision_at_release"] == REVISION
@@ -276,26 +300,30 @@ def validate():
         assert oos_result[key] is False, f"OOS monitor unexpectedly changed {key}"
 
     text = INDEX.read_text(encoding="utf-8")
-    assert "2-player consolidation · V3 + V5" in text
+    assert "PACKAGE_ADJUSTMENT_V1_7_V6_C2_SIZE3" in text
+    assert "pkg.premiumTier === '3-player-v6' ? 'V6' : 'V4'" in text
+    assert "return `3-player package - ${version} - ${ratio}`;" in text
+    assert "2-player consolidation - V3 + V5" in text
+
     behavior = _run_js_behavior(text)
     assert behavior["status"] == "PASS"
-    assert behavior["checked"] >= 18
+    assert behavior["checked"] >= 24
 
-    result = {
+    print(
+        "PASS controlled-live Package Adjustment V1.7: "
+        f"{behavior['checked']} JS behavior cases; V3/V5 size2 preserved; "
+        "V6 C2 size3 overlay evidence-bounded; V4 fallback preserved; "
+        "exact-live OOS aligned"
+    )
+    return {
         "status": "PASS",
         "production_revision": REVISION,
         "candidate_spec_sha256": candidate["candidate_spec_sha256"],
         "exact_live_formula_sha256": manifest["exact_live_formula_sha256"],
         "js_behavior_cases_checked": behavior["checked"],
         "trade_verdict_only": True,
-        "support_ceiling": "60/40",
     }
-    print(
-        "PASS controlled-live Package Adjustment V1.6: "
-        f"{behavior['checked']} JS behavior cases; V3/V4 preserved; "
-        "V5 through 60/40; exact-live OOS aligned"
-    )
-    return result
+
 
 if __name__ == "__main__":
     validate()

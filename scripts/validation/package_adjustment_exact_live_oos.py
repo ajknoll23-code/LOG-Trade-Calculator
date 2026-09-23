@@ -22,6 +22,7 @@ VALIDATION_DIR = ROOT / "scripts/validation"
 REVISION_TO_SCRIPT = {
     "v1.5-audit-step6-scope-ui-idp": VALIDATION_DIR / "package_adjustment_exact_live_oos_v1_5.py",
     "v1.6-v5-size2-composition-overlay": VALIDATION_DIR / "package_adjustment_exact_live_oos_v1_6.py",
+    "v1.7-v6-size3-c2-overlay": VALIDATION_DIR / "package_adjustment_exact_live_oos_v1_7.py",
 }
 
 def resolve_revision():
