@@ -16,15 +16,15 @@
 ## Artifact coverage
 
 - Total projected players: **1444**
-- Position counts: **{"DB": 336, "DL": 343, "LB": 225, "QB": 75, "RB": 133, "TE": 132, "WR": 200}**
-- Source counts: **{"fantasypros_normalized_fallback": 84, "idp_v1_both": 461, "idp_v1_fp_only": 8, "idp_v1_no_new_data": 2, "idp_v1_sleeper_only": 433, "sleeper_league_scored": 456}**
+- Position counts: **{"DB": 336, "DL": 343, "LB": 223, "QB": 75, "RB": 133, "TE": 133, "WR": 201}**
+- Source counts: **{"fantasypros_normalized_fallback": 86, "idp_v1_both": 461, "idp_v1_fp_only": 8, "idp_v1_no_new_data": 2, "idp_v1_sleeper_only": 431, "sleeper_league_scored": 456}**
 
 ## Current league validation
 
 - Teams checked: **12**
 - Teams with all 17 legal slots fillable: **12 / 12**
 - Teams with a projection-complete non-K starting lineup: **12 / 12**
-- Active non-K roster projection coverage: **97.86%**
+- Active non-K roster projection coverage: **98.11%**
 - Selected non-K players needing fallback: **0**
 
 ## Team detail
@@ -37,7 +37,7 @@
 | Landry's Hat | 100.0% | 17/17 | 0 |
 | Pullham Bluecocks  | 97.1% | 17/17 | 0 |
 | Cock Mchorse 🐴 | 94.3% | 17/17 | 0 |
-| Jersey Bagels | 87.9% | 17/17 | 0 |
+| Jersey Bagels | 91.4% | 17/17 | 0 |
 | Apex Predators | 97.2% | 17/17 | 0 |
 | Toddy2times | 100.0% | 17/17 | 0 |
 | Moose Knuckles | 100.0% | 17/17 | 0 |
@@ -46,7 +46,7 @@
 
 ## Identity / provenance
 
-- FantasyPros IDs mapped to Sleeper IDs: **968**
+- FantasyPros IDs mapped to Sleeper IDs: **970**
 - Manual-review identity rows skipped: **0**
 
 The artifact is deterministic: its input file SHA-256 hashes are stored in the JSON, and no wall-clock timestamp is embedded.
