@@ -1,0 +1,808 @@
+#!/usr/bin/env python3
+"""Freeze Draft Pick FV V6 structural-continuity preregistration.
+
+This stage is design-only. It reads predecessor manifests/catalog
+metadata but never reads historical NFL outcome rows, current market
+values, package-vote outcomes, or 2024 player outcomes.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+ROOT = Path.cwd()
+D = ROOT / "research" / "draft-pick-fv-v6"
+V3 = ROOT / "research" / "draft-pick-fv-v3"
+V4 = ROOT / "research" / "draft-pick-fv-v4"
+V5 = ROOT / "research" / "draft-pick-fv-v5"
+
+OUT_JSON = D / "structural_continuity_preregistration_v6.json"
+OUT_MD = D / "structural_continuity_preregistration_v6.md"
+OUT_MANIFEST = (
+    D / "structural_continuity_preregistration_manifest_v6.json"
+)
+
+PICK_BASE = {
+    "1": {"early": 7500.0, "mid": 5854.0, "late": 5244.0},
+    "2": {"early": 3906.0, "mid": 3624.0, "late": 3291.0},
+    "3": {"early": 2692.0, "mid": 2682.0, "late": 2319.0},
+    "4": {"early": 1972.0, "mid": 1831.0, "late": 1689.0},
+    "5": {"early": 1414.0, "mid": 1250.0, "late": 1118.0},
+    "6": {"early": 1014.0, "mid": 853.0, "late": 740.0},
+}
+YEAR_DISCOUNT = {"2027": 1.0, "2028": 0.85, "2029": 0.72}
+CELLS = [
+    f"r{r}_{tier}"
+    for r in range(1, 5)
+    for tier in ("early", "mid", "late")
+]
+
+def read_json(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def git_blob(path: Path) -> str:
+    return subprocess.check_output(
+        ["git", "hash-object", str(path)], text=True
+    ).strip()
+
+def git_head() -> str:
+    return subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], text=True
+    ).strip()
+
+def main() -> None:
+    if any(p.exists() for p in (OUT_JSON, OUT_MD, OUT_MANIFEST)):
+        raise RuntimeError("V6 preregistration output already exists")
+
+    v5_close = read_json(
+        V5 / "r1_r2_v5_research_closeout.json"
+    )
+    v5_close_m = read_json(
+        V5 / "r1_r2_v5_research_closeout_manifest.json"
+    )
+    v3_pre = read_json(V3 / "preregistration_v3.json")
+    v3_catalog = read_json(
+        V3 / "historical_draft_source_catalog_v3.json"
+    )
+    v3_repair = read_json(
+        V3 / "historical_draft_pick_contract_repair_summary_v3.json"
+    )
+    v3_repair_m = read_json(
+        V3 / "historical_draft_pick_contract_repair_manifest_v3.json"
+    )
+    v5_amend = read_json(
+        V5 / "r1_r2_bridge_preoutcome_amendment_v5_1.json"
+    )
+    v5_ident = read_json(
+        V5 / "r1_r2_source_identity_summary_v5_1.json"
+    )
+    v4_close = read_json(
+        V4 / "clean_source_recovery_manifest_v4.json"
+    )
+
+    assert v5_close["status"] == \
+        "V5_RESEARCH_CLOSED_NO_ELIGIBLE_CANDIDATE"
+    assert v5_close["selected_candidate"] is None
+    assert v5_close["v5_refit_allowed"] is False
+    assert v5_close_m["research_complete"] is True
+    assert v4_close["decision"] == \
+        "STOP_V4_CLEAN_SOURCE_RECOVERY_INSUFFICIENT"
+
+    r1_r4_league_n = sum(
+        int(row["primary_r1_r4"])
+        for row in v3_catalog["counts_by_year"].values()
+    )
+    assert r1_r4_league_n == 213
+    assert v3_catalog["contains_player_outcomes"] is False
+    assert v3_catalog["contains_market_or_ktc_values"] is False
+    assert v3_repair["historical_player_outcomes_read"] is False
+    assert v3_repair_m["historical_player_outcomes_read"] is False
+    assert v3_repair_m["source_catalog_gate_pass"] is True
+
+    # V5.1 establishes that occurrence-level identity/retention,
+    # not unique-player coverage, is the operational source gate.
+    assert v5_ident["identity_gate"]["pick_occurrence_coverage"] >= 0.95
+    assert v5_amend["historical_player_outcomes_read"] is False
+
+    generated = datetime.now(timezone.utc).isoformat()
+
+    prereg = {
+        "schema_version": 1,
+        "study_id": "draft-pick-fv-v6-r1-r4-structural-continuity",
+        "stage": "phase1_preregistration",
+        "status": "FROZEN_PRE_V6_R3_R4_OUTCOME_ACCESS",
+        "generated_at_utc": generated,
+        "preregistered_at_head_sha": git_head(),
+        "research_only": True,
+        "production_change_authorized": False,
+        "question": (
+            "Can a continuous R1-R4 Draft Pick Fundamental Value "
+            "curve materially improve realized player-equivalent "
+            "accuracy while preserving monotone continuity into the "
+            "frozen R5-R6 production table?"
+        ),
+        "reason_for_v6": {
+            "v5_final_decision":
+                v5_close["final_decision"],
+            "v5_c2_validation_improvement_vs_C0":
+                v5_close["candidate_summary"][
+                    "C2_R1_R2_ROUND_RESCALE"
+                ]["validation_improvement_vs_C0"],
+            "v5_c2_only_failed_gate":
+                v5_close["candidate_summary"][
+                    "C2_R1_R2_ROUND_RESCALE"
+                ]["failed_eligibility_gates"],
+            "v5_c2_boundary_violation":
+                v5_close["structural_violations"][
+                    "C2_R1_R2_ROUND_RESCALE"
+                ],
+            "v5_c3_validation_improvement_vs_C0":
+                v5_close["candidate_summary"][
+                    "C3_R1_R2_LOW_PARAMETER_TIER_CURVE"
+                ]["validation_improvement_vs_C0"],
+            "interpretation": (
+                "V5 demonstrated a large scale mismatch but could "
+                "not alter R1-R2 without creating an R2-to-R3 "
+                "upward discontinuity. V6 is a new study that "
+                "expands the fitted scope through R4 rather than "
+                "repairing V5 after validation."
+            ),
+        },
+        "evidence_status": {
+            "2018_2023_r1_r2_outcomes_previously_exposed":
+                True,
+            "2022_2023_are_spent_validation_classes":
+                True,
+            "2018_2023_usage_in_v6":
+                "development_and_cross_validation_only",
+            "v6_prereg_workflow_reads_r3_r4_nfl_outcomes":
+                False,
+            "v6_prereg_workflow_reads_2024_nfl_outcomes":
+                False,
+            "2024_primary_h3_is_future_clean_confirmation":
+                True,
+            "no_claim_that_2018_2023_are_fresh_holdout":
+                True,
+        },
+        "frozen_deployed_baseline": {
+            "candidate_id": "C0_DEPLOYED",
+            "pick_base_2027": PICK_BASE,
+            "year_discount_context_only": YEAR_DISCOUNT,
+            "r5_r6_fit_status": "frozen_not_fit",
+            "r5_boundary_anchor":
+                {"r5_early": PICK_BASE["5"]["early"]},
+        },
+        "source_population": {
+            "development_years":
+                [2018, 2019, 2020, 2021, 2022, 2023],
+            "provider": "MyFantasyLeague",
+            "format": "12-team Superflex/2QB dynasty rookie drafts",
+            "primary_scope": "R1-R4",
+            "frozen_v3_source_catalog_reused": True,
+            "frozen_v3_primary_r1_r4_league_n": r1_r4_league_n,
+            "counts_by_year": {
+                y: v["primary_r1_r4"]
+                for y, v in v3_catalog["counts_by_year"].items()
+            },
+            "development_source_rule": (
+                "Reuse the exact frozen V3 primary_r1_r4 league "
+                "catalog and pre-outcome harvested occurrence file. "
+                "Do not conduct a new 2018-2023 league search."
+            ),
+            "development_occurrence_source":
+                "historical_draft_pick_contract_repair_v3.jsonl",
+            "development_occurrence_source_git_blob":
+                git_blob(
+                    V3 /
+                    "historical_draft_pick_contract_repair_v3.jsonl"
+                ),
+            "2024_holdout_source": {
+                "provider": "MyFantasyLeague",
+                "source_search_allowed_after_prereg": True,
+                "same_league_eligibility_rules_as_v3_primary_r1_r4":
+                    True,
+                "minimum_eligible_leagues": 19,
+                "minimum_reason": (
+                    "19 is the smallest frozen historical "
+                    "primary_r1_r4 class count (2018); threshold "
+                    "is fixed before 2024 outcomes are read."
+                ),
+                "must_be_frozen_before_candidate_fit": True,
+                "alternate_provider_after_fit_or_holdout_results":
+                    False,
+            },
+        },
+        "source_and_identity_contract": {
+            "invalid_occurrence_rule": (
+                "Omit and flag invalid/nonplayer occurrences; do not "
+                "requalify or discard an otherwise frozen league."
+            ),
+            "duplicate_player_same_league_rule": (
+                "Retain first valid occurrence, exclude later "
+                "duplicate occurrence, flag anomaly; no whole-league "
+                "removal."
+            ),
+            "operational_identity_denominator":
+                "retained pick occurrences",
+            "unique_player_identity_coverage":
+                "diagnostic_only_not_gate",
+            "minimum_occurrence_identity_coverage": 0.95,
+            "minimum_year_cell_retention": 0.95,
+            "minimum_year_cell_identity_coverage": 0.95,
+            "stable_identity_priority": [
+                "existing exact MFL-to-GSIS/Sleeper crosswalk",
+                "existing FantasyPros-to-Sleeper crosswalk",
+                "nflverse stable ID corroboration",
+                (
+                    "unambiguous normalized name + frozen "
+                    "draft-era position + draft class"
+                ),
+            ],
+            "manual_post_outcome_identity_adjudication_allowed":
+                False,
+            "v5_1_occurrence_semantics_inherited": True,
+        },
+        "historical_outcome_contract": {
+            "provider": "Sleeper historical weekly NFL stats",
+            "scoring_logic": (
+                "reviewed league scoring from "
+                "historical_weekly_points_pipeline.py"
+            ),
+            "weeks": list(range(1, 19)),
+            "availability_gate": (
+                "Every development class must have nonempty H1-H3 "
+                "season data before fitting. A missing required "
+                "season excludes the class before fit and forces "
+                "the six-class feasibility gate to be re-evaluated."
+            ),
+            "replacement_pool_position_lineage_hardening": {
+                "target_rookie_position": (
+                    "prefer frozen draft-era source position"
+                ),
+                "full_nfl_replacement_pool_position": (
+                    "season-appropriate nflverse roster position "
+                    "mapped by stable player ID; do not classify "
+                    "historical replacement pools from a current "
+                    "2026 Sleeper position snapshot"
+                ),
+                "reason": (
+                    "V5 audit found current-position lineage could "
+                    "reclassify historical IDP replacement pools."
+                ),
+            },
+            "O1_shape": {
+                "name":
+                    "three_year_replacement_adjusted_football_utility",
+                "annual_surplus": (
+                    "max(0, season_total - "
+                    "replacement_ppg*scheduled_games)"
+                ),
+                "H3": "sum years 1-3",
+                "use": "shape_robustness_only_not_FV",
+            },
+            "O2_scale": {
+                "name": "three_year_player_equivalent_fv",
+                "base_scale": 5500.0,
+                "realized_prod_mult": (
+                    "0 if zero games; otherwise "
+                    "clamp(-0.10 + 0.75 * "
+                    "(season_total/(replacement_ppg*scheduled_games)), "
+                    "0.15, 1.55)"
+                ),
+                "age_as_of": "September 1 of evaluated season",
+                "role": "Starter",
+                "aggregation":
+                    "arithmetic mean of annual equivalents",
+            },
+            "frozen_replacement_ranks":
+                v3_pre["frozen_replacement_ranks"],
+            "frozen_position_weights":
+                v3_pre["frozen_scale_bridge"]["position_weight"],
+            "scheduled_games":
+                {"through_2020": 16, "2021_and_later": 17},
+        },
+        "fit_weighting": {
+            "draft_class_weight":
+                "each 2018-2023 class contributes equal total weight",
+            "cell_weight":
+                "12 R1-R4 production cells receive equal macro weight",
+            "league_weight": (
+                "within class and cell, frozen eligible leagues "
+                "receive equal total weight"
+            ),
+            "occurrence_weight": (
+                "retained occurrences divide their league-cell "
+                "weight equally"
+            ),
+            "player_independence": (
+                "repeated league selections of the same rookie are "
+                "not independent; inferential resampling clusters by "
+                "stable player identity within draft class"
+            ),
+        },
+        "candidate_families": {
+            "C0_DEPLOYED": {
+                "eligible": False,
+                "role": "baseline_only_never_refit",
+                "definition":
+                    "exact deployed R1-R6 PICK_BASE",
+                "effective_parameters": 0,
+            },
+            "C1_ROUNDWISE_RESCALE_R1_R4": {
+                "eligible": True,
+                "effective_parameters": 4,
+                "definition": (
+                    "For rounds 1-4, multiply every deployed tier "
+                    "within round r by k_r. R5-R6 remain exact."
+                ),
+                "bounds": {
+                    "k1": [0.15, 1.25],
+                    "k2": [0.15, 1.25],
+                    "k3": [0.15, 1.25],
+                    "k4": [0.15, 1.25],
+                },
+                "optimizer": (
+                    "exact weighted-LAD linear program using "
+                    "scipy.optimize.linprog(method='highs')"
+                ),
+                "structural_constraints": [
+                    "all 18 production cells positive",
+                    (
+                        "all 18 cells non-increasing in exact "
+                        "round/tier slot order"
+                    ),
+                    "R5-R6 unchanged",
+                    "R4 late >= frozen R5 early 1414",
+                ],
+            },
+            "C2_ANCHORED_ADDITIVE_ROUND_TIER_CURVE": {
+                "eligible": True,
+                "effective_parameters": 5,
+                "definition": (
+                    "For R1-R4: value = A "
+                    "- s12*I(round>=2) "
+                    "- s34*max(round-2,0) "
+                    "- tier_penalty[tier], where early penalty=0."
+                ),
+                "parameters": [
+                    "A", "s12", "s34",
+                    "mid_penalty", "late_penalty"
+                ],
+                "bounds": {
+                    "A": [2000.0, 9000.0],
+                    "s12": [0.0, 5000.0],
+                    "s34": [0.0, 3000.0],
+                    "mid_penalty": [0.0, 2500.0],
+                    "late_penalty": [0.0, 3500.0],
+                },
+                "constraints": [
+                    "0 <= mid_penalty <= late_penalty",
+                    "late_penalty <= s12",
+                    "late_penalty <= s34",
+                    "R4 late >= 1414",
+                    "R5-R6 unchanged",
+                ],
+                "optimizer": (
+                    "exact weighted-LAD linear program using "
+                    "scipy.optimize.linprog(method='highs')"
+                ),
+            },
+            "C3_SHRUNK_MONOTONE_SLOT_CURVE_R1_R4": {
+                "eligible": True,
+                "definition": (
+                    "Fit C2 on the training classes; compute "
+                    "year-balanced exact-slot H3 O2 means for "
+                    "slots 1-48; shrink each exact-slot mean toward "
+                    "its C2 slot prediction using alpha pseudo-drafts; "
+                    "apply weighted PAVA with a hard lower anchor "
+                    "of 1414 at the R4->R5 boundary; aggregate slots "
+                    "1-4,5-8,9-12 within each round."
+                ),
+                "alpha_grid":
+                    [3, 6, 12, 24, 48, 96, 192],
+                "alpha_selection": (
+                    "six-class leave-one-draft-year-out H3 O2 "
+                    "macro MAE; among alphas within 1% relative of "
+                    "best choose the largest alpha to favor more "
+                    "shrinkage"
+                ),
+                "edge_alpha_rule": (
+                    "if selected alpha is 3 or 192, C3 is "
+                    "development-ineligible because shrinkage is "
+                    "not identified inside the preregistered grid"
+                ),
+                "R5_R6": "frozen unchanged",
+            },
+            "D1_BOUNDARY_FREE_ROUNDWISE_DIAGNOSTIC": {
+                "eligible": False,
+                "definition": (
+                    "Same as C1 but omits only the R4-late >= "
+                    "R5-early boundary. Development diagnostic "
+                    "quantifying the cost of freezing R5-R6. It can "
+                    "never be selected or deployed in V6."
+                ),
+            },
+        },
+        "development_selection": {
+            "method":
+                "leave-one-draft-class-out cross-validation",
+            "folds": [
+                {"held_out": y,
+                 "fit_on": [z for z in range(2018, 2024) if z != y]}
+                for y in range(2018, 2024)
+            ],
+            "primary_metric": (
+                "equal-year equal-cell macro MAE on H3 O2 "
+                "three_year_player_equivalent_fv"
+            ),
+            "C0_fit": "never",
+            "final_parameter_fit": (
+                "after family selection, refit selected family once "
+                "on all 2018-2023 development classes; freeze before "
+                "any 2024 outcome is opened"
+            ),
+            "bootstrap": {
+                "replicates": 10000,
+                "seed": 20260923,
+                "paired": True,
+                "cluster":
+                    "stable player identity within draft class",
+                "quantity":
+                    "candidate minus C0 LOYO macro MAE",
+                "eligibility_rule": (
+                    "one-sided 95% upper confidence bound < 0"
+                ),
+            },
+            "eligibility_gates": [
+                "LOYO H3 O2 macro MAE improvement vs C0 >= 5%",
+                "improve vs C0 in at least 5 of 6 held-out classes",
+                (
+                    "worst held-out class relative MAE regression "
+                    "vs C0 <= 10%"
+                ),
+                (
+                    "paired player-cluster bootstrap one-sided 95% "
+                    "upper bound for candidate-minus-C0 MAE < 0"
+                ),
+                (
+                    "H3 O1 normalized-shape error regression "
+                    "vs C0 <= 2%"
+                ),
+                (
+                    "H2 O2 macro MAE relative regression vs C0 "
+                    "<= 2%"
+                ),
+                (
+                    "mature H4 O2 macro MAE relative regression "
+                    "vs C0 <= 2%"
+                ),
+                "all 18 production cells positive",
+                "all 18 production cells monotone non-increasing",
+                "R5-R6 exactly unchanged",
+                "R4 late >= frozen R5 early 1414",
+                "development occurrence identity coverage >=95%",
+                "every development year x cell retention >=95%",
+                "every development year x cell identity >=95%",
+                "no forbidden outcome/market/vote leakage",
+                (
+                    "no final numeric parameter at a preregistered "
+                    "hard numeric bound within 1e-6 relative, unless "
+                    "the equality is an explicit structural anchor"
+                ),
+            ],
+            "winner_pool": [
+                "C1_ROUNDWISE_RESCALE_R1_R4",
+                "C2_ANCHORED_ADDITIVE_ROUND_TIER_CURVE",
+                "C3_SHRUNK_MONOTONE_SLOT_CURVE_R1_R4",
+            ],
+            "winner_rule": (
+                "lowest LOYO H3 O2 macro MAE among eligible "
+                "families; candidates within 1% relative MAE of "
+                "best are resolved by fewer effective fitted "
+                "degrees of freedom in C1,C2,C3 order"
+            ),
+            "none_eligible":
+                "STOP_NO_V6_R1_R4_DEVELOPMENT_CANDIDATE",
+        },
+        "temporal_holdout_2024": {
+            "source_and_identity_must_be_frozen_before_fit": True,
+            "outcomes_sealed_until_final_candidate_frozen": True,
+            "current_interim_horizon": "H2_2024_and_2025_only",
+            "interim_H2_can_authorize_production": False,
+            "interim_H2_continue_gate": [
+                "H2 O2 equal-cell macro MAE improvement vs C0 >=5%",
+                (
+                    "no round-level H2 O2 MAE regression vs C0 "
+                    "worse than 5%"
+                ),
+                (
+                    "H2 O1 normalized-shape error regression "
+                    "vs C0 <=2%"
+                ),
+                "all source/identity gates remain satisfied",
+            ],
+            "interim_fail_decision":
+                "STOP_V6_2024_H2_TEMPORAL_CONFIRMATION",
+            "future_primary_H3": {
+                "class": 2024,
+                "seasons": [2024, 2025, 2026],
+                "partial_2026_data_allowed": False,
+                "scoring_not_before": (
+                    "2026 NFL regular season is complete and "
+                    "Week 18 statistics are published"
+                ),
+                "primary_gate": [
+                    (
+                        "H3 O2 equal-cell macro MAE improvement "
+                        "vs C0 >=5%"
+                    ),
+                    (
+                        "no round-level H3 O2 MAE regression vs C0 "
+                        "worse than 5%"
+                    ),
+                    (
+                        "H3 O1 normalized-shape error regression "
+                        "vs C0 <=2%"
+                    ),
+                    "interim 2024 H2 continue gate previously passed",
+                    "candidate parameters unchanged since freeze",
+                ],
+                "pass_decision":
+                    "PASS_V6_2024_H3_CONFIRMATION_HUMAN_REVIEW_NEXT",
+                "fail_decision":
+                    "STOP_V6_2024_H3_CONFIRMATION",
+            },
+        },
+        "external_postselection_audits": {
+            "only_after_2024_H3_pass": True,
+            "frozen_mock_trade_replay": {
+                "allowed": True,
+                "used_for_fit": False,
+                "used_for_family_selection": False,
+                "can_retroactively_refit_candidate": False,
+                "sources": [
+                    (
+                        "Package Adjustment V4 frozen "
+                        "pick-containing confirmation catalog"
+                    ),
+                    (
+                        "Trade Robustness V1 frozen pick "
+                        "sensitivity shadow cases"
+                    ),
+                ],
+                "purpose": (
+                    "describe trade-result stability, softening, "
+                    "and flips under the already-frozen V6 values"
+                ),
+            },
+            "market_or_ktc_comparison": {
+                "allowed_after_candidate_freeze": True,
+                "fit_target": False,
+                "selection_input": False,
+                "purpose":
+                    "descriptive scale/market disagreement only",
+            },
+        },
+        "forbidden": [
+            "treating 2022-2023 as fresh validation",
+            "post-V5 repair or overwrite of V5 artifacts",
+            "new 2018-2023 league search",
+            "R5-R6 fitting or production changes in V6",
+            "YEAR_DISCOUNT fitting or changes",
+            "KTC/current market values as fit or selection targets",
+            "package votes as fit or selection targets",
+            "2024 outcome access before V6 final candidate freeze",
+            (
+                "2026 realized NFL outcomes before future 2024 H3 "
+                "confirmation stage"
+            ),
+            "partial-2026 H3 scoring",
+            "manual identity adjudication after V6 outcome access",
+            "candidate-family changes after development outcomes",
+            "candidate refit after 2024 holdout is opened",
+            "automatic production deployment",
+        ],
+        "stage_gates": {
+            "after_phase1": (
+                "Freeze R1-R4 development and 2024 holdout "
+                "source/identity only. No NFL outcomes."
+            ),
+            "after_phase2": (
+                "If 2018-2023 or 2024 source/identity gates fail, "
+                "stop before any V6 outcome ingestion."
+            ),
+            "after_phase3": (
+                "Harvest/rebuild 2018-2023 R1-R4 outcomes using "
+                "season-appropriate position lineage. Keep 2024 "
+                "outcomes sealed."
+            ),
+            "after_phase4": (
+                "Run LOYO development selection, refit selected "
+                "family on all 2018-2023, freeze exact candidate. "
+                "Do not open 2024 outcomes during fit."
+            ),
+            "after_phase5": (
+                "Open only 2024 H2 (2024-2025 seasons) once. "
+                "It may stop the study but cannot authorize "
+                "production."
+            ),
+            "future_phase6": (
+                "After 2026 regular season completion, score frozen "
+                "candidate on 2024 H3 exactly once."
+            ),
+            "after_H3_pass": (
+                "Run external frozen trade replay and descriptive "
+                "market comparison, then require separate human "
+                "production review/deployment."
+            ),
+        },
+        "next_stage":
+            "draft-pick-fv-v6-phase2-r1-r4-source-identity-freeze",
+        "source_fingerprints": {
+            "v5_closeout_sha256":
+                sha256(
+                    V5 / "r1_r2_v5_research_closeout.json"
+                ),
+            "v5_closeout_manifest_sha256":
+                sha256(
+                    V5 /
+                    "r1_r2_v5_research_closeout_manifest.json"
+                ),
+            "v3_preregistration_sha256":
+                sha256(V3 / "preregistration_v3.json"),
+            "v3_source_catalog_sha256":
+                sha256(
+                    V3 /
+                    "historical_draft_source_catalog_v3.json"
+                ),
+            "v3_occurrence_harvest_sha256":
+                sha256(
+                    V3 /
+                    "historical_draft_pick_contract_repair_v3.jsonl"
+                ),
+            "v3_occurrence_summary_sha256":
+                sha256(
+                    V3 /
+                    "historical_draft_pick_contract_repair_summary_v3.json"
+                ),
+            "v3_occurrence_manifest_sha256":
+                sha256(
+                    V3 /
+                    "historical_draft_pick_contract_repair_manifest_v3.json"
+                ),
+            "v5_1_identity_amendment_sha256":
+                sha256(
+                    V5 /
+                    "r1_r2_bridge_preoutcome_amendment_v5_1.json"
+                ),
+            "v5_1_identity_summary_sha256":
+                sha256(
+                    V5 /
+                    "r1_r2_source_identity_summary_v5_1.json"
+                ),
+        },
+    }
+
+    OUT_JSON.write_text(
+        json.dumps(prereg, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    lines = [
+        "# Draft Pick FV V6 — R1–R4 Structural Continuity Preregistration",
+        "",
+        "**Status:** `FROZEN_PRE_V6_R3_R4_OUTCOME_ACCESS`",
+        "",
+        "V6 is a new study, not a repair of V5.",
+        "",
+        "## Why V6 exists",
+        "",
+        (
+            "V5 showed that materially lower R1/R2 values fit "
+            "realized player-equivalent outcomes much better, but "
+            "the strongest simple candidate failed only because "
+            "lower R2 values were spliced onto the untouched R3 "
+            "table. V6 therefore fits R1–R4 as one continuous "
+            "early-round system."
+        ),
+        "",
+        "## Frozen scope",
+        "",
+        "- Fit: **R1–R4**",
+        "- Frozen: **R5–R6**",
+        "- Frozen R5 boundary anchor: **R5 early = 1414**",
+        "- YEAR_DISCOUNT: **unchanged / not fit**",
+        "- Development classes: **2018–2023**",
+        "- 2022–2023 status: **spent V5 evidence; development only**",
+        "- Future clean primary confirmation: **2024 rookie H3**",
+        "",
+        "## Candidate families",
+        "",
+        "- **C1:** four round-specific rescale parameters, exact LAD LP",
+        "- **C2:** five-parameter anchored additive round/tier curve, exact LAD LP",
+        "- **C3:** shrunk exact-slot monotone curve with PAVA and R5 boundary anchor",
+        "- **D1:** boundary-free diagnostic only; cannot win",
+        "",
+        "## Selection firewall",
+        "",
+        (
+            "Candidate family selection uses six-class leave-one-"
+            "draft-year-out development scoring. The final selected "
+            "candidate is then refit once on all 2018–2023 and "
+            "frozen before any 2024 player outcome is opened."
+        ),
+        "",
+        "## 2024 temporal confirmation",
+        "",
+        (
+            "After candidate freeze, V6 may score only 2024 H2 "
+            "(2024–2025 seasons). H2 cannot authorize production. "
+            "The primary H3 confirmation remains sealed until the "
+            "2026 NFL regular season is complete."
+        ),
+        "",
+        "## Source strategy",
+        "",
+        (
+            "2018–2023 reuses the exact frozen V3 213-league R1–R4 "
+            "source catalog and pre-outcome occurrence harvest; no "
+            "new historical league search is allowed. Phase 2 will "
+            "apply V5.1 occurrence-level identity semantics and "
+            "freeze a new 2024 source/identity holdout before fit."
+        ),
+        "",
+        "## Production",
+        "",
+        "- Production change authorized: **No**",
+        "- Automatic promotion: **No**",
+        "- External mock-trade replay: **after 2024 H3 pass only**",
+        "",
+        f"Next stage: `{prereg['next_stage']}`",
+        "",
+    ]
+    OUT_MD.write_text("\n".join(lines), encoding="utf-8")
+
+    manifest = {
+        "schema_version": 1,
+        "study_id": prereg["study_id"],
+        "stage": prereg["stage"],
+        "status": prereg["status"],
+        "generated_at_utc": generated,
+        "preregistered_at_head_sha":
+            prereg["preregistered_at_head_sha"],
+        "production_change_authorized": False,
+        "historical_r3_r4_outcomes_read": False,
+        "holdout_2024_outcomes_read": False,
+        "candidate_fit_performed": False,
+        "candidate_selection_performed": False,
+        "next_stage": prereg["next_stage"],
+        "input_hashes": prereg["source_fingerprints"],
+        "output_hashes": {
+            OUT_JSON.name: sha256(OUT_JSON),
+            OUT_MD.name: sha256(OUT_MD),
+        },
+    }
+    OUT_MANIFEST.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    print(
+        "DECISION=PASS_V6_PHASE1_STRUCTURAL_CONTINUITY_"
+        "PREREGISTRATION_FROZEN_SOURCE_IDENTITY_NEXT"
+    )
+    print("DEVELOPMENT=2018-2023 R1-R4")
+    print("HOLDOUT=2024 H2 interim / H3 future primary")
+    print("R5_R6=FROZEN")
+
+if __name__ == "__main__":
+    main()
