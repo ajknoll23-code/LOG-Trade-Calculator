@@ -1,0 +1,2592 @@
+# PREFLIGHTED: V6_PHASE2_R1_R4_SOURCE_IDENTITY_FREEZE_V1
+name: Draft Pick FV V6 - Phase 2 R1-R4 Source Identity Freeze
+
+"on":
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      base_sha: ${{ steps.base.outputs.sha }}
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Capture starting main
+        id: base
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13.15'
+
+      - name: Install transport dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir             "requests==2.34.2"
+
+      - name: Guard exact frozen predecessor blobs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+          declare -A EXPECTED=(
+            ["research/draft-pick-fv-v6/structural_continuity_preregistration_v6.json"]="87c25b5390f75707934deb6d28b5513e6c93cf25"
+            ["research/draft-pick-fv-v6/structural_continuity_preregistration_manifest_v6.json"]="8607689dbc0c657702e29fe1e96203fc84a17846"
+            ["research/draft-pick-fv-v6/structural_continuity_preoutcome_amendment_v6_1.json"]="574c7645c6afa4c8272b0ac1bd77319b6d680de0"
+            ["research/draft-pick-fv-v6/structural_continuity_preoutcome_amendment_manifest_v6_1.json"]="a1046d3239bd7c015ff9c3574e42267195156483"
+            ["research/draft-pick-fv-v3/rookie_scope_contamination_audit_v3.json"]="c9eaf80c70a295f46a1908c2c45995dede303b92"
+            ["research/draft-pick-fv-v4/clean_source_recovery_v4.json"]="24d998b9fadd4c6336ae229de9252fe688680f0f"
+            ["research/draft-pick-fv-v5/r1_r2_source_lineage_v5.json"]="f743400e05a76c2968b0013bd280aa09b2d166a9"
+            ["research/draft-pick-fv-v3/mfl_validated_proxy_feasibility_v1.json"]="e726d0fcc7f2630e958482be5efffadae95e5955"
+            ["scripts/identity_crosswalk.json"]="ed34038ee0c711861616ed01219e458520c11867"
+          )
+
+          for path in "${!EXPECTED[@]}"; do
+            actual="$(git hash-object "$path")"
+            if [ "$actual" != "${EXPECTED[$path]}" ]; then
+              echo "ERROR: frozen predecessor blob drift: $path"
+              echo "expected=${EXPECTED[$path]}"
+              echo "actual=$actual"
+              exit 1
+            fi
+          done
+
+          for p in             research/draft-pick-fv-v6/build_r1_r4_source_identity_v6_1.py             research/draft-pick-fv-v6/r1_r4_development_pick_identity_v6_1.jsonl             research/draft-pick-fv-v6/r1_r4_holdout_2024_pick_identity_v6_1.jsonl             research/draft-pick-fv-v6/r1_r4_source_catalog_v6_1.json             research/draft-pick-fv-v6/r1_r4_source_identity_summary_v6_1.json             research/draft-pick-fv-v6/r1_r4_source_identity_summary_v6_1.md             research/draft-pick-fv-v6/r1_r4_source_identity_manifest_v6_1.json
+          do
+            test ! -e "$p"
+          done
+
+          echo "PASS: exact V6.1 Phase 2 predecessor and overwrite guards."
+
+      - name: Write Phase 2 source and identity engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "${RUNNER_TEMP}/build_r1_r4_source_identity_v6_1.py" <<'PY'
+          #!/usr/bin/env python3
+          """Draft Pick FV V6.1 Phase 2: clean R1-R4 source + identity freeze.
+
+          Pre-outcome only:
+          - rebuilds exact R1-R4 draft occurrences for the frozen 378 clean 2018-2023
+            league cohort;
+          - discovers and contamination-screens the 2024 temporal holdout under the
+            frozen V6.1 source contract;
+          - freezes deterministic player identities and league-balanced occurrence
+            weights;
+          - never reads NFL player outcomes, market/KTC values, package votes, or
+            candidate scores.
+          """
+
+          from __future__ import annotations
+
+          import argparse
+          import csv
+          import hashlib
+          import json
+          import math
+          import re
+          import statistics
+          import time
+          import unicodedata
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from typing import Any
+          from urllib.parse import urlencode
+
+          import requests
+
+          ROOT = Path.cwd()
+          V3 = ROOT / "research" / "draft-pick-fv-v3"
+          V4 = ROOT / "research" / "draft-pick-fv-v4"
+          V5 = ROOT / "research" / "draft-pick-fv-v5"
+          V6 = ROOT / "research" / "draft-pick-fv-v6"
+
+          PRE = V6 / "structural_continuity_preregistration_v6.json"
+          PRE_MAN = V6 / "structural_continuity_preregistration_manifest_v6.json"
+          AMEND = V6 / "structural_continuity_preoutcome_amendment_v6_1.json"
+          AMEND_MAN = V6 / "structural_continuity_preoutcome_amendment_manifest_v6_1.json"
+          V3_CONTAM = V3 / "rookie_scope_contamination_audit_v3.json"
+          V4_RECOVERY = V4 / "clean_source_recovery_v4.json"
+          V5_LINEAGE = V5 / "r1_r2_source_lineage_v5.json"
+          V3_FEAS = V3 / "mfl_validated_proxy_feasibility_v1.json"
+          FP_XWALK = ROOT / "scripts" / "identity_crosswalk.json"
+
+          OUT_SCRIPT = V6 / "build_r1_r4_source_identity_v6_1.py"
+          OUT_DEV_PICKS = V6 / "r1_r4_development_pick_identity_v6_1.jsonl"
+          OUT_HOLDOUT_PICKS = V6 / "r1_r4_holdout_2024_pick_identity_v6_1.jsonl"
+          OUT_CATALOG = V6 / "r1_r4_source_catalog_v6_1.json"
+          OUT_SUMMARY = V6 / "r1_r4_source_identity_summary_v6_1.json"
+          OUT_MD = V6 / "r1_r4_source_identity_summary_v6_1.md"
+          OUT_MAN = V6 / "r1_r4_source_identity_manifest_v6_1.json"
+
+          STUDY_ID = "draft-pick-fv-v6-r1-r4-structural-continuity"
+          YEARS = (2018, 2019, 2020, 2021, 2022, 2023)
+          HOLDOUT_YEAR = 2024
+          EXPECTED_BY_YEAR = {
+              2018: 31, 2019: 50, 2020: 59,
+              2021: 64, 2022: 90, 2023: 84,
+          }
+          EXPECTED_DEV_LEAGUES = 378
+          EXPECTED_DEV_OCCURRENCES = EXPECTED_DEV_LEAGUES * 48
+          MIN_COVERAGE = 0.95
+          MIN_2024_LEAGUES = 19
+          BASE = "https://api.myfantasyleague.com"
+
+          SEARCH_TERMS = [
+              "dynasty", "superflex", "super flex", "2qb", "2 qb", "rookie",
+              "idp", "devy", "empire", "contract", "salary", "taxi",
+              "fantasy", "football", "league",
+          ]
+          MAX_PER_TERM = 50
+          REQUEST_SLEEP = 1.10
+          REQUEST_RETRIES = 9
+
+          DP_SHA256 = "0174ea890e71d33fa0afc1b846ce1c92273542278a287b6bd52c3a4aa5edce73"
+          NV_SHA256 = "4dd70f328f31b0bb7cbf043412298d5a325863e27b8f2eeea22c9e925c808dee"
+
+          DP_COLUMNS = [
+              "mfl_id", "gsis_id", "sleeper_id", "name", "merge_name",
+              "position", "draft_year", "db_season",
+          ]
+          NV_COLUMNS = ["gsis_id", "display_name", "position", "rookie_season"]
+          SENTINELS = {"", "0", "0000", "----", "NA", "N/A", "NULL", "NONE", "NAN"}
+
+          CELLS = tuple(
+              f"r{rnd}_{tier}"
+              for rnd in range(1, 5)
+              for tier in ("early", "mid", "late")
+          )
+
+
+          class GateError(RuntimeError):
+              pass
+
+
+          def now() -> str:
+              return datetime.now(timezone.utc).isoformat()
+
+
+          def load(path: Path) -> dict[str, Any]:
+              return json.loads(path.read_text(encoding="utf-8"))
+
+
+          def read_jsonl(path: Path) -> list[dict[str, Any]]:
+              rows = []
+              with path.open(encoding="utf-8") as f:
+                  for n, line in enumerate(f, 1):
+                      if not line.strip():
+                          continue
+                      try:
+                          row = json.loads(line)
+                      except json.JSONDecodeError as exc:
+                          raise GateError(f"{path}:{n}: invalid JSONL: {exc}") from exc
+                      if not isinstance(row, dict):
+                          raise GateError(f"{path}:{n}: row not object")
+                      rows.append(row)
+              return rows
+
+
+          def write_json(path: Path, obj: Any) -> None:
+              path.write_text(
+                  json.dumps(obj, indent=2, sort_keys=True) + "\n",
+                  encoding="utf-8",
+              )
+
+
+          def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+              with path.open("w", encoding="utf-8") as f:
+                  for row in rows:
+                      f.write(
+                          json.dumps(row, sort_keys=True, separators=(",", ":"))
+                          + "\n"
+                      )
+
+
+          def sha256(path: Path) -> str:
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+          def canonical_sha(obj: Any) -> str:
+              raw = json.dumps(
+                  obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+              ).encode("utf-8")
+              return hashlib.sha256(raw).hexdigest()
+
+
+          def stable_hash(text: str) -> str:
+              return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+          def as_list(x: Any) -> list[Any]:
+              if x is None:
+                  return []
+              return x if isinstance(x, list) else [x]
+
+
+          def safe_int(x: Any) -> int | None:
+              try:
+                  s = str(x).strip()
+              except Exception:
+                  return None
+              if not re.fullmatch(r"[+-]?\d+", s):
+                  return None
+              try:
+                  return int(s)
+              except ValueError:
+                  return None
+
+
+          def stable_id(x: Any) -> str | None:
+              s = str(x or "").strip()
+              if not s or s.upper() in SENTINELS:
+                  return None
+              return s
+
+
+          def norm(x: Any) -> str:
+              return re.sub(r"\s+", " ", str(x or "").strip()).lower()
+
+
+          def clean_name(x: Any) -> str:
+              s = str(x or "").strip()
+              if "," in s:
+                  bits = [z.strip() for z in s.split(",", 1)]
+                  if len(bits) == 2 and bits[0] and bits[1]:
+                      s = bits[1] + " " + bits[0]
+              s = unicodedata.normalize("NFKD", s)
+              s = "".join(ch for ch in s if not unicodedata.combining(ch))
+              s = s.lower()
+              s = re.sub(r"\b(jr|sr|ii|iii|iv|v)\b\.?", " ", s)
+              s = s.replace("'", "").replace("’", "")
+              s = re.sub(r"[^a-z0-9]+", " ", s)
+              return re.sub(r"\s+", " ", s).strip()
+
+
+          def norm_position(x: Any) -> str:
+              s = str(x or "").strip().upper()
+              return {
+                  "DE": "DL", "DT": "DL", "NT": "DL", "EDGE": "DL",
+                  "ILB": "LB", "OLB": "LB",
+                  "CB": "DB", "S": "DB", "FS": "DB", "SS": "DB",
+              }.get(s, s)
+
+
+          def explicit_devy_marker(name: Any) -> bool:
+              n = norm(name)
+              return bool(
+                  re.search(r"\bdevy\b", n)
+                  or re.search(r"\bdevy pick\b", n)
+                  or re.search(r"\bdevy placeholder\b", n)
+                  or re.search(r"\bplaceholder devy\b", n)
+              )
+
+
+          def tier_for_within(within: int) -> str:
+              if 1 <= within <= 4:
+                  return "early"
+              if 5 <= within <= 8:
+                  return "mid"
+              if 9 <= within <= 12:
+                  return "late"
+              raise GateError(f"invalid within-round pick: {within}")
+
+
+          def cell_for(round_no: int, within: int) -> str:
+              if round_no not in {1, 2, 3, 4}:
+                  raise GateError(f"invalid round: {round_no}")
+              return f"r{round_no}_{tier_for_within(within)}"
+
+
+          def api_url(year: int, endpoint: str, **params: Any) -> str:
+              q = {"TYPE": endpoint, "JSON": 1}
+              q.update({k: v for k, v in params.items() if v is not None})
+              return f"{BASE}/{year}/export?" + urlencode(q)
+
+
+          def get_json(
+              session: requests.Session,
+              url: str,
+              retries: int = REQUEST_RETRIES,
+              sleep_seconds: float = REQUEST_SLEEP,
+          ) -> dict[str, Any]:
+              last: Exception | None = None
+              fallback_429 = (20, 30, 45, 60, 90, 120, 120, 120)
+              for attempt in range(retries):
+                  try:
+                      r = session.get(url, timeout=60)
+                      if r.status_code == 429:
+                          try:
+                              server_wait = float(r.headers.get("Retry-After") or 0)
+                          except ValueError:
+                              server_wait = 0.0
+                          wait = max(
+                              server_wait,
+                              float(fallback_429[min(attempt, len(fallback_429) - 1)]),
+                          )
+                          last = GateError(f"HTTP 429; cooldown={wait:.0f}s")
+                          if attempt + 1 >= retries:
+                              break
+                          print(
+                              f"MFL 429 attempt {attempt+1}/{retries}; "
+                              f"sleeping {wait:.0f}s",
+                              flush=True,
+                          )
+                          time.sleep(wait)
+                          continue
+                      r.raise_for_status()
+                      obj = r.json()
+                      if not isinstance(obj, dict):
+                          raise GateError("non-object JSON")
+                      time.sleep(sleep_seconds)
+                      return obj
+                  except (requests.RequestException, ValueError, GateError) as exc:
+                      last = exc
+                      if attempt + 1 < retries:
+                          wait = min(60.0, 5.0 * (2 ** min(attempt, 4)))
+                          print(
+                              f"MFL transport attempt {attempt+1}/{retries}: "
+                              f"{type(exc).__name__}; sleeping {wait:.0f}s",
+                              flush=True,
+                          )
+                          time.sleep(wait)
+              raise GateError(
+                  f"transport failure after {retries} attempts: "
+                  f"{type(last).__name__}: {last}"
+              )
+
+
+          # ---------- Frozen contract guards ----------
+
+          def guard_contract() -> dict[str, Any]:
+              pre = load(PRE)
+              pm = load(PRE_MAN)
+              amend = load(AMEND)
+              am = load(AMEND_MAN)
+              contam = load(V3_CONTAM)
+              v4 = load(V4_RECOVERY)
+              lineage = load(V5_LINEAGE)
+              feas = load(V3_FEAS)
+
+              if pre["status"] != "FROZEN_PRE_V6_R3_R4_OUTCOME_ACCESS":
+                  raise GateError("V6 Phase 1 status drift")
+              if pre["next_stage"] != (
+                  "draft-pick-fv-v6-phase2-r1-r4-source-identity-freeze"
+              ):
+                  raise GateError("V6 Phase 1 next-stage drift")
+              for key in (
+                  "historical_r3_r4_outcomes_read",
+                  "holdout_2024_outcomes_read",
+                  "candidate_fit_performed",
+                  "candidate_selection_performed",
+                  "production_change_authorized",
+              ):
+                  if pm[key] is not False:
+                      raise GateError(f"Phase 1 firewall drift: {key}")
+
+              if amend["decision"] != (
+                  "PASS_V6_1_CLEAN_SOURCE_AMENDMENT_FROZEN_PHASE2_AUTHORIZED"
+              ):
+                  raise GateError("V6.1 amendment decision drift")
+              if am["decision"] != amend["decision"]:
+                  raise GateError("V6.1 manifest decision drift")
+              if amend["next_stage"] != (
+                  "draft-pick-fv-v6-phase2-r1-r4-source-identity-freeze-v6-1"
+              ):
+                  raise GateError("V6.1 next-stage drift")
+              for obj in (amend, am):
+                  for key in (
+                      "historical_r3_r4_outcomes_read",
+                      "holdout_2024_outcomes_read",
+                      "candidate_fit_performed",
+                      "candidate_selection_performed",
+                      "production_change_authorized",
+                  ):
+                      if obj[key] is not False:
+                          raise GateError(f"V6.1 firewall drift: {key}")
+
+              dev = amend["source_contract_replacement"][
+                  "frozen_clean_development_source"
+              ]
+              got_counts = {int(k): int(v) for k, v in dev["counts_by_year"].items()}
+              if int(dev["league_n"]) != EXPECTED_DEV_LEAGUES:
+                  raise GateError("V6.1 clean development league count drift")
+              if got_counts != EXPECTED_BY_YEAR:
+                  raise GateError("V6.1 clean development by-year drift")
+              if int(dev["v3_clean_seed_n"]) != 172:
+                  raise GateError("V6.1 V3 clean seed drift")
+              if int(dev["v4_new_clean_n"]) != 206:
+                  raise GateError("V6.1 V4 clean expansion drift")
+              if dev["new_2018_2023_source_search_allowed"] is not False:
+                  raise GateError("historical source-search lock drift")
+
+              hold = amend["holdout_2024_source_contract"]
+              if int(hold["minimum_clean_full4_leagues"]) != MIN_2024_LEAGUES:
+                  raise GateError("2024 minimum cohort drift")
+              dd = hold["discovery_design"]
+              if dd["search_terms"] != SEARCH_TERMS:
+                  raise GateError("2024 search terms drift")
+              if int(dd["max_per_term"]) != MAX_PER_TERM:
+                  raise GateError("2024 search cap drift")
+              if dd["probe_entire_bounded_unique_union"] is not True:
+                  raise GateError("2024 complete-union rule drift")
+              if dd["search_failures_are_fatal"] is not True:
+                  raise GateError("2024 search failure rule drift")
+
+              if contam["audit_counts"]["frozen_catalog_league_n"] != 213:
+                  raise GateError("V3 contamination source total drift")
+              if contam["audit_counts"]["clean_league_n"] != 172:
+                  raise GateError("V3 clean seed total drift")
+              if contam["audit_counts"]["positive_contaminated_league_n"] != 41:
+                  raise GateError("V3 contamination total drift")
+              if contam["historical_player_outcomes_read"] is not False:
+                  raise GateError("V3 contamination audit read outcomes")
+
+              if v4["clean_totals"]["primary_r1_r4"] != 378:
+                  raise GateError("V4 clean R1-R4 total drift")
+              if v4["historical_player_outcomes_read"] is not False:
+                  raise GateError("V4 source recovery read outcomes")
+
+              if lineage["clean_full_r4_total"] != 378:
+                  raise GateError("V5 clean lineage total drift")
+              if lineage["clean_full_r4_counts_by_year"] != {
+                  str(k): v for k, v in EXPECTED_BY_YEAR.items()
+              }:
+                  raise GateError("V5 clean lineage by-year drift")
+              if lineage["historical_player_outcomes_read"] is not False:
+                  raise GateError("V5 lineage read outcomes")
+
+              if feas["historical_player_outcomes_read"] is not False:
+                  raise GateError("V3 source feasibility read outcomes")
+              if feas["discovery_design"]["search_terms"] != SEARCH_TERMS:
+                  raise GateError("V3 discovery terms drift")
+              if feas["discovery_design"]["max_per_term"] != MAX_PER_TERM:
+                  raise GateError("V3 discovery cap drift")
+
+              return {
+                  "pre": pre,
+                  "pm": pm,
+                  "amend": amend,
+                  "am": am,
+                  "contam": contam,
+                  "v4": v4,
+                  "lineage": lineage,
+                  "feas": feas,
+              }
+
+
+          def build_clean_development_sources(
+              contam: dict[str, Any],
+              v4: dict[str, Any],
+          ) -> list[dict[str, Any]]:
+              rows = []
+              for row in contam["league_audit"]:
+                  if row["positive_rookie_scope_contamination"]:
+                      continue
+                  if not row["scope"].get("primary_r1_r4"):
+                      continue
+                  rows.append({
+                      "draft_year": int(row["draft_year"]),
+                      "league_id": str(row["league_id"]),
+                      "league_name": row.get("league_name"),
+                      "idp": bool(row.get("idp", False)),
+                      "source_origin": "v3_clean_seed",
+                      "positive_contamination": False,
+                  })
+              for row in v4["new_source_evidence"]["rows"]:
+                  if row["positive_contamination"]:
+                      continue
+                  if not row.get("primary_r1_r4"):
+                      continue
+                  rows.append({
+                      "draft_year": int(row["draft_year"]),
+                      "league_id": str(row["league_id"]),
+                      "league_name": row.get("league_name"),
+                      "idp": bool(row.get("idp", False)),
+                      "source_origin": "v4_expanded_clean",
+                      "positive_contamination": False,
+                  })
+              rows.sort(key=lambda x: (x["draft_year"], int(x["league_id"])))
+              keys = [(x["draft_year"], x["league_id"]) for x in rows]
+              if len(keys) != len(set(keys)):
+                  dup = [k for k, n in Counter(keys).items() if n > 1]
+                  raise GateError(f"duplicate clean source keys: {dup[:10]}")
+              if len(rows) != EXPECTED_DEV_LEAGUES:
+                  raise GateError(
+                      f"clean source count {len(rows)} != {EXPECTED_DEV_LEAGUES}"
+                  )
+              got = Counter(x["draft_year"] for x in rows)
+              if dict(sorted(got.items())) != EXPECTED_BY_YEAR:
+                  raise GateError(f"clean source by-year drift: {dict(got)}")
+              return rows
+
+
+          # ---------- MFL league and draft parsing ----------
+
+          def search_ids(data: dict[str, Any]) -> list[str]:
+              leagues = data.get("leagues")
+              if not isinstance(leagues, dict):
+                  return []
+              out = []
+              for row in as_list(leagues.get("league")):
+                  if not isinstance(row, dict):
+                      continue
+                  lid = row.get("id") or row.get("league_id") or row.get("leagueId")
+                  if lid is not None:
+                      out.append(str(lid))
+              return out
+
+
+          def league_obj(data: dict[str, Any]) -> dict[str, Any] | None:
+              x = data.get("league")
+              return x if isinstance(x, dict) else None
+
+
+          def franchise_count(lg: dict[str, Any]) -> int | None:
+              f = lg.get("franchises")
+              return safe_int(f.get("count")) if isinstance(f, dict) else None
+
+
+          def qb_limit(lg: dict[str, Any]) -> str | None:
+              starters = lg.get("starters")
+              if not isinstance(starters, dict):
+                  return None
+              for row in as_list(starters.get("position")):
+                  if (
+                      isinstance(row, dict)
+                      and str(row.get("name", "")).upper() == "QB"
+                  ):
+                      v = str(row.get("limit", "")).strip()
+                      return v or None
+              return None
+
+
+          def keeper_state(lg: dict[str, Any]) -> str:
+              if (
+                  "keeperType" not in lg
+                  or lg.get("keeperType") is None
+                  or norm(lg.get("keeperType")) == ""
+              ):
+                  return "missing"
+              v = norm(lg.get("keeperType"))
+              if v == "dynasty":
+                  return "dynasty"
+              if v == "keeper":
+                  return "keeper"
+              if v in {"none", "redraft"}:
+                  return "none"
+              return f"other:{v}"
+
+
+          def rookie_pool(lg: dict[str, Any]) -> bool:
+              return norm(lg.get("draftPlayerPool")).startswith("rook")
+
+
+          def is_idp(lg: dict[str, Any]) -> bool:
+              starters = lg.get("starters")
+              if not isinstance(starters, dict):
+                  return False
+              x = starters.get("idp_starters")
+              if isinstance(x, str):
+                  return bool(x.strip())
+              return bool(x)
+
+
+          def qualifier(lg: dict[str, Any]) -> tuple[bool, str]:
+              if franchise_count(lg) != 12:
+                  return False, "not_12_team"
+              if qb_limit(lg) not in {"1-2", "2"}:
+                  return False, "not_superflex"
+              if not rookie_pool(lg):
+                  return False, "not_rookie_pool"
+              ks = keeper_state(lg)
+              if ks == "dynasty":
+                  return True, "explicit_dynasty"
+              if ks == "missing":
+                  return True, "validated_missing_keeper_proxy"
+              return False, f"observed_non_dynasty:{ks}"
+
+
+          def obvious_mock_name(name: Any) -> bool:
+              n = norm(name)
+              return any(tok in n for tok in ("mock", "draft master", "draftmasters"))
+
+
+          def extract_units(data: dict[str, Any]) -> list[dict[str, Any]]:
+              root = data.get("draftResults")
+              if not isinstance(root, dict):
+                  return []
+              return [
+                  u for u in as_list(root.get("draftUnit"))
+                  if isinstance(u, dict)
+              ]
+
+
+          def unit_type(unit: dict[str, Any]) -> str:
+              return str(unit.get("type") or "").strip().upper()
+
+
+          def choose_unit(
+              units: list[dict[str, Any]],
+          ) -> tuple[dict[str, Any] | None, str, list[dict[str, Any]]]:
+              summary = []
+              for i, unit in enumerate(units):
+                  picks = [
+                      p for p in as_list(unit.get("draftPick"))
+                      if isinstance(p, dict)
+                  ]
+                  summary.append({
+                      "unit_index": i,
+                      "type": unit_type(unit) or None,
+                      "pick_n": len(picks),
+                  })
+              if len(units) == 1:
+                  return units[0], "single_draft_unit", summary
+              league_units = [u for u in units if unit_type(u) == "LEAGUE"]
+              if len(league_units) == 1:
+                  return league_units[0], "unique_LEAGUE_draft_unit", summary
+              return None, "ambiguous_multiple_draft_units", summary
+
+
+          def canonical_r1_r4(unit: dict[str, Any] | None) -> dict[str, Any]:
+              if unit is None:
+                  return {
+                      "slots": {},
+                      "missing_slots": list(range(1, 49)),
+                      "duplicate_slots": [],
+                      "duplicate_players": [],
+                      "invalid_grid": [],
+                  }
+              raw = [
+                  p for p in as_list(unit.get("draftPick"))
+                  if isinstance(p, dict)
+              ]
+              slots: dict[int, dict[str, Any]] = {}
+              duplicate_slots = []
+              invalid_grid = []
+              for row_index, p in enumerate(raw):
+                  rnd = safe_int(p.get("round"))
+                  within = safe_int(p.get("pick"))
+                  if rnd is None or within is None:
+                      continue
+                  if rnd < 1 or rnd > 4 or within < 1:
+                      continue
+                  if within > 12:
+                      invalid_grid.append({
+                          "row_index": row_index,
+                          "round": rnd,
+                          "pick": within,
+                      })
+                      continue
+                  slot = (rnd - 1) * 12 + within
+                  if slot in slots:
+                      duplicate_slots.append({
+                          "overall_slot": slot,
+                          "first_row_index": slots[slot]["raw_row_index"],
+                          "duplicate_row_index": row_index,
+                      })
+                      continue
+                  slots[slot] = {
+                      "overall_slot": slot,
+                      "round": rnd,
+                      "within_round_pick": within,
+                      "mfl_player_id": stable_id(p.get("player")),
+                      "franchise_id": stable_id(
+                          p.get("franchise")
+                          or p.get("franchise_id")
+                          or p.get("franchiseId")
+                      ),
+                      "raw_row_index": row_index,
+                  }
+
+              seen: dict[str, int] = {}
+              duplicate_players = []
+              for slot in sorted(slots):
+                  pid = slots[slot]["mfl_player_id"]
+                  if not pid:
+                      continue
+                  if pid in seen:
+                      duplicate_players.append({
+                          "mfl_player_id": pid,
+                          "first_slot": seen[pid],
+                          "removed_slot": slot,
+                      })
+                      slots[slot]["mfl_player_id"] = None
+                  else:
+                      seen[pid] = slot
+
+              missing = [
+                  slot for slot in range(1, 49)
+                  if slot not in slots or not slots[slot].get("mfl_player_id")
+              ]
+              return {
+                  "slots": slots,
+                  "missing_slots": missing,
+                  "duplicate_slots": duplicate_slots,
+                  "duplicate_players": duplicate_players,
+                  "invalid_grid": invalid_grid,
+              }
+
+
+          def all_unit_pick_rows(units: list[dict[str, Any]]) -> dict[str, Any]:
+              rows = []
+              seen_slots = set()
+              duplicate_slot_n = 0
+              blank_n = 0
+              invalid_n = 0
+              for unit_index, unit in enumerate(units):
+                  for p in as_list(unit.get("draftPick")):
+                      if not isinstance(p, dict):
+                          continue
+                      rnd = safe_int(p.get("round"))
+                      within = safe_int(p.get("pick"))
+                      pid = stable_id(p.get("player"))
+                      if rnd is None or within is None or rnd < 1 or rnd > 6:
+                          continue
+                      if within < 1 or within > 12:
+                          invalid_n += 1
+                          continue
+                      if pid is None:
+                          blank_n += 1
+                          continue
+                      key = (rnd, within)
+                      if key in seen_slots:
+                          duplicate_slot_n += 1
+                      else:
+                          seen_slots.add(key)
+                      rows.append({
+                          "unit_index": unit_index,
+                          "round": rnd,
+                          "within_round_pick": within,
+                          "overall_slot": (rnd - 1) * 12 + within,
+                          "mfl_player_id": pid,
+                      })
+              filled = {
+                  str(r): sum((r, p) in seen_slots for p in range(1, 13))
+                  for r in range(1, 7)
+              }
+              return {
+                  "rows": rows,
+                  "filled_by_round": filled,
+                  "full4": all(filled[str(r)] == 12 for r in range(1, 5)),
+                  "duplicate_slot_occurrence_n": duplicate_slot_n,
+                  "blank_player_occurrence_n": blank_n,
+                  "invalid_pick_number_n": invalid_n,
+              }
+
+
+          # ---------- Identity ----------
+
+          def parse_players(data: dict[str, Any]) -> dict[str, dict[str, Any]]:
+              root = data.get("players")
+              if not isinstance(root, dict):
+                  return {}
+              out = {}
+              for row in as_list(root.get("player")):
+                  if not isinstance(row, dict):
+                      continue
+                  pid = stable_id(row.get("id") or row.get("player_id"))
+                  if not pid:
+                      continue
+                  out[pid] = {
+                      "name": stable_id(row.get("name")),
+                      "position": stable_id(row.get("position")),
+                      "draft_year": safe_int(row.get("draft_year")),
+                  }
+              return out
+
+
+          def league_scoped_players(
+              session: requests.Session,
+              year: int,
+              league_id: str,
+              player_ids: list[str],
+          ) -> dict[str, dict[str, Any]]:
+              ids = sorted(set(player_ids), key=lambda x: (len(x), x))
+              found: dict[str, dict[str, Any]] = {}
+              for start in range(0, len(ids), 100):
+                  chunk = ids[start:start + 100]
+                  data = get_json(
+                      session,
+                      api_url(
+                          year, "players", L=league_id, DETAILS=1,
+                          PLAYERS=",".join(chunk),
+                      ),
+                  )
+                  found.update(parse_players(data))
+              missing = [pid for pid in ids if pid not in found]
+              if missing:
+                  data = get_json(
+                      session,
+                      api_url(year, "players", L=league_id, DETAILS=1),
+                  )
+                  full = parse_players(data)
+                  for pid in missing:
+                      if pid in full:
+                          found[pid] = full[pid]
+              still = [pid for pid in ids if pid not in found]
+              if still:
+                  print(
+                      f"{year}/{league_id}: metadata unresolved for "
+                      f"{len(still)} IDs after targeted+full fetch; "
+                      f"retaining as diagnostic unknown/unresolved identity. "
+                      f"examples={still[:8]}",
+                      flush=True,
+                  )
+              return found
+
+
+          def load_identity_indexes(
+              dp_path: Path,
+              nv_path: Path,
+              fp_path: Path,
+          ) -> dict[str, Any]:
+              if sha256(dp_path) != DP_SHA256:
+                  raise GateError("DynastyProcess identity source hash mismatch")
+              if sha256(nv_path) != NV_SHA256:
+                  raise GateError("nflverse identity source hash mismatch")
+
+              by_mfl = {}
+              dp_by_name_pos_year = defaultdict(list)
+              dp_by_gsis = defaultdict(list)
+              with dp_path.open(newline="", encoding="utf-8-sig") as f:
+                  reader = csv.reader(f)
+                  header = next(reader)
+                  idx = {c: i for i, c in enumerate(header)}
+                  missing = [c for c in DP_COLUMNS if c not in idx]
+                  if missing:
+                      raise GateError(f"DynastyProcess missing columns: {missing}")
+                  for raw in reader:
+                      if len(raw) < len(header):
+                          raw += [""] * (len(header) - len(raw))
+                      row = {c: raw[idx[c]] for c in DP_COLUMNS}
+                      rec = {
+                          "mfl_id": stable_id(row["mfl_id"]),
+                          "gsis_id": stable_id(row["gsis_id"]),
+                          "sleeper_id": stable_id(row["sleeper_id"]),
+                          "name": stable_id(row["name"]),
+                          "merge_name": stable_id(row["merge_name"]),
+                          "position": stable_id(row["position"]),
+                          "draft_year": safe_int(row["draft_year"]),
+                      }
+                      mid = rec["mfl_id"]
+                      if mid:
+                          if mid in by_mfl:
+                              raise GateError(f"duplicate DynastyProcess MFL ID: {mid}")
+                          by_mfl[mid] = rec
+                      nm = clean_name(rec["merge_name"] or rec["name"])
+                      pos = norm_position(rec["position"])
+                      dy = rec["draft_year"]
+                      if nm and pos and dy is not None:
+                          dp_by_name_pos_year[(nm, pos, int(dy))].append(rec)
+                      if rec["gsis_id"]:
+                          dp_by_gsis[rec["gsis_id"]].append(rec)
+
+              nv_by_name_pos_year = defaultdict(list)
+              nv_years_by_name_pos = defaultdict(set)
+              with nv_path.open(newline="", encoding="utf-8-sig") as f:
+                  reader = csv.reader(f)
+                  header = next(reader)
+                  idx = {c: i for i, c in enumerate(header)}
+                  missing = [c for c in NV_COLUMNS if c not in idx]
+                  if missing:
+                      raise GateError(f"nflverse missing columns: {missing}")
+                  for raw in reader:
+                      if len(raw) < len(header):
+                          raw += [""] * (len(header) - len(raw))
+                      gsis = stable_id(raw[idx["gsis_id"]])
+                      name = stable_id(raw[idx["display_name"]])
+                      pos_raw = stable_id(raw[idx["position"]])
+                      rookie = safe_int(raw[idx["rookie_season"]])
+                      nm = clean_name(name)
+                      pos = norm_position(pos_raw)
+                      if gsis and nm and pos and rookie is not None:
+                          rec = {
+                              "gsis_id": gsis,
+                              "name": name,
+                              "position": pos_raw,
+                              "draft_year": int(rookie),
+                          }
+                          nv_by_name_pos_year[(nm, pos, int(rookie))].append(rec)
+                          nv_years_by_name_pos[(nm, pos)].add(int(rookie))
+
+              fp_obj = json.loads(fp_path.read_text(encoding="utf-8"))
+              if not isinstance(fp_obj, list):
+                  raise GateError("FantasyPros/Sleeper crosswalk is not a list")
+              fp_by_name_pos = defaultdict(list)
+              for row in fp_obj:
+                  if not isinstance(row, dict):
+                      continue
+                  sid = stable_id(row.get("sleeper_id"))
+                  nm = clean_name(row.get("name"))
+                  pos = norm_position(row.get("fp_position") or row.get("sleeper_pos"))
+                  if sid and nm and pos and not row.get("requires_manual_review", False):
+                      fp_by_name_pos[(nm, pos)].append({
+                          "sleeper_id": sid,
+                          "name": row.get("name"),
+                          "position": row.get("fp_position") or row.get("sleeper_pos"),
+                      })
+
+              return {
+                  "by_mfl": by_mfl,
+                  "dp_by_name_pos_year": dp_by_name_pos_year,
+                  "dp_by_gsis": dp_by_gsis,
+                  "nv_by_name_pos_year": nv_by_name_pos_year,
+                  "nv_years_by_name_pos": nv_years_by_name_pos,
+                  "fp_by_name_pos": fp_by_name_pos,
+              }
+
+
+          def unique_by_stable(
+              rows: list[dict[str, Any]],
+              fields: tuple[str, ...],
+          ) -> dict[str, Any] | None:
+              stable = {}
+              for row in rows:
+                  key = tuple(row.get(f) for f in fields)
+                  if not any(key):
+                      continue
+                  stable[key] = row
+              return next(iter(stable.values())) if len(stable) == 1 else None
+
+
+          def sleeper_for_gsis(
+              gsis: str | None,
+              idx: dict[str, Any],
+          ) -> str | None:
+              if not gsis:
+                  return None
+              ids = {
+                  row["sleeper_id"]
+                  for row in idx["dp_by_gsis"].get(gsis, [])
+                  if row.get("sleeper_id")
+              }
+              return next(iter(ids)) if len(ids) == 1 else None
+
+
+          def resolve_identity(
+              year: int,
+              mfl_id: str,
+              meta: dict[str, Any] | None,
+              idx: dict[str, Any],
+          ) -> dict[str, Any]:
+              exact = idx["by_mfl"].get(mfl_id)
+              if (
+                  exact
+                  and (exact.get("gsis_id") or exact.get("sleeper_id"))
+                  and (
+                      exact.get("draft_year") is None
+                      or int(exact["draft_year"]) == year
+                  )
+              ):
+                  return {
+                      "identity_resolved": True,
+                      "outcome_ready_sleeper_id": bool(exact.get("sleeper_id")),
+                      "identity_method": "exact_dynastyprocess_mfl_crosswalk",
+                      "gsis_id": exact.get("gsis_id"),
+                      "sleeper_id": exact.get("sleeper_id"),
+                      "name": exact.get("name"),
+                      "draft_position": exact.get("position"),
+                      "identity_draft_class": exact.get("draft_year"),
+                  }
+
+              name = (meta or {}).get("name") or (exact or {}).get("name")
+              pos_raw = (meta or {}).get("position") or (exact or {}).get("position")
+              nm = clean_name(name)
+              pos = norm_position(pos_raw)
+              key = (nm, pos, year)
+
+              nv = unique_by_stable(
+                  idx["nv_by_name_pos_year"].get(key, []),
+                  ("gsis_id",),
+              )
+
+              # Frozen priority 2: existing FantasyPros->Sleeper crosswalk, but only
+              # when draft-class identity is independently unique in nflverse.
+              fps = idx["fp_by_name_pos"].get((nm, pos), [])
+              fp = unique_by_stable(fps, ("sleeper_id",))
+              if fp is not None and nv is not None:
+                  return {
+                      "identity_resolved": True,
+                      "outcome_ready_sleeper_id": True,
+                      "identity_method":
+                          "fantasypros_sleeper_crosswalk_nflverse_class_corroborated",
+                      "gsis_id": nv["gsis_id"],
+                      "sleeper_id": fp["sleeper_id"],
+                      "name": fp["name"] or nv["name"],
+                      "draft_position": fp["position"] or nv["position"],
+                      "identity_draft_class": year,
+                  }
+
+              # Frozen priority 3: stable nflverse identity.
+              if nv is not None:
+                  sid = sleeper_for_gsis(nv["gsis_id"], idx)
+                  return {
+                      "identity_resolved": True,
+                      "outcome_ready_sleeper_id": bool(sid),
+                      "identity_method": "nflverse_name_position_draft_class",
+                      "gsis_id": nv["gsis_id"],
+                      "sleeper_id": sid,
+                      "name": nv["name"],
+                      "draft_position": nv["position"],
+                      "identity_draft_class": year,
+                  }
+
+              # Frozen priority 4: unambiguous normalized name+position+class in the
+              # pinned DynastyProcess identity table.
+              dp = unique_by_stable(
+                  idx["dp_by_name_pos_year"].get(key, []),
+                  ("gsis_id", "sleeper_id"),
+              )
+              if dp is not None:
+                  return {
+                      "identity_resolved": True,
+                      "outcome_ready_sleeper_id": bool(dp.get("sleeper_id")),
+                      "identity_method":
+                          "dynastyprocess_name_position_draft_class",
+                      "gsis_id": dp.get("gsis_id"),
+                      "sleeper_id": dp.get("sleeper_id"),
+                      "name": dp.get("name"),
+                      "draft_position": dp.get("position"),
+                      "identity_draft_class": year,
+                  }
+
+              return {
+                  "identity_resolved": False,
+                  "outcome_ready_sleeper_id": False,
+                  "identity_method": "unresolved",
+                  "gsis_id": (exact or {}).get("gsis_id"),
+                  "sleeper_id": (exact or {}).get("sleeper_id"),
+                  "name": name,
+                  "draft_position": pos_raw,
+                  "identity_draft_class": (exact or {}).get("draft_year"),
+              }
+
+
+          # ---------- Diagnostics and weights ----------
+
+          def occurrence_diagnostics(
+              rows: list[dict[str, Any]],
+              leagues: list[dict[str, Any]],
+              years: tuple[int, ...],
+              *,
+              year_weight_target: float,
+          ) -> dict[str, Any]:
+              expected_leagues_by_year = Counter(int(x["draft_year"]) for x in leagues)
+              valid_by_yc = Counter()
+              represented_yc = defaultdict(set)
+              valid_lgc = Counter()
+              valid_lgy = Counter()
+              represented_y = defaultdict(set)
+
+              for row in rows:
+                  y = int(row["draft_year"])
+                  lid = str(row["league_id"])
+                  cell = row["cell"]
+                  valid_by_yc[(y, cell)] += 1
+                  represented_yc[(y, cell)].add(lid)
+                  valid_lgc[(y, lid, cell)] += 1
+                  valid_lgy[(y, lid)] += 1
+                  represented_y[y].add(lid)
+
+              cell_diag = {}
+              gate_ret = True
+              gate_ident = True
+              gate_sleep = True
+
+              for y in years:
+                  nlg = expected_leagues_by_year[y]
+                  for cell in CELLS:
+                      rs = [r for r in rows if int(r["draft_year"]) == y and r["cell"] == cell]
+                      expected = nlg * 4
+                      valid = len(rs)
+                      ident = sum(bool(r["identity_resolved"]) for r in rs)
+                      sleeper = sum(bool(r["outcome_ready_sleeper_id"]) for r in rs)
+                      retention = valid / expected if expected else 0.0
+                      ident_cov = ident / valid if valid else 0.0
+                      sleep_cov = sleeper / valid if valid else 0.0
+                      represented = len(represented_yc[(y, cell)])
+                      represented_fraction = represented / nlg if nlg else 0.0
+                      cell_diag[f"{y}:{cell}"] = {
+                          "draft_year": y,
+                          "cell": cell,
+                          "frozen_league_n": nlg,
+                          "expected_occurrence_n": expected,
+                          "retained_occurrence_n": valid,
+                          "retention_fraction": retention,
+                          "represented_league_n": represented,
+                          "represented_league_fraction": represented_fraction,
+                          "identity_resolved_n": ident,
+                          "identity_coverage": ident_cov,
+                          "sleeper_ready_n": sleeper,
+                          "sleeper_ready_coverage": sleep_cov,
+                      }
+                      gate_ret = (
+                          gate_ret
+                          and retention >= MIN_COVERAGE
+                          and represented_fraction >= MIN_COVERAGE
+                      )
+                      gate_ident = gate_ident and ident_cov >= MIN_COVERAGE
+                      gate_sleep = gate_sleep and sleep_cov >= MIN_COVERAGE
+
+              # Freeze weights only after denominators are known.
+              for row in rows:
+                  y = int(row["draft_year"])
+                  lid = str(row["league_id"])
+                  cell = row["cell"]
+                  n_repr_cell = len(represented_yc[(y, cell)])
+                  n_lg_cell = valid_lgc[(y, lid, cell)]
+                  n_repr_year = len(represented_y[y])
+                  n_lg_year = valid_lgy[(y, lid)]
+                  if min(n_repr_cell, n_lg_cell, n_repr_year, n_lg_year) <= 0:
+                      raise GateError("invalid occurrence weight denominator")
+                  row["cell_weight_v6_1"] = (
+                      year_weight_target / n_repr_cell / n_lg_cell
+                  )
+                  row["source_weight_r1_r4_v6_1"] = (
+                      year_weight_target / n_repr_year / n_lg_year
+                  )
+
+              # Exact normalization.
+              cell_sums = defaultdict(float)
+              year_sums = defaultdict(float)
+              for row in rows:
+                  y = int(row["draft_year"])
+                  cell_sums[(y, row["cell"])] += float(row["cell_weight_v6_1"])
+                  year_sums[y] += float(row["source_weight_r1_r4_v6_1"])
+              for key, total in cell_sums.items():
+                  if not math.isclose(total, year_weight_target, rel_tol=0.0, abs_tol=1e-12):
+                      raise GateError(f"cell weight normalization failed {key}: {total}")
+              for y, total in year_sums.items():
+                  if not math.isclose(total, year_weight_target, rel_tol=0.0, abs_tol=1e-12):
+                      raise GateError(f"year weight normalization failed {y}: {total}")
+
+              overall_ident = (
+                  sum(bool(r["identity_resolved"]) for r in rows) / len(rows)
+                  if rows else 0.0
+              )
+              overall_sleep = (
+                  sum(bool(r["outcome_ready_sleeper_id"]) for r in rows) / len(rows)
+                  if rows else 0.0
+              )
+
+              return {
+                  "retention_gate_pass": gate_ret,
+                  "identity_gate_pass": gate_ident and overall_ident >= MIN_COVERAGE,
+                  "sleeper_gate_pass": gate_sleep and overall_sleep >= MIN_COVERAGE,
+                  "overall_identity_coverage": overall_ident,
+                  "overall_sleeper_ready_coverage": overall_sleep,
+                  "cell_year": cell_diag,
+                  "year_weight_target": year_weight_target,
+                  "weight_normalization_proved": True,
+              }
+
+
+          def stable_player_key(ident: dict[str, Any]) -> str | None:
+              if ident.get("sleeper_id"):
+                  return "sleeper:" + str(ident["sleeper_id"])
+              if ident.get("gsis_id"):
+                  return "gsis:" + str(ident["gsis_id"])
+              return None
+
+
+          # ---------- Historical year worker ----------
+
+          def historical_year(
+              year: int,
+              out_path: Path,
+              dp_path: Path,
+              nv_path: Path,
+          ) -> None:
+              if year not in YEARS:
+                  raise GateError(f"unsupported historical year: {year}")
+              state = guard_contract()
+              sources = [
+                  x for x in build_clean_development_sources(
+                      state["contam"], state["v4"]
+                  )
+                  if int(x["draft_year"]) == year
+              ]
+              if len(sources) != EXPECTED_BY_YEAR[year]:
+                  raise GateError("historical year source count drift")
+
+              idx = load_identity_indexes(dp_path, nv_path, FP_XWALK)
+              session = requests.Session()
+              session.headers.update({
+                  "User-Agent":
+                      f"LOG-Trade-Calculator-Draft-Pick-FV-V6-Phase2-{year}/1.0"
+              })
+
+              leagues = []
+              occurrences = []
+
+              for i, src in enumerate(sources, 1):
+                  lid = str(src["league_id"])
+                  data = get_json(session, api_url(year, "draftResults", L=lid))
+                  units = extract_units(data)
+                  chosen, reason, unit_summary = choose_unit(units)
+                  can = canonical_r1_r4(chosen)
+
+                  league = dict(src)
+                  league.update({
+                      "draft_unit_n": len(units),
+                      "unit_selection_reason": reason,
+                      "unit_summary": unit_summary,
+                      "missing_slots_1_48": can["missing_slots"],
+                      "duplicate_slots_1_48": can["duplicate_slots"],
+                      "duplicate_players_1_48": can["duplicate_players"],
+                      "invalid_grid_1_48": can["invalid_grid"],
+                  })
+                  leagues.append(league)
+
+                  raw_rows = []
+                  for slot in range(1, 49):
+                      rec = can["slots"].get(slot)
+                      if not rec or not rec.get("mfl_player_id"):
+                          continue
+                      raw_rows.append({
+                          "draft_year": year,
+                          "league_id": lid,
+                          "league_name": src.get("league_name"),
+                          "league_idp": bool(src.get("idp", False)),
+                          "source_origin": src["source_origin"],
+                          "overall_slot": slot,
+                          "round": int(rec["round"]),
+                          "within_round_pick": int(rec["within_round_pick"]),
+                          "tier": tier_for_within(int(rec["within_round_pick"])),
+                          "cell": cell_for(
+                              int(rec["round"]), int(rec["within_round_pick"])
+                          ),
+                          "mfl_player_id": rec["mfl_player_id"],
+                          "franchise_id": rec["franchise_id"],
+                          "split": "development",
+                          "source_occurrence_valid_v6_1": True,
+                      })
+
+                  unresolved = []
+                  for row in raw_rows:
+                      exact = idx["by_mfl"].get(row["mfl_player_id"])
+                      safe = bool(
+                          exact
+                          and (exact.get("gsis_id") or exact.get("sleeper_id"))
+                          and (
+                              exact.get("draft_year") is None
+                              or int(exact["draft_year"]) == year
+                          )
+                      )
+                      if not safe:
+                          unresolved.append(row["mfl_player_id"])
+
+                  meta = {}
+                  if unresolved:
+                      meta = league_scoped_players(
+                          session, year, lid, unresolved
+                      )
+
+                  for row in raw_rows:
+                      ident = resolve_identity(
+                          year,
+                          row["mfl_player_id"],
+                          meta.get(row["mfl_player_id"]),
+                          idx,
+                      )
+                      row.update(ident)
+                      row["stable_player_key"] = stable_player_key(ident)
+                      occurrences.append(row)
+
+                  if i % 10 == 0 or i == len(sources):
+                      print(
+                          f"{year}: {i}/{len(sources)} clean leagues; "
+                          f"occurrences={len(occurrences)}",
+                          flush=True,
+                      )
+
+              diag = occurrence_diagnostics(
+                  occurrences, leagues, (year,), year_weight_target=1.0 / 6.0
+              )
+              payload = {
+                  "schema_version": 1,
+                  "stage": "phase2_historical_year",
+                  "study_id": STUDY_ID,
+                  "draft_year": year,
+                  "generated_at_utc": now(),
+                  "research_only": True,
+                  "historical_player_outcomes_read": False,
+                  "holdout_2024_outcomes_read": False,
+                  "market_or_ktc_values_read": False,
+                  "package_vote_data_read": False,
+                  "candidate_fit_performed": False,
+                  "candidate_selection_performed": False,
+                  "production_change_authorized": False,
+                  "frozen_source_league_n": len(leagues),
+                  "expected_source_league_n": EXPECTED_BY_YEAR[year],
+                  "leagues": leagues,
+                  "occurrences": occurrences,
+                  "diagnostics": diag,
+                  "identity_sources": {
+                      "dynastyprocess_sha256": sha256(dp_path),
+                      "nflverse_players_sha256": sha256(nv_path),
+                      "fantasypros_sleeper_crosswalk_sha256": sha256(FP_XWALK),
+                  },
+              }
+              write_json(out_path, payload)
+
+
+          # ---------- 2024 holdout ----------
+
+          def discover_2024(session: requests.Session) -> tuple[list[str], dict[str, Any]]:
+              term_counts = {}
+              all_ids = set()
+              for term in SEARCH_TERMS:
+                  data = get_json(
+                      session,
+                      api_url(HOLDOUT_YEAR, "leagueSearch", SEARCH=term),
+                  )
+                  rows = search_ids(data)
+                  rows = sorted(
+                      set(rows),
+                      key=lambda x: stable_hash(f"{HOLDOUT_YEAR}|{term}|{x}"),
+                  )[:MAX_PER_TERM]
+                  term_counts[term] = len(rows)
+                  all_ids.update(rows)
+              ordered = sorted(
+                  all_ids,
+                  key=lambda x: stable_hash(f"{HOLDOUT_YEAR}|candidate|{x}"),
+              )
+              return ordered, {
+                  "search_terms": SEARCH_TERMS,
+                  "max_per_term": MAX_PER_TERM,
+                  "term_counts_after_cap": term_counts,
+                  "bounded_unique_union_n": len(ordered),
+                  "all_bounded_union_candidates_probed": True,
+                  "search_errors": {},
+              }
+
+
+          def classify_contamination(
+              year: int,
+              pick_rows: list[dict[str, Any]],
+              metadata: dict[str, dict[str, Any]],
+              idx: dict[str, Any],
+          ) -> dict[str, Any]:
+              evidence = []
+              unknown = []
+              same_year = 0
+              status = Counter()
+
+              years_by_name_pos = idx["nv_years_by_name_pos"]
+              for p in pick_rows:
+                  pid = p["mfl_player_id"]
+                  meta = metadata.get(pid)
+                  if meta is None:
+                      unknown.append({
+                          "overall_slot": p["overall_slot"],
+                          "mfl_player_id": pid,
+                          "kind": "league_scoped_player_metadata_missing",
+                      })
+                      status["league_scoped_player_metadata_missing"] += 1
+                      continue
+                  name = meta.get("name")
+                  pos = norm_position(meta.get("position"))
+                  nm = clean_name(name)
+
+                  if explicit_devy_marker(name):
+                      evidence.append({
+                          "overall_slot": p["overall_slot"],
+                          "mfl_player_id": pid,
+                          "kind": "explicit_devy_custom_player",
+                          "name": name,
+                          "position": meta.get("position"),
+                      })
+                      status["explicit_devy_custom_player"] += 1
+                      continue
+
+                  years = sorted(years_by_name_pos.get((nm, pos), set()))
+                  if len(years) == 1:
+                      dy = years[0]
+                      if dy < year:
+                          evidence.append({
+                              "overall_slot": p["overall_slot"],
+                              "mfl_player_id": pid,
+                              "kind": "resolved_past_nfl_class",
+                              "name": name,
+                              "position": meta.get("position"),
+                              "identity_draft_class": dy,
+                          })
+                          status["resolved_past_nfl_class"] += 1
+                      elif dy > year:
+                          evidence.append({
+                              "overall_slot": p["overall_slot"],
+                              "mfl_player_id": pid,
+                              "kind": "resolved_future_nfl_class",
+                              "name": name,
+                              "position": meta.get("position"),
+                              "identity_draft_class": dy,
+                          })
+                          status["resolved_future_nfl_class"] += 1
+                      else:
+                          same_year += 1
+                          status["resolved_same_year"] += 1
+                  elif len(years) > 1:
+                      unknown.append({
+                          "overall_slot": p["overall_slot"],
+                          "mfl_player_id": pid,
+                          "kind": "ambiguous_name_position_multiple_draft_classes",
+                          "name": name,
+                          "position": meta.get("position"),
+                          "candidate_draft_years": years,
+                      })
+                      status["ambiguous_name_position_multiple_draft_classes"] += 1
+                  else:
+                      unknown.append({
+                          "overall_slot": p["overall_slot"],
+                          "mfl_player_id": pid,
+                          "kind": "no_external_same_identity_draft_class",
+                          "name": name,
+                          "position": meta.get("position"),
+                          "mfl_metadata_draft_year": meta.get("draft_year"),
+                      })
+                      status["no_external_same_identity_draft_class"] += 1
+
+              return {
+                  "positive_contamination": bool(evidence),
+                  "positive_evidence_n": len(evidence),
+                  "positive_evidence": evidence,
+                  "diagnostic_unknown_n": len(unknown),
+                  "diagnostic_unknown": unknown,
+                  "resolved_same_year_n": same_year,
+                  "identity_status_counts": dict(status),
+              }
+
+
+          def holdout_2024(
+              out_path: Path,
+              dp_path: Path,
+              nv_path: Path,
+          ) -> None:
+              guard_contract()
+              idx = load_identity_indexes(dp_path, nv_path, FP_XWALK)
+              session = requests.Session()
+              session.headers.update({
+                  "User-Agent":
+                      "LOG-Trade-Calculator-Draft-Pick-FV-V6-Phase2-2024Holdout/1.0"
+              })
+
+              ids, discovery = discover_2024(session)
+              clean_leagues = []
+              rejected = []
+              occurrences = []
+              counts = Counter()
+
+              for i, lid in enumerate(ids, 1):
+                  data = get_json(session, api_url(HOLDOUT_YEAR, "league", L=lid))
+                  lg = league_obj(data)
+                  if lg is None:
+                      counts["league_missing"] += 1
+                      continue
+                  ok, qkind = qualifier(lg)
+                  if not ok:
+                      counts[f"qualifier_reject:{qkind}"] += 1
+                      continue
+                  if obvious_mock_name(lg.get("name")):
+                      counts["obvious_mock_reject"] += 1
+                      continue
+
+                  draft = get_json(
+                      session, api_url(HOLDOUT_YEAR, "draftResults", L=lid)
+                  )
+                  units = extract_units(draft)
+                  all_rows = all_unit_pick_rows(units)
+                  if not all_rows["full4"]:
+                      counts["incomplete_r1_r4_reject"] += 1
+                      continue
+
+                  ids_for_meta = [
+                      r["mfl_player_id"] for r in all_rows["rows"]
+                  ]
+                  meta = league_scoped_players(
+                      session, HOLDOUT_YEAR, lid, ids_for_meta
+                  )
+                  contam = classify_contamination(
+                      HOLDOUT_YEAR, all_rows["rows"], meta, idx
+                  )
+                  if contam["positive_contamination"]:
+                      counts["positive_contamination_reject"] += 1
+                      rejected.append({
+                          "league_id": lid,
+                          "league_name": lg.get("name"),
+                          "qualifier_kind": qkind,
+                          "positive_evidence_n": contam["positive_evidence_n"],
+                          "positive_evidence": contam["positive_evidence"],
+                      })
+                      continue
+
+                  chosen, reason, unit_summary = choose_unit(units)
+                  can = canonical_r1_r4(chosen)
+                  clean = {
+                      "draft_year": HOLDOUT_YEAR,
+                      "league_id": lid,
+                      "league_name": lg.get("name"),
+                      "idp": is_idp(lg),
+                      "source_origin": "v6_2024_bounded_discovery_clean",
+                      "qualifier_kind": qkind,
+                      "keeper_state": keeper_state(lg),
+                      "qb_limit": qb_limit(lg),
+                      "draft_player_pool": lg.get("draftPlayerPool"),
+                      "positive_contamination": False,
+                      "diagnostic_unknown_n": contam["diagnostic_unknown_n"],
+                      "diagnostic_unknown": contam["diagnostic_unknown"],
+                      "draft_unit_n": len(units),
+                      "unit_selection_reason": reason,
+                      "unit_summary": unit_summary,
+                      "missing_slots_1_48": can["missing_slots"],
+                      "duplicate_slots_1_48": can["duplicate_slots"],
+                      "duplicate_players_1_48": can["duplicate_players"],
+                      "invalid_grid_1_48": can["invalid_grid"],
+                  }
+                  clean_leagues.append(clean)
+
+                  for slot in range(1, 49):
+                      rec = can["slots"].get(slot)
+                      if not rec or not rec.get("mfl_player_id"):
+                          continue
+                      ident = resolve_identity(
+                          HOLDOUT_YEAR,
+                          rec["mfl_player_id"],
+                          meta.get(rec["mfl_player_id"]),
+                          idx,
+                      )
+                      row = {
+                          "draft_year": HOLDOUT_YEAR,
+                          "league_id": lid,
+                          "league_name": lg.get("name"),
+                          "league_idp": is_idp(lg),
+                          "source_origin": "v6_2024_bounded_discovery_clean",
+                          "overall_slot": slot,
+                          "round": int(rec["round"]),
+                          "within_round_pick": int(rec["within_round_pick"]),
+                          "tier": tier_for_within(int(rec["within_round_pick"])),
+                          "cell": cell_for(
+                              int(rec["round"]), int(rec["within_round_pick"])
+                          ),
+                          "mfl_player_id": rec["mfl_player_id"],
+                          "franchise_id": rec["franchise_id"],
+                          "split": "temporal_holdout_2024",
+                          "source_occurrence_valid_v6_1": True,
+                      }
+                      row.update(ident)
+                      row["stable_player_key"] = stable_player_key(ident)
+                      occurrences.append(row)
+
+                  counts["clean_full4"] += 1
+                  if i % 50 == 0 or i == len(ids):
+                      print(
+                          f"2024: {i}/{len(ids)} candidates; "
+                          f"clean_full4={counts['clean_full4']}",
+                          flush=True,
+                      )
+
+              clean_leagues.sort(key=lambda x: int(x["league_id"]))
+              occurrences.sort(
+                  key=lambda x: (int(x["league_id"]), int(x["overall_slot"]))
+              )
+              diag = occurrence_diagnostics(
+                  occurrences,
+                  clean_leagues,
+                  (HOLDOUT_YEAR,),
+                  year_weight_target=1.0,
+              )
+              source_n_gate = len(clean_leagues) >= MIN_2024_LEAGUES
+              source_gate = (
+                  source_n_gate
+                  and diag["retention_gate_pass"]
+                  and diag["identity_gate_pass"]
+                  and diag["sleeper_gate_pass"]
+              )
+
+              payload = {
+                  "schema_version": 1,
+                  "stage": "phase2_holdout_2024_source_identity",
+                  "study_id": STUDY_ID,
+                  "draft_year": HOLDOUT_YEAR,
+                  "generated_at_utc": now(),
+                  "research_only": True,
+                  "historical_player_outcomes_read": False,
+                  "holdout_2024_outcomes_read": False,
+                  "market_or_ktc_values_read": False,
+                  "package_vote_data_read": False,
+                  "candidate_fit_performed": False,
+                  "candidate_selection_performed": False,
+                  "production_change_authorized": False,
+                  "discovery": discovery,
+                  "probe_counts": dict(counts),
+                  "minimum_clean_full4_leagues": MIN_2024_LEAGUES,
+                  "clean_full4_league_n": len(clean_leagues),
+                  "source_count_gate_pass": source_n_gate,
+                  "source_identity_gate_pass": source_gate,
+                  "clean_leagues": clean_leagues,
+                  "positive_contamination_rejections": rejected,
+                  "occurrences": occurrences,
+                  "diagnostics": diag,
+                  "identity_sources": {
+                      "dynastyprocess_sha256": sha256(dp_path),
+                      "nflverse_players_sha256": sha256(nv_path),
+                      "fantasypros_sleeper_crosswalk_sha256": sha256(FP_XWALK),
+                  },
+              }
+              write_json(out_path, payload)
+
+
+          # ---------- Aggregate and freeze ----------
+
+          def aggregate(
+              partial_dir: Path,
+              holdout_path: Path,
+          ) -> None:
+              state = guard_contract()
+              parts = []
+              for year in YEARS:
+                  p = partial_dir / f"year_{year}.json"
+                  if not p.exists():
+                      raise GateError(f"missing historical year artifact: {p}")
+                  d = load(p)
+                  if int(d["draft_year"]) != year:
+                      raise GateError(f"wrong year artifact: {p}")
+                  for key in (
+                      "historical_player_outcomes_read",
+                      "holdout_2024_outcomes_read",
+                      "candidate_fit_performed",
+                      "candidate_selection_performed",
+                      "production_change_authorized",
+                  ):
+                      if d[key] is not False:
+                          raise GateError(f"historical artifact firewall: {key}")
+                  parts.append(d)
+
+              hold = load(holdout_path)
+              if int(hold["draft_year"]) != HOLDOUT_YEAR:
+                  raise GateError("wrong 2024 holdout artifact")
+              for key in (
+                  "historical_player_outcomes_read",
+                  "holdout_2024_outcomes_read",
+                  "candidate_fit_performed",
+                  "candidate_selection_performed",
+                  "production_change_authorized",
+              ):
+                  if hold[key] is not False:
+                      raise GateError(f"holdout artifact firewall: {key}")
+
+              expected_fp_sha = sha256(FP_XWALK)
+              for d in [*parts, hold]:
+                  src = d["identity_sources"]
+                  if src["dynastyprocess_sha256"] != DP_SHA256:
+                      raise GateError("worker DynastyProcess hash drift")
+                  if src["nflverse_players_sha256"] != NV_SHA256:
+                      raise GateError("worker nflverse hash drift")
+                  if src["fantasypros_sleeper_crosswalk_sha256"] != expected_fp_sha:
+                      raise GateError("worker FantasyPros/Sleeper crosswalk hash drift")
+
+              dev_leagues = [x for d in parts for x in d["leagues"]]
+              dev_rows = [x for d in parts for x in d["occurrences"]]
+              if len(dev_leagues) != EXPECTED_DEV_LEAGUES:
+                  raise GateError("aggregated development league count drift")
+              by_year = Counter(int(x["draft_year"]) for x in dev_leagues)
+              if dict(sorted(by_year.items())) != EXPECTED_BY_YEAR:
+                  raise GateError("aggregated development by-year drift")
+
+              # Workers froze weights independently. Recompute global diagnostics and
+              # weights from the aggregate to prove exact same contract.
+              dev_diag = occurrence_diagnostics(
+                  dev_rows, dev_leagues, YEARS, year_weight_target=1.0 / 6.0
+              )
+              hold_rows = list(hold["occurrences"])
+              hold_leagues = list(hold["clean_leagues"])
+              hold_diag = occurrence_diagnostics(
+                  hold_rows, hold_leagues, (HOLDOUT_YEAR,), year_weight_target=1.0
+              )
+
+              dev_gate = (
+                  len(dev_leagues) == EXPECTED_DEV_LEAGUES
+                  and dev_diag["retention_gate_pass"]
+                  and dev_diag["identity_gate_pass"]
+                  and dev_diag["sleeper_gate_pass"]
+              )
+              hold_gate = (
+                  len(hold_leagues) >= MIN_2024_LEAGUES
+                  and hold_diag["retention_gate_pass"]
+                  and hold_diag["identity_gate_pass"]
+                  and hold_diag["sleeper_gate_pass"]
+              )
+              outcome_authorized = dev_gate and hold_gate
+              decision = (
+                  "PASS_V6_1_PHASE2_R1_R4_SOURCE_IDENTITY_FREEZE_"
+                  "HISTORICAL_OUTCOME_HARVEST_AUTHORIZED_NEXT_STAGE"
+                  if outcome_authorized
+                  else
+                  "STOP_V6_1_PHASE2_SOURCE_OR_IDENTITY_GATE_NO_OUTCOME_INGESTION"
+              )
+
+              dev_rows.sort(
+                  key=lambda x: (
+                      int(x["draft_year"]),
+                      int(x["league_id"]),
+                      int(x["overall_slot"]),
+                  )
+              )
+              hold_rows.sort(
+                  key=lambda x: (
+                      int(x["league_id"]),
+                      int(x["overall_slot"]),
+                  )
+              )
+              write_jsonl(OUT_DEV_PICKS, dev_rows)
+              write_jsonl(OUT_HOLDOUT_PICKS, hold_rows)
+
+              catalog = {
+                  "schema_version": 1,
+                  "study_id": STUDY_ID,
+                  "stage": "phase2_r1_r4_source_identity_freeze_v6_1",
+                  "status": (
+                      "FROZEN_SOURCE_IDENTITY_PASS"
+                      if outcome_authorized
+                      else "FROZEN_SOURCE_IDENTITY_STOP"
+                  ),
+                  "generated_at_utc": now(),
+                  "research_only": True,
+                  "historical_player_outcomes_read": False,
+                  "holdout_2024_outcomes_read": False,
+                  "candidate_fit_performed": False,
+                  "candidate_selection_performed": False,
+                  "production_change_authorized": False,
+                  "development": {
+                      "provider": "MyFantasyLeague",
+                      "years": list(YEARS),
+                      "expected_clean_league_n": EXPECTED_DEV_LEAGUES,
+                      "clean_league_n": len(dev_leagues),
+                      "counts_by_year": {
+                          str(y): by_year[y] for y in YEARS
+                      },
+                      "leagues": dev_leagues,
+                      "diagnostics": dev_diag,
+                  },
+                  "temporal_holdout_2024": {
+                      "provider": "MyFantasyLeague",
+                      "outcomes_sealed": True,
+                      "minimum_clean_league_n": MIN_2024_LEAGUES,
+                      "clean_league_n": len(hold_leagues),
+                      "discovery": hold["discovery"],
+                      "probe_counts": hold["probe_counts"],
+                      "positive_contamination_rejections":
+                          hold["positive_contamination_rejections"],
+                      "leagues": hold_leagues,
+                      "diagnostics": hold_diag,
+                  },
+              }
+              write_json(OUT_CATALOG, catalog)
+
+              dev_methods = Counter(x["identity_method"] for x in dev_rows)
+              hold_methods = Counter(x["identity_method"] for x in hold_rows)
+              summary = {
+                  "schema_version": 1,
+                  "study_id": STUDY_ID,
+                  "stage": "phase2_r1_r4_source_identity_freeze_v6_1",
+                  "status": catalog["status"],
+                  "generated_at_utc": catalog["generated_at_utc"],
+                  "decision": decision,
+                  "research_only": True,
+                  "pre_outcome_stage": True,
+                  "historical_player_outcomes_read": False,
+                  "holdout_2024_outcomes_read": False,
+                  "market_or_ktc_values_read": False,
+                  "package_vote_data_read": False,
+                  "candidate_fit_performed": False,
+                  "candidate_selection_performed": False,
+                  "candidate_scores_computed": False,
+                  "production_change_authorized": False,
+                  "automatic_production_promotion_allowed": False,
+                  "development_source_gate": {
+                      "pass": dev_gate,
+                      "clean_league_n": len(dev_leagues),
+                      "expected_clean_league_n": EXPECTED_DEV_LEAGUES,
+                      "counts_by_year": {
+                          str(y): by_year[y] for y in YEARS
+                      },
+                      "retained_occurrence_n": len(dev_rows),
+                      "expected_raw_occurrence_n": EXPECTED_DEV_OCCURRENCES,
+                      "overall_retention_fraction":
+                          len(dev_rows) / EXPECTED_DEV_OCCURRENCES,
+                      "retention_gate_pass": dev_diag["retention_gate_pass"],
+                      "identity_gate_pass": dev_diag["identity_gate_pass"],
+                      "sleeper_gate_pass": dev_diag["sleeper_gate_pass"],
+                      "overall_identity_coverage":
+                          dev_diag["overall_identity_coverage"],
+                      "overall_sleeper_ready_coverage":
+                          dev_diag["overall_sleeper_ready_coverage"],
+                      "identity_method_counts": dict(dev_methods),
+                      "cell_year": dev_diag["cell_year"],
+                  },
+                  "temporal_holdout_2024_source_gate": {
+                      "pass": hold_gate,
+                      "outcomes_sealed": True,
+                      "clean_league_n": len(hold_leagues),
+                      "minimum_clean_league_n": MIN_2024_LEAGUES,
+                      "retained_occurrence_n": len(hold_rows),
+                      "expected_raw_occurrence_n": len(hold_leagues) * 48,
+                      "overall_retention_fraction": (
+                          len(hold_rows) / (len(hold_leagues) * 48)
+                          if hold_leagues else 0.0
+                      ),
+                      "retention_gate_pass": hold_diag["retention_gate_pass"],
+                      "identity_gate_pass": hold_diag["identity_gate_pass"],
+                      "sleeper_gate_pass": hold_diag["sleeper_gate_pass"],
+                      "overall_identity_coverage":
+                          hold_diag["overall_identity_coverage"],
+                      "overall_sleeper_ready_coverage":
+                          hold_diag["overall_sleeper_ready_coverage"],
+                      "identity_method_counts": dict(hold_methods),
+                      "cell": {
+                          k: v for k, v in hold_diag["cell_year"].items()
+                      },
+                  },
+                  "identity_contract": state["amend"]["identity_contract"],
+                  "source_contract": {
+                      "development":
+                          state["amend"]["source_contract_replacement"][
+                              "frozen_clean_development_source"
+                          ],
+                      "holdout_2024":
+                          state["amend"]["holdout_2024_source_contract"],
+                  },
+                  "outcome_ingestion_authorized_next_stage": outcome_authorized,
+                  "holdout_2024_outcome_ingestion_authorized": False,
+                  "next_stage": (
+                      "draft-pick-fv-v6-phase3-r1-r4-historical-outcome-harvest"
+                      if outcome_authorized
+                      else None
+                  ),
+                  "identity_sources": {
+                      "dynastyprocess_sha256": DP_SHA256,
+                      "nflverse_players_sha256": NV_SHA256,
+                      "fantasypros_sleeper_crosswalk_sha256": expected_fp_sha,
+                  },
+                  "input_hashes": {
+                      PRE.name: sha256(PRE),
+                      PRE_MAN.name: sha256(PRE_MAN),
+                      AMEND.name: sha256(AMEND),
+                      AMEND_MAN.name: sha256(AMEND_MAN),
+                      V3_CONTAM.name: sha256(V3_CONTAM),
+                      V4_RECOVERY.name: sha256(V4_RECOVERY),
+                      V5_LINEAGE.name: sha256(V5_LINEAGE),
+                      V3_FEAS.name: sha256(V3_FEAS),
+                      FP_XWALK.name: sha256(FP_XWALK),
+                  },
+              }
+              write_json(OUT_SUMMARY, summary)
+
+              md = [
+                  "# Draft Pick FV V6.1 — R1–R4 Source & Identity Freeze",
+                  "",
+                  f"**Decision:** `{decision}`",
+                  "",
+                  "## Development source",
+                  "",
+                  f"- Clean leagues: **{len(dev_leagues)} / 378**",
+                  f"- Retained R1–R4 occurrences: "
+                  f"**{len(dev_rows)} / {EXPECTED_DEV_OCCURRENCES}**",
+                  f"- Occurrence identity coverage: "
+                  f"**{dev_diag['overall_identity_coverage']:.2%}**",
+                  f"- Sleeper-ready coverage: "
+                  f"**{dev_diag['overall_sleeper_ready_coverage']:.2%}**",
+                  f"- Every year × cell retention gate: "
+                  f"**{'PASS' if dev_diag['retention_gate_pass'] else 'FAIL'}**",
+                  f"- Every year × cell identity gate: "
+                  f"**{'PASS' if dev_diag['identity_gate_pass'] else 'FAIL'}**",
+                  "",
+                  "## 2024 temporal holdout source",
+                  "",
+                  f"- Clean full-R4 leagues: **{len(hold_leagues)}** "
+                  f"(minimum {MIN_2024_LEAGUES})",
+                  f"- Retained R1–R4 occurrences: **{len(hold_rows)}**",
+                  f"- Occurrence identity coverage: "
+                  f"**{hold_diag['overall_identity_coverage']:.2%}**",
+                  f"- Sleeper-ready coverage: "
+                  f"**{hold_diag['overall_sleeper_ready_coverage']:.2%}**",
+                  "- 2024 NFL outcomes read: **No**",
+                  "",
+                  "## Firewalls",
+                  "",
+                  "- Historical NFL outcomes read: **No**",
+                  "- 2024 holdout outcomes read: **No**",
+                  "- KTC/market values read: **No**",
+                  "- Package votes read: **No**",
+                  "- Candidate fit performed: **No**",
+                  "- Production change authorized: **No**",
+                  "",
+                  "## Next step",
+                  "",
+                  (
+                      "Phase 3 may harvest **2018–2023 R1–R4 historical outcomes only**. "
+                      "The 2024 holdout outcome file remains sealed."
+                      if outcome_authorized
+                      else
+                      "Stop before any V6 outcome ingestion and diagnose the failed "
+                      "pre-outcome source/identity gate."
+                  ),
+                  "",
+              ]
+              OUT_MD.write_text("\n".join(md), encoding="utf-8")
+
+              manifest = {
+                  "schema_version": 1,
+                  "study_id": STUDY_ID,
+                  "stage": summary["stage"],
+                  "status": summary["status"],
+                  "decision": decision,
+                  "generated_at_utc": summary["generated_at_utc"],
+                  "research_only": True,
+                  "historical_player_outcomes_read": False,
+                  "holdout_2024_outcomes_read": False,
+                  "candidate_fit_performed": False,
+                  "candidate_selection_performed": False,
+                  "production_change_authorized": False,
+                  "source_catalog_frozen": True,
+                  "development_identity_map_frozen": True,
+                  "holdout_2024_source_identity_frozen": True,
+                  "development_source_gate_pass": dev_gate,
+                  "holdout_2024_source_gate_pass": hold_gate,
+                  "outcome_ingestion_authorized_next_stage": outcome_authorized,
+                  "holdout_2024_outcome_ingestion_authorized": False,
+                  "next_stage": summary["next_stage"],
+                  "input_hashes": summary["input_hashes"],
+                  "output_hashes": {
+                      OUT_DEV_PICKS.name: sha256(OUT_DEV_PICKS),
+                      OUT_HOLDOUT_PICKS.name: sha256(OUT_HOLDOUT_PICKS),
+                      OUT_CATALOG.name: sha256(OUT_CATALOG),
+                      OUT_SUMMARY.name: sha256(OUT_SUMMARY),
+                      OUT_MD.name: sha256(OUT_MD),
+                  },
+                  "canonical_summary_sha256": canonical_sha(summary),
+              }
+              write_json(OUT_MAN, manifest)
+
+              print(f"DECISION={decision}")
+              print(
+                  f"development={len(dev_leagues)} leagues / "
+                  f"{len(dev_rows)} retained occurrences"
+              )
+              print(
+                  f"holdout_2024={len(hold_leagues)} clean leagues / "
+                  f"{len(hold_rows)} retained occurrences"
+              )
+              print(f"OUTCOME_AUTHORIZED={outcome_authorized}")
+              print("2024_OUTCOMES_REMAIN_SEALED=true")
+
+
+          # ---------- Tests ----------
+
+          def selftest() -> None:
+              assert clean_name("Odell Beckham Jr.") == "odell beckham"
+              assert norm_position("CB") == "DB"
+              assert stable_id("0000") is None
+              assert explicit_devy_marker("Devy Pick 1")
+              assert cell_for(1, 1) == "r1_early"
+              assert cell_for(4, 12) == "r4_late"
+
+              # Single canonical unit, duplicate player exclusion.
+              unit = {
+                  "type": "LEAGUE",
+                  "draftPick": [
+                      {
+                          "round": str(r),
+                          "pick": str(p),
+                          "player": (
+                              "DUP"
+                              if (r, p) in {(1, 1), (1, 2)}
+                              else f"{r}-{p}"
+                          ),
+                      }
+                      for r in range(1, 5)
+                      for p in range(1, 13)
+                  ],
+              }
+              can = canonical_r1_r4(unit)
+              assert len(can["missing_slots"]) == 1
+              assert can["duplicate_players"][0]["removed_slot"] == 2
+
+              chosen, why, _ = choose_unit([unit])
+              assert chosen is unit and why == "single_draft_unit"
+
+              # Qualifier.
+              lg = {
+                  "keeperType": "dynasty",
+                  "draftPlayerPool": "Rookie",
+                  "franchises": {"count": "12"},
+                  "starters": {
+                      "position": [{"name": "QB", "limit": "1-2"}],
+                  },
+              }
+              assert qualifier(lg) == (True, "explicit_dynasty")
+
+              # Contamination logic with synthetic identity index.
+              idx = {
+                  "nv_years_by_name_pos": {
+                      ("future player", "WR"): {2025},
+                      ("same player", "RB"): {2024},
+                  }
+              }
+              picks = [
+                  {"overall_slot": 1, "mfl_player_id": "a"},
+                  {"overall_slot": 2, "mfl_player_id": "b"},
+              ]
+              meta = {
+                  "a": {"name": "Future Player", "position": "WR", "draft_year": 2025},
+                  "b": {"name": "Same Player", "position": "RB", "draft_year": 2024},
+              }
+              c = classify_contamination(2024, picks, meta, idx)
+              assert c["positive_contamination"] is True
+              assert c["positive_evidence"][0]["kind"] == "resolved_future_nfl_class"
+
+              # Weight and gate logic with a complete synthetic 2-league cohort.
+              leagues = [
+                  {"draft_year": 2024, "league_id": "1"},
+                  {"draft_year": 2024, "league_id": "2"},
+              ]
+              rows = []
+              for lid in ("1", "2"):
+                  for r in range(1, 5):
+                      for p in range(1, 13):
+                          rows.append({
+                              "draft_year": 2024,
+                              "league_id": lid,
+                              "cell": cell_for(r, p),
+                              "identity_resolved": True,
+                              "outcome_ready_sleeper_id": True,
+                          })
+              d = occurrence_diagnostics(
+                  rows, leagues, (2024,), year_weight_target=1.0
+              )
+              assert d["retention_gate_pass"]
+              assert d["identity_gate_pass"]
+              assert d["sleeper_gate_pass"]
+              assert d["weight_normalization_proved"]
+              print("PASS: V6.1 Phase 2 source/identity self-test")
+
+
+          def guard_only() -> None:
+              state = guard_contract()
+              rows = build_clean_development_sources(
+                  state["contam"], state["v4"]
+              )
+              assert len(rows) == 378
+              print("PASS: V6.1 Phase 2 live predecessor contract guard")
+              print("DEVELOPMENT_COUNTS=", dict(Counter(
+                  int(x["draft_year"]) for x in rows
+              )))
+
+
+          def check_outputs() -> None:
+              s = load(OUT_SUMMARY)
+              m = load(OUT_MAN)
+              c = load(OUT_CATALOG)
+              allowed = {
+                  "PASS_V6_1_PHASE2_R1_R4_SOURCE_IDENTITY_FREEZE_"
+                  "HISTORICAL_OUTCOME_HARVEST_AUTHORIZED_NEXT_STAGE",
+                  "STOP_V6_1_PHASE2_SOURCE_OR_IDENTITY_GATE_NO_OUTCOME_INGESTION",
+              }
+              if s["decision"] not in allowed:
+                  raise GateError("unexpected Phase 2 decision")
+              if m["decision"] != s["decision"]:
+                  raise GateError("manifest decision mismatch")
+              if c["status"] != s["status"]:
+                  raise GateError("catalog status mismatch")
+
+              for obj in (s, m, c):
+                  for key in (
+                      "historical_player_outcomes_read",
+                      "holdout_2024_outcomes_read",
+                      "candidate_fit_performed",
+                      "candidate_selection_performed",
+                      "production_change_authorized",
+                  ):
+                      if obj[key] is not False:
+                          raise GateError(f"output firewall violation: {key}")
+
+              if m["holdout_2024_outcome_ingestion_authorized"] is not False:
+                  raise GateError("2024 outcome ingestion accidentally authorized")
+              if s["temporal_holdout_2024_source_gate"]["outcomes_sealed"] is not True:
+                  raise GateError("2024 holdout not sealed")
+              if s["development_source_gate"]["clean_league_n"] != 378:
+                  raise GateError("development source count mismatch")
+              if s["development_source_gate"]["counts_by_year"] != {
+                  str(k): v for k, v in EXPECTED_BY_YEAR.items()
+              }:
+                  raise GateError("development source year counts mismatch")
+
+              for name, expected in m["output_hashes"].items():
+                  path = V6 / name
+                  if sha256(path) != expected:
+                      raise GateError(f"output hash mismatch: {name}")
+              print("PASS: V6.1 Phase 2 frozen outputs validated")
+
+
+          def main() -> None:
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--selftest", action="store_true")
+              ap.add_argument("--guard", action="store_true")
+              ap.add_argument("--historical-year", type=int)
+              ap.add_argument("--holdout-2024", action="store_true")
+              ap.add_argument("--aggregate", action="store_true")
+              ap.add_argument("--out")
+              ap.add_argument("--partial-dir")
+              ap.add_argument("--holdout-path")
+              ap.add_argument("--dp")
+              ap.add_argument("--nflverse")
+              ap.add_argument("--check", action="store_true")
+              args = ap.parse_args()
+
+              if args.selftest:
+                  selftest()
+                  return
+              if args.guard:
+                  guard_only()
+                  return
+              if args.historical_year is not None:
+                  if not (args.out and args.dp and args.nflverse):
+                      raise SystemExit("--out --dp --nflverse required")
+                  historical_year(
+                      args.historical_year,
+                      Path(args.out),
+                      Path(args.dp),
+                      Path(args.nflverse),
+                  )
+                  return
+              if args.holdout_2024:
+                  if not (args.out and args.dp and args.nflverse):
+                      raise SystemExit("--out --dp --nflverse required")
+                  holdout_2024(
+                      Path(args.out), Path(args.dp), Path(args.nflverse)
+                  )
+                  return
+              if args.aggregate:
+                  if not (args.partial_dir and args.holdout_path):
+                      raise SystemExit("--partial-dir and --holdout-path required")
+                  aggregate(Path(args.partial_dir), Path(args.holdout_path))
+                  return
+              if args.check:
+                  check_outputs()
+                  return
+              raise SystemExit(
+                  "choose --selftest, --guard, --historical-year, "
+                  "--holdout-2024, --aggregate, or --check"
+              )
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+          chmod +x "${RUNNER_TEMP}/build_r1_r4_source_identity_v6_1.py"
+
+      - name: Preflight engine against live repo contract
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          p = Path(os.environ["RUNNER_TEMP"]) / "build_r1_r4_source_identity_v6_1.py"
+          compile(p.read_text(encoding="utf-8"), str(p), "exec")
+          print("PASS: generated engine compiles without writing pyc.")
+          PY
+
+          python3 "${RUNNER_TEMP}/build_r1_r4_source_identity_v6_1.py" --selftest
+          python3 "${RUNNER_TEMP}/build_r1_r4_source_identity_v6_1.py" --guard
+
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          t = (
+              Path(os.environ["RUNNER_TEMP"])
+              / "build_r1_r4_source_identity_v6_1.py"
+          ).read_text()
+          forbidden = [
+              "api.sleeper.app/v1/stats",
+              "/stats/nfl/",
+              "r1_r2_development_outcomes_v5_1.jsonl",
+              "r1_r2_locked_validation_outcomes_v5_1.jsonl",
+              "three_year_player_equivalent_fv",
+          ]
+          for token in forbidden:
+              assert token not in t, f"forbidden outcome path/token: {token}"
+          print("PASS: Phase 2 engine contains no historical NFL outcome-read path.")
+          PY
+
+      - name: Upload frozen Phase 2 engine artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: v6-phase2-engine
+          path: ${{ runner.temp }}/build_r1_r4_source_identity_v6_1.py
+          if-no-files-found: error
+          retention-days: 7
+
+  historical:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        year: [2018, 2019, 2020, 2021, 2022, 2023]
+
+    steps:
+      - name: Check out exact study base
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.base_sha }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13.15'
+
+      - name: Install transport dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir             "requests==2.34.2"
+
+      - name: Download Phase 2 engine
+        uses: actions/download-artifact@v4
+        with:
+          name: v6-phase2-engine
+          path: ${{ runner.temp }}/v6-phase2-engine
+
+      - name: Pin pre-outcome identity metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/v6-identity"
+
+          DP_URL="https://raw.githubusercontent.com/dynastyprocess/data/692c23d639542d6e9e94ba3898ed978a0b772724/files/db_playerids.csv"
+          DP_SHA="0174ea890e71d33fa0afc1b846ce1c92273542278a287b6bd52c3a4aa5edce73"
+          NV_URL="https://github.com/nflverse/nflverse-data/releases/download/players/players.csv"
+          NV_SHA="4dd70f328f31b0bb7cbf043412298d5a325863e27b8f2eeea22c9e925c808dee"
+
+          curl -fL --retry 5 --retry-delay 4 "$DP_URL"             -o "${RUNNER_TEMP}/v6-identity/db_playerids.csv"
+          curl -fL --retry 5 --retry-delay 4 "$NV_URL"             -o "${RUNNER_TEMP}/v6-identity/nflverse_players.csv"
+
+          test "$(sha256sum "${RUNNER_TEMP}/v6-identity/db_playerids.csv" | awk '{print $1}')" = "$DP_SHA"
+          test "$(sha256sum "${RUNNER_TEMP}/v6-identity/nflverse_players.csv" | awk '{print $1}')" = "$NV_SHA"
+
+          echo "PASS: exact pre-outcome identity assets pinned."
+
+      - name: Rebuild clean R1-R4 historical occurrences
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/historical-${{ matrix.year }}"
+
+          python3             "${RUNNER_TEMP}/v6-phase2-engine/build_r1_r4_source_identity_v6_1.py"             --historical-year "${{ matrix.year }}"             --dp "${RUNNER_TEMP}/v6-identity/db_playerids.csv"             --nflverse "${RUNNER_TEMP}/v6-identity/nflverse_players.csv"             --out "${RUNNER_TEMP}/historical-${{ matrix.year }}/year_${{ matrix.year }}.json"
+
+      - name: Validate historical year artifact firewall
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          y = int(os.environ["YEAR"])
+          p = Path(os.environ["RUNNER_TEMP"]) / f"historical-{y}" / f"year_{y}.json"
+          d = json.loads(p.read_text())
+          assert d["draft_year"] == y
+          assert d["frozen_source_league_n"] == d["expected_source_league_n"]
+          for key in (
+              "historical_player_outcomes_read",
+              "holdout_2024_outcomes_read",
+              "candidate_fit_performed",
+              "candidate_selection_performed",
+              "production_change_authorized",
+          ):
+              assert d[key] is False
+          print(
+              f"PASS: {y} source/identity artifact frozen; "
+              f"retention={d['diagnostics']['retention_gate_pass']} "
+              f"identity={d['diagnostics']['identity_gate_pass']}"
+          )
+          PY
+        env:
+          YEAR: ${{ matrix.year }}
+
+      - name: Upload historical year checkpoint
+        uses: actions/upload-artifact@v4
+        with:
+          name: v6-phase2-historical-${{ matrix.year }}
+          path: ${{ runner.temp }}/historical-${{ matrix.year }}/year_${{ matrix.year }}.json
+          if-no-files-found: error
+          retention-days: 7
+
+  holdout_2024:
+    needs: [prepare, historical]
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+
+    steps:
+      - name: Check out exact study base
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.base_sha }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13.15'
+
+      - name: Install transport dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir             "requests==2.34.2"
+
+      - name: Download Phase 2 engine
+        uses: actions/download-artifact@v4
+        with:
+          name: v6-phase2-engine
+          path: ${{ runner.temp }}/v6-phase2-engine
+
+      - name: Pin pre-outcome identity metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/v6-identity"
+
+          DP_URL="https://raw.githubusercontent.com/dynastyprocess/data/692c23d639542d6e9e94ba3898ed978a0b772724/files/db_playerids.csv"
+          DP_SHA="0174ea890e71d33fa0afc1b846ce1c92273542278a287b6bd52c3a4aa5edce73"
+          NV_URL="https://github.com/nflverse/nflverse-data/releases/download/players/players.csv"
+          NV_SHA="4dd70f328f31b0bb7cbf043412298d5a325863e27b8f2eeea22c9e925c808dee"
+
+          curl -fL --retry 5 --retry-delay 4 "$DP_URL"             -o "${RUNNER_TEMP}/v6-identity/db_playerids.csv"
+          curl -fL --retry 5 --retry-delay 4 "$NV_URL"             -o "${RUNNER_TEMP}/v6-identity/nflverse_players.csv"
+
+          test "$(sha256sum "${RUNNER_TEMP}/v6-identity/db_playerids.csv" | awk '{print $1}')" = "$DP_SHA"
+          test "$(sha256sum "${RUNNER_TEMP}/v6-identity/nflverse_players.csv" | awk '{print $1}')" = "$NV_SHA"
+
+      - name: Discover, contamination-screen, and freeze 2024 holdout source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/holdout"
+
+          python3             "${RUNNER_TEMP}/v6-phase2-engine/build_r1_r4_source_identity_v6_1.py"             --holdout-2024             --dp "${RUNNER_TEMP}/v6-identity/db_playerids.csv"             --nflverse "${RUNNER_TEMP}/v6-identity/nflverse_players.csv"             --out "${RUNNER_TEMP}/holdout/holdout_2024.json"
+
+      - name: Validate 2024 holdout firewall
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          p = Path(os.environ["RUNNER_TEMP"]) / "holdout" / "holdout_2024.json"
+          d = json.loads(p.read_text())
+          assert d["draft_year"] == 2024
+          assert d["discovery"]["all_bounded_union_candidates_probed"] is True
+          assert d["discovery"]["search_errors"] == {}
+          for key in (
+              "historical_player_outcomes_read",
+              "holdout_2024_outcomes_read",
+              "candidate_fit_performed",
+              "candidate_selection_performed",
+              "production_change_authorized",
+          ):
+              assert d[key] is False
+          print(
+              "PASS: 2024 source cohort frozen pre-outcome; "
+              f"clean={d['clean_full4_league_n']} "
+              f"gate={d['source_identity_gate_pass']}"
+          )
+          PY
+
+      - name: Upload 2024 holdout checkpoint
+        uses: actions/upload-artifact@v4
+        with:
+          name: v6-phase2-holdout-2024
+          path: ${{ runner.temp }}/holdout/holdout_2024.json
+          if-no-files-found: error
+          retention-days: 7
+
+  aggregate_and_freeze:
+    needs: [prepare, historical, holdout_2024]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out exact study base
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.base_sha }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13.15'
+
+      - name: Install regression dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir             "requests==2.34.2"
+
+      - name: Download Phase 2 engine
+        uses: actions/download-artifact@v4
+        with:
+          name: v6-phase2-engine
+          path: ${{ runner.temp }}/v6-phase2-engine
+
+      - name: Download historical checkpoints
+        uses: actions/download-artifact@v4
+        with:
+          pattern: v6-phase2-historical-*
+          path: ${{ runner.temp }}/v6-phase2-historical
+          merge-multiple: true
+
+      - name: Download 2024 holdout checkpoint
+        uses: actions/download-artifact@v4
+        with:
+          name: v6-phase2-holdout-2024
+          path: ${{ runner.temp }}/v6-phase2-holdout
+
+      - name: Aggregate and freeze Phase 2
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cp             "${RUNNER_TEMP}/v6-phase2-engine/build_r1_r4_source_identity_v6_1.py"             research/draft-pick-fv-v6/build_r1_r4_source_identity_v6_1.py
+          chmod +x research/draft-pick-fv-v6/build_r1_r4_source_identity_v6_1.py
+
+          python3             research/draft-pick-fv-v6/build_r1_r4_source_identity_v6_1.py             --aggregate             --partial-dir "${RUNNER_TEMP}/v6-phase2-historical"             --holdout-path "${RUNNER_TEMP}/v6-phase2-holdout/holdout_2024.json"
+
+          python3             research/draft-pick-fv-v6/build_r1_r4_source_identity_v6_1.py             --check
+
+      - name: Prove exact research-only change scope
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t changed < <(
+            git status --porcelain=v1 --untracked-files=all |
+            sed -E 's/^.. //' |
+            sort
+          )
+          expected=(
+            "research/draft-pick-fv-v6/build_r1_r4_source_identity_v6_1.py"
+            "research/draft-pick-fv-v6/r1_r4_development_pick_identity_v6_1.jsonl"
+            "research/draft-pick-fv-v6/r1_r4_holdout_2024_pick_identity_v6_1.jsonl"
+            "research/draft-pick-fv-v6/r1_r4_source_catalog_v6_1.json"
+            "research/draft-pick-fv-v6/r1_r4_source_identity_manifest_v6_1.json"
+            "research/draft-pick-fv-v6/r1_r4_source_identity_summary_v6_1.json"
+            "research/draft-pick-fv-v6/r1_r4_source_identity_summary_v6_1.md"
+          )
+
+          diff -u             <(printf '%s\n' "${expected[@]}" | sort)             <(printf '%s\n' "${changed[@]}" | sort)
+
+          echo "PASS: exactly seven intended V6.1 Phase 2 research files changed."
+
+      - name: Run production and repository regression
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TU_JSON="scripts/artifacts/generated/team_utility_lineup_projections.json"
+          TU_MD="scripts/artifacts/reports/team_utility_lineup_projection_report.md"
+
+          restore_tu() {
+            git checkout -- "$TU_JSON" "$TU_MD"
+          }
+          trap restore_tu EXIT
+
+          python3             scripts/projections/build_team_utility_lineup_projections.py             --write
+
+          python3 scripts/validation/check_package_adjustment_live.py
+          python3 scripts/validation/repo_regression_checks.py
+
+          restore_tu
+          trap - EXIT
+          git diff --exit-code -- "$TU_JSON" "$TU_MD"
+
+      - name: Re-prove deployed Draft Pick contract unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          text = Path("index.html").read_text(encoding="utf-8")
+          expected = [
+              "  1: {early:7500, mid:5854, late:5244},",
+              "  2: {early:3906, mid:3624, late:3291},",
+              "  3: {early:2692, mid:2682, late:2319},",
+              "  4: {early:1972, mid:1831, late:1689},",
+              "  5: {early:1414, mid:1250, late:1118},  // extrapolated — no KTC data",
+              "  6: {early:1014, mid:853,  late:740},   // extrapolated — no KTC data",
+              "const YEAR_DISCOUNT = { '2027':1.0, '2028':0.85, '2029':0.72 };",
+          ]
+          for line in expected:
+              assert line in text, f"deployed pick contract drift: {line}"
+          print("PASS: deployed PICK_BASE/YEAR_DISCOUNT unchanged.")
+          PY
+
+      - name: Commit frozen V6.1 Phase 2 artifacts
+        shell: bash
+        env:
+          BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$BASE_SHA" || {
+            echo "ERROR: origin/main moved during Phase 2; refusing stale commit."
+            exit 1
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email             "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add             research/draft-pick-fv-v6/build_r1_r4_source_identity_v6_1.py             research/draft-pick-fv-v6/r1_r4_development_pick_identity_v6_1.jsonl             research/draft-pick-fv-v6/r1_r4_holdout_2024_pick_identity_v6_1.jsonl             research/draft-pick-fv-v6/r1_r4_source_catalog_v6_1.json             research/draft-pick-fv-v6/r1_r4_source_identity_manifest_v6_1.json             research/draft-pick-fv-v6/r1_r4_source_identity_summary_v6_1.json             research/draft-pick-fv-v6/r1_r4_source_identity_summary_v6_1.md
+
+          git diff --cached --quiet && {
+            echo "ERROR: nothing staged."
+            exit 1
+          }
+
+          git commit -m "Freeze Draft Pick FV V6.1 Phase 2 source identity"
+          git push origin HEAD:main
+
+          echo "PASS: V6.1 Phase 2 source/identity freeze committed."
