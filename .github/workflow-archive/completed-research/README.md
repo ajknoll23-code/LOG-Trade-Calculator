@@ -1,15 +1,41 @@
 # Completed GitHub Actions Research Workflows
 
-Completed manual-only research and deployment workflows are moved out of '.github/workflows' so they no longer clutter the Actions workflow list. Scheduled, reusable, and still-open research workflows remain active.
+Completed manual-only research/deployment workflows are moved out of `.github/workflows` so they do not clutter the GitHub Actions workflow list.
 
-Archived files are preserved byte-for-byte. Their original paths, Git blob SHAs, and SHA-256 hashes are recorded in 'archive_manifest.json'.
+Archived YAML files are preserved byte-for-byte. Original paths, Git blob SHAs, SHA-256 hashes, and triggers are recorded in `archive_manifest.json`.
 
-A very small number of files may be deleted instead of archived only when they are exact SHA-pinned obsolete duplicates with an identified successor. Those deletions are also recorded in the manifest.
+Recurring production/data workflows and studies that are still collecting or intentionally rerunnable remain active.
 
-Archive refreshed: 2026-09-18T21:03:18.154683+00:00
+Archive refreshed: 2026-09-23T15:21:00.349737+00:00
 
-Archived workflow count: **90**
+Archived workflow count: **113**
+Active protected workflow count: **19**
 
+## Active protected workflows
+
+- age-curve-v2-phase5.yml
+- cross-position-apex-calibration-v1-phase2-cross-study-reconciliation.yml
+- durability-v2-phase5.yml
+- fantasypros-api-pipeline.yml
+- free-agent-utility-v1-refresh.yml
+- ktc-vote-aggregation.yml
+- ktc_voter_balance_prospective.yml
+- market-edge-v1-prospective-study.yml
+- no-history-rookie-v2-phase3.yml
+- opportunity-v2-phase5.yml
+- package-adjustment-audit-step4-exact-live-oos.yml
+- position-weight-v2-phase5.yml
+- prospective-trade-evidence-capture.yml
+- replacement-level-v2-phase5.yml
+- repo-regression-checks.yml
+- research-program-status-v1-current-state-audit.yml
+- scheduled-data-refresh.yml
+- sync-sleeper.yml
+- workflow-folder-cleanup.yml
+
+## Archived workflows
+
+- cross-position-apex-calibration-v1-phase1-diagnostic-freeze.yml
 - draft-pick-fv-mathematical-audit.yml
 - draft-pick-fv-v1-historical-draft-catalog.yml
 - draft-pick-fv-v1-preregistration.yml
@@ -29,6 +55,14 @@ Archived workflow count: **90**
 - draft-pick-fv-v3-mfl-source-feasibility.yml
 - draft-pick-fv-v3-mfl-validated-proxy-feasibility.yml
 - draft-pick-fv-v3-rookie-scope-contamination-audit.yml
+- draft-pick-fv-v4-clean-source-recovery.yml
+- draft-pick-fv-v5-phase2-1-preoutcome-source-retention-amendment.yml
+- draft-pick-fv-v5-phase3-historical-outcome-harvest.yml
+- draft-pick-fv-v5-phase4-development-candidate-fit.yml
+- draft-pick-fv-v5-phase5-locked-validation-scoring.yml
+- draft-pick-fv-v5-phase6-research-closeout.yml
+- draft-pick-fv-v5-r1-r2-bridge-preregistration.yml
+- draft-pick-fv-v5-r1-r2-source-catalog-identity-freeze.yml
 - draft-pick-valuation-structural-audit.yml
 - draft-slot-projection-activation.yml
 - elite-surplus-positional-scarcity-audit.yml
@@ -81,6 +115,7 @@ Archived workflow count: **90**
 - market-value-v2-phase2-voter-policy-robustness.yml
 - market-value-v2-phase3-production-candidate-shadow.yml
 - market-value-v2-phase4-production-deployment.yml
+- offense-position-lineage-v1-phase1-audit-freeze.yml
 - package-adjustment-nextgen-v2-m2b-failure-diagnostic.yml
 - package-adjustment-nextgen-v2-m3-development-fit.yml
 - package-adjustment-nextgen-v2-m3-development-preregistration.yml
@@ -89,9 +124,22 @@ Archived workflow count: **90**
 - package-adjustment-nextgen-v2-prospective-maturity-monitor.yml
 - package-adjustment-nextgen-v2-research-closeout.yml
 - package-adjustment-v6-development-catalog.yml
+- package-adjustment-v6-development-evaluation.yml
+- package-adjustment-v6-development-freeze-exact-700.yml
 - package-adjustment-v6-development-maturity-monitor.yml
 - package-adjustment-v6-development-preregistration.yml
 - package-adjustment-v6-development-voting-activation.yml
+- package-adjustment-v6-production-deployment.yml
+- package-adjustment-v6-production-review.yml
+- package-adjustment-v6-prospective-catalog-freeze.yml
+- package-adjustment-v6-prospective-evaluation.yml
+- package-adjustment-v6-prospective-feasibility-amendment.yml
+- package-adjustment-v6-prospective-freeze-exact-1800.yml
+- package-adjustment-v6-prospective-maturity-monitor.yml
+- package-adjustment-v6-prospective-power-analysis.yml
+- package-adjustment-v6-prospective-preregistration.yml
+- package-adjustment-v6-prospective-voting-activation.yml
+- package-adjustment-v7-phase0-pick-player-scale-bridge-audit.yml
 - qb-elite-fv-compression-diagnostic.yml
 - qb-production-multiplier-lineage-diagnostic.yml
 - trade-robustness-v1-phase1-shadow.yml
@@ -101,6 +149,7 @@ Archived workflow count: **90**
 - trade-robustness-v1-phase4-pick-ui.yml
 - trade-robustness-v1-ui-polish.yml
 
-## Deleted obsolete duplicates
+## Deleted exact obsolete duplicates
 
-- fourforfour-offense-v1-confidence-c2-confirm-and-deploy.yml — Superseded stale pre-patch 4for4 Offense Confidence C2 deploy workflow
+- `.github/workflows/fourforfour-offense-v1-confidence-c2-confirm-and-deploy.yml` — Superseded stale pre-patch 4for4 Offense Confidence C2 deploy workflow
+- `workflows/.githubdraft-pick-fv-v5-phase6-research-closeout.yml` — Malformed duplicate path created during V5 Phase 6 workflow replacement; canonical workflow is archived from .github/workflows in this cleanup.
