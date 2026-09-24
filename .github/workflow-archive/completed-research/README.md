@@ -6,9 +6,9 @@ Archived YAML files are preserved byte-for-byte. Original paths, Git blob SHAs, 
 
 Recurring production/data workflows and studies that are still collecting or intentionally rerunnable remain active.
 
-Archive refreshed: 2026-09-23T15:21:00.349737+00:00
+Archive refreshed: 2026-09-24T05:39:05.557197+00:00
 
-Archived workflow count: **113**
+Archived workflow count: **120**
 Active protected workflow count: **19**
 
 ## Active protected workflows
@@ -63,6 +63,13 @@ Active protected workflow count: **19**
 - draft-pick-fv-v5-phase6-research-closeout.yml
 - draft-pick-fv-v5-r1-r2-bridge-preregistration.yml
 - draft-pick-fv-v5-r1-r2-source-catalog-identity-freeze.yml
+- draft-pick-fv-v6-phase1-1-clean-source-amendment.yml
+- draft-pick-fv-v6-phase1-structural-continuity-preregistration.yml
+- draft-pick-fv-v6-phase2-r1-r4-source-identity-freeze.yml
+- draft-pick-fv-v6-phase3-1-dob-lineage-repair.yml
+- draft-pick-fv-v6-phase3-r1-r4-historical-outcome-harvest.yml
+- draft-pick-fv-v6-phase4-loyo-development-selection.yml
+- draft-pick-fv-v6-phase4-research-closeout.yml
 - draft-pick-valuation-structural-audit.yml
 - draft-slot-projection-activation.yml
 - elite-surplus-positional-scarcity-audit.yml
