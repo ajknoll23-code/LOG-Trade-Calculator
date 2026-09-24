@@ -1,0 +1,378 @@
+# PREFLIGHTED: DRAFT_PICK_FV_V7_PHASE2_ACCELERATED_FINALIZE_V1
+name: Draft Pick FV V7 - Phase 2 Accelerated Finalize
+
+"on":
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Capture finalization base
+        id: base
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13.15'
+
+      - name: Install finalization dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir "requests==2.34.2"
+
+      - name: Guard accelerated lineage and unopened final-output paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          python3 - <<'PY2'
+          import json
+          from pathlib import Path
+          d=Path('research/draft-pick-fv-v7')
+          a=json.loads((d/'r1_r6_phase2_accelerated_probe_resume_v7.json').read_text())
+          m=json.loads((d/'r1_r6_phase2_accelerated_probe_resume_manifest_v7.json').read_text())
+          dec='FREEZE_V7_PHASE2_ACCELERATED_PROBE_RESUME_AUTHORIZED'
+          assert a['decision']==dec and m['decision']==dec
+          assert a['candidate_universe_total_n']==6203
+          assert a['batch_size']==25 and a['chunk_r25_batches_per_job']==5
+          assert a['max_parallel']==3
+          assert a['prior_run_id']==36052205794
+          assert a['prior_successful_probe_expected_n']==3
+          assert a['prior_successful_probe_artifact_ids']==[10830973334,10830739613,10832554808]
+          assert set(a['prior_successful_probe_artifacts'])=={'2018/1','2018/2','2018/4'}
+          assert a['minimum_inter_request_seconds']==5.0
+          assert a['request_spacing_clock']=='request_start_to_request_start'
+          assert a['new_league_search_allowed'] is False
+          assert a['scientific_contract_changed'] is False
+          assert a['source_selection_contract_changed'] is False
+          assert a['candidate_membership_changed'] is False
+          assert a['candidate_order_changed'] is False
+          assert a['transport_safety_floor_changed'] is False
+          assert a['retry_redirect_cooldown_contract_changed'] is False
+          print('PASS: accelerated lineage exact, including three reusable green probes.')
+          PY2
+
+          for p in \
+            research/draft-pick-fv-v7/build_r1_r6_source_identity_v7.py \
+            research/draft-pick-fv-v7/r1_r6_identity_asset_manifest_v7.json \
+            research/draft-pick-fv-v7/r1_r6_development_pick_identity_v7.jsonl \
+            research/draft-pick-fv-v7/r1_r6_holdout_2024_pick_identity_v7.jsonl \
+            research/draft-pick-fv-v7/r1_r6_source_catalog_v7.json \
+            research/draft-pick-fv-v7/r1_r6_source_identity_manifest_v7.json \
+            research/draft-pick-fv-v7/r1_r6_source_identity_summary_v7.json \
+            research/draft-pick-fv-v7/r1_r6_source_identity_summary_v7.md
+          do
+            test ! -e "$p" || { echo "ERROR: Phase 2 final output already exists: $p"; exit 1; }
+          done
+
+      - name: Discover latest successful A B C shard runs
+        id: shards
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/shards"
+          gh run list --repo "$GITHUB_REPOSITORY" \
+            --workflow draft-pick-fv-v7-phase2-accelerated-probe-shard.yml \
+            --event workflow_dispatch --status success --limit 100 \
+            --json databaseId,displayTitle,createdAt \
+            > "${RUNNER_TEMP}/shard-runs.json"
+
+          for S in A B C; do
+            TITLE="Draft Pick FV V7 - Probe Shard $S"
+            RID="$(jq -r --arg title "$TITLE" '[.[] | select(.displayTitle==$title)] | sort_by(.createdAt) | reverse | .[0].databaseId // empty' "${RUNNER_TEMP}/shard-runs.json")"
+            test -n "$RID" || { echo "ERROR: no successful shard run found for $S"; exit 1; }
+            echo "SHARD_$S run_id=$RID"
+            echo "shard_${S,,}_run_id=$RID" >> "$GITHUB_OUTPUT"
+            mkdir -p "${RUNNER_TEMP}/shards/$S"
+            gh run download "$RID" --repo "$GITHUB_REPOSITORY" \
+              -n "v7-p2-accelerated-shard-$S-years" \
+              -D "${RUNNER_TEMP}/shards/$S"
+          done
+
+      - name: Validate shard manifests and assemble six historical years
+        shell: bash
+        env:
+          RUN_A: ${{ steps.shards.outputs.shard_a_run_id }}
+          RUN_B: ${{ steps.shards.outputs.shard_b_run_id }}
+          RUN_C: ${{ steps.shards.outputs.shard_c_run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/years" "${RUNNER_TEMP}/final-engine"
+          python3 - <<'PY2'
+          import hashlib, json, os, shutil
+          from pathlib import Path
+
+          root=Path(os.environ['RUNNER_TEMP']); repo=Path.cwd(); d=repo/'research/draft-pick-fv-v7'
+          sha=lambda p: hashlib.sha256(Path(p).read_bytes()).hexdigest()
+          contract_sha=sha(d/'r1_r6_phase2_accelerated_probe_resume_v7.json')
+          contract_man_sha=sha(d/'r1_r6_phase2_accelerated_probe_resume_manifest_v7.json')
+          expected={'A':(2018,2021),'B':(2019,2022),'C':(2020,2023)}
+          runs={'A':os.environ['RUN_A'],'B':os.environ['RUN_B'],'C':os.environ['RUN_C']}
+          assert len(set(runs.values()))==3,runs
+          engine_sha=None; asset_sha=None; found_years=set()
+          engine_source=None
+
+          for s,years in expected.items():
+              base=root/'shards'/s
+              mans=list(base.rglob(f'shard_{s}_manifest.json'))
+              assert len(mans)==1,(s,mans)
+              man=json.loads(mans[0].read_text())
+              assert man['shard']==s and tuple(man['years'])==years
+              assert man['source_slow_r25_run_id']==36052205794
+              assert man['accelerated_contract_sha256']==contract_sha
+              assert man['accelerated_contract_manifest_sha256']==contract_man_sha
+              if s=='A': assert man['reused_green_batches']==['2018/1','2018/2','2018/4']
+              else: assert man['reused_green_batches']==[]
+              if engine_sha is None:
+                  engine_sha=man['engine_sha256']; asset_sha=man['identity_asset_manifest_sha256']
+              else:
+                  assert man['engine_sha256']==engine_sha
+                  assert man['identity_asset_manifest_sha256']==asset_sha
+
+              engines=list(base.rglob('engine/build_r1_r6_source_identity_v7.py'))
+              assets=list(base.rglob('engine/r1_r6_identity_asset_manifest_v7.json'))
+              dps=list(base.rglob('engine/db_playerids.csv'))
+              nvs=list(base.rglob('engine/nflverse_players.csv'))
+              assert len(engines)==len(assets)==len(dps)==len(nvs)==1
+              assert sha(engines[0])==engine_sha
+              assert sha(assets[0])==asset_sha
+              if engine_source is None:
+                  engine_source=(engines[0],assets[0],dps[0],nvs[0])
+
+              for y in years:
+                  ys=list(base.rglob(f'year_{y}.json')); assert len(ys)==1,(s,y,ys)
+                  assert sha(ys[0])==man['year_output_sha256'][str(y)]
+                  obj=json.loads(ys[0].read_text())
+                  assert obj['draft_year']==y
+                  assert obj['discovery']['all_bounded_union_candidates_probed'] is True
+                  assert obj['discovery']['early_stopping_used'] is False
+                  assert obj['discovery']['search_errors']=={}
+                  for k in ('historical_player_outcomes_read','holdout_2024_outcomes_read','candidate_fit_performed','candidate_scores_computed','candidate_selection_performed','production_change_authorized'):
+                      assert obj[k] is False
+                  assert y not in found_years; found_years.add(y)
+                  shutil.copy2(ys[0],root/'years'/f'year_{y}.json')
+
+          assert found_years==set(range(2018,2024)),found_years
+          assert engine_source is not None
+          for p in engine_source: shutil.copy2(p,root/'final-engine'/p.name)
+          assert sha(root/'final-engine/build_r1_r6_source_identity_v7.py')==engine_sha
+          assert sha(root/'final-engine/r1_r6_identity_asset_manifest_v7.json')==asset_sha
+          print(f'PASS: assembled six frozen historical years from shard runs {runs}; engine={engine_sha}.')
+          PY2
+
+      - name: Preflight shard engine on finalization base
+        shell: bash
+        run: |
+          set -euo pipefail
+          E="${RUNNER_TEMP}/final-engine/build_r1_r6_source_identity_v7.py"
+          chmod +x "$E"
+          python3 "$E" --selftest
+          python3 "$E" --guard
+
+      - name: Rebuild only frozen 2024 holdout cohort
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/holdout"
+          python3 "${RUNNER_TEMP}/final-engine/build_r1_r6_source_identity_v7.py" \
+            --holdout-2024 \
+            --dp "${RUNNER_TEMP}/final-engine/db_playerids.csv" \
+            --nflverse "${RUNNER_TEMP}/final-engine/nflverse_players.csv" \
+            --asset-manifest "${RUNNER_TEMP}/final-engine/r1_r6_identity_asset_manifest_v7.json" \
+            --out "${RUNNER_TEMP}/holdout/holdout_2024.json"
+
+      - name: Validate frozen 2024 firewall
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY2'
+          import json, os
+          from pathlib import Path
+          d=json.loads((Path(os.environ['RUNNER_TEMP'])/'holdout/holdout_2024.json').read_text())
+          assert d['draft_year']==2024
+          assert d['holdout_2024_search_performed'] is False
+          assert d['holdout_2024_replacement_or_substitution_used'] is False
+          assert d['holdout_2024_contamination_reclassification_used'] is False
+          assert d['frozen_V6_full72_league_n']==10
+          assert d['clean_full72_league_n']==10
+          for k in ('historical_player_outcomes_read','holdout_2024_outcomes_read','candidate_fit_performed','candidate_scores_computed','candidate_selection_performed','production_change_authorized'):
+              assert d[k] is False
+          print(f"PASS: exact ten frozen 2024 leagues rebuilt; identity_gate={d['source_identity_gate_pass']}")
+          PY2
+
+      - name: Aggregate and freeze Phase 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "${RUNNER_TEMP}/final-engine/build_r1_r6_source_identity_v7.py" \
+            research/draft-pick-fv-v7/build_r1_r6_source_identity_v7.py
+          cp "${RUNNER_TEMP}/final-engine/r1_r6_identity_asset_manifest_v7.json" \
+            research/draft-pick-fv-v7/r1_r6_identity_asset_manifest_v7.json
+          chmod +x research/draft-pick-fv-v7/build_r1_r6_source_identity_v7.py
+
+          python3 research/draft-pick-fv-v7/build_r1_r6_source_identity_v7.py \
+            --aggregate \
+            --partial-dir "${RUNNER_TEMP}/years" \
+            --holdout-path "${RUNNER_TEMP}/holdout/holdout_2024.json" \
+            --asset-manifest research/draft-pick-fv-v7/r1_r6_identity_asset_manifest_v7.json
+
+          python3 research/draft-pick-fv-v7/build_r1_r6_source_identity_v7.py --check
+
+      - name: Prove final summary contains accelerated recovery lineage
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY2'
+          import hashlib, json
+          from pathlib import Path
+          d=Path('research/draft-pick-fv-v7')
+          s=json.loads((d/'r1_r6_source_identity_summary_v7.json').read_text())
+          m=json.loads((d/'r1_r6_source_identity_manifest_v7.json').read_text())
+          names=(
+            'r1_r6_phase2_probe_repartition_recovery_v7.json',
+            'r1_r6_phase2_probe_repartition_recovery_manifest_v7.json',
+            'r1_r6_phase2_accelerated_probe_resume_v7.json',
+            'r1_r6_phase2_accelerated_probe_resume_manifest_v7.json',
+          )
+          sha=lambda p: hashlib.sha256(Path(p).read_bytes()).hexdigest()
+          for x in names:
+              assert s['input_hashes'][x]==sha(d/x),x
+              assert m['input_hashes'][x]==s['input_hashes'][x],x
+          print('PASS: final freeze cryptographically includes R25 + accelerated resume lineage.')
+          PY2
+
+      - name: Prove exact research-only mutation scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t changed < <(
+            git status --porcelain=v1 --untracked-files=all |
+            sed -E 's/^.. //' | sort
+          )
+          expected=(
+            "research/draft-pick-fv-v7/build_r1_r6_source_identity_v7.py"
+            "research/draft-pick-fv-v7/r1_r6_identity_asset_manifest_v7.json"
+            "research/draft-pick-fv-v7/r1_r6_development_pick_identity_v7.jsonl"
+            "research/draft-pick-fv-v7/r1_r6_holdout_2024_pick_identity_v7.jsonl"
+            "research/draft-pick-fv-v7/r1_r6_source_catalog_v7.json"
+            "research/draft-pick-fv-v7/r1_r6_source_identity_manifest_v7.json"
+            "research/draft-pick-fv-v7/r1_r6_source_identity_summary_v7.json"
+            "research/draft-pick-fv-v7/r1_r6_source_identity_summary_v7.md"
+          )
+          diff -u <(printf '%s\n' "${expected[@]}" | sort) <(printf '%s\n' "${changed[@]}" | sort)
+
+      - name: Run production and repository regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          TU_JSON="scripts/artifacts/generated/team_utility_lineup_projections.json"
+          TU_MD="scripts/artifacts/reports/team_utility_lineup_projection_report.md"
+          restore_tu() { git checkout -- "$TU_JSON" "$TU_MD"; }
+          trap restore_tu EXIT
+          python3 scripts/projections/build_team_utility_lineup_projections.py --write
+          python3 scripts/validation/check_package_adjustment_live.py
+          python3 scripts/validation/repo_regression_checks.py
+          restore_tu
+          trap - EXIT
+          git diff --exit-code -- "$TU_JSON" "$TU_MD"
+
+      - name: Re-prove deployed Draft Pick contract unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY2'
+          from pathlib import Path
+          t=Path('index.html').read_text()
+          expected=[
+            "  1: {early:7500, mid:5854, late:5244},",
+            "  2: {early:3906, mid:3624, late:3291},",
+            "  3: {early:2692, mid:2682, late:2319},",
+            "  4: {early:1972, mid:1831, late:1689},",
+            "  5: {early:1414, mid:1250, late:1118},  // extrapolated — no KTC data",
+            "  6: {early:1014, mid:853,  late:740},   // extrapolated — no KTC data",
+            "const YEAR_DISCOUNT = { '2027':1.0, '2028':0.85, '2029':0.72 };",
+          ]
+          for x in expected: assert x in t,x
+          print('PASS: deployed PICK_BASE/YEAR_DISCOUNT unchanged.')
+          PY2
+
+      - name: Commit frozen V7 Phase 2 artifacts with drift-safe rebase
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            research/draft-pick-fv-v7/build_r1_r6_source_identity_v7.py \
+            research/draft-pick-fv-v7/r1_r6_identity_asset_manifest_v7.json \
+            research/draft-pick-fv-v7/r1_r6_development_pick_identity_v7.jsonl \
+            research/draft-pick-fv-v7/r1_r6_holdout_2024_pick_identity_v7.jsonl \
+            research/draft-pick-fv-v7/r1_r6_source_catalog_v7.json \
+            research/draft-pick-fv-v7/r1_r6_source_identity_manifest_v7.json \
+            research/draft-pick-fv-v7/r1_r6_source_identity_summary_v7.json \
+            research/draft-pick-fv-v7/r1_r6_source_identity_summary_v7.md
+          git diff --cached --quiet && { echo 'ERROR: no Phase 2 artifacts staged.'; exit 1; }
+          git commit -m "Freeze Draft Pick FV V7 Phase 2 source identity"
+          git fetch origin main
+          critical=(
+            research/draft-pick-fv-v7/r1_r6_full_scale_preregistration_v7.json
+            research/draft-pick-fv-v7/r1_r6_phase2_source_implementation_contract_v7.json
+            research/draft-pick-fv-v7/r1_r6_phase2_transport_recovery_v7.json
+            research/draft-pick-fv-v7/r1_r6_phase2_checkpoint_recovery_v7.json
+            research/draft-pick-fv-v7/r1_r6_phase2_probe_repartition_recovery_v7.json
+            research/draft-pick-fv-v7/r1_r6_phase2_accelerated_probe_resume_v7.json
+            research/draft-pick-fv-v6/r1_r4_source_catalog_v6_1.json
+            research/draft-pick-fv-v6/build_r1_r4_source_identity_v6_1.py
+            scripts/identity_crosswalk.json
+            index.html
+          )
+          for p in "${critical[@]}"; do
+            test "$(git rev-parse "$BASE_SHA:$p")" = "$(git rev-parse "origin/main:$p")" || {
+              echo "ERROR: scientific/production predecessor drift on main: $p"; exit 1;
+            }
+          done
+          for p in \
+            research/draft-pick-fv-v7/build_r1_r6_source_identity_v7.py \
+            research/draft-pick-fv-v7/r1_r6_identity_asset_manifest_v7.json \
+            research/draft-pick-fv-v7/r1_r6_development_pick_identity_v7.jsonl \
+            research/draft-pick-fv-v7/r1_r6_holdout_2024_pick_identity_v7.jsonl \
+            research/draft-pick-fv-v7/r1_r6_source_catalog_v7.json \
+            research/draft-pick-fv-v7/r1_r6_source_identity_manifest_v7.json \
+            research/draft-pick-fv-v7/r1_r6_source_identity_summary_v7.json \
+            research/draft-pick-fv-v7/r1_r6_source_identity_summary_v7.md
+          do
+            if git cat-file -e "origin/main:$p" 2>/dev/null; then
+              echo "ERROR: final output path appeared on main during finalization: $p"; exit 1
+            fi
+          done
+          git rebase origin/main
+          python3 research/draft-pick-fv-v7/build_r1_r6_source_identity_v7.py --check
+          git push origin HEAD:main
+          echo 'PASS: V7 Phase 2 accelerated shard source/identity freeze committed.'
