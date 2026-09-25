@@ -27,7 +27,7 @@
 
 ## Completed outcome state
 
-- Outcome refresh: `2026-09-23T14:31:25.201140Z`
+- Outcome refresh: `2026-09-25T12:14:19.971987Z`
 - Completed weeks recognized: **[1, 2]**
 - Consecutive prefix used: **[1, 2]**
 
@@ -40,16 +40,16 @@ Phase-8 monitoring reference rank: **64 / 121**
 
 | Rank | Variant | FP wt | History wt | Ranks | Floor | Primary Spearman | Δ vs deployed | Pairwise |
 |---:|---|---:|---:|---|---:|---:|---:|---:|
-| 1 | `fp_0.00__history_0.25__documented__floor_0.15` | 0% | 25% | documented | 0.15 | 0.594252 | 0.048572 | 0.712569 |
-| 2 | `fp_0.00__history_0.25__documented__floor_0.20` | 0% | 25% | documented | 0.20 | 0.593962 | 0.048282 | 0.713796 |
-| 3 | `fp_0.00__history_0.25__documented__floor_0.05` | 0% | 25% | documented | 0.05 | 0.593726 | 0.048046 | 0.711706 |
-| 4 | `fp_0.00__history_0.25__documented__floor_0.10` | 0% | 25% | documented | 0.10 | 0.593487 | 0.047807 | 0.71184 |
-| 5 | `fp_0.25__history_0.25__documented__floor_0.20` | 25% | 25% | documented | 0.20 | 0.593312 | 0.047632 | 0.713684 |
-| 6 | `fp_0.25__history_0.25__documented__floor_0.15` | 25% | 25% | documented | 0.15 | 0.593233 | 0.047553 | 0.712574 |
-| 7 | `fp_0.25__history_0.25__documented__floor_0.05` | 25% | 25% | documented | 0.05 | 0.592371 | 0.046691 | 0.71157 |
-| 8 | `fp_0.25__history_0.25__documented__floor_0.10` | 25% | 25% | documented | 0.10 | 0.592319 | 0.046639 | 0.711732 |
-| 9 | `fp_0.75__history_0.25__documented__floor_0.15` | 75% | 25% | documented | 0.15 | 0.591324 | 0.045644 | 0.712091 |
-| 10 | `fp_0.75__history_0.25__evidence_hybrid__floor_0.15` | 75% | 25% | evidence_hybrid | 0.15 | 0.5911 | 0.04542 | 0.712445 |
+| 1 | `fp_0.00__history_0.25__documented__floor_0.15` | 0% | 25% | documented | 0.15 | 0.594456 | 0.048437 | 0.712665 |
+| 2 | `fp_0.00__history_0.25__documented__floor_0.20` | 0% | 25% | documented | 0.20 | 0.594159 | 0.04814 | 0.713892 |
+| 3 | `fp_0.00__history_0.25__documented__floor_0.05` | 0% | 25% | documented | 0.05 | 0.59393 | 0.047911 | 0.711802 |
+| 4 | `fp_0.00__history_0.25__documented__floor_0.10` | 0% | 25% | documented | 0.10 | 0.593691 | 0.047672 | 0.711936 |
+| 5 | `fp_0.25__history_0.25__documented__floor_0.20` | 25% | 25% | documented | 0.20 | 0.593506 | 0.047487 | 0.713781 |
+| 6 | `fp_0.25__history_0.25__documented__floor_0.15` | 25% | 25% | documented | 0.15 | 0.593431 | 0.047412 | 0.71267 |
+| 7 | `fp_0.25__history_0.25__documented__floor_0.05` | 25% | 25% | documented | 0.05 | 0.592569 | 0.04655 | 0.711666 |
+| 8 | `fp_0.25__history_0.25__documented__floor_0.10` | 25% | 25% | documented | 0.10 | 0.592517 | 0.046498 | 0.711827 |
+| 9 | `fp_0.75__history_0.25__documented__floor_0.15` | 75% | 25% | documented | 0.15 | 0.591545 | 0.045526 | 0.712207 |
+| 10 | `fp_0.75__history_0.25__evidence_hybrid__floor_0.15` | 75% | 25% | evidence_hybrid | 0.15 | 0.591199 | 0.04518 | 0.71259 |
 
 ## Stability
 
