@@ -17,9 +17,9 @@ Policy SHA256: `bafc53164f6d98448965c5d0b531b14be31a3d744f0e4a44d6cdac71b6c05247
 | Pos | N | Median half-width | Median provider component | Median history component | Median availability component |
 |---|---:|---:|---:|---:|---:|
 | QB | 64 | 37.7% | 3.8% | 17.2% | 28.9% |
-| RB | 97 | 24.2% | 6.9% | 18.5% | 4.3% |
+| RB | 97 | 24.1% | 6.9% | 18.5% | 4.3% |
 | WR | 114 | 25.9% | 8.7% | 22.5% | 6.9% |
-| TE | 44 | 25.0% | 7.9% | 19.2% | 7.1% |
+| TE | 44 | 25.0% | 7.8% | 19.2% | 7.1% |
 | DL | 86 | 25.2% | 10.4% | 21.0% | 5.2% |
 | LB | 79 | 22.1% | 15.8% | 14.7% | 1.7% |
 | DB | 65 | 19.5% | 11.8% | 14.4% | 1.9% |
@@ -32,7 +32,7 @@ Policy SHA256: `bafc53164f6d98448965c5d0b531b14be31a3d744f0e4a44d6cdac71b6c05247
 | jameis winston | QB | 1086 | 0 | 2172 | 100.0% | very_high |
 | tyrel dodson | LB | 4295 | 0 | 8590 | 100.0% | very_high |
 | zion young | DL | 1013 | 20 | 2006 | 98.0% | very_high |
-| malik nabers | WR | 4083 | 173 | 7993 | 95.8% | very_high |
+| malik nabers | WR | 4083 | 172 | 7994 | 95.8% | very_high |
 | cedric gray | LB | 4509 | 235 | 8783 | 94.8% | very_high |
 | dezhaun stribling | WR | 2190 | 190 | 4190 | 91.3% | very_high |
 | dylan sampson | RB | 1526 | 148 | 2904 | 90.3% | very_high |
