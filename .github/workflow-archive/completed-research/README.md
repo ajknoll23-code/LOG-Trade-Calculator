@@ -6,15 +6,22 @@ Archived YAML files are preserved byte-for-byte. Original paths, Git blob SHAs, 
 
 Recurring production/data workflows and studies that are still collecting or intentionally rerunnable remain active.
 
-Archive refreshed: 2026-09-24T05:39:05.557197+00:00
+Archive refreshed: 2026-09-25T03:55:11.404163+00:00
 
-Archived workflow count: **120**
-Active protected workflow count: **19**
+Archived workflow count: **132**
+Active protected workflow count: **26**
 
 ## Active protected workflows
 
 - age-curve-v2-phase5.yml
 - cross-position-apex-calibration-v1-phase2-cross-study-reconciliation.yml
+- draft-pick-fv-v7-phase1-r1-r6-full-scale-preregistration.yml
+- draft-pick-fv-v7-phase2-accelerated-finalize.yml
+- draft-pick-fv-v7-phase2-accelerated-probe-resume-v2.yml
+- draft-pick-fv-v7-phase2-accelerated-probe-shard.yml
+- draft-pick-fv-v7-phase2-checkpointed-source-identity-freeze.yml
+- draft-pick-fv-v7-phase2-r1-r6-source-identity-freeze.yml
+- draft-pick-fv-v7-phase2-r25-probe-recovery.yml
 - durability-v2-phase5.yml
 - fantasypros-api-pipeline.yml
 - free-agent-utility-v1-refresh.yml
@@ -35,7 +42,19 @@ Active protected workflow count: **19**
 
 ## Archived workflows
 
+- DLF-Phase-1B-V2.yml
+- DLF-Phase-1C-Historical-Incremental-Signal-V2.yml
+- DLF-Prospect-FV-Phase-1B3-Prereg-Correction.yml
+- DLF-Prospect-FV-Phase-1B4-Temporal-Implementation-Freeze.yml
+- DLF-Prospect-FV-Phase-1C-Historical-Incremental-Signal.yml
+- DLF-Prospect-FV-V1-Phase-1D-Closeout.yml
+- DLF-Prospect-FV-V2-Phase-1A-Advanced-Preregistration.yml
+- DLF-Prospect-FV-V2-Phase-1B-Advanced-Development-Signal.yml
+- DLF-Prospect-FV-V2-Phase-1C-Closeout.yml
 - cross-position-apex-calibration-v1-phase1-diagnostic-freeze.yml
+- dlf-prospect-fv-v1-phase1a-source-feasibility.yml
+- dlf-prospect-fv-v1-phase1a2-deterministic-source-freeze-v2.yml
+- dlf-prospect-fv-v1-phase1b-identity-preregistration.yml
 - draft-pick-fv-mathematical-audit.yml
 - draft-pick-fv-v1-historical-draft-catalog.yml
 - draft-pick-fv-v1-preregistration.yml
