@@ -1,0 +1,336 @@
+# PREFLIGHTED: PACKAGE_ADJUSTMENT_V7_OUTCOME_BLIND_MATURITY_MONITOR_V1
+name: Package Adjustment V7 - Outcome-Blind Maturity Monitor
+'on':
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: package-adjustment-v7-development-maturity-monitor
+  cancel-in-progress: false
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+    - name: Check out current main
+      uses: actions/checkout@v4
+      with:
+        ref: main
+        fetch-depth: 1
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Install monitor dependency
+      shell: bash
+      run: |-
+        set -euo pipefail
+        python3 -m pip install --disable-pip-version-check --no-cache-dir "requests==2.34.2"
+    - name: Guard frozen V7 activation contract
+      shell: bash
+      run: |-
+        set -euo pipefail
+        test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+        declare -A EXPECTED=(
+          ["research/package-adjustment-v7/development_voting_activation_manifest_v1.json"]="90f78e63f8a019ac47d78cee9151548a1afd6b89"
+          ["research/package-adjustment-v7/package_vote_challenges_v7_development_v1.json"]="01823ce0f146fd09693b4585bf4948c3076bd9d3"
+          ["research/package-adjustment-v7/phase1a_power_analysis_v1.json"]="7f908d437d8cea1b0c4561d114118b8fe94d8fa7"
+        )
+
+        for p in "${!EXPECTED[@]}"; do
+          a="$(git hash-object "$p")"
+          test "$a" = "${EXPECTED[$p]}" || {
+            echo "ERROR: frozen V7 maturity predecessor drift: $p expected=${EXPECTED[$p]} actual=$a"
+            exit 1
+          }
+        done
+
+        python3 - <<'PY'
+        import hashlib, json
+        from pathlib import Path
+
+        d=Path("research/package-adjustment-v7")
+        act=json.loads((d/"development_voting_activation_manifest_v1.json").read_text())
+        cat=d/"package_vote_challenges_v7_development_v1.json"
+        power=json.loads((d/"phase1a_power_analysis_v1.json").read_text())
+
+        assert act["status"]=="V7_DEVELOPMENT_VOTING_ACTIVATED"
+        assert act["catalog"]["sha256"]==hashlib.sha256(cat.read_bytes()).hexdigest()
+        assert act["catalog"]["challenge_count"]==40
+        assert act["maturity_contract"]["first_checkpoint_distinct_voters"]==40
+        assert act["maturity_contract"]["minimum_distinct_voters_per_challenge"]==32
+        assert act["maturity_contract"]["hard_cap_distinct_voters"]==50
+        assert act["maturity_contract"]["stopping_may_use_vote_direction"] is False
+        assert act["maturity_contract"]["stopping_may_use_candidate_performance"] is False
+        assert power["selected_first_checkpoint_distinct_voters"]==40
+        assert power["hard_cap_distinct_voters"]==50
+
+        html=Path("index.html").read_text(encoding="utf-8")
+        assert "Package Adjustment V7 Development Voting." in html
+        assert "__pkgv7dev__|" in html
+        assert "const PACKAGE_VOTE_TOTAL_CHALLENGES = 40;" in html
+
+        ktc=Path("scripts/market/ktc_pipeline.py").read_text(encoding="utf-8")
+        assert '"__pkgv7dev__|"' in ktc
+
+        reg=Path("scripts/validation/repo_regression_checks.py").read_text(encoding="utf-8")
+        assert '"__pkgv7dev__|"' in reg
+        assert "PASS V7 frozen 40-challenge sampling contract:" in reg
+        assert 'assert "const byCell = new Map();" in block' not in reg[
+            reg.index("def check_package_sampling_contract():"):
+            reg.index("\ndef check_index_js_syntax():")
+        ]
+        print("PASS: frozen V7 activation and permanent sampling contract verified.")
+        PY
+
+        python3 scripts/validation/check_package_adjustment_live.py
+    - name: Self-test outcome-blind maturity arithmetic
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 - <<'PY'
+        from collections import defaultdict
+
+        FIRST=40
+        MIN_PER=32
+        HARD=50
+        CHALLENGES=[f"c{i:02d}" for i in range(40)]
+
+        def decision(rows):
+            seen=set()
+            dedup=[]
+            for voter,cid in rows:
+                key=(voter,cid)
+                if key in seen:
+                    continue
+                seen.add(key)
+                dedup.append((voter,cid))
+            first=[]
+            firstset=set()
+            for voter,_ in dedup:
+                if voter not in firstset:
+                    firstset.add(voter)
+                    first.append(voter)
+            accepted=set(first[:HARD])
+            rows=[r for r in dedup if r[0] in accepted]
+
+            voters=set()
+            per={cid:set() for cid in CHALLENGES}
+            qualified=None
+            for i,(voter,cid) in enumerate(rows):
+                voters.add(voter)
+                per[cid].add(voter)
+                if len(voters)>=FIRST and all(len(per[c])>=MIN_PER for c in CHALLENGES):
+                    qualified=(i+1,len(voters),min(len(per[c]) for c in CHALLENGES))
+                    break
+            if qualified:
+                return "STOP", qualified, len(accepted), min(len(per[c]) for c in CHALLENGES)
+            current_voters=len({v for v,_ in rows})
+            current_per={cid:set() for cid in CHALLENGES}
+            for v,c in rows:
+                current_per[c].add(v)
+            minimum=min(len(current_per[c]) for c in CHALLENGES)
+            if current_voters<FIRST:
+                return "LT40",None,current_voters,minimum
+            if current_voters<HARD:
+                return "CONTINUE",None,current_voters,minimum
+            return "HARD",None,current_voters,minimum
+
+        rows=[]
+        for v in range(39):
+            for c in CHALLENGES:
+                rows.append((f"v{v}",c))
+        assert decision(rows)[0]=="LT40"
+
+        rows2=list(rows)
+        rows2.append(("v39","c00"))
+        assert decision(rows2)[0]=="STOP"
+        assert decision(rows2)[1][1]==40
+        assert decision(rows2)[1][2]>=32
+
+        rows3=[]
+        for v in range(40):
+            for c in CHALLENGES[:-1]:
+                rows3.append((f"v{v}",c))
+        for v in range(20):
+            rows3.append((f"v{v}",CHALLENGES[-1]))
+        assert decision(rows3)[0]=="CONTINUE"
+
+        rows4=list(rows3)
+        for v in range(40,50):
+            for c in CHALLENGES[:-1]:
+                rows4.append((f"v{v}",c))
+        assert decision(rows4)[0]=="HARD"
+
+        # Voter 51+ must not expand accepted cohort.
+        rows5=list(rows4)+[("v50",c) for c in CHALLENGES]
+        assert decision(rows5)[2]==50
+
+        # Duplicate voter/challenge rows cannot inflate coverage.
+        dup=[("v0","c00"),("v0","c00")]
+        d=decision(dup)
+        assert d[2]==1 and d[3]==0
+
+        print("PASS: V7 outcome-blind 40/32/50 maturity arithmetic.")
+        PY
+    - name: Build outcome-blind maturity report
+      shell: bash
+      run: "set -euo pipefail\nrm -rf /tmp/package-adjustment-v7-development-maturity\nmkdir -p /tmp/package-adjustment-v7-development-maturity\n\
+        python3 - <<'PY'\nfrom __future__ import annotations\n\nimport csv\nimport hashlib\nimport io\nimport json\nfrom collections\
+        \ import Counter, defaultdict\nfrom datetime import datetime, timezone\nfrom pathlib import Path\n\nimport requests\n\
+        \nROOT = Path.cwd()\nD = ROOT / \"research\" / \"package-adjustment-v7\"\nACT = D / \"development_voting_activation_manifest_v1.json\"\
+        \nCAT = D / \"package_vote_challenges_v7_development_v1.json\"\nPOWER = D / \"phase1a_power_analysis_v1.json\"\nKTC\
+        \ = ROOT / \"scripts\" / \"market\" / \"ktc_pipeline.py\"\n\nOUT = Path(\"/tmp/package-adjustment-v7-development-maturity\"\
+        )\nOUT.mkdir(parents=True, exist_ok=True)\n\nSHEET_URL = (\n    \"https://docs.google.com/spreadsheets/d/e/\"\n  \
+        \  \"2PACX-1vTuKORGumlKJmUmBdeNWPstkj8VRjPoVkylbqHv1KqwoyziJYOUlkZUKRsSxzB3qHXmyjjLpGpH6W03/\"\n    \"pub?gid=458294959&single=true&output=csv\"\
+        \n)\n\ndef load(path: Path):\n    return json.loads(path.read_text(encoding=\"utf-8\"))\n\ndef parse_utc(value):\n\
+        \    s = str(value or \"\").strip()\n    if not s:\n        return None\n    if s.endswith(\"Z\"):\n        s = s[:-1]\
+        \ + \"+00:00\"\n    try:\n        dt = datetime.fromisoformat(s)\n    except ValueError:\n        return None\n  \
+        \  if dt.tzinfo is None:\n        dt = dt.replace(tzinfo=timezone.utc)\n    return dt.astimezone(timezone.utc)\n\n\
+        act = load(ACT)\ncat = load(CAT)\npower = load(POWER)\n\nassert act[\"status\"] == \"V7_DEVELOPMENT_VOTING_ACTIVATED\"\
+        \nassert act[\"research_only\"] is True\nassert act[\"candidate_fit_performed\"] is False\nassert act[\"candidate_scores_read\"\
+        ] is False\nassert act[\"v7_vote_outcomes_read_at_activation\"] is False\nassert act[\"production_change_authorized\"\
+        ] is False\nassert act[\"maturity_contract\"][\"first_checkpoint_distinct_voters\"] == 40\nassert act[\"maturity_contract\"\
+        ][\"minimum_distinct_voters_per_challenge\"] == 32\nassert act[\"maturity_contract\"][\"hard_cap_distinct_voters\"\
+        ] == 50\nassert act[\"maturity_contract\"][\"stopping_may_use_vote_direction\"] is False\nassert act[\"maturity_contract\"\
+        ][\"stopping_may_use_candidate_performance\"] is False\n\nVOTE_PREFIX = act[\"transport\"][\"vote_prefix\"]\nMETA_PREFIX\
+        \ = act[\"transport\"][\"meta_prefix\"]\nSCHEMA_MARKER = act[\"transport\"][\"schema_marker\"]\nassert VOTE_PREFIX\
+        \ == \"__pkgv7dev__|\"\nassert META_PREFIX == \"__pkgv7dev_meta__|\"\nassert SCHEMA_MARKER == \"__pkgv7dev_schema__|1\"\
+        \n\nFIRST = int(act[\"maturity_contract\"][\"first_checkpoint_distinct_voters\"])\nMIN_PER = int(act[\"maturity_contract\"\
+        ][\"minimum_distinct_voters_per_challenge\"])\nHARD = int(act[\"maturity_contract\"][\"hard_cap_distinct_voters\"\
+        ])\nassert (FIRST, MIN_PER, HARD) == (40, 32, 50)\n\ncutoff = parse_utc(act[\"valid_ballot_start_utc\"])\nassert cutoff\
+        \ is not None\n\nassert cat[\"status\"] == \"FROZEN_PRE_VOTE_DEVELOPMENT_CATALOG\"\nassert cat[\"challenge_count\"\
+        ] == 40\nassert cat[\"frozen\"] is True\nassert cat[\"v7_votes_read\"] is False\nassert cat[\"candidate_fit_performed\"\
+        ] is False\nassert cat[\"candidate_predictions_used_for_catalog_selection\"] is False\nassert cat[\"fv_visible_to_voter\"\
+        ] is False\n\nchallenges = {str(c[\"id\"]): c for c in cat[\"challenges\"]}\nassert len(challenges) == 40\n\n# Verify\
+        \ this monitor's source URL still matches the KTC transport source\n# without running the KTC consumer itself.\nktc_text\
+        \ = KTC.read_text(encoding=\"utf-8\")\nassert f'SHEET_CSV_URL = \"{SHEET_URL}\"' in ktc_text\nassert '\"__pkgv7dev__|\"\
+        ' in ktc_text\n\ngenerated_at = datetime.now(timezone.utc)\nresp = requests.get(SHEET_URL, timeout=30)\nresp.raise_for_status()\n\
+        sheet_sha256 = hashlib.sha256(resp.content).hexdigest()\nsource_rows = list(csv.DictReader(io.StringIO(resp.text)))\n\
+        \nexcluded = Counter()\nraw_namespace_rows = 0\nstructural = []\n\nfor source_index, row in enumerate(source_rows):\n\
+        \    keep = str(row.get(\"keep\") or \"\")\n    if not keep.startswith(VOTE_PREFIX):\n        continue\n    raw_namespace_rows\
+        \ += 1\n\n    ts = parse_utc(row.get(\"timestamp\"))\n    if ts is None:\n        excluded[\"invalid_timestamp\"]\
+        \ += 1\n        continue\n    if ts <= cutoff:\n        excluded[\"pre_activation_or_at_cutoff\"] += 1\n        continue\n\
+        \    if ts > generated_at:\n        excluded[\"future_timestamp\"] += 1\n        continue\n\n    voter = str(row.get(\"\
+        voter_roster_id\") or \"\").strip()\n    if not voter:\n        excluded[\"missing_voter_id\"] += 1\n        continue\n\
+        \n    # OUTCOME-BLIND BY CONSTRUCTION:\n    # Read only the challenge id before the first post-prefix delimiter.\n\
+        \    # The response token after that delimiter is never parsed or stored.\n    payload = keep[len(VOTE_PREFIX):]\n\
+        \    if \"|\" not in payload:\n        excluded[\"malformed_vote_transport\"] += 1\n        continue\n    challenge_id\
+        \ = payload.split(\"|\", 1)[0].strip()\n    if challenge_id not in challenges:\n        excluded[\"unknown_challenge_id\"\
+        ] += 1\n        continue\n\n    # Namespace check only; never inspect the A/B randomized-left payload.\n    meta =\
+        \ str(row.get(\"trade\") or \"\")\n    if not meta.startswith(META_PREFIX):\n        excluded[\"invalid_meta_namespace\"\
+        ] += 1\n        continue\n\n    if str(row.get(\"cut\") or \"\") != SCHEMA_MARKER:\n        excluded[\"invalid_schema_marker\"\
+        ] += 1\n        continue\n\n    structural.append({\n        \"timestamp\": ts,\n        \"source_index\": source_index,\n\
+        \        \"voter\": voter,\n        \"challenge_id\": challenge_id,\n    })\n\nstructural.sort(key=lambda r: (r[\"\
+        timestamp\"], r[\"source_index\"]))\n\n# Exact analysis rule: first valid post-activation vote per voter/challenge.\n\
+        seen_voter_challenge = set()\ndeduped = []\nfor row in structural:\n    key = (row[\"voter\"], row[\"challenge_id\"\
+        ])\n    if key in seen_voter_challenge:\n        excluded[\"duplicate_voter_challenge_after_first\"] += 1\n      \
+        \  continue\n    seen_voter_challenge.add(key)\n    deduped.append(row)\n\n# Hard cap is on distinct voters, not ballots.\
+        \ Freeze cohort membership by\n# first structurally valid unique challenge ballot. Later ballots from one of\n# the\
+        \ first 50 voters remain eligible; first-seen voter 51+ is excluded.\nfirst_seen = {}\nfor row in deduped:\n    first_seen.setdefault(row[\"\
+        voter\"], (row[\"timestamp\"], row[\"source_index\"]))\nordered_voters = [\n    voter for voter, _ in sorted(first_seen.items(),\
+        \ key=lambda kv: (kv[1][0], kv[1][1], kv[0]))\n]\naccepted_voters = set(ordered_voters[:HARD])\noverflow_voters =\
+        \ ordered_voters[HARD:]\nif overflow_voters:\n    excluded[\"voters_beyond_hard_cap\"] = len(overflow_voters)\n\n\
+        eligible = [r for r in deduped if r[\"voter\"] in accepted_voters]\n\ndef snapshot(rows):\n    voter_set = {r[\"voter\"\
+        ] for r in rows}\n    per = {cid: set() for cid in challenges}\n    per_topology = defaultdict(lambda: {\"challenge_ids\"\
+        : set(), \"voters_by_challenge\": defaultdict(set)})\n    for row in rows:\n        cid = row[\"challenge_id\"]\n\
+        \        per[cid].add(row[\"voter\"])\n        topo = challenges[cid][\"topology\"]\n        per_topology[topo][\"\
+        challenge_ids\"].add(cid)\n        per_topology[topo][\"voters_by_challenge\"][cid].add(row[\"voter\"])\n\n    challenge_rows\
+        \ = []\n    for cid in sorted(challenges):\n        n = len(per[cid])\n        challenge_rows.append({\n         \
+        \   \"challenge_id\": cid,\n            \"topology\": challenges[cid][\"topology\"],\n            \"distinct_voters\"\
+        : n,\n            \"coverage_gate_pass\": n >= MIN_PER,\n        })\n\n    topology_rows = {}\n    for topo in sorted({c[\"\
+        topology\"] for c in challenges.values()}):\n        ids = sorted(cid for cid,c in challenges.items() if c[\"topology\"\
+        ] == topo)\n        counts = [len(per[cid]) for cid in ids]\n        topology_rows[topo] = {\n            \"challenge_count\"\
+        : len(ids),\n            \"minimum_distinct_voters\": min(counts),\n            \"maximum_distinct_voters\": max(counts),\n\
+        \            \"challenges_passing_coverage\": sum(n >= MIN_PER for n in counts),\n        }\n\n    return {\n    \
+        \    \"accepted_ballots\": len(rows),\n        \"distinct_voters\": len(voter_set),\n        \"distinct_challenges_observed\"\
+        : sum(bool(per[cid]) for cid in challenges),\n        \"minimum_challenge_distinct_voters\": min(len(per[cid]) for\
+        \ cid in challenges),\n        \"maximum_challenge_distinct_voters\": max(len(per[cid]) for cid in challenges),\n\
+        \        \"challenges_passing_coverage\": sum(len(per[cid]) >= MIN_PER for cid in challenges),\n        \"all_challenges_pass_coverage\"\
+        : all(len(per[cid]) >= MIN_PER for cid in challenges),\n        \"challenges\": challenge_rows,\n        \"topologies\"\
+        : topology_rows,\n    }\n\ncurrent = snapshot(eligible)\n\n# Reconstruct the earliest exact outcome-blind maturity\
+        \ moment.\nvoters_running = set()\nper_running = {cid: set() for cid in challenges}\nqualification = None\nfor idx,\
+        \ row in enumerate(eligible):\n    voters_running.add(row[\"voter\"])\n    per_running[row[\"challenge_id\"]].add(row[\"\
+        voter\"])\n    if len(voters_running) >= FIRST and all(len(per_running[cid]) >= MIN_PER for cid in challenges):\n\
+        \        qualification = {\n            \"eligible_ballot_prefix_length\": idx + 1,\n            \"qualified_at_utc\"\
+        : row[\"timestamp\"].isoformat(),\n            \"qualified_at_source_index\": row[\"source_index\"],\n           \
+        \ \"distinct_voters\": len(voters_running),\n            \"minimum_challenge_distinct_voters\": min(len(per_running[cid])\
+        \ for cid in challenges),\n        }\n        break\n\nif qualification is not None:\n    decision = \"STOP_AND_FREEZE_AT_FIRST_COVERAGE_QUALIFICATION\"\
+        \nelif current[\"distinct_voters\"] < FIRST:\n    decision = \"CONTINUE_TO_40_DISTINCT_VOTERS\"\nelif current[\"distinct_voters\"\
+        ] < HARD:\n    decision = \"CONTINUE_COVERAGE_UP_TO_50_DISTINCT_VOTERS\"\nelse:\n    decision = \"STOP_AT_50_HARD_CAP_COVERAGE_NOT_MET\"\
+        \n\nreport = {\n    \"schema_version\": 1,\n    \"study_id\": act[\"study_id\"],\n    \"stage\": \"development_outcome_blind_maturity_monitor\"\
+        ,\n    \"status\": decision,\n    \"generated_at_utc\": generated_at.isoformat(),\n    \"outcome_blind\": True,\n\
+        \    \"vote_direction_read\": False,\n    \"display_side_payload_read\": False,\n    \"candidate_scores_read\": False,\n\
+        \    \"candidate_fit_performed\": False,\n    \"production_change_authorized\": False,\n    \"contract\": {\n    \
+        \    \"first_checkpoint_distinct_voters\": FIRST,\n        \"minimum_distinct_voters_per_challenge\": MIN_PER,\n \
+        \       \"hard_cap_distinct_voters\": HARD,\n        \"one_vote_per_voter_per_challenge\": \"first valid post-activation\
+        \ row only\",\n    },\n    \"source\": {\n        \"sheet_sha256\": sheet_sha256,\n        \"source_csv_row_count\"\
+        : len(source_rows),\n        \"raw_v7_namespace_rows\": raw_namespace_rows,\n        \"activation_cutoff_utc\": cutoff.isoformat(),\n\
+        \    },\n    \"exclusions\": dict(sorted(excluded.items())),\n    \"cohort\": {\n        \"all_distinct_structurally_valid_voters\"\
+        : len(ordered_voters),\n        \"accepted_voters_under_hard_cap\": min(len(ordered_voters), HARD),\n        \"overflow_voter_count\"\
+        : len(overflow_voters),\n    },\n    \"current\": current,\n    \"first_qualification\": qualification,\n    \"decision\"\
+        : decision,\n}\n\n(OUT / \"maturity.json\").write_text(json.dumps(report, indent=2, sort_keys=True) + \"\\n\", encoding=\"\
+        utf-8\")\n\nlines = [\n    \"# Package Adjustment V7 \u2014 Outcome-Blind Development Maturity\",\n    \"\",\n   \
+        \ f\"**Decision:** `{decision}`\",\n    \"\",\n    \"**No vote direction, randomized display-side payload, candidate\
+        \ score, or fitted result was read.**\",\n    \"\",\n    f\"- Distinct accepted voters: **{current['distinct_voters']}\
+        \ / {FIRST} first checkpoint**\",\n    f\"- Hard cap: **{HARD} distinct voters**\",\n    f\"- Challenges observed:\
+        \ **{current['distinct_challenges_observed']} / 40**\",\n    f\"- Challenges at \u2265{MIN_PER} distinct voters: **{current['challenges_passing_coverage']}\
+        \ / 40**\",\n    f\"- Weakest challenge coverage: **{current['minimum_challenge_distinct_voters']} voters**\",\n \
+        \   f\"- Strongest challenge coverage: **{current['maximum_challenge_distinct_voters']} voters**\",\n    \"\",\n]\n\
+        if qualification:\n    lines += [\n        \"## First exact maturity point\",\n        \"\",\n        f\"- Qualified\
+        \ at: `{qualification['qualified_at_utc']}`\",\n        f\"- Distinct voters at qualification: **{qualification['distinct_voters']}**\"\
+        ,\n        f\"- Minimum challenge coverage at qualification: **{qualification['minimum_challenge_distinct_voters']}**\"\
+        ,\n        f\"- Eligible ballot prefix: **{qualification['eligible_ballot_prefix_length']} rows**\",\n        \"\"\
+        ,\n    ]\nlines += [\n    \"## Coverage by topology\",\n    \"\",\n    \"| Topology | Challenges | Passing coverage\
+        \ | Minimum voters | Maximum voters |\",\n    \"|---|---:|---:|---:|---:|\",\n]\nfor topo,row in current[\"topologies\"\
+        ].items():\n    lines.append(\n        f\"| {topo} | {row['challenge_count']} | {row['challenges_passing_coverage']}\
+        \ | \"\n        f\"{row['minimum_distinct_voters']} | {row['maximum_distinct_voters']} |\"\n    )\nlines += [\n  \
+        \  \"\",\n    \"## Isolation\",\n    \"\",\n    \"- The response token after the V7 challenge id is never parsed.\"\
+        ,\n    \"- The randomized left-side token is never parsed.\",\n    \"- No candidate formula or model prediction is\
+        \ loaded.\",\n    \"- No production value or live trade verdict is changed.\",\n    \"\",\n]\n(OUT / \"maturity.md\"\
+        ).write_text(\"\\n\".join(lines), encoding=\"utf-8\")\n\nprint(json.dumps({\n    \"decision\": decision,\n    \"distinct_voters\"\
+        : current[\"distinct_voters\"],\n    \"challenges_passing_coverage\": current[\"challenges_passing_coverage\"],\n\
+        \    \"minimum_challenge_distinct_voters\": current[\"minimum_challenge_distinct_voters\"],\n    \"hard_cap\": HARD,\n\
+        \    \"first_qualification\": qualification,\n    \"vote_direction_read\": False,\n    \"candidate_scores_read\":\
+        \ False,\n}, indent=2))\nPY\n"
+    - name: Prove report contains no outcome fields
+      shell: bash
+      run: |-
+        set -euo pipefail
+        python3 - <<'PY'
+        import json
+        from pathlib import Path
+
+        p=Path("/tmp/package-adjustment-v7-development-maturity/maturity.json")
+        d=json.loads(p.read_text())
+
+        assert d["outcome_blind"] is True
+        assert d["vote_direction_read"] is False
+        assert d["display_side_payload_read"] is False
+        assert d["candidate_scores_read"] is False
+        assert d["candidate_fit_performed"] is False
+        assert d["production_change_authorized"] is False
+
+        serialized=json.dumps(d,sort_keys=True).lower()
+        for forbidden in (
+            "choice_pct","side_a_votes","side_b_votes","candidate_log_loss",
+            "candidate_minus","winner_model","selected_candidate","fit_parameter",
+        ):
+            assert forbidden not in serialized, forbidden
+
+        assert d["contract"]=={
+            "first_checkpoint_distinct_voters":40,
+            "minimum_distinct_voters_per_challenge":32,
+            "hard_cap_distinct_voters":50,
+            "one_vote_per_voter_per_challenge":"first valid post-activation row only",
+        }
+        print("PASS: output artifact is coverage-only and outcome-blind.")
+        PY
+    - name: Upload maturity report
+      uses: actions/upload-artifact@v4
+      with:
+        name: package-adjustment-v7-development-maturity
+        path: /tmp/package-adjustment-v7-development-maturity
+        if-no-files-found: error
+        retention-days: 30
