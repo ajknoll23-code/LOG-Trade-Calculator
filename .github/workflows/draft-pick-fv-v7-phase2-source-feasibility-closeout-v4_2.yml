@@ -1,0 +1,345 @@
+name: Draft Pick FV V7 - Phase 2 Source Feasibility Closeout V4.2
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  closeout:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Download V4.1 diagnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/v41"
+          gh run download 36201271674 \
+            --repo "$GITHUB_REPOSITORY" \
+            -n "v7-p2-gate-diagnostic-v4-1" \
+            -D "${RUNNER_TEMP}/v41"
+          test -f "${RUNNER_TEMP}/v41/phase2_gate_diagnostic_v4_1.json"
+
+      - name: Download exact checkpoint sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p \
+            "${RUNNER_TEMP}/prior-all/A" \
+            "${RUNNER_TEMP}/prior-all/B" \
+            "${RUNNER_TEMP}/prior-all/C" \
+            "${RUNNER_TEMP}/prior-all/slow" \
+            "${RUNNER_TEMP}/targeted-success" \
+            "${RUNNER_TEMP}/v4-current"
+
+          gh run download 36060826299 --repo "$GITHUB_REPOSITORY" \
+            --pattern 'v7-p2-shard-A-probe-*' \
+            -D "${RUNNER_TEMP}/prior-all/A"
+
+          gh run download 36061005645 --repo "$GITHUB_REPOSITORY" \
+            --pattern 'v7-p2-shard-B-probe-*' \
+            -D "${RUNNER_TEMP}/prior-all/B"
+
+          gh run download 36060855053 --repo "$GITHUB_REPOSITORY" \
+            --pattern 'v7-p2-shard-C-probe-*' \
+            -D "${RUNNER_TEMP}/prior-all/C"
+
+          for N in 1 2 4; do
+            mkdir -p "${RUNNER_TEMP}/prior-all/slow/$N"
+            gh run download 36052205794 --repo "$GITHUB_REPOSITORY" \
+              -n "v7-p2-r25-probe-2018-$N" \
+              -D "${RUNNER_TEMP}/prior-all/slow/$N"
+          done
+
+          gh run download 36120014342 --repo "$GITHUB_REPOSITORY" \
+            --pattern 'v7-p2-targeted-recovery-20*' \
+            -D "${RUNNER_TEMP}/targeted-success"
+
+          gh run download 36194461700 --repo "$GITHUB_REPOSITORY" \
+            --pattern 'v7-p2-candidate-isolation-20*' \
+            -D "${RUNNER_TEMP}/v4-current"
+
+      - name: Produce source feasibility closeout
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import math
+          import os
+          from collections import Counter, defaultdict
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"])
+          diag = json.loads((root/"v41"/"phase2_gate_diagnostic_v4_1.json").read_text())
+
+          assert diag["exact_checkpoint_coverage"] == "251/251"
+          assert diag["exact_candidate_accounting"] == "6203/6203"
+          assert diag["transport_censoring_gate_pass"] is True
+          assert diag["phase2_outcome_ingestion_authorized"] is False
+          assert diag["firewalls"]["historical_player_outcomes_read"] is False
+          assert diag["firewalls"]["holdout_2024_outcomes_read"] is False
+
+          expected_counts = {2018:43, 2019:41, 2020:41, 2021:42, 2022:42, 2023:42}
+          sources = [root/"prior-all", root/"targeted-success", root/"v4-current"]
+
+          # Select the exact-once checkpoint set using the same byte-identity rule as V4/V4.1.
+          chosen = {y:{} for y in expected_counts}
+          for y, expected_n in expected_counts.items():
+              for base in sources:
+                  if not base.exists():
+                      continue
+                  for p in base.rglob("batch_*.json"):
+                      d = json.loads(p.read_text())
+                      if int(d["draft_year"]) != y:
+                          continue
+                      b = int(d["batch_index"])
+                      h = hashlib.sha256(p.read_bytes()).hexdigest()
+                      if b in chosen[y]:
+                          assert chosen[y][b][0] == h, (y, b, "non-identical duplicate")
+                      else:
+                          chosen[y][b] = (h, p)
+              assert set(chosen[y]) == set(range(expected_n)), (y, sorted(set(range(expected_n))-set(chosen[y])))
+
+          taxonomy = {}
+          candidate_total = 0
+          clean_total = 0
+
+          for y in expected_counts:
+              status = Counter()
+              reason = Counter()
+              probe_counts = Counter()
+              clean_origins = Counter()
+              clean_qualifier_kind = Counter()
+              unknown_kinds = Counter()
+              identity_methods = Counter()
+              occurrence_flags = Counter()
+              clean_league_ids = set()
+              transport = []
+
+              for b in range(expected_counts[y]):
+                  p = chosen[y][b][1]
+                  d = json.loads(p.read_text())
+
+                  candidate_total += len(d["candidate_ids"])
+                  for disp in d.get("candidate_dispositions", []):
+                      s = str(disp.get("status", "missing_status"))
+                      status[s] += 1
+                      if disp.get("reason") is not None:
+                          reason[f"{s}:{disp['reason']}"] += 1
+
+                  probe_counts.update(d.get("probe_counts", {}))
+                  transport.extend(d.get("transport_unresolved", []))
+
+                  for league in d.get("clean_leagues", []):
+                      lid = str(league["league_id"])
+                      assert lid not in clean_league_ids, (y, lid, "duplicate clean league")
+                      clean_league_ids.add(lid)
+                      clean_origins[str(league.get("source_origin"))] += 1
+                      clean_qualifier_kind[str(league.get("qualifier_kind"))] += 1
+                      for u in league.get("diagnostic_unknown", []):
+                          unknown_kinds[str(u.get("kind", "missing_kind"))] += 1
+
+                  for occ in d.get("occurrences", []):
+                      identity_methods[str(occ.get("identity_method"))] += 1
+                      occurrence_flags["occurrence_n"] += 1
+                      occurrence_flags["valid_n"] += int(bool(occ.get("source_occurrence_valid_v7")))
+                      occurrence_flags["identity_resolved_n"] += int(bool(occ.get("identity_resolved")))
+                      occurrence_flags["sleeper_ready_n"] += int(bool(occ.get("outcome_ready_sleeper_id")))
+
+              clean_total += len(clean_league_ids)
+              taxonomy[str(y)] = {
+                  "candidate_disposition_status_counts": dict(sorted(status.items())),
+                  "candidate_disposition_reason_counts": dict(sorted(reason.items())),
+                  "probe_count_sums": dict(sorted(probe_counts.items())),
+                  "clean_full72_league_n_from_checkpoints": len(clean_league_ids),
+                  "clean_source_origin_counts": dict(sorted(clean_origins.items())),
+                  "clean_qualifier_kind_counts": dict(sorted(clean_qualifier_kind.items())),
+                  "diagnostic_unknown_kind_counts": dict(sorted(unknown_kinds.items())),
+                  "identity_method_counts": dict(sorted(identity_methods.items())),
+                  "occurrence_flags": dict(occurrence_flags),
+                  "transport_unresolved_n_from_checkpoints": len(transport),
+              }
+
+          assert candidate_total == 6203, candidate_total
+
+          # Best-case source-search rescue math.
+          # Each year-cell contains four expected picks per full-72 league.
+          # Added leagues are assumed PERFECT (4/4 valid retained picks), so this is a strict lower bound.
+          feasibility = []
+          for yr in diag["years"]:
+              y = int(yr["draft_year"])
+              n = int(yr["clean_full72_league_n"])
+              count_shortfall = max(0, int(yr["minimum_clean_full72_leagues"]) - n)
+
+              retention_lb = []
+              for c in yr["failing_retention_cells"]:
+                  r = float(c["retention_fraction"])
+                  expected = 4 * n
+                  valid = int(round(r * expected))
+                  x = 0
+                  while (valid + 4*x) / (4*(n+x)) < 0.95 - 1e-12:
+                      x += 1
+                      assert x < 10000
+                  retention_lb.append({
+                      "cell": c["cell"],
+                      "current_retention_fraction": r,
+                      "current_expected_occurrence_n": expected,
+                      "current_valid_occurrence_n_approx": valid,
+                      "minimum_additional_perfect_full72_leagues_to_95pct": x,
+                  })
+
+              worst_retention_lb = max(
+                  [x["minimum_additional_perfect_full72_leagues_to_95pct"] for x in retention_lb],
+                  default=0,
+              )
+              best_case_additional_perfect_leagues_needed = max(count_shortfall, worst_retention_lb)
+
+              if yr["retention_gate_pass"] and yr["identity_gate_pass"] and not yr["source_count_gate_pass"]:
+                  dominant = "source_count_only"
+              elif not yr["retention_gate_pass"]:
+                  dominant = "retention_structural"
+                  if not yr["source_count_gate_pass"]:
+                      dominant += "_plus_source_count"
+                  if not yr["identity_gate_pass"]:
+                      dominant += "_plus_identity"
+              elif not yr["identity_gate_pass"]:
+                  dominant = "identity_only"
+              else:
+                  dominant = "none"
+
+              feasibility.append({
+                  "draft_year": y,
+                  "clean_full72_league_n": n,
+                  "count_shortfall_to_12": count_shortfall,
+                  "source_count_gate_pass": yr["source_count_gate_pass"],
+                  "retention_gate_pass": yr["retention_gate_pass"],
+                  "identity_gate_pass": yr["identity_gate_pass"],
+                  "sleeper_ready_gate_pass": yr["sleeper_ready_gate_pass"],
+                  "dominant_failure_mode": dominant,
+                  "worst_cell_minimum_additional_perfect_full72_leagues_to_95pct_retention": worst_retention_lb,
+                  "best_case_additional_perfect_full72_leagues_needed_to_pass_count_and_retention": best_case_additional_perfect_leagues_needed,
+                  "retention_best_case_lower_bounds": sorted(
+                      retention_lb,
+                      key=lambda z: (-z["minimum_additional_perfect_full72_leagues_to_95pct"], z["cell"]),
+                  ),
+              })
+
+          # The preregistered search was complete over the frozen deterministic candidate union.
+          # V7 therefore stops rather than modifying gates after source evidence was observed.
+          closeout = {
+              "schema_version": 1,
+              "study_id": "draft-pick-fv-v7-r1-r6-full-scale-tail-continuity",
+              "stage": "phase2_source_feasibility_closeout_v4_2",
+              "v4_run_id": 36194461700,
+              "v4_1_run_id": 36201271674,
+              "decision": "STOP_V7_R1_R6_SOURCE_FEASIBILITY_INSUFFICIENT",
+              "v7_phase2_pass": False,
+              "outcome_ingestion_authorized": False,
+              "candidate_universe_total_n": 6203,
+              "exact_checkpoint_n": 251,
+              "transport_unresolved_n": int(diag["transport_unresolved_n"]),
+              "transport_unresolved_fraction": float(diag["transport_unresolved_fraction"]),
+              "transport_censoring_gate_pass": bool(diag["transport_censoring_gate_pass"]),
+              "preregistered_minimum_full72_leagues_per_year": 12,
+              "preregistered_minimum_retention": 0.95,
+              "preregistered_minimum_identity": 0.95,
+              "all_historical_search_complete_under_frozen_contract": True,
+              "post_source_freeze_historical_search_allowed_in_v7": False,
+              "v7_gate_change_allowed_after_source_evidence": False,
+              "source_taxonomy_by_year": taxonomy,
+              "best_case_search_rescue_feasibility_by_year": feasibility,
+              "interpretation": {
+                  "2018": "Count-only failure under current source evidence; retention and identity pass.",
+                  "2019": "Count passes, but retention fails. Even perfect added leagues require a materially larger cohort to repair the worst cell.",
+                  "2020": "Severe later-round retention failure plus source-count failure; modest additional search cannot repair the frozen 95% gate.",
+                  "2021": "Source-count, retention, identity, and Sleeper-readiness failures coexist.",
+                  "2022": "Source count passes; deep-round retention is the dominant failure and identity also fails in R4-R6.",
+                  "2023": "Source count and identity pass; deep-round retention is the dominant failure.",
+              },
+              "successor_design_requirement": [
+                  "Do not weaken or reinterpret V7 gates post hoc.",
+                  "Keep all NFL outcomes sealed while successor source design is preregistered.",
+                  "Evaluate a successor design that does not require one identical full-72 league cohort to supply all 18 cells unless source feasibility can be established pre-outcome.",
+                  "Preserve equal-year/equal-cell weighting and explicit minimum per-cell source/identity requirements.",
+                  "Preregister any depth-specific or partial-draft cohort rule before reading 2018-2023 player outcomes.",
+                  "Keep 2024 holdout outcomes sealed.",
+              ],
+              "firewalls": {
+                  "historical_player_outcomes_read": False,
+                  "holdout_2024_outcomes_read": False,
+                  "candidate_fit_performed": False,
+                  "candidate_scores_computed": False,
+                  "candidate_selection_performed": False,
+                  "production_change_authorized": False,
+              },
+          }
+
+          out = root/"closeout"
+          out.mkdir(exist_ok=True)
+          (out/"phase2_source_feasibility_closeout_v4_2.json").write_text(
+              json.dumps(closeout, indent=2, sort_keys=True) + "\n"
+          )
+
+          md = [
+              "# Draft Pick FV V7 — Phase 2 Source Feasibility Closeout V4.2",
+              "",
+              "**Decision:** `STOP_V7_R1_R6_SOURCE_FEASIBILITY_INSUFFICIENT`",
+              "",
+              "- V4 transport isolation: **PASS**",
+              "- Exact checkpoint coverage: **251/251**",
+              "- Exact candidate accounting: **6203/6203**",
+              f"- Transport unresolved: **{diag['transport_unresolved_n']} ({diag['transport_unresolved_fraction']:.4%})**",
+              "- Historical outcomes read: **NO**",
+              "- 2024 outcomes read: **NO**",
+              "",
+              "## Best-case rescue lower bounds",
+              "",
+              "| Year | Clean full-72 | Count shortfall | Dominant failure | Extra PERFECT full-72 leagues needed in best case |",
+              "|---:|---:|---:|---|---:|",
+          ]
+          for x in feasibility:
+              md.append(
+                  f"| {x['draft_year']} | {x['clean_full72_league_n']} | {x['count_shortfall_to_12']} | "
+                  f"{x['dominant_failure_mode']} | "
+                  f"{x['best_case_additional_perfect_full72_leagues_needed_to_pass_count_and_retention']} |"
+              )
+
+          md += [
+              "",
+              "The additional-league figures are **optimistic lower bounds**: every hypothetical added league is assumed to provide perfect 4/4 retained occurrences in every cell.",
+              "",
+              "## Scientific conclusion",
+              "",
+              "V7 cannot proceed to outcome fitting under its frozen source/identity contract.",
+              "The correct next step is a new preregistered successor source design while all NFL outcome data remain sealed.",
+              "No V7 source threshold, retention threshold, identity threshold, candidate family, or outcome rule was changed by this closeout.",
+              "",
+          ]
+
+          (out/"phase2_source_feasibility_closeout_v4_2.md").write_text("\n".join(md) + "\n")
+          print("\n".join(md))
+          PY
+
+      - name: Upload closeout
+        uses: actions/upload-artifact@v4
+        with:
+          name: v7-p2-source-feasibility-closeout-v4-2
+          path: ${{ runner.temp }}/closeout/
+          if-no-files-found: error
+          retention-days: 30
