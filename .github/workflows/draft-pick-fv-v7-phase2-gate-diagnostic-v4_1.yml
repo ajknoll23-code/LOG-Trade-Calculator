@@ -1,0 +1,308 @@
+name: Draft Pick FV V7 - Phase 2 Gate Diagnostic V4.1
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install runtime dependency
+        run: python -m pip install --disable-pip-version-check requests
+
+      - name: Download frozen V4 engine and discoveries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/engine" "${RUNNER_TEMP}/discoveries"
+          gh run download 36194461700 --repo "$GITHUB_REPOSITORY" -n "v7-p2-candidate-isolation-engine" -D "${RUNNER_TEMP}/engine"
+          gh run download 36194461700 --repo "$GITHUB_REPOSITORY" -n "v7-p2-candidate-isolation-discoveries" -D "${RUNNER_TEMP}/discoveries"
+
+          test -f "${RUNNER_TEMP}/engine/build_r1_r6_source_identity_v7.py"
+          test -f "${RUNNER_TEMP}/engine/identity_crosswalk.json"
+          test -f "${RUNNER_TEMP}/engine/r1_r6_identity_asset_manifest_v7.json"
+          for Y in 2018 2019 2020 2021 2022 2023; do
+            test -f "${RUNNER_TEMP}/discoveries/discovery_${Y}.json"
+          done
+
+      - name: Download all validated checkpoint sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p \
+            "${RUNNER_TEMP}/prior-all/A" \
+            "${RUNNER_TEMP}/prior-all/B" \
+            "${RUNNER_TEMP}/prior-all/C" \
+            "${RUNNER_TEMP}/prior-all/slow" \
+            "${RUNNER_TEMP}/targeted-success" \
+            "${RUNNER_TEMP}/v4-current"
+
+          gh run download 36060826299 --repo "$GITHUB_REPOSITORY" --pattern 'v7-p2-shard-A-probe-*' -D "${RUNNER_TEMP}/prior-all/A"
+          gh run download 36061005645 --repo "$GITHUB_REPOSITORY" --pattern 'v7-p2-shard-B-probe-*' -D "${RUNNER_TEMP}/prior-all/B"
+          gh run download 36060855053 --repo "$GITHUB_REPOSITORY" --pattern 'v7-p2-shard-C-probe-*' -D "${RUNNER_TEMP}/prior-all/C"
+
+          for N in 1 2 4; do
+            mkdir -p "${RUNNER_TEMP}/prior-all/slow/$N"
+            gh run download 36052205794 --repo "$GITHUB_REPOSITORY" \
+              -n "v7-p2-r25-probe-2018-$N" \
+              -D "${RUNNER_TEMP}/prior-all/slow/$N"
+          done
+
+          gh run download 36120014342 --repo "$GITHUB_REPOSITORY" \
+            --pattern 'v7-p2-targeted-recovery-20*' \
+            -D "${RUNNER_TEMP}/targeted-success"
+
+          gh run download 36194461700 --repo "$GITHUB_REPOSITORY" \
+            --pattern 'v7-p2-candidate-isolation-20*' \
+            -D "${RUNNER_TEMP}/v4-current"
+
+      - name: Assemble exact-once 251 checkpoints
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, math, os, shutil
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"])
+          discroot = root / "discoveries"
+          sources = [root/"prior-all", root/"targeted-success", root/"v4-current"]
+          out = root / "assembled"
+          out.mkdir(parents=True, exist_ok=True)
+
+          expected_counts = {2018:43, 2019:41, 2020:41, 2021:42, 2022:42, 2023:42}
+          grand_batch_n = 0
+          grand_candidate_n = 0
+          unresolved = []
+
+          for y, n in expected_counts.items():
+              disc = json.loads((discroot/f"discovery_{y}.json").read_text())
+              ids = list(disc["candidate_ids"])
+              assert math.ceil(len(ids)/25) == n
+              seen = {}
+
+              for base in sources:
+                  if not base.exists():
+                      continue
+                  for p in base.rglob("batch_*.json"):
+                      d = json.loads(p.read_text())
+                      yy = int(d["draft_year"])
+                      b = int(d["batch_index"])
+                      if yy != y:
+                          continue
+                      exp = ids[b*25:min(len(ids),(b+1)*25)]
+                      assert d["candidate_ids"] == exp
+                      assert d["batch_size"] == 25
+                      assert hashlib.sha256("\n".join(exp).encode()).hexdigest() == d["candidate_ids_sha256"]
+                      for k in (
+                          "historical_player_outcomes_read",
+                          "holdout_2024_outcomes_read",
+                          "candidate_fit_performed",
+                          "candidate_scores_computed",
+                          "candidate_selection_performed",
+                          "production_change_authorized",
+                      ):
+                          assert d[k] is False, (p, k)
+                      h = hashlib.sha256(p.read_bytes()).hexdigest()
+                      if b in seen:
+                          assert seen[b][0] == h, (y, b, "non-identical duplicate")
+                      else:
+                          seen[b] = (h, p)
+
+              assert set(seen) == set(range(n)), (y, sorted(set(range(n))-set(seen)))
+              yd = out / str(y)
+              yd.mkdir(exist_ok=True)
+              flat = []
+
+              for b in range(n):
+                  p = seen[b][1]
+                  d = json.loads(p.read_text())
+                  shutil.copy2(p, yd/f"batch_{b:03d}.json")
+                  flat.extend(d["candidate_ids"])
+                  if d.get("candidate_transport_isolation_applied"):
+                      assert [x["league_id"] for x in d["candidate_dispositions"]] == [str(x) for x in d["candidate_ids"]]
+                      unresolved.extend(d["transport_unresolved"])
+
+              assert flat == ids
+              assert len(flat) == len(set(flat))
+              grand_batch_n += n
+              grand_candidate_n += len(ids)
+
+          assert grand_batch_n == 251
+          assert grand_candidate_n == 6203
+
+          keys = [(int(x["draft_year"]), int(x["batch_index"]), str(x["league_id"])) for x in unresolved]
+          assert len(keys) == len(set(keys))
+          frac = len(unresolved) / 6203
+          assert frac <= 0.01, (len(unresolved), frac)
+
+          (out/"transport_unresolved_ledger.json").write_text(
+              json.dumps(
+                  sorted(unresolved, key=lambda x:(int(x["draft_year"]), int(x["batch_index"]), int(x["candidate_position_in_batch"]))),
+                  indent=2,
+                  sort_keys=True,
+              ) + "\n"
+          )
+          print(f"PASS: 251/251 checkpoints; 6203/6203 candidates; unresolved={len(unresolved)} ({frac:.6%})")
+          PY
+
+      - name: Aggregate six years with frozen engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/years"
+          for Y in 2018 2019 2020 2021 2022 2023; do
+            python3 "${RUNNER_TEMP}/engine/build_r1_r6_source_identity_v7.py" \
+              --aggregate-year "$Y" \
+              --discovery-path "${RUNNER_TEMP}/discoveries/discovery_$Y.json" \
+              --batch-dir "${RUNNER_TEMP}/assembled/$Y" \
+              --out "${RUNNER_TEMP}/years/year_$Y.json"
+          done
+
+      - name: Produce gate diagnostic
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          from collections import Counter
+
+          root = Path(os.environ["RUNNER_TEMP"])
+          years = root/"years"
+          ledger = json.loads((root/"assembled"/"transport_unresolved_ledger.json").read_text())
+
+          MIN_DEV = 12
+          MIN_COV = 0.95
+          rows = []
+          all_pass = True
+
+          for y in range(2018, 2024):
+              d = json.loads((years/f"year_{y}.json").read_text())
+              u = [x for x in ledger if int(x["draft_year"]) == y]
+              diag = d["diagnostics"]
+              cells = diag["cell_year"]
+
+              failing_retention = []
+              failing_identity = []
+              failing_sleeper = []
+              for name, c in cells.items():
+                  if float(c["retention_fraction"]) < MIN_COV or float(c["represented_league_fraction"]) < MIN_COV:
+                      failing_retention.append({
+                          "cell": name,
+                          "retention_fraction": c["retention_fraction"],
+                          "represented_league_fraction": c["represented_league_fraction"],
+                      })
+                  if float(c["identity_coverage"]) < MIN_COV:
+                      failing_identity.append({"cell": name, "identity_coverage": c["identity_coverage"]})
+                  if float(c["sleeper_ready_coverage"]) < MIN_COV:
+                      failing_sleeper.append({"cell": name, "sleeper_ready_coverage": c["sleeper_ready_coverage"]})
+
+              row = {
+                  "draft_year": y,
+                  "candidate_n": int(d["discovery"]["bounded_unique_union_including_seed_n"]),
+                  "transport_unresolved_n": len(u),
+                  "clean_full72_league_n": int(d["clean_full72_league_n"]),
+                  "minimum_clean_full72_leagues": MIN_DEV,
+                  "source_count_gate_pass": bool(d["source_count_gate_pass"]),
+                  "retention_gate_pass": bool(diag["retention_gate_pass"]),
+                  "identity_gate_pass": bool(diag["identity_gate_pass"]),
+                  "sleeper_ready_gate_pass": bool(diag["sleeper_gate_pass"]),
+                  "source_identity_gate_pass": bool(d["source_identity_gate_pass"]),
+                  "overall_identity_coverage": float(diag["overall_identity_coverage"]),
+                  "overall_sleeper_ready_coverage": float(diag["overall_sleeper_ready_coverage"]),
+                  "failing_retention_cell_n": len(failing_retention),
+                  "failing_identity_cell_n": len(failing_identity),
+                  "failing_sleeper_cell_n": len(failing_sleeper),
+                  "failing_retention_cells": failing_retention,
+                  "failing_identity_cells": failing_identity,
+                  "failing_sleeper_cells": failing_sleeper,
+              }
+              rows.append(row)
+              all_pass = all_pass and row["source_identity_gate_pass"]
+
+          summary = {
+              "schema_version": 1,
+              "study_id": "draft-pick-fv-v7-r1-r6-full-scale-tail-continuity",
+              "stage": "phase2_gate_diagnostic_v4_1",
+              "v4_run_id": 36194461700,
+              "exact_checkpoint_coverage": "251/251",
+              "exact_candidate_accounting": "6203/6203",
+              "transport_unresolved_n": len(ledger),
+              "transport_unresolved_fraction": len(ledger)/6203,
+              "transport_censoring_gate_pass": len(ledger)/6203 <= 0.01,
+              "minimum_clean_full72_leagues_per_year": MIN_DEV,
+              "minimum_cell_coverage": MIN_COV,
+              "all_year_source_identity_gates_pass": all_pass,
+              "phase2_outcome_ingestion_authorized": all_pass,
+              "decision": (
+                  "PASS_PHASE2_SOURCE_IDENTITY"
+                  if all_pass
+                  else "STOP_PHASE2_SOURCE_IDENTITY_GATE_DIAGNOSE_BEFORE_ANY_OUTCOME_INGESTION"
+              ),
+              "years": rows,
+              "firewalls": {
+                  "historical_player_outcomes_read": False,
+                  "holdout_2024_outcomes_read": False,
+                  "candidate_fit_performed": False,
+                  "candidate_scores_computed": False,
+                  "candidate_selection_performed": False,
+                  "production_change_authorized": False,
+              },
+          }
+
+          out = root/"gate-diagnostic"
+          out.mkdir(exist_ok=True)
+          (out/"phase2_gate_diagnostic_v4_1.json").write_text(json.dumps(summary, indent=2, sort_keys=True)+"\n")
+
+          md = [
+              "# Draft Pick FV V7 — Phase 2 Gate Diagnostic V4.1",
+              "",
+              f"**Decision:** `{summary['decision']}`",
+              "",
+              f"- Exact checkpoints: **251/251**",
+              f"- Exact candidates: **6203/6203**",
+              f"- Transport unresolved: **{len(ledger)} ({len(ledger)/6203:.4%})**",
+              "",
+              "| Year | Clean full-72 | Count | Retention | Identity | Sleeper | Overall source/identity |",
+              "|---:|---:|:---:|:---:|:---:|:---:|:---:|",
+          ]
+          for r in rows:
+              yn = lambda b: "PASS" if b else "FAIL"
+              md.append(
+                  f"| {r['draft_year']} | {r['clean_full72_league_n']} / {MIN_DEV} | "
+                  f"{yn(r['source_count_gate_pass'])} | {yn(r['retention_gate_pass'])} | "
+                  f"{yn(r['identity_gate_pass'])} | {yn(r['sleeper_ready_gate_pass'])} | "
+                  f"{yn(r['source_identity_gate_pass'])} |"
+              )
+          md += [
+              "",
+              "No source threshold or identity threshold was changed by this diagnostic.",
+              "No historical player outcomes were read.",
+              "",
+          ]
+          (out/"phase2_gate_diagnostic_v4_1.md").write_text("\n".join(md))
+          print("\n".join(md))
+          PY
+
+      - name: Upload gate diagnostic
+        uses: actions/upload-artifact@v4
+        with:
+          name: v7-p2-gate-diagnostic-v4-1
+          path: ${{ runner.temp }}/gate-diagnostic/
+          if-no-files-found: error
+          retention-days: 30
