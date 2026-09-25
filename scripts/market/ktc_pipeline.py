@@ -71,7 +71,7 @@ MIN_PAIRWISE_FOR_SIGNAL = 30
 # NextGen V2, plus V3/V4 fresh confirmation share transport only.
 # Remove all reserved row families before normal KTC daily-cap and
 # Bradley-Terry work.
-PACKAGE_VOTE_PREFIXES = ("__pkgv1__|", "__pkgv2__|", "__pkgv3__|", "__pkgv4__|", "__pkgv5__|", "__pkgnv2__|", "__pkgnv2p1__|", "__pkgv6__|", "__pkgv6p1__|", "__pkgv3c1__|", "__pkgv4c1__|")
+PACKAGE_VOTE_PREFIXES = ("__pkgv1__|", "__pkgv2__|", "__pkgv3__|", "__pkgv4__|", "__pkgv5__|", "__pkgnv2__|", "__pkgnv2p1__|", "__pkgv6__|", "__pkgv6p1__|", "__pkgv3c1__|", "__pkgv4c1__|", "__pkgv7dev__|",)
 
 def is_package_vote_row(row):
     keep = str(row.get("keep") or "")

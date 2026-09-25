@@ -334,6 +334,7 @@ def check_aliases_and_ktc_positions():
         "__pkgv6p1__|",
         "__pkgv3c1__|",
         "__pkgv4c1__|",
+        "__pkgv7dev__|",
     )
     assert package_prefixes == expected_package_prefixes, (
         "KTC/package-vote transport isolation drift: "
@@ -569,39 +570,65 @@ def check_team_utility_projection_runtime_invariants():
 
 def check_package_sampling_contract():
     text = INDEX.read_text(encoding="utf-8")
-    start = text.index("function packageVoteTodayKey(){")
+    start = text.index("function packageVoteHash(value){")
     end = text.index("\nfunction render(){", start)
     block = text[start:end]
 
-    assert "PACKAGE_VOTE_V6P1_EXACT_CELL_SAMPLING_V1" in block
+    # V7 development voting uses the exact frozen 40-challenge catalog.
+    # Each voter sees every challenge once in a stable voter-keyed order;
+    # canonical A/B display side is independently voter/challenge-keyed.
+    assert "Package Adjustment V7 Development Voting." in text
     assert "function packageVoteOwnPlayers()" not in block
     assert "function packageVoteEligibleChallenges()" not in block
     assert "own.has(" not in block
-    assert "const byCell = new Map();" in block
-    assert "if(!byCell.has(c.research_cell)) byCell.set(c.research_cell, []);" in block
-    assert "const cells = Array.from(byCell.keys()).sort();" in block
-    assert "if(cells.length !== 24) return null;" in block
-    assert "const selectedCell = cells[Math.floor(Math.random() * cells.length)];" in block
-    assert "let challengePool = cellPool.filter(c => !recent.has(c.id));" in block
-    assert "if(!challengePool.length) challengePool = cellPool;" in block
-    assert "left: Math.random() < 0.5 ? 'T' : 'P'" in block
+
+    assert "function packageVoteHash(value){" in block
+    assert "function packageVoteCompletedKey(){" in block
+    assert "function packageVoteCompleted(){" in block
+    assert "const completed = new Set(packageVoteCompleted());" in block
+    assert "const ordered = PACKAGE_VOTE_CHALLENGES.slice().sort((a,b) => {" in block
+    assert "packageVoteHash(`${voter}|order|${a.id}`)" in block
+    assert "packageVoteHash(`${voter}|order|${b.id}`)" in block
+    assert "const challenge = ordered.find(c => !completed.has(String(c.id)));" in block
+    assert "packageVoteHash(`${voter}|side|${challenge.id}`)" in block
+    assert "? 'A' : 'B';" in block
+    assert "Math.random()" not in block
     assert "Date.now() < Date.parse(PACKAGE_VOTE_VALID_AFTER_UTC)" in block
 
-    cell_idx = block.index("const selectedCell =")
-    recent_idx = block.index("const recent = new Set(packageVoteRecent());")
-    assert cell_idx < recent_idx, "recent filtering must occur only after cell selection"
+    # Loader remains fail-closed to the exact frozen V7 schema.
+    assert "doc.study_id !== 'package-adjustment-v7-multi-v-multi'" in block
+    assert "doc.stage !== 'phase1a_development_catalog'" in block
+    assert "doc.status !== 'FROZEN_PRE_VOTE_DEVELOPMENT_CATALOG'" in block
+    assert "doc.frozen !== true" in block
+    assert "doc.released !== false" in block
+    assert "doc.voting_activated !== false" in block
+    assert "doc.v7_votes_read !== false" in block
+    assert "doc.candidate_fit_performed !== false" in block
+    assert "doc.candidate_predictions_used_for_catalog_selection !== false" in block
+    assert "doc.fv_visible_to_voter !== false" in block
+    assert "Number(doc.challenge_count) !== 40" in block
+    assert "doc.challenges.length !== 40" in block
+    assert "c.candidate_prediction_used_for_selection === false" in block
+    assert "c.fv_visible_to_voter === false" in block
 
-    assert "Package Adjustment V6P1 Prospective Confirmation:" in text
+    # Exact transport and frozen catalog identity.
     assert "const PACKAGE_VOTE_DAILY_LIMIT = 40;" in text
-    assert "const PACKAGE_VOTE_CATALOG_SHA256 = '2739a0f0728b422cce632fec2381c5a4d35a572dbfabc46c97c0591bb2f5a3fc';" in text
-    assert "3f1e3d265265453e5356b93a34a3737e367c7990/research/package-adjustment-v6/package_vote_challenges_v6_prospective_v1.json" in text
-    assert "__pkgv6p1__|" in text
-    assert "__pkgv6p1_meta__|" in text
-    assert "__pkgv6p1_schema__|1" in text
+    assert "const PACKAGE_VOTE_TOTAL_CHALLENGES = 40;" in text
+    assert "const PACKAGE_VOTE_CATALOG_SHA256 = 'ddf1ad55a7f6b46a198e0855c7f2d1ae5346d5a1e8b88bb6e1a859076c2ac8dd';" in text
+    assert "research/package-adjustment-v7/package_vote_challenges_v7_development_v1.json" in text
+    assert "__pkgv7dev__|" in text
+    assert "__pkgv7dev_meta__|" in text
+    assert "__pkgv7dev_schema__|1" in text
+    assert "package_votes_v7dev_completed_" in text
+
+    # Old V6P1 random-cell sampler must not survive activation.
+    assert "const byCell = new Map();" not in block
+    assert "selectedCell = cells[Math.floor(Math.random()" not in block
+    assert "left: Math.random() < 0.5 ? 'T' : 'P'" not in block
 
     print(
-        "PASS V6P1 exact 24-cell sampling contract: no voter-roster filtering; "
-        "recent-memory post-cell only; display side randomized"
+        "PASS V7 frozen 40-challenge sampling contract: exactly-once voter-keyed order; "
+        "stable A/B display randomization; FV/candidate-blind; V7 transport isolated"
     )
 
 
