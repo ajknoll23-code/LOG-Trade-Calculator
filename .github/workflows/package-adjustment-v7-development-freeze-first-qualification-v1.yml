@@ -1,0 +1,446 @@
+name: Package Adjustment V7 - Development Freeze First Qualification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  freeze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PYTHONDONTWRITEBYTECODE: "1"
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Capture base
+        id: base
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependency
+        run: python3 -m pip install --disable-pip-version-check --no-cache-dir "requests==2.34.2"
+
+      - name: Guard frozen inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          D="research/package-adjustment-v7"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          test "$(git hash-object "$D/phase1_multi_vs_multi_preregistration_v1.json")" = "07063ddc8842ec01f876efe5dcab548f9c223a60"
+          test "$(git hash-object "$D/phase1a_power_analysis_v1.json")" = "7f908d437d8cea1b0c4561d114118b8fe94d8fa7"
+          test "$(git hash-object "$D/package_vote_challenges_v7_development_v1.json")" = "01823ce0f146fd09693b4585bf4948c3076bd9d3"
+          test "$(git hash-object "$D/development_voting_activation_manifest_v1.json")" = "90f78e63f8a019ac47d78cee9151548a1afd6b89"
+          test "$(git hash-object ".github/workflows/package-adjustment-v7-outcome-blind-maturity-monitor-v1.yml")" = "e3536d60144d1c0fadd215c65e4949bee0132ab5"
+          test ! -e "$D/development_first_qualification_frozen_v1.json"
+          test ! -e "$D/development_first_qualification_freeze_manifest_v1.json"
+          test ! -e "$D/development_first_qualification_freeze_v1.md"
+          python3 scripts/validation/check_package_adjustment_live.py
+
+      - name: Download and verify maturity anchor
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/maturity"
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/10911620832" --jq '.digest')" = \
+            "sha256:0adbd8c83ec9b1d95f29c327ba45e9e9820a38a283a288b0ae29bdcd5c21c7a1"
+          gh run download 36258072678 \
+            --repo "$GITHUB_REPOSITORY" \
+            -n "package-adjustment-v7-development-maturity" \
+            -D "${RUNNER_TEMP}/maturity"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          d=json.loads((Path(os.environ["RUNNER_TEMP"])/"maturity"/"maturity.json").read_text())
+          assert d["decision"]=="STOP_AND_FREEZE_AT_FIRST_COVERAGE_QUALIFICATION"
+          assert d["vote_direction_read"] is False
+          assert d["candidate_scores_read"] is False
+          assert d["candidate_fit_performed"] is False
+          assert d["production_change_authorized"] is False
+          q=d["first_qualification"]
+          assert q["eligible_ballot_prefix_length"]==1522
+          assert q["qualified_at_utc"]=="2026-09-26T17:09:31.411000+00:00"
+          assert q["qualified_at_source_index"]==9708
+          assert q["distinct_voters"]==40
+          assert q["minimum_challenge_distinct_voters"]==38
+          print("PASS: exact maturity anchor verified.")
+          PY
+
+      - name: Freeze exact first-qualified sample
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+          import csv, hashlib, io, json, os, re
+          from collections import Counter
+          from datetime import datetime, timezone
+          from pathlib import Path
+          import requests
+
+          ROOT=Path.cwd()
+          D=ROOT/"research"/"package-adjustment-v7"
+          CAT=D/"package_vote_challenges_v7_development_v1.json"
+          ACT=D/"development_voting_activation_manifest_v1.json"
+          OUT=D/"development_first_qualification_frozen_v1.json"
+          MAN=D/"development_first_qualification_freeze_manifest_v1.json"
+          MD=D/"development_first_qualification_freeze_v1.md"
+          MAT=Path(os.environ["RUNNER_TEMP"])/"maturity"/"maturity.json"
+
+          SHEET=(
+              "https://docs.google.com/spreadsheets/d/e/"
+              "2PACX-1vTuKORGumlKJmUmBdeNWPstkj8VRjPoVkylbqHv1KqwoyziJYOUlkZUKRsSxzB3qHXmyjjLpGpH6W03/"
+              "pub?gid=458294959&single=true&output=csv"
+          )
+          EXPECTED_N=1522
+          EXPECTED_TS="2026-09-26T17:09:31.411000+00:00"
+          EXPECTED_SOURCE_INDEX=9708
+          MIN_PER=32
+          HARD=50
+
+          def load(p): return json.loads(p.read_text())
+          def parse_utc(v):
+              s=str(v or "").strip()
+              if not s: return None
+              if s.endswith("Z"): s=s[:-1]+"+00:00"
+              try: x=datetime.fromisoformat(s)
+              except ValueError: return None
+              if x.tzinfo is None: x=x.replace(tzinfo=timezone.utc)
+              return x.astimezone(timezone.utc)
+          def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
+
+          catdoc=load(CAT)
+          act=load(ACT)
+          maturity=load(MAT)
+          challenges={str(c["id"]):c for c in catdoc["challenges"]}
+          assert len(challenges)==40
+          assert maturity["first_qualification"]["eligible_ballot_prefix_length"]==EXPECTED_N
+
+          prefix=act["transport"]["vote_prefix"]
+          meta_prefix=act["transport"]["meta_prefix"]
+          marker=act["transport"]["schema_marker"]
+          cutoff=parse_utc(act["valid_ballot_start_utc"])
+          assert cutoff is not None
+
+          resp=requests.get(SHEET,timeout=30)
+          resp.raise_for_status()
+          if "text/html" in str(resp.headers.get("content-type") or "").lower():
+              raise RuntimeError("sheet export returned HTML")
+          src=list(csv.DictReader(io.StringIO(resp.text)))
+          assert src
+          required={"timestamp","voter_roster_id","keep","trade","cut"}
+          assert required<=set(src[0])
+
+          excluded=Counter()
+          structural=[]
+          raw_namespace=0
+          for source_index,row in enumerate(src):
+              keep=str(row.get("keep") or "")
+              if not keep.startswith(prefix): continue
+              raw_namespace+=1
+              ts=parse_utc(row.get("timestamp"))
+              if ts is None:
+                  excluded["invalid_timestamp"]+=1; continue
+              if ts<=cutoff:
+                  excluded["pre_activation_or_at_cutoff"]+=1; continue
+              voter=str(row.get("voter_roster_id") or "").strip()
+              if not voter:
+                  excluded["missing_voter_id"]+=1; continue
+              payload=keep[len(prefix):]
+              if "|" not in payload:
+                  excluded["malformed_vote_transport"]+=1; continue
+              cid=payload.split("|",1)[0].strip()
+              if cid not in challenges:
+                  excluded["unknown_challenge_id"]+=1; continue
+              trade=str(row.get("trade") or "")
+              if not trade.startswith(meta_prefix):
+                  excluded["invalid_meta_namespace"]+=1; continue
+              if str(row.get("cut") or "")!=marker:
+                  excluded["invalid_schema_marker"]+=1; continue
+              structural.append({
+                  "timestamp":ts,"source_index":source_index,
+                  "source_row_number":source_index+2,"voter":voter,
+                  "challenge_id":cid,"keep_raw":keep,"trade_raw":trade,
+              })
+
+          structural.sort(key=lambda r:(r["timestamp"],r["source_index"]))
+
+          seen=set(); dedup=[]
+          for r in structural:
+              k=(r["voter"],r["challenge_id"])
+              if k in seen:
+                  excluded["duplicate_voter_challenge_after_first"]+=1
+                  continue
+              seen.add(k); dedup.append(r)
+
+          first={}
+          for r in dedup:
+              first.setdefault(r["voter"],(r["timestamp"],r["source_index"]))
+          ordered=[v for v,_ in sorted(first.items(),key=lambda kv:(kv[1][0],kv[1][1],kv[0]))]
+          accepted=set(ordered[:HARD])
+          eligible=[r for r in dedup if r["voter"] in accepted]
+
+          voters=set()
+          per={cid:set() for cid in challenges}
+          stop=None
+          for i,r in enumerate(eligible):
+              voters.add(r["voter"])
+              per[r["challenge_id"]].add(r["voter"])
+              if len(voters)>=40 and all(len(per[c])>=MIN_PER for c in challenges):
+                  stop=i
+                  break
+          assert stop is not None
+          frozen=eligible[:stop+1]
+
+          assert len(frozen)==EXPECTED_N
+          assert frozen[-1]["timestamp"].isoformat()==EXPECTED_TS
+          assert frozen[-1]["source_index"]==EXPECTED_SOURCE_INDEX
+          assert len({r["voter"] for r in frozen})==40
+          coverage={cid:len({r["voter"] for r in frozen if r["challenge_id"]==cid}) for cid in challenges}
+          assert min(coverage.values())==38
+          assert max(coverage.values())<=40
+          assert all(v>=32 for v in coverage.values())
+
+          before=frozen[:-1]
+          before_voters={r["voter"] for r in before}
+          before_cov={cid:len({r["voter"] for r in before if r["challenge_id"]==cid}) for cid in challenges}
+          assert not (len(before_voters)>=40 and all(v>=32 for v in before_cov.values()))
+
+          cmap={}
+          ballots=[]
+          for n,r in enumerate(frozen,1):
+              cmap.setdefault(r["voter"],f"v{len(cmap)+1:03d}")
+              payload=r["keep_raw"][len(prefix):]
+              cid,sep,choice=payload.partition("|")
+              assert sep and cid==r["challenge_id"] and choice in {"A","B"}
+              left=r["trade_raw"][len(meta_prefix):].strip()
+              assert left in {"A","B"}
+              c=challenges[cid]
+              ballots.append({
+                  "ordinal":n,
+                  "timestamp_utc":r["timestamp"].isoformat(),
+                  "source_row_number":r["source_row_number"],
+                  "voter_cluster":cmap[r["voter"]],
+                  "challenge_id":cid,
+                  "topology":c["topology"],
+                  "contrast_band":c["primary_contrast_band"],
+                  "human_choice":choice,
+                  "display_left":left,
+                  "human_choice_left":choice==left,
+              })
+
+          assert len(cmap)==40
+          assert len({(b["voter_cluster"],b["challenge_id"]) for b in ballots})==EXPECTED_N
+          assert "voter_roster_id" not in json.dumps(ballots)
+
+          frozen_at=datetime.now(timezone.utc).isoformat()
+          data={
+              "schema_version":1,
+              "study_id":"package-adjustment-v7-multi-v-multi",
+              "stage":"development_first_coverage_qualification_freeze",
+              "status":"FROZEN_AT_FIRST_COVERAGE_QUALIFICATION",
+              "frozen_at_utc":frozen_at,
+              "qualification":{
+                  "eligible_ballot_prefix_length":EXPECTED_N,
+                  "qualified_at_utc":EXPECTED_TS,
+                  "qualified_at_source_index":EXPECTED_SOURCE_INDEX,
+                  "first_checkpoint_distinct_voters":40,
+                  "minimum_required_challenge_coverage":32,
+                  "actual_minimum_challenge_coverage":38,
+                  "hard_cap_distinct_voters":50,
+              },
+              "ballot_count":EXPECTED_N,
+              "distinct_voter_clusters":40,
+              "distinct_challenges":40,
+              "minimum_challenge_distinct_voters":38,
+              "maximum_challenge_distinct_voters":max(coverage.values()),
+              "challenge_coverage":dict(sorted(coverage.items())),
+              "ballots":ballots,
+              "privacy":{
+                  "raw_voter_ids_persisted":False,
+                  "voters_relabelled_as_stable_clusters_within_frozen_sample":True,
+              },
+              "source":{
+                  "sheet_sha256_at_freeze_fetch":hashlib.sha256(resp.content).hexdigest(),
+                  "sheet_row_count_at_freeze_fetch":len(src),
+                  "raw_v7_namespace_rows_at_freeze_fetch":raw_namespace,
+                  "structurally_valid_rows_at_freeze_fetch":len(structural),
+                  "deduped_rows_at_freeze_fetch":len(dedup),
+                  "excluded_counts":dict(sorted(excluded.items())),
+              },
+              "firewalls":{
+                  "vote_direction_read_for_exact_frozen_prefix":True,
+                  "candidate_scores_read":False,
+                  "candidate_fit_performed":False,
+                  "candidate_selection_performed":False,
+                  "confirmation_catalog_generated":False,
+                  "draft_pick_votes_read":False,
+                  "production_change_authorized":False,
+              },
+          }
+          OUT.write_text(json.dumps(data,indent=2,sort_keys=True)+"\n")
+
+          manifest={
+              "schema_version":1,
+              "study_id":"package-adjustment-v7-multi-v-multi",
+              "stage":"development_evidence_freeze_manifest",
+              "status":"FROZEN_DEVELOPMENT_EVIDENCE",
+              "generated_at_utc":frozen_at,
+              "maturity_anchor":{
+                  "run_id":36258072678,
+                  "artifact_id":10911620832,
+                  "artifact_digest":"sha256:0adbd8c83ec9b1d95f29c327ba45e9e9820a38a283a288b0ae29bdcd5c21c7a1",
+                  "head_sha":"ff33ba3b55623f30b395f8345098b003b78ea1d6",
+                  "decision":"STOP_AND_FREEZE_AT_FIRST_COVERAGE_QUALIFICATION",
+                  "eligible_ballot_prefix_length":EXPECTED_N,
+                  "qualified_at_utc":EXPECTED_TS,
+                  "qualified_at_source_index":EXPECTED_SOURCE_INDEX,
+              },
+              "input_git_blobs":{
+                  "phase1_multi_vs_multi_preregistration_v1.json":"07063ddc8842ec01f876efe5dcab548f9c223a60",
+                  "phase1a_power_analysis_v1.json":"7f908d437d8cea1b0c4561d114118b8fe94d8fa7",
+                  "package_vote_challenges_v7_development_v1.json":"01823ce0f146fd09693b4585bf4948c3076bd9d3",
+                  "development_voting_activation_manifest_v1.json":"90f78e63f8a019ac47d78cee9151548a1afd6b89",
+              },
+              "data":{
+                  "path":str(OUT.relative_to(ROOT)),
+                  "sha256":sha(OUT),
+                  "ballot_count":EXPECTED_N,
+                  "distinct_voters":40,
+                  "challenge_count":40,
+                  "minimum_challenge_coverage":38,
+              },
+              "candidate_fit_performed":False,
+              "candidate_selection_performed":False,
+              "confirmation_catalog_generated":False,
+              "production_change_authorized":False,
+              "next_action":"Evaluate only preregistered C1/C2/C3 on this exact frozen development dataset; do not read later development ballots.",
+          }
+          MAN.write_text(json.dumps(manifest,indent=2,sort_keys=True)+"\n")
+
+          MD.write_text(
+              "# Package Adjustment V7 — Exact Development Freeze\n\n"
+              "**Status:** `FROZEN_AT_FIRST_COVERAGE_QUALIFICATION`\n\n"
+              "- Frozen ballots: **1,522**\n"
+              "- Distinct voters: **40**\n"
+              "- Challenges represented: **40 / 40**\n"
+              "- Weakest challenge at exact qualification: **38 voters**\n"
+              f"- Qualification time: `{EXPECTED_TS}`\n"
+              "- Maturity run: `36258072678`\n\n"
+              "The freeze reconstructs the earliest outcome-blind maturity point, then reads response "
+              "direction only for that exact prefix. Later development ballots are excluded.\n\n"
+              "No candidate was fit or selected, no confirmation catalog was generated, draft-pick "
+              "votes remain blocked, and production is unchanged.\n"
+          )
+          print("PASS: exact 1,522-ballot V7 development sample frozen.")
+          PY
+
+      - name: Validate freeze and isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, re
+          from pathlib import Path
+          d=Path("research/package-adjustment-v7")
+          data=json.loads((d/"development_first_qualification_frozen_v1.json").read_text())
+          man=json.loads((d/"development_first_qualification_freeze_manifest_v1.json").read_text())
+          cat=json.loads((d/"package_vote_challenges_v7_development_v1.json").read_text())
+
+          assert data["status"]=="FROZEN_AT_FIRST_COVERAGE_QUALIFICATION"
+          assert data["ballot_count"]==1522
+          assert data["distinct_voter_clusters"]==40
+          assert data["distinct_challenges"]==40
+          assert data["minimum_challenge_distinct_voters"]==38
+          assert len(data["ballots"])==1522
+          assert len({(b["voter_cluster"],b["challenge_id"]) for b in data["ballots"]})==1522
+          assert {b["challenge_id"] for b in data["ballots"]}=={c["id"] for c in cat["challenges"]}
+          assert all(re.fullmatch(r"v\d{3}",b["voter_cluster"]) for b in data["ballots"])
+          assert all(b["human_choice"] in {"A","B"} for b in data["ballots"])
+          assert all(b["display_left"] in {"A","B"} for b in data["ballots"])
+          assert "voter_roster_id" not in json.dumps(data)
+
+          digest=hashlib.sha256((d/"development_first_qualification_frozen_v1.json").read_bytes()).hexdigest()
+          assert man["data"]["sha256"]==digest
+          assert man["candidate_fit_performed"] is False
+          assert man["candidate_selection_performed"] is False
+          assert man["confirmation_catalog_generated"] is False
+          assert man["production_change_authorized"] is False
+          print("PASS: exact freeze, privacy, hash and stage firewalls verified.")
+          PY
+          python3 scripts/validation/check_package_adjustment_live.py
+
+      - name: Prove exact change scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t changed < <(git status --porcelain=v1 --untracked-files=all | sed -E 's/^.. //' | sort)
+          expected=(
+            research/package-adjustment-v7/development_first_qualification_freeze_manifest_v1.json
+            research/package-adjustment-v7/development_first_qualification_freeze_v1.md
+            research/package-adjustment-v7/development_first_qualification_frozen_v1.json
+          )
+          diff -u <(printf '%s\n' "${expected[@]}" | sort) <(printf '%s\n' "${changed[@]}" | sort)
+
+      - name: Upload freeze evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-adjustment-v7-development-first-qualification-freeze
+          path: |
+            research/package-adjustment-v7/development_first_qualification_freeze_manifest_v1.json
+            research/package-adjustment-v7/development_first_qualification_freeze_v1.md
+            research/package-adjustment-v7/development_first_qualification_frozen_v1.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Commit exact freeze
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            research/package-adjustment-v7/development_first_qualification_frozen_v1.json \
+            research/package-adjustment-v7/development_first_qualification_freeze_manifest_v1.json \
+            research/package-adjustment-v7/development_first_qualification_freeze_v1.md
+          git diff --cached --quiet && { echo "ERROR: no freeze changes staged"; exit 1; }
+          git commit -m "Freeze Package Adjustment V7 development evidence"
+
+          git fetch origin main
+          critical=(
+            research/package-adjustment-v7/phase1_multi_vs_multi_preregistration_v1.json
+            research/package-adjustment-v7/phase1a_power_analysis_v1.json
+            research/package-adjustment-v7/package_vote_challenges_v7_development_v1.json
+            research/package-adjustment-v7/development_voting_activation_manifest_v1.json
+            .github/workflows/package-adjustment-v7-outcome-blind-maturity-monitor-v1.yml
+            scripts/validation/check_package_adjustment_live.py
+          )
+          for p in "${critical[@]}"; do
+            test "$(git rev-parse "$BASE_SHA:$p")" = "$(git rev-parse "origin/main:$p")" || {
+              echo "ERROR: frozen V7 input changed during exact freeze: $p"
+              exit 1
+            }
+          done
+
+          git rebase origin/main
+          python3 scripts/validation/check_package_adjustment_live.py
+          git push origin HEAD:main
