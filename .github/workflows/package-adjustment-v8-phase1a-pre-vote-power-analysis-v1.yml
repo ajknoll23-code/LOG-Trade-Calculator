@@ -1,0 +1,434 @@
+name: Package Adjustment V8 - Phase 1A Pre-Vote Power Analysis V1
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  power:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+
+    steps:
+      - name: Checkout current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Capture base SHA
+        id: base
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Guard frozen V8 preregistration and independent planning sources
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          V8="research/package-adjustment-v8"
+          V6="research/package-adjustment-v6"
+
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+          test "$(git hash-object "$V8/topology_split_preregistration_v1.json")" = \
+            "0861346a483ed9938246fd04173408c47c012ee9"
+          test "$(git hash-object "$V8/topology_split_preregistration_manifest_v1.json")" = \
+            "dfcee1b51e9d050c20ca99cc05f60632003d6c3b"
+
+          test "$(sha256sum "$V8/topology_split_preregistration_v1.json" | awk '{print $1}')" = \
+            "e3c8b618585c2d560b4967451c4daeef27dd5219ec245ce3af55d33e8cc21a0a"
+
+          test "$(git hash-object "$V6/development_candidate_v1.json")" = \
+            "446a176757919be3deef0659ac01e05884be4007"
+          test "$(git hash-object "$V6/prospective_evaluation_v1.json")" = \
+            "7fd2a07f3bd9b9214e1293d50b867c7f023ab2d1"
+
+          test "$(sha256sum "$V6/development_candidate_v1.json" | awk '{print $1}')" = \
+            "f42ff7226aa83b455bcc6e5d8317144765f5deb7f5994d3bde8d4ae30e484afc"
+          test "$(sha256sum "$V6/prospective_evaluation_v1.json" | awk '{print $1}')" = \
+            "8e503060d67c33b9ac339a0072538afed3a848b42b5486296651fd56170e944b"
+
+          test ! -e "$V8/topology_split_power_analysis_v1.json"
+          test ! -e "$V8/topology_split_power_analysis_manifest_v1.json"
+          test ! -e "$V8/topology_split_power_analysis_v1.md"
+          test ! -e "$V8/development_catalog_v1.json"
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          p=json.loads(
+              Path("research/package-adjustment-v8/topology_split_preregistration_v1.json").read_text()
+          )
+          m=json.loads(
+              Path("research/package-adjustment-v8/topology_split_preregistration_manifest_v1.json").read_text()
+          )
+
+          assert p["status"]=="FROZEN_PRE_POWER_PRE_CATALOG_PRE_VOTE"
+          assert p["power_and_maturity"]["power_analysis_must_be_frozen_before_catalog"] is True
+          assert p["power_and_maturity"]["power_target"]==0.80
+          assert p["power_and_maturity"]["maximum_unique_voters"]==50
+          assert p["development_catalog_preregistration"]["topology_counts"]=={
+              "2v2":10,"2v3":6,"2v4":6,"3v3":6,"3v4":6,"4v4":6
+          }
+          assert p["candidate_family"]["C1_TOPOLOGY_SPLIT_V6_TRANSFER"]["score"]["2v2"]==\
+              "sum(v_i) on both sides exactly"
+
+          assert m["power_analysis_performed"] is False
+          assert m["development_catalog_generated"] is False
+          assert m["v8_votes_read"] is False
+          assert m["production_change_authorized"] is False
+
+          print("PASS: V8 preregistration authorizes power planning but not catalog generation yet.")
+          PY
+
+      - name: Compute and freeze conservative V8 power plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p research/package-adjustment-v8
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import math
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from statistics import NormalDist
+
+          ROOT=Path.cwd()
+          V8=ROOT/"research"/"package-adjustment-v8"
+          V6=ROOT/"research"/"package-adjustment-v6"
+
+          PREREG=V8/"topology_split_preregistration_v1.json"
+          DEV=V6/"development_candidate_v1.json"
+          PROS=V6/"prospective_evaluation_v1.json"
+
+          OUT=V8/"topology_split_power_analysis_v1.json"
+          MAN=V8/"topology_split_power_analysis_manifest_v1.json"
+          MD=V8/"topology_split_power_analysis_v1.md"
+
+          def load(p): return json.loads(p.read_text())
+          def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
+
+          prereg=load(PREREG)
+          dev=load(DEV)
+          pros=load(PROS)
+
+          target=float(prereg["power_and_maturity"]["power_target"])
+          hard_cap=int(prereg["power_and_maturity"]["maximum_unique_voters"])
+          practical=float(
+              prereg["development_evaluation"]["eligibility_gates"]
+              ["combined_cv_improvement_vs_c0_min"]
+          )
+          z=NormalDist().inv_cdf(0.95)
+
+          # Equal-topology primary metric gives each of six topologies 1/6 weight.
+          # The frozen V8 candidate equals raw sum exactly in 2v2, so for planning
+          # we conservatively assign zero structural effect to 2v2 and only 5/6 of
+          # the independent V6 effect to the remaining topology mass. We do NOT
+          # shrink the historical SD, which is deliberately conservative.
+          topology_effect_fraction=5.0/6.0
+
+          sources=[
+              {
+                  "name":"v6_development_crossed_bootstrap",
+                  "voters":int(dev["development_evidence"]["distinct_voter_clusters"]),
+                  "raw_independent_effect_D":float(
+                      dev["crossed_cluster_uncertainty"]["point_difference_candidate_minus_C1"]
+                  ),
+                  "sd":float(dev["crossed_cluster_uncertainty"]["bootstrap_sd"]),
+                  "source_sha256":sha(DEV),
+              },
+              {
+                  "name":"v6_prospective_crossed_bootstrap",
+                  "voters":int(pros["evidence"]["distinct_voter_clusters"]),
+                  "raw_independent_effect_D":float(
+                      pros["primary_confirmation"]["D_overall_C2_minus_C1"]
+                  ),
+                  "sd":float(
+                      pros["primary_confirmation"]["crossed_cluster_uncertainty"]["bootstrap_sd"]
+                  ),
+                  "source_sha256":sha(PROS),
+              },
+          ]
+
+          rows=[]
+          for n in range(30,hard_cap+1):
+              sr=[]
+              for src in sources:
+                  D=src["raw_independent_effect_D"]*topology_effect_fraction
+                  se=src["sd"]*math.sqrt(src["voters"]/float(n))
+                  threshold=min(-practical,-z*se)
+                  power=NormalDist().cdf((threshold-D)/se)
+                  sr.append({
+                      "source":src["name"],
+                      "projected_se":se,
+                      "raw_independent_effect_D":src["raw_independent_effect_D"],
+                      "topology_attenuation_fraction":topology_effect_fraction,
+                      "planning_assumed_true_D":D,
+                      "joint_primary_gate_threshold_Dhat":threshold,
+                      "approximate_power":power,
+                  })
+              conservative=min(x["approximate_power"] for x in sr)
+              rows.append({
+                  "distinct_voter_checkpoint":n,
+                  "source_projections":sr,
+                  "conservative_power":conservative,
+                  "passes_target":conservative>=target,
+              })
+
+          eligible=[r for r in rows if r["passes_target"]]
+          if not eligible:
+              raise RuntimeError("No voter count through the preregistered hard cap reaches power target")
+
+          first=int(eligible[0]["distinct_voter_checkpoint"])
+          assert first==44, first
+
+          # Coverage must independently support the same >=80% power assumption.
+          # Therefore every challenge must have at least the same number of
+          # distinct voters as the selected powered checkpoint.
+          minimum_per_challenge=first
+          assert minimum_per_challenge==44
+          assert minimum_per_challenge<=hard_cap
+
+          generated=datetime.now(timezone.utc).isoformat()
+
+          power={
+              "schema_version":1,
+              "study_id":prereg["study_id"],
+              "stage":"phase1a_pre_vote_power_analysis",
+              "status":"FROZEN_PRE_CATALOG_PRE_VOTE_POWER",
+              "generated_at_utc":generated,
+              "method":
+                  "conservative normal planning approximation using two independent pre-V7 V6 crossed-cluster effect/SD sources; effect attenuated by 5/6 because V8 is structurally raw-sum neutral in 2v2; SD is not attenuated",
+              "planning_sources_independent_of_v8_votes":True,
+              "v7_vote_outcomes_used_for_power":False,
+              "v8_vote_outcomes_used_for_power":False,
+              "candidate_scores_on_v8_catalog_used_for_power":False,
+              "power_target":target,
+              "minimum_worthwhile_improvement":practical,
+              "one_sided_z":z,
+              "topology_effect_fraction":topology_effect_fraction,
+              "topology_effect_fraction_reason":
+                  "V8 primary evaluation equal-weights six topologies and the frozen candidate equals raw sum exactly in 2v2; zero effect is conservatively assigned to 1/6 of topology mass.",
+              "source_inputs":sources,
+              "checkpoints":rows,
+              "selected_first_checkpoint_distinct_voters":first,
+              "coverage_gate_at_or_after_first_checkpoint":{
+                  "minimum_distinct_voters_total":first,
+                  "minimum_distinct_voters_per_challenge":minimum_per_challenge,
+                  "hard_cap_distinct_voters":hard_cap,
+                  "collection_rule":
+                      "At 44 total distinct voters, freeze only if every one of the 40 fresh challenges has at least 44 distinct voters. Otherwise continue outcome-blind collection until all 40 reach 44 or 50 total distinct voters is reached.",
+                  "hard_cap_failure_rule":
+                      "If 50 total distinct voters is reached and any challenge remains below 44 distinct voters, stop V8 development voting as insufficient coverage without reading vote direction or candidate performance.",
+                  "all_40_presented_per_session":True,
+              },
+              "maturity_monitor_firewall":{
+                  "may_read_voter_identity_cluster":True,
+                  "may_read_challenge_id":True,
+                  "may_read_submission_timestamp":True,
+                  "may_read_vote_direction":False,
+                  "may_read_candidate_prediction":False,
+                  "may_read_candidate_score":False,
+                  "first_valid_ballot_per_voter_challenge_only":True,
+                  "freeze_at_first_coverage_qualified_prefix":True,
+              },
+              "decision":"FREEZE_V8_POWER_AT_44_VOTERS_AND_44_PER_CHALLENGE",
+              "next_if_green":
+                  "Generate the fresh 40-trade realism-constrained development catalog and run its dedicated pre-vote catalog audit before voting activation.",
+              "development_catalog_generated":False,
+              "production_change_authorized":False,
+          }
+
+          OUT.write_text(json.dumps(power,indent=2,sort_keys=True)+"\n")
+
+          manifest={
+              "schema_version":1,
+              "study_id":prereg["study_id"],
+              "stage":"phase1a_power_analysis_manifest",
+              "status":power["status"],
+              "generated_at_utc":generated,
+              "inputs":{
+                  "v8_preregistration_sha256":sha(PREREG),
+                  "v6_development_candidate_sha256":sha(DEV),
+                  "v6_prospective_evaluation_sha256":sha(PROS),
+              },
+              "output_sha256":sha(OUT),
+              "selected_first_checkpoint_distinct_voters":first,
+              "minimum_distinct_voters_per_challenge":minimum_per_challenge,
+              "hard_cap_distinct_voters":hard_cap,
+              "development_catalog_generated":False,
+              "v8_votes_read":False,
+              "candidate_fit_performed":False,
+              "candidate_selection_performed":False,
+              "production_change_authorized":False,
+          }
+          MAN.write_text(json.dumps(manifest,indent=2,sort_keys=True)+"\n")
+
+          row44=next(r for r in rows if r["distinct_voter_checkpoint"]==44)
+          row40=next(r for r in rows if r["distinct_voter_checkpoint"]==40)
+          row50=next(r for r in rows if r["distinct_voter_checkpoint"]==50)
+
+          lines=[
+              "# Package Adjustment V8 — Phase 1A Pre-Vote Power Analysis","",
+              "**Decision:** `FREEZE_V8_POWER_AT_44_VOTERS_AND_44_PER_CHALLENGE`","",
+              "The V8 candidate is raw-sum neutral in 2v2. Power planning therefore attenuates each independent V6 effect by 5/6 while leaving uncertainty unchanged.","",
+              f"- 40 voters conservative power: **{row40['conservative_power']:.4f}** — below 0.80.",
+              f"- 44 voters conservative power: **{row44['conservative_power']:.4f}** — passes 0.80.",
+              f"- 50 voters conservative power: **{row50['conservative_power']:.4f}**.",
+              "- First powered checkpoint: **44 distinct voters**.",
+              "- Coverage gate: **44 distinct voters on every one of 40 challenges**.",
+              "- Hard cap: **50 distinct voters**.","",
+              "If 44 total voters is reached before every challenge has 44 voters, continue collection outcome-blind. If 50 total voters is reached without 44-per-challenge coverage, stop for insufficient coverage.","",
+              "No V7 vote outcome or V8 vote outcome was used to choose this sample size.",
+              "No development catalog was generated by this workflow.",
+              "Production remains unchanged."
+          ]
+          MD.write_text("\n".join(lines)+"\n")
+
+          print(json.dumps({
+              "decision":power["decision"],
+              "power_at_40":row40["conservative_power"],
+              "power_at_44":row44["conservative_power"],
+              "power_at_50":row50["conservative_power"],
+              "first_checkpoint":first,
+              "minimum_per_challenge":minimum_per_challenge,
+              "hard_cap":hard_cap,
+              "v7_vote_outcomes_used":False,
+              "v8_vote_outcomes_used":False,
+              "catalog_generated":False,
+              "production_change_authorized":False
+          },indent=2))
+          PY
+
+      - name: Validate frozen power analysis and firewalls
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+
+          d=Path("research/package-adjustment-v8")
+          p=json.loads((d/"topology_split_power_analysis_v1.json").read_text())
+          m=json.loads((d/"topology_split_power_analysis_manifest_v1.json").read_text())
+
+          assert p["status"]=="FROZEN_PRE_CATALOG_PRE_VOTE_POWER"
+          assert p["decision"]=="FREEZE_V8_POWER_AT_44_VOTERS_AND_44_PER_CHALLENGE"
+          assert p["power_target"]==0.80
+          assert p["topology_effect_fraction"]==5/6
+          assert p["selected_first_checkpoint_distinct_voters"]==44
+          assert p["coverage_gate_at_or_after_first_checkpoint"]["minimum_distinct_voters_per_challenge"]==44
+          assert p["coverage_gate_at_or_after_first_checkpoint"]["hard_cap_distinct_voters"]==50
+
+          row40=next(x for x in p["checkpoints"] if x["distinct_voter_checkpoint"]==40)
+          row44=next(x for x in p["checkpoints"] if x["distinct_voter_checkpoint"]==44)
+          assert row40["passes_target"] is False
+          assert row44["passes_target"] is True
+          assert row40["conservative_power"] < 0.80
+          assert row44["conservative_power"] >= 0.80
+
+          assert p["v7_vote_outcomes_used_for_power"] is False
+          assert p["v8_vote_outcomes_used_for_power"] is False
+          assert p["candidate_scores_on_v8_catalog_used_for_power"] is False
+          assert p["development_catalog_generated"] is False
+          assert p["production_change_authorized"] is False
+
+          f=p["maturity_monitor_firewall"]
+          assert f["may_read_vote_direction"] is False
+          assert f["may_read_candidate_prediction"] is False
+          assert f["may_read_candidate_score"] is False
+          assert f["freeze_at_first_coverage_qualified_prefix"] is True
+
+          digest=hashlib.sha256(
+              (d/"topology_split_power_analysis_v1.json").read_bytes()
+          ).hexdigest()
+          assert m["output_sha256"]==digest
+          assert m["selected_first_checkpoint_distinct_voters"]==44
+          assert m["minimum_distinct_voters_per_challenge"]==44
+          assert m["hard_cap_distinct_voters"]==50
+          assert m["development_catalog_generated"] is False
+          assert m["v8_votes_read"] is False
+          assert m["candidate_fit_performed"] is False
+          assert m["production_change_authorized"] is False
+
+          print("PASS: V8 Phase 1A power analysis and outcome-blind maturity contract verified.")
+          PY
+
+          python3 scripts/validation/check_package_adjustment_live.py
+
+      - name: Prove exact change scope
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t changed < <(
+            git status --porcelain=v1 --untracked-files=all |
+            sed -E 's/^.. //' |
+            sort
+          )
+
+          expected=(
+            research/package-adjustment-v8/topology_split_power_analysis_manifest_v1.json
+            research/package-adjustment-v8/topology_split_power_analysis_v1.json
+            research/package-adjustment-v8/topology_split_power_analysis_v1.md
+          )
+
+          diff -u \
+            <(printf '%s\n' "${expected[@]}" | sort) \
+            <(printf '%s\n' "${changed[@]}" | sort)
+
+      - name: Commit frozen V8 power plan
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            research/package-adjustment-v8/topology_split_power_analysis_v1.json \
+            research/package-adjustment-v8/topology_split_power_analysis_manifest_v1.json \
+            research/package-adjustment-v8/topology_split_power_analysis_v1.md
+
+          git diff --cached --quiet && {
+            echo "ERROR: no V8 power-analysis changes staged"
+            exit 1
+          }
+
+          git commit -m "Freeze Package Adjustment V8 power plan"
+
+          git fetch origin main
+          critical=(
+            research/package-adjustment-v8/topology_split_preregistration_v1.json
+            research/package-adjustment-v8/topology_split_preregistration_manifest_v1.json
+            research/package-adjustment-v6/development_candidate_v1.json
+            research/package-adjustment-v6/prospective_evaluation_v1.json
+            scripts/validation/check_package_adjustment_live.py
+          )
+
+          for p in "${critical[@]}"; do
+            test "$(git rev-parse "$BASE_SHA:$p")" = \
+                 "$(git rev-parse "origin/main:$p")" || {
+              echo "ERROR: frozen power input changed during run: $p"
+              exit 1
+            }
+          done
+
+          git rebase origin/main
+          python3 scripts/validation/check_package_adjustment_live.py
+          git push origin HEAD:main
