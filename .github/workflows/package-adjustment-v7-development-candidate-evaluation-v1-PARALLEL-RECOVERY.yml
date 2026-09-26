@@ -1,0 +1,1368 @@
+name: Package Adjustment V7 - Development Candidate Evaluation V1 Parallel Recovery
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  base:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Capture base SHA
+        id: base
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install exact evaluator dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir \
+            "numpy==2.3.3" "scipy==1.16.2"
+
+      - name: Guard immutable V7 development evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          D="research/package-adjustment-v7"
+
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+          test "$(git hash-object "$D/development_first_qualification_frozen_v1.json")" = "86162cdf1a34e20b35066c2da545cc925743f1d8"
+          test "$(git hash-object "$D/development_first_qualification_freeze_manifest_v1.json")" = "88f318bb0752066972fec76ca9d686da0c1a4599"
+          test "$(git hash-object "$D/phase1_multi_vs_multi_preregistration_v1.json")" = "07063ddc8842ec01f876efe5dcab548f9c223a60"
+          test "$(git hash-object "$D/package_vote_challenges_v7_development_v1.json")" = "01823ce0f146fd09693b4585bf4948c3076bd9d3"
+
+          test "$(sha256sum "$D/development_first_qualification_frozen_v1.json" | awk '{print $1}')" = \
+            "3f3e6dec81eb694102df970607f05f0d96d46eb1a7368fec151c945ebf1aac9a"
+
+          test "$(git hash-object ".github/workflows/package-adjustment-v7-development-candidate-evaluation-v1.yml")" = \
+            "0a1e9d276182d8a9310b4c292013789fafea40b5"
+
+          test ! -e "$D/development_evaluation_v1.json"
+          test ! -e "$D/development_evaluation_manifest_v1.json"
+          test ! -e "$D/development_evaluation_v1.md"
+          test ! -e "$D/development_candidate_frozen_v1.json"
+
+          python3 scripts/validation/check_package_adjustment_live.py
+
+      - name: Freeze exact serial evaluator core
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/prep"
+
+          cat > "${RUNNER_TEMP}/prep/evaluate_v7_core.py" <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import math
+          from collections import defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import numpy as np
+          from scipy.optimize import minimize
+
+          ROOT=Path.cwd()
+          D=ROOT/"research"/"package-adjustment-v7"
+          DATA=D/"development_first_qualification_frozen_v1.json"
+          FREEZE=D/"development_first_qualification_freeze_manifest_v1.json"
+          PREREG=D/"phase1_multi_vs_multi_preregistration_v1.json"
+          CATALOG=D/"package_vote_challenges_v7_development_v1.json"
+
+          OUT=D/"development_evaluation_v1.json"
+          MAN=D/"development_evaluation_manifest_v1.json"
+          MD=D/"development_evaluation_v1.md"
+          CAND=D/"development_candidate_frozen_v1.json"
+
+          TOPOLOGIES=("2v2","2v3","2v4","3v3","3v4","4v4")
+          CANDIDATES=("C0_RAW_SUM","C1_V6_Q_TRANSFER","C2_GLOBAL_Q","C3_APEX_REMAINDER")
+          SELECTABLE=("C1_V6_Q_TRANSFER","C2_GLOBAL_Q","C3_APEX_REMAINDER")
+          Q_V6=2.9897594788655337
+          Q_BOUNDS=(1.05,6.0)
+          LAMBDA_BOUNDS=(0.0,1.0)
+          BETA_BOUNDS=(0.05,25.0)
+          DELTA_BOUNDS=(-0.75,0.75)
+          MIN_IMPROVEMENT=0.005
+          WITHIN_TOPOLOGY=0.002
+          WORST_TOPOLOGY_REGRESSION=0.010
+          BOUND_REL_TOL=1e-6
+          BOOT_DRAWS=10000
+          BOOT_SEED=20260925
+
+          def load(p): return json.loads(p.read_text())
+          def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
+
+          def score(vals, candidate, theta=None):
+              x=np.asarray(vals,dtype=float)
+              if np.any(x<=0): raise ValueError("FV must be strictly positive")
+              if candidate=="C0_RAW_SUM":
+                  return float(x.sum())
+              if candidate=="C1_V6_Q_TRANSFER":
+                  q=Q_V6
+                  return float(np.power(np.power(x,q).sum(),1.0/q))
+              if candidate=="C2_GLOBAL_Q":
+                  q=float(theta)
+                  return float(np.power(np.power(x,q).sum(),1.0/q))
+              if candidate=="C3_APEX_REMAINDER":
+                  lam=float(theta)
+                  return float(x.max()+lam*(x.sum()-x.max()))
+              raise KeyError(candidate)
+
+          def sigmoid(z):
+              z=np.clip(z,-50,50)
+              return 1/(1+np.exp(-z))
+
+          def logloss(y,p):
+              p=np.clip(p,1e-12,1-1e-12)
+              return -(y*np.log(p)+(1-y)*np.log(1-p))
+
+          def deterministic_fold_map(challenges):
+              # Grouped by challenge. Within each topology, balance all five folds while
+              # interleaving contrast bands deterministically by SHA256.
+              by_top=defaultdict(lambda: defaultdict(list))
+              for cid,c in challenges.items():
+                  by_top[c["topology"]][c["primary_contrast_band"]].append(cid)
+              fmap={}
+              for topo in TOPOLOGIES:
+                  fold_counts=[0]*5
+                  bands=sorted(by_top[topo])
+                  for band in bands:
+                      ids=sorted(
+                          by_top[topo][band],
+                          key=lambda cid: hashlib.sha256(
+                              f"v7|20260925|{topo}|{band}|{cid}".encode()
+                          ).hexdigest(),
+                      )
+                      offset=int(hashlib.sha256(f"{topo}|{band}".encode()).hexdigest()[:8],16)%5
+                      for cid in ids:
+                          min_count=min(fold_counts)
+                          choices=[f for f,n in enumerate(fold_counts) if n==min_count]
+                          f=min(choices,key=lambda x:(x-offset)%5)
+                          fmap[cid]=f
+                          fold_counts[f]+=1
+              assert len(fmap)==40
+              for topo in TOPOLOGIES:
+                  fs={fmap[cid] for cid,c in challenges.items() if c["topology"]==topo}
+                  assert fs==set(range(5)), (topo,fs)
+              return fmap
+
+          def rows_for(ballots,challenges, candidate, theta=None, allowed_challenges=None):
+              rows=[]
+              allowed=set(allowed_challenges) if allowed_challenges is not None else None
+              for b in ballots:
+                  cid=b["challenge_id"]
+                  if allowed is not None and cid not in allowed: continue
+                  c=challenges[cid]
+                  sa=score([a["fv"] for a in c["side_A"]["assets"]],candidate,theta)
+                  sb=score([a["fv"] for a in c["side_B"]["assets"]],candidate,theta)
+                  left=b["display_left"]
+                  sl,sr=(sa,sb) if left=="A" else (sb,sa)
+                  rows.append({
+                      "challenge_id":cid,
+                      "topology":c["topology"],
+                      "voter":b["voter_cluster"],
+                      "x":math.log(sl/sr),
+                      "y":1.0 if b["human_choice_left"] else 0.0,
+                  })
+              return rows
+
+          def weights(rows):
+              by_top=defaultdict(set)
+              by_ch=defaultdict(list)
+              for i,r in enumerate(rows):
+                  by_top[r["topology"]].add(r["challenge_id"])
+                  by_ch[r["challenge_id"]].append(i)
+              tops=sorted(by_top)
+              assert tops
+              w=np.zeros(len(rows),dtype=float)
+              for topo in tops:
+                  cids=sorted(by_top[topo])
+                  for cid in cids:
+                      ids=by_ch[cid]
+                      each=1.0/len(tops)/len(cids)/len(ids)
+                      for i in ids: w[i]=each
+              assert abs(w.sum()-1.0)<1e-9
+              return w
+
+          def fit_model(ballots,challenges,candidate,allowed_challenges,delta_fixed=None):
+              free_score = candidate in {"C2_GLOBAL_Q","C3_APEX_REMAINDER"}
+              if candidate=="C2_GLOBAL_Q": sbounds=Q_BOUNDS; sstarts=(1.3,2.0,3.0,4.5,5.7)
+              elif candidate=="C3_APEX_REMAINDER": sbounds=LAMBDA_BOUNDS; sstarts=(0.1,0.3,0.5,0.7,0.9)
+              else: sbounds=None; sstarts=(None,)
+
+              best=None
+              for s0 in sstarts:
+                  base_rows=rows_for(ballots,challenges,candidate,s0,allowed_challenges)
+                  w=weights(base_rows)
+                  y=np.array([r["y"] for r in base_rows])
+
+                  def objective(v):
+                      k=0
+                      theta=s0
+                      if free_score:
+                          theta=float(v[k]); k+=1
+                          rs=rows_for(ballots,challenges,candidate,theta,allowed_challenges)
+                          x=np.array([r["x"] for r in rs])
+                      else:
+                          x=np.array([r["x"] for r in base_rows])
+                      beta=float(v[k]); k+=1
+                      delta=0.0 if delta_fixed is not None else float(v[k])
+                      p=sigmoid(beta*x+delta)
+                      return float(np.sum(w*logloss(y,p)))
+
+                  x0=[]
+                  b=[]
+                  if free_score:
+                      x0.append(float(s0)); b.append(sbounds)
+                  x0.append(1.0); b.append(BETA_BOUNDS)
+                  if delta_fixed is None:
+                      x0.append(0.0); b.append(DELTA_BOUNDS)
+
+                  res=minimize(objective,np.array(x0),method="L-BFGS-B",bounds=b,
+                               options={"maxiter":1000,"ftol":1e-12,"gtol":1e-9})
+                  if not res.success and not np.isfinite(res.fun):
+                      continue
+                  if best is None or res.fun<best.fun:
+                      best=res
+
+              if best is None:
+                  raise RuntimeError(f"optimizer failed for {candidate}")
+
+              k=0
+              theta=None
+              if free_score:
+                  theta=float(best.x[k]); k+=1
+              beta=float(best.x[k]); k+=1
+              delta=0.0 if delta_fixed is not None else float(best.x[k])
+              return {
+                  "candidate":candidate,
+                  "theta":theta,
+                  "beta":beta,
+                  "delta_left":delta,
+                  "training_loss":float(best.fun),
+                  "optimizer_success":bool(best.success),
+                  "optimizer_message":str(best.message),
+              }
+
+          def predict(ballots,challenges,candidate,fit,allowed_challenges):
+              rs=rows_for(ballots,challenges,candidate,fit["theta"],allowed_challenges)
+              out=[]
+              for r in rs:
+                  p=float(sigmoid(fit["beta"]*r["x"]+fit["delta_left"]))
+                  out.append({**r,"p":p,"loss":float(logloss(r["y"],p))})
+              return out
+
+          def macro_loss(preds):
+              by_top=defaultdict(lambda: defaultdict(list))
+              for r in preds:
+                  by_top[r["topology"]][r["challenge_id"]].append(r["loss"])
+              vals=[]
+              for topo in sorted(by_top):
+                  chmeans=[float(np.mean(v)) for v in by_top[topo].values()]
+                  vals.append(float(np.mean(chmeans)))
+              return float(np.mean(vals))
+
+          def topology_losses(preds):
+              by=defaultdict(lambda: defaultdict(list))
+              for r in preds:
+                  by[r["topology"]][r["challenge_id"]].append(r["loss"])
+              return {
+                  topo:float(np.mean([np.mean(v) for v in by[topo].values()]))
+                  for topo in TOPOLOGIES
+              }
+
+          def cv(ballots,challenges,fmap,candidate,delta_fixed=None,excluded_challenges=frozenset()):
+              active=set(challenges)-set(excluded_challenges)
+              all_oof=[]
+              folds=[]
+              fit_params=[]
+              for f in range(5):
+                  valid={cid for cid in active if fmap[cid]==f}
+                  train=active-valid
+                  assert valid and train
+                  fit=fit_model(ballots,challenges,candidate,train,delta_fixed=delta_fixed)
+                  pred=predict(ballots,challenges,candidate,fit,valid)
+                  assert pred
+                  all_oof.extend(pred)
+                  folds.append({"fold":f,"loss":macro_loss(pred),"validation_challenges":sorted(valid)})
+                  fit_params.append(fit)
+              return {
+                  "candidate":candidate,
+                  "primary_cv_loss":macro_loss(all_oof),
+                  "topology_losses":topology_losses(all_oof),
+                  "folds":folds,
+                  "fold_fits":fit_params,
+                  "oof":all_oof,
+              }
+
+          def boundary_pass(candidate, cv_result, full_fit):
+              vals=[]
+              if candidate=="C2_GLOBAL_Q":
+                  vals=[f["theta"] for f in cv_result["fold_fits"]]+[full_fit["theta"]]
+                  lo,hi=Q_BOUNDS
+              elif candidate=="C3_APEX_REMAINDER":
+                  vals=[f["theta"] for f in cv_result["fold_fits"]]+[full_fit["theta"]]
+                  lo,hi=LAMBDA_BOUNDS
+              else:
+                  return True
+              scale=max(abs(lo),abs(hi),1.0)
+              return all((v-lo)>BOUND_REL_TOL*scale and (hi-v)>BOUND_REL_TOL*scale for v in vals)
+
+          def invariants(candidate, theta):
+              samples=[
+                  [100,200],[100,200,300],[150,175,210,260],
+                  [500,501,502],[1000,250,125,75],
+              ]
+              for vals in samples:
+                  s=score(vals,candidate,theta)
+                  assert s>0
+                  assert abs(score(list(reversed(vals)),candidate,theta)-s)<1e-9*max(1,s)
+                  k=3.7
+                  assert abs(score([k*v for v in vals],candidate,theta)-k*s)<1e-8*max(1,k*s)
+                  grown=list(vals); grown[0]+=1.0
+                  assert score(grown,candidate,theta)+1e-10>=s
+              for v in (1.0,10.0,9999.0):
+                  assert abs(score([v],candidate,theta)-v)<1e-9*max(1,v)
+              return True
+
+          def crossed_bootstrap(diff_rows, challenges):
+              # diff_rows carries paired candidate-minus-C0 OOF loss on identical ballots.
+              voters=sorted({r["voter"] for r in diff_rows})
+              cids=sorted({r["challenge_id"] for r in diff_rows})
+              by=defaultdict(dict)
+              topo={cid:challenges[cid]["topology"] for cid in cids}
+              for r in diff_rows:
+                  by[r["challenge_id"]][r["voter"]]=r["diff"]
+              rng=np.random.default_rng(BOOT_SEED)
+              vals=np.empty(BOOT_DRAWS,dtype=float)
+              for d in range(BOOT_DRAWS):
+                  vs=rng.choice(voters,size=len(voters),replace=True)
+                  cs=rng.choice(cids,size=len(cids),replace=True)
+                  vm=defaultdict(int); cm=defaultdict(int)
+                  for v in vs: vm[v]+=1
+                  for c in cs: cm[c]+=1
+                  top_ch=defaultdict(list)
+                  for cid,mult in cm.items():
+                      per=by[cid]
+                      denom=sum(vm[v] for v in per if v in vm)
+                      if denom==0: continue
+                      mean=sum(vm[v]*per[v] for v in per if v in vm)/denom
+                      top_ch[topo[cid]].extend([mean]*mult)
+                  topmeans=[float(np.mean(top_ch[t])) for t in TOPOLOGIES if top_ch[t]]
+                  vals[d]=float(np.mean(topmeans))
+              return {
+                  "draws":BOOT_DRAWS,
+                  "seed":BOOT_SEED,
+                  "mean":float(np.mean(vals)),
+                  "one_sided_95_ucb":float(np.quantile(vals,0.95)),
+                  "p_fraction_lt_zero":float(np.mean(vals<0)),
+              }
+
+          def align_diff(cand,c0):
+              a={(r["voter"],r["challenge_id"]):r for r in cand["oof"]}
+              b={(r["voter"],r["challenge_id"]):r for r in c0["oof"]}
+              assert set(a)==set(b)
+              return [
+                  {
+                      "voter":k[0],"challenge_id":k[1],
+                      "topology":a[k]["topology"],
+                      "diff":a[k]["loss"]-b[k]["loss"],
+                  }
+                  for k in sorted(a)
+              ]
+
+          def full_player_map(challenges):
+              p=defaultdict(set)
+              for cid,c in challenges.items():
+                  for side in ("side_A","side_B"):
+                      for a in c[side]["assets"]:
+                          p[a["key"]].add(cid)
+              return {k:sorted(v) for k,v in sorted(p.items())}
+
+          def run_analysis(ballots,challenges,fmap,delta_fixed=None,excluded=frozenset()):
+              return {c:cv(ballots,challenges,fmap,c,delta_fixed=delta_fixed,excluded_challenges=excluded)
+                      for c in CANDIDATES}
+
+          def selftest():
+              # Mathematical score behavior independent of observed outcomes.
+              for cand,theta in (
+                  ("C0_RAW_SUM",None),("C1_V6_Q_TRANSFER",None),
+                  ("C2_GLOBAL_Q",2.5),("C3_APEX_REMAINDER",0.4),
+              ):
+                  assert invariants(cand,theta)
+              assert score([2,3],"C0_RAW_SUM") == 5
+              assert abs(score([7],"C2_GLOBAL_Q",3.0)-7)<1e-12
+              assert abs(score([7],"C3_APEX_REMAINDER",0.5)-7)<1e-12
+              print("PASS: evaluator score-function self-tests.")
+          PY
+
+          test "$(sha256sum "${RUNNER_TEMP}/prep/evaluate_v7_core.py" | awk '{print $1}')" = \
+            "4fedd139da31879ff69b504f12e4432cfd7e5f5efed8e9bac47cb8355d022cff"
+
+          python3 -m py_compile "${RUNNER_TEMP}/prep/evaluate_v7_core.py"
+          PYTHONPATH="${RUNNER_TEMP}/prep" python3 - <<'PY'
+          import evaluate_v7_core as E
+          E.selftest()
+          print("PASS: exact serial evaluator math core frozen for parallel recovery.")
+          PY
+
+      - name: Run base CV bootstrap and sensitivity once
+        shell: bash
+        env:
+          BASE_REPO_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          PYTHONPATH="${RUNNER_TEMP}/prep" python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          import evaluate_v7_core as E
+
+          data=E.load(E.DATA)
+          freeze=E.load(E.FREEZE)
+          prereg=E.load(E.PREREG)
+          catdoc=E.load(E.CATALOG)
+
+          assert E.sha(E.DATA)=="3f3e6dec81eb694102df970607f05f0d96d46eb1a7368fec151c945ebf1aac9a"
+          assert freeze["data"]["sha256"]==E.sha(E.DATA)
+          assert data["ballot_count"]==1522
+          assert data["distinct_voter_clusters"]==40
+          assert data["distinct_challenges"]==40
+
+          challenges={str(c["id"]):c for c in catdoc["challenges"]}
+          ballots=data["ballots"]
+          fmap=E.deterministic_fold_map(challenges)
+
+          results=E.run_analysis(ballots,challenges,fmap)
+          c0=results["C0_RAW_SUM"]
+
+          fullfits={
+              c:E.fit_model(ballots,challenges,c,set(challenges))
+              for c in E.CANDIDATES
+          }
+
+          details={}
+          for cand in E.SELECTABLE:
+              r=results[cand]
+              improvement=c0["primary_cv_loss"]-r["primary_cv_loss"]
+              fold_improvements=[
+                  c0["folds"][i]["loss"]-r["folds"][i]["loss"] for i in range(5)
+              ]
+              topo_delta={
+                  t:r["topology_losses"][t]-c0["topology_losses"][t]
+                  for t in E.TOPOLOGIES
+              }
+              diff=E.align_diff(r,c0)
+              boot=E.crossed_bootstrap(diff,challenges)
+              inv=E.invariants(cand,fullfits[cand]["theta"])
+              details[cand]={
+                  "primary_cv_loss":r["primary_cv_loss"],
+                  "c0_primary_cv_loss":c0["primary_cv_loss"],
+                  "improvement_vs_c0":improvement,
+                  "fold_improvements_vs_c0":fold_improvements,
+                  "folds_improved":sum(x>0 for x in fold_improvements),
+                  "topology_candidate_minus_c0":topo_delta,
+                  "topologies_improve_or_within_0_002":
+                      sum(v<=E.WITHIN_TOPOLOGY for v in topo_delta.values()),
+                  "worst_topology_regression":max(topo_delta.values()),
+                  "bootstrap":boot,
+                  "full_fit":fullfits[cand],
+                  "fold_fits":r["fold_fits"],
+                  "mathematical_invariants_pass":inv,
+                  "score_parameter_not_at_bound":
+                      E.boundary_pass(cand,r,fullfits[cand]),
+              }
+
+          sens=E.run_analysis(ballots,challenges,fmap,delta_fixed=0.0)
+          primary_rank=sorted(
+              E.SELECTABLE,key=lambda c:(results[c]["primary_cv_loss"],c)
+          )
+          sensitivity_rank=sorted(
+              E.SELECTABLE,key=lambda c:(sens[c]["primary_cv_loss"],c)
+          )
+          sensitivity_ranking_unchanged=(primary_rank==sensitivity_rank)
+
+          for cand in E.SELECTABLE:
+              x=details[cand]
+              x["gates_pre_influence"]={
+                  "cv_improvement_ge_0_005":
+                      x["improvement_vs_c0"]>=E.MIN_IMPROVEMENT-1e-12,
+                  "improves_at_least_4_of_5_folds":x["folds_improved"]>=4,
+                  "at_least_5_of_6_topologies_improve_or_within_0_002":
+                      x["topologies_improve_or_within_0_002"]>=5,
+                  "worst_topology_regression_le_0_010":
+                      x["worst_topology_regression"]<=E.WORST_TOPOLOGY_REGRESSION+1e-12,
+                  "bootstrap_one_sided_95_ucb_lt_0":
+                      x["bootstrap"]["one_sided_95_ucb"]<0,
+                  "mathematical_invariants_pass":
+                      x["mathematical_invariants_pass"],
+                  "score_parameter_not_at_hard_bound":
+                      x["score_parameter_not_at_bound"],
+                  "delta_left_zero_ranking_unchanged":
+                      sensitivity_ranking_unchanged,
+                  "mixed_asset_fixture_not_used":True,
+              }
+              x["pre_influence_eligible"]=all(x["gates_pre_influence"].values())
+
+          pre=[
+              c for c in E.SELECTABLE
+              if details[c]["pre_influence_eligible"]
+          ]
+          provisional=None
+          if pre:
+              pre=sorted(
+                  pre,
+                  key=lambda c:(
+                      results[c]["primary_cv_loss"],
+                      0 if c=="C1_V6_Q_TRANSFER" else 1,
+                      c,
+                  ),
+              )
+              provisional=pre[0]
+              if len(pre)>1:
+                  a,b=pre[0],pre[1]
+                  if abs(
+                      results[a]["primary_cv_loss"]-
+                      results[b]["primary_cv_loss"]
+                  )<=0.001:
+                      free={
+                          "C1_V6_Q_TRANSFER":0,
+                          "C2_GLOBAL_Q":1,
+                          "C3_APEX_REMAINDER":1,
+                      }
+                      provisional=sorted(
+                          [a,b],
+                          key=lambda c:(
+                              free[c],results[c]["primary_cv_loss"],c
+                          ),
+                      )[0]
+
+          player_map=E.full_player_map(challenges)
+          assert len(player_map)==236
+          assert max(len(v) for v in player_map.values())<=2
+
+          base={
+              "schema_version":1,
+              "study_id":"package-adjustment-v7-multi-v-multi",
+              "stage":"development_candidate_evaluation_parallel_base",
+              "execution_contract":{
+                  "scientific_logic_changed":False,
+                  "parallelization_only":True,
+                  "serial_evaluator_core_sha256":
+                      "4fedd139da31879ff69b504f12e4432cfd7e5f5efed8e9bac47cb8355d022cff",
+                  "serial_workflow_git_blob":
+                      "0a1e9d276182d8a9310b4c292013789fafea40b5",
+                  "timed_out_run_id":36259048780,
+                  "timed_out_step":
+                      "Evaluate frozen development evidence",
+                  "shard_count":8,
+              },
+              "base_repo_sha":os.environ["BASE_REPO_SHA"],
+              "source":{
+                  "frozen_data_sha256":E.sha(E.DATA),
+                  "frozen_data_git_blob":
+                      "86162cdf1a34e20b35066c2da545cc925743f1d8",
+                  "ballots":1522,
+                  "voters":40,
+                  "challenges":40,
+              },
+              "fold_map":dict(sorted(fmap.items())),
+              "c0":{
+                  "primary_cv_loss":c0["primary_cv_loss"],
+                  "topology_losses":c0["topology_losses"],
+                  "folds":c0["folds"],
+                  "full_fit":fullfits["C0_RAW_SUM"],
+              },
+              "candidate_primary_losses":{
+                  c:results[c]["primary_cv_loss"] for c in E.CANDIDATES
+              },
+              "details":details,
+              "delta_left_zero_sensitivity":{
+                  "primary_rank":primary_rank,
+                  "delta_zero_rank":sensitivity_rank,
+                  "ranking_unchanged":sensitivity_ranking_unchanged,
+                  "losses":{
+                      c:sens[c]["primary_cv_loss"] for c in E.SELECTABLE
+                  },
+              },
+              "provisional_pre_influence_winner":provisional,
+              "player_map":player_map,
+              "unique_players":len(player_map),
+              "if_none_eligible":
+                  prereg["development_evaluation"]["if_none_eligible"],
+              "confirmation_catalog_generated":False,
+              "production_change_authorized":False,
+          }
+
+          out=Path(os.environ["RUNNER_TEMP"])/"prep"/"base.json"
+          out.write_text(json.dumps(base,indent=2,sort_keys=True)+"\n")
+
+          print(json.dumps({
+              "c0_cv_loss":c0["primary_cv_loss"],
+              "candidate_improvements":{
+                  c:details[c]["improvement_vs_c0"] for c in E.SELECTABLE
+              },
+              "pre_influence_eligible":{
+                  c:details[c]["pre_influence_eligible"]
+                  for c in E.SELECTABLE
+              },
+              "provisional_pre_influence_winner":provisional,
+              "unique_players":len(player_map),
+          },indent=2))
+          PY
+
+      - name: Validate base artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH="${RUNNER_TEMP}/prep" python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          import evaluate_v7_core as E
+
+          p=Path(os.environ["RUNNER_TEMP"])/"prep"/"base.json"
+          d=json.loads(p.read_text())
+
+          assert d["execution_contract"]["scientific_logic_changed"] is False
+          assert d["execution_contract"]["parallelization_only"] is True
+          assert d["execution_contract"]["shard_count"]==8
+          assert d["execution_contract"]["serial_evaluator_core_sha256"]==\
+              "4fedd139da31879ff69b504f12e4432cfd7e5f5efed8e9bac47cb8355d022cff"
+          assert d["source"]["frozen_data_sha256"]==\
+              "3f3e6dec81eb694102df970607f05f0d96d46eb1a7368fec151c945ebf1aac9a"
+          assert d["unique_players"]==236
+          assert len(d["player_map"])==236
+          assert len(d["fold_map"])==40
+          assert set(d["details"])==set(E.SELECTABLE)
+          assert d["confirmation_catalog_generated"] is False
+          assert d["production_change_authorized"] is False
+          print("PASS: base CV/bootstrap/sensitivity artifact validated.")
+          PY
+
+      - name: Upload parallel evaluator base
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-adjustment-v7-development-evaluation-parallel-base
+          path: ${{ runner.temp }}/prep/
+          if-no-files-found: error
+          retention-days: 30
+
+  leave_one_player_out:
+    needs: base
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      SHARD: ${{ matrix.shard }}
+      SHARD_COUNT: "8"
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install exact evaluator dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir \
+            "numpy==2.3.3" "scipy==1.16.2"
+
+      - name: Download frozen parallel base
+        uses: actions/download-artifact@v4
+        with:
+          name: package-adjustment-v7-development-evaluation-parallel-base
+          path: ${{ runner.temp }}/prep
+
+      - name: Guard shard inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          D="research/package-adjustment-v7"
+          test "$(sha256sum "$D/development_first_qualification_frozen_v1.json" | awk '{print $1}')" = \
+            "3f3e6dec81eb694102df970607f05f0d96d46eb1a7368fec151c945ebf1aac9a"
+          test "$(sha256sum "${RUNNER_TEMP}/prep/evaluate_v7_core.py" | awk '{print $1}')" = \
+            "4fedd139da31879ff69b504f12e4432cfd7e5f5efed8e9bac47cb8355d022cff"
+
+      - name: Run assigned leave-one-player-out refits
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/out"
+
+          PYTHONPATH="${RUNNER_TEMP}/prep" python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          import evaluate_v7_core as E
+
+          shard=int(os.environ["SHARD"])
+          shard_count=int(os.environ["SHARD_COUNT"])
+
+          base=json.loads(
+              (Path(os.environ["RUNNER_TEMP"])/"prep"/"base.json").read_text()
+          )
+          data=E.load(E.DATA)
+          catdoc=E.load(E.CATALOG)
+          challenges={str(c["id"]):c for c in catdoc["challenges"]}
+          ballots=data["ballots"]
+          fmap={str(k):int(v) for k,v in base["fold_map"].items()}
+
+          player_map=E.full_player_map(challenges)
+          assert player_map==base["player_map"]
+
+          players=sorted(player_map)
+          assigned=[
+              p for i,p in enumerate(players)
+              if i % shard_count == shard
+          ]
+          assert assigned
+
+          records=[]
+          for i,player in enumerate(assigned,1):
+              drop=player_map[player]
+              rr=E.run_analysis(
+                  ballots,challenges,fmap,excluded=set(drop)
+              )
+              c0_loss=rr["C0_RAW_SUM"]["primary_cv_loss"]
+              losses={
+                  c:rr[c]["primary_cv_loss"] for c in E.SELECTABLE
+              }
+              improvements={
+                  c:c0_loss-losses[c] for c in E.SELECTABLE
+              }
+              best=min(
+                  E.SELECTABLE,
+                  key=lambda c:(losses[c],c),
+              )
+              records.append({
+                  "player":player,
+                  "dropped_challenges":drop,
+                  "c0_primary_cv_loss":c0_loss,
+                  "candidate_primary_cv_losses":losses,
+                  "improvements_vs_c0":improvements,
+                  "best_selectable_candidate":best,
+              })
+              if i%5==0 or i==len(assigned):
+                  print(
+                      f"LOPO shard {shard}: {i}/{len(assigned)} "
+                      f"player={player} best={best}",
+                      flush=True,
+                  )
+
+          out={
+              "schema_version":1,
+              "study_id":"package-adjustment-v7-multi-v-multi",
+              "stage":"development_leave_one_player_out_shard",
+              "shard":shard,
+              "shard_count":shard_count,
+              "assigned_player_n":len(assigned),
+              "assigned_players":assigned,
+              "records":records,
+              "serial_evaluator_core_sha256":
+                  "4fedd139da31879ff69b504f12e4432cfd7e5f5efed8e9bac47cb8355d022cff",
+              "frozen_data_sha256":
+                  "3f3e6dec81eb694102df970607f05f0d96d46eb1a7368fec151c945ebf1aac9a",
+              "scientific_logic_changed":False,
+              "production_change_authorized":False,
+          }
+
+          p=Path(os.environ["RUNNER_TEMP"])/"out"/f"shard_{shard}.json"
+          p.write_text(json.dumps(out,indent=2,sort_keys=True)+"\n")
+          PY
+
+      - name: Validate shard
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          shard=int(os.environ["SHARD"])
+          p=Path(os.environ["RUNNER_TEMP"])/"out"/f"shard_{shard}.json"
+          d=json.loads(p.read_text())
+
+          assert d["shard"]==shard
+          assert d["shard_count"]==8
+          assert d["assigned_player_n"]==len(d["assigned_players"])==len(d["records"])
+          assert [x["player"] for x in d["records"]]==d["assigned_players"]
+          assert len(set(d["assigned_players"]))==len(d["assigned_players"])
+          assert d["scientific_logic_changed"] is False
+          assert d["production_change_authorized"] is False
+          print(f"PASS: LOPO shard {shard} validated with {len(d['records'])} players.")
+          PY
+
+      - name: Upload LOPO shard
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-adjustment-v7-lopo-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/out/shard_${{ matrix.shard }}.json
+          if-no-files-found: error
+          retention-days: 30
+
+  assemble:
+    needs: [base, leave_one_player_out]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Download frozen parallel base
+        uses: actions/download-artifact@v4
+        with:
+          name: package-adjustment-v7-development-evaluation-parallel-base
+          path: ${{ runner.temp }}/prep
+
+      - name: Download all LOPO shards
+        uses: actions/download-artifact@v4
+        with:
+          pattern: package-adjustment-v7-lopo-shard-*
+          path: ${{ runner.temp }}/shards
+          merge-multiple: true
+
+      - name: Deterministically assemble exact serial decision
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import hashlib, json, os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          ROOT=Path.cwd()
+          D=ROOT/"research"/"package-adjustment-v7"
+          DATA=D/"development_first_qualification_frozen_v1.json"
+          FREEZE=D/"development_first_qualification_freeze_manifest_v1.json"
+          PREREG=D/"phase1_multi_vs_multi_preregistration_v1.json"
+          CATALOG=D/"package_vote_challenges_v7_development_v1.json"
+          OUT=D/"development_evaluation_v1.json"
+          MAN=D/"development_evaluation_manifest_v1.json"
+          MD=D/"development_evaluation_v1.md"
+          CAND=D/"development_candidate_frozen_v1.json"
+
+          SELECTABLE=(
+              "C1_V6_Q_TRANSFER",
+              "C2_GLOBAL_Q",
+              "C3_APEX_REMAINDER",
+          )
+
+          def sha(p):
+              return hashlib.sha256(p.read_bytes()).hexdigest()
+
+          temp=Path(os.environ["RUNNER_TEMP"])
+          base=json.loads((temp/"prep"/"base.json").read_text())
+
+          assert base["source"]["frozen_data_sha256"]==\
+              "3f3e6dec81eb694102df970607f05f0d96d46eb1a7368fec151c945ebf1aac9a"
+          assert sha(DATA)==base["source"]["frozen_data_sha256"]
+          assert base["unique_players"]==236
+          assert base["execution_contract"]["shard_count"]==8
+          assert base["execution_contract"]["scientific_logic_changed"] is False
+          assert base["execution_contract"]["parallelization_only"] is True
+
+          shard_docs=[]
+          for shard in range(8):
+              p=temp/"shards"/f"shard_{shard}.json"
+              assert p.exists(), p
+              d=json.loads(p.read_text())
+              assert d["shard"]==shard
+              assert d["shard_count"]==8
+              assert d["serial_evaluator_core_sha256"]==\
+                  base["execution_contract"]["serial_evaluator_core_sha256"]
+              assert d["frozen_data_sha256"]==base["source"]["frozen_data_sha256"]
+              assert d["scientific_logic_changed"] is False
+              shard_docs.append(d)
+
+          expected_players=sorted(base["player_map"])
+          all_records={}
+          all_assigned=[]
+          for d in shard_docs:
+              expected=[
+                  p for i,p in enumerate(expected_players)
+                  if i%8==d["shard"]
+              ]
+              assert d["assigned_players"]==expected
+              all_assigned.extend(expected)
+              for rec in d["records"]:
+                  player=rec["player"]
+                  assert player not in all_records
+                  assert rec["dropped_challenges"]==base["player_map"][player]
+                  all_records[player]=rec
+
+          assert sorted(all_assigned)==expected_players
+          assert sorted(all_records)==expected_players
+          assert len(all_records)==236
+
+          influence={
+              c:{
+                  "players_checked":0,
+                  "minimum_improvement_vs_c0":float("inf"),
+                  "worst_player":None,
+                  "positive_improvement_for_every_player":True,
+              }
+              for c in SELECTABLE
+          }
+
+          provisional=base["provisional_pre_influence_winner"]
+          winner_stable=True
+          winner_flip_players=[]
+
+          # Iterate in the exact same sorted player order as the serial implementation.
+          for player in expected_players:
+              rec=all_records[player]
+              for cand in SELECTABLE:
+                  imp=rec["improvements_vs_c0"][cand]
+                  z=influence[cand]
+                  z["players_checked"]+=1
+                  if imp<z["minimum_improvement_vs_c0"]:
+                      z["minimum_improvement_vs_c0"]=imp
+                      z["worst_player"]=player
+                  if imp<=0:
+                      z["positive_improvement_for_every_player"]=False
+
+              if provisional is not None:
+                  best=rec["best_selectable_candidate"]
+                  if best!=provisional:
+                      winner_stable=False
+                      winner_flip_players.append({
+                          "player":player,
+                          "best_candidate":best,
+                      })
+
+          details=base["details"]
+          for cand in SELECTABLE:
+              details[cand]["leave_one_player_out"]=influence[cand]
+              details[cand]["gates"]={
+                  **details[cand]["gates_pre_influence"],
+                  "leave_one_player_out_positive_improvement_every_player":
+                      influence[cand]["positive_improvement_for_every_player"],
+              }
+              details[cand]["eligible"]=all(
+                  details[cand]["gates"].values()
+              )
+
+          losses=base["candidate_primary_losses"]
+          eligible=[
+              c for c in SELECTABLE
+              if details[c]["eligible"]
+          ]
+          selected=None
+          if eligible:
+              ordered=sorted(
+                  eligible,key=lambda c:(losses[c],c)
+              )
+              selected=ordered[0]
+              if (
+                  len(ordered)>1
+                  and abs(losses[ordered[0]]-losses[ordered[1]])<=0.001
+              ):
+                  free={
+                      "C1_V6_Q_TRANSFER":0,
+                      "C2_GLOBAL_Q":1,
+                      "C3_APEX_REMAINDER":1,
+                  }
+                  selected=sorted(
+                      [ordered[0],ordered[1]],
+                      key=lambda c:(free[c],losses[c],c),
+                  )[0]
+
+          # Preserve the serial implementation's winner-stability logic exactly.
+          if (
+              selected is not None
+              and (provisional!=selected or not winner_stable)
+          ):
+              details[selected]["gates"][
+                  "leave_one_player_out_winner_stable"
+              ]=False
+              details[selected]["eligible"]=False
+              eligible=[
+                  c for c in SELECTABLE
+                  if details[c]["eligible"] and c!=selected
+              ]
+              selected=None
+              if eligible:
+                  ordered=sorted(
+                      eligible,key=lambda c:(losses[c],c)
+                  )
+                  selected=ordered[0]
+
+          decision=(
+              "FREEZE_DEVELOPMENT_CANDIDATE_AND_BUILD_FRESH_CONFIRMATION_POWER"
+              if selected is not None
+              else base["if_none_eligible"]
+          )
+
+          generated=datetime.now(timezone.utc).isoformat()
+          result={
+              "schema_version":1,
+              "study_id":"package-adjustment-v7-multi-v-multi",
+              "stage":"development_candidate_evaluation",
+              "status":decision,
+              "generated_at_utc":generated,
+              "source":{
+                  "frozen_data_path":
+                      str(DATA.relative_to(ROOT)),
+                  "frozen_data_sha256":sha(DATA),
+                  "frozen_data_git_blob":
+                      "86162cdf1a34e20b35066c2da545cc925743f1d8",
+                  "ballots":1522,
+                  "voters":40,
+                  "challenges":40,
+              },
+              "fold_map":base["fold_map"],
+              "primary_metric":
+                  "equal-topology macro mean log loss from 5-fold grouped OOF predictions",
+              "c0":base["c0"],
+              "candidates":details,
+              "delta_left_zero_sensitivity":
+                  base["delta_left_zero_sensitivity"],
+              "leave_one_player_out":{
+                  "unique_players":236,
+                  "provisional_pre_influence_winner":provisional,
+                  "provisional_winner_stable_every_player":
+                      winner_stable,
+                  "winner_flip_players":winner_flip_players,
+              },
+              "selected_candidate":selected,
+              "eligible_candidates":eligible,
+              "decision":decision,
+              "no_posthoc_rescue_model":True,
+              "confirmation_catalog_generated":False,
+              "production_change_authorized":False,
+          }
+          OUT.write_text(
+              json.dumps(result,indent=2,sort_keys=True)+"\n"
+          )
+
+          if selected is not None:
+              fullfit=details[selected]["full_fit"]
+              candidate_doc={
+                  "schema_version":1,
+                  "study_id":"package-adjustment-v7-multi-v-multi",
+                  "stage":"development_candidate_freeze",
+                  "status":"FROZEN_BEFORE_CONFIRMATION_CATALOG",
+                  "generated_at_utc":generated,
+                  "candidate":selected,
+                  "score_parameter":fullfit["theta"],
+                  "nuisance_beta":fullfit["beta"],
+                  "nuisance_delta_left":fullfit["delta_left"],
+                  "source_development_evaluation_sha256":
+                      sha(OUT),
+                  "source_frozen_data_sha256":sha(DATA),
+                  "confirmation_outcomes_read":False,
+                  "confirmation_catalog_generated":False,
+                  "production_change_authorized":False,
+              }
+              CAND.write_text(
+                  json.dumps(candidate_doc,indent=2,sort_keys=True)+"\n"
+              )
+
+          manifest={
+              "schema_version":1,
+              "study_id":"package-adjustment-v7-multi-v-multi",
+              "stage":"development_evaluation_manifest",
+              "status":decision,
+              "generated_at_utc":generated,
+              "inputs":{
+                  "frozen_data_sha256":sha(DATA),
+                  "freeze_manifest_sha256":sha(FREEZE),
+                  "preregistration_sha256":sha(PREREG),
+                  "catalog_sha256":sha(CATALOG),
+              },
+              "execution":{
+                  "mode":"parallel_recovery_after_serial_timeout",
+                  "scientific_logic_changed":False,
+                  "serial_evaluator_core_sha256":
+                      base["execution_contract"][
+                          "serial_evaluator_core_sha256"
+                      ],
+                  "timed_out_run_id":36259048780,
+                  "leave_one_player_out_shards":8,
+                  "players_checked":236,
+              },
+              "evaluation":{
+                  "path":str(OUT.relative_to(ROOT)),
+                  "sha256":sha(OUT),
+                  "selected_candidate":selected,
+                  "eligible_candidates":eligible,
+              },
+              "candidate_freeze":(
+                  {
+                      "path":str(CAND.relative_to(ROOT)),
+                      "sha256":sha(CAND),
+                  }
+                  if CAND.exists() else None
+              ),
+              "confirmation_catalog_generated":False,
+              "production_change_authorized":False,
+          }
+          MAN.write_text(
+              json.dumps(manifest,indent=2,sort_keys=True)+"\n"
+          )
+
+          lines=[
+              "# Package Adjustment V7 — Development Candidate Evaluation",
+              "",
+              f"**Decision:** `{decision}`",
+              "",
+              "- Execution recovery: **8-way parallel LOPO; scientific logic unchanged**",
+              "- Frozen development ballots: **1522**",
+              "- Distinct voters: **40**",
+              "- Challenges: **40**",
+              f"- Selected candidate: **{selected or 'none'}**",
+              f"- Eligible candidates: **{', '.join(eligible) if eligible else 'none'}**",
+              "",
+              "## Primary CV results",
+              "",
+              "| Candidate | CV log loss | Improvement vs raw sum | Eligible |",
+              "|---|---:|---:|---|",
+          ]
+          for c in SELECTABLE:
+              lines.append(
+                  f"| {c} | {details[c]['primary_cv_loss']:.6f} | "
+                  f"{details[c]['improvement_vs_c0']:.6f} | "
+                  f"{'yes' if details[c]['eligible'] else 'no'} |"
+              )
+          lines += [
+              "",
+              "- Delta-left=0 ranking unchanged: "
+              f"**{base['delta_left_zero_sensitivity']['ranking_unchanged']}**",
+              "- Leave-one-player-out players checked: **236**",
+              "- Provisional winner stable across every player exclusion: "
+              f"**{winner_stable}**",
+              "",
+              "No confirmation catalog was generated and production was not changed.",
+          ]
+          MD.write_text("\n".join(lines)+"\n")
+
+          print(json.dumps({
+              "decision":decision,
+              "selected_candidate":selected,
+              "eligible_candidates":eligible,
+              "c0_cv_loss":base["c0"]["primary_cv_loss"],
+              "candidate_improvements":{
+                  c:details[c]["improvement_vs_c0"] for c in SELECTABLE
+              },
+              "lopo_players":236,
+              "winner_stable":winner_stable,
+          },indent=2))
+          PY
+
+      - name: Validate exact serial-equivalent outputs and firewalls
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+
+          d=Path("research/package-adjustment-v7")
+          r=json.loads((d/"development_evaluation_v1.json").read_text())
+          m=json.loads((d/"development_evaluation_manifest_v1.json").read_text())
+          freeze=json.loads(
+              (d/"development_first_qualification_freeze_manifest_v1.json").read_text()
+          )
+
+          assert r["source"]["frozen_data_sha256"]==\
+              "3f3e6dec81eb694102df970607f05f0d96d46eb1a7368fec151c945ebf1aac9a"
+          assert r["source"]["ballots"]==1522
+          assert r["source"]["voters"]==40
+          assert r["source"]["challenges"]==40
+          assert len(r["fold_map"])==40
+          assert r["confirmation_catalog_generated"] is False
+          assert r["production_change_authorized"] is False
+          assert r["no_posthoc_rescue_model"] is True
+
+          assert set(r["candidates"])=={
+              "C1_V6_Q_TRANSFER",
+              "C2_GLOBAL_Q",
+              "C3_APEX_REMAINDER",
+          }
+          for c,x in r["candidates"].items():
+              assert len(x["fold_improvements_vs_c0"])==5
+              assert set(x["topology_candidate_minus_c0"])=={
+                  "2v2","2v3","2v4","3v3","3v4","4v4"
+              }
+              assert x["bootstrap"]["draws"]==10000
+              assert x["bootstrap"]["seed"]==20260925
+              assert x["leave_one_player_out"]["players_checked"]==236
+              assert set(x["gates_pre_influence"])=={
+                  "cv_improvement_ge_0_005",
+                  "improves_at_least_4_of_5_folds",
+                  "at_least_5_of_6_topologies_improve_or_within_0_002",
+                  "worst_topology_regression_le_0_010",
+                  "bootstrap_one_sided_95_ucb_lt_0",
+                  "mathematical_invariants_pass",
+                  "score_parameter_not_at_hard_bound",
+                  "delta_left_zero_ranking_unchanged",
+                  "mixed_asset_fixture_not_used",
+              }
+
+          assert r["leave_one_player_out"]["unique_players"]==236
+          assert m["execution"]["mode"]==\
+              "parallel_recovery_after_serial_timeout"
+          assert m["execution"]["scientific_logic_changed"] is False
+          assert m["execution"]["players_checked"]==236
+          assert m["execution"]["serial_evaluator_core_sha256"]==\
+              "4fedd139da31879ff69b504f12e4432cfd7e5f5efed8e9bac47cb8355d022cff"
+
+          digest=hashlib.sha256(
+              (d/"development_evaluation_v1.json").read_bytes()
+          ).hexdigest()
+          assert m["evaluation"]["sha256"]==digest
+          assert m["confirmation_catalog_generated"] is False
+          assert m["production_change_authorized"] is False
+          assert freeze["production_change_authorized"] is False
+
+          selected=r["selected_candidate"]
+          cp=d/"development_candidate_frozen_v1.json"
+          if selected is None:
+              assert not cp.exists()
+              assert r["decision"]==\
+                  "STOP_V7_MULTI_V_MULTI_NO_DEVELOPMENT_SIGNAL"
+          else:
+              assert cp.exists()
+              cand=json.loads(cp.read_text())
+              assert cand["candidate"]==selected
+              assert cand["status"]==\
+                  "FROZEN_BEFORE_CONFIRMATION_CATALOG"
+              assert cand["confirmation_catalog_generated"] is False
+              assert cand["production_change_authorized"] is False
+              assert cand["source_frozen_data_sha256"]==\
+                  r["source"]["frozen_data_sha256"]
+
+          print(
+              "PASS: parallel recovery reproduced the serial scientific contract "
+              "and all stage firewalls."
+          )
+          PY
+
+          python3 scripts/validation/check_package_adjustment_live.py
+
+      - name: Upload development evaluation evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-adjustment-v7-development-evaluation-v1-parallel-recovery
+          path: |
+            research/package-adjustment-v7/development_evaluation_v1.json
+            research/package-adjustment-v7/development_evaluation_manifest_v1.json
+            research/package-adjustment-v7/development_evaluation_v1.md
+            research/package-adjustment-v7/development_candidate_frozen_v1.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Prove exact evaluation scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t changed < <(
+            git status --porcelain=v1 --untracked-files=all |
+            sed -E 's/^.. //' |
+            sort
+          )
+
+          expected=(
+            research/package-adjustment-v7/development_evaluation_manifest_v1.json
+            research/package-adjustment-v7/development_evaluation_v1.json
+            research/package-adjustment-v7/development_evaluation_v1.md
+          )
+          if test -e research/package-adjustment-v7/development_candidate_frozen_v1.json; then
+            expected+=(research/package-adjustment-v7/development_candidate_frozen_v1.json)
+          fi
+
+          diff -u \
+            <(printf '%s\n' "${expected[@]}" | sort) \
+            <(printf '%s\n' "${changed[@]}" | sort)
+
+      - name: Commit frozen development evaluation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE_SHA="$(
+            python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          p=Path(os.environ["RUNNER_TEMP"])/"prep"/"base.json"
+          print(json.loads(p.read_text())["base_repo_sha"])
+          PY
+          )"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            research/package-adjustment-v7/development_evaluation_v1.json \
+            research/package-adjustment-v7/development_evaluation_manifest_v1.json \
+            research/package-adjustment-v7/development_evaluation_v1.md
+          test ! -e research/package-adjustment-v7/development_candidate_frozen_v1.json || \
+            git add research/package-adjustment-v7/development_candidate_frozen_v1.json
+
+          git diff --cached --quiet && {
+            echo "ERROR: no development evaluation changes staged"
+            exit 1
+          }
+          git commit -m "Evaluate Package Adjustment V7 development evidence"
+
+          git fetch origin main
+          critical=(
+            research/package-adjustment-v7/development_first_qualification_frozen_v1.json
+            research/package-adjustment-v7/development_first_qualification_freeze_manifest_v1.json
+            research/package-adjustment-v7/phase1_multi_vs_multi_preregistration_v1.json
+            research/package-adjustment-v7/package_vote_challenges_v7_development_v1.json
+            scripts/validation/check_package_adjustment_live.py
+          )
+          for p in "${critical[@]}"; do
+            test "$(git rev-parse "$BASE_SHA:$p")" = \
+                 "$(git rev-parse "origin/main:$p")" || {
+              echo "ERROR: frozen V7 development input changed during parallel evaluation: $p"
+              exit 1
+            }
+          done
+
+          git rebase origin/main
+          python3 scripts/validation/check_package_adjustment_live.py
+          git push origin HEAD:main
