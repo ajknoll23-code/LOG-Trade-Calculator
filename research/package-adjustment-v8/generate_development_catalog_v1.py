@@ -1,0 +1,2217 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import bisect
+import hashlib
+import heapq
+import json
+import math
+import os
+import subprocess
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+import numpy as np
+from scipy.optimize import Bounds, LinearConstraint, milp
+from scipy.sparse import coo_matrix
+
+
+ROOT = Path(__file__).resolve().parents[2]
+V8 = ROOT / "research" / "package-adjustment-v8"
+V7 = ROOT / "research" / "package-adjustment-v7"
+
+PREREG = V8 / "topology_split_preregistration_v1.json"
+POWER = V8 / "topology_split_power_analysis_v1.json"
+DESIGN = V8 / "catalog_design_contract_v1.json"
+FEAS = V8 / "catalog_design_feasibility_v1.json"
+AMENDMENT = V8 / "fixed50_protocol_amendment_v1.json"
+AMENDMENT_MANIFEST = V8 / "fixed50_protocol_amendment_manifest_v1.json"
+SNAPSHOT = V7 / "phase1a_player_fv_snapshot_v1.json"
+V7_CATALOG = V7 / "package_vote_challenges_v7_development_v1.json"
+
+Q = 2.9897594788655337
+
+POSITIONS = ("QB", "RB", "WR", "TE", "DL", "LB", "DB")
+SIDE_MIN_TOTAL = {2: 7000, 3: 9000, 4: 11500}
+SIDE_PROFILES = {
+    2: (
+        (0.50, 0.50),
+        (0.60, 0.40),
+        (0.70, 0.30),
+    ),
+    3: (
+        (0.34, 0.33, 0.33),
+        (0.45, 0.33, 0.22),
+        (0.55, 0.30, 0.15),
+        (0.65, 0.20, 0.15),
+    ),
+    4: (
+        (0.25, 0.25, 0.25, 0.25),
+        (0.35, 0.28, 0.22, 0.15),
+        (0.45, 0.25, 0.18, 0.12),
+        (0.55, 0.18, 0.15, 0.12),
+    ),
+}
+
+SLOT_CELLS = {
+    "2v2": (
+        "A_low", "B_low", "A_low", "B_low",
+        "A_moderate", "B_moderate",
+        "A_high", "B_high", "A_high", "B_high",
+    ),
+    "2v3": (
+        "A_low", "B_low",
+        "A_moderate", "B_moderate",
+        "A_high", "B_high",
+    ),
+    "2v4": (
+        "A_low", "B_low",
+        "A_moderate", "B_moderate",
+        "A_high", "B_high",
+    ),
+    "3v3": (
+        "A_low", "B_low",
+        "A_moderate", "B_moderate",
+        "A_high", "B_high",
+    ),
+    "3v4": (
+        "A_low", "B_low",
+        "A_moderate", "B_moderate",
+        "A_high", "B_high",
+    ),
+    "4v4": (
+        "A_low", "B_low",
+        "A_moderate", "B_moderate",
+        "A_high", "B_high",
+    ),
+}
+
+BAND_TARGETS = {
+    "low": 0.036,
+    "moderate": 0.085,
+    "high": 0.200,
+}
+
+# Retention is deliberately broad. Phase 1C V1 proved that a small
+# quality-biased reservoir can be locally rich yet globally infeasible
+# under the frozen two-appearance cap. These reservoirs retain quality,
+# deterministic global diversity, position diversity, and explicit
+# per-player diversity across the full legal FV range.
+QUALITY_KEEP = 700
+HASH_DIVERSITY_KEEP = 1200
+POSITION_KEEP = 60
+PLAYER_KEEP = 4
+MIN_CELL_RETAINED = 1000
+
+SOLVER_TIME_LIMIT_SECONDS = 240
+SOLVER_MIP_REL_GAP = 0.0
+
+
+def load_json(path: Path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def git_blob(path: Path) -> str:
+    return subprocess.check_output(
+        ["git", "hash-object", str(path)],
+        cwd=ROOT,
+        text=True,
+    ).strip()
+
+
+def canonical_side_signature(keys):
+    return "|".join(sorted(keys))
+
+
+def canonical_trade_signature(keys_a, keys_b):
+    return "||".join(
+        sorted(
+            (
+                canonical_side_signature(keys_a),
+                canonical_side_signature(keys_b),
+            )
+        )
+    )
+
+
+def challenge_signature(challenge):
+    return canonical_trade_signature(
+        [x["key"] for x in challenge["side_A"]["assets"]],
+        [x["key"] for x in challenge["side_B"]["assets"]],
+    )
+
+
+def stable_hash_int(text: str) -> int:
+    return int(
+        hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
+        16,
+    )
+
+
+@dataclass(frozen=True)
+class Side:
+    keys: tuple[str, ...]
+    players: tuple[dict, ...]
+    raw_sum: int
+    apex_fv: int
+    min_fv: int
+    min_share: float
+    top_share: float
+    apex_excess_share: float
+    hhi: float
+    signature: str
+
+
+@dataclass(frozen=True)
+class Candidate:
+    topology: str
+    direction: str
+    band: str
+    side_a: Side
+    side_b: Side
+    signature: str
+    min_fv: int
+    below_3000: int
+    lower_apex_fv: int
+    raw_ratio: float
+    contrast: float
+    contrast_distance_int: int
+    ratio_distance_int: int
+    position_set: tuple[str, ...]
+    player_keys: tuple[str, ...]
+    quality_key: tuple
+    stable_hash: int
+
+
+def side_from_players(players, size):
+    raw_sum = sum(int(p["fv"]) for p in players)
+    shares = [int(p["fv"]) / raw_sum for p in players]
+    keys = tuple(sorted(p["key"] for p in players))
+    return Side(
+        keys=keys,
+        players=tuple(
+            sorted(
+                (dict(p) for p in players),
+                key=lambda p: (-int(p["fv"]), p["key"]),
+            )
+        ),
+        raw_sum=raw_sum,
+        apex_fv=max(int(p["fv"]) for p in players),
+        min_fv=min(int(p["fv"]) for p in players),
+        min_share=min(shares),
+        top_share=max(shares),
+        apex_excess_share=max(shares) - 1.0 / size,
+        hhi=sum(x * x for x in shares),
+        signature=canonical_side_signature(keys),
+    )
+
+
+def nearest_players(pool, desired, used, limit=18):
+    rows = [p for p in pool if p["key"] not in used]
+    rows.sort(
+        key=lambda p: (
+            abs(int(p["fv"]) - desired),
+            p["key"],
+        )
+    )
+    return rows[:limit]
+
+
+def build_side_pool(eligible, size):
+    source = [
+        p for p in eligible
+        if size != 2 or int(p["fv"]) >= 3000
+    ]
+    source.sort(key=lambda p: (int(p["fv"]), p["key"]))
+
+    out = {}
+    rejection = Counter()
+
+    for anchor in source:
+        for profile in SIDE_PROFILES[size]:
+            total_goal = int(anchor["fv"]) / profile[0]
+
+            for variant in range(6):
+                chosen = [anchor]
+                used = {anchor["key"]}
+
+                for i in range(1, size):
+                    nearby = nearest_players(
+                        source,
+                        total_goal * profile[i],
+                        used,
+                    )
+                    if not nearby:
+                        chosen = []
+                        rejection["no_nearby_player"] += 1
+                        break
+                    pick = nearby[(variant + i * 3) % len(nearby)]
+                    chosen.append(pick)
+                    used.add(pick["key"])
+
+                if len(chosen) != size:
+                    continue
+
+                side = side_from_players(chosen, size)
+
+                if side.raw_sum < SIDE_MIN_TOTAL[size]:
+                    rejection["side_total_below_minimum"] += 1
+                    continue
+                if side.apex_fv < 4000:
+                    rejection["side_apex_below_4000"] += 1
+                    continue
+                if side.min_share < 0.10 - 1e-12:
+                    rejection["asset_share_below_10pct"] += 1
+                    continue
+                if size == 2 and side.min_fv < 3000:
+                    rejection["2v2_asset_below_3000"] += 1
+                    continue
+
+                out.setdefault(side.signature, side)
+
+    rows = sorted(
+        out.values(),
+        key=lambda s: (s.raw_sum, s.signature),
+    )
+    return rows, dict(rejection)
+
+
+class Retainer:
+    def __init__(self, cell):
+        self.cell = cell
+        self._counter = 0
+        self.quality_heap = []
+        self.hash_heap = []
+        self.position_heaps = {
+            pos: [] for pos in POSITIONS
+        }
+        self.player_heaps = defaultdict(list)
+        self.valid_seen = 0
+
+    def _quality_desirability(self, candidate):
+        # Larger tuple = better. Root of heap is the worst retained.
+        return (
+            candidate.min_fv,
+            -candidate.below_3000,
+            candidate.lower_apex_fv,
+            -candidate.contrast_distance_int,
+            -candidate.ratio_distance_int,
+        )
+
+    def _push_limited(self, heap, item, limit):
+        if len(heap) < limit:
+            heapq.heappush(heap, item)
+        elif item[0] > heap[0][0]:
+            heapq.heapreplace(heap, item)
+
+    def consider(self, candidate):
+        self.valid_seen += 1
+        self._counter += 1
+
+        quality = self._quality_desirability(candidate)
+        self._push_limited(
+            self.quality_heap,
+            (quality, self._counter, candidate),
+            QUALITY_KEEP,
+        )
+
+        # Deterministic diversity sample across the ENTIRE legal
+        # FV range. V1 incorrectly restricted this reservoir to
+        # min_fv >= 3000, which could starve unequal-cardinality cells
+        # of legal 2500-2999 pieces needed for global feasibility.
+        self._push_limited(
+            self.hash_heap,
+            (-candidate.stable_hash, self._counter, candidate),
+            HASH_DIVERSITY_KEEP,
+        )
+
+        for pos in candidate.position_set:
+            self._push_limited(
+                self.position_heaps[pos],
+                (quality, self._counter, candidate),
+                POSITION_KEEP,
+            )
+
+        # Guarantee broad player representation inside every design
+        # cell. This does not alter any scientific gate; it only keeps
+        # the global optimizer from seeing a premium-player monoculture.
+        for key in candidate.player_keys:
+            self._push_limited(
+                self.player_heaps[key],
+                (quality, self._counter, candidate),
+                PLAYER_KEEP,
+            )
+
+    def retained(self):
+        by_sig = {}
+
+        sources = [self.quality_heap, self.hash_heap]
+        sources.extend(self.position_heaps.values())
+        sources.extend(self.player_heaps.values())
+
+        for heap in sources:
+            for _, _, candidate in heap:
+                prior = by_sig.get(candidate.signature)
+                if prior is None or (
+                    candidate.quality_key < prior.quality_key
+                ):
+                    by_sig[candidate.signature] = candidate
+
+        rows = list(by_sig.values())
+        rows.sort(key=lambda c: c.quality_key)
+
+        if len(rows) < MIN_CELL_RETAINED:
+            raise RuntimeError(
+                f"Cell {self.cell} retained only {len(rows)} "
+                f"candidates from {self.valid_seen} valid pairs"
+            )
+        return rows
+
+
+def classify_bands(abs_contrast, bands):
+    return [
+        band
+        for band, (lo, hi) in bands.items()
+        if abs_contrast >= float(lo) - 1e-12
+        and abs_contrast <= float(hi) + 1e-12
+    ]
+
+
+def generate_cell_candidates(
+    pools,
+    design,
+    old_signatures,
+):
+    bands = design["contrast_bands"]
+
+    needed_cells = set()
+    for topology, cells in SLOT_CELLS.items():
+        for cell in cells:
+            direction, band = cell.split("_", 1)
+            needed_cells.add((topology, direction, band))
+
+    retainers = {
+        cell: Retainer(":".join(cell))
+        for cell in sorted(needed_cells)
+    }
+
+    rejection = Counter()
+    topology_pair_counts = Counter()
+
+    for topology in SLOT_CELLS:
+        a_size, b_size = map(int, topology.split("v"))
+        side_a_pool = pools[a_size]
+        side_b_pool = pools[b_size]
+        b_sums = [s.raw_sum for s in side_b_pool]
+
+        for side_a in side_a_pool:
+            lo = bisect.bisect_left(
+                b_sums,
+                0.92 * side_a.raw_sum,
+            )
+            hi = bisect.bisect_right(
+                b_sums,
+                side_a.raw_sum / 0.92,
+            )
+
+            keys_a = set(side_a.keys)
+
+            for side_b in side_b_pool[lo:hi]:
+                if keys_a.intersection(side_b.keys):
+                    rejection["player_on_both_sides"] += 1
+                    continue
+
+                signature = canonical_trade_signature(
+                    side_a.keys,
+                    side_b.keys,
+                )
+                if signature in old_signatures:
+                    rejection["exact_v7_challenge_overlap"] += 1
+                    continue
+
+                ratio = min(
+                    side_a.raw_sum,
+                    side_b.raw_sum,
+                ) / max(
+                    side_a.raw_sum,
+                    side_b.raw_sum,
+                )
+                if ratio < 0.92 - 1e-12:
+                    rejection["raw_ratio_below_092"] += 1
+                    continue
+
+                contrast = (
+                    side_a.apex_excess_share
+                    - side_b.apex_excess_share
+                )
+                if abs(contrast) < 1e-15:
+                    rejection["zero_concentration_direction"] += 1
+                    continue
+
+                direction = "A" if contrast > 0 else "B"
+                matched_bands = classify_bands(
+                    abs(contrast),
+                    bands,
+                )
+                if not matched_bands:
+                    rejection["outside_contrast_bands"] += 1
+                    continue
+
+                all_players = (
+                    list(side_a.players)
+                    + list(side_b.players)
+                )
+                min_fv = min(
+                    int(p["fv"]) for p in all_players
+                )
+                below_3000 = sum(
+                    int(p["fv"]) < 3000
+                    for p in all_players
+                )
+                lower_apex = min(
+                    side_a.apex_fv,
+                    side_b.apex_fv,
+                )
+                position_set = tuple(
+                    sorted({p["pos"] for p in all_players})
+                )
+                player_keys = tuple(
+                    sorted(p["key"] for p in all_players)
+                )
+
+                for band in matched_bands:
+                    cell = (topology, direction, band)
+                    if cell not in retainers:
+                        continue
+
+                    contrast_distance_int = round(
+                        abs(
+                            abs(contrast)
+                            - BAND_TARGETS[band]
+                        )
+                        * 1_000_000
+                    )
+                    ratio_distance_int = round(
+                        abs(ratio - 0.97) * 1_000_000
+                    )
+
+                    quality_key = (
+                        -min_fv,
+                        below_3000,
+                        -lower_apex,
+                        contrast_distance_int,
+                        ratio_distance_int,
+                        signature,
+                    )
+
+                    candidate = Candidate(
+                        topology=topology,
+                        direction=direction,
+                        band=band,
+                        side_a=side_a,
+                        side_b=side_b,
+                        signature=signature,
+                        min_fv=min_fv,
+                        below_3000=below_3000,
+                        lower_apex_fv=lower_apex,
+                        raw_ratio=ratio,
+                        contrast=contrast,
+                        contrast_distance_int=contrast_distance_int,
+                        ratio_distance_int=ratio_distance_int,
+                        position_set=position_set,
+                        player_keys=player_keys,
+                        quality_key=quality_key,
+                        stable_hash=stable_hash_int(
+                            f"{topology}|{direction}|{band}|"
+                            f"{signature}"
+                        ),
+                    )
+
+                    retainers[cell].consider(candidate)
+                    topology_pair_counts[topology] += 1
+
+    retained = {
+        cell: retainer.retained()
+        for cell, retainer in retainers.items()
+    }
+
+    diagnostics = {
+        "valid_seen_by_cell": {
+            ":".join(cell): retainers[cell].valid_seen
+            for cell in sorted(retainers)
+        },
+        "retained_by_cell": {
+            ":".join(cell): len(retained[cell])
+            for cell in sorted(retained)
+        },
+        "retained_unique_players_by_cell": {
+            ":".join(cell): len({
+                key
+                for candidate in retained[cell]
+                for key in candidate.player_keys
+            })
+            for cell in sorted(retained)
+        },
+        "retained_min_fv_range_by_cell": {
+            ":".join(cell): [
+                min(c.min_fv for c in retained[cell]),
+                max(c.min_fv for c in retained[cell]),
+            ]
+            for cell in sorted(retained)
+        },
+        "retention_contract": {
+            "quality_keep": QUALITY_KEEP,
+            "hash_diversity_keep_all_legal_fv": HASH_DIVERSITY_KEEP,
+            "position_keep": POSITION_KEEP,
+            "player_keep": PLAYER_KEEP,
+            "minimum_retained_per_cell": MIN_CELL_RETAINED,
+        },
+        "pair_rejection_counts": dict(rejection),
+        "topology_band_memberships_seen":
+            dict(topology_pair_counts),
+    }
+    return retained, diagnostics
+
+
+def make_slots():
+    slots = []
+    slot_id = 0
+    for topology, cells in SLOT_CELLS.items():
+        for cell in cells:
+            direction, band = cell.split("_", 1)
+            slots.append(
+                {
+                    "slot_index": slot_id,
+                    "topology": topology,
+                    "direction": direction,
+                    "band": band,
+                }
+            )
+            slot_id += 1
+    assert len(slots) == 40
+    return slots
+
+
+class GlobalSolver:
+    def __init__(self, slots, retained, player_keys, max_player_appearances=2, position_minimum=4):
+        self.slots = slots
+        self.retained = retained
+        self.player_keys = tuple(sorted(player_keys))
+        self.max_player_appearances = int(max_player_appearances)
+        self.position_minimum = int(position_minimum)
+        self.player_index = {
+            key: i for i, key in enumerate(self.player_keys)
+        }
+
+        self.var_records = []
+        self.slot_vars = defaultdict(list)
+        self.player_vars = defaultdict(list)
+        self.signature_vars = defaultdict(list)
+        self.position_vars = defaultdict(list)
+
+        for slot in slots:
+            cell = (
+                slot["topology"],
+                slot["direction"],
+                slot["band"],
+            )
+            candidates = retained[cell]
+
+            for local_rank, candidate in enumerate(candidates):
+                j = len(self.var_records)
+                self.var_records.append(
+                    {
+                        "slot": slot,
+                        "candidate": candidate,
+                        "local_rank": local_rank,
+                    }
+                )
+                self.slot_vars[slot["slot_index"]].append(j)
+                for key in candidate.player_keys:
+                    self.player_vars[key].append(j)
+                self.signature_vars[
+                    candidate.signature
+                ].append(j)
+                for pos in candidate.position_set:
+                    self.position_vars[pos].append(j)
+
+        self.nx = len(self.var_records)
+        self.u_offset = self.nx
+        self.nvars = self.nx + len(self.player_keys)
+
+        self.rows = []
+        self.lb = []
+        self.ub = []
+
+        self._build_base_constraints()
+
+    def add_row(self, coeffs, lower, upper):
+        self.rows.append(coeffs)
+        self.lb.append(lower)
+        self.ub.append(upper)
+
+    def _build_base_constraints(self):
+        # Exactly one candidate per scientific slot.
+        for slot in self.slots:
+            idxs = self.slot_vars[slot["slot_index"]]
+            self.add_row(
+                {j: 1.0 for j in idxs},
+                1.0,
+                1.0,
+            )
+
+        # Maximum two appearances per player.
+        for key in self.player_keys:
+            idxs = self.player_vars.get(key, [])
+            if idxs:
+                self.add_row(
+                    {j: 1.0 for j in idxs},
+                    -np.inf,
+                    float(self.max_player_appearances),
+                )
+
+        # Same exact trade signature may be selected only once.
+        for signature, idxs in self.signature_vars.items():
+            if len(idxs) > 1:
+                self.add_row(
+                    {j: 1.0 for j in idxs},
+                    -np.inf,
+                    1.0,
+                )
+
+        # At least four challenges containing each position.
+        for pos in POSITIONS:
+            idxs = self.position_vars.get(pos, [])
+            if not idxs:
+                raise RuntimeError(
+                    f"No retained candidate contains {pos}"
+                )
+            if self.position_minimum > 0:
+                self.add_row(
+                    {j: 1.0 for j in idxs},
+                    float(self.position_minimum),
+                    np.inf,
+                )
+
+        # Exact used-player binary links:
+        # usage <= max_player_appearances*u and u <= usage.
+        for key, pidx in self.player_index.items():
+            u = self.u_offset + pidx
+            idxs = self.player_vars.get(key, [])
+
+            coeffs = {j: 1.0 for j in idxs}
+            coeffs[u] = -float(self.max_player_appearances)
+            self.add_row(coeffs, -np.inf, 0.0)
+
+            coeffs = {j: -1.0 for j in idxs}
+            coeffs[u] = 1.0
+            self.add_row(coeffs, -np.inf, 0.0)
+
+    def _constraint(self, extra_rows=()):
+        rows = list(self.rows)
+        lbs = list(self.lb)
+        ubs = list(self.ub)
+
+        for coeffs, lower, upper in extra_rows:
+            rows.append(coeffs)
+            lbs.append(lower)
+            ubs.append(upper)
+
+        rr = []
+        cc = []
+        vv = []
+        for i, coeffs in enumerate(rows):
+            for j, value in coeffs.items():
+                if value:
+                    rr.append(i)
+                    cc.append(j)
+                    vv.append(float(value))
+
+        matrix = coo_matrix(
+            (vv, (rr, cc)),
+            shape=(len(rows), self.nvars),
+        ).tocsr()
+
+        return LinearConstraint(
+            matrix,
+            np.asarray(lbs, dtype=float),
+            np.asarray(ubs, dtype=float),
+        )
+
+    def solve(
+        self,
+        objective,
+        threshold,
+        extra_rows=(),
+        label="solve",
+    ):
+        c = np.zeros(self.nvars, dtype=float)
+
+        if objective is not None:
+            for j, value in objective.items():
+                c[j] = float(value)
+
+        lower = np.zeros(self.nvars, dtype=float)
+        upper = np.ones(self.nvars, dtype=float)
+
+        for j, record in enumerate(self.var_records):
+            if record["candidate"].min_fv < threshold:
+                upper[j] = 0.0
+
+        result = milp(
+            c=c,
+            integrality=np.ones(self.nvars, dtype=int),
+            bounds=Bounds(lower, upper),
+            constraints=self._constraint(extra_rows),
+            options={
+                "time_limit": SOLVER_TIME_LIMIT_SECONDS,
+                "mip_rel_gap": SOLVER_MIP_REL_GAP,
+                "presolve": True,
+            },
+        )
+
+        if not result.success:
+            return None
+
+        selected = [
+            j
+            for j in range(self.nx)
+            if result.x[j] > 0.5
+        ]
+        if len(selected) != 40:
+            raise RuntimeError(
+                f"{label}: expected 40 selected variables, "
+                f"got {len(selected)}"
+            )
+
+        used_players = [
+            self.player_keys[i]
+            for i in range(len(self.player_keys))
+            if result.x[self.u_offset + i] > 0.5
+        ]
+
+        return {
+            "result": result,
+            "selected": selected,
+            "used_players": used_players,
+        }
+
+    def metric_row(self, metric):
+        coeffs = {}
+        for j, record in enumerate(self.var_records):
+            c = record["candidate"]
+            if metric == "min_fv_sum":
+                value = c.min_fv
+            elif metric == "below_3000":
+                value = c.below_3000
+            elif metric == "lower_apex_sum":
+                value = c.lower_apex_fv
+            elif metric == "contrast_distance":
+                value = c.contrast_distance_int
+            elif metric == "ratio_distance":
+                value = c.ratio_distance_int
+            elif metric == "tie_rank":
+                value = (
+                    record["local_rank"] + 1
+                    + stable_hash_int(
+                        f"{record['slot']['slot_index']}|"
+                        f"{c.signature}"
+                    ) % 1000 / 1000.0
+                )
+            else:
+                raise KeyError(metric)
+            if value:
+                coeffs[j] = float(value)
+        return coeffs
+
+    def used_player_row(self):
+        return {
+            self.u_offset + i: 1.0
+            for i in range(len(self.player_keys))
+        }
+
+    def selected_metric(self, selected, metric):
+        total = 0
+        for j in selected:
+            c = self.var_records[j]["candidate"]
+            if metric == "min_fv_sum":
+                total += c.min_fv
+            elif metric == "below_3000":
+                total += c.below_3000
+            elif metric == "lower_apex_sum":
+                total += c.lower_apex_fv
+            elif metric == "contrast_distance":
+                total += c.contrast_distance_int
+            elif metric == "ratio_distance":
+                total += c.ratio_distance_int
+            else:
+                raise KeyError(metric)
+        return int(total)
+
+
+def optimize_catalog(slots, retained, eligible):
+    solver = GlobalSolver(
+        slots,
+        retained,
+        [p["key"] for p in eligible],
+    )
+
+    thresholds = sorted(
+        {
+            record["candidate"].min_fv
+            for record in solver.var_records
+        }
+    )
+    if 2500 not in thresholds:
+        thresholds.insert(0, 2500)
+
+    # Frozen priority #3 is the catalog-wide minimum asset FV.
+    # Prove its global optimum directly with monotone feasibility
+    # searches. A zero-objective MILP only needs to find one valid
+    # 40-trade catalog at a threshold; any feasible solution is
+    # already optimal for that feasibility problem.
+    lo = 0
+    hi = len(thresholds) - 1
+    best_threshold = None
+    best_solution = None
+    threshold_trials = []
+
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        threshold = thresholds[mid]
+
+        solved = solver.solve(
+            objective=None,
+            threshold=threshold,
+            label=f"threshold_{threshold}",
+        )
+        feasible = solved is not None
+        threshold_trials.append(
+            {
+                "threshold": threshold,
+                "feasible": feasible,
+            }
+        )
+
+        if feasible:
+            best_threshold = threshold
+            best_solution = solved
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    if best_threshold is None or best_solution is None:
+        diagnostics = {
+            "exact_max2_position4": False,
+            "max3_position4": GlobalSolver(
+                slots, retained, [p["key"] for p in eligible],
+                max_player_appearances=3, position_minimum=4,
+            ).solve(
+                objective=None,
+                threshold=2500,
+                label="diagnostic_max3",
+            ) is not None,
+            "max2_no_position_minimum": GlobalSolver(
+                slots, retained, [p["key"] for p in eligible],
+                max_player_appearances=2, position_minimum=0,
+            ).solve(
+                objective=None,
+                threshold=2500,
+                label="diagnostic_no_position",
+            ) is not None,
+            "retained_candidates_by_cell": {
+                ":".join(cell): len(rows)
+                for cell, rows in sorted(retained.items())
+            },
+            "retained_unique_players_by_cell": {
+                ":".join(cell): len(
+                    {
+                        key
+                        for c in rows
+                        for key in c.player_keys
+                    }
+                )
+                for cell, rows in sorted(retained.items())
+            },
+        }
+        raise RuntimeError(
+            "No feasible 40-trade catalog under frozen "
+            "max-2 constraints. "
+            + json.dumps(diagnostics, sort_keys=True)
+        )
+
+    chosen_by_slot = {}
+    for j in best_solution["selected"]:
+        record = solver.var_records[j]
+        slot_id = record["slot"]["slot_index"]
+        if slot_id in chosen_by_slot:
+            raise RuntimeError(
+                f"Duplicate selected slot {slot_id}"
+            )
+        chosen_by_slot[slot_id] = record
+
+    if len(chosen_by_slot) != 40:
+        raise RuntimeError(
+            "Threshold solution did not select all 40 slots"
+        )
+
+    # The V2 implementation added a non-preregistered global
+    # "maximize SUM of minimum asset FVs" stage after already
+    # proving the highest catalog-wide minimum-FV threshold. That
+    # extra equality lock made every later MILP dramatically
+    # harder and is unnecessary for the frozen selection priority.
+    #
+    # From this point forward, keep the globally optimal threshold
+    # fixed and apply the remaining frozen priorities using a
+    # deterministic local lexicographic improvement pass. Every
+    # accepted move:
+    #   * stays in the same frozen design cell,
+    #   * keeps min FV >= the globally optimal threshold,
+    #   * preserves max two appearances/player,
+    #   * preserves no duplicate trade signatures,
+    #   * preserves >=4 challenge coverage for every position,
+    #   * never worsens any earlier secondary priority.
+    #
+    # No claim of global optimality is made for secondary
+    # aesthetics; the human review gate remains mandatory.
+
+    def tie_component(record):
+        candidate = record["candidate"]
+        return (
+            (record["local_rank"] + 1) * 1000
+            + stable_hash_int(
+                f"{record['slot']['slot_index']}|"
+                f"{candidate.signature}"
+            ) % 1000
+        )
+
+    appearance = Counter()
+    signatures = set()
+    position_coverage = Counter()
+
+    for record in chosen_by_slot.values():
+        candidate = record["candidate"]
+        signatures.add(candidate.signature)
+        for key in candidate.player_keys:
+            appearance[key] += 1
+        for pos in candidate.position_set:
+            position_coverage[pos] += 1
+
+    if max(appearance.values()) > 2:
+        raise RuntimeError(
+            "Initial threshold solution violates appearance cap"
+        )
+    if any(position_coverage[pos] < 4 for pos in POSITIONS):
+        raise RuntimeError(
+            "Initial threshold solution violates position coverage"
+        )
+    if len(signatures) != 40:
+        raise RuntimeError(
+            "Initial threshold solution has duplicate signatures"
+        )
+
+    def metric_snapshot(chosen):
+        rows = list(chosen.values())
+        return {
+            "below_3000": sum(
+                r["candidate"].below_3000
+                for r in rows
+            ),
+            "lower_apex_sum": sum(
+                r["candidate"].lower_apex_fv
+                for r in rows
+            ),
+            "unique_players": len(
+                {
+                    key
+                    for r in rows
+                    for key in r["candidate"].player_keys
+                }
+            ),
+            "contrast_distance": sum(
+                r["candidate"].contrast_distance_int
+                for r in rows
+            ),
+            "ratio_distance": sum(
+                r["candidate"].ratio_distance_int
+                for r in rows
+            ),
+            "tie_rank": sum(
+                tie_component(r)
+                for r in rows
+            ),
+        }
+
+    def lex_key(snapshot):
+        # Lower tuple is better.
+        return (
+            snapshot["below_3000"],
+            -snapshot["lower_apex_sum"],
+            -snapshot["unique_players"],
+            snapshot["contrast_distance"],
+            snapshot["ratio_distance"],
+            snapshot["tie_rank"],
+        )
+
+    initial_metrics = metric_snapshot(chosen_by_slot)
+    current_metrics = dict(initial_metrics)
+    current_key = lex_key(current_metrics)
+
+    # Pre-sort all slot alternatives once. The ordering is fully
+    # deterministic and intentionally follows the frozen secondary
+    # priorities before the final signature/hash tie-break.
+    alternatives = {}
+    for slot in slots:
+        slot_id = slot["slot_index"]
+        rows = []
+        for j in solver.slot_vars[slot_id]:
+            record = solver.var_records[j]
+            c = record["candidate"]
+            if c.min_fv < best_threshold:
+                continue
+            rows.append(record)
+        rows.sort(
+            key=lambda r: (
+                r["candidate"].below_3000,
+                -r["candidate"].lower_apex_fv,
+                r["candidate"].contrast_distance_int,
+                r["candidate"].ratio_distance_int,
+                tie_component(r),
+                r["candidate"].signature,
+            )
+        )
+        if not rows:
+            raise RuntimeError(
+                f"No alternatives remain for slot {slot_id} "
+                f"at threshold {best_threshold}"
+            )
+        alternatives[slot_id] = rows
+
+    accepted_moves = []
+    passes = 0
+    max_passes = 200
+
+    while passes < max_passes:
+        passes += 1
+        best_move = None
+        best_move_key = current_key
+        best_move_metrics = None
+
+        for slot in slots:
+            slot_id = slot["slot_index"]
+            old_record = chosen_by_slot[slot_id]
+            old = old_record["candidate"]
+
+            for new_record in alternatives[slot_id]:
+                if new_record is old_record:
+                    continue
+                new = new_record["candidate"]
+
+                if (
+                    new.signature in signatures
+                    and new.signature != old.signature
+                ):
+                    continue
+
+                involved = set(old.player_keys) | set(
+                    new.player_keys
+                )
+                new_unique = current_metrics[
+                    "unique_players"
+                ]
+                valid = True
+
+                for key in involved:
+                    before = appearance.get(key, 0)
+                    after = (
+                        before
+                        - (1 if key in old.player_keys else 0)
+                        + (1 if key in new.player_keys else 0)
+                    )
+                    if after < 0 or after > 2:
+                        valid = False
+                        break
+                    if before == 0 and after > 0:
+                        new_unique += 1
+                    elif before > 0 and after == 0:
+                        new_unique -= 1
+
+                if not valid:
+                    continue
+
+                all_positions = set(
+                    old.position_set
+                ) | set(new.position_set)
+                for pos in all_positions:
+                    after = (
+                        position_coverage[pos]
+                        - (1 if pos in old.position_set else 0)
+                        + (1 if pos in new.position_set else 0)
+                    )
+                    if after < 4:
+                        valid = False
+                        break
+
+                if not valid:
+                    continue
+
+                proposed = {
+                    "below_3000":
+                        current_metrics["below_3000"]
+                        - old.below_3000
+                        + new.below_3000,
+                    "lower_apex_sum":
+                        current_metrics["lower_apex_sum"]
+                        - old.lower_apex_fv
+                        + new.lower_apex_fv,
+                    "unique_players": new_unique,
+                    "contrast_distance":
+                        current_metrics["contrast_distance"]
+                        - old.contrast_distance_int
+                        + new.contrast_distance_int,
+                    "ratio_distance":
+                        current_metrics["ratio_distance"]
+                        - old.ratio_distance_int
+                        + new.ratio_distance_int,
+                    "tie_rank":
+                        current_metrics["tie_rank"]
+                        - tie_component(old_record)
+                        + tie_component(new_record),
+                }
+                proposed_key = lex_key(proposed)
+
+                if proposed_key < best_move_key:
+                    best_move_key = proposed_key
+                    best_move_metrics = proposed
+                    best_move = (
+                        slot_id,
+                        old_record,
+                        new_record,
+                    )
+                elif (
+                    proposed_key == best_move_key
+                    and best_move is not None
+                ):
+                    # Explicit deterministic tie resolution.
+                    candidate_tie = (
+                        slot_id,
+                        new.signature,
+                    )
+                    incumbent_tie = (
+                        best_move[0],
+                        best_move[2]["candidate"].signature,
+                    )
+                    if candidate_tie < incumbent_tie:
+                        best_move_metrics = proposed
+                        best_move = (
+                            slot_id,
+                            old_record,
+                            new_record,
+                        )
+
+        if best_move is None:
+            break
+
+        slot_id, old_record, new_record = best_move
+        old = old_record["candidate"]
+        new = new_record["candidate"]
+
+        signatures.remove(old.signature)
+        signatures.add(new.signature)
+
+        for key in set(old.player_keys) | set(
+            new.player_keys
+        ):
+            appearance[key] = (
+                appearance.get(key, 0)
+                - (1 if key in old.player_keys else 0)
+                + (1 if key in new.player_keys else 0)
+            )
+            if appearance[key] == 0:
+                del appearance[key]
+
+        for pos in set(old.position_set) | set(
+            new.position_set
+        ):
+            position_coverage[pos] = (
+                position_coverage[pos]
+                - (1 if pos in old.position_set else 0)
+                + (1 if pos in new.position_set else 0)
+            )
+
+        chosen_by_slot[slot_id] = new_record
+        current_metrics = best_move_metrics
+        current_key = best_move_key
+        accepted_moves.append(
+            {
+                "pass": passes,
+                "slot_index": slot_id,
+                "old_signature": old.signature,
+                "new_signature": new.signature,
+                "metrics_after": dict(
+                    current_metrics
+                ),
+            }
+        )
+
+    if passes >= max_passes:
+        raise RuntimeError(
+            "Deterministic local improvement exceeded pass cap"
+        )
+
+    # Final hard-constraint proof after secondary improvement.
+    final_appearance = Counter()
+    final_signatures = set()
+    final_position_coverage = Counter()
+    for record in chosen_by_slot.values():
+        c = record["candidate"]
+        if c.min_fv < best_threshold:
+            raise RuntimeError(
+                "Secondary improvement violated global "
+                "minimum-FV threshold"
+            )
+        if c.signature in final_signatures:
+            raise RuntimeError(
+                "Secondary improvement created duplicate trade"
+            )
+        final_signatures.add(c.signature)
+        for key in c.player_keys:
+            final_appearance[key] += 1
+        for pos in c.position_set:
+            final_position_coverage[pos] += 1
+
+    if max(final_appearance.values()) > 2:
+        raise RuntimeError(
+            "Secondary improvement violated appearance cap"
+        )
+    if any(
+        final_position_coverage[pos] < 4
+        for pos in POSITIONS
+    ):
+        raise RuntimeError(
+            "Secondary improvement violated position coverage"
+        )
+
+    final_metrics = metric_snapshot(chosen_by_slot)
+    if lex_key(final_metrics) > lex_key(initial_metrics):
+        raise RuntimeError(
+            "Secondary selection worsened frozen priority tuple"
+        )
+
+    stage_results = [
+        {
+            "stage":
+                "maximize_catalog_wide_minimum_asset_fv",
+            "method":
+                "exact_monotone_milp_feasibility",
+            "optimum": best_threshold,
+            "optimality_proven": True,
+            "threshold_trials": threshold_trials,
+        },
+        {
+            "stage":
+                "apply_remaining_frozen_selection_priorities",
+            "method":
+                "deterministic_single_slot_lexicographic_improvement",
+            "global_optimality_claimed": False,
+            "initial_metrics": initial_metrics,
+            "final_metrics": final_metrics,
+            "accepted_moves": len(
+                accepted_moves
+            ),
+            "passes": passes,
+            "priority_order": [
+                "minimize_assets_below_3000",
+                "maximize_lower_side_apex_fv",
+                "maximize_unique_players_minimize_reuse",
+                "minimize_concentration_target_distance",
+                "minimize_raw_ratio_target_distance",
+                "deterministic_signature_tie_break",
+            ],
+        },
+    ]
+
+    return {
+        "best_threshold": best_threshold,
+        "threshold_trials": threshold_trials,
+        "stage_results": stage_results,
+        "chosen_by_slot": chosen_by_slot,
+        "candidate_variable_count": solver.nx,
+        "binary_variable_count": solver.nvars,
+        "base_constraint_count": len(solver.rows),
+        "retained_candidate_count_by_slot": {
+            str(slot["slot_index"]): len(
+                solver.slot_vars[slot["slot_index"]]
+            )
+            for slot in slots
+        },
+        "secondary_selection": {
+            "method":
+                "deterministic_single_slot_lexicographic_improvement",
+            "initial_metrics": initial_metrics,
+            "final_metrics": final_metrics,
+            "accepted_moves": accepted_moves,
+            "global_secondary_optimality_claimed":
+                False,
+        },
+    }
+
+
+def side_json(side: Side):
+    return {
+        "asset_count": len(side.players),
+        "assets": [dict(p) for p in side.players],
+        "raw_fv": side.raw_sum,
+        "apex_fv": side.apex_fv,
+        "minimum_asset_fv": side.min_fv,
+        "minimum_asset_share": round(
+            side.min_share, 9
+        ),
+        "top_asset_share": round(
+            side.top_share, 9
+        ),
+        "apex_excess_share": round(
+            side.apex_excess_share, 9
+        ),
+        "hhi": round(side.hhi, 9),
+    }
+
+
+def voter_safe_side(side: Side):
+    return {
+        "asset_count": len(side.players),
+        "assets": [
+            {
+                "key": p["key"],
+                "name": p["name"],
+                "pos": p["pos"],
+                "team": p["team"],
+            }
+            for p in side.players
+        ],
+    }
+
+
+def quantile(sorted_values, q):
+    if not sorted_values:
+        return None
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    pos = q * (len(sorted_values) - 1)
+    lo = math.floor(pos)
+    hi = math.ceil(pos)
+    if lo == hi:
+        return sorted_values[lo]
+    frac = pos - lo
+    return (
+        sorted_values[lo] * (1 - frac)
+        + sorted_values[hi] * frac
+    )
+
+
+def scan_forbidden_voter_keys(value, path="root"):
+    forbidden = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            lowered = str(key).lower()
+            if (
+                "fv" in lowered
+                or "score" in lowered
+                or "prediction" in lowered
+                or "concentration" in lowered
+                or "contrast" in lowered
+                or "ratio" in lowered
+                or "apex" in lowered
+                or "hhi" in lowered
+            ):
+                forbidden.append(f"{path}.{key}")
+            forbidden.extend(
+                scan_forbidden_voter_keys(
+                    child,
+                    f"{path}.{key}",
+                )
+            )
+    elif isinstance(value, list):
+        for i, child in enumerate(value):
+            forbidden.extend(
+                scan_forbidden_voter_keys(
+                    child,
+                    f"{path}[{i}]",
+                )
+            )
+    return forbidden
+
+
+def build_outputs(output_dir: Path):
+    prereg = load_json(PREREG)
+    power = load_json(POWER)
+    design = load_json(DESIGN)
+    feasibility = load_json(FEAS)
+    amendment = load_json(AMENDMENT)
+    amendment_manifest = load_json(AMENDMENT_MANIFEST)
+    snapshot = load_json(SNAPSHOT)
+    v7_catalog = load_json(V7_CATALOG)
+
+    if prereg["study_id"] != design["study_id"]:
+        raise RuntimeError("Study ID mismatch")
+    if design["status"] != "FROZEN_PRE_CATALOG_PRE_VOTE":
+        raise RuntimeError("Catalog design not frozen")
+    if feasibility["status"] != "PASS":
+        raise RuntimeError("Design feasibility not green")
+    if power["selected_first_checkpoint_distinct_voters"] != 44:
+        raise RuntimeError("Unexpected original power checkpoint")
+    if amendment["status"] != "FROZEN_PRE_CATALOG_PRE_VOTE_FIXED_50":
+        raise RuntimeError("Fixed-50 amendment is not frozen")
+    maturity = amendment["amended_development_maturity"]
+    if maturity["required_accepted_complete_voters"] != 50:
+        raise RuntimeError("Fixed-50 accepted-voter requirement drift")
+    if maturity["required_distinct_voters_per_challenge"] != 50:
+        raise RuntimeError("Fixed-50 per-challenge requirement drift")
+    if maturity["required_accepted_ballots"] != 2000:
+        raise RuntimeError("Fixed-50 ballot requirement drift")
+    if amendment_manifest["v8_votes_read"] is not False:
+        raise RuntimeError("Amendment unexpectedly read V8 votes")
+
+    eligible = [
+        dict(p)
+        for p in snapshot["players"]
+        if int(p["fv"]) >= 2500
+        and p.get("team") not in (None, "")
+        and str(p["key"]).lower() != "joe mixon"
+    ]
+    eligible.sort(
+        key=lambda p: (int(p["fv"]), p["key"])
+    )
+    if len(eligible) != 284:
+        raise RuntimeError(
+            f"Expected 284 realism-eligible players; "
+            f"found {len(eligible)}"
+        )
+
+    pools = {}
+    side_rejections = {}
+    for size in (2, 3, 4):
+        pools[size], side_rejections[size] = (
+            build_side_pool(eligible, size)
+        )
+
+    expected_pool_counts = {
+        2: 1545,
+        3: 2422,
+        4: 2470,
+    }
+    actual_pool_counts = {
+        size: len(rows)
+        for size, rows in pools.items()
+    }
+    if actual_pool_counts != expected_pool_counts:
+        raise RuntimeError(
+            "Phase 1B side-pool reproduction drift: "
+            f"expected={expected_pool_counts} "
+            f"actual={actual_pool_counts}"
+        )
+
+    old_signatures = {
+        challenge_signature(c)
+        for c in v7_catalog["challenges"]
+    }
+    if len(old_signatures) != 40:
+        raise RuntimeError(
+            "V7 challenge signatures are not unique"
+        )
+
+    retained, generation_diagnostics = (
+        generate_cell_candidates(
+            pools,
+            design,
+            old_signatures,
+        )
+    )
+
+    slots = make_slots()
+
+    print(json.dumps({
+        "phase1c_retention_pre_solver": {
+            "retained_by_cell": generation_diagnostics["retained_by_cell"],
+            "retained_unique_players_by_cell": generation_diagnostics["retained_unique_players_by_cell"],
+            "retained_min_fv_range_by_cell": generation_diagnostics["retained_min_fv_range_by_cell"],
+            "retention_contract": generation_diagnostics["retention_contract"],
+        }
+    }, indent=2, sort_keys=True))
+
+    optimized = optimize_catalog(
+        slots,
+        retained,
+        eligible,
+    )
+
+    challenges = []
+    appearance = Counter()
+    position_challenges = Counter()
+    signatures = set()
+    direction_count = Counter()
+    band_count = Counter()
+    topology_count = Counter()
+    cell_count = Counter()
+    occurrence_fvs = []
+    raw_ratios = []
+    side_apex_values = []
+    v7_overlap = []
+
+    for i, slot in enumerate(slots, start=1):
+        record = optimized["chosen_by_slot"][
+            slot["slot_index"]
+        ]
+        c = record["candidate"]
+
+        if c.signature in signatures:
+            raise RuntimeError(
+                f"Duplicate selected trade signature: "
+                f"{c.signature}"
+            )
+        signatures.add(c.signature)
+
+        if c.signature in old_signatures:
+            v7_overlap.append(c.signature)
+
+        challenge_id = f"pkgv8dev_{i:03d}"
+
+        challenge = {
+            "schema_version": 1,
+            "id": challenge_id,
+            "experiment":
+                "package_adjustment_v8_topology_split_development",
+            "topology": c.topology,
+            "primary_concentration_metric":
+                "apex_excess_share",
+            "primary_concentration_direction": c.direction,
+            "primary_contrast_band": c.band,
+            "side_A": side_json(c.side_a),
+            "side_B": side_json(c.side_b),
+            "apex_excess_share_difference_A_minus_B":
+                round(c.contrast, 9),
+            "raw_sum_ratio_min_over_max":
+                round(c.raw_ratio, 9),
+            "minimum_asset_fv": c.min_fv,
+            "lower_side_apex_fv":
+                c.lower_apex_fv,
+            "players_below_3000":
+                c.below_3000,
+            "candidate_prediction_used_for_selection":
+                False,
+            "candidate_score_used_for_selection":
+                False,
+            "fv_visible_to_voter": False,
+            "display_side_randomization_required":
+                True,
+        }
+        challenges.append(challenge)
+
+        all_players = (
+            list(c.side_a.players)
+            + list(c.side_b.players)
+        )
+        for p in all_players:
+            appearance[p["key"]] += 1
+            occurrence_fvs.append(int(p["fv"]))
+        for pos in {p["pos"] for p in all_players}:
+            position_challenges[pos] += 1
+
+        direction_count[c.direction] += 1
+        band_count[c.band] += 1
+        topology_count[c.topology] += 1
+        cell_count[
+            f"{c.topology}:{c.direction}_{c.band}"
+        ] += 1
+        raw_ratios.append(c.raw_ratio)
+        side_apex_values.extend(
+            [c.side_a.apex_fv, c.side_b.apex_fv]
+        )
+
+    occurrence_fvs.sort()
+    raw_ratios.sort()
+
+    # Exact frozen design checks.
+    assert len(challenges) == 40
+    assert topology_count == Counter(
+        design["topology_counts"]
+    )
+    assert direction_count == Counter(
+        {"A": 20, "B": 20}
+    )
+    assert max(appearance.values()) <= 2
+    assert all(
+        position_challenges[pos] >= 4
+        for pos in POSITIONS
+    )
+    assert not v7_overlap
+
+    for challenge in challenges:
+        topology = challenge["topology"]
+        a = challenge["side_A"]
+        b = challenge["side_B"]
+
+        assets = a["assets"] + b["assets"]
+        assert all(
+            int(p["fv"]) >= 2500
+            for p in assets
+        )
+        assert all(
+            p.get("team") not in (None, "")
+            for p in assets
+        )
+        assert all(
+            p["key"] != "joe mixon"
+            for p in assets
+        )
+        if topology == "2v2":
+            assert all(
+                int(p["fv"]) >= 3000
+                for p in assets
+            )
+
+        assert a["apex_fv"] >= 4000
+        assert b["apex_fv"] >= 4000
+        assert a["minimum_asset_share"] >= 0.10 - 1e-9
+        assert b["minimum_asset_share"] >= 0.10 - 1e-9
+        assert (
+            challenge["raw_sum_ratio_min_over_max"]
+            >= 0.92 - 1e-9
+        )
+
+        size_a, size_b = map(
+            int,
+            topology.split("v"),
+        )
+        assert a["raw_fv"] >= SIDE_MIN_TOTAL[size_a]
+        assert b["raw_fv"] >= SIDE_MIN_TOTAL[size_b]
+
+        diff = (
+            a["apex_excess_share"]
+            - b["apex_excess_share"]
+        )
+        expected_direction = "A" if diff > 0 else "B"
+        assert expected_direction == (
+            challenge[
+                "primary_concentration_direction"
+            ]
+        )
+
+        lo, hi = design["contrast_bands"][
+            challenge["primary_contrast_band"]
+        ]
+        assert abs(diff) >= float(lo) - 2e-9
+        assert abs(diff) <= float(hi) + 2e-9
+
+    voter_safe = {
+        "schema_version": 1,
+        "study_id": design["study_id"],
+        "stage":
+            "phase1c_voter_safe_development_catalog",
+        "status":
+            "FROZEN_REVIEW_REQUIRED_NOT_ACTIVATED",
+        "challenge_count": 40,
+        "display_side_randomization_required":
+            True,
+        "challenge_order_randomization_required":
+            True,
+        "voting_activated": False,
+        "review_required_before_activation": True,
+        "challenges": [
+            {
+                "schema_version": 1,
+                "id": c["id"],
+                "experiment": c["experiment"],
+                "topology": c["topology"],
+                "side_A": voter_safe_side(
+                    optimized["chosen_by_slot"][
+                        slots[i]["slot_index"]
+                    ]["candidate"].side_a
+                ),
+                "side_B": voter_safe_side(
+                    optimized["chosen_by_slot"][
+                        slots[i]["slot_index"]
+                    ]["candidate"].side_b
+                ),
+            }
+            for i, c in enumerate(challenges)
+        ],
+    }
+
+    forbidden_voter_keys = scan_forbidden_voter_keys(
+        voter_safe
+    )
+    if forbidden_voter_keys:
+        raise RuntimeError(
+            "Voter-safe catalog leaks hidden model/value "
+            f"fields: {forbidden_voter_keys[:10]}"
+        )
+
+    unique_players = len(appearance)
+    repeated_players = sorted(
+        key
+        for key, count in appearance.items()
+        if count == 2
+    )
+    below_3000_occurrences = sum(
+        x < 3000 for x in occurrence_fvs
+    )
+
+    audit = {
+        "schema_version": 1,
+        "study_id": design["study_id"],
+        "stage":
+            "phase1c_development_catalog_audit",
+        "status":
+            "PASS_REVIEW_REQUIRED_BEFORE_VOTING",
+        "generated_at_utc":
+            os.environ["CATALOG_GENERATED_AT_UTC"],
+        "all_hard_gates_pass": True,
+        "challenge_count": 40,
+        "topology_counts": dict(topology_count),
+        "direction_counts": dict(direction_count),
+        "band_counts": dict(band_count),
+        "cell_counts": dict(cell_count),
+        "catalog_value_distribution": {
+            "asset_occurrences":
+                len(occurrence_fvs),
+            "minimum_fv":
+                min(occurrence_fvs),
+            "p10_fv":
+                quantile(occurrence_fvs, 0.10),
+            "p25_fv":
+                quantile(occurrence_fvs, 0.25),
+            "median_fv":
+                quantile(occurrence_fvs, 0.50),
+            "p75_fv":
+                quantile(occurrence_fvs, 0.75),
+            "p90_fv":
+                quantile(occurrence_fvs, 0.90),
+            "maximum_fv":
+                max(occurrence_fvs),
+            "occurrences_below_3000":
+                below_3000_occurrences,
+        },
+        "trade_quality": {
+            "catalog_wide_minimum_asset_fv":
+                min(occurrence_fvs),
+            "minimum_2v2_asset_fv": min(
+                int(p["fv"])
+                for c in challenges
+                if c["topology"] == "2v2"
+                for side in ("side_A", "side_B")
+                for p in c[side]["assets"]
+            ),
+            "minimum_side_apex_fv":
+                min(side_apex_values),
+            "minimum_raw_sum_ratio":
+                min(raw_ratios),
+            "median_raw_sum_ratio":
+                quantile(raw_ratios, 0.50),
+            "team_null_count": sum(
+                p.get("team") in (None, "")
+                for c in challenges
+                for side in ("side_A", "side_B")
+                for p in c[side]["assets"]
+            ),
+            "joe_mixon_occurrences":
+                appearance.get("joe mixon", 0),
+        },
+        "reuse": {
+            "unique_players": unique_players,
+            "repeated_player_count":
+                len(repeated_players),
+            "repeated_players":
+                repeated_players,
+            "maximum_player_appearances":
+                max(appearance.values()),
+            "appearance_counts":
+                dict(sorted(appearance.items())),
+        },
+        "position_challenge_coverage":
+            {
+                pos: position_challenges[pos]
+                for pos in POSITIONS
+            },
+        "freshness": {
+            "exact_v7_trade_overlap_count":
+                len(v7_overlap),
+            "exact_v7_trade_overlaps":
+                v7_overlap,
+        },
+        "voter_blinding": {
+            "fv_visible_to_voter": False,
+            "forbidden_hidden_key_count":
+                len(forbidden_voter_keys),
+            "forbidden_hidden_keys":
+                forbidden_voter_keys,
+            "display_side_randomization_required":
+                True,
+            "challenge_order_randomization_required":
+                True,
+        },
+        "power_contract": {
+            "original_first_powered_checkpoint": 44,
+            "amended_required_complete_voters": 50,
+            "amended_required_distinct_voters_per_challenge": 50,
+            "amended_required_accepted_ballots": 2000,
+            "early_stop_before_50_allowed": False,
+        },
+        "selection": {
+            "global_minimum_asset_fv_threshold":
+                optimized["best_threshold"],
+            "threshold_trials":
+                optimized["threshold_trials"],
+            "lexicographic_stages":
+                optimized["stage_results"],
+            "candidate_variable_count":
+                optimized["candidate_variable_count"],
+            "binary_variable_count":
+                optimized["binary_variable_count"],
+            "base_constraint_count":
+                optimized["base_constraint_count"],
+            "retained_candidate_count_by_slot":
+                optimized[
+                    "retained_candidate_count_by_slot"
+                ],
+            "candidate_model_prediction_used":
+                False,
+            "candidate_model_score_used":
+                False,
+            "secondary_selection_method":
+                "deterministic_single_slot_lexicographic_improvement",
+            "global_secondary_optimality_claimed":
+                False,
+        },
+        "generation_diagnostics":
+            generation_diagnostics,
+        "side_pool_counts":
+            {
+                str(k): len(v)
+                for k, v in pools.items()
+            },
+        "side_pool_rejection_counts":
+            side_rejections,
+        "review_gate":
+            "AWAIT_HUMAN_CATALOG_REVIEW_BEFORE_VOTING_ACTIVATION",
+        "voting_activated": False,
+        "production_change_authorized": False,
+    }
+
+    internal_catalog = {
+        "schema_version": 1,
+        "study_id": design["study_id"],
+        "stage":
+            "phase1c_development_catalog",
+        "status":
+            "FROZEN_REVIEW_REQUIRED_NOT_ACTIVATED",
+        "generated_at_utc":
+            os.environ["CATALOG_GENERATED_AT_UTC"],
+        "challenge_count": 40,
+        "frozen": True,
+        "released_to_voters": False,
+        "voting_activated": False,
+        "human_catalog_review_required": True,
+        "fv_visible_to_voter": False,
+        "candidate_predictions_used_for_catalog_selection":
+            False,
+        "candidate_scores_used_for_catalog_selection":
+            False,
+        "primary_concentration_metric":
+            "apex_excess_share",
+        "challenges": challenges,
+        "audit_summary": {
+            "catalog_wide_minimum_asset_fv":
+                audit["trade_quality"][
+                    "catalog_wide_minimum_asset_fv"
+                ],
+            "minimum_2v2_asset_fv":
+                audit["trade_quality"][
+                    "minimum_2v2_asset_fv"
+                ],
+            "minimum_side_apex_fv":
+                audit["trade_quality"][
+                    "minimum_side_apex_fv"
+                ],
+            "occurrences_below_3000":
+                below_3000_occurrences,
+            "unique_players":
+                unique_players,
+            "maximum_player_appearances":
+                max(appearance.values()),
+            "exact_v7_trade_overlap_count":
+                len(v7_overlap),
+            "team_null_count":
+                audit["trade_quality"][
+                    "team_null_count"
+                ],
+        },
+        "source_sha256": {
+            "preregistration": sha256(PREREG),
+            "power_analysis": sha256(POWER),
+            "catalog_design_contract":
+                sha256(DESIGN),
+            "catalog_design_feasibility":
+                sha256(FEAS),
+            "fixed50_protocol_amendment":
+                sha256(AMENDMENT),
+            "fixed50_protocol_amendment_manifest":
+                sha256(AMENDMENT_MANIFEST),
+            "frozen_player_snapshot":
+                sha256(SNAPSHOT),
+            "v7_development_catalog":
+                sha256(V7_CATALOG),
+        },
+    }
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    internal_path = (
+        output_dir / "development_catalog_v1.json"
+    )
+    safe_path = (
+        output_dir
+        / "package_vote_challenges_v8_development_v1.json"
+    )
+    audit_path = (
+        output_dir / "development_catalog_audit_v1.json"
+    )
+
+    internal_path.write_text(
+        json.dumps(
+            internal_catalog,
+            indent=2,
+            sort_keys=True,
+        ) + "\n",
+        encoding="utf-8",
+    )
+    safe_path.write_text(
+        json.dumps(
+            voter_safe,
+            indent=2,
+            sort_keys=True,
+        ) + "\n",
+        encoding="utf-8",
+    )
+    audit_path.write_text(
+        json.dumps(
+            audit,
+            indent=2,
+            sort_keys=True,
+        ) + "\n",
+        encoding="utf-8",
+    )
+
+    review_lines = [
+        "# Package Adjustment V8 — Development Catalog Human Review",
+        "",
+        "**Status:** `PASS_REVIEW_REQUIRED_BEFORE_VOTING`",
+        "",
+        "No voting is active. Review all 40 trades for dynasty-market realism before activation.",
+        "",
+        f"- Global minimum player FV selected: **{audit['trade_quality']['catalog_wide_minimum_asset_fv']}**",
+        f"- 2v2 minimum player FV: **{audit['trade_quality']['minimum_2v2_asset_fv']}**",
+        f"- Player occurrences below 3000 FV: **{below_3000_occurrences}**",
+        f"- Unique players: **{unique_players} / {len(occurrence_fvs)} appearances**",
+        f"- Maximum player appearances: **{max(appearance.values())}**",
+        f"- Exact V7 trade overlap: **{len(v7_overlap)}**",
+        f"- Minimum raw-sum ratio: **{min(raw_ratios):.4f}**",
+        "- Frozen development maturity: **50 complete voters × 40 = 2,000 accepted ballots**",
+        "",
+        "## All 40 trades",
+        "",
+    ]
+
+    for challenge in challenges:
+        def fmt_side(side):
+            return " + ".join(
+                f"{p['name']} ({p['pos']}, {p['team']}, FV {p['fv']})"
+                for p in side["assets"]
+            )
+
+        review_lines.extend(
+            [
+                f"### {challenge['id']} — {challenge['topology']} — "
+                f"{challenge['primary_concentration_direction']}_"
+                f"{challenge['primary_contrast_band']}",
+                "",
+                f"**Side A:** {fmt_side(challenge['side_A'])}",
+                "",
+                f"**Side B:** {fmt_side(challenge['side_B'])}",
+                "",
+                f"Raw FV totals: {challenge['side_A']['raw_fv']} vs "
+                f"{challenge['side_B']['raw_fv']} "
+                f"(ratio {challenge['raw_sum_ratio_min_over_max']:.4f})",
+                "",
+                f"Minimum asset FV: {challenge['minimum_asset_fv']} | "
+                f"Lower side apex FV: {challenge['lower_side_apex_fv']}",
+                "",
+            ]
+        )
+
+    review_lines.extend(
+        [
+            "## Review rule",
+            "",
+            "Approve or reject the catalog as a whole before voting activation. "
+            "If rejected for realism, create a new pre-vote catalog revision under "
+            "the same frozen scientific rules; do not hand-edit individual votes or "
+            "use any vote outcomes.",
+            "",
+        ]
+    )
+
+    review_path = (
+        output_dir / "development_catalog_review_v1.md"
+    )
+    review_path.write_text(
+        "\n".join(review_lines),
+        encoding="utf-8",
+    )
+
+    manifest = {
+        "schema_version": 1,
+        "study_id": design["study_id"],
+        "stage":
+            "phase1c_development_catalog_manifest",
+        "status":
+            "PASS_REVIEW_REQUIRED_BEFORE_VOTING",
+        "generated_at_utc":
+            os.environ["CATALOG_GENERATED_AT_UTC"],
+        "inputs": {
+            "preregistration_git_blob":
+                git_blob(PREREG),
+            "power_analysis_git_blob":
+                git_blob(POWER),
+            "catalog_design_contract_git_blob":
+                git_blob(DESIGN),
+            "catalog_design_feasibility_git_blob":
+                git_blob(FEAS),
+            "fixed50_protocol_amendment_git_blob":
+                git_blob(AMENDMENT),
+            "fixed50_protocol_amendment_manifest_git_blob":
+                git_blob(AMENDMENT_MANIFEST),
+            "frozen_player_snapshot_git_blob":
+                git_blob(SNAPSHOT),
+            "v7_catalog_git_blob":
+                git_blob(V7_CATALOG),
+        },
+        "outputs": {
+            "development_catalog_sha256":
+                sha256(internal_path),
+            "voter_safe_catalog_sha256":
+                sha256(safe_path),
+            "catalog_audit_sha256":
+                sha256(audit_path),
+            "catalog_review_sha256":
+                sha256(review_path),
+        },
+        "challenge_signature_sha256":
+            hashlib.sha256(
+                "\n".join(
+                    challenge_signature(c)
+                    for c in challenges
+                ).encode("utf-8")
+            ).hexdigest(),
+        "challenge_count": 40,
+        "catalog_audit_passed": True,
+        "human_catalog_review_required": True,
+        "voting_activated": False,
+        "v8_votes_read": False,
+        "candidate_fit_performed": False,
+        "candidate_selection_performed": False,
+        "production_change_authorized": False,
+    }
+
+    manifest_path = (
+        output_dir / "development_catalog_manifest_v1.json"
+    )
+    manifest_path.write_text(
+        json.dumps(
+            manifest,
+            indent=2,
+            sort_keys=True,
+        ) + "\n",
+        encoding="utf-8",
+    )
+
+    return {
+        "challenge_signature_sha256":
+            manifest["challenge_signature_sha256"],
+        "audit": audit,
+        "manifest": manifest,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        required=True,
+    )
+    args = parser.parse_args()
+
+    required_time = os.environ.get(
+        "CATALOG_GENERATED_AT_UTC"
+    )
+    if not required_time:
+        raise SystemExit(
+            "CATALOG_GENERATED_AT_UTC must be supplied"
+        )
+
+    result = build_outputs(
+        args.output_dir.resolve()
+    )
+
+    print(
+        json.dumps(
+            {
+                "decision":
+                    "PASS_REVIEW_REQUIRED_BEFORE_VOTING",
+                "challenge_signature_sha256":
+                    result[
+                        "challenge_signature_sha256"
+                    ],
+                "catalog_wide_minimum_asset_fv":
+                    result["audit"][
+                        "trade_quality"
+                    ][
+                        "catalog_wide_minimum_asset_fv"
+                    ],
+                "occurrences_below_3000":
+                    result["audit"][
+                        "catalog_value_distribution"
+                    ][
+                        "occurrences_below_3000"
+                    ],
+                "unique_players":
+                    result["audit"]["reuse"][
+                        "unique_players"
+                    ],
+                "max_player_appearances":
+                    result["audit"]["reuse"][
+                        "maximum_player_appearances"
+                    ],
+                "v7_overlap_count":
+                    result["audit"]["freshness"][
+                        "exact_v7_trade_overlap_count"
+                    ],
+                "voting_activated": False,
+                "production_change_authorized":
+                    False,
+            },
+            indent=2,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
