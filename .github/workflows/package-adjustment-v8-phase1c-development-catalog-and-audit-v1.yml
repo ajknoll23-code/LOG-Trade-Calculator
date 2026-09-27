@@ -1,4 +1,4 @@
-name: Package Adjustment V8 - Phase 1C Development Catalog and Audit V1
+name: Package Adjustment V8 - Phase 1C Development Catalog and Audit V2
 
 on:
   workflow_dispatch:
@@ -60,8 +60,10 @@ jobs:
             "9f75e427c8d182b8e1ac2bf0ef5759a80d7e2b0c"
           test "$(git hash-object "$V8/catalog_design_feasibility_v1.json")" = \
             "f2e6d72d58acea23700807af991f3c0a1103bd05"
-          test -f "$V8/fixed50_protocol_amendment_v1.json"
-          test -f "$V8/fixed50_protocol_amendment_manifest_v1.json"
+          test "$(git hash-object "$V8/fixed50_protocol_amendment_v1.json")" = \
+            "d2b931dc03acee62b10091f064737b125467b705"
+          test "$(git hash-object "$V8/fixed50_protocol_amendment_manifest_v1.json")" = \
+            "bbb41fa5a9ce3d3c95d5d5f808e181ebd64f2ef4"
 
           test "$(git hash-object "$V7/phase1a_player_fv_snapshot_v1.json")" = \
             "945bfb8f504bf62cba46464e1940126fd7a528e8"
@@ -226,10 +228,16 @@ jobs:
               "high": 0.200,
           }
 
-          QUALITY_KEEP = 350
-          HASH_DIVERSITY_KEEP = 200
-          POSITION_KEEP = 30
-          MIN_CELL_RETAINED = 250
+          # Retention is deliberately broad. Phase 1C V1 proved that a small
+          # quality-biased reservoir can be locally rich yet globally infeasible
+          # under the frozen two-appearance cap. These reservoirs retain quality,
+          # deterministic global diversity, position diversity, and explicit
+          # per-player diversity across the full legal FV range.
+          QUALITY_KEEP = 700
+          HASH_DIVERSITY_KEEP = 1200
+          POSITION_KEEP = 60
+          PLAYER_KEEP = 4
+          MIN_CELL_RETAINED = 1000
 
           SOLVER_TIME_LIMIT_SECONDS = 240
           SOLVER_MIP_REL_GAP = 0.0
@@ -417,6 +425,7 @@ jobs:
                   self.position_heaps = {
                       pos: [] for pos in POSITIONS
                   }
+                  self.player_heaps = defaultdict(list)
                   self.valid_seen = 0
 
               def _quality_desirability(self, candidate):
@@ -446,15 +455,15 @@ jobs:
                       QUALITY_KEEP,
                   )
 
-                  # Deterministic diversity sample among >=3000-FV candidates.
-                  if candidate.min_fv >= 3000:
-                      # We want the smallest hashes. -hash makes the root the
-                      # largest/worst hash among retained samples.
-                      self._push_limited(
-                          self.hash_heap,
-                          (-candidate.stable_hash, self._counter, candidate),
-                          HASH_DIVERSITY_KEEP,
-                      )
+                  # Deterministic diversity sample across the ENTIRE legal
+                  # FV range. V1 incorrectly restricted this reservoir to
+                  # min_fv >= 3000, which could starve unequal-cardinality cells
+                  # of legal 2500-2999 pieces needed for global feasibility.
+                  self._push_limited(
+                      self.hash_heap,
+                      (-candidate.stable_hash, self._counter, candidate),
+                      HASH_DIVERSITY_KEEP,
+                  )
 
                   for pos in candidate.position_set:
                       self._push_limited(
@@ -463,11 +472,22 @@ jobs:
                           POSITION_KEEP,
                       )
 
+                  # Guarantee broad player representation inside every design
+                  # cell. This does not alter any scientific gate; it only keeps
+                  # the global optimizer from seeing a premium-player monoculture.
+                  for key in candidate.player_keys:
+                      self._push_limited(
+                          self.player_heaps[key],
+                          (quality, self._counter, candidate),
+                          PLAYER_KEEP,
+                      )
+
               def retained(self):
                   by_sig = {}
 
                   sources = [self.quality_heap, self.hash_heap]
                   sources.extend(self.position_heaps.values())
+                  sources.extend(self.player_heaps.values())
 
                   for heap in sources:
                       for _, _, candidate in heap:
@@ -664,6 +684,28 @@ jobs:
                       ":".join(cell): len(retained[cell])
                       for cell in sorted(retained)
                   },
+                  "retained_unique_players_by_cell": {
+                      ":".join(cell): len({
+                          key
+                          for candidate in retained[cell]
+                          for key in candidate.player_keys
+                      })
+                      for cell in sorted(retained)
+                  },
+                  "retained_min_fv_range_by_cell": {
+                      ":".join(cell): [
+                          min(c.min_fv for c in retained[cell]),
+                          max(c.min_fv for c in retained[cell]),
+                      ]
+                      for cell in sorted(retained)
+                  },
+                  "retention_contract": {
+                      "quality_keep": QUALITY_KEEP,
+                      "hash_diversity_keep_all_legal_fv": HASH_DIVERSITY_KEEP,
+                      "position_keep": POSITION_KEEP,
+                      "player_keep": PLAYER_KEEP,
+                      "minimum_retained_per_cell": MIN_CELL_RETAINED,
+                  },
                   "pair_rejection_counts": dict(rejection),
                   "topology_band_memberships_seen":
                       dict(topology_pair_counts),
@@ -691,10 +733,12 @@ jobs:
 
 
           class GlobalSolver:
-              def __init__(self, slots, retained, player_keys):
+              def __init__(self, slots, retained, player_keys, max_player_appearances=2, position_minimum=4):
                   self.slots = slots
                   self.retained = retained
                   self.player_keys = tuple(sorted(player_keys))
+                  self.max_player_appearances = int(max_player_appearances)
+                  self.position_minimum = int(position_minimum)
                   self.player_index = {
                       key: i for i, key in enumerate(self.player_keys)
                   }
@@ -763,7 +807,7 @@ jobs:
                           self.add_row(
                               {j: 1.0 for j in idxs},
                               -np.inf,
-                              2.0,
+                              float(self.max_player_appearances),
                           )
 
                   # Same exact trade signature may be selected only once.
@@ -782,20 +826,21 @@ jobs:
                           raise RuntimeError(
                               f"No retained candidate contains {pos}"
                           )
-                      self.add_row(
-                          {j: 1.0 for j in idxs},
-                          4.0,
-                          np.inf,
-                      )
+                      if self.position_minimum > 0:
+                          self.add_row(
+                              {j: 1.0 for j in idxs},
+                              float(self.position_minimum),
+                              np.inf,
+                          )
 
                   # Exact used-player binary links:
-                  # usage <= 2*u and u <= usage.
+                  # usage <= max_player_appearances*u and u <= usage.
                   for key, pidx in self.player_index.items():
                       u = self.u_offset + pidx
                       idxs = self.player_vars.get(key, [])
 
                       coeffs = {j: 1.0 for j in idxs}
-                      coeffs[u] = -2.0
+                      coeffs[u] = -float(self.max_player_appearances)
                       self.add_row(coeffs, -np.inf, 0.0)
 
                       coeffs = {j: -1.0 for j in idxs}
@@ -991,8 +1036,27 @@ jobs:
                       hi = mid - 1
 
               if best_threshold is None:
+                  diagnostics = {
+                      "exact_max2_position4": False,
+                      "max3_position4": GlobalSolver(
+                          slots, retained, [p["key"] for p in eligible],
+                          max_player_appearances=3, position_minimum=4,
+                      ).solve(objective=None, threshold=2500, label="diagnostic_max3") is not None,
+                      "max2_no_position_minimum": GlobalSolver(
+                          slots, retained, [p["key"] for p in eligible],
+                          max_player_appearances=2, position_minimum=0,
+                      ).solve(objective=None, threshold=2500, label="diagnostic_no_position") is not None,
+                      "retained_candidates_by_cell": {
+                          ":".join(cell): len(rows) for cell, rows in sorted(retained.items())
+                      },
+                      "retained_unique_players_by_cell": {
+                          ":".join(cell): len({key for c in rows for key in c.player_keys})
+                          for cell, rows in sorted(retained.items())
+                      },
+                  }
                   raise RuntimeError(
-                      "No feasible 40-trade catalog under retained candidates"
+                      "No feasible 40-trade catalog under frozen max-2 constraints. "
+                      + json.dumps(diagnostics, sort_keys=True)
                   )
 
               extra = []
@@ -1327,6 +1391,16 @@ jobs:
               )
 
               slots = make_slots()
+
+              print(json.dumps({
+                  "phase1c_retention_pre_solver": {
+                      "retained_by_cell": generation_diagnostics["retained_by_cell"],
+                      "retained_unique_players_by_cell": generation_diagnostics["retained_unique_players_by_cell"],
+                      "retained_min_fv_range_by_cell": generation_diagnostics["retained_min_fv_range_by_cell"],
+                      "retention_contract": generation_diagnostics["retention_contract"],
+                  }
+              }, indent=2, sort_keys=True))
+
               optimized = optimize_catalog(
                   slots,
                   retained,
@@ -2262,7 +2336,7 @@ jobs:
             exit 1
           }
 
-          git commit -m "Freeze Package Adjustment V8 development catalog for review"
+          git commit -m "Freeze Package Adjustment V8 development catalog for review V2"
 
           git fetch origin main
 
