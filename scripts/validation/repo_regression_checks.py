@@ -335,6 +335,7 @@ def check_aliases_and_ktc_positions():
         "__pkgv3c1__|",
         "__pkgv4c1__|",
         "__pkgv7dev__|",
+        "__pkgv8dev__|",
     )
     assert package_prefixes == expected_package_prefixes, (
         "KTC/package-vote transport isolation drift: "
@@ -568,69 +569,52 @@ def check_team_utility_projection_runtime_invariants():
 
 
 
+
 def check_package_sampling_contract():
     text = INDEX.read_text(encoding="utf-8")
-    start = text.index("function packageVoteHash(value){")
+    start = text.index("function packageVoteSlotStorageKey(){")
     end = text.index("\nfunction render(){", start)
     block = text[start:end]
 
-    # V7 development voting uses the exact frozen 40-challenge catalog.
-    # Each voter sees every challenge once in a stable voter-keyed order;
-    # canonical A/B display side is independently voter/challenge-keyed.
-    assert "Package Adjustment V7 Development Voting." in text
-    assert "function packageVoteOwnPlayers()" not in block
-    assert "function packageVoteEligibleChallenges()" not in block
-    assert "own.has(" not in block
-
-    assert "function packageVoteHash(value){" in block
-    assert "function packageVoteCompletedKey(){" in block
-    assert "function packageVoteCompleted(){" in block
-    assert "const completed = new Set(packageVoteCompleted());" in block
-    assert "const ordered = PACKAGE_VOTE_CHALLENGES.slice().sort((a,b) => {" in block
-    assert "packageVoteHash(`${voter}|order|${a.id}`)" in block
-    assert "packageVoteHash(`${voter}|order|${b.id}`)" in block
-    assert "const challenge = ordered.find(c => !completed.has(String(c.id)));" in block
-    assert "packageVoteHash(`${voter}|side|${challenge.id}`)" in block
-    assert "? 'A' : 'B';" in block
+    assert "Package Adjustment V8 Development Voting." in text
+    assert "function packageVoteAssignedSlot(){" in block
+    assert "new URLSearchParams(window.location.search).get('pkgv8slot')" in block
+    assert "package_votes_v8dev_slot_" in block
+    assert "package_votes_v8dev_slot_conflict_" in block
+    assert "if(validUrl && validStored && fromUrl !== stored)" in block
+    assert "const spec=PACKAGE_VOTE_SCHEDULE.slots[String(slot)];" in block
+    assert "const id=spec.challenge_order.find(cid=>!completed.has(String(cid)));" in block
+    assert "const left=spec.display_left_by_challenge[String(id)];" in block
+    assert "const displayOrder=spec.challenge_order.indexOf(String(id));" in block
     assert "Math.random()" not in block
-    assert "Date.now() < Date.parse(PACKAGE_VOTE_VALID_AFTER_UTC)" in block
 
-    # Loader remains fail-closed to the exact frozen V7 schema.
-    assert "doc.study_id !== 'package-adjustment-v7-multi-v-multi'" in block
-    assert "doc.stage !== 'phase1a_development_catalog'" in block
-    assert "doc.status !== 'FROZEN_PRE_VOTE_DEVELOPMENT_CATALOG'" in block
-    assert "doc.frozen !== true" in block
-    assert "doc.released !== false" in block
-    assert "doc.voting_activated !== false" in block
-    assert "doc.v7_votes_read !== false" in block
-    assert "doc.candidate_fit_performed !== false" in block
-    assert "doc.candidate_predictions_used_for_catalog_selection !== false" in block
-    assert "doc.fv_visible_to_voter !== false" in block
-    assert "Number(doc.challenge_count) !== 40" in block
-    assert "doc.challenges.length !== 40" in block
-    assert "c.candidate_prediction_used_for_selection === false" in block
-    assert "c.fv_visible_to_voter === false" in block
+    assert "doc.study_id!=='package-adjustment-v8-topology-split-multi-v-multi'" in block
+    assert "doc.stage!=='phase1c_voter_safe_development_catalog'" in block
+    assert "doc.status!=='FROZEN_REVIEW_REQUIRED_NOT_ACTIVATED'" in block
+    assert "doc.voting_activated!==false" in block
+    assert "sched.stage!=='phase1f_balanced_randomization_schedule'" in block
+    assert "sched.status!=='FROZEN_PRE_VOTE'" in block
+    assert "Number(sched.accepted_voter_slots)!==50" in block
+    assert "!('fv' in p)" in block
 
-    # Exact transport and frozen catalog identity.
     assert "const PACKAGE_VOTE_DAILY_LIMIT = 40;" in text
     assert "const PACKAGE_VOTE_TOTAL_CHALLENGES = 40;" in text
-    assert "const PACKAGE_VOTE_CATALOG_SHA256 = 'ddf1ad55a7f6b46a198e0855c7f2d1ae5346d5a1e8b88bb6e1a859076c2ac8dd';" in text
-    assert "research/package-adjustment-v7/package_vote_challenges_v7_development_v1.json" in text
-    assert "__pkgv7dev__|" in text
-    assert "__pkgv7dev_meta__|" in text
-    assert "__pkgv7dev_schema__|1" in text
-    assert "package_votes_v7dev_completed_" in text
+    assert "const PACKAGE_VOTE_TOTAL_SLOTS = 50;" in text
+    assert "research/package-adjustment-v8/package_vote_challenges_v8_development_v1.json" in text
+    assert "research/package-adjustment-v8/voting_randomization_schedule_v1.json" in text
+    assert "__pkgv8dev__|" in text
+    assert "__pkgv8dev_meta__|" in text
+    assert "__pkgv8dev_schema__|1" in text
+    assert "trade:`__pkgv8dev_meta__|${left}|${slot}|${displayOrder}`" in block
+    assert "package_votes_v8dev_completed_" in text
 
-    # Old V6P1 random-cell sampler must not survive activation.
-    assert "const byCell = new Map();" not in block
-    assert "selectedCell = cells[Math.floor(Math.random()" not in block
-    assert "left: Math.random() < 0.5 ? 'T' : 'P'" not in block
+    assert "packageVoteHash(`${voter}|order|${a.id}`)" not in block
+    assert "packageVoteHash(`${voter}|side|${challenge.id}`)" not in block
 
     print(
-        "PASS V7 frozen 40-challenge sampling contract: exactly-once voter-keyed order; "
-        "stable A/B display randomization; FV/candidate-blind; V7 transport isolated"
+        "PASS V8 frozen 50-slot package sampling contract: exact slot order, "
+        "25/25 display balance, slot-bound transport, FV/candidate blind"
     )
-
 
 def check_index_js_syntax():
     text = INDEX.read_text(encoding="utf-8")
