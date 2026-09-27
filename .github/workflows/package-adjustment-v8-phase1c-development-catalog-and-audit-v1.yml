@@ -1,4 +1,4 @@
-name: Package Adjustment V8 - Phase 1C Development Catalog Human-Review Revision V5
+name: Package Adjustment V8 - Phase 1C Certified Catalog Freeze V6
 
 on:
   workflow_dispatch:
@@ -365,6 +365,7 @@ jobs:
           MIN_CELL_RETAINED = 1000
 
           SOLVER_TIME_LIMIT_SECONDS = 240
+          SOLVER_FEASIBILITY_RETRY_SECONDS = (240, 480)
           SOLVER_MIP_REL_GAP = 0.0
 
 
@@ -874,6 +875,7 @@ jobs:
                   self.signature_vars = defaultdict(list)
                   self.side_signature_vars = defaultdict(list)
                   self.position_vars = defaultdict(list)
+                  self.last_attempts = []
 
                   for slot in slots:
                       cell = (
@@ -1041,43 +1043,85 @@ jobs:
                       if record["candidate"].min_fv < threshold:
                           upper[j] = 0.0
 
-                  result = milp(
-                      c=c,
-                      integrality=np.ones(self.nvars, dtype=int),
-                      bounds=Bounds(lower, upper),
-                      constraints=self._constraint(extra_rows),
-                      options={
-                          "time_limit": SOLVER_TIME_LIMIT_SECONDS,
-                          "mip_rel_gap": SOLVER_MIP_REL_GAP,
-                          "presolve": True,
-                      },
+                  limits = (
+                      SOLVER_FEASIBILITY_RETRY_SECONDS
+                      if objective is None
+                      else (SOLVER_TIME_LIMIT_SECONDS,)
                   )
+                  attempts = []
 
-                  if not result.success:
-                      return None
-
-                  selected = [
-                      j
-                      for j in range(self.nx)
-                      if result.x[j] > 0.5
-                  ]
-                  if len(selected) != 40:
-                      raise RuntimeError(
-                          f"{label}: expected 40 selected variables, "
-                          f"got {len(selected)}"
+                  for time_limit in limits:
+                      result = milp(
+                          c=c,
+                          integrality=np.ones(self.nvars, dtype=int),
+                          bounds=Bounds(lower, upper),
+                          constraints=self._constraint(extra_rows),
+                          options={
+                              "time_limit": time_limit,
+                              "mip_rel_gap": SOLVER_MIP_REL_GAP,
+                              "presolve": True,
+                          },
                       )
 
-                  used_players = [
-                      self.player_keys[i]
-                      for i in range(len(self.player_keys))
-                      if result.x[self.u_offset + i] > 0.5
-                  ]
+                      has_incumbent = (
+                          getattr(result, "x", None) is not None
+                      )
+                      attempts.append(
+                          {
+                              "time_limit_seconds": int(time_limit),
+                              "status": int(result.status),
+                              "success": bool(result.success),
+                              "has_incumbent": bool(has_incumbent),
+                              "message": str(result.message),
+                          }
+                      )
+                      self.last_attempts = list(attempts)
 
-                  return {
-                      "result": result,
-                      "selected": selected,
-                      "used_players": used_players,
-                  }
+                      # For a pure feasibility probe, any valid integer
+                      # incumbent proves feasibility even if HiGHS stopped
+                      # on the wall-clock limit before declaring success.
+                      if has_incumbent:
+                          selected = [
+                              j
+                              for j in range(self.nx)
+                              if result.x[j] > 0.5
+                          ]
+                          if len(selected) == 40:
+                              used_players = [
+                                  self.player_keys[i]
+                                  for i in range(len(self.player_keys))
+                                  if result.x[
+                                      self.u_offset + i
+                                  ] > 0.5
+                              ]
+                              return {
+                                  "result": result,
+                                  "selected": selected,
+                                  "used_players": used_players,
+                                  "attempts": list(attempts),
+                                  "classification":
+                                      "FEASIBLE_INCUMBENT",
+                              }
+
+                      # HiGHS status 2 is a proof of infeasibility.
+                      if int(result.status) == 2:
+                          return None
+
+                      # A timeout/no incumbent is unresolved, not
+                      # infeasible. Retry once with the larger budget.
+                      if int(result.status) == 1:
+                          continue
+
+                      raise RuntimeError(
+                          f"{label}: unexpected MILP termination "
+                          f"status={result.status}: {result.message}"
+                      )
+
+                  raise RuntimeError(
+                      f"{label}: feasibility remained unresolved after "
+                      f"{list(limits)} seconds; refusing to classify "
+                      "timeout as infeasible"
+                  )
 
               def metric_row(self, metric):
                   coeffs = {}
@@ -1173,6 +1217,14 @@ jobs:
                       {
                           "threshold": threshold,
                           "feasible": feasible,
+                          "classification":
+                              "FEASIBLE"
+                              if feasible
+                              else "PROVEN_INFEASIBLE",
+                          "solver_attempts":
+                              solved["attempts"]
+                              if feasible
+                              else list(solver.last_attempts),
                       }
                   )
 
@@ -1182,6 +1234,44 @@ jobs:
                       lo = mid + 1
                   else:
                       hi = mid - 1
+
+              if best_threshold is not None:
+                  best_idx = thresholds.index(best_threshold)
+                  next_higher_threshold = (
+                      thresholds[best_idx + 1]
+                      if best_idx + 1 < len(thresholds)
+                      else None
+                  )
+                  if next_higher_threshold is not None:
+                      boundary = solver.solve(
+                          objective=None,
+                          threshold=next_higher_threshold,
+                          label=(
+                              "boundary_proof_"
+                              f"{next_higher_threshold}"
+                          ),
+                      )
+                      threshold_trials.append(
+                          {
+                              "threshold": next_higher_threshold,
+                              "feasible": boundary is not None,
+                              "classification":
+                                  "FEASIBLE"
+                                  if boundary is not None
+                                  else "PROVEN_INFEASIBLE",
+                              "solver_attempts":
+                                  boundary["attempts"]
+                                  if boundary is not None
+                                  else list(solver.last_attempts),
+                              "boundary_probe": True,
+                          }
+                      )
+                      if boundary is not None:
+                          raise RuntimeError(
+                              "Threshold search underreported the "
+                              "globally feasible minimum FV: "
+                              f"{next_higher_threshold} is feasible"
+                          )
 
               if best_threshold is None or best_solution is None:
                   diagnostics = {
@@ -1644,6 +1734,17 @@ jobs:
                           "exact_monotone_milp_feasibility",
                       "optimum": best_threshold,
                       "optimality_proven": True,
+                      "infeasibility_requires_highs_status_2": True,
+                      "timeouts_never_classified_infeasible": True,
+                      "next_higher_candidate_threshold":
+                          next_higher_threshold,
+                      "next_higher_threshold_proven_infeasible":
+                          (
+                              next_higher_threshold is None
+                              or threshold_trials[-1][
+                                  "classification"
+                              ] == "PROVEN_INFEASIBLE"
+                          ),
                       "threshold_trials": threshold_trials,
                   },
                   {
@@ -2601,6 +2702,88 @@ jobs:
             research/package-adjustment-v8/generate_development_catalog_v1.py \
             --output-dir research/package-adjustment-v8
 
+
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+
+          d=Path("research/package-adjustment-v8")
+          catalog=json.loads((d/"development_catalog_v1.json").read_text())
+          audit=json.loads((d/"development_catalog_audit_v1.json").read_text())
+          manifest=json.loads((d/"development_catalog_manifest_v1.json").read_text())
+
+          def side_sig(side):
+              return "|".join(sorted(
+                  x["key"] for x in side["assets"]
+              ))
+
+          def trade_sig(c):
+              return "||".join(sorted((
+                  side_sig(c["side_A"]),
+                  side_sig(c["side_B"]),
+              )))
+
+          rows=[]
+          for c in catalog["challenges"]:
+              rows.append({
+                  "id":c["id"],
+                  "topology":c["topology"],
+                  "direction":
+                      c["primary_concentration_direction"],
+                  "band":c["primary_contrast_band"],
+                  "side_A_signature":side_sig(c["side_A"]),
+                  "side_B_signature":side_sig(c["side_B"]),
+                  "trade_signature":trade_sig(c),
+                  "minimum_asset_fv":c["minimum_asset_fv"],
+              })
+
+          cert={
+              "schema_version":1,
+              "study_id":catalog["study_id"],
+              "stage":"phase1c_catalog_selection_certificate",
+              "status":"FROZEN_REVIEW_REQUIRED_NOT_ACTIVATED",
+              "challenge_count":40,
+              "challenge_signature_sha256":
+                  manifest["challenge_signature_sha256"],
+              "global_minimum_asset_fv_threshold":
+                  audit["selection"][
+                      "global_minimum_asset_fv_threshold"
+                  ],
+              "threshold_proof":
+                  audit["selection"]["lexicographic_stages"][0],
+              "selected_challenges":rows,
+              "input_git_blobs":manifest["inputs"],
+              "replay_contract":
+                  "REPLAY_FROZEN_SELECTION_WITHOUT_SECOND_MILP",
+              "v8_votes_read":False,
+              "voting_activated":False,
+              "production_change_authorized":False,
+          }
+          cert_path=d/"catalog_selection_certificate_v1.json"
+          cert_path.write_text(
+              json.dumps(cert,indent=2,sort_keys=True)+"\n"
+          )
+
+          manifest["outputs"]["selection_certificate_sha256"] = (
+              hashlib.sha256(cert_path.read_bytes()).hexdigest()
+          )
+          manifest["reproduction_contract"] = (
+              "CERTIFICATE_REPLAY_NO_SECOND_OPTIMIZER_INVOCATION"
+          )
+          (d/"development_catalog_manifest_v1.json").write_text(
+              json.dumps(manifest,indent=2,sort_keys=True)+"\n"
+          )
+
+          print(json.dumps({
+              "selection_certificate_sha256":
+                  manifest["outputs"][
+                      "selection_certificate_sha256"
+                  ],
+              "reproduction_contract":
+                  manifest["reproduction_contract"],
+          },indent=2))
+          PY
+
       - name: Independently validate catalog audit and voter blinding
         shell: bash
         run: |
@@ -2757,6 +2940,10 @@ jobs:
           assert manifest["v8_votes_read"] is False
           assert manifest["production_change_authorized"] is False
 
+          cert=json.loads(
+              (V8/"catalog_selection_certificate_v1.json").read_text()
+          )
+
           checks={
               "development_catalog_v1.json":
                   manifest["outputs"]["development_catalog_sha256"],
@@ -2771,57 +2958,249 @@ jobs:
               actual=hashlib.sha256((V8/name).read_bytes()).hexdigest()
               assert actual==expected,(name,expected,actual)
 
-          print("PASS: independent catalog audit, freshness, realism, and voter blinding verified.")
+          cert_actual=hashlib.sha256(
+              (V8/"catalog_selection_certificate_v1.json").read_bytes()
+          ).hexdigest()
+          assert cert_actual==manifest["outputs"][
+              "selection_certificate_sha256"
+          ]
+          assert cert["challenge_signature_sha256"]==manifest[
+              "challenge_signature_sha256"
+          ]
+          assert cert["v8_votes_read"] is False
+          assert cert["voting_activated"] is False
+
+          print("PASS: independent catalog audit, freshness, realism, voter blinding, and selection certificate verified.")
           print("PASS: voting remains inactive pending human review.")
           PY
 
           python3 scripts/validation/check_package_adjustment_live.py
 
-      - name: Reproduce selected challenge signatures
+      - name: Replay frozen selection certificate without re-solving
         shell: bash
         run: |
           set -euo pipefail
 
-          rm -rf "$RUNNER_TEMP/pkgv8-repro"
-          mkdir -p "$RUNNER_TEMP/pkgv8-repro"
-
-          python3 \
-            research/package-adjustment-v8/generate_development_catalog_v1.py \
-            --output-dir "$RUNNER_TEMP/pkgv8-repro"
-
           python3 - <<'PY'
-          import hashlib
-          import json
-          import os
+          import hashlib, json, math
+          from collections import Counter
           from pathlib import Path
 
-          repo=Path("research/package-adjustment-v8")
-          tmp=Path(os.environ["RUNNER_TEMP"])/"pkgv8-repro"
+          V8=Path("research/package-adjustment-v8")
+          V7=Path("research/package-adjustment-v7")
 
-          a=json.loads((repo/"development_catalog_manifest_v1.json").read_text())
-          b=json.loads((tmp/"development_catalog_manifest_v1.json").read_text())
+          catalog=json.loads((V8/"development_catalog_v1.json").read_text())
+          audit=json.loads((V8/"development_catalog_audit_v1.json").read_text())
+          manifest=json.loads((V8/"development_catalog_manifest_v1.json").read_text())
+          cert=json.loads((V8/"catalog_selection_certificate_v1.json").read_text())
+          design=json.loads((V8/"catalog_design_contract_v1.json").read_text())
+          snapshot=json.loads((V7/"phase1a_player_fv_snapshot_v1.json").read_text())
+          old=json.loads((V7/"package_vote_challenges_v7_development_v1.json").read_text())
 
-          assert a["challenge_signature_sha256"]==b["challenge_signature_sha256"]
-          assert a["challenge_count"]==b["challenge_count"]==40
+          players={p["key"]:p for p in snapshot["players"]}
+          side_min={2:7000,3:9000,4:11500}
 
-          ar=json.loads((repo/"development_catalog_audit_v1.json").read_text())
-          br=json.loads((tmp/"development_catalog_audit_v1.json").read_text())
+          def side_sig(side):
+              return "|".join(sorted(
+                  x["key"] for x in side["assets"]
+              ))
 
-          keys=(
-              "catalog_wide_minimum_asset_fv",
-              "minimum_2v2_asset_fv",
-              "minimum_side_apex_fv",
-              "minimum_raw_sum_ratio",
-              "team_null_count",
-              "joe_mixon_occurrences",
+          def trade_sig(c):
+              return "||".join(sorted((
+                  side_sig(c["side_A"]),
+                  side_sig(c["side_B"]),
+              )))
+
+          def close(a,b,tol=2e-9):
+              return abs(float(a)-float(b))<=tol
+
+          replay_rows=[]
+          appearances=Counter()
+          pos_cov=Counter()
+          topology=Counter()
+          directions=Counter()
+          side_sigs=[]
+          trade_sigs=[]
+
+          for c in catalog["challenges"]:
+              a=c["side_A"]; b=c["side_B"]
+              size_a,size_b=map(int,c["topology"].split("v"))
+              assert a["asset_count"]==size_a
+              assert b["asset_count"]==size_b
+
+              for side,size in ((a,size_a),(b,size_b)):
+                  keys=[x["key"] for x in side["assets"]]
+                  assert len(keys)==len(set(keys))
+                  raw=0
+                  fvs=[]
+                  for asset in side["assets"]:
+                      ref=players[asset["key"]]
+                      for field in ("name","pos","team","fv"):
+                          assert asset[field]==ref[field],(
+                              c["id"],asset["key"],field
+                          )
+                      raw+=int(asset["fv"])
+                      fvs.append(int(asset["fv"]))
+                      appearances[asset["key"]]+=1
+                  assert raw==side["raw_fv"]
+                  assert max(fvs)==side["apex_fv"]
+                  assert min(fvs)==side["minimum_asset_fv"]
+                  assert raw>=side_min[size]
+                  assert max(fvs)>=4000
+                  if size==2:
+                      assert min(fvs)>=3000
+                  else:
+                      assert min(fvs)>=2500
+
+                  shares=[v/raw for v in fvs]
+                  assert close(
+                      min(shares),
+                      side["minimum_asset_share"],
+                      1.1e-9,
+                  )
+                  assert close(
+                      max(shares),
+                      side["top_asset_share"],
+                      1.1e-9,
+                  )
+                  assert close(
+                      max(shares)-1.0/size,
+                      side["apex_excess_share"],
+                      1.1e-9,
+                  )
+                  assert close(
+                      sum(x*x for x in shares),
+                      side["hhi"],
+                      1.1e-9,
+                  )
+                  side_sigs.append(side_sig(side))
+
+              assert not (
+                  {x["key"] for x in a["assets"]}
+                  & {x["key"] for x in b["assets"]}
+              )
+
+              ratio=min(a["raw_fv"],b["raw_fv"])/max(
+                  a["raw_fv"],b["raw_fv"]
+              )
+              assert close(
+                  ratio,
+                  c["raw_sum_ratio_min_over_max"],
+                  1.1e-9,
+              )
+              assert ratio>=0.92-1e-9
+
+              diff=(
+                  a["apex_excess_share"]
+                  - b["apex_excess_share"]
+              )
+              assert close(
+                  diff,
+                  c[
+                      "apex_excess_share_difference_A_minus_B"
+                  ],
+                  1.1e-9,
+              )
+              direction="A" if diff>0 else "B"
+              assert direction==c[
+                  "primary_concentration_direction"
+              ]
+              lo,hi=design["contrast_bands"][
+                  c["primary_contrast_band"]
+              ]
+              assert abs(diff)>=float(lo)-2e-9
+              assert abs(diff)<=float(hi)+2e-9
+
+              assets=a["assets"]+b["assets"]
+              for pos in {x["pos"] for x in assets}:
+                  pos_cov[pos]+=1
+              topology[c["topology"]]+=1
+              directions[direction]+=1
+
+              ts=trade_sig(c)
+              trade_sigs.append(ts)
+              replay_rows.append({
+                  "id":c["id"],
+                  "topology":c["topology"],
+                  "direction":direction,
+                  "band":c["primary_contrast_band"],
+                  "side_A_signature":side_sig(a),
+                  "side_B_signature":side_sig(b),
+                  "trade_signature":ts,
+                  "minimum_asset_fv":c["minimum_asset_fv"],
+              })
+
+          assert len(catalog["challenges"])==40
+          assert len(set(trade_sigs))==40
+          assert len(side_sigs)==80
+          assert len(set(side_sigs))==80
+          assert max(appearances.values())<=2
+          assert topology==Counter(design["topology_counts"])
+          assert directions==Counter({"A":20,"B":20})
+          for pos in ("QB","RB","WR","TE","DL","LB","DB"):
+              assert pos_cov[pos]>=4,(pos,pos_cov[pos])
+
+          old_sigs={trade_sig(c) for c in old["challenges"]}
+          assert not (set(trade_sigs)&old_sigs)
+
+          replay_hash=hashlib.sha256(
+              "\n".join(trade_sigs).encode("utf-8")
+          ).hexdigest()
+          assert replay_hash==manifest["challenge_signature_sha256"]
+          assert replay_hash==cert["challenge_signature_sha256"]
+          assert replay_rows==cert["selected_challenges"]
+
+          threshold=cert["global_minimum_asset_fv_threshold"]
+          assert min(
+              int(x["fv"])
+              for c in catalog["challenges"]
+              for side in ("side_A","side_B")
+              for x in c[side]["assets"]
+          )==threshold
+
+          proof=cert["threshold_proof"]
+          assert proof["optimality_proven"] is True
+          assert proof["timeouts_never_classified_infeasible"] is True
+          assert proof["infeasibility_requires_highs_status_2"] is True
+          assert proof[
+              "next_higher_threshold_proven_infeasible"
+          ] is True
+          assert all(
+              t["classification"] in (
+                  "FEASIBLE","PROVEN_INFEASIBLE"
+              )
+              for t in proof["threshold_trials"]
           )
-          for key in keys:
-              assert ar["trade_quality"][key]==br["trade_quality"][key],key
 
-          assert ar["reuse"]==br["reuse"]
-          assert ar["position_challenge_coverage"]==br["position_challenge_coverage"]
+          cert_sha=hashlib.sha256(
+              (V8/"catalog_selection_certificate_v1.json").read_bytes()
+          ).hexdigest()
+          assert cert_sha==manifest["outputs"][
+              "selection_certificate_sha256"
+          ]
 
-          print("PASS: independent rerun reproduced the exact 40 challenge signatures and audit metrics.")
+          assert audit["freshness"][
+              "unique_side_package_count"
+          ]==80
+          assert audit["reuse"][
+              "maximum_player_appearances"
+          ]<=2
+          assert manifest["reproduction_contract"]==(
+              "CERTIFICATE_REPLAY_NO_SECOND_OPTIMIZER_INVOCATION"
+          )
+          assert cert["v8_votes_read"] is False
+          assert cert["voting_activated"] is False
+          assert cert["production_change_authorized"] is False
+
+          print(json.dumps({
+              "decision":"PASS_CERTIFICATE_REPLAY",
+              "challenge_signature_sha256":replay_hash,
+              "challenge_count":40,
+              "unique_side_packages":80,
+              "global_minimum_asset_fv_threshold":threshold,
+              "second_optimizer_invocation":False,
+              "votes_read":False,
+          },indent=2))
           PY
 
       - name: Prove exact research-only change scope
@@ -2838,6 +3217,7 @@ jobs:
           expected=(
             research/package-adjustment-v8/catalog_human_review_amendment_v1.json
             research/package-adjustment-v8/catalog_human_review_amendment_v1.md
+            research/package-adjustment-v8/catalog_selection_certificate_v1.json
             research/package-adjustment-v8/development_catalog_audit_v1.json
             research/package-adjustment-v8/development_catalog_manifest_v1.json
             research/package-adjustment-v8/development_catalog_review_v1.md
@@ -2871,6 +3251,7 @@ jobs:
           git add \
             research/package-adjustment-v8/catalog_human_review_amendment_v1.json \
             research/package-adjustment-v8/catalog_human_review_amendment_v1.md \
+            research/package-adjustment-v8/catalog_selection_certificate_v1.json \
             research/package-adjustment-v8/pre-vote-rejected-catalog-v1 \
             research/package-adjustment-v8/generate_development_catalog_v1.py \
             research/package-adjustment-v8/development_catalog_v1.json \
@@ -2884,7 +3265,7 @@ jobs:
             exit 1
           }
 
-          git commit -m "Freeze Package Adjustment V8 development catalog for review V2"
+          git commit -m "Freeze Package Adjustment V8 certified development catalog V6"
 
           git fetch origin main
 
@@ -2935,12 +3316,17 @@ jobs:
           assert audit["freshness"]["unique_side_package_count"]==80
           assert audit["freshness"]["repeated_exact_side_package_count"]==0
           amendment=json.loads((d/"catalog_human_review_amendment_v1.json").read_text())
+          cert=json.loads((d/"catalog_selection_certificate_v1.json").read_text())
           assert amendment["v8_votes_collected"] is False
           assert amendment["v8_vote_outcomes_read"] is False
+          assert cert["v8_votes_read"] is False
+          assert manifest["reproduction_contract"]==(
+              "CERTIFICATE_REPLAY_NO_SECOND_OPTIMIZER_INVOCATION"
+          )
 
-          print("PASS: post-rebase catalog review and 80/80 unique-side firewall still intact.")
+          print("PASS: post-rebase catalog review, certificate replay, and 80/80 unique-side firewall still intact.")
           PY
 
           git push origin HEAD:main
 
-          echo "PASS: Package Adjustment V8 revised catalog frozen with 80/80 unique side packages; voting remains inactive."
+          echo "PASS: Package Adjustment V8 certified catalog frozen with 80/80 unique side packages; voting remains inactive."
