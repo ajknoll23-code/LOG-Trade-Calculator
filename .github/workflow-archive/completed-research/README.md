@@ -4,24 +4,18 @@ Completed manual-only research/deployment workflows are moved out of `.github/wo
 
 Archived YAML files are preserved byte-for-byte. Original paths, Git blob SHAs, SHA-256 hashes, and triggers are recorded in `archive_manifest.json`.
 
-Recurring production/data workflows and studies that are still collecting or intentionally rerunnable remain active.
+Recurring production/data workflows and studies that are still active or intentionally rerunnable remain in `.github/workflows`.
 
-Archive refreshed: 2026-09-25T03:55:11.404163+00:00
+Archive refreshed: 2026-09-27T00:30:28.590642+00:00
 
-Archived workflow count: **132**
-Active protected workflow count: **26**
+Archived workflow count: **158**
+Active protected workflow count: **20**
 
 ## Active protected workflows
 
 - age-curve-v2-phase5.yml
 - cross-position-apex-calibration-v1-phase2-cross-study-reconciliation.yml
-- draft-pick-fv-v7-phase1-r1-r6-full-scale-preregistration.yml
-- draft-pick-fv-v7-phase2-accelerated-finalize.yml
-- draft-pick-fv-v7-phase2-accelerated-probe-resume-v2.yml
-- draft-pick-fv-v7-phase2-accelerated-probe-shard.yml
-- draft-pick-fv-v7-phase2-checkpointed-source-identity-freeze.yml
-- draft-pick-fv-v7-phase2-r1-r6-source-identity-freeze.yml
-- draft-pick-fv-v7-phase2-r25-probe-recovery.yml
+- draft-pick-fv-v8-phase0b-qualified-depth-feasibility-PATCHED.yml
 - durability-v2-phase5.yml
 - fantasypros-api-pipeline.yml
 - free-agent-utility-v1-refresh.yml
@@ -38,7 +32,7 @@ Active protected workflow count: **26**
 - research-program-status-v1-current-state-audit.yml
 - scheduled-data-refresh.yml
 - sync-sleeper.yml
-- workflow-folder-cleanup.yml
+- workflow-folder-cleanup-UPDATED-2026-09-26.yml
 
 ## Archived workflows
 
@@ -89,6 +83,22 @@ Active protected workflow count: **26**
 - draft-pick-fv-v6-phase3-r1-r4-historical-outcome-harvest.yml
 - draft-pick-fv-v6-phase4-loyo-development-selection.yml
 - draft-pick-fv-v6-phase4-research-closeout.yml
+- draft-pick-fv-v7-phase1-r1-r6-full-scale-preregistration.yml
+- draft-pick-fv-v7-phase2-accelerated-finalize.yml
+- draft-pick-fv-v7-phase2-accelerated-probe-resume-v2.yml
+- draft-pick-fv-v7-phase2-accelerated-probe-shard.yml
+- draft-pick-fv-v7-phase2-candidate-transport-isolation-v4.yml
+- draft-pick-fv-v7-phase2-checkpointed-source-identity-freeze.yml
+- draft-pick-fv-v7-phase2-gate-diagnostic-v4_1.yml
+- draft-pick-fv-v7-phase2-r1-r6-source-identity-freeze.yml
+- draft-pick-fv-v7-phase2-r25-probe-recovery.yml
+- draft-pick-fv-v7-phase2-residual-router-recovery-v2.yml
+- draft-pick-fv-v7-phase2-residual-router-recovery-v3.yml
+- draft-pick-fv-v7-phase2-residual-router-recovery.yml
+- draft-pick-fv-v7-phase2-source-feasibility-closeout-v4_2.yml
+- draft-pick-fv-v7-phase2-targeted-r25-recovery.yml
+- draft-pick-fv-v8-phase0a-raw-depth-feasibility-v2-reloaded.yml
+- draft-pick-fv-v8-phase0b-qualified-depth-feasibility.yml
 - draft-pick-valuation-structural-audit.yml
 - draft-slot-projection-activation.yml
 - elite-surplus-positional-scarcity-audit.yml
@@ -165,7 +175,17 @@ Active protected workflow count: **26**
 - package-adjustment-v6-prospective-power-analysis.yml
 - package-adjustment-v6-prospective-preregistration.yml
 - package-adjustment-v6-prospective-voting-activation.yml
+- package-adjustment-v7-development-candidate-evaluation-v1-PARALLEL-RECOVERY.yml
+- package-adjustment-v7-development-candidate-evaluation-v1.yml
+- package-adjustment-v7-development-freeze-first-qualification-v1.yml
+- package-adjustment-v7-development-voting-activation-r4.yml
+- package-adjustment-v7-outcome-blind-maturity-monitor-v1.yml
 - package-adjustment-v7-phase0-pick-player-scale-bridge-audit.yml
+- package-adjustment-v7-phase1-multi-v-multi-preregistration.yml
+- package-adjustment-v7-phase1a-power-and-catalog-freeze-v1.yml
+- package-adjustment-v8-phase1a-pre-vote-power-analysis-v1.yml
+- package-adjustment-v8-phase1b-catalog-design-freeze-v1.yml
+- package-adjustment-v8-topology-split-preregistration-v1-REALISM-REVISED.yml
 - qb-elite-fv-compression-diagnostic.yml
 - qb-production-multiplier-lineage-diagnostic.yml
 - trade-robustness-v1-phase1-shadow.yml
