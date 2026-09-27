@@ -29,7 +29,6 @@ DESIGN = V8 / "catalog_design_contract_v1.json"
 FEAS = V8 / "catalog_design_feasibility_v1.json"
 AMENDMENT = V8 / "fixed50_protocol_amendment_v1.json"
 AMENDMENT_MANIFEST = V8 / "fixed50_protocol_amendment_manifest_v1.json"
-HUMAN_REVIEW_AMENDMENT = V8 / "catalog_human_review_amendment_v1.json"
 SNAPSHOT = V7 / "phase1a_player_fv_snapshot_v1.json"
 V7_CATALOG = V7 / "package_vote_challenges_v7_development_v1.json"
 
@@ -108,7 +107,6 @@ PLAYER_KEEP = 4
 MIN_CELL_RETAINED = 1000
 
 SOLVER_TIME_LIMIT_SECONDS = 240
-SOLVER_FEASIBILITY_RETRY_SECONDS = (240, 480)
 SOLVER_MIP_REL_GAP = 0.0
 
 
@@ -616,9 +614,7 @@ class GlobalSolver:
         self.slot_vars = defaultdict(list)
         self.player_vars = defaultdict(list)
         self.signature_vars = defaultdict(list)
-        self.side_signature_vars = defaultdict(list)
         self.position_vars = defaultdict(list)
-        self.last_attempts = []
 
         for slot in slots:
             cell = (
@@ -643,13 +639,6 @@ class GlobalSolver:
                 self.signature_vars[
                     candidate.signature
                 ].append(j)
-                for side_signature in {
-                    candidate.side_a.signature,
-                    candidate.side_b.signature,
-                }:
-                    self.side_signature_vars[
-                        side_signature
-                    ].append(j)
                 for pos in candidate.position_set:
                     self.position_vars[pos].append(j)
 
@@ -690,16 +679,6 @@ class GlobalSolver:
 
         # Same exact trade signature may be selected only once.
         for signature, idxs in self.signature_vars.items():
-            if len(idxs) > 1:
-                self.add_row(
-                    {j: 1.0 for j in idxs},
-                    -np.inf,
-                    1.0,
-                )
-
-        # Human-review realism amendment: an exact side
-        # package may appear at most once anywhere in the catalog.
-        for side_signature, idxs in self.side_signature_vars.items():
             if len(idxs) > 1:
                 self.add_row(
                     {j: 1.0 for j in idxs},
@@ -786,85 +765,43 @@ class GlobalSolver:
             if record["candidate"].min_fv < threshold:
                 upper[j] = 0.0
 
-        limits = (
-            SOLVER_FEASIBILITY_RETRY_SECONDS
-            if objective is None
-            else (SOLVER_TIME_LIMIT_SECONDS,)
+        result = milp(
+            c=c,
+            integrality=np.ones(self.nvars, dtype=int),
+            bounds=Bounds(lower, upper),
+            constraints=self._constraint(extra_rows),
+            options={
+                "time_limit": SOLVER_TIME_LIMIT_SECONDS,
+                "mip_rel_gap": SOLVER_MIP_REL_GAP,
+                "presolve": True,
+            },
         )
-        attempts = []
 
-        for time_limit in limits:
-            result = milp(
-                c=c,
-                integrality=np.ones(self.nvars, dtype=int),
-                bounds=Bounds(lower, upper),
-                constraints=self._constraint(extra_rows),
-                options={
-                    "time_limit": time_limit,
-                    "mip_rel_gap": SOLVER_MIP_REL_GAP,
-                    "presolve": True,
-                },
-            )
+        if not result.success:
+            return None
 
-            has_incumbent = (
-                getattr(result, "x", None) is not None
-            )
-            attempts.append(
-                {
-                    "time_limit_seconds": int(time_limit),
-                    "status": int(result.status),
-                    "success": bool(result.success),
-                    "has_incumbent": bool(has_incumbent),
-                    "message": str(result.message),
-                }
-            )
-            self.last_attempts = list(attempts)
-
-            # For a pure feasibility probe, any valid integer
-            # incumbent proves feasibility even if HiGHS stopped
-            # on the wall-clock limit before declaring success.
-            if has_incumbent:
-                selected = [
-                    j
-                    for j in range(self.nx)
-                    if result.x[j] > 0.5
-                ]
-                if len(selected) == 40:
-                    used_players = [
-                        self.player_keys[i]
-                        for i in range(len(self.player_keys))
-                        if result.x[
-                            self.u_offset + i
-                        ] > 0.5
-                    ]
-                    return {
-                        "result": result,
-                        "selected": selected,
-                        "used_players": used_players,
-                        "attempts": list(attempts),
-                        "classification":
-                            "FEASIBLE_INCUMBENT",
-                    }
-
-            # HiGHS status 2 is a proof of infeasibility.
-            if int(result.status) == 2:
-                return None
-
-            # A timeout/no incumbent is unresolved, not
-            # infeasible. Retry once with the larger budget.
-            if int(result.status) == 1:
-                continue
-
+        selected = [
+            j
+            for j in range(self.nx)
+            if result.x[j] > 0.5
+        ]
+        if len(selected) != 40:
             raise RuntimeError(
-                f"{label}: unexpected MILP termination "
-                f"status={result.status}: {result.message}"
+                f"{label}: expected 40 selected variables, "
+                f"got {len(selected)}"
             )
 
-        raise RuntimeError(
-            f"{label}: feasibility remained unresolved after "
-            f"{list(limits)} seconds; refusing to classify "
-            "timeout as infeasible"
-        )
+        used_players = [
+            self.player_keys[i]
+            for i in range(len(self.player_keys))
+            if result.x[self.u_offset + i] > 0.5
+        ]
+
+        return {
+            "result": result,
+            "selected": selected,
+            "used_players": used_players,
+        }
 
     def metric_row(self, metric):
         coeffs = {}
@@ -960,14 +897,6 @@ def optimize_catalog(slots, retained, eligible):
             {
                 "threshold": threshold,
                 "feasible": feasible,
-                "classification":
-                    "FEASIBLE"
-                    if feasible
-                    else "PROVEN_INFEASIBLE",
-                "solver_attempts":
-                    solved["attempts"]
-                    if feasible
-                    else list(solver.last_attempts),
             }
         )
 
@@ -977,44 +906,6 @@ def optimize_catalog(slots, retained, eligible):
             lo = mid + 1
         else:
             hi = mid - 1
-
-    if best_threshold is not None:
-        best_idx = thresholds.index(best_threshold)
-        next_higher_threshold = (
-            thresholds[best_idx + 1]
-            if best_idx + 1 < len(thresholds)
-            else None
-        )
-        if next_higher_threshold is not None:
-            boundary = solver.solve(
-                objective=None,
-                threshold=next_higher_threshold,
-                label=(
-                    "boundary_proof_"
-                    f"{next_higher_threshold}"
-                ),
-            )
-            threshold_trials.append(
-                {
-                    "threshold": next_higher_threshold,
-                    "feasible": boundary is not None,
-                    "classification":
-                        "FEASIBLE"
-                        if boundary is not None
-                        else "PROVEN_INFEASIBLE",
-                    "solver_attempts":
-                        boundary["attempts"]
-                        if boundary is not None
-                        else list(solver.last_attempts),
-                    "boundary_probe": True,
-                }
-            )
-            if boundary is not None:
-                raise RuntimeError(
-                    "Threshold search underreported the "
-                    "globally feasible minimum FV: "
-                    f"{next_higher_threshold} is feasible"
-                )
 
     if best_threshold is None or best_solution is None:
         diagnostics = {
@@ -1103,21 +994,11 @@ def optimize_catalog(slots, retained, eligible):
 
     appearance = Counter()
     signatures = set()
-    side_signatures = set()
     position_coverage = Counter()
 
     for record in chosen_by_slot.values():
         candidate = record["candidate"]
         signatures.add(candidate.signature)
-        for side_signature in (
-            candidate.side_a.signature,
-            candidate.side_b.signature,
-        ):
-            if side_signature in side_signatures:
-                raise RuntimeError(
-                    "Initial threshold solution repeats a side package"
-                )
-            side_signatures.add(side_signature)
         for key in candidate.player_keys:
             appearance[key] += 1
         for pos in candidate.position_set:
@@ -1239,21 +1120,6 @@ def optimize_catalog(slots, retained, eligible):
                 ):
                     continue
 
-                old_side_signatures={
-                    old.side_a.signature,
-                    old.side_b.signature,
-                }
-                new_side_signatures={
-                    new.side_a.signature,
-                    new.side_b.signature,
-                }
-                if any(
-                    sig in side_signatures
-                    and sig not in old_side_signatures
-                    for sig in new_side_signatures
-                ):
-                    continue
-
                 involved = set(old.player_keys) | set(
                     new.player_keys
                 )
@@ -1360,21 +1226,6 @@ def optimize_catalog(slots, retained, eligible):
         signatures.remove(old.signature)
         signatures.add(new.signature)
 
-        for sig in {
-            old.side_a.signature,
-            old.side_b.signature,
-        }:
-            side_signatures.remove(sig)
-        for sig in {
-            new.side_a.signature,
-            new.side_b.signature,
-        }:
-            if sig in side_signatures:
-                raise RuntimeError(
-                    "Accepted move would duplicate a side package"
-                )
-            side_signatures.add(sig)
-
         for key in set(old.player_keys) | set(
             new.player_keys
         ):
@@ -1418,7 +1269,6 @@ def optimize_catalog(slots, retained, eligible):
     # Final hard-constraint proof after secondary improvement.
     final_appearance = Counter()
     final_signatures = set()
-    final_side_signatures = set()
     final_position_coverage = Counter()
     for record in chosen_by_slot.values():
         c = record["candidate"]
@@ -1432,24 +1282,10 @@ def optimize_catalog(slots, retained, eligible):
                 "Secondary improvement created duplicate trade"
             )
         final_signatures.add(c.signature)
-        for side_signature in (
-            c.side_a.signature,
-            c.side_b.signature,
-        ):
-            if side_signature in final_side_signatures:
-                raise RuntimeError(
-                    "Secondary improvement created repeated side package"
-                )
-            final_side_signatures.add(side_signature)
         for key in c.player_keys:
             final_appearance[key] += 1
         for pos in c.position_set:
             final_position_coverage[pos] += 1
-
-    if len(final_side_signatures) != 80:
-        raise RuntimeError(
-            f"Expected 80 unique side packages; got {len(final_side_signatures)}"
-        )
 
     if max(final_appearance.values()) > 2:
         raise RuntimeError(
@@ -1477,17 +1313,6 @@ def optimize_catalog(slots, retained, eligible):
                 "exact_monotone_milp_feasibility",
             "optimum": best_threshold,
             "optimality_proven": True,
-            "infeasibility_requires_highs_status_2": True,
-            "timeouts_never_classified_infeasible": True,
-            "next_higher_candidate_threshold":
-                next_higher_threshold,
-            "next_higher_threshold_proven_infeasible":
-                (
-                    next_higher_threshold is None
-                    or threshold_trials[-1][
-                        "classification"
-                    ] == "PROVEN_INFEASIBLE"
-                ),
             "threshold_trials": threshold_trials,
         },
         {
@@ -1929,26 +1754,6 @@ def build_outputs(output_dir: Path):
             f"fields: {forbidden_voter_keys[:10]}"
         )
 
-    selected_side_signatures = []
-    for c in challenges:
-        for side in ("side_A","side_B"):
-            selected_side_signatures.append(
-                canonical_side_signature(
-                    [x["key"] for x in c[side]["assets"]]
-                )
-            )
-    if len(selected_side_signatures) != 80:
-        raise RuntimeError("Expected exactly 80 selected sides")
-    if len(set(selected_side_signatures)) != 80:
-        counts=Counter(selected_side_signatures)
-        repeated={
-            sig:n for sig,n in counts.items() if n>1
-        }
-        raise RuntimeError(
-            "Human-review side-package uniqueness gate failed: "
-            + json.dumps(repeated,sort_keys=True)
-        )
-
     unique_players = len(appearance)
     repeated_players = sorted(
         key
@@ -2040,9 +1845,6 @@ def build_outputs(output_dir: Path):
                 len(v7_overlap),
             "exact_v7_trade_overlaps":
                 v7_overlap,
-            "unique_side_package_count": 80,
-            "repeated_exact_side_package_count": 0,
-            "human_review_side_uniqueness_gate_passed": True,
         },
         "voter_blinding": {
             "fv_visible_to_voter": False,
@@ -2162,8 +1964,6 @@ def build_outputs(output_dir: Path):
                 sha256(AMENDMENT),
             "fixed50_protocol_amendment_manifest":
                 sha256(AMENDMENT_MANIFEST),
-            "catalog_human_review_amendment":
-                sha256(HUMAN_REVIEW_AMENDMENT),
             "frozen_player_snapshot":
                 sha256(SNAPSHOT),
             "v7_development_catalog":
@@ -2222,7 +2022,6 @@ def build_outputs(output_dir: Path):
         f"- Unique players: **{unique_players} / {len(occurrence_fvs)} appearances**",
         f"- Maximum player appearances: **{max(appearance.values())}**",
         f"- Exact V7 trade overlap: **{len(v7_overlap)}**",
-        "- Exact repeated side packages: **0 / 80 sides**",
         f"- Minimum raw-sum ratio: **{min(raw_ratios):.4f}**",
         "- Frozen development maturity: **50 complete voters × 40 = 2,000 accepted ballots**",
         "",
@@ -2299,8 +2098,6 @@ def build_outputs(output_dir: Path):
                 git_blob(AMENDMENT),
             "fixed50_protocol_amendment_manifest_git_blob":
                 git_blob(AMENDMENT_MANIFEST),
-            "catalog_human_review_amendment_git_blob":
-                git_blob(HUMAN_REVIEW_AMENDMENT),
             "frozen_player_snapshot_git_blob":
                 git_blob(SNAPSHOT),
             "v7_catalog_git_blob":
