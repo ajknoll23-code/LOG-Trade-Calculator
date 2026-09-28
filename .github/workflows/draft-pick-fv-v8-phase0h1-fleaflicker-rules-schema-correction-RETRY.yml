@@ -1,0 +1,464 @@
+name: Draft Pick FV V8 - Phase 0H1 Fleaflicker Rules Schema Correction
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: draft-pick-fv-v8-phase0h1-fleaflicker-rules-schema-correction
+  cancel-in-progress: false
+
+jobs:
+  reclassify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PYTHONDONTWRITEBYTECODE: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install runtime dependency
+        run: python -m pip install --disable-pip-version-check requests
+
+      - name: Download and verify exact Phase 0H artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/p0h" "${RUNNER_TEMP}/out"
+
+          RUN_ID="36453013232"
+          ARTIFACT_ID="10984590931"
+          EXPECTED_DIGEST="sha256:b7a68a69762057fac7acc845e78d3b90b129fb5b9eb37e15acc045c86cf15e36"
+
+          ACTUAL_DIGEST="$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}" --jq '.digest // ""')"
+          test "$ACTUAL_DIGEST" = "$EXPECTED_DIGEST"
+
+          gh run download "$RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            -n "v8-p0h-fleaflicker-third-provider-preregistration" \
+            -D "${RUNNER_TEMP}/p0h"
+
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          p=Path(os.environ["RUNNER_TEMP"])/"p0h"
+          r=json.loads((p/"v8_phase0h_fleaflicker_third_provider_source_frame.json").read_text())
+          c=json.loads((p/"v8_phase0h_fleaflicker_third_provider_contract.json").read_text())
+
+          assert r["decision"]=="STOP_V8_PHASE0H_FLEAFLICKER_SOURCE_FRAME_INSUFFICIENT_BEFORE_DRAFT_PICKS"
+          assert r["candidate_n"]==46
+          assert r["candidate_ids_sha256"]=="4d2a4420a7ab49314b0b1240e48c81cf979138d9eadd172715949182e015ba0f"
+          assert len(r["candidate_ids"])==46
+          assert len(set(r["candidate_ids"]))==46
+          assert r["candidate_status_counts"]=={
+              "current_rules_not_sf_2qb":42,
+              "historical_2018_not_12_team":4,
+          }
+          assert r["prequalified_metadata_only_league_n"]==0
+          assert r["transport"]["unresolved_distinct_league_n"]==0
+          assert r["transport"]["gate_pass"] is True
+          assert r["fleaflicker_draft_board_read"] is False
+          assert r["fleaflicker_draft_pick_read"] is False
+          assert r["historical_player_outcomes_read"] is False
+          assert r["holdout_2024_outcomes_read"] is False
+          assert r["production_change_authorized"] is False
+
+          assert c["status"]=="FROZEN_PRE_FLEAFLICKER_DRAFT_BOARD_PRE_OUTCOME"
+          assert c["discovery"]["candidate_n"]==46
+          assert c["discovery"]["candidate_ids_sha256"]==r["candidate_ids_sha256"]
+          assert c["metadata_qualification"]["historical_team_count_required"]==12
+          assert c["metadata_qualification"]["sf_2qb_is_current_rules_continuity_proxy"] is True
+          assert c["metadata_qualification"]["rookie_scope_not_tested_in_phase0h"] is True
+          assert c["metadata_qualification"]["draft_board_endpoint_allowed_in_phase0h"] is False
+
+          print("PASS: exact Phase 0H frozen 46-candidate universe verified.")
+          PY
+
+      - name: Reclassify only the frozen Phase 0H candidates with corrected Fleaflicker rules schema
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import math
+          import os
+          import time
+          from collections import Counter
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+
+          ROOT=Path(os.environ["RUNNER_TEMP"])
+          P0H=ROOT/"p0h"
+          OUT=ROOT/"out"
+
+          frozen=json.loads((P0H/"v8_phase0h_fleaflicker_third_provider_source_frame.json").read_text())
+          contract=json.loads((P0H/"v8_phase0h_fleaflicker_third_provider_contract.json").read_text())
+
+          API_BASE="https://www.fleaflicker.com/api"
+          REQUIRED_NEW_DISTINCT_LEAGUES=6
+          TRANSPORT_CAP=3
+          YEAR=2018
+
+          def safe_int(x: Any):
+              try:
+                  return int(str(x).strip())
+              except Exception:
+                  return None
+
+          def sha_ids(values):
+              return hashlib.sha256("\n".join(str(x) for x in values).encode()).hexdigest()
+
+          def get_positions(obj: dict[str,Any]):
+              # Fleaflicker's live JSON has historically used camelCase
+              # (rosterPositions), while current generated API docs expose
+              # snake_case (roster_positions). Accept both without changing
+              # any scientific qualification rule.
+              x=obj.get("rosterPositions")
+              if not isinstance(x,list):
+                  x=obj.get("roster_positions")
+              return x if isinstance(x,list) else None
+
+          def sf_2qb_from_rules(obj: dict[str,Any]):
+              positions=get_positions(obj)
+              top_keys=sorted(str(k) for k in obj.keys())
+              if positions is None:
+                  return False,"rules_schema_unrecognized",{
+                      "top_level_keys":top_keys,
+                      "recognized_positions_key":None,
+                  }
+
+              positions_key=(
+                  "rosterPositions"
+                  if isinstance(obj.get("rosterPositions"),list)
+                  else "roster_positions"
+              )
+
+              qb_only_starts=0
+              qb_flex_starts=0
+              start_rows=[]
+
+              for p in positions:
+                  if not isinstance(p,dict):
+                      continue
+                  group=str(p.get("group") or "").upper()
+                  if group!="START":
+                      continue
+
+                  start=max(0,safe_int(p.get("start")) or 0)
+                  elig={str(x).upper() for x in (p.get("eligibility") or []) if x is not None}
+                  if start<=0:
+                      continue
+
+                  start_rows.append({
+                      "label":p.get("label"),
+                      "eligibility":sorted(elig),
+                      "start":start,
+                  })
+
+                  if elig=={"QB"}:
+                      qb_only_starts+=start
+
+                  if "QB" in elig and bool(elig & {"RB","WR","TE"}):
+                      qb_flex_starts+=start
+
+              detail={
+                  "top_level_keys":top_keys,
+                  "recognized_positions_key":positions_key,
+                  "roster_position_n":len(positions),
+                  "qb_only_starts":qb_only_starts,
+                  "qb_flex_starts":qb_flex_starts,
+                  "start_rows":start_rows,
+                  "num_starters":safe_int(obj.get("numStarters") if "numStarters" in obj else obj.get("num_starters")),
+                  "max_roster_size":safe_int(obj.get("maxRosterSize") if "maxRosterSize" in obj else obj.get("max_roster_size")),
+              }
+
+              if qb_only_starts>=2:
+                  return True,"current_rules_2qb",detail
+              if qb_only_starts>=1 and qb_flex_starts>=1:
+                  return True,"current_rules_superflex",detail
+              return False,"current_rules_not_sf_2qb",detail
+
+          # Parser self-tests explicitly cover the exact schema mismatch that
+          # invalidated the Phase 0H zero-result conclusion.
+          def selftest():
+              camel={
+                  "rosterPositions":[
+                      {"group":"START","label":"QB","eligibility":["QB"],"start":1},
+                      {"group":"START","label":"FLEX","eligibility":["QB","RB","WR","TE"],"start":1},
+                  ],
+                  "numStarters":10,
+                  "maxRosterSize":25,
+              }
+              ok,kind,detail=sf_2qb_from_rules(camel)
+              assert ok and kind=="current_rules_superflex"
+              assert detail["recognized_positions_key"]=="rosterPositions"
+
+              snake={
+                  "roster_positions":[
+                      {"group":"START","label":"QB","eligibility":["QB"],"start":2},
+                  ],
+                  "num_starters":9,
+                  "max_roster_size":22,
+              }
+              ok,kind,detail=sf_2qb_from_rules(snake)
+              assert ok and kind=="current_rules_2qb"
+              assert detail["recognized_positions_key"]=="roster_positions"
+
+              oneqb={
+                  "rosterPositions":[
+                      {"group":"START","label":"QB","eligibility":["QB"],"start":1},
+                      {"group":"START","label":"FLEX","eligibility":["RB","WR","TE"],"start":1},
+                  ]
+              }
+              ok,kind,_=sf_2qb_from_rules(oneqb)
+              assert not ok and kind=="current_rules_not_sf_2qb"
+
+              ok,kind,_=sf_2qb_from_rules({"groups":[]})
+              assert not ok and kind=="rules_schema_unrecognized"
+
+              print("PASS: corrected Fleaflicker camelCase/snake_case rules parser self-test.")
+
+          selftest()
+
+          session=requests.Session()
+          session.headers.update({
+              "User-Agent":"LOG-Draft-Pick-FV-V8-P0H1-Fleaflicker-RulesSchemaCorrection/1.0",
+              "Accept":"application/json,*/*;q=0.8",
+          })
+
+          def fetch_rules(lid: str):
+              url=f"{API_BASE}/FetchLeagueRules"
+              last=None
+              for attempt in range(6):
+                  try:
+                      r=session.get(
+                          url,
+                          params={"sport":"NFL","league_id":int(lid)},
+                          timeout=35,
+                      )
+                      if r.status_code in {429,500,502,503,504}:
+                          raise requests.HTTPError(f"HTTP {r.status_code}",response=r)
+                      r.raise_for_status()
+                      obj=r.json()
+                      if not isinstance(obj,dict):
+                          raise RuntimeError("non-object rules JSON")
+                      time.sleep(0.20)
+                      return obj
+                  except Exception as exc:
+                      last=exc
+                      if attempt==5:
+                          break
+                      time.sleep(min(2**attempt,12))
+              raise RuntimeError(f"rules transport exhausted: {type(last).__name__}: {last}")
+
+          # Preserve the exact Phase 0H order and exact historical-team result.
+          records=[]
+          for prior in frozen["candidate_records"]:
+              lid=str(prior["league_id"])
+              rec={
+                  "scan_index":int(prior["scan_index"]),
+                  "league_id":lid,
+                  "league_name":prior.get("league_name"),
+                  "historical_2018_team_n":prior.get("historical_2018_team_n"),
+                  "phase0h_status":prior["status"],
+              }
+
+              if prior.get("historical_2018_team_n")!=12:
+                  rec["status"]="historical_2018_not_12_team_frozen"
+                  records.append(rec)
+                  continue
+
+              try:
+                  rules=fetch_rules(lid)
+                  ok,kind,detail=sf_2qb_from_rules(rules)
+                  rec["rules_kind"]=kind
+                  rec["rules_detail"]=detail
+                  rec["status"]="prequalified_metadata_only" if ok else kind
+                  records.append(rec)
+              except Exception as exc:
+                  rec["status"]="transport_unresolved"
+                  rec["transport_error_fingerprint_sha256"]=hashlib.sha256(str(exc).encode()).hexdigest()
+                  records.append(rec)
+
+          assert len(records)==46
+          assert [x["league_id"] for x in records]==frozen["candidate_ids"]
+          assert sha_ids([x["league_id"] for x in records])==frozen["candidate_ids_sha256"]
+
+          status_counts=Counter(x["status"] for x in records)
+          prequalified=[x for x in records if x["status"]=="prequalified_metadata_only"]
+          prequalified_ids=[x["league_id"] for x in prequalified]
+          transport=[x for x in records if x["status"]=="transport_unresolved"]
+          schema_unrecognized=[x for x in records if x["status"]=="rules_schema_unrecognized"]
+
+          combined_unresolved_n=len(transport)+len(schema_unrecognized)
+          unresolved_gate=combined_unresolved_n<=TRANSPORT_CAP
+          minimum_pass=len(prequalified_ids)>=REQUIRED_NEW_DISTINCT_LEAGUES
+          proceed=minimum_pass and unresolved_gate
+
+          decision=(
+              "PROCEED_TO_V8_PHASE0I_FLEAFLICKER_DRAFT_SCOPE_AND_R6_PROBE"
+              if proceed else
+              "STOP_V8_PHASE0H1_FLEAFLICKER_SOURCE_FRAME_INSUFFICIENT_BEFORE_DRAFT_PICKS"
+          )
+
+          result={
+              "schema_version":1,
+              "study_id":"draft-pick-fv-v8-depth-specific-source-cohorts",
+              "stage":"phase0h1_fleaflicker_rules_schema_correction",
+              "decision":decision,
+              "correction_reason":{
+                  "phase0h_parser_expected_only":"roster_positions",
+                  "live_legacy_client_key":"rosterPositions",
+                  "corrected_parser_accepts":["rosterPositions","roster_positions"],
+                  "scientific_qualification_rule_changed":False,
+                  "candidate_universe_changed":False,
+                  "historical_team_gate_changed":False,
+                  "current_sf_2qb_proxy_rule_changed":False,
+              },
+              "input_phase0h":{
+                  "run_id":36453013232,
+                  "artifact_id":10984590931,
+                  "artifact_digest":"sha256:b7a68a69762057fac7acc845e78d3b90b129fb5b9eb37e15acc045c86cf15e36",
+                  "candidate_n":46,
+                  "candidate_ids_sha256":"4d2a4420a7ab49314b0b1240e48c81cf979138d9eadd172715949182e015ba0f",
+              },
+              "candidate_n":46,
+              "candidate_ids":list(frozen["candidate_ids"]),
+              "candidate_ids_sha256":frozen["candidate_ids_sha256"],
+              "candidate_status_counts":dict(sorted(status_counts.items())),
+              "candidate_records":records,
+              "prequalified_metadata_only_league_n":len(prequalified_ids),
+              "prequalified_metadata_only_league_ids":prequalified_ids,
+              "prequalified_metadata_only_league_ids_sha256":sha_ids(prequalified_ids),
+              "minimum_required_for_phase0i":REQUIRED_NEW_DISTINCT_LEAGUES,
+              "source_frame_minimum_pass":minimum_pass,
+              "unresolved":{
+                  "transport_n":len(transport),
+                  "schema_unrecognized_n":len(schema_unrecognized),
+                  "combined_n":combined_unresolved_n,
+                  "maximum_allowed_n":TRANSPORT_CAP,
+                  "gate_pass":unresolved_gate,
+              },
+              "fleaflicker_draft_board_read":False,
+              "fleaflicker_draft_pick_read":False,
+              "player_catalog_read":False,
+              "historical_player_outcomes_read":False,
+              "holdout_2024_outcomes_read":False,
+              "holdout_2024_search_performed":False,
+              "market_or_ktc_values_read":False,
+              "package_vote_data_read":False,
+              "candidate_fit_performed":False,
+              "candidate_scores_computed":False,
+              "production_change_authorized":False,
+              "next_stage":(
+                  "draft-pick-fv-v8-phase0i-fleaflicker-draft-scope-r6-probe"
+                  if proceed else
+                  "STOP_RESEARCH_BEFORE_OUTCOMES_REVIEW_FLEAFLICKER_SOURCE_FRAME"
+              ),
+          }
+
+          (OUT/"v8_phase0h1_fleaflicker_rules_schema_correction.json").write_text(
+              json.dumps(result,indent=2,sort_keys=True)+"\n"
+          )
+
+          lines=[
+              "# Draft Pick FV V8 — Phase 0H1 Fleaflicker Rules Schema Correction",
+              "",
+              f"**Decision:** `{decision}`",
+              "",
+              "- Frozen Phase 0H candidate universe: **46** (unchanged)",
+              f"- Historical 2018 12-team candidates reclassified: **{sum(1 for x in records if x['historical_2018_team_n']==12)}**",
+              f"- SF/2QB metadata-qualified leagues: **{len(prequalified_ids)}**",
+              f"- Minimum required for Phase 0I: **{REQUIRED_NEW_DISTINCT_LEAGUES}**",
+              f"- Transport unresolved: **{len(transport)}**",
+              f"- Rules schema unresolved after camelCase + snake_case support: **{len(schema_unrecognized)}**",
+              "",
+              "The Phase 0H candidate universe, historical-team gate, dynasty/keeper proxy, and SF/2QB qualification rule are unchanged. Only JSON field-name compatibility was corrected.",
+              "",
+              "No Fleaflicker draft board, draft pick, player outcome, 2024 holdout outcome, market/KTC value, package-vote, fit, score, or production value was read.",
+          ]
+          (OUT/"v8_phase0h1_fleaflicker_rules_schema_correction.md").write_text(
+              "\n".join(lines)+"\n"
+          )
+
+          print("\n".join(lines))
+          PY
+
+      - name: Validate Phase 0H1 correction and firewalls
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          p=Path(os.environ["RUNNER_TEMP"])/"out"/"v8_phase0h1_fleaflicker_rules_schema_correction.json"
+          d=json.loads(p.read_text())
+
+          assert d["candidate_n"]==46
+          assert len(d["candidate_ids"])==46
+          assert len(set(d["candidate_ids"]))==46
+          assert d["candidate_ids_sha256"]=="4d2a4420a7ab49314b0b1240e48c81cf979138d9eadd172715949182e015ba0f"
+          assert d["input_phase0h"]["run_id"]==36453013232
+          assert d["input_phase0h"]["artifact_id"]==10984590931
+          assert d["correction_reason"]["scientific_qualification_rule_changed"] is False
+          assert d["correction_reason"]["candidate_universe_changed"] is False
+          assert d["correction_reason"]["historical_team_gate_changed"] is False
+          assert d["correction_reason"]["current_sf_2qb_proxy_rule_changed"] is False
+          assert d["minimum_required_for_phase0i"]==6
+
+          for key in (
+              "fleaflicker_draft_board_read",
+              "fleaflicker_draft_pick_read",
+              "player_catalog_read",
+              "historical_player_outcomes_read",
+              "holdout_2024_outcomes_read",
+              "holdout_2024_search_performed",
+              "market_or_ktc_values_read",
+              "package_vote_data_read",
+              "candidate_fit_performed",
+              "candidate_scores_computed",
+              "production_change_authorized",
+          ):
+              assert d[key] is False,(key,d[key])
+
+          assert d["decision"] in {
+              "PROCEED_TO_V8_PHASE0I_FLEAFLICKER_DRAFT_SCOPE_AND_R6_PROBE",
+              "STOP_V8_PHASE0H1_FLEAFLICKER_SOURCE_FRAME_INSUFFICIENT_BEFORE_DRAFT_PICKS",
+          }
+
+          if d["decision"]=="PROCEED_TO_V8_PHASE0I_FLEAFLICKER_DRAFT_SCOPE_AND_R6_PROBE":
+              assert d["prequalified_metadata_only_league_n"]>=6
+              assert d["source_frame_minimum_pass"] is True
+              assert d["unresolved"]["gate_pass"] is True
+              assert d["next_stage"]=="draft-pick-fv-v8-phase0i-fleaflicker-draft-scope-r6-probe"
+
+          print("PASS: Phase 0H1 corrects only Fleaflicker JSON field-name compatibility; source frame remains frozen and outcome sealed.")
+          PY
+
+      - name: Upload Phase 0H1 correction closeout
+        uses: actions/upload-artifact@v4
+        with:
+          name: v8-p0h1-fleaflicker-rules-schema-correction
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
+          retention-days: 30
