@@ -1,21 +1,20 @@
 # Completed GitHub Actions Research Workflows
 
-Completed manual-only research/deployment workflows are moved out of `.github/workflows` so they do not clutter the GitHub Actions workflow list.
+Completed manual/research workflows are moved out of `.github/workflows` so the Actions list stays organized.
 
-Archived YAML files are preserved byte-for-byte. Original paths, Git blob SHAs, SHA-256 hashes, and triggers are recorded in `archive_manifest.json`.
+Archived YAML files are preserved byte-for-byte. Original paths, Git blob SHAs, SHA-256 hashes, triggers, and any scoped push paths are recorded in `archive_manifest.json`.
 
-Recurring production/data workflows and studies that are still active or intentionally rerunnable remain in `.github/workflows`.
+Recurring production/data workflows and active research remain in `.github/workflows`.
 
-Archive refreshed: 2026-09-27T00:30:28.590642+00:00
+Archive refreshed: 2026-09-28T23:17:14.444178+00:00
 
-Archived workflow count: **158**
-Active protected workflow count: **20**
+Archived workflow count: **187**
+Active protected workflow count: **26**
 
 ## Active protected workflows
 
 - age-curve-v2-phase5.yml
 - cross-position-apex-calibration-v1-phase2-cross-study-reconciliation.yml
-- draft-pick-fv-v8-phase0b-qualified-depth-feasibility-PATCHED.yml
 - durability-v2-phase5.yml
 - fantasypros-api-pipeline.yml
 - free-agent-utility-v1-refresh.yml
@@ -25,6 +24,13 @@ Active protected workflow count: **20**
 - no-history-rookie-v2-phase3.yml
 - opportunity-v2-phase5.yml
 - package-adjustment-audit-step4-exact-live-oos.yml
+- package-adjustment-v8-development-voting-activation-v1.yml
+- package-adjustment-v8-outcome-blind-maturity-monitor-v1.yml
+- package-adjustment-v8-phase1c-development-catalog-and-audit-v1.yml
+- package-adjustment-v8-phase1d-fixed50-protocol-amendment-v1.yml
+- package-adjustment-v8-phase1e-evaluation-engine-freeze-v2.yml
+- package-adjustment-v8-phase1f-pre-vote-operational-hardening-v2.yml
+- package-adjustment-v8-phase1f-pre-vote-operational-hardening-v3.yml
 - position-weight-v2-phase5.yml
 - prospective-trade-evidence-capture.yml
 - replacement-level-v2-phase5.yml
@@ -32,7 +38,7 @@ Active protected workflow count: **20**
 - research-program-status-v1-current-state-audit.yml
 - scheduled-data-refresh.yml
 - sync-sleeper.yml
-- workflow-folder-cleanup-UPDATED-2026-09-26.yml
+- workflow-folder-cleanup-v9-prep.yml
 
 ## Archived workflows
 
@@ -97,8 +103,37 @@ Active protected workflow count: **20**
 - draft-pick-fv-v7-phase2-residual-router-recovery.yml
 - draft-pick-fv-v7-phase2-source-feasibility-closeout-v4_2.yml
 - draft-pick-fv-v7-phase2-targeted-r25-recovery.yml
+- draft-pick-fv-v8-1-closeout-preregistration.yml
+- draft-pick-fv-v8-1-final-research-closeout-v2.yml
+- draft-pick-fv-v8-1-final-research-closeout.yml
+- draft-pick-fv-v8-1-phase1-5.yml
+- draft-pick-fv-v8-1-phase1-6-holdout-rookie-only-scope-hardening-v2.yml
+- draft-pick-fv-v8-1-phase1-6-holdout-rookie-only-scope-hardening.yml
+- draft-pick-fv-v8-1-phase1-sparse-tail-sensitivity.yml
+- draft-pick-fv-v8-1-phase2-2024-h2-independent-confirmation-ready.yml
 - draft-pick-fv-v8-phase0a-raw-depth-feasibility-v2-reloaded.yml
+- draft-pick-fv-v8-phase0b-qualified-depth-feasibility-PATCHED.yml
 - draft-pick-fv-v8-phase0b-qualified-depth-feasibility.yml
+- draft-pick-fv-v8-phase0c-incremental-r6-rescue-v2.yml
+- draft-pick-fv-v8-phase0c-incremental-r6-rescue-v3-sharded.yml
+- draft-pick-fv-v8-phase0c-incremental-r6-rescue.yml
+- draft-pick-fv-v8-phase0c-local-cell-source-redesign.yml
+- draft-pick-fv-v8-phase0d-targeted-2018-r6-source-expansion.yml
+- draft-pick-fv-v8-phase0e-sleeper-second-source-2018-r6-PATCHED.yml
+- draft-pick-fv-v8-phase0e-sleeper-second-source-2018-r6.yml
+- draft-pick-fv-v8-phase0f-sleeper-qualified-draft-metadata-audit.yml
+- draft-pick-fv-v8-phase0g-sleeper-bridge-upper-bound-closeout-RETRY.yml
+- draft-pick-fv-v8-phase0g-sleeper-bridge-upper-bound-closeout.yml
+- draft-pick-fv-v8-phase0h-fleaflicker-third-provider-preregistration-RETRY.yml
+- draft-pick-fv-v8-phase0h1-fleaflicker-rules-schema-correction-RETRY.yml
+- draft-pick-fv-v8-phase0i-fleaflicker-draft-scope-r6-probe-RETRY.yml
+- draft-pick-fv-v8-phase0i-fleaflicker-draft-scope-r6-probe.yml
+- draft-pick-fv-v8-phase0j-source-availability-amendment.yml
+- draft-pick-fv-v8-phase1-1-position-retention-hardening-RETRY.yml
+- draft-pick-fv-v8-phase1-1-position-retention-hardening.yml
+- draft-pick-fv-v8-phase1-incremental-source-identity-freeze.yml
+- draft-pick-fv-v8-phase2-historical-outcome-harvest.yml
+- draft-pick-fv-v8-phase3-loyo-development-selection.yml
 - draft-pick-valuation-structural-audit.yml
 - draft-slot-projection-activation.yml
 - elite-surplus-positional-scarcity-audit.yml
