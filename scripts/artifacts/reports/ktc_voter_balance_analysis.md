@@ -1,7 +1,7 @@
 # KTC Voter-Balance Research Analysis
 
 Method: `ktc-voter-balance-analysis-v1`  
-Source generated at: `2026-09-25T12:14:13.665653`  
+Source generated at: `2026-09-28T19:49:51.741524`  
 Status: `research_only_no_market_value_change`
 
 ## Critical interpretation
