@@ -1,0 +1,1176 @@
+name: Draft Pick FV V8 - Phase 0E Sleeper Second Source 2018 R6
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: draft-pick-fv-v8-phase0e-sleeper-second-source-2018-r6
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      matrix: ${{ steps.freeze.outputs.matrix }}
+      shard_count: ${{ steps.freeze.outputs.shard_count }}
+      candidate_count: ${{ steps.freeze.outputs.candidate_count }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install runtime dependency
+        run: python -m pip install --disable-pip-version-check requests
+
+      - name: Resolve and verify exact Phase 0D stop artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/prep/p0d"
+
+          # Immutable Phase 0D lineage. Do not auto-resolve "latest":
+          # Phase 0E is preregistered against this exact scientific stop.
+          RUN_ID="36378357894"
+          ARTIFACT_ID="10952656904"
+          EXPECTED_ARTIFACT_DIGEST="sha256:0c24659a7e085f47876227349c884060714f6efbdc90ef680c26750c4359f1a6"
+
+          ARTIFACT_DIGEST="$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}" \
+            --jq '.digest // ""')"
+          test "$ARTIFACT_DIGEST" = "$EXPECTED_ARTIFACT_DIGEST"
+
+          gh run download "$RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            -n "v8-p0d-targeted-2018-r6-closeout" \
+            -D "${RUNNER_TEMP}/prep/p0d"
+
+          printf '%s\n' "$RUN_ID" > "${RUNNER_TEMP}/prep/p0d_run_id.txt"
+          printf '%s\n' "$ARTIFACT_ID" > "${RUNNER_TEMP}/prep/p0d_artifact_id.txt"
+          printf '%s\n' "$ARTIFACT_DIGEST" > "${RUNNER_TEMP}/prep/p0d_artifact_digest.txt"
+
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          p=Path(os.environ["RUNNER_TEMP"])/"prep"/"p0d"
+          s=json.loads((p/"v8_phase0d_targeted_2018_r6_source_expansion.json").read_text())
+          e=json.loads((p/"v8_phase0d_exact_source_identity_evidence.json").read_text())
+
+          assert s["decision"]=="STOP_AND_PREREGISTER_V8_PHASE0E_SECOND_SOURCE_2018_R6_BEFORE_OUTCOMES"
+          assert s["phase0c_year_cells_passing"]==105
+          assert s["phase0d_target_year"]==2018
+          assert s["phase0d_target_cells"]==["r6_early","r6_mid","r6_late"]
+          assert s["phase0d_baseline_n_each"]==6
+          assert s["phase0d_new_candidate_n"]==959
+          assert s["phase0d_shard_n"]==60
+          assert s["phase0d_candidate_evidence_prefetched_n"]==959
+          assert s["phase0d_ordered_replay_attempt_n"]==959
+          assert s["phase0d_completion_order_invariance_pass"] is True
+          assert s["phase0d_final_target_counts"]=={
+              "r6_early":6,"r6_mid":6,"r6_late":6,
+          }
+          assert s["year_cells_passing"]==105
+          assert s["all_year_cells_pass"] is False
+          assert s["transport"]["combined_distinct_unresolved_candidate_n"]==27
+          assert s["transport"]["maximum_allowed_candidate_n"]==62
+          assert s["transport"]["gate_pass"] is True
+          assert s["deficient_year_cells"]==[
+              {"draft_year":2018,"cell":"r6_early","fully_usable_league_n":6,"shortfall":6},
+              {"draft_year":2018,"cell":"r6_late","fully_usable_league_n":6,"shortfall":6},
+              {"draft_year":2018,"cell":"r6_mid","fully_usable_league_n":6,"shortfall":6},
+          ]
+          assert s["historical_outcome_ingestion_authorized"] is False
+          assert s["holdout_2024_outcomes_read"] is False
+          assert s["production_change_authorized"] is False
+          assert all(v is False for v in s["firewalls"].values())
+
+          assert e["decision"]==s["decision"]
+          assert e["phase0d_completion_order_invariance_pass"] is True
+          assert e["historical_player_outcomes_read"] is False
+          assert e["holdout_2024_outcomes_read"] is False
+          assert e["candidate_fit_performed"] is False
+          assert e["production_change_authorized"] is False
+          for cell in ("r6_early","r6_mid","r6_late"):
+              assert len(e["cell_membership_league_ids"][f"2018:{cell}"])==6
+
+          print("PASS: exact Phase 0D scientific stop verified before Sleeper discovery.")
+          PY
+
+      - name: Freeze Phase 0E Sleeper discovery contract before draft inspection
+        id: freeze
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import math
+          import os
+          import time
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+
+          ROOT=Path(os.environ["RUNNER_TEMP"])/"prep"
+          P0D=ROOT/"p0d"
+
+          YEAR=2018
+          TARGET_CELLS=("r6_early","r6_mid","r6_late")
+          SEED_LEAGUES=("289646328504385536",)
+          DISCOVERY_WAVES=3
+          MAX_USERS_PER_WAVE=240
+          MAX_LEAGUES_FOR_USER_EXPANSION_PER_WAVE=180
+          CANDIDATE_CAP=1800
+          SHARD_SIZE=20
+          MAX_SHARDS=256
+          MAX_PARALLEL=12
+
+          class TransportError(RuntimeError): pass
+
+          session=requests.Session()
+          session.headers["User-Agent"]="LOG-Draft-Pick-FV-V8-P0E-Sleeper-Discovery/1.0"
+
+          def stable_hash(text: str) -> str:
+              return hashlib.sha256(text.encode()).hexdigest()
+
+          def sha_ids(values: list[str]) -> str:
+              return hashlib.sha256("\n".join(values).encode()).hexdigest()
+
+          def get_json(path: str) -> Any:
+              url=f"https://api.sleeper.app/v1/{path.lstrip('/')}"
+              last=None
+              for attempt in range(6):
+                  try:
+                      r=session.get(url,timeout=30)
+                      if r.status_code in {429,500,502,503,504}:
+                          raise requests.HTTPError(f"HTTP {r.status_code}",response=r)
+                      r.raise_for_status()
+                      time.sleep(0.08)
+                      return r.json()
+                  except Exception as exc:
+                      last=exc
+                      if attempt==5:
+                          break
+                      time.sleep(min(2**attempt,16))
+              raise TransportError(f"Sleeper discovery transport failure path={path}: {type(last).__name__}: {last}")
+
+          s=json.loads((P0D/"v8_phase0d_targeted_2018_r6_source_expansion.json").read_text())
+          e=json.loads((P0D/"v8_phase0d_exact_source_identity_evidence.json").read_text())
+          assert s["decision"]=="STOP_AND_PREREGISTER_V8_PHASE0E_SECOND_SOURCE_2018_R6_BEFORE_OUTCOMES"
+          assert s["phase0d_final_target_counts"]=={c:6 for c in TARGET_CELLS}
+
+          run_id=(ROOT/"p0d_run_id.txt").read_text().strip()
+          artifact_id=(ROOT/"p0d_artifact_id.txt").read_text().strip()
+          artifact_digest=(ROOT/"p0d_artifact_digest.txt").read_text().strip()
+
+          # Discovery deliberately reads only league IDs and user IDs. It does not inspect
+          # draft metadata, draft picks, player identities, player outcomes, or market data.
+          seen_users=set()
+          seen_leagues=set(SEED_LEAGUES)
+          frontier_users=set()
+          wave_stats=[]
+
+          for lid in SEED_LEAGUES:
+              users=get_json(f"league/{lid}/users") or []
+              for u in users:
+                  uid=str((u or {}).get("user_id") or "").strip()
+                  if uid:
+                      frontier_users.add(uid)
+
+          for wave in range(1,DISCOVERY_WAVES+1):
+              ordered_users=sorted(
+                  (u for u in frontier_users if u not in seen_users),
+                  key=lambda u:(stable_hash(f"v8p0e|wave{wave}|user|{u}"),u),
+              )[:MAX_USERS_PER_WAVE]
+              if not ordered_users:
+                  wave_stats.append({
+                      "wave":wave,"queried_user_n":0,"new_league_n":0,
+                      "expanded_league_n":0,"next_user_n":0,
+                  })
+                  frontier_users=set()
+                  continue
+
+              new_leagues=set()
+              for uid in ordered_users:
+                  seen_users.add(uid)
+                  leagues=get_json(f"user/{uid}/leagues/nfl/{YEAR}") or []
+                  for lg in leagues:
+                      lid=str((lg or {}).get("league_id") or "").strip()
+                      if lid and lid not in seen_leagues:
+                          seen_leagues.add(lid)
+                          new_leagues.add(lid)
+
+              expansion_ids=sorted(
+                  new_leagues,
+                  key=lambda lid:(stable_hash(f"v8p0e|wave{wave}|league-users|{lid}"),lid),
+              )[:MAX_LEAGUES_FOR_USER_EXPANSION_PER_WAVE]
+              next_users=set()
+              for lid in expansion_ids:
+                  users=get_json(f"league/{lid}/users") or []
+                  for u in users:
+                      uid=str((u or {}).get("user_id") or "").strip()
+                      if uid and uid not in seen_users:
+                          next_users.add(uid)
+
+              wave_stats.append({
+                  "wave":wave,
+                  "queried_user_n":len(ordered_users),
+                  "new_league_n":len(new_leagues),
+                  "expanded_league_n":len(expansion_ids),
+                  "next_user_n":len(next_users),
+              })
+              frontier_users=next_users
+
+          discovered=sorted(
+              seen_leagues,
+              key=lambda lid:(stable_hash(f"v8p0e|2018|candidate|{lid}"),lid),
+          )
+          candidates=discovered[:CANDIDATE_CAP]
+          if len(candidates)<12:
+              raise RuntimeError(f"Sleeper discovery produced only {len(candidates)} candidate leagues")
+          assert len(candidates)==len(set(candidates))
+
+          shard_n=math.ceil(len(candidates)/SHARD_SIZE)
+          assert shard_n<=MAX_SHARDS,(len(candidates),shard_n)
+          matrix=[]
+          for i in range(shard_n):
+              lo=i*SHARD_SIZE
+              hi=min(len(candidates),(i+1)*SHARD_SIZE)
+              matrix.append({
+                  "shard":f"{i:03d}",
+                  "start":lo+1,
+                  "end":hi,
+                  "slot":i%MAX_PARALLEL,
+              })
+
+          contract={
+              "schema_version":1,
+              "study_id":"draft-pick-fv-v8-depth-specific-source-cohorts",
+              "stage":"phase0e_sleeper_second_source_2018_r6_preregistration",
+              "status":"FROZEN_PRE_PHASE0E_SLEEPER_DRAFT_PROBE_PRE_OUTCOME",
+              "trigger":{
+                  "phase0d_decision":s["decision"],
+                  "phase0d_new_mfl_candidates_exhausted":959,
+                  "phase0d_final_target_counts":{c:6 for c in TARGET_CELLS},
+                  "remaining_year":2018,
+                  "remaining_cells":list(TARGET_CELLS),
+                  "required_additional_independent_source_leagues_each":6,
+                  "source_only_evidence":True,
+              },
+              "frozen_phase0d_baseline":{
+                  "run_id":run_id,
+                  "artifact_id":artifact_id,
+                  "artifact_digest":artifact_digest,
+                  "summary_sha256":hashlib.sha256((P0D/"v8_phase0d_targeted_2018_r6_source_expansion.json").read_bytes()).hexdigest(),
+                  "exact_evidence_sha256":hashlib.sha256((P0D/"v8_phase0d_exact_source_identity_evidence.json").read_bytes()).hexdigest(),
+                  "all_non_target_105_year_cells_frozen":True,
+                  "non_target_membership_may_change":False,
+                  "target_phase0d_membership_may_be_removed_or_reordered":False,
+                  "target_membership_may_only_append_phase0e_sleeper_sources":True,
+              },
+              "second_source":{
+                  "provider":"Sleeper",
+                  "api_base":"https://api.sleeper.app/v1",
+                  "year":2018,
+                  "identity":"native Sleeper player_id; no MFL-to-Sleeper crosswalk",
+                  "source_independence_from_mfl":True,
+                  "historical_outcome_source":False,
+              },
+              "candidate_discovery":{
+                  "method":"deterministic_bipartite_user_league_graph",
+                  "seed_league_ids":list(SEED_LEAGUES),
+                  "seed_reason":"Sleeper public API documentation 2018 example league; fixed before draft inspection",
+                  "waves":DISCOVERY_WAVES,
+                  "max_users_per_wave":MAX_USERS_PER_WAVE,
+                  "max_leagues_for_user_expansion_per_wave":MAX_LEAGUES_FOR_USER_EXPANSION_PER_WAVE,
+                  "candidate_cap":CANDIDATE_CAP,
+                  "candidate_order":"SHA256(v8p0e|2018|candidate|league_id), then league_id",
+                  "candidate_n":len(candidates),
+                  "candidate_ids_sha256":sha_ids(candidates),
+                  "draft_metadata_read_during_discovery":False,
+                  "draft_picks_read_during_discovery":False,
+                  "player_catalog_read_during_discovery":False,
+                  "manual_candidate_addition_allowed":False,
+                  "outcome_dependent_discovery":False,
+                  "discovery_transport_failure_is_fatal":True,
+              },
+              "league_qualifier":{
+                  "season":"2018",
+                  "total_rosters":12,
+                  "dynasty_rule":"league.settings.type == 2",
+                  "superflex_2qb_rule":"SUPER_FLEX roster slot present OR at least two QB roster slots",
+                  "obvious_mock_rule":"reject league or selected draft metadata name containing substring mock (case-insensitive)",
+              },
+              "draft_qualifier":{
+                  "season":"2018",
+                  "status":"complete",
+                  "teams":12,
+                  "minimum_rounds":6,
+                  "rookie_rule":"draft.settings.player_type == 1 only; no retrospective player-experience fallback",
+                  "multiple_eligible_drafts_rule":"earliest start_time, then draft_id",
+                  "target_windows":{
+                      "r6_early":[61,62,63,64],
+                      "r6_mid":[65,66,67,68],
+                      "r6_late":[69,70,71,72],
+                  },
+                  "all_four_slots_exactly_once":True,
+                  "four_nonnull_distinct_sleeper_player_ids":True,
+                  "earlier_round_completeness_required":False,
+              },
+              "selection_rule":{
+                  "baseline_fully_usable_leagues_per_cell":6,
+                  "minimum_total_fully_usable_leagues_per_cell":12,
+                  "required_phase0e_sleeper_additions_per_cell":6,
+                  "candidate_replay_order":"exact frozen Phase 0E candidate order",
+                  "stop_rule":"ordered reducer stops immediately after all three 2018 R6 cells reach 12",
+                  "shards_collect_evidence_only":True,
+                  "shards_may_not_select_sources":True,
+                  "completion_order_may_not_affect_selection":True,
+                  "outcome_dependent_selection":False,
+              },
+              "execution":{
+                  "mode":"deterministic_parallel_candidate_shards_then_ordered_reducer",
+                  "shard_size":SHARD_SIZE,
+                  "shard_n":shard_n,
+                  "max_parallel":MAX_PARALLEL,
+                  "github_matrix_max":MAX_SHARDS,
+              },
+              "transport":{
+                  "phase0d_mfl_unresolved_candidate_n_frozen":27,
+                  "phase0d_mfl_transport_gate_pass_frozen":True,
+                  "phase0e_sleeper_transport_gate":"unresolved <= max(5, ceil(0.01 * candidate_n)); preserves the frozen ~1% V8 transport policy",
+                  "phase0e_sleeper_max_unresolved_candidate_n":max(5,math.ceil(0.01*len(candidates))),
+                  "prefetched_after_ordered_stop_excluded_from_scientific_transport_gate":True,
+              },
+              "firewalls":{
+                  "historical_player_outcomes_read":False,
+                  "holdout_2024_outcomes_read":False,
+                  "holdout_2024_search_performed":False,
+                  "current_player_catalog_read":False,
+                  "market_or_ktc_values_read":False,
+                  "package_vote_data_read":False,
+                  "candidate_fit_performed":False,
+                  "candidate_scores_computed":False,
+                  "production_change_authorized":False,
+              },
+              "pass_decision":"PROCEED_TO_V8_PHASE1_INCREMENTAL_SOURCE_IDENTITY_FREEZE",
+              "fail_decision":"STOP_V8_PHASE0E_SLEEPER_SECOND_SOURCE_INSUFFICIENT_BEFORE_OUTCOMES",
+          }
+
+          plan={
+              "schema_version":1,
+              "study_id":contract["study_id"],
+              "stage":"phase0e_sleeper_second_source_candidate_plan",
+              "year":YEAR,
+              "target_cells":list(TARGET_CELLS),
+              "baseline_membership":{
+                  cell:list(e["cell_membership_league_ids"][f"2018:{cell}"])
+                  for cell in TARGET_CELLS
+              },
+              "seed_league_ids":list(SEED_LEAGUES),
+              "discovery_wave_stats":wave_stats,
+              "discovered_league_n_before_cap":len(discovered),
+              "candidate_cap":CANDIDATE_CAP,
+              "candidate_ids":candidates,
+              "candidate_ids_sha256":sha_ids(candidates),
+              "shard_size":SHARD_SIZE,
+              "shard_count":shard_n,
+              "historical_player_outcomes_read":False,
+              "holdout_2024_outcomes_read":False,
+              "candidate_fit_performed":False,
+              "production_change_authorized":False,
+          }
+
+          (ROOT/"v8_phase0e_contract.json").write_text(json.dumps(contract,indent=2,sort_keys=True)+"\n")
+          (ROOT/"v8_phase0e_plan.json").write_text(json.dumps(plan,indent=2,sort_keys=True)+"\n")
+
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as f:
+              f.write("matrix="+json.dumps({"include":matrix},separators=(",",":"))+"\n")
+              f.write(f"shard_count={shard_n}\n")
+              f.write(f"candidate_count={len(candidates)}\n")
+
+          print(json.dumps({
+              "seed_leagues":list(SEED_LEAGUES),
+              "waves":wave_stats,
+              "discovered_before_cap":len(discovered),
+              "frozen_candidate_n":len(candidates),
+              "candidate_sha256":sha_ids(candidates),
+              "shard_n":shard_n,
+              "sleeper_transport_cap":contract["transport"]["phase0e_sleeper_max_unresolved_candidate_n"],
+          },indent=2,sort_keys=True))
+          PY
+
+      - name: Write frozen Phase 0E Sleeper shard probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "${RUNNER_TEMP}/prep/phase0e_sleeper_probe_v8.py" <<'PY'
+          #!/usr/bin/env python3
+          from __future__ import annotations
+
+          import argparse
+          import hashlib
+          import json
+          import time
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+
+          WINDOWS={
+              "r6_early":(61,62,63,64),
+              "r6_mid":(65,66,67,68),
+              "r6_late":(69,70,71,72),
+          }
+
+          class TransportError(RuntimeError): pass
+
+          def safe_int(x):
+              try: return int(x)
+              except Exception: return None
+
+          def obvious_mock(text: Any) -> bool:
+              return "mock" in str(text or "").strip().lower()
+
+          def get_json(session: requests.Session, path: str):
+              url=f"https://api.sleeper.app/v1/{path.lstrip('/')}"
+              last=None
+              for attempt in range(6):
+                  try:
+                      r=session.get(url,timeout=30)
+                      if r.status_code in {429,500,502,503,504}:
+                          raise requests.HTTPError(f"HTTP {r.status_code}",response=r)
+                      r.raise_for_status()
+                      # 12 parallel jobs x ~1 request/sec/job remains below Sleeper's
+                      # documented ~1000 calls/minute general guidance.
+                      time.sleep(1.05)
+                      return r.json()
+                  except Exception as exc:
+                      last=exc
+                      if attempt==5: break
+                      time.sleep(min(2**attempt,16))
+              raise TransportError(f"Sleeper transport failure path={path}: {type(last).__name__}: {last}")
+
+          def qualifies_league(lg: dict) -> tuple[bool,str]:
+              if str(lg.get("season") or "")!="2018": return False,"season"
+              if safe_int(lg.get("total_rosters"))!=12: return False,"teams"
+              settings=lg.get("settings") or {}
+              if safe_int(settings.get("type"))!=2: return False,"not_dynasty"
+              rp=[str(x).upper() for x in (lg.get("roster_positions") or [])]
+              if "SUPER_FLEX" not in rp and rp.count("QB")<2: return False,"not_superflex_2qb"
+              if obvious_mock(lg.get("name")): return False,"obvious_mock"
+              return True,"qualified"
+
+          def eligible_drafts(drafts: list[dict]) -> list[dict]:
+              out=[]
+              for d in drafts:
+                  if str(d.get("season") or "")!="2018": continue
+                  if str(d.get("status") or "").lower()!="complete": continue
+                  settings=d.get("settings") or {}
+                  if safe_int(settings.get("teams"))!=12: continue
+                  if (safe_int(settings.get("rounds")) or 0)<6: continue
+                  if safe_int(settings.get("player_type"))!=1: continue
+                  meta=d.get("metadata") or {}
+                  if obvious_mock(meta.get("name") or meta.get("title") or ""): continue
+                  if not str(d.get("draft_id") or "").strip(): continue
+                  out.append(d)
+              return sorted(out,key=lambda d:(
+                  safe_int(d.get("start_time")) if safe_int(d.get("start_time")) is not None else 10**30,
+                  str(d.get("draft_id")),
+              ))
+
+          def parse_windows(lid: str, draft_id: str, picks: list[dict]):
+              by_pick={}
+              for p in picks:
+                  n=safe_int(p.get("pick_no"))
+                  if n is None: continue
+                  by_pick.setdefault(n,[]).append(p)
+              results={}
+              for cell,slots in WINDOWS.items():
+                  rows=[]; bad=None
+                  for n in slots:
+                      xs=by_pick.get(n,[])
+                      if len(xs)==0: bad="missing_slot"; break
+                      if len(xs)!=1: bad="duplicate_slot"; break
+                      p=xs[0]
+                      if safe_int(p.get("round"))!=6: bad="wrong_round"; break
+                      pid=str(p.get("player_id") or "").strip()
+                      if not pid: bad="missing_player_id"; break
+                      rows.append({
+                          "draft_year":2018,
+                          "league_id":f"sleeper:{lid}",
+                          "native_league_id":lid,
+                          "source_provider":"Sleeper",
+                          "draft_id":draft_id,
+                          "cell":cell,
+                          "overall_slot":n,
+                          "round":6,
+                          "within_round_pick":n-60,
+                          "mfl_player_id":None,
+                          "sleeper_player_id":pid,
+                          "franchise_id":str(p.get("roster_id") or "").strip() or None,
+                          "identity_resolved":True,
+                          "identity_method":"sleeper_native_player_id",
+                          "outcome_ready_sleeper_id":True,
+                          "stable_player_key":f"sleeper:{pid}",
+                      })
+                  if bad is None:
+                      pids=[r["sleeper_player_id"] for r in rows]
+                      if len(set(pids))!=4: bad="duplicate_player_id"
+                  if bad is None:
+                      results[cell]={"structural_status":"structurally_complete","status":"usable","occurrences":rows}
+                  else:
+                      results[cell]={"structural_status":bad,"status":"structural_reject"}
+              return results
+
+          def selftest():
+              picks=[]
+              for n in range(61,73):
+                  picks.append({"pick_no":n,"round":6,"player_id":str(5000+n),"roster_id":str((n-61)%12+1)})
+              x=parse_windows("L","D",picks)
+              assert all(x[c]["status"]=="usable" for c in WINDOWS)
+              assert x["r6_early"]["occurrences"][0]["stable_player_key"]=="sleeper:5061"
+              print("PASS: Phase 0E Sleeper probe self-test")
+
+          def run(args):
+              prep=Path(args.prep); out=Path(args.out)
+              plan=json.loads((prep/"v8_phase0e_plan.json").read_text())
+              contract=json.loads((prep/"v8_phase0e_contract.json").read_text())
+              order=[str(x) for x in plan["candidate_ids"]]
+              assert hashlib.sha256("\n".join(order).encode()).hexdigest()==plan["candidate_ids_sha256"]
+              if args.start_index<1 or args.end_index>len(order) or args.start_index>args.end_index:
+                  raise RuntimeError("invalid shard range")
+              batch=order[args.start_index-1:args.end_index]
+
+              session=requests.Session()
+              session.headers["User-Agent"]=f"LOG-Draft-Pick-FV-V8-P0E-Sleeper-{args.shard_id}/1.0"
+              records=[]; transport=[]
+
+              for offset,lid in enumerate(batch):
+                  scan_index=args.start_index+offset
+                  rec={
+                      "scan_index":scan_index,
+                      "league_id":lid,
+                      "source_key":f"sleeper:{lid}",
+                      "draft_year":2018,
+                      "cell_results":{},
+                  }
+                  stage="league"
+                  try:
+                      lg=get_json(session,f"league/{lid}")
+                      if not isinstance(lg,dict) or not lg:
+                          rec["status"]="league_missing"; records.append(rec); continue
+                      ok,reason=qualifies_league(lg)
+                      rec["qualification_reason"]=reason
+                      if not ok:
+                          rec["status"]="league_qualifier_reject"; records.append(rec); continue
+
+                      stage="drafts"
+                      drafts=get_json(session,f"league/{lid}/drafts") or []
+                      eligible=eligible_drafts([d for d in drafts if isinstance(d,dict)])
+                      if not eligible:
+                          rec["status"]="rookie_draft_reject"; records.append(rec); continue
+                      chosen=eligible[0]
+                      draft_id=str(chosen["draft_id"])
+                      rec["selected_draft_id"]=draft_id
+                      rec["eligible_draft_n"]=len(eligible)
+                      rec["selected_draft_start_time"]=safe_int(chosen.get("start_time"))
+
+                      stage="picks"
+                      picks=get_json(session,f"draft/{draft_id}/picks") or []
+                      if not isinstance(picks,list):
+                          rec["status"]="picks_shape_reject"; records.append(rec); continue
+                      rec["cell_results"]=parse_windows(lid,draft_id,[p for p in picks if isinstance(p,dict)])
+                      usable=[c for c,v in rec["cell_results"].items() if v.get("status")=="usable"]
+                      rec["usable_cells"]=usable
+                      rec["status"]="usable_at_least_one_cell" if usable else "evaluated_no_usable_cell"
+                      records.append(rec)
+
+                  except TransportError as exc:
+                      u={
+                          "draft_year":2018,
+                          "league_id":lid,
+                          "source_key":f"sleeper:{lid}",
+                          "scan_index":scan_index,
+                          "stage":stage,
+                          "failure_class":"sleeper_transport_exhausted",
+                          "error_fingerprint_sha256":hashlib.sha256(str(exc).encode()).hexdigest(),
+                      }
+                      transport.append(u)
+                      rec["status"]="transport_unresolved"
+                      rec["transport"]=u
+                      records.append(rec)
+
+              assert [r["league_id"] for r in records]==batch
+              assert [int(r["scan_index"]) for r in records]==list(range(args.start_index,args.end_index+1))
+              payload={
+                  "schema_version":1,
+                  "study_id":contract["study_id"],
+                  "stage":"phase0e_sleeper_second_source_candidate_shard",
+                  "draft_year":2018,
+                  "shard_id":args.shard_id,
+                  "start_index":args.start_index,
+                  "end_index":args.end_index,
+                  "candidate_n":len(batch),
+                  "records":records,
+                  "transport_unresolved":transport,
+                  "shards_collect_evidence_only":True,
+                  "candidate_selection_performed":False,
+                  "historical_player_outcomes_read":False,
+                  "holdout_2024_outcomes_read":False,
+                  "holdout_2024_search_performed":False,
+                  "current_player_catalog_read":False,
+                  "market_or_ktc_values_read":False,
+                  "package_vote_data_read":False,
+                  "candidate_fit_performed":False,
+                  "candidate_scores_computed":False,
+                  "production_change_authorized":False,
+              }
+              out.parent.mkdir(parents=True,exist_ok=True)
+              out.write_text(json.dumps(payload,indent=2,sort_keys=True)+"\n")
+              print(json.dumps({
+                  "shard":args.shard_id,
+                  "range":[args.start_index,args.end_index],
+                  "candidate_n":len(batch),
+                  "usable_candidate_n":sum(r["status"]=="usable_at_least_one_cell" for r in records),
+                  "transport_unresolved_n":len(transport),
+              },indent=2,sort_keys=True))
+
+          def main():
+              ap=argparse.ArgumentParser()
+              ap.add_argument("--self-test",action="store_true")
+              ap.add_argument("--start-index",type=int)
+              ap.add_argument("--end-index",type=int)
+              ap.add_argument("--shard-id")
+              ap.add_argument("--prep")
+              ap.add_argument("--out")
+              a=ap.parse_args()
+              if a.self_test:
+                  selftest(); return
+              if None in (a.start_index,a.end_index,a.shard_id,a.prep,a.out):
+                  ap.error("probe mode requires all shard arguments")
+              run(a)
+
+          if __name__=="__main__":
+              main()
+          PY
+          chmod +x "${RUNNER_TEMP}/prep/phase0e_sleeper_probe_v8.py"
+          python3 "${RUNNER_TEMP}/prep/phase0e_sleeper_probe_v8.py" --self-test
+
+      - name: Validate frozen Phase 0E preregistration
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          p=Path(os.environ["RUNNER_TEMP"])/"prep"
+          c=json.loads((p/"v8_phase0e_contract.json").read_text())
+          q=json.loads((p/"v8_phase0e_plan.json").read_text())
+          assert c["status"]=="FROZEN_PRE_PHASE0E_SLEEPER_DRAFT_PROBE_PRE_OUTCOME"
+          assert c["trigger"]["phase0d_new_mfl_candidates_exhausted"]==959
+          assert c["trigger"]["phase0d_final_target_counts"]=={
+              "r6_early":6,"r6_mid":6,"r6_late":6,
+          }
+          assert c["second_source"]["provider"]=="Sleeper"
+          assert c["second_source"]["source_independence_from_mfl"] is True
+          assert c["candidate_discovery"]["draft_metadata_read_during_discovery"] is False
+          assert c["candidate_discovery"]["draft_picks_read_during_discovery"] is False
+          assert c["candidate_discovery"]["player_catalog_read_during_discovery"] is False
+          assert c["candidate_discovery"]["manual_candidate_addition_allowed"] is False
+          assert c["candidate_discovery"]["outcome_dependent_discovery"] is False
+          assert c["draft_qualifier"]["rookie_rule"].startswith("draft.settings.player_type == 1")
+          assert c["selection_rule"]["required_phase0e_sleeper_additions_per_cell"]==6
+          assert c["selection_rule"]["shards_may_not_select_sources"] is True
+          assert c["transport"]["phase0d_mfl_unresolved_candidate_n_frozen"]==27
+          assert c["transport"]["phase0d_mfl_transport_gate_pass_frozen"] is True
+          assert c["transport"]["phase0e_sleeper_max_unresolved_candidate_n"]==max(5,(len(q["candidate_ids"])+99)//100)
+          assert c["frozen_phase0d_baseline"]["all_non_target_105_year_cells_frozen"] is True
+          assert all(v is False for v in c["firewalls"].values())
+          assert len(q["candidate_ids"])==c["candidate_discovery"]["candidate_n"]
+          assert q["candidate_ids_sha256"]==c["candidate_discovery"]["candidate_ids_sha256"]
+          assert q["shard_count"]<=256
+          print(f"PASS: Phase 0E preregistered with {len(q['candidate_ids'])} frozen Sleeper candidates before draft inspection.")
+          PY
+
+      - name: Upload frozen Phase 0E prep
+        uses: actions/upload-artifact@v4
+        with:
+          name: v8-p0e-sleeper-second-source-prep
+          path: ${{ runner.temp }}/prep/
+          if-no-files-found: error
+          retention-days: 30
+
+  sleeper_shards:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 12
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      SHARD: ${{ matrix.shard }}
+      START_INDEX: ${{ matrix.start }}
+      END_INDEX: ${{ matrix.end }}
+      SLOT: ${{ matrix.slot }}
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install runtime dependency
+        run: python -m pip install --disable-pip-version-check requests
+
+      - name: Download frozen Phase 0E prep
+        uses: actions/download-artifact@v4
+        with:
+          name: v8-p0e-sleeper-second-source-prep
+          path: ${{ runner.temp }}/prep
+
+      - name: Probe deterministic Sleeper candidate shard
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/out"
+          sleep "$(( SLOT * 2 ))"
+          python3 "${RUNNER_TEMP}/prep/phase0e_sleeper_probe_v8.py" \
+            --start-index "$START_INDEX" \
+            --end-index "$END_INDEX" \
+            --shard-id "$SHARD" \
+            --prep "${RUNNER_TEMP}/prep" \
+            --out "${RUNNER_TEMP}/out/shard_2018_${SHARD}.json"
+
+      - name: Upload Phase 0E Sleeper shard evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v8-p0e-sleeper-shard-2018-${{ matrix.shard }}
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
+          retention-days: 30
+
+  reduce:
+    needs: [prepare, sleeper_shards]
+    if: always() && needs.prepare.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      EXPECTED_SHARD_COUNT: ${{ needs.prepare.outputs.shard_count }}
+      EXPECTED_CANDIDATE_COUNT: ${{ needs.prepare.outputs.candidate_count }}
+    steps:
+      - name: Download frozen Phase 0E prep
+        uses: actions/download-artifact@v4
+        with:
+          name: v8-p0e-sleeper-second-source-prep
+          path: ${{ runner.temp }}/prep
+
+      - name: Download all Phase 0E Sleeper shard evidence
+        uses: actions/download-artifact@v4
+        with:
+          pattern: v8-p0e-sleeper-shard-2018-*
+          path: ${{ runner.temp }}/shards
+          merge-multiple: true
+
+      - name: Deterministically reduce Sleeper source and close Phase 0E
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/assembled"
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import math
+          import os
+          from collections import Counter, defaultdict
+          from pathlib import Path
+
+          root=Path(os.environ["RUNNER_TEMP"])
+          prep=root/"prep"; shards=root/"shards"; out=root/"assembled"
+          contract=json.loads((prep/"v8_phase0e_contract.json").read_text())
+          plan=json.loads((prep/"v8_phase0e_plan.json").read_text())
+          p0d_summary=json.loads((prep/"p0d"/"v8_phase0d_targeted_2018_r6_source_expansion.json").read_text())
+          p0d=json.loads((prep/"p0d"/"v8_phase0d_exact_source_identity_evidence.json").read_text())
+
+          expected_shards=int(os.environ["EXPECTED_SHARD_COUNT"])
+          expected_candidates=int(os.environ["EXPECTED_CANDIDATE_COUNT"])
+          order=[str(x) for x in plan["candidate_ids"]]
+          assert len(order)==expected_candidates
+          assert hashlib.sha256("\n".join(order).encode()).hexdigest()==plan["candidate_ids_sha256"]
+
+          docs=[]
+          for p in sorted(shards.glob("shard_2018_*.json")):
+              d=json.loads(p.read_text())
+              for k in (
+                  "candidate_selection_performed","historical_player_outcomes_read",
+                  "holdout_2024_outcomes_read","holdout_2024_search_performed",
+                  "current_player_catalog_read","market_or_ktc_values_read",
+                  "package_vote_data_read","candidate_fit_performed",
+                  "candidate_scores_computed","production_change_authorized",
+              ):
+                  assert d[k] is False,(p.name,k)
+              assert d["shards_collect_evidence_only"] is True
+              docs.append(d)
+          assert len(docs)==expected_shards,(len(docs),expected_shards)
+
+          all_records=[r for d in docs for r in d["records"]]
+          assert len(all_records)==expected_candidates,(len(all_records),expected_candidates)
+          by_index={int(r["scan_index"]):r for r in all_records}
+          assert len(by_index)==expected_candidates
+          assert set(by_index)==set(range(1,expected_candidates+1))
+          for i,lid in enumerate(order,1):
+              assert str(by_index[i]["league_id"])==lid,(i,lid,by_index[i]["league_id"])
+
+          targets=("r6_early","r6_mid","r6_late")
+          baseline={cell:list(p0d["cell_membership_league_ids"][f"2018:{cell}"]) for cell in targets}
+          assert {c:len(v) for c,v in baseline.items()}=={c:6 for c in targets}
+
+          def frozen_105_payload(memberships,occurrences):
+              keep_memberships={}
+              keep_occurrences={}
+              target_keys={f"2018:{c}" for c in targets}
+              for k,v in memberships.items():
+                  if k not in target_keys:
+                      keep_memberships[k]=v
+              for k,v in occurrences.items():
+                  if not any(k.startswith(t+":") for t in target_keys):
+                      keep_occurrences[k]=v
+              return {"memberships":keep_memberships,"occurrences":keep_occurrences}
+
+          def canon_sha(x):
+              return hashlib.sha256(json.dumps(x,sort_keys=True,separators=(",",":")).encode()).hexdigest()
+
+          frozen_105_before=canon_sha(frozen_105_payload(p0d["cell_membership_league_ids"],p0d["occurrences"]))
+
+          def replay(records):
+              idx={int(r["scan_index"]):r for r in records}
+              additions={cell:[] for cell in targets}
+              occurrences=[]; attempts=[]; transport=[]; counts=Counter()
+
+              def complete():
+                  return all(len(baseline[c])+len(additions[c])>=12 for c in targets)
+
+              for scan_index,lid in enumerate(order,1):
+                  if complete(): break
+                  rec=idx[scan_index]
+                  assert str(rec["league_id"])==lid
+                  source_key=f"sleeper:{lid}"
+                  attempt={"scan_index":scan_index,"league_id":lid,"source_key":source_key}
+
+                  if rec["status"]=="transport_unresolved":
+                      transport.append(rec["transport"])
+                      attempt["status"]="transport_unresolved"
+                      attempt["transport"]=rec["transport"]
+                      attempts.append(attempt); counts["transport_unresolved"]+=1
+                      continue
+
+                  if rec["status"] in {
+                      "league_missing","league_qualifier_reject","rookie_draft_reject",
+                      "picks_shape_reject","evaluated_no_usable_cell",
+                  }:
+                      attempt["status"]=rec["status"]
+                      if "qualification_reason" in rec:
+                          attempt["qualification_reason"]=rec["qualification_reason"]
+                      if "selected_draft_id" in rec:
+                          attempt["selected_draft_id"]=rec["selected_draft_id"]
+                      attempts.append(attempt); counts[rec["status"]]+=1
+                      continue
+
+                  assert rec["status"]=="usable_at_least_one_cell",rec["status"]
+                  added=[]
+                  for cell in targets:
+                      if len(baseline[cell])+len(additions[cell])>=12:
+                          continue
+                      c=rec.get("cell_results",{}).get(cell,{})
+                      if c.get("status")!="usable":
+                          counts[f"{cell}:{c.get('structural_status') or c.get('status') or 'reject'}"]+=1
+                          continue
+                      assert source_key not in baseline[cell]
+                      assert source_key not in additions[cell]
+                      rows=c["occurrences"]
+                      assert len(rows)==4
+                      assert len({int(x["overall_slot"]) for x in rows})==4
+                      assert len({str(x["sleeper_player_id"]) for x in rows})==4
+                      assert all(bool(x["identity_resolved"]) for x in rows)
+                      assert all(bool(x["outcome_ready_sleeper_id"]) for x in rows)
+                      assert all(x["source_provider"]=="Sleeper" for x in rows)
+                      additions[cell].append(source_key)
+                      occurrences.extend(rows)
+                      added.append(cell)
+                      counts[f"{cell}:rescued"]+=1
+
+                  attempt["selected_draft_id"]=rec.get("selected_draft_id")
+                  attempt["added_cells"]=added
+                  attempt["status"]="rescued" if added else "evaluated_no_rescue"
+                  attempts.append(attempt)
+
+              final_counts={c:len(baseline[c])+len(additions[c]) for c in targets}
+              return {
+                  "additions":additions,
+                  "occurrences":occurrences,
+                  "attempts":attempts,
+                  "transport":transport,
+                  "counts":dict(sorted(counts.items())),
+                  "final_counts":final_counts,
+                  "success":all(v>=12 for v in final_counts.values()),
+                  "last_scan_index":attempts[-1]["scan_index"] if attempts else 0,
+              }
+
+          canonical=replay(all_records)
+          reversed_result=replay(list(reversed(all_records)))
+          assert canonical==reversed_result,"completion-order invariance failed"
+
+          memberships={k:list(v) for k,v in p0d["cell_membership_league_ids"].items()}
+          provenance={k:dict(v) for k,v in p0d["cell_membership_provenance"].items()}
+          occurrences={k:list(v) for k,v in p0d["occurrences"].items()}
+
+          for cell,lids in canonical["additions"].items():
+              key=f"2018:{cell}"
+              for source_key in lids:
+                  assert source_key.startswith("sleeper:")
+                  assert source_key not in memberships[key]
+                  memberships[key].append(source_key)
+                  provenance[key][source_key]="phase0e_sleeper_second_source"
+
+          grouped=defaultdict(list)
+          for row in canonical["occurrences"]:
+              grouped[(int(row["draft_year"]),row["cell"],str(row["league_id"]))].append(row)
+          for (y,cell,source_key),rows in grouped.items():
+              key=f"{y}:{cell}:{source_key}"
+              assert key not in occurrences
+              assert len(rows)==4
+              occurrences[key]=rows
+
+          # Exactly 105 non-target year-cells and their exact occurrence payloads must be unchanged.
+          frozen_105_after=canon_sha(frozen_105_payload(memberships,occurrences))
+          assert frozen_105_after==frozen_105_before
+
+          # The six MFL baseline sources per 2018 R6 cell are immutable and remain first.
+          for cell in targets:
+              key=f"2018:{cell}"
+              assert memberships[key][:6]==baseline[cell]
+              assert all(not str(x).startswith("sleeper:") for x in baseline[cell])
+              assert all(str(x).startswith("sleeper:") for x in memberships[key][6:])
+
+          cells={}; deficient=[]
+          for key,lids in sorted(memberships.items()):
+              assert len(set(lids))==len(lids),key
+              for lid in lids:
+                  rows=occurrences[f"{key}:{lid}"]
+                  assert len(rows)==4
+                  assert len({int(x["overall_slot"]) for x in rows})==4
+                  assert all(bool(x["identity_resolved"]) for x in rows)
+                  assert all(bool(x["outcome_ready_sleeper_id"]) for x in rows)
+              y=int(key.split(":")[0]); cell=key.split(":",1)[1]; n=len(lids)
+              passed=n>=12
+              if not passed:
+                  deficient.append({"draft_year":y,"cell":cell,"fully_usable_league_n":n,"shortfall":12-n})
+              cells[key]={
+                  "draft_year":y,
+                  "cell":cell,
+                  "fully_usable_league_n":n,
+                  "minimum_required":12,
+                  "source_gate_pass":passed,
+                  "occurrence_n":n*4,
+                  "identity_coverage":1.0,
+                  "sleeper_ready_coverage":1.0,
+                  "phase0e_sleeper_added_league_n":sum(
+                      1 for lid in lids if provenance[key].get(lid)=="phase0e_sleeper_second_source"
+                  ),
+              }
+          assert len(cells)==108
+
+          prefetch_transport=[]
+          for d in docs:
+              prefetch_transport.extend(d.get("transport_unresolved",[]))
+          replayed_transport=canonical["transport"]
+          replayed_transport_keys={str(x["league_id"]) for x in replayed_transport}
+          transport_cap=int(contract["transport"]["phase0e_sleeper_max_unresolved_candidate_n"])
+          transport_gate=len(replayed_transport_keys)<=transport_cap
+
+          passed_cells=sum(bool(x["source_gate_pass"]) for x in cells.values())
+          all_pass=passed_cells==108 and not deficient
+          exact_sleeper_additions={c:len(canonical["additions"][c]) for c in targets}
+          phase0e_source_gate=(
+              canonical["success"] and
+              all_pass and
+              transport_gate and
+              exact_sleeper_additions=={c:6 for c in targets}
+          )
+          decision=contract["pass_decision"] if phase0e_source_gate else contract["fail_decision"]
+
+          summary={
+              "schema_version":1,
+              "study_id":contract["study_id"],
+              "stage":"phase0e_sleeper_second_source_2018_r6_closeout",
+              "decision":decision,
+              "phase0d_decision":p0d_summary["decision"],
+              "phase0d_target_counts_frozen":{c:6 for c in targets},
+              "phase0e_provider":"Sleeper",
+              "phase0e_candidate_n":expected_candidates,
+              "phase0e_candidate_ids_sha256":plan["candidate_ids_sha256"],
+              "phase0e_shard_n":expected_shards,
+              "phase0e_candidate_evidence_prefetched_n":len(all_records),
+              "phase0e_ordered_replay_attempt_n":len(canonical["attempts"]),
+              "phase0e_last_scan_index":canonical["last_scan_index"],
+              "phase0e_completion_order_invariance_pass":True,
+              "phase0e_sleeper_additions":canonical["additions"],
+              "phase0e_sleeper_addition_counts":exact_sleeper_additions,
+              "phase0e_final_target_counts":canonical["final_counts"],
+              "phase0e_attempt_status_counts":canonical["counts"],
+              "non_target_105_exact_payload_sha256_before":frozen_105_before,
+              "non_target_105_exact_payload_sha256_after":frozen_105_after,
+              "non_target_105_exactly_frozen":True,
+              "year_cell_n":108,
+              "year_cells_passing":passed_cells,
+              "all_year_cells_pass":all_pass,
+              "deficient_year_cells":deficient,
+              "transport":{
+                  "phase0d_mfl_unresolved_candidate_n_frozen":27,
+                  "phase0d_mfl_transport_gate_pass_frozen":True,
+                  "phase0e_prefetched_unresolved_candidate_n":len({str(x["league_id"]) for x in prefetch_transport}),
+                  "phase0e_replayed_prefix_unresolved_candidate_n":len(replayed_transport_keys),
+                  "phase0e_maximum_allowed_candidate_n":transport_cap,
+                  "prefetched_after_stop_excluded_from_gate":True,
+                  "gate_pass":transport_gate,
+              },
+              "year_cell":cells,
+              "firewalls":contract["firewalls"],
+              "historical_outcome_ingestion_authorized":False,
+              "holdout_2024_outcomes_read":False,
+              "production_change_authorized":False,
+              "next_stage":(
+                  "draft-pick-fv-v8-phase1-incremental-source-identity-freeze"
+                  if phase0e_source_gate else
+                  "STOP_RESEARCH_BEFORE_OUTCOMES_REVIEW_PHASE0E_SOURCE_FRAME"
+              ),
+          }
+
+          exact={
+              "schema_version":1,
+              "study_id":contract["study_id"],
+              "stage":"phase0e_exact_mixed_source_identity_evidence",
+              "decision":decision,
+              "cell_membership_league_ids":memberships,
+              "cell_membership_provenance":provenance,
+              "occurrences":occurrences,
+              "phase0e_candidate_ids":order,
+              "phase0e_candidate_ids_sha256":plan["candidate_ids_sha256"],
+              "phase0e_attempts":canonical["attempts"],
+              "phase0e_transport_unresolved":canonical["transport"],
+              "phase0e_completion_order_invariance_pass":True,
+              "non_target_105_exact_payload_sha256":frozen_105_after,
+              "historical_player_outcomes_read":False,
+              "holdout_2024_outcomes_read":False,
+              "current_player_catalog_read":False,
+              "candidate_fit_performed":False,
+              "production_change_authorized":False,
+          }
+
+          (out/"v8_phase0e_sleeper_second_source_2018_r6.json").write_text(json.dumps(summary,indent=2,sort_keys=True)+"\n")
+          (out/"v8_phase0e_exact_mixed_source_identity_evidence.json").write_text(json.dumps(exact,indent=2,sort_keys=True)+"\n")
+
+          lines=[
+              "# Draft Pick FV V8 — Phase 0E Sleeper Second Source 2018 R6",
+              "",
+              f"**Decision:** `{decision}`",
+              "",
+              f"- Frozen Sleeper candidates: **{expected_candidates}**",
+              f"- Shards: **{expected_shards}**",
+              f"- Ordered-replay candidates attempted: **{len(canonical['attempts'])}**",
+              "- Completion-order invariance: **PASS**",
+              "- Non-target 105/108 year-cells exact-freeze check: **PASS**",
+              f"- Added Sleeper leagues Early / Mid / Late: **{exact_sleeper_additions['r6_early']} / {exact_sleeper_additions['r6_mid']} / {exact_sleeper_additions['r6_late']}**",
+              f"- Final 2018 R6 Early / Mid / Late: **{canonical['final_counts']['r6_early']} / {canonical['final_counts']['r6_mid']} / {canonical['final_counts']['r6_late']}**",
+              f"- Year-cells passing final source gate: **{passed_cells} / 108**",
+              f"- Sleeper replay-prefix unresolved transport: **{len(replayed_transport_keys)}**; cap **{transport_cap}**",
+              "",
+              "Sleeper player IDs are native source identities; no MFL-to-Sleeper crosswalk was used for Phase 0E additions.",
+              "",
+              "No historical NFL outcomes, 2024 outcomes, current player catalog, market/KTC values, package votes, candidate fits, candidate scores, or production values were read.",
+          ]
+          if deficient:
+              lines += ["","## Remaining deficient cells","","| Year | Cell | Fully usable | Shortfall |","|---:|---|---:|---:|"]
+              for x in deficient:
+                  lines.append(f"| {x['draft_year']} | {x['cell']} | {x['fully_usable_league_n']} | {x['shortfall']} |")
+          (out/"v8_phase0e_sleeper_second_source_2018_r6.md").write_text("\n".join(lines)+"\n")
+          print("\n".join(lines))
+          PY
+
+      - name: Validate Phase 0E closeout firewalls and source isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          out=Path(os.environ["RUNNER_TEMP"])/"assembled"
+          s=json.loads((out/"v8_phase0e_sleeper_second_source_2018_r6.json").read_text())
+          e=json.loads((out/"v8_phase0e_exact_mixed_source_identity_evidence.json").read_text())
+
+          assert s["phase0d_decision"]=="STOP_AND_PREREGISTER_V8_PHASE0E_SECOND_SOURCE_2018_R6_BEFORE_OUTCOMES"
+          assert s["phase0d_target_counts_frozen"]=={
+              "r6_early":6,"r6_mid":6,"r6_late":6,
+          }
+          assert s["phase0e_provider"]=="Sleeper"
+          assert s["phase0e_completion_order_invariance_pass"] is True
+          assert s["non_target_105_exactly_frozen"] is True
+          assert s["non_target_105_exact_payload_sha256_before"]==s["non_target_105_exact_payload_sha256_after"]
+          assert s["year_cell_n"]==108
+          assert len(s["year_cell"])==108
+          assert s["transport"]["phase0d_mfl_unresolved_candidate_n_frozen"]==27
+          assert s["transport"]["phase0d_mfl_transport_gate_pass_frozen"] is True
+          assert s["transport"]["prefetched_after_stop_excluded_from_gate"] is True
+          assert s["historical_outcome_ingestion_authorized"] is False
+          assert s["holdout_2024_outcomes_read"] is False
+          assert s["production_change_authorized"] is False
+          assert all(v is False for v in s["firewalls"].values())
+          assert e["phase0e_completion_order_invariance_pass"] is True
+          assert e["historical_player_outcomes_read"] is False
+          assert e["holdout_2024_outcomes_read"] is False
+          assert e["current_player_catalog_read"] is False
+          assert e["candidate_fit_performed"] is False
+          assert e["production_change_authorized"] is False
+          assert s["decision"] in {
+              "PROCEED_TO_V8_PHASE1_INCREMENTAL_SOURCE_IDENTITY_FREEZE",
+              "STOP_V8_PHASE0E_SLEEPER_SECOND_SOURCE_INSUFFICIENT_BEFORE_OUTCOMES",
+          }
+          if s["decision"]=="PROCEED_TO_V8_PHASE1_INCREMENTAL_SOURCE_IDENTITY_FREEZE":
+              assert s["phase0e_sleeper_addition_counts"]=={
+                  "r6_early":6,"r6_mid":6,"r6_late":6,
+              }
+              assert s["phase0e_final_target_counts"]=={
+                  "r6_early":12,"r6_mid":12,"r6_late":12,
+              }
+              assert s["year_cells_passing"]==108
+              assert s["all_year_cells_pass"] is True
+              assert s["transport"]["gate_pass"] is True
+          print("PASS: Phase 0E closeout is outcome-sealed, exact-order deterministic, Sleeper-native, and isolated to 2018 R6.")
+          PY
+
+      - name: Upload Phase 0E closeout
+        uses: actions/upload-artifact@v4
+        with:
+          name: v8-p0e-sleeper-second-source-2018-r6-closeout
+          path: ${{ runner.temp }}/assembled/
+          if-no-files-found: error
+          retention-days: 30
