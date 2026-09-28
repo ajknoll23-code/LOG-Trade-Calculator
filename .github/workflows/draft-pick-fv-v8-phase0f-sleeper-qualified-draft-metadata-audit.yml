@@ -1,0 +1,385 @@
+name: Draft Pick FV V8 - Phase 0F Sleeper Qualified Draft Metadata Audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: draft-pick-fv-v8-phase0f-sleeper-qualified-draft-metadata-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install runtime dependency
+        run: python -m pip install --disable-pip-version-check requests
+
+      - name: Download and verify exact Phase 0E closeout
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/p0e"
+
+          RUN_ID="36428277548"
+          ARTIFACT_ID="10972212842"
+          EXPECTED_DIGEST="sha256:f8a2c97ad791f7a037913fa62f3a21b06d572bbe69251eefd322be84e267c014"
+
+          ACTUAL_DIGEST="$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}" --jq '.digest // ""')"
+          test "$ACTUAL_DIGEST" = "$EXPECTED_DIGEST"
+
+          gh run download "$RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            -n "v8-p0e-sleeper-second-source-2018-r6-closeout" \
+            -D "${RUNNER_TEMP}/p0e"
+
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          p=Path(os.environ["RUNNER_TEMP"])/"p0e"
+          s=json.loads((p/"v8_phase0e_sleeper_second_source_2018_r6.json").read_text())
+          e=json.loads((p/"v8_phase0e_exact_mixed_source_identity_evidence.json").read_text())
+
+          assert s["decision"]=="STOP_V8_PHASE0E_SLEEPER_SECOND_SOURCE_INSUFFICIENT_BEFORE_OUTCOMES"
+          assert s["phase0e_candidate_n"]==840
+          assert s["phase0e_sleeper_addition_counts"]=={
+              "r6_early":0,"r6_mid":0,"r6_late":0,
+          }
+          assert s["phase0e_final_target_counts"]=={
+              "r6_early":6,"r6_mid":6,"r6_late":6,
+          }
+          assert s["year_cells_passing"]==105
+          assert s["transport"]["phase0e_replayed_prefix_unresolved_candidate_n"]==0
+          assert s["historical_outcome_ingestion_authorized"] is False
+          assert s["holdout_2024_outcomes_read"] is False
+          assert s["production_change_authorized"] is False
+
+          attempts=e["phase0e_attempts"]
+          assert len(attempts)==840
+          rookie=[x for x in attempts if x["status"]=="rookie_draft_reject"]
+          qual_reject=[x for x in attempts if x["status"]=="league_qualifier_reject"]
+          assert len(rookie)==38
+          assert len(qual_reject)==802
+          assert all(x.get("qualification_reason")=="qualified" for x in rookie)
+
+          print("PASS: exact Phase 0E stop verified; metadata-audit cohort = 38 qualified Sleeper leagues.")
+          PY
+
+      - name: Audit draft metadata for the 38 qualified Sleeper leagues
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/out"
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import os
+          import time
+          from collections import Counter
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+
+          ROOT=Path(os.environ["RUNNER_TEMP"])
+          P0E=ROOT/"p0e"
+          OUT=ROOT/"out"
+
+          exact=json.loads((P0E/"v8_phase0e_exact_mixed_source_identity_evidence.json").read_text())
+          summary=json.loads((P0E/"v8_phase0e_sleeper_second_source_2018_r6.json").read_text())
+
+          attempts=exact["phase0e_attempts"]
+          cohort=[
+              {
+                  "scan_index":int(x["scan_index"]),
+                  "league_id":str(x["league_id"]),
+              }
+              for x in attempts
+              if x["status"]=="rookie_draft_reject"
+          ]
+          cohort=sorted(cohort,key=lambda x:x["scan_index"])
+          assert len(cohort)==38
+          assert len({x["league_id"] for x in cohort})==38
+
+          session=requests.Session()
+          session.headers["User-Agent"]="LOG-Draft-Pick-FV-V8-P0F-Sleeper-Metadata-Audit/1.0"
+
+          class TransportError(RuntimeError): pass
+
+          def safe_int(x):
+              try: return int(x)
+              except Exception: return None
+
+          def get_json(path: str) -> Any:
+              url=f"https://api.sleeper.app/v1/{path.lstrip('/')}"
+              last=None
+              for attempt in range(6):
+                  try:
+                      r=session.get(url,timeout=30)
+                      if r.status_code in {429,500,502,503,504}:
+                          raise requests.HTTPError(f"HTTP {r.status_code}",response=r)
+                      r.raise_for_status()
+                      time.sleep(0.20)
+                      return r.json()
+                  except Exception as exc:
+                      last=exc
+                      if attempt==5:
+                          break
+                      time.sleep(min(2**attempt,16))
+              raise TransportError(
+                  f"Sleeper metadata-audit transport failure path={path}: "
+                  f"{type(last).__name__}: {last}"
+              )
+
+          records=[]
+          unresolved=[]
+
+          for item in cohort:
+              lid=item["league_id"]
+              rec={
+                  "scan_index":item["scan_index"],
+                  "league_id":lid,
+                  "source_key":f"sleeper:{lid}",
+                  "drafts":[],
+              }
+              try:
+                  drafts=get_json(f"league/{lid}/drafts") or []
+                  if not isinstance(drafts,list):
+                      raise RuntimeError(f"unexpected draft-list shape for {lid}")
+
+                  for d in drafts:
+                      if not isinstance(d,dict):
+                          continue
+                      settings=d.get("settings") or {}
+                      meta=d.get("metadata") or {}
+                      rec["drafts"].append({
+                          "draft_id":str(d.get("draft_id") or "").strip() or None,
+                          "season":str(d.get("season") or "").strip() or None,
+                          "status":str(d.get("status") or "").strip().lower() or None,
+                          "type":str(d.get("type") or "").strip().lower() or None,
+                          "start_time":safe_int(d.get("start_time")),
+                          "teams":safe_int(settings.get("teams")),
+                          "rounds":safe_int(settings.get("rounds")),
+                          "player_type":safe_int(settings.get("player_type")),
+                          "metadata_name":str(meta.get("name") or "").strip() or None,
+                          "metadata_title":str(meta.get("title") or "").strip() or None,
+                      })
+
+                  rec["drafts"]=sorted(
+                      rec["drafts"],
+                      key=lambda d:(
+                          d["season"] or "",
+                          d["start_time"] if d["start_time"] is not None else 10**30,
+                          d["draft_id"] or "",
+                      ),
+                  )
+
+                  d2018=[d for d in rec["drafts"] if d["season"]=="2018"]
+                  complete_12=[
+                      d for d in d2018
+                      if d["status"]=="complete" and d["teams"]==12
+                  ]
+                  depth6=[d for d in complete_12 if (d["rounds"] or 0)>=6]
+                  tagged_rookie=[d for d in depth6 if d["player_type"]==1]
+                  nonrookie_tag=[d for d in depth6 if d["player_type"]!=1]
+
+                  rec["classification"]={
+                      "draft_2018_n":len(d2018),
+                      "complete_12team_2018_n":len(complete_12),
+                      "complete_12team_6plus_round_2018_n":len(depth6),
+                      "phase0e_tagged_rookie_eligible_n":len(tagged_rookie),
+                      "sixplus_round_nonrookie_tag_n":len(nonrookie_tag),
+                      "max_complete_12team_rounds":max(
+                          [d["rounds"] or 0 for d in complete_12],
+                          default=0,
+                      ),
+                  }
+                  records.append(rec)
+
+              except TransportError as exc:
+                  unresolved.append({
+                      "scan_index":item["scan_index"],
+                      "league_id":lid,
+                      "failure_class":"sleeper_transport_exhausted",
+                      "error_fingerprint_sha256":hashlib.sha256(str(exc).encode()).hexdigest(),
+                  })
+
+          if unresolved:
+              raise RuntimeError(
+                  f"Phase 0F requires complete metadata for all 38 leagues; "
+                  f"transport unresolved={len(unresolved)}"
+              )
+
+          assert len(records)==38
+
+          # Phase 0E would have accepted any complete 2018 12-team draft with
+          # rounds>=6 and player_type==1. Finding one here means an implementation
+          # inconsistency, not a new scientific branch.
+          phase0e_should_have_accepted=[
+              r for r in records
+              if r["classification"]["phase0e_tagged_rookie_eligible_n"]>0
+          ]
+
+          bridge_candidates=[
+              r for r in records
+              if r["classification"]["sixplus_round_nonrookie_tag_n"]>0
+          ]
+
+          shallow_only=[
+              r for r in records
+              if r["classification"]["complete_12team_2018_n"]>0
+              and r["classification"]["complete_12team_6plus_round_2018_n"]==0
+          ]
+
+          no_complete_12=[
+              r for r in records
+              if r["classification"]["complete_12team_2018_n"]==0
+          ]
+
+          if phase0e_should_have_accepted:
+              decision="STOP_AND_FIX_V8_PHASE0E_SLEEPER_DRAFT_SELECTION_IMPLEMENTATION"
+          elif bridge_candidates:
+              decision="PREREGISTER_V8_PHASE0G_SLEEPER_ROOKIE_CLASSIFICATION_BRIDGE_BEFORE_PICKS"
+          else:
+              decision="STOP_SLEEPER_AS_V8_2018_R6_SECOND_SOURCE_AND_PREREGISTER_THIRD_PROVIDER_BEFORE_OUTCOMES"
+
+          round_hist=Counter()
+          player_type_hist=Counter()
+          for r in records:
+              for d in r["drafts"]:
+                  if d["season"]=="2018" and d["status"]=="complete" and d["teams"]==12:
+                      round_hist[str(d["rounds"])] += 1
+                      player_type_hist[str(d["player_type"])] += 1
+
+          result={
+              "schema_version":1,
+              "study_id":"draft-pick-fv-v8-depth-specific-source-cohorts",
+              "stage":"phase0f_sleeper_qualified_draft_metadata_audit",
+              "decision":decision,
+              "input_phase0e_run_id":36428277548,
+              "input_phase0e_artifact_id":10972212842,
+              "input_phase0e_artifact_digest":"sha256:f8a2c97ad791f7a037913fa62f3a21b06d572bbe69251eefd322be84e267c014",
+              "qualified_sleeper_league_n":38,
+              "records":records,
+              "summary":{
+                  "phase0e_should_have_accepted_league_n":len(phase0e_should_have_accepted),
+                  "sixplus_round_nonrookie_tag_bridge_candidate_league_n":len(bridge_candidates),
+                  "shallow_complete_12team_league_n":len(shallow_only),
+                  "no_complete_12team_2018_draft_league_n":len(no_complete_12),
+                  "complete_12team_round_histogram":dict(sorted(round_hist.items())),
+                  "complete_12team_player_type_histogram":dict(sorted(player_type_hist.items())),
+              },
+              "phase0e_should_have_accepted_league_ids":[r["league_id"] for r in phase0e_should_have_accepted],
+              "bridge_candidate_league_ids":[r["league_id"] for r in bridge_candidates],
+              "shallow_only_league_ids":[r["league_id"] for r in shallow_only],
+              "no_complete_12team_2018_draft_league_ids":[r["league_id"] for r in no_complete_12],
+              "transport_unresolved":unresolved,
+              "draft_pick_endpoint_read":False,
+              "player_catalog_read":False,
+              "historical_player_outcomes_read":False,
+              "holdout_2024_outcomes_read":False,
+              "market_or_ktc_values_read":False,
+              "package_vote_data_read":False,
+              "candidate_fit_performed":False,
+              "candidate_scores_computed":False,
+              "production_change_authorized":False,
+          }
+
+          (OUT/"v8_phase0f_sleeper_qualified_draft_metadata_audit.json").write_text(
+              json.dumps(result,indent=2,sort_keys=True)+"\n"
+          )
+
+          lines=[
+              "# Draft Pick FV V8 — Phase 0F Sleeper Qualified Draft Metadata Audit",
+              "",
+              f"**Decision:** `{decision}`",
+              "",
+              "- Phase 0E qualified Sleeper leagues audited: **38**",
+              f"- Phase 0E-selection inconsistency leagues: **{len(phase0e_should_have_accepted)}**",
+              f"- 2018 complete 12-team ≥6-round drafts with non-rookie/missing tag: **{len(bridge_candidates)}**",
+              f"- Complete 12-team drafts that are too shallow for R6: **{len(shallow_only)}**",
+              f"- No complete 12-team 2018 draft: **{len(no_complete_12)}**",
+              "",
+              "## Complete 12-team 2018 draft round histogram",
+              "",
+          ]
+          for k,v in sorted(round_hist.items(), key=lambda kv:(int(kv[0]) if kv[0] not in {"None"} else 9999,kv[0])):
+              lines.append(f"- `{k}` rounds: **{v}** draft(s)")
+
+          lines += [
+              "",
+              "## Complete 12-team 2018 player_type histogram",
+              "",
+          ]
+          for k,v in sorted(player_type_hist.items()):
+              lines.append(f"- `player_type={k}`: **{v}** draft(s)")
+
+          lines += [
+              "",
+              "No draft picks were read. No player identities, historical outcomes, 2024 holdout outcomes, market/KTC values, package votes, fits, scores, or production values were read.",
+          ]
+
+          (OUT/"v8_phase0f_sleeper_qualified_draft_metadata_audit.md").write_text(
+              "\n".join(lines)+"\n"
+          )
+          print("\n".join(lines))
+          PY
+
+      - name: Validate Phase 0F firewalls
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          p=Path(os.environ["RUNNER_TEMP"])/"out"/"v8_phase0f_sleeper_qualified_draft_metadata_audit.json"
+          d=json.loads(p.read_text())
+
+          assert d["qualified_sleeper_league_n"]==38
+          assert len(d["records"])==38
+          assert not d["transport_unresolved"]
+          assert d["draft_pick_endpoint_read"] is False
+          assert d["player_catalog_read"] is False
+          assert d["historical_player_outcomes_read"] is False
+          assert d["holdout_2024_outcomes_read"] is False
+          assert d["market_or_ktc_values_read"] is False
+          assert d["package_vote_data_read"] is False
+          assert d["candidate_fit_performed"] is False
+          assert d["candidate_scores_computed"] is False
+          assert d["production_change_authorized"] is False
+          assert d["decision"] in {
+              "STOP_AND_FIX_V8_PHASE0E_SLEEPER_DRAFT_SELECTION_IMPLEMENTATION",
+              "PREREGISTER_V8_PHASE0G_SLEEPER_ROOKIE_CLASSIFICATION_BRIDGE_BEFORE_PICKS",
+              "STOP_SLEEPER_AS_V8_2018_R6_SECOND_SOURCE_AND_PREREGISTER_THIRD_PROVIDER_BEFORE_OUTCOMES",
+          }
+
+          print("PASS: Phase 0F is metadata-only, outcome-sealed, and limited to the 38 Phase 0E-qualified Sleeper leagues.")
+          PY
+
+      - name: Upload Phase 0F audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: v8-p0f-sleeper-qualified-draft-metadata-audit
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
+          retention-days: 30
