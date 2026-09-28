@@ -47,6 +47,36 @@ jobs:
             "PyYAML==6.0.2" \
             "requests==2.34.2"
 
+      - name: Remove exact stray cleanup duplicate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ACTIVE=".github/workflows/workflow-folder-cleanup-UPDATED-2026-09-26.yml"
+          STRAY=".github/workflows/workflow-folder-cleanup-UPDATED-2026-09-26-v2.yml"
+          KNOWN_STRAY_BLOB="d9723667329ebbf8a7ba11c6c7972e773a4d1eba"
+
+          test -f "$ACTIVE" || {
+            echo "ERROR: canonical cleanup workflow is missing."
+            exit 1
+          }
+
+          if test -e "$STRAY"; then
+            actual="$(git hash-object "$STRAY")"
+            echo "Stray cleanup blob: $actual"
+            test "$actual" = "$KNOWN_STRAY_BLOB" || {
+              echo "ERROR: stray cleanup file content is not the exact known V2 duplicate."
+              exit 1
+            }
+            rm "$STRAY"
+            echo "PASS: removed exact stray V2 cleanup duplicate."
+          else
+            echo "PASS: no stray V2 cleanup duplicate present."
+          fi
+
+          test -f "$ACTIVE"
+          test ! -e "$STRAY"
+
       - name: Guard Draft Pick V8.1 closure and exact workflow inventory
         shell: bash
         env:
@@ -166,23 +196,50 @@ jobs:
                   ["git", "hash-object", str(path)], text=True
               ).strip()
 
-          def trigger_names(path):
+          def trigger_contract(path):
               doc = yaml.load(
                   Path(path).read_text(encoding="utf-8"),
                   Loader=yaml.BaseLoader,
               )
               if not isinstance(doc, dict):
                   raise SystemExit(f"Invalid workflow YAML object: {path}")
-              triggers = doc.get("on")
-              if isinstance(triggers, str):
-                  return {triggers}
-              if isinstance(triggers, list):
-                  return set(map(str, triggers))
-              if isinstance(triggers, dict):
-                  return set(map(str, triggers.keys()))
-              raise SystemExit(
-                  f"Unrecognized workflow trigger syntax: {path}: {triggers!r}"
-              )
+
+              raw = doc.get("on")
+              if isinstance(raw, str):
+                  return {raw}, [], set()
+              if isinstance(raw, list):
+                  return set(map(str, raw)), [], set()
+              if not isinstance(raw, dict):
+                  raise SystemExit(
+                      f"Unrecognized workflow trigger syntax: {path}: {raw!r}"
+                  )
+
+              triggers = set(map(str, raw.keys()))
+              push_paths = []
+              push_keys = set()
+
+              if "push" in raw:
+                  push = raw["push"]
+                  if push is None:
+                      push = {}
+                  if not isinstance(push, dict):
+                      raise SystemExit(
+                          f"Unexpected push trigger form in {path}: {push!r}"
+                      )
+                  push_keys = set(map(str, push.keys()))
+                  paths = push.get("paths", [])
+                  if isinstance(paths, str):
+                      push_paths = [paths]
+                  elif isinstance(paths, list):
+                      push_paths = list(map(str, paths))
+                  elif paths is None:
+                      push_paths = []
+                  else:
+                      raise SystemExit(
+                          f"Unexpected push.paths form in {path}: {paths!r}"
+                      )
+
+              return triggers, push_paths, push_keys
 
           def run_info(run_id):
               repo = os.environ["GH_REPOSITORY"]
@@ -318,12 +375,43 @@ jobs:
                       f"SHA drift for {name}: expected={expected_sha} actual={actual_sha}"
                   )
 
-              triggers = trigger_names(src)
-              if triggers != {"workflow_dispatch"}:
+              triggers, push_paths, push_keys = trigger_contract(src)
+
+              # Completed Draft Pick workflows may be manual-only, or may also
+              # contain a narrowly scoped push trigger that watches only workflow
+              # files in this exact archive cohort. Once the entire cohort is
+              # archived, those push triggers are intentionally retired too.
+              allowed_trigger_sets = (
+                  {"workflow_dispatch"},
+                  {"workflow_dispatch", "push"},
+              )
+              if triggers not in allowed_trigger_sets:
                   raise SystemExit(
-                      f"Refusing to archive non-manual-only workflow "
+                      f"Refusing to archive workflow with unsupported triggers "
                       f"{name}: triggers={sorted(triggers)}"
                   )
+
+              if "push" in triggers:
+                  if push_keys != {"paths"}:
+                      raise SystemExit(
+                          f"Refusing push-trigger workflow with non-path push "
+                          f"constraints {name}: push_keys={sorted(push_keys)}"
+                      )
+                  if not push_paths:
+                      raise SystemExit(
+                          f"Refusing unscoped push-trigger workflow {name}"
+                      )
+                  allowed_push_paths = {
+                      f".github/workflows/{n}" for n in archive_targets
+                  }
+                  unexpected_push_paths = sorted(
+                      set(push_paths) - allowed_push_paths
+                  )
+                  if unexpected_push_paths:
+                      raise SystemExit(
+                          f"Refusing push-trigger workflow {name}; paths escape "
+                          f"archive cohort: {unexpected_push_paths}"
+                      )
 
               family = (
                   "Draft Pick FV V8.1 completed/closed"
@@ -337,6 +425,7 @@ jobs:
                       "git_blob_sha": actual_sha,
                       "sha256": hashlib.sha256(src.read_bytes()).hexdigest(),
                       "triggers": sorted(triggers),
+                      "push_paths": sorted(push_paths),
                       "cleanup_batch": batch,
                       "research_family": family,
                   }
@@ -372,7 +461,7 @@ jobs:
 
           print("PASS: V8.1 final closeout authorizes Draft Pick workflow cleanup.")
           print("PASS: active workflows before cleanup: 55")
-          print("PASS: Draft Pick V8/V8.1 workflows to archive: 29")
+          print("PASS: Draft Pick V8/V8.1 workflows to archive: 29 (manual-only or cohort-scoped push)")
           print("PASS: active protected workflows after cleanup: 26")
           print("PASS: Package Adjustment V8 workflows remain active and untouched.")
           PY
@@ -613,6 +702,10 @@ jobs:
               "workflow-folder-cleanup-UPDATED-2026-09-26.yml"
               in actual
           )
+          assert (
+              "workflow-folder-cleanup-UPDATED-2026-09-26-v2.yml"
+              not in actual
+          )
 
           dispatcher = (
               workflow_dir / "package-adjustment-audit-step4-exact-live-oos.yml"
@@ -695,6 +788,7 @@ jobs:
           allowed = {
               ".github/workflow-archive/completed-research/README.md",
               ".github/workflow-archive/completed-research/archive_manifest.json",
+              ".github/workflows/workflow-folder-cleanup-UPDATED-2026-09-26-v2.yml",
           }
 
           for row in batch_rows:
