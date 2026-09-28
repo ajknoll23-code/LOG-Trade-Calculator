@@ -1,0 +1,681 @@
+name: Draft Pick FV V8 - Phase 1.1 Position Retention Hardening
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/draft-pick-fv-v8-phase1-1-position-retention-hardening.yml'
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: draft-pick-fv-v8-phase1-1-position-retention-hardening
+  cancel-in-progress: false
+
+jobs:
+  harden:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PYTHONDONTWRITEBYTECODE: "1"
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Download exact Phase 1 freeze and frozen identity assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/p1" "${RUNNER_TEMP}/p0a" "${RUNNER_TEMP}/out"
+
+          P1_RUN_ID="36463704131"
+          P1_ARTIFACT_ID="10988354110"
+          P1_DIGEST="sha256:4d95c475c3dfd74f1045e585e091490f54209ed84950259c9c0cf60f149a1de7"
+
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${P1_ARTIFACT_ID}" --jq '.digest // ""')" = "$P1_DIGEST"
+          gh run download "$P1_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            -n "v8-p1-incremental-source-identity-freeze" \
+            -D "${RUNNER_TEMP}/p1"
+
+          P0A_RUN_ID="36207166693"
+          P0A_ARTIFACT_ID="10894002488"
+          P0A_DIGEST="sha256:bb24b4ea7378936ea1f8b9504e631f566218a3bdf20297d19d5fe7657de32d5d"
+
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${P0A_ARTIFACT_ID}" --jq '.digest // ""')" = "$P0A_DIGEST"
+          gh run download "$P0A_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            -n "v8-p0a-raw-depth-prep" \
+            -D "${RUNNER_TEMP}/p0a"
+
+      - name: Apply frozen position lineage and occurrence retention rule
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import json
+          import math
+          import os
+          from collections import Counter, defaultdict
+          from pathlib import Path
+          from typing import Any
+
+          ROOT=Path(os.environ["RUNNER_TEMP"])
+          P1=ROOT/"p1"
+          P0A=ROOT/"p0a"
+          OUT=ROOT/"out"
+
+          IN_ROWS=P1/"v8_phase1_incremental_source_identity_occurrences.jsonl"
+          IN_SUM=P1/"v8_phase1_incremental_source_identity_freeze.json"
+          IN_MAN=P1/"v8_phase1_incremental_source_identity_freeze_manifest.json"
+          NV=P0A/"engine"/"nflverse_players.csv"
+
+          EXPECTED_INPUT_N=24988
+          EXPECTED_INPUT_SHA="7da5d8e16cdf38cd8b34e275b4c1a9982c4e1bffdcb00068b0f63766140a1fea"
+          EXPECTED_NV_SHA="4dd70f328f31b0bb7cbf043412298d5a325863e27b8f2eeea22c9e925c808dee"
+          EXPECTED_GROUP_N=6247
+          EXPECTED_REPAIRED_OCCURRENCE_N=74
+          EXPECTED_REPAIRED_TARGET_N=1
+          EXPECTED_EXCLUDED_OCCURRENCE_N=18
+          EXPECTED_EXCLUDED_TARGET_N=11
+          EXPECTED_RETAINED_N=24970
+          EXPECTED_RETAINED_UNIQUE_TARGET_N=929
+          MIN_RETENTION=0.95
+
+          POS_MAP={
+              "QB":"QB",
+              "RB":"RB",
+              "FB":"RB",
+              "WR":"WR",
+              "TE":"TE",
+              "DE":"DL",
+              "DT":"DL",
+              "NT":"DL",
+              "DL":"DL",
+              "EDGE":"DL",
+              "OLB":"LB",
+              "ILB":"LB",
+              "MLB":"LB",
+              "LB":"LB",
+              "CB":"DB",
+              "S":"DB",
+              "SS":"DB",
+              "FS":"DB",
+              "DB":"DB",
+          }
+          SUPPORTED={"QB","RB","WR","TE","DL","LB","DB"}
+          YEARS=tuple(range(2018,2024))
+          CELLS=tuple(
+              f"r{rnd}_{tier}"
+              for rnd in range(1,7)
+              for tier in ("early","mid","late")
+          )
+
+          def sha(path: Path) -> str:
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          def load(path: Path):
+              return json.loads(path.read_text())
+
+          def read_jsonl(path: Path):
+              rows=[]
+              with path.open() as f:
+                  for n,line in enumerate(f,1):
+                      if not line.strip():
+                          continue
+                      obj=json.loads(line)
+                      assert isinstance(obj,dict),(path,n)
+                      rows.append(obj)
+              return rows
+
+          def write_jsonl(path: Path, rows):
+              with path.open("w",encoding="utf-8") as f:
+                  for row in rows:
+                      f.write(
+                          json.dumps(
+                              row,
+                              sort_keys=True,
+                              separators=(",",":"),
+                              ensure_ascii=False,
+                          )+"\n"
+                      )
+
+          def norm_pos(v: Any):
+              return POS_MAP.get(str(v or "").strip().upper())
+
+          def safe_int(v: Any):
+              try:
+                  return int(str(v).strip())
+              except Exception:
+                  return None
+
+          summary=load(IN_SUM)
+          manifest=load(IN_MAN)
+
+          assert summary["decision"]=="PROCEED_TO_V8_PHASE2_HISTORICAL_OUTCOME_HARVEST"
+          assert summary["status"]=="FROZEN_PRE_HISTORICAL_OUTCOME_ACCESS"
+          assert summary["source_frame"]["retained_occurrence_n"]==EXPECTED_INPUT_N
+          assert summary["source_frame"]["source_membership_group_n"]==EXPECTED_GROUP_N
+          assert summary["identity"]["identity_coverage"]==1.0
+          assert summary["identity"]["sleeper_ready_coverage"]==1.0
+          assert summary["historical_outcome_ingestion_authorized"] is True
+          assert summary["holdout_2024_outcomes_read"] is False
+          assert summary["candidate_fit_performed"] is False
+          assert summary["production_change_authorized"] is False
+
+          assert manifest["occurrence_n"]==EXPECTED_INPUT_N
+          assert manifest["occurrence_jsonl_sha256"]==EXPECTED_INPUT_SHA
+          assert manifest["historical_outcome_ingestion_authorized"] is True
+          assert manifest["holdout_2024_outcomes_read"] is False
+          assert manifest["candidate_fit_performed"] is False
+          assert manifest["production_change_authorized"] is False
+
+          assert sha(IN_ROWS)==EXPECTED_INPUT_SHA
+          assert sha(NV)==EXPECTED_NV_SHA
+
+          rows=read_jsonl(IN_ROWS)
+          assert len(rows)==EXPECTED_INPUT_N
+
+          # Frozen exact-GSIS metadata index. No name matching.
+          by_gsis={}
+          with NV.open(newline="",encoding="utf-8-sig") as f:
+              reader=csv.DictReader(f)
+              required={"gsis_id","display_name","position","rookie_season"}
+              assert required.issubset(reader.fieldnames or [])
+              for raw in reader:
+                  gsis=str(raw.get("gsis_id") or "").strip()
+                  if not gsis:
+                      continue
+                  assert gsis not in by_gsis
+                  by_gsis[gsis]={
+                      "display_name":raw.get("display_name"),
+                      "position":raw.get("position"),
+                      "rookie_season":safe_int(raw.get("rookie_season")),
+                  }
+
+          original_by_year_cell=Counter(
+              (int(r["draft_year"]),str(r["cell"]))
+              for r in rows
+          )
+          original_groups=Counter(
+              (int(r["draft_year"]),str(r["cell"]),str(r["league_id"]))
+              for r in rows
+          )
+          assert len(original_groups)==EXPECTED_GROUP_N
+          assert set(original_groups.values())=={4}
+
+          retained=[]
+          excluded=[]
+          repaired_target_keys=set()
+          repaired_occurrence_n=0
+
+          for row in rows:
+              y=int(row["draft_year"])
+              cell=str(row["cell"])
+              lid=str(row["league_id"])
+              sid=str(row["sleeper_id"])
+              gsis=str(row.get("gsis_id") or "").strip()
+              raw_pos=str(row.get("draft_position") or "").strip()
+              source_pos=norm_pos(raw_pos)
+
+              if source_pos in SUPPORTED:
+                  out=dict(row)
+                  out["outcome_position_v8"]=source_pos
+                  out["position_retention_status_v8"]="retained_frozen_source_position"
+                  out["position_lineage_method_v8"]="frozen_source_position_normalized"
+                  retained.append(out)
+                  continue
+
+              nv=by_gsis.get(gsis)
+              nv_pos=norm_pos((nv or {}).get("position"))
+              nv_rookie=(nv or {}).get("rookie_season")
+
+              # Frozen repair rule:
+              # exact GSIS + supported nflverse position + same rookie class only.
+              if nv_pos in SUPPORTED and nv_rookie==y:
+                  out=dict(row)
+                  out["outcome_position_v8"]=nv_pos
+                  out["position_retention_status_v8"]="retained_exact_gsis_rookie_class_position_repair"
+                  out["position_lineage_method_v8"]="exact_gsis_nflverse_position_same_rookie_class"
+                  out["original_draft_position_v8"]=raw_pos
+                  retained.append(out)
+                  repaired_occurrence_n+=1
+                  repaired_target_keys.add((y,sid))
+                  continue
+
+              reason=(
+                  "unsupported_model_position_confirmed_by_exact_gsis"
+                  if nv is not None and nv_pos is None
+                  else
+                  "unsupported_or_unresolved_historical_position"
+              )
+              excluded.append({
+                  "draft_year":y,
+                  "cell":cell,
+                  "league_id":lid,
+                  "overall_slot":int(row["overall_slot"]),
+                  "sleeper_id":sid,
+                  "stable_player_key":row["stable_player_key"],
+                  "gsis_id":gsis or None,
+                  "name":row.get("name"),
+                  "frozen_source_position":raw_pos or None,
+                  "nflverse_position":(nv or {}).get("position"),
+                  "nflverse_rookie_season":nv_rookie,
+                  "reason":reason,
+                  "historical_player_outcomes_read":False,
+              })
+
+          excluded_target_keys={
+              (int(x["draft_year"]),str(x["sleeper_id"]))
+              for x in excluded
+          }
+
+          assert repaired_occurrence_n==EXPECTED_REPAIRED_OCCURRENCE_N
+          assert len(repaired_target_keys)==EXPECTED_REPAIRED_TARGET_N
+          assert len(excluded)==EXPECTED_EXCLUDED_OCCURRENCE_N
+          assert len(excluded_target_keys)==EXPECTED_EXCLUDED_TARGET_N
+          assert len(retained)==EXPECTED_RETAINED_N
+          assert len({
+              (int(r["draft_year"]),str(r["sleeper_id"]))
+              for r in retained
+          })==EXPECTED_RETAINED_UNIQUE_TARGET_N
+
+          # The exact observed invalid-position pattern is frozen before outcomes:
+          # 16 kicker occurrences and 2 punter occurrences.
+          excluded_raw=Counter(x["frozen_source_position"] for x in excluded)
+          assert excluded_raw=={"PK":16,"PN":2},excluded_raw
+
+          # No source membership group may be removed. The 18 affected
+          # league-cells retain 3/4 occurrences; all other groups remain 4/4.
+          retained_groups=Counter(
+              (int(r["draft_year"]),str(r["cell"]),str(r["league_id"]))
+              for r in retained
+          )
+          assert set(retained_groups)==set(original_groups)
+          assert len(retained_groups)==EXPECTED_GROUP_N
+          group_size_dist=Counter(retained_groups.values())
+          assert group_size_dist=={4:6229,3:18},group_size_dist
+
+          # Apply the frozen V7 >=95% occurrence-retention gate to every
+          # historical year-cell before opening player outcomes.
+          retained_by_year_cell=Counter(
+              (int(r["draft_year"]),str(r["cell"]))
+              for r in retained
+          )
+          retention={}
+          for y in YEARS:
+              for cell in CELLS:
+                  n0=original_by_year_cell[(y,cell)]
+                  n1=retained_by_year_cell[(y,cell)]
+                  assert n0>0
+                  rate=n1/n0
+                  retention[f"{y}:{cell}"]={
+                      "pre_retention_occurrence_n":n0,
+                      "retained_occurrence_n":n1,
+                      "retention_rate":rate,
+                      "minimum_required":MIN_RETENTION,
+                      "pass":rate>=MIN_RETENTION,
+                  }
+          assert all(x["pass"] for x in retention.values())
+          minimum_retention=min(x["retention_rate"] for x in retention.values())
+          assert math.isclose(
+              minimum_retention,
+              47/48,
+              rel_tol=0.0,
+              abs_tol=1e-15,
+          ),minimum_retention
+
+          # Recompute weights exactly according to the already-frozen V7
+          # contract. League membership stays fixed; retained occurrences
+          # divide each league-cell weight equally.
+          grouped=defaultdict(list)
+          for row in retained:
+              grouped[
+                  (int(row["draft_year"]),str(row["cell"]),str(row["league_id"]))
+              ].append(row)
+
+          hardened=[]
+          for y in YEARS:
+              for cell in CELLS:
+                  cell_rows=[
+                      key for key in grouped
+                      if key[0]==y and key[1]==cell
+                  ]
+                  league_n=len(cell_rows)
+                  assert league_n==len({
+                      str(r["league_id"])
+                      for r in rows
+                      if int(r["draft_year"])==y and str(r["cell"])==cell
+                  })
+                  year_cell_weight=1.0/108.0
+                  league_weight=year_cell_weight/league_n
+
+                  for key in sorted(
+                      cell_rows,
+                      key=lambda x:int(x[2]),
+                  ):
+                      xs=sorted(
+                          grouped[key],
+                          key=lambda r:int(r["overall_slot"]),
+                      )
+                      assert len(xs) in {3,4}
+                      occurrence_weight=league_weight/len(xs)
+                      for retained_index,row in enumerate(xs,1):
+                          out=dict(row)
+                          out["pre_retention_development_fit_weight_v8"] = \
+                              row["development_fit_weight_v8"]
+                          out["retained_occurrence_n_in_league_cell_v8"]=len(xs)
+                          out["development_fit_weight_v8"]=occurrence_weight
+                          out["retained_occurrence_index_v8"]=retained_index
+                          hardened.append(out)
+
+          assert len(hardened)==EXPECTED_RETAINED_N
+
+          # Deterministic output order.
+          hardened.sort(
+              key=lambda r:(
+                  int(r["draft_year"]),
+                  int(r["round"]),
+                  {"early":0,"mid":1,"late":2}[str(r["cell"]).split("_")[1]],
+                  int(r["source_membership_index"]),
+                  int(r["overall_slot"]),
+              )
+          )
+
+          # Weight invariants after retention.
+          total=sum(float(r["development_fit_weight_v8"]) for r in hardened)
+          assert math.isclose(total,1.0,rel_tol=0.0,abs_tol=1e-12)
+
+          year_w=defaultdict(float)
+          cell_w=defaultdict(float)
+          year_cell_w=defaultdict(float)
+          league_cell_w=defaultdict(float)
+
+          for r in hardened:
+              w=float(r["development_fit_weight_v8"])
+              y=int(r["draft_year"])
+              c=str(r["cell"])
+              lid=str(r["league_id"])
+              year_w[y]+=w
+              cell_w[c]+=w
+              year_cell_w[(y,c)]+=w
+              league_cell_w[(y,c,lid)]+=w
+
+          for y in YEARS:
+              assert math.isclose(year_w[y],1/6,rel_tol=0.0,abs_tol=1e-12)
+          for c in CELLS:
+              assert math.isclose(cell_w[c],1/18,rel_tol=0.0,abs_tol=1e-12)
+          for y in YEARS:
+              for c in CELLS:
+                  assert math.isclose(
+                      year_cell_w[(y,c)],
+                      1/108,
+                      rel_tol=0.0,
+                      abs_tol=1e-12,
+                  )
+
+          # Identity stays fully resolved among retained occurrences.
+          assert all(r["identity_resolved"] is True for r in hardened)
+          assert all(r["outcome_ready_sleeper_id"] is True for r in hardened)
+          assert all(r["sleeper_id"] for r in hardened)
+          assert all(r["outcome_position_v8"] in SUPPORTED for r in hardened)
+
+          sparse=[
+              r for r in hardened
+              if int(r["draft_year"])==2018
+              and str(r["cell"]).startswith("r6_")
+          ]
+          assert len(sparse)==72
+          assert all(r["source_sparse_2018_r6"] is True for r in sparse)
+
+          out_rows=OUT/"v8_phase1_1_position_retention_occurrences.jsonl"
+          out_excluded=OUT/"v8_phase1_1_excluded_occurrences.jsonl"
+          write_jsonl(out_rows,hardened)
+          write_jsonl(out_excluded,excluded)
+
+          decision="PROCEED_TO_V8_PHASE2_HISTORICAL_OUTCOME_HARVEST"
+
+          summary={
+              "schema_version":1,
+              "study_id":"draft-pick-fv-v8-depth-specific-source-cohorts",
+              "stage":"phase1_1_position_retention_hardening",
+              "status":"FROZEN_PRE_HISTORICAL_OUTCOME_ACCESS",
+              "decision":decision,
+              "input_phase1":{
+                  "run_id":36463704131,
+                  "artifact_id":10988354110,
+                  "artifact_digest":
+                      "sha256:4d95c475c3dfd74f1045e585e091490f54209ed84950259c9c0cf60f149a1de7",
+                  "occurrence_n":EXPECTED_INPUT_N,
+                  "occurrence_sha256":EXPECTED_INPUT_SHA,
+              },
+              "position_lineage":{
+                  "nflverse_players_sha256":EXPECTED_NV_SHA,
+                  "join_key":"exact_gsis_id_only",
+                  "name_matching_used":False,
+                  "current_sleeper_position_used":False,
+                  "repair_requires_supported_position":True,
+                  "repair_requires_nflverse_rookie_season_equal_draft_year":True,
+                  "repaired_occurrence_n":repaired_occurrence_n,
+                  "repaired_unique_target_n":len(repaired_target_keys),
+              },
+              "retention":{
+                  "input_occurrence_n":EXPECTED_INPUT_N,
+                  "excluded_occurrence_n":len(excluded),
+                  "excluded_unique_target_n":len(excluded_target_keys),
+                  "retained_occurrence_n":len(hardened),
+                  "retained_unique_target_n":EXPECTED_RETAINED_UNIQUE_TARGET_N,
+                  "source_membership_group_n":EXPECTED_GROUP_N,
+                  "source_membership_groups_removed_n":0,
+                  "league_cell_retained_size_distribution":{
+                      str(k):v for k,v in sorted(group_size_dist.items())
+                  },
+                  "minimum_year_cell_retention":minimum_retention,
+                  "minimum_required":MIN_RETENTION,
+                  "all_108_year_cells_pass":True,
+                  "by_year_cell":retention,
+              },
+              "weighting_contract":{
+                  "cell_macro_weight":"1/18",
+                  "draft_class_weight":"1/6",
+                  "year_cell_weight":"1/108",
+                  "league_membership_changed":False,
+                  "league_weight_rule":"equal within frozen year-cell membership",
+                  "occurrence_weight_rule":"retained occurrences divide league-cell weight equally",
+                  "grand_weight_sum":total,
+                  "all_year_weights_equal_one_sixth":True,
+                  "all_cell_weights_equal_one_eighteenth":True,
+                  "all_year_cell_weights_equal_one_108th":True,
+              },
+              "identity":{
+                  "retained_identity_coverage":1.0,
+                  "retained_sleeper_ready_coverage":1.0,
+                  "all_retained_positions_supported":True,
+              },
+              "sparse_2018_r6_occurrence_n":72,
+              "sparse_cell_controls":load(IN_SUM)["sparse_cell_controls"],
+              "output":{
+                  "retained_occurrences_file":out_rows.name,
+                  "retained_occurrences_sha256":sha(out_rows),
+                  "excluded_occurrences_file":out_excluded.name,
+                  "excluded_occurrences_sha256":sha(out_excluded),
+              },
+              "historical_player_outcomes_read":False,
+              "historical_outcome_ingestion_authorized":True,
+              "holdout_2024_outcomes_read":False,
+              "holdout_2024_search_performed":False,
+              "market_or_ktc_values_read":False,
+              "package_vote_data_read":False,
+              "candidate_fit_performed":False,
+              "candidate_scores_computed":False,
+              "production_change_authorized":False,
+              "next_stage":"draft-pick-fv-v8-phase2-historical-outcome-harvest",
+          }
+
+          manifest={
+              "schema_version":1,
+              "study_id":summary["study_id"],
+              "stage":"phase1_1_position_retention_hardening_manifest",
+              "status":summary["status"],
+              "decision":decision,
+              "input_occurrence_n":EXPECTED_INPUT_N,
+              "retained_occurrence_n":EXPECTED_RETAINED_N,
+              "excluded_occurrence_n":EXPECTED_EXCLUDED_OCCURRENCE_N,
+              "repaired_occurrence_n":EXPECTED_REPAIRED_OCCURRENCE_N,
+              "retained_unique_target_n":EXPECTED_RETAINED_UNIQUE_TARGET_N,
+              "source_membership_group_n":EXPECTED_GROUP_N,
+              "minimum_year_cell_retention":minimum_retention,
+              "all_108_year_cells_pass":True,
+              "retained_occurrences_sha256":sha(out_rows),
+              "excluded_occurrences_sha256":sha(out_excluded),
+              "historical_player_outcomes_read":False,
+              "historical_outcome_ingestion_authorized":True,
+              "holdout_2024_outcomes_read":False,
+              "candidate_fit_performed":False,
+              "production_change_authorized":False,
+              "next_stage":summary["next_stage"],
+          }
+
+          (OUT/"v8_phase1_1_position_retention_hardening.json").write_text(
+              json.dumps(summary,indent=2,sort_keys=True)+"\n"
+          )
+          (OUT/"v8_phase1_1_position_retention_hardening_manifest.json").write_text(
+              json.dumps(manifest,indent=2,sort_keys=True)+"\n"
+          )
+
+          lines=[
+              "# Draft Pick FV V8 — Phase 1.1 Position Retention Hardening",
+              "",
+              f"**Decision:** `{decision}`",
+              "",
+              f"- Phase 1 input occurrences: **{EXPECTED_INPUT_N:,}**",
+              f"- Exact-GSIS same-class position repairs: **{repaired_occurrence_n}** occurrences / **{len(repaired_target_keys)}** unique player",
+              f"- Unsupported K/P exclusions: **{len(excluded)}** occurrences / **{len(excluded_target_keys)}** unique players",
+              f"- Retained development occurrences: **{len(hardened):,}**",
+              f"- Retained unique player-year targets: **{EXPECTED_RETAINED_UNIQUE_TARGET_N}**",
+              f"- Frozen source league-cell groups retained: **{EXPECTED_GROUP_N:,} / {EXPECTED_GROUP_N:,}**",
+              f"- Minimum year-cell occurrence retention: **{minimum_retention:.2%}**",
+              "- 108/108 year-cell retention gates: **PASS**",
+              "- Retained identity/Sleeper readiness: **100% / 100%**",
+              "- 2018 R6 sparse occurrences retained: **72 / 72**",
+              "",
+              "Weights were renormalized only within affected frozen league-cells, so the original equal-cell/equal-class/equal-league weighting contract still sums to exactly 1.0.",
+              "",
+              "No NFL outcomes, 2024 holdout outcomes, KTC/market data, package votes, candidate fits, candidate scores, or production values were read.",
+              "",
+              "Next: `draft-pick-fv-v8-phase2-historical-outcome-harvest`.",
+          ]
+          (OUT/"v8_phase1_1_position_retention_hardening.md").write_text(
+              "\n".join(lines)+"\n"
+          )
+
+          print("\n".join(lines))
+          PY
+
+      - name: Validate Phase 1.1 closeout
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          import math
+          import os
+          from pathlib import Path
+
+          out=Path(os.environ["RUNNER_TEMP"])/"out"
+          s=json.loads((out/"v8_phase1_1_position_retention_hardening.json").read_text())
+          m=json.loads((out/"v8_phase1_1_position_retention_hardening_manifest.json").read_text())
+
+          assert s["decision"]=="PROCEED_TO_V8_PHASE2_HISTORICAL_OUTCOME_HARVEST"
+          assert s["status"]=="FROZEN_PRE_HISTORICAL_OUTCOME_ACCESS"
+
+          assert s["position_lineage"]["join_key"]=="exact_gsis_id_only"
+          assert s["position_lineage"]["name_matching_used"] is False
+          assert s["position_lineage"]["current_sleeper_position_used"] is False
+          assert s["position_lineage"]["repaired_occurrence_n"]==74
+          assert s["position_lineage"]["repaired_unique_target_n"]==1
+
+          r=s["retention"]
+          assert r["input_occurrence_n"]==24988
+          assert r["excluded_occurrence_n"]==18
+          assert r["excluded_unique_target_n"]==11
+          assert r["retained_occurrence_n"]==24970
+          assert r["retained_unique_target_n"]==929
+          assert r["source_membership_group_n"]==6247
+          assert r["source_membership_groups_removed_n"]==0
+          assert r["league_cell_retained_size_distribution"]=={
+              "3":18,
+              "4":6229,
+          }
+          assert math.isclose(
+              r["minimum_year_cell_retention"],
+              47/48,
+              rel_tol=0.0,
+              abs_tol=1e-15,
+          )
+          assert r["all_108_year_cells_pass"] is True
+          assert all(v["pass"] for v in r["by_year_cell"].values())
+
+          w=s["weighting_contract"]
+          assert math.isclose(w["grand_weight_sum"],1.0,rel_tol=0.0,abs_tol=1e-12)
+          assert w["league_membership_changed"] is False
+          assert w["all_year_weights_equal_one_sixth"] is True
+          assert w["all_cell_weights_equal_one_eighteenth"] is True
+          assert w["all_year_cell_weights_equal_one_108th"] is True
+
+          assert s["identity"]["retained_identity_coverage"]==1.0
+          assert s["identity"]["retained_sleeper_ready_coverage"]==1.0
+          assert s["identity"]["all_retained_positions_supported"] is True
+          assert s["sparse_2018_r6_occurrence_n"]==72
+
+          assert s["historical_player_outcomes_read"] is False
+          assert s["historical_outcome_ingestion_authorized"] is True
+          assert s["holdout_2024_outcomes_read"] is False
+          assert s["holdout_2024_search_performed"] is False
+          assert s["market_or_ktc_values_read"] is False
+          assert s["package_vote_data_read"] is False
+          assert s["candidate_fit_performed"] is False
+          assert s["candidate_scores_computed"] is False
+          assert s["production_change_authorized"] is False
+
+          assert m["decision"]==s["decision"]
+          assert m["retained_occurrence_n"]==24970
+          assert m["excluded_occurrence_n"]==18
+          assert m["repaired_occurrence_n"]==74
+          assert m["retained_unique_target_n"]==929
+          assert m["source_membership_group_n"]==6247
+          assert m["all_108_year_cells_pass"] is True
+          assert m["historical_player_outcomes_read"] is False
+          assert m["historical_outcome_ingestion_authorized"] is True
+          assert m["holdout_2024_outcomes_read"] is False
+          assert m["candidate_fit_performed"] is False
+          assert m["production_change_authorized"] is False
+
+          rows=out/"v8_phase1_1_position_retention_occurrences.jsonl"
+          excl=out/"v8_phase1_1_excluded_occurrences.jsonl"
+          assert sum(1 for x in rows.open() if x.strip())==24970
+          assert sum(1 for x in excl.open() if x.strip())==18
+
+          print("PASS: Phase 1.1 applies the frozen invalid-occurrence rule pre-outcome, preserves all 6,247 source groups, and passes 108/108 retention gates.")
+          PY
+
+      - name: Upload Phase 1.1 hardening closeout
+        uses: actions/upload-artifact@v4
+        with:
+          name: v8-p1-1-position-retention-hardening
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
+          retention-days: 30
