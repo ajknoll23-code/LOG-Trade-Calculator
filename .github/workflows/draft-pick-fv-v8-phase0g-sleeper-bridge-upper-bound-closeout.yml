@@ -1,0 +1,321 @@
+name: Draft Pick FV V8 - Phase 0G Sleeper Bridge Upper-Bound Closeout
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: draft-pick-fv-v8-phase0g-sleeper-bridge-upper-bound-closeout
+  cancel-in-progress: false
+
+jobs:
+  closeout:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Download and verify exact Phase 0F audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/p0f"
+
+          RUN_ID="36430823783"
+          ARTIFACT_ID="10973426972"
+          EXPECTED_DIGEST="sha256:ec139d9979852f452438f3a24057b1ff548f743a9a7a92302e3245f0e1e9c450"
+
+          ACTUAL_DIGEST="$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}" --jq '.digest // ""')"
+          test "$ACTUAL_DIGEST" = "$EXPECTED_DIGEST"
+
+          gh run download "$RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            -n "v8-p0f-sleeper-qualified-draft-metadata-audit" \
+            -D "${RUNNER_TEMP}/p0f"
+
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          p=Path(os.environ["RUNNER_TEMP"])/"p0f"
+          d=json.loads((p/"v8_phase0f_sleeper_qualified_draft_metadata_audit.json").read_text())
+
+          assert d["decision"]=="PREREGISTER_V8_PHASE0G_SLEEPER_ROOKIE_CLASSIFICATION_BRIDGE_BEFORE_PICKS"
+          assert d["qualified_sleeper_league_n"]==38
+          assert d["summary"]["phase0e_should_have_accepted_league_n"]==0
+          assert d["summary"]["sixplus_round_nonrookie_tag_bridge_candidate_league_n"]==37
+          assert d["summary"]["shallow_complete_12team_league_n"]==1
+          assert d["summary"]["no_complete_12team_2018_draft_league_n"]==0
+          assert not d["transport_unresolved"]
+          assert d["draft_pick_endpoint_read"] is False
+          assert d["player_catalog_read"] is False
+          assert d["historical_player_outcomes_read"] is False
+          assert d["holdout_2024_outcomes_read"] is False
+          assert d["production_change_authorized"] is False
+
+          print("PASS: exact Phase 0F metadata-only audit verified.")
+          PY
+
+      - name: Freeze Phase 0G bridge semantics and compute maximum possible rescue
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/out"
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import os
+          from collections import Counter, defaultdict
+          from pathlib import Path
+
+          ROOT=Path(os.environ["RUNNER_TEMP"])
+          P0F=ROOT/"p0f"
+          OUT=ROOT/"out"
+
+          src_path=P0F/"v8_phase0f_sleeper_qualified_draft_metadata_audit.json"
+          d=json.loads(src_path.read_text())
+
+          REQUIRED_NEW_DISTINCT_LEAGUES_PER_CELL=6
+          TARGET_CELLS=("r6_early","r6_mid","r6_late")
+
+          # Frozen bridge rule:
+          #
+          # Phase 0E preregistered player_type==1 as Sleeper's source-native rookie
+          # classification. Phase 0G may repair only absent source classification
+          # (player_type is null/missing). It may NOT retrospectively override an
+          # explicit alternate player_type value after seeing source metadata.
+          #
+          # This is intentionally conservative and outcome-sealed. It avoids turning
+          # the bridge into a post-hoc recoding of Sleeper's own explicit categories.
+          bridge_rule={
+              "source_native_rookie_tag":1,
+              "bridge_may_repair_missing_player_type_only":True,
+              "bridge_may_override_explicit_alternate_player_type":False,
+              "minimum_rounds_for_r6":6,
+              "required_new_distinct_leagues_per_target_cell":REQUIRED_NEW_DISTINCT_LEAGUES_PER_CELL,
+              "target_cells":list(TARGET_CELLS),
+          }
+
+          candidate_drafts=[]
+          by_league=defaultdict(list)
+
+          for r in d["records"]:
+              lid=str(r["league_id"])
+              for x in r["drafts"]:
+                  if (
+                      x.get("season")=="2018"
+                      and x.get("status")=="complete"
+                      and x.get("teams")==12
+                      and int(x.get("rounds") or 0)>=6
+                      and x.get("player_type")!=1
+                  ):
+                      row={
+                          "league_id":lid,
+                          "draft_id":str(x.get("draft_id") or ""),
+                          "rounds":int(x.get("rounds") or 0),
+                          "player_type":x.get("player_type"),
+                          "metadata_name":x.get("metadata_name"),
+                          "metadata_title":x.get("metadata_title"),
+                      }
+                      candidate_drafts.append(row)
+                      by_league[lid].append(row)
+
+          assert len(by_league)==37
+          assert len(candidate_drafts)>0
+
+          player_type_draft_counts=Counter(
+              "missing" if x["player_type"] is None else str(x["player_type"])
+              for x in candidate_drafts
+          )
+
+          explicit_alt_leagues=sorted({
+              x["league_id"]
+              for x in candidate_drafts
+              if x["player_type"] is not None
+          })
+          missing_tag_leagues=sorted({
+              x["league_id"]
+              for x in candidate_drafts
+              if x["player_type"] is None
+          })
+
+          # These are the ONLY leagues that could possibly be rescued under the
+          # frozen bridge semantics. This is an upper bound; no claim is made that
+          # any of them are actually rookie drafts.
+          bridgeable_upper_bound_leagues=missing_tag_leagues
+          bridgeable_upper_bound_n=len(bridgeable_upper_bound_leagues)
+
+          # Maximum possible additions to each R6 cell equals the number of distinct
+          # potentially bridgeable leagues, because one league can contribute at most
+          # one independent source membership per target cell.
+          max_possible_additions={
+              cell:bridgeable_upper_bound_n
+              for cell in TARGET_CELLS
+          }
+          max_possible_final_counts={
+              cell:6+bridgeable_upper_bound_n
+              for cell in TARGET_CELLS
+          }
+
+          required_shortfall_after_best_case={
+              cell:max(0,REQUIRED_NEW_DISTINCT_LEAGUES_PER_CELL-bridgeable_upper_bound_n)
+              for cell in TARGET_CELLS
+          }
+
+          source_frame_can_close_gap=(
+              bridgeable_upper_bound_n>=REQUIRED_NEW_DISTINCT_LEAGUES_PER_CELL
+          )
+
+          if source_frame_can_close_gap:
+              decision="PREREGISTER_V8_PHASE0H_SLEEPER_MISSING_TAG_ROOKIE_PROOF_BEFORE_PICKS"
+              next_stage="draft-pick-fv-v8-phase0h-sleeper-missing-tag-rookie-proof"
+          else:
+              decision="STOP_SLEEPER_AS_V8_2018_R6_SECOND_SOURCE_AND_PREREGISTER_THIRD_PROVIDER_BEFORE_OUTCOMES"
+              next_stage="PREREGISTER_V8_PHASE0H_THIRD_PROVIDER_2018_R6_BEFORE_OUTCOMES"
+
+          assert bridgeable_upper_bound_n==4, bridgeable_upper_bound_n
+          assert len(explicit_alt_leagues)==34, len(explicit_alt_leagues)
+          assert source_frame_can_close_gap is False
+          assert decision=="STOP_SLEEPER_AS_V8_2018_R6_SECOND_SOURCE_AND_PREREGISTER_THIRD_PROVIDER_BEFORE_OUTCOMES"
+
+          result={
+              "schema_version":1,
+              "study_id":"draft-pick-fv-v8-depth-specific-source-cohorts",
+              "stage":"phase0g_sleeper_bridge_upper_bound_closeout",
+              "decision":decision,
+              "input_phase0f":{
+                  "run_id":36430823783,
+                  "artifact_id":10973426972,
+                  "artifact_digest":"sha256:ec139d9979852f452438f3a24057b1ff548f743a9a7a92302e3245f0e1e9c450",
+                  "json_sha256":hashlib.sha256(src_path.read_bytes()).hexdigest(),
+              },
+              "bridge_rule":bridge_rule,
+              "phase0f_bridge_candidate_league_n":37,
+              "phase0f_bridge_candidate_draft_n":len(candidate_drafts),
+              "candidate_draft_player_type_counts":dict(sorted(player_type_draft_counts.items())),
+              "explicit_alternate_tag_league_n":len(explicit_alt_leagues),
+              "explicit_and_missing_tag_sets_may_overlap_across_multiple_drafts_in_same_league":True,
+              "missing_player_type_league_n":bridgeable_upper_bound_n,
+              "missing_player_type_league_ids":bridgeable_upper_bound_leagues,
+              "bridgeable_distinct_league_upper_bound_n":bridgeable_upper_bound_n,
+              "required_new_distinct_leagues_per_target_cell":REQUIRED_NEW_DISTINCT_LEAGUES_PER_CELL,
+              "max_possible_additions_by_cell":max_possible_additions,
+              "max_possible_final_counts_by_cell":max_possible_final_counts,
+              "minimum_remaining_shortfall_by_cell":required_shortfall_after_best_case,
+              "source_frame_can_close_gap":source_frame_can_close_gap,
+              "scientific_interpretation":(
+                  "Even under the maximally favorable assumption that every 2018 R6-capable "
+                  "Sleeper draft with missing player_type is a valid rookie draft, only four "
+                  "distinct leagues can be rescued. Six are required. Therefore Sleeper cannot "
+                  "close the frozen 2018 R6 source shortfall without overriding explicit alternate "
+                  "source classifications."
+              ),
+              "draft_pick_endpoint_read":False,
+              "player_catalog_read":False,
+              "historical_player_outcomes_read":False,
+              "holdout_2024_outcomes_read":False,
+              "holdout_2024_search_performed":False,
+              "market_or_ktc_values_read":False,
+              "package_vote_data_read":False,
+              "candidate_fit_performed":False,
+              "candidate_scores_computed":False,
+              "production_change_authorized":False,
+              "next_stage":next_stage,
+          }
+
+          (OUT/"v8_phase0g_sleeper_bridge_upper_bound_closeout.json").write_text(
+              json.dumps(result,indent=2,sort_keys=True)+"\n"
+          )
+
+          lines=[
+              "# Draft Pick FV V8 — Phase 0G Sleeper Bridge Upper-Bound Closeout",
+              "",
+              f"**Decision:** `{decision}`",
+              "",
+              f"- Phase 0F R6-capable non-rookie-tag candidate leagues: **37**",
+              f"- Leagues with explicit alternate `player_type`: **{len(explicit_alt_leagues)}**",
+              f"- Leagues with missing `player_type` and therefore potentially bridgeable: **{bridgeable_upper_bound_n}**",
+              f"- New independent leagues required per 2018 R6 cell: **{REQUIRED_NEW_DISTINCT_LEAGUES_PER_CELL}**",
+              f"- Best-case maximum final Early / Mid / Late counts: **{max_possible_final_counts['r6_early']} / {max_possible_final_counts['r6_mid']} / {max_possible_final_counts['r6_late']}**",
+              f"- Best-case remaining shortfall per target cell: **{required_shortfall_after_best_case['r6_early']}**",
+              "",
+              "Phase 0G does not claim the four missing-tag leagues are rookie drafts. It grants all four for the upper-bound test; the source still cannot reach the frozen minimum of 12 leagues per target cell.",
+              "",
+              "No Sleeper draft picks, player catalog, historical outcomes, 2024 holdout data, market/KTC values, package votes, candidate fits, candidate scores, or production values were read.",
+          ]
+
+          (OUT/"v8_phase0g_sleeper_bridge_upper_bound_closeout.md").write_text(
+              "\n".join(lines)+"\n"
+          )
+          print("\n".join(lines))
+          PY
+
+      - name: Validate Phase 0G scientific stop and firewalls
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          p=Path(os.environ["RUNNER_TEMP"])/"out"/"v8_phase0g_sleeper_bridge_upper_bound_closeout.json"
+          d=json.loads(p.read_text())
+
+          assert d["decision"]=="STOP_SLEEPER_AS_V8_2018_R6_SECOND_SOURCE_AND_PREREGISTER_THIRD_PROVIDER_BEFORE_OUTCOMES"
+          assert d["phase0f_bridge_candidate_league_n"]==37
+          assert d["explicit_alternate_tag_league_n"]==34
+          assert d["explicit_and_missing_tag_sets_may_overlap_across_multiple_drafts_in_same_league"] is True
+          assert d["missing_player_type_league_n"]==4
+          assert d["bridgeable_distinct_league_upper_bound_n"]==4
+          assert d["required_new_distinct_leagues_per_target_cell"]==6
+          assert d["max_possible_additions_by_cell"]=={
+              "r6_early":4,"r6_mid":4,"r6_late":4,
+          }
+          assert d["max_possible_final_counts_by_cell"]=={
+              "r6_early":10,"r6_mid":10,"r6_late":10,
+          }
+          assert d["minimum_remaining_shortfall_by_cell"]=={
+              "r6_early":2,"r6_mid":2,"r6_late":2,
+          }
+          assert d["source_frame_can_close_gap"] is False
+          assert d["next_stage"]=="PREREGISTER_V8_PHASE0H_THIRD_PROVIDER_2018_R6_BEFORE_OUTCOMES"
+
+          for key in (
+              "draft_pick_endpoint_read",
+              "player_catalog_read",
+              "historical_player_outcomes_read",
+              "holdout_2024_outcomes_read",
+              "holdout_2024_search_performed",
+              "market_or_ktc_values_read",
+              "package_vote_data_read",
+              "candidate_fit_performed",
+              "candidate_scores_computed",
+              "production_change_authorized",
+          ):
+              assert d[key] is False,(key,d[key])
+
+          print("PASS: Sleeper source frame is formally closed by an outcome-sealed upper bound; third provider is required.")
+          PY
+
+      - name: Upload Phase 0G closeout
+        uses: actions/upload-artifact@v4
+        with:
+          name: v8-p0g-sleeper-bridge-upper-bound-closeout
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
+          retention-days: 30
