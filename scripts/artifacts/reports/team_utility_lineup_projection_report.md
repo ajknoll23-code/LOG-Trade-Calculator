@@ -15,9 +15,9 @@
 
 ## Artifact coverage
 
-- Total projected players: **1452**
-- Position counts: **{"DB": 338, "DL": 342, "LB": 223, "QB": 78, "RB": 134, "TE": 135, "WR": 202}**
-- Source counts: **{"fantasypros_normalized_fallback": 88, "idp_v1_both": 462, "idp_v1_fp_only": 7, "idp_v1_no_new_data": 3, "idp_v1_sleeper_only": 431, "sleeper_league_scored": 461}**
+- Total projected players: **1455**
+- Position counts: **{"DB": 338, "DL": 342, "LB": 223, "QB": 78, "RB": 134, "TE": 135, "WR": 205}**
+- Source counts: **{"fantasypros_normalized_fallback": 91, "idp_v1_both": 462, "idp_v1_fp_only": 7, "idp_v1_no_new_data": 3, "idp_v1_sleeper_only": 431, "sleeper_league_scored": 461}**
 
 ## Current league validation
 
@@ -46,7 +46,7 @@
 
 ## Identity / provenance
 
-- FantasyPros IDs mapped to Sleeper IDs: **974**
+- FantasyPros IDs mapped to Sleeper IDs: **977**
 - Manual-review identity rows skipped: **0**
 
 The artifact is deterministic: its input file SHA-256 hashes are stored in the JSON, and no wall-clock timestamp is embedded.
