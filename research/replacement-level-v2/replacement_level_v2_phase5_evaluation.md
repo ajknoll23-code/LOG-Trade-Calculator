@@ -34,10 +34,10 @@ The future replacement point is derived from the realized future data itself via
 
 | Family | Pos-balanced MAE | Pos-balanced RMSE | Pooled MAE | Δ MAE vs control | Positions available |
 |---|---:|---:|---:|---:|---:|
-| `legacy_control` | 0.3868 | 0.4854 | 0.3853 | — | 7 |
-| `prior_limited_evidence` | 0.3712 | 0.4690 | 0.3670 | -0.0156 | 7 |
-| `stable_positions_only` | 0.3569 | 0.4546 | 0.3496 | -0.0299 | 7 |
-| `full_phase2_leaders` | 0.3404 | 0.4383 | 0.3385 | -0.0464 | 7 |
+| `legacy_control` | 0.3870 | 0.4855 | 0.3854 | — | 7 |
+| `prior_limited_evidence` | 0.3714 | 0.4691 | 0.3672 | -0.0156 | 7 |
+| `stable_positions_only` | 0.3571 | 0.4547 | 0.3497 | -0.0299 | 7 |
+| `full_phase2_leaders` | 0.3406 | 0.4384 | 0.3387 | -0.0464 | 7 |
 
 ## Future-only replacement structure
 
@@ -58,9 +58,9 @@ The same candidate-independent future-relative-production test using cumulative 
 | Family | Pos-balanced MAE | Δ MAE vs control | Pooled MAE |
 |---|---:|---:|---:|
 | `legacy_control` | 0.4413 | — | 0.4354 |
-| `prior_limited_evidence` | 0.4270 | -0.0143 | 0.4175 |
-| `stable_positions_only` | 0.4159 | -0.0254 | 0.4037 |
-| `full_phase2_leaders` | 0.4036 | -0.0377 | 0.3946 |
+| `prior_limited_evidence` | 0.4269 | -0.0143 | 0.4175 |
+| `stable_positions_only` | 0.4157 | -0.0256 | 0.4036 |
+| `full_phase2_leaders` | 0.4034 | -0.0379 | 0.3944 |
 
 ## Readiness ladder
 
