@@ -24,13 +24,7 @@ Production resolver covering QB / RB / WR / TE / DL / LB / DB.
 - `name_found_position_incompatible`: **1**
 - `name_position_team_confirmed`: **956**
 - `no_sleeper_name_candidate`: **98**
-- `phase10_independent_stable_id_corroboration`: **1**
-- `phase12_batch_stable_id_corroboration`: **3**
-- `phase14_batch_stable_id_corroboration`: **3**
-- `phase16_batch_stable_id_corroboration`: **3**
-- `phase18_batch_stable_id_corroboration`: **3**
-- `phase20_final_pair_stable_id_corroboration`: **1**
-- `previous_authoritative_stable_id_preserved`: **7**
+- `previous_authoritative_stable_id_preserved`: **21**
 - `previous_authoritative_stable_id_preserved_position_changed`: **3**
 
 ## Manual-review rows

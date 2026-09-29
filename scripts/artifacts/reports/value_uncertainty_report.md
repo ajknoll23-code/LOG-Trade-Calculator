@@ -8,8 +8,8 @@ Policy SHA256: `bafc53164f6d98448965c5d0b531b14be31a3d744f0e4a44d6cdac71b6c05247
 **These ranges are not probability confidence intervals.** They are deterministic sensitivity envelopes around the deployed point value using currently observable projection disagreement, historical sampling noise, and availability-history signal.
 
 - Players: **565**
-- Width quartiles: Q25 **19.0%**, median **24.8%**, Q75 **32.6%**
-- Provider coverage (0/1/2): **{'0': 47, '1': 88, '2': 430}**
+- Width quartiles: Q25 **19.1%**, median **24.8%**, Q75 **32.6%**
+- Provider coverage (0/1/2): **{'0': 47, '1': 89, '2': 429}**
 - History coverage: **{'insufficient': 126, 'with_2plus_games': 439}**
 
 ## Position summary
@@ -17,13 +17,13 @@ Policy SHA256: `bafc53164f6d98448965c5d0b531b14be31a3d744f0e4a44d6cdac71b6c05247
 | Pos | N | Median half-width | Median provider component | Median history component | Median availability component |
 |---|---:|---:|---:|---:|---:|
 | QB | 64 | 39.7% | 4.7% | 17.2% | 28.9% |
-| RB | 97 | 24.1% | 7.3% | 18.5% | 4.3% |
-| WR | 114 | 26.3% | 9.7% | 22.5% | 6.9% |
-| TE | 44 | 24.0% | 5.3% | 19.2% | 7.1% |
+| RB | 97 | 24.1% | 7.4% | 18.5% | 4.3% |
+| WR | 114 | 26.4% | 9.8% | 22.5% | 6.9% |
+| TE | 44 | 24.0% | 5.2% | 19.2% | 7.1% |
 | DL | 86 | 25.2% | 10.7% | 21.0% | 5.2% |
 | LB | 79 | 22.1% | 14.8% | 14.7% | 1.7% |
 | DB | 65 | 20.7% | 14.3% | 14.4% | 1.9% |
-| K | 16 | 30.8% | 20.2% | 20.9% | 10.4% |
+| K | 16 | 30.8% | 20.1% | 20.9% | 10.4% |
 
 ## Widest current envelopes
 
