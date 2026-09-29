@@ -10,9 +10,9 @@ Status: **`COLLECTION_ONLY`**
 - Frozen candidate SHA256: `e720f1e26c1dd137f9b3d14110cd2fe1a28843a012d5b01f2d185291398a70c6`
 - Frozen at: **2026-09-03T18:50:10.024333Z**
 - First eligible future week: **1**
-- Completed consecutive weeks used: **[1, 2]**
+- Completed consecutive weeks used: **[1, 2, 3]**
 - Eligible preseason cohort: **95**
-- Players with an active game in current window: **69**
+- Players with an active game in current window: **71**
 
 ## Prospective metrics
 
@@ -20,18 +20,18 @@ Primary target: **Fundamental Value vs cumulative future fantasy points**.
 
 | Prior weight | Total-points Spearman | Active-PPG FV Spearman | Active-PPG PM Spearman | Total-points pairwise |
 |---:|---:|---:|---:|---:|
-| 0.00 | 0.4918 | 0.4336 | 0.4665 | 0.6943 |
-| 0.15 | 0.4829 | 0.4538 | 0.4856 | 0.6905 |
-| 0.30 | 0.4768 | 0.4883 | 0.5045 | 0.6909 |
-| 0.45 | 0.4419 | 0.4938 | 0.5028 | 0.6780 |
+| 0.00 | 0.4898 | 0.4360 | 0.4679 | 0.6928 |
+| 0.15 | 0.4825 | 0.4596 | 0.4816 | 0.6893 |
+| 0.30 | 0.4750 | 0.4990 | 0.4983 | 0.6876 |
+| 0.45 | 0.4446 | 0.5060 | 0.5018 | 0.6762 |
 
 ## Difference vs frozen 0% prospect-prior control
 
 | Prior weight | Δ total-points Spearman | Δ active-PPG FV Spearman | Δ active-PPG PM Spearman | Δ total-points pairwise |
 |---:|---:|---:|---:|---:|
-| 0.15 | -0.0088 | +0.0201 | +0.0191 | -0.0039 |
-| 0.30 | -0.0149 | +0.0547 | +0.0380 | -0.0034 |
-| 0.45 | -0.0498 | +0.0601 | +0.0363 | -0.0163 |
+| 0.15 | -0.0073 | +0.0236 | +0.0137 | -0.0035 |
+| 0.30 | -0.0148 | +0.0630 | +0.0304 | -0.0051 |
+| 0.45 | -0.0452 | +0.0700 | +0.0339 | -0.0166 |
 
 ## Readiness ladder
 
