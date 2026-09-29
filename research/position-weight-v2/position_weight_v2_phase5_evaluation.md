@@ -29,7 +29,7 @@ Same-position pairs are excluded. A common global scale cannot change this metri
 | Variant | Players | Pairwise accuracy | Comparable cross-position pairs |
 |---|---:|---:|---:|
 | `deployed_control` | 398 | 0.7258 | 61742 |
-| `bridge_50` | 398 | 0.7253 | 61742 |
+| `bridge_50` | 398 | 0.7252 | 61742 |
 
 Bridge-50 pairwise accuracy delta vs control: **-0.0006**
 
@@ -37,7 +37,7 @@ Bridge-50 pairwise accuracy delta vs control: **-0.0006**
 
 | Variant | Min-max MAE | Min-max RMSE |
 |---|---:|---:|
-| `deployed_control` | 0.1884 | 0.2356 |
+| `deployed_control` | 0.1885 | 0.2357 |
 | `bridge_50` | 0.1454 | 0.1888 |
 
 Bridge-50 normalized MAE delta vs control: **-0.0430**
