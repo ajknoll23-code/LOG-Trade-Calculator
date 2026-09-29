@@ -10,14 +10,14 @@
 | Horizon | Status | N | Gap→change ρ | Mean-reversion ρ | Incremental Δ | Directional | Buy−sell spread |
 |---|---|---:|---:|---:|---:|---:|---:|
 | 1w_diagnostic | evaluated | 503 | 0.040 | 0.141 | -0.102 | 0.505 | 0.003 |
-| 2w_supportive | pending | — | — | — | — | — | — |
+| 2w_supportive | evaluated | 503 | 0.040 | 0.141 | -0.102 | 0.505 | 0.003 |
 | 4w_primary | pending | — | — | — | — | — | — |
 
 ## Secondary realized-production test
 
 This is descriptive only and cannot rescue a failed market-movement result.
 
-- 2w: **pending** (needs weeks [2, 3])
+- 2w: n=503, position-gap→production-surprise Spearman **0.657**
 - 4w: **pending** (needs weeks [2, 3, 4, 5])
 
 ## Governance
