@@ -1,0 +1,256 @@
+name: Draft Pick FV V9 - Production Rollback
+
+"on":
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: draft-pick-fv-v9-production-deployment
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Capture rollback base
+        id: base
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13.15'
+
+      - name: Install regression dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir "requests==2.34.2"
+
+      - name: Guard exact deployed V9 state and rollback artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, subprocess
+          from pathlib import Path
+
+          expected_blobs = {
+            "index.html":"2c1f1d7ff0930a7a13c141da071f0e3c9db52672",
+            "free-agent-board.html":"5995dc123c3d222a21c1f5b3f99f3d67c6fca307",
+            "model/releases/draft-pick-fv-v9/rollback.json":"915f8e67ec447f9b106d7a1803384966308b02cf",
+            "research/draft-pick-fv-v9/v9_frozen_production_candidate.json":"9bcc2e9483ac585e783d25b4d004be77af3908ad",
+          }
+          for p,want in expected_blobs.items():
+              got=subprocess.check_output(["git","hash-object",p],text=True).strip()
+              assert got==want,(p,want,got)
+
+          rb=json.loads(Path("model/releases/draft-pick-fv-v9/rollback.json").read_text())
+          assert rb["release_id"]=="draft-pick-fv-v9-production-release"
+          assert rb["pre_deployment_git_blobs"]["index.html"]=="52ea5808f236d9208271db4e26ef800c8af3abc4"
+          assert rb["pre_deployment_git_blobs"]["free-agent-board.html"]=="748884bb4720bbffb5db306b6e23c5e7e94102b3"
+          assert rb["source_commit_before_production_mutation"]=="c7ebbfb1b0498cdafae0d57ad0ac312f4e1d869d"
+
+          frozen=json.loads(Path("research/draft-pick-fv-v9/v9_frozen_production_candidate.json").read_text())
+          assert frozen["phase2_engineering_bridge_authorized"] is True
+          assert frozen["candidate"]["k"]==0.383
+          assert frozen["candidate"]["d"]==0.332
+
+          print("PASS: exact deployed V9 production state and exact rollback artifact verified.")
+          PY
+
+      - name: Restore exact pre-V9 PICK_BASE
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, re, subprocess
+          from pathlib import Path
+
+          rb=json.loads(Path("model/releases/draft-pick-fv-v9/rollback.json").read_text())
+          pat=re.compile(r"const PICK_BASE = \{.*?\n\};",re.S)
+
+          for p in ("index.html","free-agent-board.html"):
+              path=Path(p)
+              text=path.read_text(encoding="utf-8")
+              ms=list(pat.finditer(text))
+              assert len(ms)==1,(p,len(ms))
+
+              old=rb["pre_deployment_pick_base_blocks"][p]
+              restored=text[:ms[0].start()]+old+text[ms[0].end():]
+              path.write_text(restored,encoding="utf-8")
+
+              blob=subprocess.check_output(["git","hash-object",p],text=True).strip()
+              expected_blob=rb["pre_deployment_git_blobs"][p]
+              assert blob==expected_blob,(p,expected_blob,blob)
+
+              sha=hashlib.sha256(path.read_bytes()).hexdigest()
+              expected_sha=rb["pre_deployment_sha256"][p]
+              assert sha==expected_sha,(p,expected_sha,sha)
+
+              assert "const YEAR_DISCOUNT = { '2027':1.0, '2028':0.85, '2029':0.72 };" in restored
+              assert "return Math.round(base * disc);" in restored
+
+          print("PASS: index.html restored byte-for-byte to pre-V9 production state.")
+          print("PASS: free-agent-board.html restored byte-for-byte to pre-V9 production state.")
+          PY
+
+      - name: Run full repository regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TU_JSON="scripts/artifacts/generated/team_utility_lineup_projections.json"
+          TU_MD="scripts/artifacts/reports/team_utility_lineup_projection_report.md"
+
+          restore_tu(){ git checkout -- "$TU_JSON" "$TU_MD"; }
+          trap restore_tu EXIT
+
+          python3 scripts/projections/build_team_utility_lineup_projections.py --write
+          python3 scripts/validation/check_package_adjustment_live.py
+          python3 scripts/validation/repo_regression_checks.py
+
+          restore_tu
+          trap - EXIT
+
+          git diff --exit-code -- "$TU_JSON" "$TU_MD"
+          echo "PASS: full repository regression suite green after V9 rollback."
+
+      - name: Freeze V9 rollback closeout
+        shell: bash
+        env:
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess
+          from datetime import datetime,timezone
+          from pathlib import Path
+
+          out=Path("model/releases/draft-pick-fv-v9")
+          rb=json.loads((out/"rollback.json").read_text())
+
+          def sha(p):
+              return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+          closeout={
+            "schema_version":1,
+            "release_id":"draft-pick-fv-v9-production-release",
+            "status":"ROLLED_BACK_FROM_PRODUCTION",
+            "decision":"ROLLBACK_V9_PICK_BASE_TO_PREDEPLOYMENT_BASELINE",
+            "generated_at_utc":datetime.now(timezone.utc).isoformat(),
+            "workflow_run_id":os.environ["RUN_ID"],
+            "workflow_run_attempt":os.environ["RUN_ATTEMPT"],
+            "rollback_reason":"Post-deployment construct-validity review determined the V9 realized-outcome MAE target was not sufficient by itself to establish ex-ante draft-pick Fundamental Value.",
+            "scientific_record_preserved":True,
+            "v9_research_artifacts_deleted":False,
+            "v9_release_artifacts_deleted":False,
+            "production_pick_base_restored":True,
+            "restored_git_blobs":{
+              "index.html":subprocess.check_output(["git","hash-object","index.html"],text=True).strip(),
+              "free-agent-board.html":subprocess.check_output(["git","hash-object","free-agent-board.html"],text=True).strip(),
+            },
+            "expected_predeployment_git_blobs":rb["pre_deployment_git_blobs"],
+            "restored_sha256":{
+              "index.html":sha("index.html"),
+              "free-agent-board.html":sha("free-agent-board.html"),
+            },
+            "year_discount_changed":False,
+            "player_valuation_changed":False,
+            "package_adjustment_changed":False,
+            "team_utility_changed":False,
+            "full_repository_regression_pass":True,
+            "next_research_requirement":"A new preregistered study must target ex-ante draft-pick value/expected utility rather than treating median-like realized-player MAE as sufficient construct validation.",
+          }
+
+          assert closeout["restored_git_blobs"]==rb["pre_deployment_git_blobs"]
+          (out/"rollback_closeout.json").write_text(
+              json.dumps(closeout,indent=2,sort_keys=True)+"\n"
+          )
+          print("PASS: V9 rollback closeout frozen.")
+          PY
+
+      - name: Prove exact rollback mutation scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import subprocess
+
+          allowed={
+            "index.html",
+            "free-agent-board.html",
+            "model/releases/draft-pick-fv-v9/rollback_closeout.json",
+          }
+          s=subprocess.check_output(
+            ["git","status","--porcelain=v1","--untracked-files=all"],
+            text=True
+          )
+          touched={line[3:] for line in s.splitlines() if line.strip()}
+          assert touched==allowed,(sorted(touched),sorted(allowed))
+          assert not any(x.startswith("research/") for x in touched)
+          print("PASS: exact rollback scope = two production surfaces + audit closeout only.")
+          PY
+
+      - name: Upload rollback evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: draft-pick-fv-v9-production-rollback
+          path: |
+            model/releases/draft-pick-fv-v9/rollback.json
+            model/releases/draft-pick-fv-v9/rollback_closeout.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Commit V9 production rollback
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$BASE_SHA" || {
+            echo "ERROR: origin/main moved during rollback validation; refusing stale rollback."
+            exit 1
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            index.html \
+            free-agent-board.html \
+            model/releases/draft-pick-fv-v9/rollback_closeout.json
+
+          git diff --cached --quiet && {
+            echo "ERROR: rollback produced no staged changes."
+            exit 1
+          }
+
+          git commit -m "Rollback Draft Pick FV V9 PICK_BASE"
+          git push origin HEAD:main
+
+          test "$(git status --porcelain)" = ""
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$(git rev-parse HEAD)"
+
+          test "$(git hash-object index.html)" = "52ea5808f236d9208271db4e26ef800c8af3abc4"
+          test "$(git hash-object free-agent-board.html)" = "748884bb4720bbffb5db306b6e23c5e7e94102b3"
+
+          echo "PASS: Draft Pick FV V9 production values rolled back exactly."
