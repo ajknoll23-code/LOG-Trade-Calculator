@@ -234,3 +234,31 @@ Active protected workflow count: **26**
 
 - `.github/workflows/fourforfour-offense-v1-confidence-c2-confirm-and-deploy.yml` — Superseded stale pre-patch 4for4 Offense Confidence C2 deploy workflow
 - `workflows/.githubdraft-pick-fv-v5-phase6-research-closeout.yml` — Malformed duplicate path created during V5 Phase 6 workflow replacement; canonical workflow is archived from .github/workflows in this cleanup.
+
+
+## 2026-09-29 — Identity V2 closure cleanup
+
+Archived 20 completed/superseded manual workflows after the formal Identity V2 Phase 22 closure. The active DL/LB Phase 2 prospective workflow remains in `.github/workflows` because it is waiting for completed Week 4.
+
+Archived in this batch:
+
+- A1-identity-v2-phase8-external-corroboration.yml
+- A10-identity-v2-phase17-batch3-deployment.yml
+- A11-identity-v2-phase18-batch4-stable-id-shadow-fixed.yml
+- A12-identity-v2-phase19-batch4-deployment.yml
+- A13-identity-v2-phase20-final-pair-stable-id-shadow.yml
+- A14-identity-v2-phase21-devin-culp-exact-scope-deployment.yml
+- A15-identity-v2-phase22-closure-freeze.yml
+- A2-identity-v2-phase9-terrell-jennings-id-corroboration.yml
+- A3-identity-v2-phase10-terrell-jennings-shadow.yml
+- A4-identity-v2-phase11-terrell-jennings-deployment-fixed.yml
+- A4-identity-v2-phase11-terrell-jennings-deployment.yml
+- A5-identity-v2-phase12-batch1-stable-id-shadow.yml
+- A6-identity-v2-phase13-batch1-deployment.yml
+- A7-identity-v2-phase14-batch2-stable-id-shadow.yml
+- A8-identity-v2-phase15-batch2-deployment.yml
+- A9-identity-v2-phase16-batch3-stable-id-shadow.yml
+- a10.yml
+- identity-v2-phase7-current-manual-review-refresh.yml
+- idp-dl-lb-residual-reconciliation-v1-phase1.yml
+- idp-dl-lb-structural-integrity-audit-v1.yml
