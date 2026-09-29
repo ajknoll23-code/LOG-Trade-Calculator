@@ -3,15 +3,15 @@
 Production resolver covering QB / RB / WR / TE / DL / LB / DB.
 
 - FantasyPros tracked rows: **1083**
-- Authoritative stable-ID matches: **970**
-- Manual-review rows: **15**
+- Authoritative stable-ID matches: **971**
+- Manual-review rows: **14**
 
 ## Coverage by position
 
 | Pos | FP rows | Authoritative | Match rate | Candidate | Manual review |
 |---|---:|---:|---:|---:|---:|
 | QB | 80 | 72 | 90.0% | 74 | 2 |
-| RB | 132 | 120 | 90.9% | 121 | 1 |
+| RB | 132 | 121 | 91.7% | 121 | 0 |
 | WR | 203 | 177 | 87.2% | 184 | 7 |
 | TE | 130 | 122 | 93.8% | 125 | 3 |
 | DL | 177 | 159 | 89.8% | 159 | 0 |
@@ -24,9 +24,10 @@ Production resolver covering QB / RB / WR / TE / DL / LB / DB.
 - `name_found_position_incompatible`: **1**
 - `name_position_team_confirmed`: **956**
 - `no_sleeper_name_candidate`: **98**
+- `phase10_independent_stable_id_corroboration`: **1**
 - `previous_authoritative_stable_id_preserved`: **7**
 - `previous_authoritative_stable_id_preserved_position_changed`: **3**
-- `unique_name_position_team_unavailable`: **14**
+- `unique_name_position_team_unavailable`: **13**
 
 ## Manual-review rows
 
@@ -36,7 +37,6 @@ These remain deliberately unresolved; downstream consumers must use existing fal
 |---|---|---|---|---|---|
 | Jake Browning | QB |  | 6111 |  | unique_name_position_team_unavailable |
 | Desmond Ridder | QB |  | 8159 |  | unique_name_position_team_unavailable |
-| Terrell Jennings | RB |  | 12412 |  | unique_name_position_team_unavailable |
 | JuJu Smith-Schuster | WR |  | 4040 |  | unique_name_position_team_unavailable |
 | Tahj Washington | WR |  | 11821 |  | unique_name_position_team_unavailable |
 | Malik Heath | WR |  | 11210 | ATL | unique_name_position_team_unavailable |
