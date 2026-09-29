@@ -1,0 +1,711 @@
+name: B4 Draft Class Strength V1 - Historical Target Expansion Source Feasibility
+
+"on":
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: draft-class-strength-v1-b4
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  probe:
+    name: Probe MFL source feasibility ${{ matrix.year }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        year: [2014, 2015, 2016, 2017]
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13.15"
+
+      - name: Install dependency
+        run: python3 -m pip install --disable-pip-version-check --no-cache-dir "requests==2.34.2"
+
+      - name: Guard B3 scientific stop and no-outcome scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          d = Path("research/draft-class-strength-v1")
+          v0 = json.loads((d / "phase0b_v0_signal_reliability.json").read_text())
+          manifest = json.loads((d / "phase0a_manifest_v2.json").read_text())
+
+          assert v0["decision"] == "STOP_EXPAND_HISTORICAL_TARGET_PANEL_BEFORE_INTERPRETING_V0"
+          assert v0["class_count"] == 6
+          assert v0["minimum_classes_before_predictor_fit"] == 10
+          assert v0["predictor_features_read"] is False
+          assert v0["predictor_fit_performed"] is False
+          assert v0["2027_class_scored"] is False
+          assert v0["production_change_authorized"] is False
+
+          assert manifest["decision"] == v0["decision"]
+          assert manifest["predictor_fit_performed"] is False
+          assert manifest["2027_class_scored"] is False
+          assert manifest["production_change_authorized"] is False
+
+          print("PASS: B3 requires historical target expansion before any predictor fit.")
+          PY
+
+      - name: Probe older MFL dynasty rookie-draft source
+        shell: bash
+        env:
+          YEAR: ${{ matrix.year }}
+        run: |
+          set -euo pipefail
+          mkdir -p "/tmp/dcs-b4/${YEAR}"
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import os
+          import re
+          import time
+          from collections import Counter
+          from pathlib import Path
+          from urllib.parse import urlencode
+
+          import requests
+
+          YEAR = int(os.environ["YEAR"])
+          assert YEAR in {2014, 2015, 2016, 2017}
+
+          BASE = "https://api.myfantasyleague.com"
+          TERMS = [
+              "dynasty",
+              "superflex",
+              "super flex",
+              "2qb",
+              "2 qb",
+              "rookie",
+              "rookie draft",
+              "superflex dynasty",
+              "sf dynasty",
+              "2qb dynasty",
+              "idp",
+              "empire",
+              "contract",
+              "salary",
+              "taxi",
+              "fantasy",
+              "football",
+              "league",
+          ]
+          MAX_PER_TERM = 250
+          MAX_CANDIDATES = 320
+          RETRIES = 4
+          SLEEP = 0.35
+          PROBE_SCHEMA = 1
+
+          def as_list(x):
+              if x is None:
+                  return []
+              return x if isinstance(x, list) else [x]
+
+          def safe_int(x):
+              try:
+                  s = str(x).strip()
+              except Exception:
+                  return None
+              if not re.fullmatch(r"[+-]?\d+", s):
+                  return None
+              try:
+                  return int(s)
+              except ValueError:
+                  return None
+
+          def norm(x):
+              return re.sub(r"\s+", " ", str(x or "").strip()).lower()
+
+          def stable_id(x):
+              s = str(x or "").strip()
+              return s or None
+
+          def stable_hash(s):
+              return hashlib.sha256(s.encode()).hexdigest()
+
+          def api_url(endpoint, **params):
+              q = {"TYPE": endpoint, "JSON": 1}
+              q.update({k: v for k, v in params.items() if v is not None})
+              return f"{BASE}/{YEAR}/export?" + urlencode(q)
+
+          def get_json(session, url):
+              last = None
+              for attempt in range(RETRIES):
+                  try:
+                      r = session.get(url, timeout=45)
+                      r.raise_for_status()
+                      obj = r.json()
+                      if not isinstance(obj, dict):
+                          raise RuntimeError("non-object JSON")
+                      time.sleep(SLEEP)
+                      return obj
+                  except Exception as exc:
+                      last = exc
+                      if attempt + 1 < RETRIES:
+                          time.sleep(min(15, 1.5 * (attempt + 1)))
+              raise RuntimeError(f"{type(last).__name__}: {last}")
+
+          def search_ids(data):
+              root = data.get("leagues")
+              if not isinstance(root, dict):
+                  return []
+              out = []
+              for row in as_list(root.get("league")):
+                  if not isinstance(row, dict):
+                      continue
+                  lid = row.get("id") or row.get("league_id") or row.get("leagueId")
+                  if lid is not None:
+                      out.append(str(lid))
+              return out
+
+          def league_obj(data):
+              x = data.get("league")
+              return x if isinstance(x, dict) else None
+
+          def franchise_count(lg):
+              f = lg.get("franchises")
+              return safe_int(f.get("count")) if isinstance(f, dict) else None
+
+          def qb_limit(lg):
+              starters = lg.get("starters")
+              if not isinstance(starters, dict):
+                  return None
+              for row in as_list(starters.get("position")):
+                  if isinstance(row, dict) and str(row.get("name", "")).upper() == "QB":
+                      v = str(row.get("limit", "")).strip()
+                      return v or None
+              return None
+
+          def keeper_state(lg):
+              if "keeperType" not in lg or lg.get("keeperType") is None or norm(lg.get("keeperType")) == "":
+                  return "missing"
+              v = norm(lg.get("keeperType"))
+              if v == "dynasty":
+                  return "dynasty"
+              if v == "keeper":
+                  return "keeper"
+              if v in {"none", "redraft"}:
+                  return "none"
+              return f"other:{v}"
+
+          def rookie_pool(lg):
+              return norm(lg.get("draftPlayerPool")).startswith("rook")
+
+          def obvious_mock(name):
+              n = norm(name)
+              return any(t in n for t in ("mock", "draft master", "draftmasters"))
+
+          def qualifier(lg):
+              if franchise_count(lg) != 12:
+                  return False, "not_12_team"
+              if qb_limit(lg) not in {"1-2", "2"}:
+                  return False, "not_superflex"
+              if not rookie_pool(lg):
+                  return False, "not_rookie_pool"
+              ks = keeper_state(lg)
+              if ks == "dynasty":
+                  return True, "explicit_dynasty"
+              if ks == "missing":
+                  return True, "missing_keeper_proxy"
+              return False, f"observed_non_dynasty:{ks}"
+
+          def draft_units(data):
+              root = data.get("draftResults")
+              if not isinstance(root, dict):
+                  return []
+              units = []
+              for unit in as_list(root.get("draftUnit")):
+                  if not isinstance(unit, dict):
+                      continue
+                  picks = [x for x in as_list(unit.get("draftPick")) if isinstance(x, dict)]
+                  if picks:
+                      units.append(picks)
+              return units
+
+          def canonical(units):
+              rows = []
+              seen = set()
+              duplicates = 0
+              for ui, picks in enumerate(units):
+                  for p in picks:
+                      rnd = safe_int(p.get("round"))
+                      pick = safe_int(p.get("pick"))
+                      pid = stable_id(p.get("player"))
+                      if rnd is None or pick is None or pid is None:
+                          continue
+                      if not (1 <= rnd <= 6 and 1 <= pick <= 12):
+                          continue
+                      key = (rnd, pick)
+                      if key in seen:
+                          duplicates += 1
+                      else:
+                          seen.add(key)
+                      rows.append({
+                          "unit_index": ui,
+                          "round": rnd,
+                          "pick": pick,
+                          "overall_slot": (rnd - 1) * 12 + pick,
+                          "mfl_player_id": pid,
+                      })
+              filled = {
+                  str(r): sum((r, p) in seen for p in range(1, 13))
+                  for r in range(1, 7)
+              }
+              return {
+                  "rows": rows,
+                  "filled_by_round": filled,
+                  "full4": all(filled[str(r)] == 12 for r in range(1, 5)),
+                  "full6": all(filled[str(r)] == 12 for r in range(1, 7)),
+                  "duplicate_slot_occurrence_n": duplicates,
+              }
+
+          def parse_players(data):
+              root = data.get("players")
+              if not isinstance(root, dict):
+                  return {}
+              out = {}
+              for row in as_list(root.get("player")):
+                  if not isinstance(row, dict):
+                      continue
+                  pid = stable_id(row.get("id") or row.get("player_id"))
+                  if not pid:
+                      continue
+                  out[pid] = {
+                      "draft_year": safe_int(row.get("draft_year")),
+                      "name": stable_id(row.get("name")),
+                      "position": stable_id(row.get("position")),
+                  }
+              return out
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": f"LOG-Draft-Class-Strength-B4-{YEAR}/1.0"
+          })
+
+          # Discovery uses the same broad predeclared term family as V4, but
+          # B4 is only a bounded feasibility probe and cannot freeze a source catalog.
+          ids = set()
+          term_counts = {}
+          term_errors = {}
+          for term in TERMS:
+              try:
+                  raw = search_ids(get_json(session, api_url("leagueSearch", SEARCH=term)))
+                  uniq = sorted(set(raw), key=lambda lid: stable_hash(f"{YEAR}|{term}|{lid}"))
+                  term_counts[term] = len(uniq)
+                  ids.update(uniq[:MAX_PER_TERM])
+              except Exception as exc:
+                  term_errors[term] = str(exc)
+
+          if term_errors:
+              raise RuntimeError(f"leagueSearch errors changed discovery frame: {term_errors}")
+
+          ordered = sorted(ids, key=lambda lid: stable_hash(f"{YEAR}|candidate|{lid}"))
+          selected = ordered[:MAX_CANDIDATES]
+
+          counts = Counter()
+          reject = Counter()
+          transport = Counter()
+          accepted = []
+
+          for idx, lid in enumerate(selected, 1):
+              counts["candidate_probed"] += 1
+
+              try:
+                  lg = league_obj(get_json(session, api_url("league", L=lid)))
+              except Exception:
+                  transport["league_fetch_failed"] += 1
+                  continue
+              if not lg:
+                  reject["league_missing"] += 1
+                  continue
+
+              ok, qkind = qualifier(lg)
+              if not ok:
+                  reject[qkind] += 1
+                  continue
+              if obvious_mock(lg.get("name")):
+                  reject["obvious_mock_name"] += 1
+                  continue
+
+              counts["base_eligible"] += 1
+
+              try:
+                  units = draft_units(get_json(session, api_url("draftResults", L=lid)))
+              except Exception:
+                  transport["draft_fetch_failed"] += 1
+                  continue
+
+              can = canonical(units)
+              if not can["full4"]:
+                  reject["not_full4"] += 1
+                  continue
+
+              counts["full4"] += 1
+
+              pids = sorted({r["mfl_player_id"] for r in can["rows"] if r["round"] <= 4})
+              metadata = {}
+              try:
+                  for start in range(0, len(pids), 100):
+                      chunk = pids[start:start+100]
+                      d = get_json(
+                          session,
+                          api_url(
+                              "players",
+                              L=lid,
+                              DETAILS=1,
+                              PLAYERS=",".join(chunk),
+                          ),
+                      )
+                      metadata.update(parse_players(d))
+              except Exception:
+                  transport["players_fetch_failed"] += 1
+                  continue
+
+              known_year = 0
+              mismatch = []
+              for pid in pids:
+                  py = metadata.get(pid, {}).get("draft_year")
+                  if py is None:
+                      continue
+                  known_year += 1
+                  if py != YEAR:
+                      mismatch.append({
+                          "mfl_player_id": pid,
+                          "draft_year": py,
+                          "name": metadata.get(pid, {}).get("name"),
+                          "position": metadata.get(pid, {}).get("position"),
+                      })
+
+              metadata_coverage = known_year / len(pids) if pids else 0.0
+              if mismatch:
+                  reject["known_draft_year_contamination"] += 1
+                  continue
+
+              counts["no_known_year_contamination"] += 1
+              if metadata_coverage >= 0.80:
+                  counts["candidate_cleanable_full4"] += 1
+
+              accepted.append({
+                  "league_id": lid,
+                  "league_name": lg.get("name"),
+                  "qualifier_kind": qkind,
+                  "keeper_state": keeper_state(lg),
+                  "qb_limit": qb_limit(lg),
+                  "full4": True,
+                  "full6": can["full6"],
+                  "draft_unit_n": len(units),
+                  "duplicate_slot_occurrence_n": can["duplicate_slot_occurrence_n"],
+                  "r1_r4_player_n": len(pids),
+                  "mfl_draft_year_metadata_coverage": metadata_coverage,
+                  "known_mismatched_draft_year_n": 0,
+                  "candidate_cleanable": metadata_coverage >= 0.80,
+              })
+
+              if idx % 25 == 0:
+                  print(
+                      f"{YEAR}: probed={idx}/{len(selected)} "
+                      f"base={counts['base_eligible']} full4={counts['full4']} "
+                      f"cleanable={counts['candidate_cleanable_full4']}",
+                      flush=True,
+                  )
+
+          # B4 is feasibility only. These gates decide whether older-year source
+          # recovery is worth building; they do NOT authorize outcome ingestion.
+          cleanable = counts["candidate_cleanable_full4"]
+          full4 = counts["full4"]
+          feasibility = cleanable >= 10
+          strong_feasibility = cleanable >= 20
+
+          out = {
+              "schema_version": PROBE_SCHEMA,
+              "study_id": "draft-class-strength-v1",
+              "stage": "b4_historical_target_expansion_source_feasibility",
+              "year": YEAR,
+              "discovery": {
+                  "search_terms": TERMS,
+                  "max_results_per_term": MAX_PER_TERM,
+                  "bounded_union_before_cap_n": len(ordered),
+                  "max_candidates_probed": MAX_CANDIDATES,
+                  "selected_candidate_n": len(selected),
+                  "term_unique_counts": term_counts,
+              },
+              "counts": dict(counts),
+              "reject_counts": dict(reject),
+              "transport_counts": dict(transport),
+              "candidate_cleanable_full4_n": cleanable,
+              "full4_n": full4,
+              "minimum_feasibility_gate": 10,
+              "strong_feasibility_reference": 20,
+              "feasibility_gate_pass": feasibility,
+              "strong_feasibility_reference_pass": strong_feasibility,
+              "accepted_candidate_rows": accepted,
+              "limitations": [
+                  "This is not a frozen historical source catalog.",
+                  "MFL draft_year metadata alone is not sufficient for final contamination adjudication.",
+                  "Final source recovery requires external identity crosswalk validation.",
+                  "No player outcomes were read.",
+                  "No H3.O2 class score was computed.",
+                  "No predictor data or 2027 data were read.",
+              ],
+              "historical_player_outcomes_read": False,
+              "predictor_fit_performed": False,
+              "2027_class_scored": False,
+              "production_change_authorized": False,
+          }
+
+          out_path = Path(f"/tmp/dcs-b4/{YEAR}/source-feasibility-{YEAR}.json")
+          out_path.write_text(json.dumps(out, indent=2, sort_keys=True) + "\n")
+
+          print(json.dumps({
+              "year": YEAR,
+              "selected_candidate_n": len(selected),
+              "base_eligible": counts["base_eligible"],
+              "full4": full4,
+              "candidate_cleanable_full4": cleanable,
+              "feasibility_gate_pass": feasibility,
+              "strong_feasibility_reference_pass": strong_feasibility,
+          }, indent=2))
+          PY
+
+      - name: Upload year feasibility artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dcs-b4-source-feasibility-${{ matrix.year }}
+          path: /tmp/dcs-b4/${{ matrix.year }}/source-feasibility-${{ matrix.year }}.json
+          if-no-files-found: error
+          retention-days: 30
+
+  reduce:
+    name: Reduce B4 source feasibility
+    needs: probe
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Fail if any year probe failed
+        shell: bash
+        env:
+          PROBE_RESULT: ${{ needs.probe.result }}
+        run: |
+          set -euo pipefail
+          test "$PROBE_RESULT" = "success" || {
+            echo "ERROR: one or more B4 year probes failed: $PROBE_RESULT"
+            exit 1
+          }
+
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Capture reducer base SHA
+        id: base
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Download all year artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dcs-b4-source-feasibility-*
+          path: /tmp/dcs-b4-results
+          merge-multiple: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13.15"
+
+      - name: Reduce and freeze B4 feasibility result
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          paths = sorted(Path("/tmp/dcs-b4-results").glob("source-feasibility-*.json"))
+          assert len(paths) == 4, paths
+
+          rows = [json.loads(p.read_text()) for p in paths]
+          assert [r["year"] for r in rows] == [2014, 2015, 2016, 2017]
+          assert all(r["historical_player_outcomes_read"] is False for r in rows)
+          assert all(r["predictor_fit_performed"] is False for r in rows)
+          assert all(r["2027_class_scored"] is False for r in rows)
+          assert all(r["production_change_authorized"] is False for r in rows)
+
+          passing = [r["year"] for r in rows if r["feasibility_gate_pass"]]
+          strong = [r["year"] for r in rows if r["strong_feasibility_reference_pass"]]
+
+          # Four passing years would expand the target panel from 6 to the
+          # preregistered 10-class minimum. Three still gets formal V0 to 9
+          # classes but is insufficient for predictor fitting.
+          if len(passing) == 4:
+              decision = "PASS_B4_BUILD_FULL_2014_2017_SOURCE_RECOVERY_AND_H3O2_EXPANSION"
+          elif len(passing) >= 2:
+              decision = "PARTIAL_B4_EXTEND_SEARCH_TO_OLDER_YEARS_AND_RECOVER_PASSING_YEARS"
+          else:
+              decision = "STOP_B4_MFL_OLDER_CLASS_SOURCE_NOT_FEASIBLE_USE_ALTERNATE_SOURCE_DESIGN"
+
+          summary = {
+              "schema_version": 1,
+              "study_id": "draft-class-strength-v1",
+              "stage": "b4_historical_target_expansion_source_feasibility",
+              "decision": decision,
+              "existing_complete_target_classes": 6,
+              "years_probed": [2014, 2015, 2016, 2017],
+              "year_results": {
+                  str(r["year"]): {
+                      "selected_candidate_n": r["discovery"]["selected_candidate_n"],
+                      "base_eligible": r["counts"].get("base_eligible", 0),
+                      "full4": r["full4_n"],
+                      "candidate_cleanable_full4": r["candidate_cleanable_full4_n"],
+                      "feasibility_gate_pass": r["feasibility_gate_pass"],
+                      "strong_feasibility_reference_pass": r["strong_feasibility_reference_pass"],
+                      "transport_counts": r["transport_counts"],
+                  }
+                  for r in rows
+              },
+              "passing_years": passing,
+              "passing_year_n": len(passing),
+              "strong_feasibility_years": strong,
+              "potential_total_complete_classes_if_all_passing_are_recovered": 6 + len(passing),
+              "minimum_classes_before_predictor_fit": 10,
+              "outcome_ingestion_authorized": False,
+              "final_source_catalog_frozen": False,
+              "historical_player_outcomes_read": False,
+              "predictor_fit_performed": False,
+              "2027_class_scored": False,
+              "production_change_authorized": False,
+              "next_stage": (
+                  "If all four pass, build contamination-hardened source recovery and "
+                  "reproduce the V10 H3.O2 outcome definition for 2014-2017. "
+                  "If partial, add 2012-2013 feasibility before outcome ingestion."
+              ),
+          }
+
+          d = Path("research/draft-class-strength-v1")
+          d.mkdir(parents=True, exist_ok=True)
+          out = d / "b4_historical_target_expansion_source_feasibility.json"
+          out.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+
+          report = [
+              "# Draft Class Strength V1 — B4 Source Feasibility",
+              "",
+              f"**Decision:** `{decision}`",
+              "",
+              f"Passing years: **{len(passing)} / 4**",
+              f"Potential total target classes: **{6 + len(passing)}**",
+              "",
+          ]
+          for y in [2014, 2015, 2016, 2017]:
+              x = summary["year_results"][str(y)]
+              report.append(
+                  f"- {y}: cleanable full4={x['candidate_cleanable_full4']}, "
+                  f"full4={x['full4']}, pass={x['feasibility_gate_pass']}"
+              )
+          report += [
+              "",
+              "No outcomes, predictor fit, 2027 score, or production changes were authorized.",
+              "",
+          ]
+          md = d / "b4_historical_target_expansion_source_feasibility.md"
+          md.write_text("\n".join(report))
+
+          manifest = {
+              "schema_version": 1,
+              "decision": decision,
+              "output_hashes": {
+                  out.name: hashlib.sha256(out.read_bytes()).hexdigest(),
+                  md.name: hashlib.sha256(md.read_bytes()).hexdigest(),
+              },
+              "historical_player_outcomes_read": False,
+              "predictor_fit_performed": False,
+              "2027_class_scored": False,
+              "production_change_authorized": False,
+          }
+          mp = d / "b4_historical_target_expansion_source_feasibility_manifest.json"
+          mp.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+          print(json.dumps({
+              "decision": decision,
+              "passing_years": passing,
+              "potential_total_complete_classes": 6 + len(passing),
+              "outcome_ingestion_authorized": False,
+          }, indent=2))
+          PY
+
+      - name: Prove B4 research-only scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import subprocess
+
+          raw = subprocess.check_output(
+              ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+              text=True,
+          )
+          touched = [line[3:] for line in raw.splitlines() if line.strip()]
+          assert touched
+          assert all(p.startswith("research/draft-class-strength-v1/") for p in touched), touched
+          assert "index.html" not in touched
+          assert "free-agent-board.html" not in touched
+          assert not any(p.startswith("scripts/") for p in touched)
+          assert not any(p.startswith("data/") for p in touched)
+          print("PASS: B4 mutation scope is research-only.")
+          PY
+
+      - name: Commit B4 source-feasibility result
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$BASE_SHA" || {
+            echo "ERROR: origin/main moved during B4 reducer."
+            exit 1
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            research/draft-class-strength-v1/b4_historical_target_expansion_source_feasibility.json \
+            research/draft-class-strength-v1/b4_historical_target_expansion_source_feasibility.md \
+            research/draft-class-strength-v1/b4_historical_target_expansion_source_feasibility_manifest.json
+
+          git diff --cached --quiet || git commit -m "Audit older draft class source feasibility"
+          git push origin HEAD:main
+
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$(git rev-parse HEAD)"
