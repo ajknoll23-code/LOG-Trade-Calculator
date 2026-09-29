@@ -1,0 +1,839 @@
+name: IDP DL-LB Structural Integrity Audit V1
+
+"on":
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: idp-dl-lb-structural-integrity-audit-v1
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Capture audit base
+        id: base
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13.15'
+
+      - name: Guard deployed FV Python port
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/snapshot_values.py --selftest
+          git diff --exit-code
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          echo "PASS: deployed FV Python port reproduces production."
+
+      - name: Freeze audit contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p research/idp-dl-lb-structural-audit-v1
+          python3 - <<'PY'
+          import json,subprocess
+          from pathlib import Path
+
+          D=Path("research/idp-dl-lb-structural-audit-v1")
+          contract={
+            "schema_version":1,
+            "study_id":"idp-dl-lb-structural-integrity-audit-v1",
+            "status":"FROZEN_BEFORE_AUDIT_CALCULATION",
+            "repo_commit_sha":subprocess.check_output(
+                ["git","rev-parse","HEAD"],text=True
+            ).strip(),
+            "scope":{
+              "positions":["DL","LB"],
+              "production_mutation_allowed":False,
+              "player_specific_manual_override_allowed":False,
+              "coefficient_refit_allowed":False,
+              "new_market_anchor_fit_allowed":False
+            },
+            "primary_questions":[
+              "Does the live DL/LB FV formula reproduce exactly and behave internally consistently?",
+              "Did IDP position-lineage delta transport preserve large legacy residuals after LB-to-DL migration?",
+              "Are any such inherited residuals systemic across the migrated DL cohort rather than isolated to Brian Burns?",
+              "How much of the live upper DL tail is attributable to the inherited residual versus current-position clean production evidence?",
+              "Do later successor overlays explain the gap, or are they small relative to the inherited lineage residual?",
+              "Do current DL/LB upper-tail values show robust statistical outlier behavior?",
+              "Do existing prospective Production V2, Replacement Level V2, and Position Weight V2 evidence authorize a root-cause parameter change yet?"
+            ],
+            "definitions":{
+              "legacy_residual":"deployed_raw_prod_mult_before_position_lineage - legacy_clean_model_prod_mult",
+              "lineage_transport_identity":"position_lineage_candidate_raw = current_position_clean_model_raw + legacy_residual",
+              "successor_overlay_delta":"current_live_raw_prod_mult - position_lineage_candidate_raw",
+              "clean_plus_successor_raw":"current_position_clean_model_raw + successor_overlay_delta",
+              "transport_excess_pct":"current_live_effective_prod / clean_plus_successor_effective_prod - 1",
+              "transport_excess_fv_pct":"current_live_fv / clean_plus_successor_fv - 1"
+            },
+            "materiality_triggers":{
+              "systemic_transport_residual":{
+                "minimum_migrated_dl_n":15,
+                "median_transport_excess_fv_pct_ge":0.15,
+                "share_migrated_dl_transport_excess_fv_pct_ge_0_15_ge":0.50
+              },
+              "upper_tail_concentration":{
+                "top10_dl_migrated_count_ge":5,
+                "top10_migrated_median_transport_excess_fv_pct_ge":0.15
+              },
+              "single_extreme_gap":{
+                "top_dl_vs_second_dl_ratio_ge":1.20,
+                "top_dl_transport_excess_fv_pct_ge":0.15
+              }
+            },
+            "interpretation_guardrails":[
+              "A trigger is evidence of structural review need, not proof that a specific player's true market value equals the counterfactual.",
+              "The current-position clean model is used to isolate the release transport residual; it is not declared ground truth.",
+              "Weeks 1-2 prospective experiments are smoke-test evidence only because their own frozen protocols remain collection-only.",
+              "Do not change POSITION_WEIGHT, replacement rank, production coefficients, age curves, or individual player values from this audit alone.",
+              "If the systemic transport-residual trigger fires, authorize a separate preregistered reconciliation study rather than hand-editing Brian Burns."
+            ],
+            "decision_rule":{
+              "if_systemic_transport_residual_trigger":
+                "STOP_TRUSTING_ABSOLUTE_FV_CALIBRATION_FOR_MIGRATED_DL_COHORT_AUTHORIZE_RECONCILIATION_RESEARCH",
+              "otherwise":
+                "NO_SYSTEMIC_LINEAGE_TRANSPORT_DISTORTION_DETECTED_CONTINUE_MONITORING"
+            },
+            "production_change_authorized":False
+          }
+          (D/"audit_contract.json").write_text(
+              json.dumps(contract,indent=2,sort_keys=True)+"\n"
+          )
+          print("PASS: audit contract frozen.")
+          PY
+
+      - name: Run full DL-LB structural audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import importlib.util
+          import json
+          import math
+          import statistics
+          import subprocess
+          from collections import Counter
+          from datetime import datetime,timezone
+          from pathlib import Path
+
+          ROOT=Path(".")
+          D=Path("research/idp-dl-lb-structural-audit-v1")
+          INDEX=Path("index.html")
+          PORT=Path("scripts/validation/snapshot_values.py")
+          PHASE1B=Path("research/idp-position-lineage-v1/idp_position_lineage_v1_phase1b.json")
+          LINEAGE_RELEASE=Path("model/releases/idp-position-lineage-v1/release.json")
+          PROD_V2=Path("research/production-v2/production_v2_phase9_evaluation.json")
+          REPL_V2=Path("research/replacement-level-v2/replacement_level_v2_phase5_evaluation.json")
+          POSW_V2=Path("research/position-weight-v2/position_weight_v2_phase5_evaluation.json")
+          UNCERTAINTY=Path("scripts/artifacts/generated/value_uncertainty.json")
+          BASE_SCALE=5500.0
+
+          def sha256(path):
+              return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+          def q(xs,p):
+              xs=sorted(float(x) for x in xs)
+              if not xs: return None
+              if len(xs)==1: return xs[0]
+              i=(len(xs)-1)*p
+              lo=math.floor(i); hi=math.ceil(i)
+              return xs[lo]+(xs[hi]-xs[lo])*(i-lo)
+
+          def summary(xs):
+              xs=[float(x) for x in xs]
+              if not xs: return None
+              return {
+                  "n":len(xs),"min":min(xs),"p10":q(xs,.10),"p25":q(xs,.25),
+                  "median":q(xs,.50),"p75":q(xs,.75),"p90":q(xs,.90),
+                  "p95":q(xs,.95),"max":max(xs),"mean":statistics.fmean(xs)
+              }
+
+          def robust_stats(xs):
+              xs=[float(x) for x in xs]
+              med=statistics.median(xs)
+              mad=statistics.median(abs(x-med) for x in xs)
+              return med,mad
+
+          def robust_z(x,med,mad):
+              if mad<=1e-12: return None
+              return 0.6744897501960817*(x-med)/mad
+
+          def js_round(x):
+              return math.floor(float(x)+0.5)
+
+          spec=importlib.util.spec_from_file_location("snapshot_values",PORT)
+          if spec is None or spec.loader is None:
+              raise RuntimeError("Could not import snapshot_values.py")
+          sv=importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(sv)
+
+          cfg=sv.load_from_html(INDEX)
+          deployed=sv.compute_all_values(cfg)
+
+          assert abs(float(cfg["position_weight"]["DL"])-0.93)<1e-12
+          assert abs(float(cfg["position_weight"]["LB"])-1.12)<1e-12
+
+          def effective_from_raw(key,role,raw):
+              role_est=float(cfg["role_mult"].get(role,1.0))
+              raw=float(raw)
+              if role=="Elite" and raw<0.65:
+                  return 0.65
+              if (
+                  raw<=0.15 and role_est>raw
+                  and key in cfg["no_real_history"]
+              ):
+                  return role_est
+              return raw
+
+          def value_from_raw(key,pos,age,role,raw):
+              eff=effective_from_raw(key,role,raw)
+              am=sv.effective_age_multiplier(
+                  pos,age,role,key,eff,float(raw),cfg
+              )
+              pw=float(cfg["position_weight"][pos])
+              value=js_round(100.0*pw*am*eff*55.0)
+              return {
+                  "raw_prod_mult":float(raw),
+                  "effective_prod_mult":float(eff),
+                  "age_mult":float(am),
+                  "value":int(value)
+              }
+
+          all_rows=[]
+          by_pos={"DL":[],"LB":[]}
+          for key,info in cfg["player_db"].items():
+              pos=info["pos"]
+              if pos not in by_pos:
+                  continue
+              age=int(info["age"])
+              role=info["role"]
+              eff,raw=sv.production_multiplier(
+                  key,role,cfg["prod_mult"],
+                  cfg["no_real_history"],cfg["role_mult"]
+              )
+              am=sv.effective_age_multiplier(
+                  pos,age,role,key,eff,raw,cfg
+              )
+              val=int(deployed[key]["value"])
+              reproduce=js_round(
+                  100.0*float(cfg["position_weight"][pos])*am*eff*55.0
+              )
+              assert reproduce==val,(key,reproduce,val)
+              row={
+                  "key":key,"pos":pos,"age":age,"role":role,
+                  "current_raw_prod_mult":None if raw is None else float(raw),
+                  "current_effective_prod_mult":float(eff),
+                  "current_age_mult":float(am),
+                  "current_fv":val,
+                  "has_real_prod_data":bool(deployed[key]["has_real_prod_data"]),
+                  "no_real_production_history":bool(
+                      deployed[key]["no_real_production_history"]
+                  )
+              }
+              all_rows.append(row)
+              by_pos[pos].append(row)
+
+          # Robust position-level distributions.
+          position_summary={}
+          for pos,rows in by_pos.items():
+              ordered=sorted(rows,key=lambda r:(-r["current_fv"],r["key"]))
+              fv_logs=[math.log(max(1,r["current_fv"])) for r in rows]
+              prod_logs=[math.log(max(1e-9,r["current_effective_prod_mult"])) for r in rows]
+              fv_med,fv_mad=robust_stats(fv_logs)
+              pr_med,pr_mad=robust_stats(prod_logs)
+              for r in rows:
+                  r["log_fv_robust_z"]=robust_z(
+                      math.log(max(1,r["current_fv"])),fv_med,fv_mad
+                  )
+                  r["log_prod_robust_z"]=robust_z(
+                      math.log(max(1e-9,r["current_effective_prod_mult"])),
+                      pr_med,pr_mad
+                  )
+              position_summary[pos]={
+                  "player_count":len(rows),
+                  "fv":summary(r["current_fv"] for r in rows),
+                  "effective_prod_mult":summary(
+                      r["current_effective_prod_mult"] for r in rows
+                  ),
+                  "top20":[{
+                      "rank":i+1,
+                      "key":r["key"],"age":r["age"],"role":r["role"],
+                      "fv":r["current_fv"],
+                      "effective_prod_mult":r["current_effective_prod_mult"],
+                      "age_mult":r["current_age_mult"],
+                      "log_fv_robust_z":r["log_fv_robust_z"],
+                      "log_prod_robust_z":r["log_prod_robust_z"],
+                  } for i,r in enumerate(ordered[:20])],
+                  "top1_to_top2_fv_ratio":
+                      (ordered[0]["current_fv"]/ordered[1]["current_fv"])
+                      if len(ordered)>=2 else None,
+                  "top1_to_p95_fv_ratio":
+                      ordered[0]["current_fv"]/q(
+                          [r["current_fv"] for r in rows],.95
+                      )
+              }
+
+          phase1b=json.loads(PHASE1B.read_text())
+          release=json.loads(LINEAGE_RELEASE.read_text())
+          release_map={
+              x["key"]:x for x in release["candidate_overrides"]
+          }
+
+          migrated=[]
+          for r in phase1b["rows"]:
+              if r.get("status")!="candidate":
+                  continue
+              key=r["key"]
+              if r["current_position"] not in ("DL","LB"):
+                  continue
+              assert key in release_map
+              info=cfg["player_db"][key]
+              current_raw=float(cfg["prod_mult"][key])
+              current_effective=effective_from_raw(
+                  key,info["role"],current_raw
+              )
+              current_fv=int(deployed[key]["value"])
+
+              deployed_raw=float(r["deployed_raw_prod_mult"])
+              legacy_clean=float(r["legacy_clean_model_prod_mult"])
+              current_clean=float(r["current_clean_model_prod_mult"])
+              candidate_raw=float(r["candidate_raw_prod_mult"])
+
+              lineage_delta=current_clean-legacy_clean
+              legacy_residual=deployed_raw-legacy_clean
+              assert math.isclose(
+                  candidate_raw,
+                  deployed_raw+lineage_delta,
+                  rel_tol=0,abs_tol=5e-5
+              ),(key,candidate_raw,deployed_raw+lineage_delta)
+              assert math.isclose(
+                  candidate_raw,
+                  current_clean+legacy_residual,
+                  rel_tol=0,abs_tol=5e-5
+              ),(key,candidate_raw,current_clean+legacy_residual)
+
+              successor_delta=current_raw-candidate_raw
+              clean_plus_successor_raw=current_clean+successor_delta
+
+              cf=value_from_raw(
+                  key,info["pos"],int(info["age"]),info["role"],
+                  clean_plus_successor_raw
+              )
+              clean=value_from_raw(
+                  key,info["pos"],int(info["age"]),info["role"],
+                  current_clean
+              )
+              candidate=value_from_raw(
+                  key,info["pos"],int(info["age"]),info["role"],
+                  candidate_raw
+              )
+
+              item={
+                  "key":key,
+                  "age":int(info["age"]),
+                  "role":info["role"],
+                  "current_position":r["current_position"],
+                  "legacy_model_position":r["legacy_model_position"],
+                  "deployed_raw_prod_mult_pre_lineage":deployed_raw,
+                  "legacy_clean_model_prod_mult":legacy_clean,
+                  "current_position_clean_model_prod_mult":current_clean,
+                  "position_lineage_delta_raw":lineage_delta,
+                  "legacy_residual_raw":legacy_residual,
+                  "position_lineage_candidate_raw":candidate_raw,
+                  "successor_overlay_delta_raw":successor_delta,
+                  "current_live_raw_prod_mult":current_raw,
+                  "current_live_effective_prod_mult":current_effective,
+                  "clean_plus_successor_raw_prod_mult":
+                      clean_plus_successor_raw,
+                  "clean_plus_successor_effective_prod_mult":
+                      cf["effective_prod_mult"],
+                  "clean_current_position_fv_no_successor":clean["value"],
+                  "position_lineage_candidate_fv_no_successor":
+                      candidate["value"],
+                  "clean_plus_successor_fv":cf["value"],
+                  "current_live_fv":current_fv,
+                  "transport_excess_raw":
+                      current_raw-clean_plus_successor_raw,
+                  "transport_excess_prod_pct":
+                      current_effective/cf["effective_prod_mult"]-1.0
+                      if cf["effective_prod_mult"]>0 else None,
+                  "transport_excess_fv_points":
+                      current_fv-cf["value"],
+                  "transport_excess_fv_pct":
+                      current_fv/cf["value"]-1.0
+                      if cf["value"]>0 else None,
+                  "successor_overlay_abs_raw":abs(successor_delta),
+                  "phase1b_current_position_history":
+                      r.get("current_position_history"),
+                  "phase1b_v1_projection":r.get("v1_projection")
+              }
+              migrated.append(item)
+
+          migrated_dl=[x for x in migrated if x["current_position"]=="DL"]
+          migrated_lb=[x for x in migrated if x["current_position"]=="LB"]
+
+          excess=[x["transport_excess_fv_pct"] for x in migrated_dl]
+          material=[x for x in migrated_dl if x["transport_excess_fv_pct"]>=0.15]
+          successor_abs=[x["successor_overlay_abs_raw"] for x in migrated_dl]
+          residual_raw=[x["legacy_residual_raw"] for x in migrated_dl]
+
+          migrated_dl_by_key={x["key"]:x for x in migrated_dl}
+          dl_order=sorted(by_pos["DL"],key=lambda r:(-r["current_fv"],r["key"]))
+          current_top10=dl_order[:10]
+          top10_migrated=[r for r in current_top10 if r["key"] in migrated_dl_by_key]
+          top10_migrated_excess=[
+              migrated_dl_by_key[r["key"]]["transport_excess_fv_pct"]
+              for r in top10_migrated
+          ]
+
+          # Counterfactual ranking that changes ONLY the inherited transport
+          # residual for migrated candidates. Native DL/LB stay exact current.
+          reconciled=[]
+          for r in by_pos["DL"]:
+              m=migrated_dl_by_key.get(r["key"])
+              reconciled.append({
+                  "key":r["key"],
+                  "current_fv":r["current_fv"],
+                  "reconciled_fv":
+                      m["clean_plus_successor_fv"] if m else r["current_fv"],
+                  "migrated":bool(m)
+              })
+          current_rank={
+              r["key"]:i+1 for i,r in enumerate(sorted(
+                  reconciled,key=lambda x:(-x["current_fv"],x["key"])
+              ))
+          }
+          reconciled_rank={
+              r["key"]:i+1 for i,r in enumerate(sorted(
+                  reconciled,key=lambda x:(-x["reconciled_fv"],x["key"])
+              ))
+          }
+          for r in reconciled:
+              r["current_rank"]=current_rank[r["key"]]
+              r["reconciled_rank"]=reconciled_rank[r["key"]]
+              r["rank_change_reconciled_minus_current"] = (
+                  r["reconciled_rank"] - r["current_rank"]
+              )
+
+          burns=next(x for x in migrated_dl if x["key"]=="brian burns")
+          second_dl=dl_order[1]
+          burns_detail={
+              **burns,
+              "current_dl_rank":current_rank["brian burns"],
+              "reconciled_dl_rank":reconciled_rank["brian burns"],
+              "current_top_dl_to_second_dl_ratio":
+                  burns["current_live_fv"]/second_dl["current_fv"],
+              "second_current_dl":{
+                  "key":second_dl["key"],"fv":second_dl["current_fv"]
+              },
+              "current_fv_vs_2027_early_1st_ratio":None
+          }
+
+          # Cross-scale reference: current live pick constants.
+          text=INDEX.read_text(encoding="utf-8")
+          import re
+          pm=re.search(r"const PICK_BASE = \{.*?\n\};",text,re.S)
+          if pm:
+              vals=list(map(float,re.findall(
+                  r"(?:early|mid|late):\s*([0-9.]+)",pm.group(0)
+              )))
+              if len(vals)==18:
+                  burns_detail["current_fv_vs_2027_early_1st_ratio"] = (
+                      burns["current_live_fv"] / vals[0]
+                  )
+
+          contract=json.loads((D/"audit_contract.json").read_text())
+          mt=contract["materiality_triggers"]
+
+          systemic = (
+              len(migrated_dl) >= mt["systemic_transport_residual"]["minimum_migrated_dl_n"]
+              and statistics.median(excess) >= mt["systemic_transport_residual"]["median_transport_excess_fv_pct_ge"]
+              and (len(material) / len(migrated_dl)) >= mt["systemic_transport_residual"]["share_migrated_dl_transport_excess_fv_pct_ge_0_15_ge"]
+          )
+          upper_tail = (
+              len(top10_migrated) >= mt["upper_tail_concentration"]["top10_dl_migrated_count_ge"]
+              and statistics.median(top10_migrated_excess) >= mt["upper_tail_concentration"]["top10_migrated_median_transport_excess_fv_pct_ge"]
+          )
+          single_extreme = (
+              burns_detail["current_top_dl_to_second_dl_ratio"] >= mt["single_extreme_gap"]["top_dl_vs_second_dl_ratio_ge"]
+              and burns["transport_excess_fv_pct"] >= mt["single_extreme_gap"]["top_dl_transport_excess_fv_pct_ge"]
+          )
+
+          # Existing prospective evidence: do not overstate two weeks.
+          prodv2=json.loads(PROD_V2.read_text())
+          replv2=json.loads(REPL_V2.read_text())
+          poswv2=json.loads(POSW_V2.read_text())
+          w=prodv2["windows"]["weeks_1_to_2_early"]
+
+          prospective_context={
+              "production_v2":{
+                  "status":prodv2["status"],
+                  "completed_weeks":prodv2["completed_weeks"],
+                  "deployment_authorized":prodv2["deployment_authorized"],
+                  "deployed_control_rank_among_121":
+                      w["deployed_control_rank_among_121"],
+                  "deployed_control_DL":
+                      w["deployed_control_metrics"]["primary_by_position"]["DL"],
+                  "deployed_control_LB":
+                      w["deployed_control_metrics"]["primary_by_position"]["LB"],
+                  "interpretation":prodv2["interpretation"]
+              },
+              "replacement_level_v2":{
+                  "status":replv2["status"],
+                  "completed_consecutive_week_count":
+                      replv2["completed_consecutive_week_count"],
+                  "deployment_authorized":replv2["deployment_authorized"],
+                  "replacement_rank_change_authorized":
+                      replv2["replacement_rank_change_authorized"],
+                  "full_phase2_leader_delta_DL":
+                      replv2["primary_deltas_vs_control"]["full_phase2_leaders"]["by_position"]["DL"],
+                  "full_phase2_leader_delta_LB":
+                      replv2["primary_deltas_vs_control"]["full_phase2_leaders"]["by_position"]["LB"],
+                  "interpretation_guardrail":
+                      replv2["interpretation_guardrail"]
+              },
+              "position_weight_v2":{
+                  "status":poswv2["status"],
+                  "completed_consecutive_week_count":
+                      poswv2["completed_consecutive_week_count"],
+                  "deployment_authorized":poswv2["deployment_authorized"],
+                  "position_weight_change_authorized":
+                      poswv2["position_weight_change_authorized"],
+                  "bridge_50_vs_control":
+                      poswv2["bridge_50_vs_control"],
+                  "interpretation_guardrail":
+                      poswv2["interpretation_guardrail"]
+              }
+          }
+
+          uncertainty_context=None
+          if UNCERTAINTY.exists():
+              uj=json.loads(UNCERTAINTY.read_text())
+              players=uj.get("players",uj)
+              b=players.get("brian burns")
+              if b:
+                  uncertainty_context={
+                      "brian_burns":b,
+                      "guardrail":
+                          "This sensitivity envelope is centered on the deployed value and therefore cannot independently validate the deployed absolute level."
+                  }
+
+          decision=(
+              contract["decision_rule"]["if_systemic_transport_residual_trigger"]
+              if systemic else
+              contract["decision_rule"]["otherwise"]
+          )
+
+          result={
+              "schema_version":1,
+              "study_id":"idp-dl-lb-structural-integrity-audit-v1",
+              "status":"AUDIT_COMPLETE",
+              "generated_at_utc":datetime.now(timezone.utc).isoformat(),
+              "git_sha":subprocess.check_output(
+                  ["git","rev-parse","HEAD"],text=True
+              ).strip(),
+              "production_change_authorized":False,
+              "production_changed":False,
+              "candidate_fit_performed":False,
+              "player_specific_override_authorized":False,
+              "decision":decision,
+              "source_sha256":{
+                  "index_html":sha256(INDEX),
+                  "snapshot_values_py":sha256(PORT),
+                  "position_lineage_phase1b":sha256(PHASE1B),
+                  "position_lineage_release":sha256(LINEAGE_RELEASE),
+                  "production_v2_phase9":sha256(PROD_V2),
+                  "replacement_level_v2_phase5":sha256(REPL_V2),
+                  "position_weight_v2_phase5":sha256(POSW_V2),
+                  "value_uncertainty":sha256(UNCERTAINTY)
+                      if UNCERTAINTY.exists() else None
+              },
+              "deployed_formula":
+                  "FV = JS-round(5500 * POSITION_WEIGHT * age_multiplier * effective_production_multiplier)",
+              "position_weights":{
+                  "DL":float(cfg["position_weight"]["DL"]),
+                  "LB":float(cfg["position_weight"]["LB"])
+              },
+              "scope":{
+                  "dl_player_count":len(by_pos["DL"]),
+                  "lb_player_count":len(by_pos["LB"]),
+                  "migrated_candidate_count":len(migrated),
+                  "migrated_dl_count":len(migrated_dl),
+                  "migrated_lb_count":len(migrated_lb)
+              },
+              "position_summary":position_summary,
+              "lineage_transport_audit":{
+                  "identity_verified_for_all_candidates":True,
+                  "migrated_dl_transport_excess_fv_pct":summary(excess),
+                  "migrated_dl_legacy_residual_raw":summary(residual_raw),
+                  "migrated_dl_successor_overlay_abs_raw":summary(successor_abs),
+                  "migrated_dl_share_ge_15pct_transport_excess":
+                      len(material)/len(migrated_dl),
+                  "migrated_dl_count_ge_15pct_transport_excess":
+                      len(material),
+                  "top10_dl_migrated_count":len(top10_migrated),
+                  "top10_dl_migrated_keys":[r["key"] for r in top10_migrated],
+                  "top10_migrated_transport_excess_fv_pct":
+                      summary(top10_migrated_excess),
+                  "systemic_transport_residual_trigger":systemic,
+                  "upper_tail_concentration_trigger":upper_tail,
+                  "single_extreme_gap_trigger":single_extreme,
+                  "all_migrated_rows":sorted(
+                      migrated,
+                      key=lambda x:(-x["transport_excess_fv_pct"],x["key"])
+                  ),
+                  "reconciled_dl_ranking_counterfactual":sorted(
+                      reconciled,key=lambda x:(x["reconciled_rank"],x["key"])
+                  )[:30]
+              },
+              "brian_burns":burns_detail,
+              "prospective_context":prospective_context,
+              "uncertainty_context":uncertainty_context,
+              "scientific_interpretation":{
+                  "what_is_proven":[
+                      "The deployed FV math reproduces exactly for every audited DL/LB.",
+                      "The position-lineage candidate algebra preserves the pre-existing deployed-vs-legacy-clean residual by construction.",
+                      "The audit directly measures how much of current migrated-DL FV remains above a current-position-clean-plus-successor counterfactual because of that preserved residual."
+                  ],
+                  "what_is_not_proven":[
+                      "The clean-plus-successor counterfactual is not proven to be true market value.",
+                      "This audit does not prove POSITION_WEIGHT is wrong.",
+                      "This audit does not prove replacement rank 32 is wrong.",
+                      "Two weeks of prospective outcomes are not enough to select coefficients.",
+                      "A Brian Burns manual cap is not scientifically authorized."
+                  ],
+                  "root_cause_priority_if_systemic_trigger_fires":[
+                      "First audit/reconcile inherited legacy residuals in migrated DL production multipliers.",
+                      "Only after that, separately evaluate replacement level and position weight under their already-frozen prospective protocols.",
+                      "Do not solve a transport-lineage problem by globally lowering all DL values."
+                  ]
+              }
+          }
+
+          (D/"audit_result.json").write_text(
+              json.dumps(result,indent=2,sort_keys=True)+"\n"
+          )
+
+          # Human-readable report.
+          lt=result["lineage_transport_audit"]
+          lines=[
+              "# IDP DL/LB Structural Integrity Audit V1",
+              "",
+              f"**Decision:** `{decision}`",
+              "",
+              "## Executive finding",
+              "",
+              f"- Audited **{len(by_pos['DL'])} DL** and **{len(by_pos['LB'])} LB** using the exact deployed FV port.",
+              f"- Position-lineage candidates audited: **{len(migrated)}** (**{len(migrated_dl)} DL**, **{len(migrated_lb)} LB**).",
+              f"- Median migrated-DL current FV excess versus current-position-clean + same successor overlay: **{100*lt['migrated_dl_transport_excess_fv_pct']['median']:.1f}%**.",
+              f"- Migrated DL at or above +15% excess: **{lt['migrated_dl_count_ge_15pct_transport_excess']}/{len(migrated_dl)} ({100*lt['migrated_dl_share_ge_15pct_transport_excess']:.1f}%)**.",
+              f"- Current top-10 DL containing migrated candidates: **{lt['top10_dl_migrated_count']}/10**.",
+              f"- Systemic transport-residual trigger: **{'YES' if systemic else 'NO'}**.",
+              "",
+              "The counterfactual above is a diagnostic isolation of inherited transport residual. It is **not** asserted to be true market value.",
+              "",
+              "## Brian Burns decomposition",
+              "",
+              f"- Current live FV: **{burns['current_live_fv']}**",
+              f"- Current live raw production multiplier: **{burns['current_live_raw_prod_mult']:.4f}**",
+              f"- Pre-lineage deployed raw multiplier: **{burns['deployed_raw_prod_mult_pre_lineage']:.4f}**",
+              f"- Legacy-position clean multiplier: **{burns['legacy_clean_model_prod_mult']:.4f}**",
+              f"- Current-position clean multiplier: **{burns['current_position_clean_model_prod_mult']:.4f}**",
+              f"- Preserved legacy residual: **{burns['legacy_residual_raw']:+.4f}**",
+              f"- Position-lineage candidate raw multiplier: **{burns['position_lineage_candidate_raw']:.4f}**",
+              f"- Later successor overlay delta: **{burns['successor_overlay_delta_raw']:+.4f}**",
+              f"- Clean-current-position + same successor overlay FV: **{burns['clean_plus_successor_fv']}**",
+              f"- FV attributable to preserved residual under this isolation: **{burns['transport_excess_fv_points']:+d} points ({100*burns['transport_excess_fv_pct']:.1f}% above the counterfactual)**",
+              f"- Current DL #1 / DL #2 gap: **{burns_detail['current_top_dl_to_second_dl_ratio']:.3f}×**",
+              "",
+              "## Migrated DL cohort",
+              "",
+              "| Player | Current FV | Clean+successor FV | Excess | Legacy residual | Later overlay |",
+              "|---|---:|---:|---:|---:|---:|"
+          ]
+          for x in sorted(
+              migrated_dl,key=lambda z:(-z["current_live_fv"],z["key"])
+          ):
+              lines.append(
+                  f"| {x['key']} | {x['current_live_fv']} | "
+                  f"{x['clean_plus_successor_fv']} | "
+                  f"{100*x['transport_excess_fv_pct']:+.1f}% | "
+                  f"{x['legacy_residual_raw']:+.4f} | "
+                  f"{x['successor_overlay_delta_raw']:+.4f} |"
+              )
+
+          lines += [
+              "",
+              "## Current top DL values",
+              "",
+              "| Rank | Player | FV | Prod mult | Migrated lineage candidate? |",
+              "|---:|---|---:|---:|---|"
+          ]
+          mig=set(x["key"] for x in migrated_dl)
+          for r in position_summary["DL"]["top20"]:
+              lines.append(
+                  f"| {r['rank']} | {r['key']} | {r['fv']} | "
+                  f"{r['effective_prod_mult']:.4f} | "
+                  f"{'yes' if r['key'] in mig else 'no'} |"
+              )
+
+          lines += [
+              "",
+              "## DL/LB distribution diagnostics",
+              "",
+              f"- DL top1/top2 FV ratio: **{position_summary['DL']['top1_to_top2_fv_ratio']:.3f}×**",
+              f"- DL top1/p95 FV ratio: **{position_summary['DL']['top1_to_p95_fv_ratio']:.3f}×**",
+              f"- LB top1/top2 FV ratio: **{position_summary['LB']['top1_to_top2_fv_ratio']:.3f}×**",
+              f"- LB top1/p95 FV ratio: **{position_summary['LB']['top1_to_p95_fv_ratio']:.3f}×**",
+              "",
+              "## Prospective evidence guardrail",
+              "",
+              f"- Production V2 status: **{prodv2['status']}**, completed weeks: **{prodv2['completed_weeks']}**, deployment authorized: **{prodv2['deployment_authorized']}**.",
+              f"- Deployed production control rank after Weeks 1-2: **{w['deployed_control_rank_among_121']}/121**. This is smoke-test evidence only under the frozen protocol.",
+              f"- DL deployed-control Spearman vs active PPG: **{w['deployed_control_metrics']['primary_by_position']['DL']['spearman']:.3f}**.",
+              f"- LB deployed-control Spearman vs active PPG: **{w['deployed_control_metrics']['primary_by_position']['LB']['spearman']:.3f}**.",
+              f"- Replacement Level V2 status: **{replv2['status']}**; replacement-rank change authorized: **{replv2['replacement_rank_change_authorized']}**.",
+              f"- Position Weight V2 status: **{poswv2['status']}**; position-weight change authorized: **{poswv2['position_weight_change_authorized']}**.",
+              "",
+              "## Scientific conclusion boundaries",
+              "",
+              "This audit may identify a structural lineage-transport problem. It does **not** authorize a manual Brian Burns correction, a global DL haircut, a POSITION_WEIGHT change, or a replacement-rank change. If the systemic transport-residual trigger fires, the next scientifically valid step is a separately preregistered reconciliation study comparing the inherited live residual against clean current-position production evidence and prospective outcomes.",
+              ""
+          ]
+          (D/"audit_report.md").write_text("\n".join(lines)+"\n")
+          print("\n".join(lines[:35]))
+          PY
+
+      - name: Validate audit result contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          D=Path("research/idp-dl-lb-structural-audit-v1")
+          r=json.loads((D/"audit_result.json").read_text())
+          assert r["status"]=="AUDIT_COMPLETE"
+          assert r["production_change_authorized"] is False
+          assert r["production_changed"] is False
+          assert r["candidate_fit_performed"] is False
+          assert r["player_specific_override_authorized"] is False
+          assert r["scope"]["dl_player_count"]>=50
+          assert r["scope"]["lb_player_count"]>=50
+          assert r["scope"]["migrated_dl_count"]>=15
+          assert r["lineage_transport_audit"]["identity_verified_for_all_candidates"] is True
+          assert len(r["lineage_transport_audit"]["all_migrated_rows"])==r["scope"]["migrated_candidate_count"]
+          assert r["brian_burns"]["current_live_fv"]>0
+          assert r["prospective_context"]["production_v2"]["deployment_authorized"] is False
+          assert r["prospective_context"]["replacement_level_v2"]["deployment_authorized"] is False
+          assert r["prospective_context"]["position_weight_v2"]["deployment_authorized"] is False
+          print("PASS: audit result contract validated.")
+          PY
+
+      - name: Freeze audit manifest
+        shell: bash
+        env:
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json,os
+          from pathlib import Path
+
+          D=Path("research/idp-dl-lb-structural-audit-v1")
+          sha=lambda p:hashlib.sha256(Path(p).read_bytes()).hexdigest()
+          result=json.loads((D/"audit_result.json").read_text())
+          files=["audit_contract.json","audit_result.json","audit_report.md"]
+          m={
+              "schema_version":1,
+              "study_id":"idp-dl-lb-structural-integrity-audit-v1",
+              "decision":result["decision"],
+              "workflow_run_id":os.environ["RUN_ID"],
+              "workflow_run_attempt":os.environ["RUN_ATTEMPT"],
+              "files":{f:sha(D/f) for f in files},
+              "production_change_authorized":False,
+              "production_changed":False
+          }
+          (D/"manifest.json").write_text(
+              json.dumps(m,indent=2,sort_keys=True)+"\n"
+          )
+          print("PASS: audit manifest frozen.")
+          PY
+
+      - name: Prove research-only commit scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import subprocess
+
+          allowed={
+              "research/idp-dl-lb-structural-audit-v1/audit_contract.json",
+              "research/idp-dl-lb-structural-audit-v1/audit_result.json",
+              "research/idp-dl-lb-structural-audit-v1/audit_report.md",
+              "research/idp-dl-lb-structural-audit-v1/manifest.json",
+          }
+          s=subprocess.check_output(
+              ["git","status","--porcelain=v1","--untracked-files=all"],
+              text=True
+          )
+          touched={line[3:] for line in s.splitlines() if line.strip()}
+          assert touched==allowed,(sorted(touched),sorted(allowed))
+          for forbidden in (
+              "index.html","free-agent-board.html","trade-desk-preview.html"
+          ):
+              assert forbidden not in touched
+          print("PASS: audit is research-only; production untouched.")
+          PY
+
+      - name: Commit DL-LB audit artifacts
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$BASE_SHA" || {
+            echo "ERROR: origin/main moved during audit."
+            exit 1
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add research/idp-dl-lb-structural-audit-v1/
+          git diff --cached --quiet && {
+            echo "ERROR: no audit artifacts staged."
+            exit 1
+          }
+          git commit -m "Complete IDP DL-LB structural integrity audit V1"
+          git push origin HEAD:main
+
+          test "$(git status --porcelain)" = ""
+          echo "PASS: audit artifacts committed; production unchanged."
