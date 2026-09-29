@@ -3,8 +3,8 @@
 Production resolver covering QB / RB / WR / TE / DL / LB / DB.
 
 - FantasyPros tracked rows: **1083**
-- Authoritative stable-ID matches: **983**
-- Manual-review rows: **2**
+- Authoritative stable-ID matches: **984**
+- Manual-review rows: **1**
 
 ## Coverage by position
 
@@ -13,7 +13,7 @@ Production resolver covering QB / RB / WR / TE / DL / LB / DB.
 | QB | 80 | 74 | 92.5% | 74 | 0 |
 | RB | 132 | 121 | 91.7% | 121 | 0 |
 | WR | 203 | 184 | 90.6% | 184 | 0 |
-| TE | 130 | 124 | 95.4% | 125 | 1 |
+| TE | 130 | 125 | 96.2% | 125 | 0 |
 | DL | 177 | 159 | 89.8% | 159 | 0 |
 | LB | 159 | 146 | 91.8% | 146 | 1 |
 | DB | 202 | 175 | 86.6% | 175 | 0 |
@@ -29,9 +29,9 @@ Production resolver covering QB / RB / WR / TE / DL / LB / DB.
 - `phase14_batch_stable_id_corroboration`: **3**
 - `phase16_batch_stable_id_corroboration`: **3**
 - `phase18_batch_stable_id_corroboration`: **3**
+- `phase20_final_pair_stable_id_corroboration`: **1**
 - `previous_authoritative_stable_id_preserved`: **7**
 - `previous_authoritative_stable_id_preserved_position_changed`: **3**
-- `unique_name_position_team_unavailable`: **1**
 
 ## Manual-review rows
 
@@ -39,5 +39,4 @@ These remain deliberately unresolved; downstream consumers must use existing fal
 
 | Player | Pos | FP team | Candidate SID | Sleeper team | Method |
 |---|---|---|---|---|---|
-| Devin Culp | TE |  | 11820 | TB | unique_name_position_team_unavailable |
 | Jonah Elliss | LB | DEN |  |  | name_found_position_incompatible |
