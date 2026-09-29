@@ -3,8 +3,8 @@
 Production resolver covering QB / RB / WR / TE / DL / LB / DB.
 
 - FantasyPros tracked rows: **1083**
-- Authoritative stable-ID matches: **977**
-- Manual-review rows: **8**
+- Authoritative stable-ID matches: **980**
+- Manual-review rows: **5**
 
 ## Coverage by position
 
@@ -12,7 +12,7 @@ Production resolver covering QB / RB / WR / TE / DL / LB / DB.
 |---|---:|---:|---:|---:|---:|
 | QB | 80 | 74 | 92.5% | 74 | 0 |
 | RB | 132 | 121 | 91.7% | 121 | 0 |
-| WR | 203 | 180 | 88.7% | 184 | 4 |
+| WR | 203 | 183 | 90.1% | 184 | 1 |
 | TE | 130 | 122 | 93.8% | 125 | 3 |
 | DL | 177 | 159 | 89.8% | 159 | 0 |
 | LB | 159 | 146 | 91.8% | 146 | 1 |
@@ -27,9 +27,10 @@ Production resolver covering QB / RB / WR / TE / DL / LB / DB.
 - `phase10_independent_stable_id_corroboration`: **1**
 - `phase12_batch_stable_id_corroboration`: **3**
 - `phase14_batch_stable_id_corroboration`: **3**
+- `phase16_batch_stable_id_corroboration`: **3**
 - `previous_authoritative_stable_id_preserved`: **7**
 - `previous_authoritative_stable_id_preserved_position_changed`: **3**
-- `unique_name_position_team_unavailable`: **7**
+- `unique_name_position_team_unavailable`: **4**
 
 ## Manual-review rows
 
@@ -37,9 +38,6 @@ These remain deliberately unresolved; downstream consumers must use existing fal
 
 | Player | Pos | FP team | Candidate SID | Sleeper team | Method |
 |---|---|---|---|---|---|
-| Xavier Weaver | WR |  | 11921 |  | unique_name_position_team_unavailable |
-| Ja'Corey Brooks | WR |  | 12532 |  | unique_name_position_team_unavailable |
-| Malik Turner | WR |  | 5781 |  | unique_name_position_team_unavailable |
 | Tejhaun Palmer | WR |  | 11802 |  | unique_name_position_team_unavailable |
 | Anthony Firkser | TE |  | 4435 |  | unique_name_position_team_unavailable |
 | John FitzPatrick | TE |  | 8500 |  | unique_name_position_team_unavailable |
