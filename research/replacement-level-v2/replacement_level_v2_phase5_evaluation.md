@@ -10,10 +10,10 @@ Status: **`COLLECTION_ONLY`**
 - Frozen candidate SHA256: `ab24d5d1a1483ada04c6ce44154dc58bba6b1ba16c520fbeaf71e199851297e6`
 - Frozen at: **2026-09-05T22:16:28.841347Z**
 - First eligible future week: **1**
-- Completed consecutive weeks used: **[1, 2]**
+- Completed consecutive weeks used: **[1, 2, 3]**
 - Full frozen candidate universe: **518**
 - Primary real-history cohort: **426**
-- Primary players with an active game: **386**
+- Primary players with an active game: **394**
 
 ## Frozen replacement-rank families
 
@@ -34,22 +34,22 @@ The future replacement point is derived from the realized future data itself via
 
 | Family | Pos-balanced MAE | Pos-balanced RMSE | Pooled MAE | Δ MAE vs control | Positions available |
 |---|---:|---:|---:|---:|---:|
-| `legacy_control` | 0.4141 | 0.5064 | 0.4182 | — | 7 |
-| `prior_limited_evidence` | 0.4000 | 0.4882 | 0.4017 | -0.0141 | 7 |
-| `stable_positions_only` | 0.3842 | 0.4715 | 0.3831 | -0.0299 | 7 |
-| `full_phase2_leaders` | 0.3823 | 0.4694 | 0.3820 | -0.0318 | 7 |
+| `legacy_control` | 0.3868 | 0.4854 | 0.3853 | — | 7 |
+| `prior_limited_evidence` | 0.3712 | 0.4690 | 0.3670 | -0.0156 | 7 |
+| `stable_positions_only` | 0.3569 | 0.4546 | 0.3496 | -0.0299 | 7 |
+| `full_phase2_leaders` | 0.3404 | 0.4383 | 0.3385 | -0.0464 | 7 |
 
 ## Future-only replacement structure
 
 | Pos | Future split rank | Replacement player | Active PPG at split |
 |---|---:|---|---:|
-| QB | 21 | jaxson dart | 14.8000 |
-| RB | 21 | aaron jones | 14.7500 |
-| WR | 13 | denzel boston | 15.4500 |
-| TE | 13 | tj hockenson | 8.7500 |
-| DL | 7 | will anderson | 15.7500 |
-| LB | 26 | barrett carter | 12.7500 |
-| DB | 8 | marlon humphrey | 12.1250 |
+| QB | 29 | baker mayfield | 12.4333 |
+| RB | 22 | bucky irving | 14.2000 |
+| WR | 11 | jalen coker | 15.0667 |
+| TE | 14 | sam laporta | 9.1333 |
+| DL | 15 | tuli tuipulotu | 12.1667 |
+| LB | 11 | nick bolton | 15.6667 |
+| DB | 26 | christian gonzalez | 8.7500 |
 
 ## Secondary availability-inclusive metric
 
@@ -57,10 +57,10 @@ The same candidate-independent future-relative-production test using cumulative 
 
 | Family | Pos-balanced MAE | Δ MAE vs control | Pooled MAE |
 |---|---:|---:|---:|
-| `legacy_control` | 0.4939 | — | 0.4875 |
-| `prior_limited_evidence` | 0.4786 | -0.0153 | 0.4685 |
-| `stable_positions_only` | 0.4656 | -0.0283 | 0.4526 |
-| `full_phase2_leaders` | 0.4518 | -0.0421 | 0.4428 |
+| `legacy_control` | 0.4413 | — | 0.4354 |
+| `prior_limited_evidence` | 0.4270 | -0.0143 | 0.4175 |
+| `stable_positions_only` | 0.4159 | -0.0254 | 0.4037 |
+| `full_phase2_leaders` | 0.4036 | -0.0377 | 0.3946 |
 
 ## Readiness ladder
 
