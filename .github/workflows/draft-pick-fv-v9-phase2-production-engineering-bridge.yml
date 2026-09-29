@@ -1,0 +1,443 @@
+name: Draft Pick FV V9 - Phase 2 Production Engineering Bridge
+
+"on":
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: draft-pick-fv-v9-production-deployment
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Capture deployment base
+        id: base
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13.15'
+
+      - name: Install regression dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir "requests==2.34.2"
+
+      - name: Guard frozen V9 PASS and exact production baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, re, subprocess
+          from pathlib import Path
+
+          expected = {
+            "research/draft-pick-fv-v9/v9_production_candidate_preregistration.json":"b6deb2f22000e5b37daea8023f79eb56d0f1737f",
+            "research/draft-pick-fv-v9/v9_phase1_production_candidate_development.json":"84b75f43d26a25af0a0347f459300b1a0cee83e9",
+            "research/draft-pick-fv-v9/v9_frozen_production_candidate.json":"9bcc2e9483ac585e783d25b4d004be77af3908ad",
+            "research/draft-pick-fv-v9/v9_phase1_production_candidate_development_manifest.json":"f13ccfb7f74673e6c2ac4a344412e858247d1346",
+            "index.html":"52ea5808f236d9208271db4e26ef800c8af3abc4",
+            "free-agent-board.html":"748884bb4720bbffb5db306b6e23c5e7e94102b3",
+            "trade-desk-preview.html":"d50715af625fcf8306e04b62fbf0fa025c9126b2",
+          }
+          for p, want in expected.items():
+              got=subprocess.check_output(["git","hash-object",p],text=True).strip()
+              assert got==want,(p,want,got)
+
+          d=Path("research/draft-pick-fv-v9")
+          result=json.loads((d/"v9_phase1_production_candidate_development.json").read_text())
+          frozen=json.loads((d/"v9_frozen_production_candidate.json").read_text())
+          manifest=json.loads((d/"v9_phase1_production_candidate_development_manifest.json").read_text())
+          decision="FREEZE_V9_ROUND_RAMP_PRODUCTION_CANDIDATE_AUTHORIZE_PHASE2_ENGINEERING_BRIDGE"
+
+          assert result["decision"]==decision
+          assert frozen["decision"]==decision
+          assert manifest["decision"]==decision
+          assert result["all_frozen_gates_pass"] is True
+          assert result["phase2_engineering_bridge_authorized"] is True
+          assert frozen["phase2_engineering_bridge_authorized"] is True
+          assert manifest["phase2_engineering_bridge_authorized"] is True
+          assert result["production_change_authorized"] is False
+          assert result["2024_H2_treated_as_fresh_holdout"] is False
+          assert result["2024_H3_read"] is False
+          assert result["2026_outcomes_read"] is False
+          assert result["year_discount_changed"] is False
+
+          c=frozen["candidate"]
+          assert c["eligible"] is True
+          assert c["k"]==0.383 and c["d"]==0.332
+          assert all(c["basic_gates"].values())
+          assert all(c["robustness_gates"].values())
+
+          c0=[
+            7500,5854,5244,
+            3906,3624,3291,
+            2692,2682,2319,
+            1972,1831,1689,
+            1414,1250,1118,
+            1014,853,740,
+          ]
+          pat=re.compile(r"const PICK_BASE = \{.*?\n\};",re.S)
+          for p in ("index.html","free-agent-board.html"):
+              t=Path(p).read_text(encoding="utf-8")
+              m=pat.search(t); assert m
+              nums=list(map(float,re.findall(r"(?:early|mid|late):([0-9.]+)",m.group(0))))
+              assert nums==list(map(float,c0)),(p,nums)
+              assert "const YEAR_DISCOUNT = { '2027':1.0, '2028':0.85, '2029':0.72 };" in t
+              assert "return Math.round(base * disc);" in t
+
+          assert not Path("model/releases/draft-pick-fv-v9").exists()
+          print("PASS: V9 PASS is frozen and production remains exact C0.")
+          PY
+
+      - name: Apply frozen V9 PICK_BASE and create rollback
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, math, re, subprocess
+          from datetime import datetime,timezone
+          from pathlib import Path
+
+          research=Path("research/draft-pick-fv-v9")
+          out=Path("model/releases/draft-pick-fv-v9")
+          out.mkdir(parents=True,exist_ok=False)
+
+          frozen=json.loads((research/"v9_frozen_production_candidate.json").read_text())
+          c=frozen["candidate"]
+          v=c["values"]
+
+          cells=[
+            "r1_early","r1_mid","r1_late",
+            "r2_early","r2_mid","r2_late",
+            "r3_early","r3_mid","r3_late",
+            "r4_early","r4_mid","r4_late",
+            "r5_early","r5_mid","r5_late",
+            "r6_early","r6_mid","r6_late",
+          ]
+          assert set(v)==set(cells)
+
+          target=[
+            v["r1_early"],v["r1_mid"],v["r1_late"],
+            v["r2_early"],v["r2_mid"],v["r2_late"],
+            v["r3_early"],v["r3_mid"],v["r3_late"],
+            v["r4_early"],v["r4_mid"],v["r4_late"],
+            v["r5_early"],v["r5_mid"],v["r5_late"],
+            v["r6_early"],v["r6_mid"],v["r6_late"],
+          ]
+
+          def f(x):
+              s=f"{float(x):.10f}".rstrip("0").rstrip(".")
+              return s if "." in s else s+".0"
+
+          new="\n".join([
+            "const PICK_BASE = {",
+            f"  1: {{early:{f(target[0])}, mid:{f(target[1])}, late:{f(target[2])}}},",
+            f"  2: {{early:{f(target[3])}, mid:{f(target[4])}, late:{f(target[5])}}},",
+            f"  3: {{early:{f(target[6])}, mid:{f(target[7])}, late:{f(target[8])}}},",
+            f"  4: {{early:{f(target[9])}, mid:{f(target[10])}, late:{f(target[11])}}},",
+            f"  5: {{early:{f(target[12])}, mid:{f(target[13])}, late:{f(target[14])}}},",
+            f"  6: {{early:{f(target[15])}, mid:{f(target[16])},  late:{f(target[17])}}},",
+            "};",
+          ])
+
+          pat=re.compile(r"const PICK_BASE = \{.*?\n\};",re.S)
+          originals={}
+          pre_blobs={}
+          pre_sha={}
+          for p in ("index.html","free-agent-board.html"):
+              path=Path(p)
+              text=path.read_text(encoding="utf-8")
+              ms=list(pat.finditer(text)); assert len(ms)==1,(p,len(ms))
+              originals[p]=ms[0].group(0)
+              pre_blobs[p]=subprocess.check_output(["git","hash-object",p],text=True).strip()
+              pre_sha[p]=hashlib.sha256(path.read_bytes()).hexdigest()
+              path.write_text(text[:ms[0].start()]+new+text[ms[0].end():],encoding="utf-8")
+
+          rollback={
+            "schema_version":1,
+            "release_id":"draft-pick-fv-v9-production-release",
+            "created_at_utc":datetime.now(timezone.utc).isoformat(),
+            "source_commit_before_production_mutation":subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip(),
+            "production_files":["index.html","free-agent-board.html"],
+            "pre_deployment_git_blobs":pre_blobs,
+            "pre_deployment_sha256":pre_sha,
+            "pre_deployment_pick_base_blocks":originals,
+            "rollback_instruction":"Restore the exact pre_deployment_pick_base_blocks. Do not alter YEAR_DISCOUNT or player valuation constants.",
+          }
+          (out/"rollback.json").write_text(json.dumps(rollback,indent=2,sort_keys=True)+"\n")
+
+          def js_round(x): return math.floor(float(x)+0.5)
+          years={"2026":0.6,"2027":1.0,"2028":0.85,"2029":0.72}
+          runtime={}
+          for year,disc in years.items():
+              runtime[year]={}
+              for rnd in range(1,7):
+                  i=(rnd-1)*3
+                  runtime[year][str(rnd)]={
+                    "early":js_round(target[i]*disc),
+                    "mid":js_round(target[i+1]*disc),
+                    "late":js_round(target[i+2]*disc),
+                  }
+
+          release={
+            "schema_version":1,
+            "release_id":"draft-pick-fv-v9-production-release",
+            "methodological_status":"ENGINEERING_RELEASE_SUPPORTED_BY_EXPOSED_MULTI_CLASS_EVIDENCE_NOT_FRESH_CONFIRMATORY_HOLDOUT",
+            "candidate_id":"V9_C1_ROUND_RAMP_RESCALE",
+            "k":c["k"],
+            "d":c["d"],
+            "frozen_pick_base_values":dict(zip(cells,target)),
+            "year_discount_unchanged":{"2027":1.0,"2028":0.85,"2029":0.72},
+            "runtime_pick_values_after_js_round":runtime,
+            "evidence_summary":{
+              "historical_H3_O2_improvement":c["historical_H3_macro_improvement"],
+              "2024_H2_O2_improvement":c["2024_H2_macro_improvement"],
+              "worst_historical_round_relative":max(c["historical_H3_round_relative"].values()),
+              "worst_2024_H2_round_relative":max(c["2024_H2_round_relative"].values()),
+              "historical_R5_R6_improvement":c["historical_H3_tail_improvement"],
+              "2024_H2_R5_R6_improvement":c["2024_H2_tail_improvement"],
+              "historical_H2_relative":c["historical_H2_relative"],
+              "historical_H4_relative":c["historical_H4_relative"],
+              "historical_O1_shape_relative":c["historical_H3_O1_shape_relative"],
+              "2024_H2_O1_shape_relative":c["2024_H2_O1_shape_relative"],
+            },
+            "production_behavior_changed":["PICK_BASE"],
+            "production_behavior_unchanged":["YEAR_DISCOUNT","pickValue rounding logic","player valuation","package adjustment","team utility"],
+            "intentionally_not_modified":["trade-desk-preview.html"],
+            "future_prospective_audit":"2025 H2 after the 2026 regular season is complete; failure triggers rollback/research review.",
+          }
+          (out/"release.json").write_text(json.dumps(release,indent=2,sort_keys=True)+"\n")
+          (out/"README.md").write_text(
+            "# Draft Pick FV V9 Production Release\n\n"
+            "Deploys the frozen V9 round-ramp PICK_BASE to index.html and free-agent-board.html.\n\n"
+            "Only PICK_BASE changes production behavior. YEAR_DISCOUNT, player valuation, Package Adjustment, and Team Utility remain unchanged. rollback.json contains exact pre-deployment blocks.\n"
+          )
+          print("PASS: exact V9 PICK_BASE applied and exact rollback frozen.")
+          PY
+
+      - name: Prove only PICK_BASE changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,re,subprocess
+          from pathlib import Path
+
+          out=Path("model/releases/draft-pick-fv-v9")
+          rollback=json.loads((out/"rollback.json").read_text())
+          frozen=json.loads(Path("research/draft-pick-fv-v9/v9_frozen_production_candidate.json").read_text())
+          c=frozen["candidate"]["values"]
+          expected=[c[x] for x in [
+            "r1_early","r1_mid","r1_late",
+            "r2_early","r2_mid","r2_late",
+            "r3_early","r3_mid","r3_late",
+            "r4_early","r4_mid","r4_late",
+            "r5_early","r5_mid","r5_late",
+            "r6_early","r6_mid","r6_late",
+          ]]
+          pat=re.compile(r"const PICK_BASE = \{.*?\n\};",re.S)
+          blocks=[]
+          for p in ("index.html","free-agent-board.html"):
+              current=Path(p).read_text(encoding="utf-8")
+              m=pat.search(current); assert m
+              nums=list(map(float,re.findall(r"(?:early|mid|late):([0-9.]+)",m.group(0))))
+              assert len(nums)==18
+              assert all(abs(a-b)<=1e-9 for a,b in zip(nums,expected)),(p,nums,expected)
+              reconstructed=current[:m.start()]+rollback["pre_deployment_pick_base_blocks"][p]+current[m.end():]
+              base=subprocess.check_output(["git","show",f"HEAD:{p}"],text=True)
+              assert reconstructed==base,f"non-PICK_BASE drift: {p}"
+              assert "const YEAR_DISCOUNT = { '2027':1.0, '2028':0.85, '2029':0.72 };" in current
+              assert "return Math.round(base * disc);" in current
+              blocks.append(m.group(0))
+          assert blocks[0]==blocks[1]
+          assert min(expected)>0
+          assert all(expected[i]>=expected[i+1]-1e-9 for i in range(17))
+          assert subprocess.check_output(["git","hash-object","trade-desk-preview.html"],text=True).strip()=="d50715af625fcf8306e04b62fbf0fa025c9126b2"
+          print("PASS: exact candidate on both production surfaces; all non-PICK_BASE bytes reconstruct exactly.")
+          PY
+
+      - name: Validate frozen runtime pick snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,math,re
+          from pathlib import Path
+
+          release=json.loads(Path("model/releases/draft-pick-fv-v9/release.json").read_text())
+          expected=release["runtime_pick_values_after_js_round"]
+          pat=re.compile(r"const PICK_BASE = \{.*?\n\};",re.S)
+
+          def snapshot(path):
+              t=Path(path).read_text(encoding="utf-8")
+              m=pat.search(t); assert m
+              nums=list(map(float,re.findall(r"(?:early|mid|late):([0-9.]+)",m.group(0))))
+              assert len(nums)==18
+              assert "const YEAR_DISCOUNT = { '2027':1.0, '2028':0.85, '2029':0.72 };" in t
+              assert "const disc = YEAR_DISCOUNT[year] ?? 0.6;" in t
+              assert "return Math.round(base * disc);" in t
+              out={}
+              for year,disc in {"2026":0.6,"2027":1.0,"2028":0.85,"2029":0.72}.items():
+                  out[year]={}
+                  for rnd in range(1,7):
+                      i=(rnd-1)*3
+                      out[year][str(rnd)]={
+                        "early":math.floor(nums[i]*disc+0.5),
+                        "mid":math.floor(nums[i+1]*disc+0.5),
+                        "late":math.floor(nums[i+2]*disc+0.5),
+                      }
+              return out
+
+          assert snapshot("index.html")==expected
+          assert snapshot("free-agent-board.html")==expected
+          print("PASS: all 72 frozen runtime pick outputs match both production surfaces.")
+          PY
+
+      - name: Run full repository regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          TU_JSON="scripts/artifacts/generated/team_utility_lineup_projections.json"
+          TU_MD="scripts/artifacts/reports/team_utility_lineup_projection_report.md"
+          restore_tu(){ git checkout -- "$TU_JSON" "$TU_MD"; }
+          trap restore_tu EXIT
+          python3 scripts/projections/build_team_utility_lineup_projections.py --write
+          python3 scripts/validation/check_package_adjustment_live.py
+          python3 scripts/validation/repo_regression_checks.py
+          restore_tu
+          trap - EXIT
+          git diff --exit-code -- "$TU_JSON" "$TU_MD"
+          echo "PASS: full repository regression suite green."
+
+      - name: Freeze deployment manifest
+        shell: bash
+        env:
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json,os
+          from datetime import datetime,timezone
+          from pathlib import Path
+          d=Path("model/releases/draft-pick-fv-v9")
+          r=Path("research/draft-pick-fv-v9")
+          sha=lambda p:hashlib.sha256(Path(p).read_bytes()).hexdigest()
+          m={
+            "schema_version":1,
+            "release_id":"draft-pick-fv-v9-production-release",
+            "status":"PRODUCTION_ENGINEERING_VALIDATED_READY_TO_COMMIT",
+            "generated_at_utc":datetime.now(timezone.utc).isoformat(),
+            "workflow_run_id":os.environ["RUN_ID"],
+            "workflow_run_attempt":os.environ["RUN_ATTEMPT"],
+            "phase1_decision":"FREEZE_V9_ROUND_RAMP_PRODUCTION_CANDIDATE_AUTHORIZE_PHASE2_ENGINEERING_BRIDGE",
+            "production_files_changed":["index.html","free-agent-board.html"],
+            "production_behavior_changed":["PICK_BASE"],
+            "year_discount_changed":False,
+            "trade_desk_preview_changed":False,
+            "player_valuation_changed":False,
+            "package_adjustment_changed":False,
+            "team_utility_changed":False,
+            "rollback_artifact_present":True,
+            "full_repository_regression_pass":True,
+            "runtime_pick_parity_pass":True,
+            "input_sha256":{
+              "v9_preregistration":sha(r/"v9_production_candidate_preregistration.json"),
+              "v9_phase1_result":sha(r/"v9_phase1_production_candidate_development.json"),
+              "v9_frozen_candidate":sha(r/"v9_frozen_production_candidate.json"),
+              "v9_phase1_manifest":sha(r/"v9_phase1_production_candidate_development_manifest.json"),
+            },
+            "release_sha256":{
+              "rollback.json":sha(d/"rollback.json"),
+              "release.json":sha(d/"release.json"),
+              "README.md":sha(d/"README.md"),
+              "index.html_post_mutation":sha("index.html"),
+              "free-agent-board.html_post_mutation":sha("free-agent-board.html"),
+            },
+            "future_prospective_audit_required":True,
+          }
+          (d/"manifest.json").write_text(json.dumps(m,indent=2,sort_keys=True)+"\n")
+          print("PASS: deployment manifest frozen.")
+          PY
+
+      - name: Prove exact deployment scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import subprocess
+          allowed={
+            "index.html",
+            "free-agent-board.html",
+            "model/releases/draft-pick-fv-v9/README.md",
+            "model/releases/draft-pick-fv-v9/rollback.json",
+            "model/releases/draft-pick-fv-v9/release.json",
+            "model/releases/draft-pick-fv-v9/manifest.json",
+          }
+          s=subprocess.check_output(["git","status","--porcelain=v1","--untracked-files=all"],text=True)
+          touched={line[3:] for line in s.splitlines() if line.strip()}
+          assert touched==allowed,(sorted(touched),sorted(allowed))
+          assert "trade-desk-preview.html" not in touched
+          assert not any(x.startswith("research/") for x in touched)
+          print("PASS: deployment scope exact.")
+          PY
+
+      - name: Upload V9 production release evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: draft-pick-fv-v9-production-release
+          path: |
+            model/releases/draft-pick-fv-v9/README.md
+            model/releases/draft-pick-fv-v9/rollback.json
+            model/releases/draft-pick-fv-v9/release.json
+            model/releases/draft-pick-fv-v9/manifest.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Commit and deploy V9 PICK_BASE
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$BASE_SHA" || {
+            echo "ERROR: origin/main moved during validation."
+            exit 1
+          }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            index.html \
+            free-agent-board.html \
+            model/releases/draft-pick-fv-v9/README.md \
+            model/releases/draft-pick-fv-v9/rollback.json \
+            model/releases/draft-pick-fv-v9/release.json \
+            model/releases/draft-pick-fv-v9/manifest.json
+          git diff --cached --quiet && { echo "ERROR: no changes staged."; exit 1; }
+          git commit -m "Deploy Draft Pick FV V9 PICK_BASE"
+          git push origin HEAD:main
+          test "$(git status --porcelain)" = ""
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$(git rev-parse HEAD)"
+          echo "PASS: Draft Pick FV V9 PICK_BASE deployed to production."
+          echo "PASS: exact rollback is model/releases/draft-pick-fv-v9/rollback.json."
