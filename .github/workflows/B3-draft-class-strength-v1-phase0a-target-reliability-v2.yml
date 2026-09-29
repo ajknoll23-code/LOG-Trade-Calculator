@@ -1,0 +1,914 @@
+name: B3 Draft Class Strength V1 - Phase 0A Target and Reliability Gate V2
+
+"on":
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  phase0a:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Capture Phase 0A base SHA
+        id: base
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13.15"
+
+      - name: Guard Draft Pick FV V10 target lineage and production baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import math
+          import re
+          from pathlib import Path
+
+          V10 = Path("research/draft-pick-fv-v10")
+          AUDIT = V10 / "v10_phase0_expected_value_construct_audit.json"
+          AUDIT_MANIFEST = V10 / "v10_phase0_expected_value_construct_audit_manifest.json"
+          PREREG = V10 / "v10_phase0_expected_value_preregistration.json"
+          PHASE1 = V10 / "v10_phase1_market_bridge_tail_evaluation.json"
+          RELEASE = Path("model/releases/draft-pick-fv-v10/manifest.json")
+
+          for p in (AUDIT, AUDIT_MANIFEST, PREREG, PHASE1, RELEASE):
+              assert p.exists(), p
+
+          am = json.loads(AUDIT_MANIFEST.read_text())
+          prereg = json.loads(PREREG.read_text())
+          phase1 = json.loads(PHASE1.read_text())
+          release = json.loads(RELEASE.read_text())
+
+          # Exact V10 fundamental audit is the frozen source for the initial
+          # realized-class target panel.
+          audit_sha = hashlib.sha256(AUDIT.read_bytes()).hexdigest()
+          assert audit_sha == am["outputs"][
+              "v10_phase0_expected_value_construct_audit.json"
+          ], (audit_sha, am["outputs"])
+
+          assert prereg["core_estimator"]["candidate_id"] == "V10_C1_CLASS_BALANCED_DIRECT_EV"
+          assert prereg["source_contract"]["development"]["years"] == [
+              2018, 2019, 2020, 2021, 2022, 2023
+          ]
+          assert prereg["source_contract"]["development"]["horizon"] == "H3"
+          assert prereg["source_contract"]["development"]["target"] == "O2"
+          assert prereg["construct_validity"]["fitting_forbidden"] is True
+          assert "fit, rescale, tune, or select the FV estimator using KTC values" in prereg["forbidden"]
+
+          # Critical market-separation proof: KTC was a later bridge, not part
+          # of the frozen H3.O2 fundamental core used below.
+          assert phase1["phase0_fundamental_core_unchanged"] is True
+          assert phase1["market_bridge"]["ktc_used_to_refit_fundamental_core"] is False
+
+          assert release["release_id"] == "draft-pick-fv-v10-production-release-v2"
+          assert release["candidate_id"] == "V10_C1_PLUS_M1_PLUS_MT2_PLUS_YD2"
+          assert release["production_change_authorized"] is True
+          assert release["runtime_pick_parity_pass"] is True
+          assert release["package_adjustment_regression_pass"] is True
+          assert release["free_agent_valuation_parity_pass"] is True
+          assert release["full_repository_regression_pass"] is True
+
+          # Production is guarded semantically; Phase 0A must not change it.
+          pick_pat = re.compile(r"const PICK_BASE = \{.*?\n\};", re.S)
+          expected = [
+              6131.5334459589, 5076.2399686507, 4657.6604873442,
+              3817.3159836295, 3142.0597288006, 3016.3370798264,
+              2776.6168665208, 2363.5289021368, 2075.7321863577,
+              1891.4310302777, 1739.5882177137, 1731.2152824551,
+              1394.2378677715, 1282.3093883098, 1276.1374141723,
+              1027.7399497050, 945.2336769150, 940.6841057576,
+          ]
+          regions = []
+          for name in ("index.html", "free-agent-board.html"):
+              text = Path(name).read_text(encoding="utf-8")
+              pm = pick_pat.search(text)
+              assert pm, name
+              vals = list(map(float, re.findall(
+                  r"(?:early|mid|late):\s*([0-9.]+)", pm.group(0)
+              )))
+              assert len(vals) == 18
+              for got, want in zip(vals, expected):
+                  assert math.isclose(got, want, rel_tol=0, abs_tol=1e-9), (
+                      name, got, want
+                  )
+              assert (
+                  "const YEAR_DISCOUNT = { '2027':1.0, "
+                  "'2028':0.8828875559, '2029':0.8069214853 };"
+              ) in text
+              assert "const disc = YEAR_DISCOUNT[year] ?? 0.6;" in text
+              assert "return Math.round(base * disc);" in text
+              regions.append(pm.group(0))
+          assert regions[0] == regions[1]
+
+          print("PASS: V10 H3.O2 fundamental target lineage is market-separated.")
+          print("PASS: live V10 production curve and year-discount semantics are exact.")
+          PY
+
+      - name: Run repository regression baseline before research artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/repo_regression_checks.py
+
+          # Research workflow begins from the checked-in repository state even
+          # if a regression helper materialized deterministic generated files.
+          git reset --hard HEAD
+          git clean -fd
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          echo "PASS: baseline repository regressions."
+
+      - name: Build revised Phase 0A preregistration target panel and V0 reliability diagnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import math
+          import random
+          import statistics
+          from pathlib import Path
+
+          ROOT = Path.cwd()
+          D = ROOT / "research/draft-class-strength-v1"
+          D.mkdir(parents=True, exist_ok=True)
+
+          V10 = ROOT / "research/draft-pick-fv-v10"
+          AUDIT = V10 / "v10_phase0_expected_value_construct_audit.json"
+          PREREG_V10 = V10 / "v10_phase0_expected_value_preregistration.json"
+          PHASE1_V10 = V10 / "v10_phase1_market_bridge_tail_evaluation.json"
+
+          audit = json.loads(AUDIT.read_text())
+          v10_prereg = json.loads(PREREG_V10.read_text())
+          v10_phase1 = json.loads(PHASE1_V10.read_text())
+
+          CELL_ORDER = [
+              "r1_early", "r1_mid", "r1_late",
+              "r2_early", "r2_mid", "r2_late",
+              "r3_early", "r3_mid", "r3_late",
+              "r4_early", "r4_mid", "r4_late",
+          ]
+          YEARS = [2018, 2019, 2020, 2021, 2022, 2023]
+          YEAR_KEYS = [str(y) for y in YEARS]
+
+          # ------------------------------------------------------------------
+          # Revised preregistration based on independent methodological review.
+          # No 2027 features or score are read or computed here.
+          # ------------------------------------------------------------------
+          prereg = {
+              "schema_version": 2,
+              "study_id": "draft-class-strength-v1",
+              "stage": "phase0a_revised_preregistration",
+              "status": "FROZEN_BEFORE_PREDICTOR_SOURCE_HARVEST",
+              "decision": "FREEZE_REVISED_BOTTOM_UP_DCS_V1_CONTRACT",
+              "objective": (
+                  "Estimate whether an upcoming rookie class has greater or lower "
+                  "market-free fundamental expected player value than a neutral "
+                  "historical class, using only information genuinely available at "
+                  "the same forecast lead time."
+              ),
+              "scientific_architecture": {
+                  "V0": (
+                      "Before examining predictors, test whether the realized "
+                      "historical class-strength target contains coherent class-level "
+                      "signal beyond cell-specific sampling noise."
+                  ),
+                  "stage1": (
+                      "If V0 and source gates permit, fit a low-capacity PLAYER-LEVEL "
+                      "expected-fundamental-outcome model using anchor-date features "
+                      "with draft class as the cross-validation cluster."
+                  ),
+                  "stage2": (
+                      "Aggregate strictly out-of-fold player predictions into one "
+                      "class-level signal."
+                  ),
+                  "stage3": (
+                      "Use only a minimal heavily-shrunk class-level calibration; "
+                      "do not regress many raw features on approximately ten classes."
+                  ),
+                  "M0": "Neutral class multiplier = 1.00.",
+                  "M1": "One continuous overall class-strength factor; default candidate.",
+                  "M2": (
+                      "Apex-plus-depth extension is conditional only and cannot be "
+                      "attempted until distinct target reliability and out-of-sample "
+                      "improvement gates are pre-specified and passed."
+                  ),
+              },
+              "historical_target_contract": {
+                  "initial_lineage": "Draft Pick FV V10 H3.O2 fundamental outcome panel",
+                  "market_price_in_target": False,
+                  "ktc_in_target": False,
+                  "current_panel_years": YEARS,
+                  "current_panel_cells": CELL_ORDER,
+                  "current_panel_role": (
+                      "Phase 0A target/reliability diagnostic only. Six classes are "
+                      "insufficient to authorize predictor-model fitting."
+                  ),
+                  "class_score": (
+                      "For each class and R1-R4 early/mid/late cell, compute log("
+                      "class cell H3.O2 EV / leave-one-class-out baseline cell EV). "
+                      "Overall score is the equal-cell mean of the 12 log ratios. "
+                      "Multiplier = exp(overall score)."
+                  ),
+                  "baseline_excludes_scored_class": True,
+                  "future_expansion_requirement": (
+                      "Expand to older complete classes using the same market-free "
+                      "outcome definition before predictor modeling."
+                  ),
+                  "vorp_alternative": (
+                      "A new VORP-style target may be studied only as a robustness "
+                      "alternative after auditing whether expanded V10-lineage H3.O2 "
+                      "can be reproduced consistently. It is not silently substituted."
+                  ),
+              },
+              "lead_time_contract": {
+                  "primary_anchor": "September 15 through October 15 of year before NFL Draft",
+                  "hard_latest_cutoff": "October 15",
+                  "historical_features_require_verifiable_capture_time": True,
+                  "feature_without_timestamp": "EXCLUDE",
+                  "current_season_partial_stats_primary": False,
+                  "college_production_primary": (
+                      "Prior completed season, age/position normalized; partial "
+                      "anchor-year season is robustness-only because schedules and "
+                      "2020 availability are not comparable."
+                  ),
+                  "longer_horizon_policy": (
+                      "A one-year-lead model cannot be applied to classes 2+ years out. "
+                      "Those remain 1.00 unless a separately validated longer-horizon "
+                      "model is built."
+                  ),
+              },
+              "prospect_cohort_contract": {
+                  "eventual_nfl_draftees_define_anchor_cohort": False,
+                  "eventual_declarants_define_anchor_cohort": False,
+                  "required_definition": (
+                      "Prospective eligibility cohort determined only from information "
+                      "known by the anchor date, such as recruiting-class/year-since-HS "
+                      "eligibility rules."
+                  ),
+                  "anchor_recall_required": True,
+                  "anchor_recall_definition": (
+                      "Share of eventual high-value/top rookie-draft outcomes represented "
+                      "in the anchor-date eligible candidate universe; diagnostic caps "
+                      "predictability and quantifies unseen risers."
+                  ),
+              },
+              "predictor_family_priority": [
+                  {
+                      "id": "F1",
+                      "name": "timestamped anchor-date consensus prospect/draft projection",
+                      "role": "candidate signal",
+                      "historical_snapshot_required": True,
+                  },
+                  {
+                      "id": "F2",
+                      "name": "objective reconstructed draft-capital projection",
+                      "role": "candidate signal",
+                      "lookahead_actual_nfl_draft_capital_forbidden": True,
+                      "component_model_must_be_cross_fit": True,
+                  },
+                  {
+                      "id": "F3",
+                      "name": "prior-completed-season age-adjusted college production",
+                      "role": "candidate signal",
+                  },
+                  {
+                      "id": "F4",
+                      "name": "as-of-signing recruiting pedigree",
+                      "role": "optional prior signal",
+                  },
+                  {
+                      "id": "MARKET",
+                      "name": "KTC or dynasty market price",
+                      "role": "external reporting benchmark only",
+                      "model_fitting_forbidden": True,
+                      "calibration_forbidden": True,
+                  },
+              ],
+              "model_selection_contract": {
+                  "player_level_primary": True,
+                  "class_level_multi_feature_regression_forbidden": True,
+                  "neutral_M0_baseline_required": True,
+                  "precommitted_naive_index_required": True,
+                  "feature_selection_nested_inside_training_fold": True,
+                  "hyperparameter_selection_nested_inside_training_fold": True,
+                  "class_clustered_cv_required": True,
+                  "walk_forward_required": True,
+                  "walk_forward_is_deployment_realistic_gate": True,
+                  "loco_required_as_secondary_validation": True,
+                  "class_block_bootstrap_required": True,
+                  "placebo_feature_shuffle_required": True,
+                  "wrong_year_anchor_negative_control_required": True,
+              },
+              "V0_signal_existence_contract": {
+                  "target": "overall class score before predictors",
+                  "null": (
+                      "Independently permute class labels within each fixed V10 cell, "
+                      "preserving every cell's marginal distribution while destroying "
+                      "cross-cell class coherence."
+                  ),
+                  "statistic": "sample variance of overall class log-strength score",
+                  "permutations": 20000,
+                  "seed": 20260929,
+                  "provisional_signal_gate": {
+                      "permutation_p_lt": 0.10,
+                      "reliability_ge": 0.30,
+                  },
+                  "reliability_estimator": (
+                      "max(0, 1 - mean(null class-score variance) / observed "
+                      "class-score variance). This Phase 0A estimator is diagnostic "
+                      "until an expanded player-level target panel is available."
+                  ),
+                  "minimum_classes_for_interpretable_V0": 8,
+                  "minimum_classes_before_predictor_fit": 10,
+                  "target_classes_before_predictor_fit": 12,
+              },
+              "future_validation_gates_to_preregister_before_fit": {
+                  "M1_oos_skill_vs_M0": (
+                      "Must be positive and materially better than neutral under "
+                      "walk-forward and LOCO; exact threshold frozen before fitting."
+                  ),
+                  "naive_benchmark": (
+                      "Sophisticated M1 must justify complexity versus a fixed simple index."
+                  ),
+                  "calibration": "Out-of-sample calibration slope must remain positive and stable.",
+                  "influence": "No single class may dominate apparent model skill.",
+                  "covid_sensitivity": "Report results with and without affected anchor/classes.",
+              },
+              "application_contract": {
+                  "one_continuous_factor_v1": True,
+                  "multiplicative_with_undiscounted_v10_base": True,
+                  "apply_before_year_discount": True,
+                  "mean_preserving_normalization_required": True,
+                  "slot_bucket_loading_if_later_estimated": (
+                      "Monotone non-increasing by later pick range and heavily shrunk; "
+                      "collapse to one scalar if data cannot distinguish loadings."
+                  ),
+                  "market_translation_must_be_class_neutral_before_production": True,
+                  "score_outside_trained_lead_time": 1.0,
+                  "exact_rookie_slot_curve_separate": True,
+              },
+              "2027_blinding_contract": {
+                  "2027_features_read_in_phase0a": False,
+                  "2027_score_computed_in_phase0a": False,
+                  "2027_may_not_select_features": True,
+                  "2027_may_not_select_hyperparameters": True,
+                  "2027_may_not_set_model_direction": True,
+                  "2027_may_not_set_multiplier_bounds": True,
+                  "named_prospect_hype_may_not_override_model": True,
+                  "first_2027_score": "after historical methodology and source contract are frozen",
+              },
+              "forbidden": [
+                  "hard-code 2027 as strong or weak",
+                  "fit class strength to KTC or other market prices",
+                  "use eventual declaration or NFL draft status to define the anchor cohort",
+                  "use actual NFL Draft capital not known at the historical anchor",
+                  "use current rankings to reconstruct historical rankings",
+                  "manually reconstruct old rankings from memory",
+                  "use end-of-season anchor-year stats as if known by October 15",
+                  "use partial 2026 NFL rookie outcomes",
+                  "fit multiple raw class-level predictors on a tiny class sample",
+                  "tune after seeing a 2027 class score",
+                  "change production PICK_BASE",
+                  "change production YEAR_DISCOUNT",
+                  "change player Fundamental Value",
+                  "change Package Adjustment",
+                  "change Team Utility",
+                  "change Market Value",
+              ],
+              "production_change_authorized": False,
+          }
+
+          # ------------------------------------------------------------------
+          # Build the initial realized class target panel from V10's market-free
+          # six-class H3.O2 cell EV matrix.
+          # ------------------------------------------------------------------
+          by_cell = {}
+          for cell in CELL_ORDER:
+              u = audit["core_uncertainty"][cell]
+              yv = u["yearly_values"]
+              assert sorted(yv) == YEAR_KEYS, (cell, sorted(yv))
+              vals = {str(y): float(yv[str(y)]) for y in YEARS}
+              assert all(v > 0 for v in vals.values())
+              by_cell[cell] = vals
+
+          rows = {}
+          for y in YEARS:
+              sy = str(y)
+              residuals = {}
+              for cell in CELL_ORDER:
+                  actual = by_cell[cell][sy]
+                  others = [
+                      by_cell[cell][str(o)] for o in YEARS if o != y
+                  ]
+                  baseline = statistics.fmean(others)
+                  residuals[cell] = math.log(actual / baseline)
+
+              overall = statistics.fmean(residuals[c] for c in CELL_ORDER)
+              apex = statistics.fmean(
+                  residuals[c] for c in CELL_ORDER if c.startswith("r1_")
+              )
+              downstream = statistics.fmean(
+                  residuals[c] for c in CELL_ORDER if not c.startswith("r1_")
+              )
+              rows[sy] = {
+                  "year": y,
+                  "cell_log_residuals": residuals,
+                  "overall_log_strength": overall,
+                  "overall_multiplier": math.exp(overall),
+                  "r1_apex_log_strength_diagnostic": apex,
+                  "r2_r4_downstream_log_strength_diagnostic": downstream,
+              }
+
+          panel = {
+              "schema_version": 1,
+              "study_id": "draft-class-strength-v1",
+              "stage": "phase0a_initial_realized_target_panel",
+              "source": {
+                  "file": str(AUDIT.relative_to(ROOT)),
+                  "sha256": hashlib.sha256(AUDIT.read_bytes()).hexdigest(),
+                  "v10_core_estimator_id": audit["core_estimator_id"],
+                  "horizon": v10_prereg["source_contract"]["development"]["horizon"],
+                  "target": v10_prereg["source_contract"]["development"]["target"],
+                  "ktc_used_to_refit_fundamental_core": v10_phase1[
+                      "market_bridge"
+                  ]["ktc_used_to_refit_fundamental_core"],
+              },
+              "years": YEARS,
+              "class_count": len(YEARS),
+              "cells": CELL_ORDER,
+              "cell_count": len(CELL_ORDER),
+              "definition": prereg["historical_target_contract"]["class_score"],
+              "rows": rows,
+              "production_change_authorized": False,
+          }
+
+          # ------------------------------------------------------------------
+          # V0 signal-existence diagnostic. With only 6 classes, this can never
+          # authorize predictor modeling, even if the provisional signal looks
+          # strong. It tells us whether expanding the panel is promising.
+          # ------------------------------------------------------------------
+          def scores_from_matrix(matrix):
+              scores = {}
+              for y in YEARS:
+                  sy = str(y)
+                  rr = []
+                  for cell in CELL_ORDER:
+                      actual = matrix[cell][sy]
+                      baseline = statistics.fmean(
+                          matrix[cell][str(o)] for o in YEARS if o != y
+                      )
+                      rr.append(math.log(actual / baseline))
+                  scores[sy] = statistics.fmean(rr)
+              return scores
+
+          observed_scores = {
+              sy: rows[sy]["overall_log_strength"] for sy in YEAR_KEYS
+          }
+          observed_var = statistics.variance(observed_scores.values())
+          assert observed_var > 0
+
+          rng = random.Random(prereg["V0_signal_existence_contract"]["seed"])
+          B = prereg["V0_signal_existence_contract"]["permutations"]
+          null_vars = []
+          exceed = 0
+
+          for _ in range(B):
+              pm = {}
+              for cell in CELL_ORDER:
+                  vals = [by_cell[cell][sy] for sy in YEAR_KEYS]
+                  rng.shuffle(vals)
+                  pm[cell] = {sy: v for sy, v in zip(YEAR_KEYS, vals)}
+              ns = scores_from_matrix(pm)
+              nv = statistics.variance(ns.values())
+              null_vars.append(nv)
+              if nv >= observed_var:
+                  exceed += 1
+
+          p_value = (exceed + 1) / (B + 1)
+          null_mean = statistics.fmean(null_vars)
+          reliability = max(0.0, 1.0 - (null_mean / observed_var))
+          max_corr = math.sqrt(reliability)
+
+          p_sorted = sorted(null_vars)
+          def q(p):
+              i = int(round((len(p_sorted) - 1) * p))
+              return p_sorted[max(0, min(len(p_sorted) - 1, i))]
+
+          signal_gate = (
+              p_value < prereg["V0_signal_existence_contract"][
+                  "provisional_signal_gate"
+              ]["permutation_p_lt"]
+              and reliability >= prereg["V0_signal_existence_contract"][
+                  "provisional_signal_gate"
+              ]["reliability_ge"]
+          )
+
+          n = len(YEARS)
+          min_v0 = prereg["V0_signal_existence_contract"][
+              "minimum_classes_for_interpretable_V0"
+          ]
+          min_fit = prereg["V0_signal_existence_contract"][
+              "minimum_classes_before_predictor_fit"
+          ]
+
+          if n < min_v0:
+              decision = "STOP_EXPAND_HISTORICAL_TARGET_PANEL_BEFORE_INTERPRETING_V0"
+          elif not signal_gate:
+              decision = "STOP_V0_SIGNAL_OR_RELIABILITY_GATE_FAILED"
+          elif n < min_fit:
+              decision = "STOP_EXPAND_TO_MINIMUM_10_CLASSES_BEFORE_PREDICTOR_FIT"
+          else:
+              decision = "PASS_V0_AUTHORIZE_SOURCE_FEASIBILITY_ONLY"
+
+          reliability_report = {
+              "schema_version": 1,
+              "study_id": "draft-class-strength-v1",
+              "stage": "phase0b_v0_signal_existence_reliability",
+              "decision": decision,
+              "diagnostic_only": n < min_v0,
+              "class_count": n,
+              "minimum_classes_for_interpretable_V0": min_v0,
+              "minimum_classes_before_predictor_fit": min_fit,
+              "observed_class_score_variance": observed_var,
+              "null_variance": {
+                  "permutations": B,
+                  "seed": prereg["V0_signal_existence_contract"]["seed"],
+                  "mean": null_mean,
+                  "p05": q(0.05),
+                  "p50": q(0.50),
+                  "p95": q(0.95),
+              },
+              "permutation_p_value": p_value,
+              "provisional_reliability": reliability,
+              "sqrt_reliability_predictability_ceiling_diagnostic": max_corr,
+              "provisional_signal_gate_pass": signal_gate,
+              "predictor_features_read": False,
+              "predictor_fit_performed": False,
+              "2027_features_read": False,
+              "2027_class_scored": False,
+              "production_change_authorized": False,
+              "interpretation": (
+                  "This six-class diagnostic cannot authorize modeling. Its purpose "
+                  "is to test whether the existing V10 target panel shows coherent "
+                  "cross-cell class variation worth expanding. Formal V0 is repeated "
+                  "after the target panel reaches the preregistered class minimum."
+              ),
+          }
+
+          # ------------------------------------------------------------------
+          # Source-feasibility contract. This records what Phase 1 must prove;
+          # it does not silently approve any current source.
+          # ------------------------------------------------------------------
+          keywords = (
+              "recruit", "college", "cfb", "devy", "mock", "prospect",
+              "247", "rivals", "on3", "draftboard", "big-board", "big_board"
+          )
+          candidate_repo_paths = []
+          for p in ROOT.rglob("*"):
+              if not p.is_file():
+                  continue
+              rel = str(p.relative_to(ROOT)).lower()
+              if ".git/" in rel:
+                  continue
+              if any(k in rel for k in keywords):
+                  candidate_repo_paths.append(str(p.relative_to(ROOT)))
+          candidate_repo_paths = sorted(candidate_repo_paths)[:250]
+
+          source_contract = {
+              "schema_version": 1,
+              "study_id": "draft-class-strength-v1",
+              "stage": "phase0_source_feasibility_contract_v2",
+              "decision": "PHASE1_SOURCE_FEASIBILITY_REQUIRED_NO_SOURCE_APPROVED_YET",
+              "approved_predictor_sources": [],
+              "repo_path_name_hits_for_manual_source_audit": candidate_repo_paths,
+              "phase1_required_outputs": [
+                  "historical class x source coverage matrix",
+                  "raw snapshot capture timestamp ledger",
+                  "raw snapshot content hashes",
+                  "prospective eligibility cohort construction",
+                  "anchor-recall report",
+                  "player identity crosswalk and error report",
+                  "historical target expansion plan beyond 2018-2023",
+                  "walk-forward-eligible class ordering",
+              ],
+              "source_acceptance_gates": {
+                  "all_included_features_have_verifiable_timestamp": True,
+                  "no_later_snapshot_backfill": True,
+                  "no_eventual_declaration_filter": True,
+                  "no_eventual_nfl_draft_filter": True,
+                  "top_candidate_identity_resolution_rate_ge": 0.99,
+                  "historical_target_classes_ge_before_predictor_fit": 10,
+                  "target_historical_classes": 12,
+              },
+              "candidate_source_families_to_investigate": [
+                  "timestamped archived consensus NFL draft boards/mocks",
+                  "game-dated college production with prior-season default",
+                  "as-of-signing recruiting data",
+                  "cross-fit reconstructed draft-capital model from objective features",
+                  "DLF/devy rankings only if true historical timestamped versions exist",
+              ],
+              "market_sources": {
+                  "KTC": "reporting/benchmark only; never fundamental-model fitting",
+                  "other_dynasty_market_prices": (
+                      "reporting/benchmark only unless a separate future study changes "
+                      "the construct definition before looking at outcomes"
+                  ),
+              },
+              "predictor_fit_performed": False,
+              "2027_class_scored": False,
+              "production_change_authorized": False,
+          }
+
+          # ------------------------------------------------------------------
+          # Human-readable report.
+          # ------------------------------------------------------------------
+          ordered = sorted(
+              rows.values(), key=lambda x: x["overall_log_strength"], reverse=True
+          )
+          lines = [
+              "# Draft Class Strength V1 — Revised Phase 0A",
+              "",
+              f"**Scientific decision:** `{decision}`",
+              "",
+              "## What changed",
+              "",
+              "- Added a V0 signal-existence/reliability gate before predictor research.",
+              "- Moved the future primary model to player level with class-clustered validation.",
+              "- Added a prospective eligibility-cohort rule to block declaration/draft hindsight.",
+              "- Made walk-forward validation a required deployment-realistic gate.",
+              "- Prior completed-season college production is primary; partial anchor-year stats are robustness-only.",
+              "- V1 defaults to one continuous class factor; apex/depth is conditional.",
+              "- Added neutral M0 and a precommitted naive benchmark.",
+              "- 2027 remains completely blinded from model selection and Phase 0A scoring.",
+              "",
+              "## Existing V10 realized target panel",
+              "",
+              f"- Complete classes currently available in the frozen V10 H3.O2 panel: **{n}**",
+              f"- Minimum for interpretable formal V0: **{min_v0}**",
+              f"- Minimum before predictor fitting: **{min_fit}**",
+              "- Cells: 12 (R1–R4 × early/mid/late)",
+              "",
+              "Initial leave-one-class-out class multipliers:",
+          ]
+          for row in ordered:
+              lines.append(
+                  f"- {row['year']}: {row['overall_multiplier']:.4f} "
+                  f"(log strength {row['overall_log_strength']:+.4f})"
+              )
+          lines += [
+              "",
+              "## Preliminary V0 diagnostic",
+              "",
+              f"- Observed class-score variance: **{observed_var:.8f}**",
+              f"- Null mean variance: **{null_mean:.8f}**",
+              f"- Permutation p-value: **{p_value:.6f}**",
+              f"- Provisional reliability: **{reliability:.4f}**",
+              f"- sqrt(reliability) ceiling diagnostic: **{max_corr:.4f}**",
+              f"- Provisional p/reliability gate: **{'PASS' if signal_gate else 'FAIL'}**",
+              "",
+              "**Important:** six classes are below the preregistered minimum, so these "
+              "V0 numbers are diagnostic only and cannot authorize predictor fitting.",
+              "",
+              "## Next scientific stage",
+              "",
+              "Expand the market-free historical target panel, then run Phase 1 source "
+              "feasibility/harvest. No 2027 score and no predictor fit are authorized yet.",
+              "",
+          ]
+
+          artifacts = {
+              "phase0a_revised_preregistration_v2.json": prereg,
+              "phase0a_initial_realized_target_panel.json": panel,
+              "phase0b_v0_signal_reliability.json": reliability_report,
+              "phase0_source_feasibility_contract_v2.json": source_contract,
+          }
+
+          for name, obj in artifacts.items():
+              (D / name).write_text(
+                  json.dumps(obj, indent=2, sort_keys=True) + "\n",
+                  encoding="utf-8",
+              )
+
+          (D / "phase0a_report.md").write_text(
+              "\n".join(lines), encoding="utf-8"
+          )
+
+          manifest = {
+              "schema_version": 1,
+              "study_id": "draft-class-strength-v1",
+              "stage": "phase0a_manifest_v2",
+              "decision": decision,
+              "artifacts": {
+                  p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                  for p in sorted(D.iterdir())
+                  if p.is_file() and p.name != "phase0a_manifest_v2.json"
+              },
+              "V0_diagnostic_only": n < min_v0,
+              "predictor_fit_performed": False,
+              "2027_class_scored": False,
+              "production_change_authorized": False,
+              "next_stage": (
+                  "Expand historical realized-target panel and then Phase 1 Source "
+                  "Feasibility + Harvest; repeat formal V0 at >=8 classes and do not "
+                  "fit predictors before >=10 complete classes."
+              ),
+          }
+          (D / "phase0a_manifest_v2.json").write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          print(json.dumps({
+              "decision": decision,
+              "class_count": n,
+              "permutation_p_value": p_value,
+              "provisional_reliability": reliability,
+              "provisional_signal_gate_pass": signal_gate,
+              "predictor_fit_performed": False,
+              "2027_class_scored": False,
+              "production_change_authorized": False,
+          }, indent=2))
+          PY
+
+      - name: Validate revised Phase 0A artifacts and scientific stop rules
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          D = Path("research/draft-class-strength-v1")
+          prereg = json.loads(
+              (D / "phase0a_revised_preregistration_v2.json").read_text()
+          )
+          panel = json.loads(
+              (D / "phase0a_initial_realized_target_panel.json").read_text()
+          )
+          v0 = json.loads(
+              (D / "phase0b_v0_signal_reliability.json").read_text()
+          )
+          src = json.loads(
+              (D / "phase0_source_feasibility_contract_v2.json").read_text()
+          )
+          manifest = json.loads((D / "phase0a_manifest_v2.json").read_text())
+
+          assert prereg["schema_version"] == 2
+          assert prereg["scientific_architecture"]["stage1"].startswith(
+              "If V0 and source gates permit, fit a low-capacity PLAYER-LEVEL"
+          )
+          assert prereg["prospect_cohort_contract"][
+              "eventual_nfl_draftees_define_anchor_cohort"
+          ] is False
+          assert prereg["prospect_cohort_contract"][
+              "eventual_declarants_define_anchor_cohort"
+          ] is False
+          assert prereg["model_selection_contract"]["walk_forward_required"] is True
+          assert prereg["model_selection_contract"][
+              "precommitted_naive_index_required"
+          ] is True
+          assert prereg["lead_time_contract"][
+              "current_season_partial_stats_primary"
+          ] is False
+          assert prereg["2027_blinding_contract"][
+              "2027_features_read_in_phase0a"
+          ] is False
+          assert prereg["2027_blinding_contract"][
+              "2027_score_computed_in_phase0a"
+          ] is False
+
+          assert panel["years"] == [2018,2019,2020,2021,2022,2023]
+          assert panel["class_count"] == 6
+          assert panel["cell_count"] == 12
+          assert panel["source"]["ktc_used_to_refit_fundamental_core"] is False
+
+          # With only six classes, Phase 0A MUST stop regardless of how promising
+          # the preliminary permutation diagnostic looks.
+          assert v0["class_count"] == 6
+          assert v0["minimum_classes_for_interpretable_V0"] == 8
+          assert v0["minimum_classes_before_predictor_fit"] == 10
+          assert v0["diagnostic_only"] is True
+          assert v0["decision"] == (
+              "STOP_EXPAND_HISTORICAL_TARGET_PANEL_BEFORE_INTERPRETING_V0"
+          )
+          assert v0["predictor_features_read"] is False
+          assert v0["predictor_fit_performed"] is False
+          assert v0["2027_features_read"] is False
+          assert v0["2027_class_scored"] is False
+          assert v0["production_change_authorized"] is False
+
+          assert src["approved_predictor_sources"] == []
+          assert src["predictor_fit_performed"] is False
+          assert src["2027_class_scored"] is False
+          assert src["production_change_authorized"] is False
+
+          assert manifest["decision"] == v0["decision"]
+          assert manifest["V0_diagnostic_only"] is True
+          assert manifest["predictor_fit_performed"] is False
+          assert manifest["2027_class_scored"] is False
+          assert manifest["production_change_authorized"] is False
+
+          for name, expected in manifest["artifacts"].items():
+              got = hashlib.sha256((D / name).read_bytes()).hexdigest()
+              assert got == expected, (name, expected, got)
+
+          all_text = "\n".join(
+              p.read_text(encoding="utf-8")
+              for p in D.iterdir()
+              if p.is_file()
+          ).lower()
+          assert '"production_change_authorized": true' not in all_text
+          assert '"predictor_fit_performed": true' not in all_text
+          assert '"2027_class_scored": true' not in all_text
+
+          print("PASS: revised Phase 0A scientific stop rules are fail-closed.")
+          PY
+
+      - name: Prove research-only mutation scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import subprocess
+
+          prefix = "research/draft-class-strength-v1/"
+          raw = subprocess.check_output(
+              ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+              text=True,
+          )
+          touched = [line[3:] for line in raw.splitlines() if line.strip()]
+          assert touched, "Expected Phase 0A research artifacts."
+          assert all(p.startswith(prefix) for p in touched), touched
+
+          forbidden = {
+              "index.html",
+              "free-agent-board.html",
+          }
+          assert not forbidden.intersection(touched), touched
+          assert not any(p.startswith("model/releases/") for p in touched)
+          assert not any(p.startswith("scripts/") for p in touched)
+          assert not any(p.startswith("data/") for p in touched)
+
+          print("PASS: only research/draft-class-strength-v1 artifacts changed.")
+          PY
+
+      - name: Commit revised Phase 0A artifacts
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$BASE_SHA" || {
+            echo "ERROR: origin/main moved during Draft Class Strength V1 Phase 0A."
+            exit 1
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add research/draft-class-strength-v1/
+
+          if git diff --cached --quiet; then
+            echo "PASS: revised Phase 0A artifacts already match; no commit required."
+            exit 0
+          fi
+
+          git commit -m "Freeze revised Draft Class Strength V1 Phase 0A"
+          git push origin HEAD:main
+
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$(git rev-parse HEAD)"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+          echo "PASS: revised Draft Class Strength V1 Phase 0A frozen on main."
