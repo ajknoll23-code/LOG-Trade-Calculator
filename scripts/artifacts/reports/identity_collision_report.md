@@ -3,19 +3,19 @@
 Production resolver covering QB / RB / WR / TE / DL / LB / DB.
 
 - FantasyPros tracked rows: **1083**
-- Authoritative stable-ID matches: **971**
-- Manual-review rows: **14**
+- Authoritative stable-ID matches: **974**
+- Manual-review rows: **11**
 
 ## Coverage by position
 
 | Pos | FP rows | Authoritative | Match rate | Candidate | Manual review |
 |---|---:|---:|---:|---:|---:|
-| QB | 80 | 72 | 90.0% | 74 | 2 |
+| QB | 80 | 74 | 92.5% | 74 | 0 |
 | RB | 132 | 121 | 91.7% | 121 | 0 |
 | WR | 203 | 177 | 87.2% | 184 | 7 |
 | TE | 130 | 122 | 93.8% | 125 | 3 |
 | DL | 177 | 159 | 89.8% | 159 | 0 |
-| LB | 159 | 145 | 91.2% | 146 | 2 |
+| LB | 159 | 146 | 91.8% | 146 | 1 |
 | DB | 202 | 175 | 86.6% | 175 | 0 |
 
 ## Match methods
@@ -25,9 +25,10 @@ Production resolver covering QB / RB / WR / TE / DL / LB / DB.
 - `name_position_team_confirmed`: **956**
 - `no_sleeper_name_candidate`: **98**
 - `phase10_independent_stable_id_corroboration`: **1**
+- `phase12_batch_stable_id_corroboration`: **3**
 - `previous_authoritative_stable_id_preserved`: **7**
 - `previous_authoritative_stable_id_preserved_position_changed`: **3**
-- `unique_name_position_team_unavailable`: **13**
+- `unique_name_position_team_unavailable`: **10**
 
 ## Manual-review rows
 
@@ -35,8 +36,6 @@ These remain deliberately unresolved; downstream consumers must use existing fal
 
 | Player | Pos | FP team | Candidate SID | Sleeper team | Method |
 |---|---|---|---|---|---|
-| Jake Browning | QB |  | 6111 |  | unique_name_position_team_unavailable |
-| Desmond Ridder | QB |  | 8159 |  | unique_name_position_team_unavailable |
 | JuJu Smith-Schuster | WR |  | 4040 |  | unique_name_position_team_unavailable |
 | Tahj Washington | WR |  | 11821 |  | unique_name_position_team_unavailable |
 | Malik Heath | WR |  | 11210 | ATL | unique_name_position_team_unavailable |
@@ -48,4 +47,3 @@ These remain deliberately unresolved; downstream consumers must use existing fal
 | John FitzPatrick | TE |  | 8500 |  | unique_name_position_team_unavailable |
 | Devin Culp | TE |  | 11820 | TB | unique_name_position_team_unavailable |
 | Jonah Elliss | LB | DEN |  |  | name_found_position_incompatible |
-| Elandon Roberts | LB |  | 3369 |  | unique_name_position_team_unavailable |
