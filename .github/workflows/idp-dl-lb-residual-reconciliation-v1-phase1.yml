@@ -1,0 +1,551 @@
+name: IDP DL-LB Residual Reconciliation V1 - Phase 1
+
+"on":
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: idp-dl-lb-residual-reconciliation-v1-phase1
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Capture base
+        id: base
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13.15'
+
+      - name: Guard exact structural audit and deployed valuation port
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/snapshot_values.py --selftest
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+
+          A=Path("research/idp-dl-lb-structural-audit-v1/audit_result.json")
+          assert hashlib.sha256(A.read_bytes()).hexdigest()==(
+              "9a83f3f965e6a6fc81c8a7867aec728a2527c51626a8af878446eb31c864cf8a"
+          )
+          a=json.loads(A.read_text())
+          assert a["decision"]==(
+              "STOP_TRUSTING_ABSOLUTE_FV_CALIBRATION_FOR_MIGRATED_DL_COHORT_"
+              "AUTHORIZE_RECONCILIATION_RESEARCH"
+          )
+          assert a["lineage_transport_audit"]["systemic_transport_residual_trigger"] is True
+          assert a["lineage_transport_audit"]["upper_tail_concentration_trigger"] is True
+          assert a["lineage_transport_audit"]["single_extreme_gap_trigger"] is True
+          assert a["production_change_authorized"] is False
+          assert a["production_changed"] is False
+          print("PASS: exact green structural audit guarded.")
+          PY
+          git diff --exit-code
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Freeze reconciliation preregistration
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p research/idp-dl-lb-residual-reconciliation-v1
+          python3 - <<'PY'
+          import json,subprocess
+          from pathlib import Path
+
+          D=Path("research/idp-dl-lb-residual-reconciliation-v1")
+          prereg={
+            "schema_version":1,
+            "study_id":"idp-dl-lb-residual-reconciliation-v1",
+            "phase":1,
+            "status":"FROZEN_BEFORE_RECONCILIATION_ANALYSIS",
+            "repo_commit_sha":subprocess.check_output(
+                ["git","rev-parse","HEAD"],text=True
+            ).strip(),
+            "scope":"RESEARCH_ONLY_NO_PRODUCTION_MUTATION",
+            "primary_cohort":{
+              "definition":"Current-live position-lineage candidates with legacy_model_position=LB and current_position=DL.",
+              "expected_n":21
+            },
+            "native_reference_groups":[
+              "Frozen IDP V1 computed players with legacy_model_position=DL and current_valuation_position=DL.",
+              "Frozen IDP V1 computed players with legacy_model_position=LB and current_valuation_position=LB."
+            ],
+            "residual_definition":"IDP V1 transported raw production multiplier minus its own clean new-model raw production multiplier.",
+            "primary_falsification_tests":[
+              "Migrated LB->DL residual distribution versus native DL residual distribution.",
+              "Migrated LB->DL residual distribution versus native LB residual distribution."
+            ],
+            "statistics":{
+              "location":"median residual difference",
+              "effect_size":"Cliff's delta",
+              "randomization_test":"two-sided deterministic permutation test of median difference, 50000 permutations, seed 20260929",
+              "bootstrap_interval":"95% bootstrap interval for median difference, 20000 resamples, seed 20260929"
+            },
+            "structural_reset_candidate":{
+              "candidate_id":"DL_LINEAGE_RESIDUAL_RESET_C0",
+              "formula":"current_position_clean_model_prod_mult + exact later successor_overlay_delta_raw",
+              "interpretation":"Remove the residual inherited from the legacy LB model while preserving the clean current-DL model and every later successor overlay exactly.",
+              "no_new_fitted_coefficient":True
+            },
+            "sensitivity_only_residual_retention":[0.0,0.25,0.5,0.75,1.0],
+            "selection_guardrail":"Residual-retention sensitivity values other than 0 and 1 are descriptive only and cannot be selected from this analysis.",
+            "outcome_guardrail":"2026 realized Weeks 1-2 may be reported only as previously-frozen collection context. They cannot select a reconciliation coefficient or authorize deployment.",
+            "hard_gates":[
+              "exact audit hash intact",
+              "exact IDP V1 frozen transport artifact available",
+              "primary cohort n=21",
+              "all primary cohort rows are legacy LB -> current DL",
+              "residual transport algebra reproduced",
+              "structural reset changes only primary cohort in an in-memory valuation counterfactual",
+              "all reset candidate values finite positive integers",
+              "no manual player-specific overrides",
+              "no production files changed"
+            ],
+            "decision_rule":{
+              "freeze_reset_candidate_for_prospective_validation_if":
+                "both Cliff's deltas >= 0.75, both permutation p-values <= 0.01, and all hard gates pass",
+              "otherwise":
+                "STOP_RECONCILIATION_CANDIDATE_NOT_SUPPORTED"
+            },
+            "production_change_authorized":False
+          }
+          (D/"phase1_preregistration.json").write_text(
+              json.dumps(prereg,indent=2,sort_keys=True)+"\n"
+          )
+          print("PASS: reconciliation preregistration frozen.")
+          PY
+
+      - name: Run residual distribution and candidate analysis
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import importlib.util,json,math,random,statistics,subprocess
+          from pathlib import Path
+
+          D=Path("research/idp-dl-lb-residual-reconciliation-v1")
+          AUDIT=Path("research/idp-dl-lb-structural-audit-v1/audit_result.json")
+          IDP=Path("model/releases/idp-v1/idp_v1_model_delta_transport_candidate.json")
+          INDEX=Path("index.html")
+          PORT=Path("scripts/validation/snapshot_values.py")
+          SEED=20260929
+          PERMS=50000
+          BOOTS=20000
+
+          def clamp(x,lo=.15,hi=1.55):
+              return max(lo,min(hi,float(x)))
+
+          def quantile(xs,p):
+              xs=sorted(float(x) for x in xs)
+              i=(len(xs)-1)*p
+              lo=math.floor(i); hi=math.ceil(i)
+              return xs[lo]+(xs[hi]-xs[lo])*(i-lo)
+
+          def summary(xs):
+              xs=[float(x) for x in xs]
+              return {
+                "n":len(xs),"min":min(xs),"p10":quantile(xs,.10),
+                "p25":quantile(xs,.25),"median":quantile(xs,.50),
+                "p75":quantile(xs,.75),"p90":quantile(xs,.90),
+                "p95":quantile(xs,.95),"max":max(xs),
+                "mean":statistics.fmean(xs)
+              }
+
+          def cliffs_delta(a,b):
+              gt=lt=0
+              for x in a:
+                  for y in b:
+                      if x>y: gt+=1
+                      elif x<y: lt+=1
+              return (gt-lt)/(len(a)*len(b))
+
+          def permutation_median_test(a,b,seed):
+              rng=random.Random(seed)
+              observed=statistics.median(a)-statistics.median(b)
+              pooled=list(a)+list(b)
+              na=len(a)
+              extreme=0
+              for _ in range(PERMS):
+                  x=pooled[:]
+                  rng.shuffle(x)
+                  d=statistics.median(x[:na])-statistics.median(x[na:])
+                  if abs(d)>=abs(observed)-1e-15:
+                      extreme+=1
+              return observed,(extreme+1)/(PERMS+1)
+
+          def bootstrap_median_diff(a,b,seed):
+              rng=random.Random(seed)
+              vals=[]
+              for _ in range(BOOTS):
+                  aa=[a[rng.randrange(len(a))] for _ in range(len(a))]
+                  bb=[b[rng.randrange(len(b))] for _ in range(len(b))]
+                  vals.append(statistics.median(aa)-statistics.median(bb))
+              return [quantile(vals,.025),quantile(vals,.975)]
+
+          spec=importlib.util.spec_from_file_location("snapshot_values",PORT)
+          if spec is None or spec.loader is None:
+              raise RuntimeError("could not import snapshot_values")
+          sv=importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(sv)
+          cfg=sv.load_from_html(INDEX)
+          deployed=sv.compute_all_values(cfg)
+
+          audit=json.loads(AUDIT.read_text())
+          idp=json.loads(IDP.read_text())
+
+          native_dl=[]
+          native_lb=[]
+          native_rows=[]
+          for key,r in idp["players"].items():
+              if r.get("status")!="computed":
+                  continue
+              ratio=r.get("candidate_ratio")
+              cand=r.get("candidate_prod_mult")
+              if ratio is None or cand is None:
+                  continue
+              clean=clamp(-0.10+0.75*float(ratio))
+              residual=float(cand)-clean
+              item={
+                  "key":key,
+                  "legacy_model_position":r.get("legacy_model_position"),
+                  "current_valuation_position":r.get("current_valuation_position"),
+                  "candidate_prod_mult":float(cand),
+                  "clean_new_model_prod_mult":clean,
+                  "residual":residual
+              }
+              if (
+                  item["legacy_model_position"]=="DL"
+                  and item["current_valuation_position"]=="DL"
+              ):
+                  native_dl.append(residual); native_rows.append(item)
+              if (
+                  item["legacy_model_position"]=="LB"
+                  and item["current_valuation_position"]=="LB"
+              ):
+                  native_lb.append(residual); native_rows.append(item)
+
+          migrated=[
+              x for x in audit["lineage_transport_audit"]["all_migrated_rows"]
+              if x["legacy_model_position"]=="LB"
+              and x["current_position"]=="DL"
+          ]
+          assert len(migrated)==21,len(migrated)
+          migrated_res=[float(x["legacy_residual_raw"]) for x in migrated]
+
+          dl_med_diff,dl_p=permutation_median_test(
+              migrated_res,native_dl,SEED
+          )
+          lb_med_diff,lb_p=permutation_median_test(
+              migrated_res,native_lb,SEED+1
+          )
+          dl_ci=bootstrap_median_diff(
+              migrated_res,native_dl,SEED+2
+          )
+          lb_ci=bootstrap_median_diff(
+              migrated_res,native_lb,SEED+3
+          )
+          dl_cliff=cliffs_delta(migrated_res,native_dl)
+          lb_cliff=cliffs_delta(migrated_res,native_lb)
+
+          # Build exact in-memory residual-retention sensitivity family.
+          by_key={x["key"]:x for x in migrated}
+          retention={}
+          for w in (0.0,0.25,0.5,0.75,1.0):
+              cc=dict(cfg)
+              cc["prod_mult"]=dict(cfg["prod_mult"])
+              rows=[]
+              for key,m in sorted(by_key.items()):
+                  raw=(
+                      float(m["current_position_clean_model_prod_mult"])
+                      + float(m["successor_overlay_delta_raw"])
+                      + w*float(m["legacy_residual_raw"])
+                  )
+                  raw=clamp(raw)
+                  cc["prod_mult"][key]=raw
+                  rows.append({
+                      "key":key,
+                      "retention":w,
+                      "candidate_raw_prod_mult":raw
+                  })
+              vals=sv.compute_all_values(cc)
+
+              changed=[
+                  key for key in deployed
+                  if int(vals[key]["value"])!=int(deployed[key]["value"])
+              ]
+              outside=[k for k in changed if k not in by_key]
+              assert not outside,outside
+
+              for row in rows:
+                  key=row["key"]
+                  row["current_fv"]=int(deployed[key]["value"])
+                  row["candidate_fv"]=int(vals[key]["value"])
+                  row["fv_delta"]=row["candidate_fv"]-row["current_fv"]
+                  assert row["candidate_fv"]>0
+
+              retention[str(w)]={
+                  "rows":rows,
+                  "changed_player_count":len(changed),
+                  "fv_delta_summary":summary(
+                      row["fv_delta"] for row in rows
+                  ),
+                  "candidate_fv_summary":summary(
+                      row["candidate_fv"] for row in rows
+                  )
+              }
+
+          reset=retention["0.0"]
+          burns=next(x for x in reset["rows"] if x["key"]=="brian burns")
+
+          all_gates={
+              "primary_cohort_n_21":len(migrated)==21,
+              "all_primary_rows_legacy_lb_current_dl":
+                  all(
+                      x["legacy_model_position"]=="LB"
+                      and x["current_position"]=="DL"
+                      for x in migrated
+                  ),
+              "native_dl_reference_n_ge_75":len(native_dl)>=75,
+              "native_lb_reference_n_ge_75":len(native_lb)>=75,
+              "reset_only_changes_primary_cohort":
+                  retention["0.0"]["changed_player_count"]<=21,
+              "all_reset_values_positive":
+                  min(x["candidate_fv"] for x in reset["rows"])>0
+          }
+          assert all(all_gates.values()),all_gates
+
+          stats={
+              "migrated_residual":summary(migrated_res),
+              "native_dl_residual":summary(native_dl),
+              "native_lb_residual":summary(native_lb),
+              "migrated_vs_native_dl":{
+                  "median_difference":dl_med_diff,
+                  "bootstrap_95_ci":dl_ci,
+                  "cliffs_delta":dl_cliff,
+                  "permutation_p_two_sided":dl_p
+              },
+              "migrated_vs_native_lb":{
+                  "median_difference":lb_med_diff,
+                  "bootstrap_95_ci":lb_ci,
+                  "cliffs_delta":lb_cliff,
+                  "permutation_p_two_sided":lb_p
+              },
+              "migrated_above_native_dl_p95_count":
+                  sum(x>quantile(native_dl,.95) for x in migrated_res),
+              "migrated_above_native_lb_p95_count":
+                  sum(x>quantile(native_lb,.95) for x in migrated_res)
+          }
+
+          support=(
+              dl_cliff>=0.75 and lb_cliff>=0.75
+              and dl_p<=0.01 and lb_p<=0.01
+              and all(all_gates.values())
+          )
+          decision=(
+              "FREEZE_DL_LINEAGE_RESIDUAL_RESET_C0_FOR_PROSPECTIVE_VALIDATION"
+              if support else
+              "STOP_RECONCILIATION_CANDIDATE_NOT_SUPPORTED"
+          )
+
+          result={
+              "schema_version":1,
+              "study_id":"idp-dl-lb-residual-reconciliation-v1",
+              "phase":1,
+              "status":"COMPLETE",
+              "decision":decision,
+              "production_change_authorized":False,
+              "candidate_fit_performed":False,
+              "manual_player_override_used":False,
+              "primary_cohort_count":len(migrated),
+              "reference_counts":{
+                  "native_dl":len(native_dl),
+                  "native_lb":len(native_lb)
+              },
+              "residual_distribution_tests":stats,
+              "hard_gates":all_gates,
+              "structural_reset_candidate":{
+                  "candidate_id":"DL_LINEAGE_RESIDUAL_RESET_C0",
+                  "residual_retention":0.0,
+                  "rows":reset["rows"],
+                  "brian_burns":burns,
+                  "interpretation":"Removes only inherited legacy-LB residual while preserving current-position clean model and later successor overlay."
+              },
+              "retention_sensitivity":retention,
+              "scientific_limits":[
+                  "This result can show that migrated residuals are structurally non-exchangeable with native DL/LB residuals.",
+                  "It cannot prove that zero residual retention is the true market value.",
+                  "The 0/25/50/75/100 retention family is not fit to current outcomes.",
+                  "No production deployment is authorized from Phase 1."
+              ],
+              "next_stage_if_frozen":
+                  "Prospective validation using the already-frozen realized-outcome protocols once they reach calibration-review readiness."
+          }
+
+          (D/"phase1_result.json").write_text(
+              json.dumps(result,indent=2,sort_keys=True)+"\n"
+          )
+
+          lines=[
+              "# IDP DL/LB Residual Reconciliation V1 — Phase 1",
+              "",
+              f"**Decision:** `{decision}`",
+              "",
+              "## Residual distributions",
+              "",
+              f"- Migrated LB→DL median residual: **{stats['migrated_residual']['median']:+.4f}** (n={len(migrated_res)})",
+              f"- Native DL median residual: **{stats['native_dl_residual']['median']:+.4f}** (n={len(native_dl)})",
+              f"- Native LB median residual: **{stats['native_lb_residual']['median']:+.4f}** (n={len(native_lb)})",
+              f"- Cliff's delta vs native DL: **{dl_cliff:+.3f}**; permutation p = **{dl_p:.6f}**",
+              f"- Cliff's delta vs native LB: **{lb_cliff:+.3f}**; permutation p = **{lb_p:.6f}**",
+              f"- Migrated residuals above native DL p95: **{stats['migrated_above_native_dl_p95_count']}/{len(migrated_res)}**",
+              f"- Migrated residuals above native LB p95: **{stats['migrated_above_native_lb_p95_count']}/{len(migrated_res)}**",
+              "",
+              "## Structural reset candidate",
+              "",
+              f"- Brian Burns: **{burns['current_fv']} → {burns['candidate_fv']}**",
+              f"- Cohort median FV delta: **{reset['fv_delta_summary']['median']:+.0f}**",
+              f"- Cohort mean FV delta: **{reset['fv_delta_summary']['mean']:+.1f}**",
+              "",
+              "The reset candidate removes only the legacy-LB residual. It does not change the current-DL clean model, age logic, position weight, replacement rank, or later successor overlay.",
+              "",
+              "No production change is authorized in this phase.",
+              ""
+          ]
+          (D/"phase1_report.md").write_text("\n".join(lines)+"\n")
+          print("\n".join(lines))
+          PY
+
+      - name: Validate reconciliation contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          D=Path("research/idp-dl-lb-residual-reconciliation-v1")
+          r=json.loads((D/"phase1_result.json").read_text())
+          assert r["status"]=="COMPLETE"
+          assert r["production_change_authorized"] is False
+          assert r["candidate_fit_performed"] is False
+          assert r["manual_player_override_used"] is False
+          assert r["primary_cohort_count"]==21
+          assert r["reference_counts"]["native_dl"]>=75
+          assert r["reference_counts"]["native_lb"]>=75
+          assert all(r["hard_gates"].values())
+          assert set(r["retention_sensitivity"])=={
+              "0.0","0.25","0.5","0.75","1.0"
+          }
+          assert len(r["structural_reset_candidate"]["rows"])==21
+          print("PASS: reconciliation analysis contract validated.")
+          PY
+
+      - name: Freeze manifest
+        shell: bash
+        env:
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json,os
+          from pathlib import Path
+
+          D=Path("research/idp-dl-lb-residual-reconciliation-v1")
+          sha=lambda p:hashlib.sha256(Path(p).read_bytes()).hexdigest()
+          r=json.loads((D/"phase1_result.json").read_text())
+          files=[
+              "phase1_preregistration.json",
+              "phase1_result.json",
+              "phase1_report.md"
+          ]
+          m={
+              "schema_version":1,
+              "study_id":"idp-dl-lb-residual-reconciliation-v1",
+              "phase":1,
+              "decision":r["decision"],
+              "workflow_run_id":os.environ["RUN_ID"],
+              "workflow_run_attempt":os.environ["RUN_ATTEMPT"],
+              "files":{f:sha(D/f) for f in files},
+              "production_change_authorized":False,
+              "production_changed":False
+          }
+          (D/"phase1_manifest.json").write_text(
+              json.dumps(m,indent=2,sort_keys=True)+"\n"
+          )
+          print("PASS: reconciliation manifest frozen.")
+          PY
+
+      - name: Prove research-only commit scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import subprocess
+
+          allowed={
+              "research/idp-dl-lb-residual-reconciliation-v1/phase1_preregistration.json",
+              "research/idp-dl-lb-residual-reconciliation-v1/phase1_result.json",
+              "research/idp-dl-lb-residual-reconciliation-v1/phase1_report.md",
+              "research/idp-dl-lb-residual-reconciliation-v1/phase1_manifest.json"
+          }
+          s=subprocess.check_output(
+              ["git","status","--porcelain=v1","--untracked-files=all"],
+              text=True
+          )
+          touched={line[3:] for line in s.splitlines() if line.strip()}
+          assert touched==allowed,(sorted(touched),sorted(allowed))
+          for forbidden in (
+              "index.html","free-agent-board.html","trade-desk-preview.html"
+          ):
+              assert forbidden not in touched
+          print("PASS: research-only scope exact.")
+          PY
+
+      - name: Commit Phase 1 reconciliation artifacts
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$BASE_SHA" || {
+            echo "ERROR: origin/main moved during reconciliation audit."
+            exit 1
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add research/idp-dl-lb-residual-reconciliation-v1/
+          git diff --cached --quiet && {
+            echo "ERROR: no reconciliation artifacts staged."
+            exit 1
+          }
+          git commit -m "Freeze IDP DL-LB residual reconciliation V1 Phase 1"
+          git push origin HEAD:main
+          test "$(git status --porcelain)" = ""
+          echo "PASS: reconciliation Phase 1 committed; production unchanged."
