@@ -1,0 +1,645 @@
+name: A8 Identity V2 Phase 15 Batch 2 Three-Player Exact-Scope Deployment
+
+# PATCH_VERSION: BATCH2_SCOPE_FIX_V2
+
+"on":
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  identity-v2-phase15-batch2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Capture base
+        id: base
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install regression dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir "requests==2.34.2"
+
+      - name: Guard exact A7 deployment anchor
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+          declare -A EXPECTED=(
+            ["scripts/identity_crosswalk.json"]="961c1005cd10a24308d02ab8e7e90dfd2338e97c"
+            ["research/identity-v2/identity_v2_phase14_batch2_direct_candidate_crosswalk.json"]="ddba956d69259fb86f4f857c7552513bd3c3ee1c"
+            ["research/identity-v2/identity_v2_phase14_batch2_stable_id_shadow.json"]="3f5ae33526defc45da629fab8c0bdcf558799b8b"
+            ["research/identity-v2/identity_v2_phase14_batch2_manifest.json"]="b2bdb54d2f3f76655b39802b88d01d9a7afb107d"
+            ["scripts/projections/resolve_fantasypros_sleeper_identity.py"]="fa4b0fd9b201d79173125f55f7c1eeee916b2506"
+          )
+          for p in "${!EXPECTED[@]}"; do
+            actual="$(git hash-object "$p")"
+            test "$actual" = "${EXPECTED[$p]}" || {
+              echo "ERROR: A8 deployment anchor drift: $p expected=${EXPECTED[$p]} actual=$actual"
+              exit 1
+            }
+          done
+
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+
+          D=Path("research/identity-v2")
+          result_path=D/"identity_v2_phase14_batch2_stable_id_shadow.json"
+          manifest_path=D/"identity_v2_phase14_batch2_manifest.json"
+          candidate_path=D/"identity_v2_phase14_batch2_direct_candidate_crosswalk.json"
+
+          r=json.loads(result_path.read_text())
+          m=json.loads(manifest_path.read_text())
+
+          expected=["16427","25668","26397"]
+          assert r["decision"]==(
+              "PASS_IDENTITY_V2_PHASE14_BATCH2_SHADOW_"
+              "AUTHORIZE_A8_EXACT_SCOPE_DEPLOYMENT_OF_PASSING_SUBSET"
+          )
+          assert r["passing_fpids"]==expected
+          assert r["held_fpids"]==[]
+          assert r["a8_exact_scope_deployment_authorized"] is True
+          assert r["direct_shadow"]["changed_fpids"]==expected
+          assert r["direct_shadow"]["manual_review_count_before"]==11
+          assert r["direct_shadow"]["manual_review_count_after"]==8
+          assert r["direct_shadow"]["all_hard_gates_pass"] is True
+          assert r["successor_resolver_shadow"]["seeded_vs_control_changed_fpids"]==expected
+          assert r["successor_resolver_shadow"]["all_hard_gates_pass"] is True
+          assert r["production_change_authorized"] is False
+          assert r["deployment_authorized"] is False
+
+          sha=lambda p:hashlib.sha256(Path(p).read_bytes()).hexdigest()
+          assert sha(result_path)==m["files"]["identity_v2_phase14_batch2_stable_id_shadow.json"]
+          assert sha(candidate_path)==m["files"]["identity_v2_phase14_batch2_direct_candidate_crosswalk.json"]
+          assert m["passing_fpids"]==expected
+          assert m["held_fpids"]==[]
+          assert m["a8_exact_scope_deployment_authorized"] is True
+          assert m["production_changed"] is False
+
+          rows=json.loads(Path("scripts/identity_crosswalk.json").read_text())
+          by={str(x["fantasypros_id"]):x for x in rows}
+          assert sum(bool(x.get("requires_manual_review")) for x in rows)==11
+
+          # Previously deployed mappings must be present before this batch.
+          deployed={
+              "26313":"11760",
+              "27959":"13457",
+              "28290":"13482",
+              "26964":"12412",
+              "15697":"3369",
+              "18557":"6111",
+              "20080":"8159",
+          }
+          for fpid,sid in deployed.items():
+              assert str(by[fpid].get("sleeper_id"))==sid,(fpid,by[fpid])
+              assert by[fpid].get("requires_manual_review") is False
+
+          print("PASS: exact A7 passing subset and post-A6 production baseline guarded.")
+          PY
+
+          cp scripts/identity_crosswalk.json \
+            "${RUNNER_TEMP}/identity_crosswalk.predeploy.json"
+
+          sha256sum \
+            index.html \
+            scripts/projections/resolve_fantasypros_sleeper_identity.py \
+            research/identity-v2/identity_v2_phase14_batch2_direct_candidate_crosswalk.json \
+            research/identity-v2/identity_v2_phase14_batch2_stable_id_shadow.json \
+            research/identity-v2/identity_v2_phase14_batch2_manifest.json \
+            > "${RUNNER_TEMP}/immutable.sha256"
+
+          if test -f free-agent-board.html; then
+            sha256sum free-agent-board.html >> "${RUNNER_TEMP}/immutable.sha256"
+          fi
+
+      - name: Preflight full repository regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/repo_regression_checks.py
+
+      - name: Apply exact three-player passing subset
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,shutil
+          from collections import defaultdict
+          from pathlib import Path
+
+          current_path=Path("scripts/identity_crosswalk.json")
+          candidate_path=Path(
+              "research/identity-v2/"
+              "identity_v2_phase14_batch2_direct_candidate_crosswalk.json"
+          )
+
+          current=json.loads(current_path.read_text())
+          candidate=json.loads(candidate_path.read_text())
+
+          expected={
+              "16427":("JuJu Smith-Schuster","WR","4040"),
+              "25668":("Malik Heath","WR","11210"),
+              "26397":("Tahj Washington","WR","11821"),
+          }
+          targets=set(expected)
+
+          def index(rows,label):
+              out={}
+              for row in rows:
+                  fpid=row.get("fantasypros_id")
+                  if fpid in (None,""):
+                      continue
+                  fpid=str(fpid)
+                  if fpid in out:
+                      raise SystemExit(f"{label}: duplicate FPID {fpid}")
+                  out[fpid]=row
+              return out
+
+          def canon(row):
+              return json.dumps(row,sort_keys=True,separators=(",",":"))
+
+          a=index(current,"current")
+          b=index(candidate,"candidate")
+          if set(a)!=set(b):
+              raise SystemExit("candidate/current FPID universe differs")
+
+          changed=sorted(
+              fpid for fpid in a if canon(a[fpid])!=canon(b[fpid])
+          )
+          if changed!=sorted(targets):
+              raise SystemExit(
+                  f"A8 candidate scope mismatch: expected={sorted(targets)} actual={changed}"
+              )
+
+          for fpid,(name,pos,sid) in expected.items():
+              before=a[fpid]
+              after=b[fpid]
+              if before.get("requires_manual_review") is not True:
+                  raise SystemExit(f"{fpid} not held in production baseline")
+              if before.get("sleeper_id") not in (None,""):
+                  raise SystemExit(f"{fpid} unexpectedly authoritative before deployment")
+              if str(before.get("candidate_sleeper_id") or "")!=sid:
+                  raise SystemExit(f"{fpid} baseline candidate SID drift")
+              if str(after.get("name") or "")!=name:
+                  raise SystemExit(f"{fpid} name mismatch")
+              if str(after.get("fp_position") or "")!=pos:
+                  raise SystemExit(f"{fpid} position mismatch")
+              if str(after.get("sleeper_id") or "")!=sid:
+                  raise SystemExit(f"{fpid} Sleeper ID mismatch")
+              if str(after.get("candidate_sleeper_id") or "")!=sid:
+                  raise SystemExit(f"{fpid} candidate SID mismatch")
+              if after.get("requires_manual_review") is not False:
+                  raise SystemExit(f"{fpid} still manual")
+              if after.get("match_confidence")!="high":
+                  raise SystemExit(f"{fpid} confidence not high")
+              if after.get("match_method")!="phase14_batch_stable_id_corroboration":
+                  raise SystemExit(f"{fpid} unexpected match method")
+
+          # Protect all earlier evidence-backed mappings and Jonah Elliss hold.
+          protected={
+              "26157":None,
+              "26313":"11760",
+              "27959":"13457",
+              "28290":"13482",
+              "26964":"12412",
+              "15697":"3369",
+              "18557":"6111",
+              "20080":"8159",
+          }
+          for fpid,sid in protected.items():
+              if canon(a[fpid])!=canon(b[fpid]):
+                  raise SystemExit(f"protected row changed: {fpid}")
+              if sid is not None:
+                  if str(b[fpid].get("sleeper_id") or "")!=sid:
+                      raise SystemExit(f"protected mapping lost: {fpid}->{sid}")
+                  if b[fpid].get("requires_manual_review") is not False:
+                      raise SystemExit(f"protected mapping returned to manual: {fpid}")
+          if b["26157"].get("requires_manual_review") is not True:
+              raise SystemExit("Jonah Elliss hold was lost")
+
+          before_manual=sum(bool(r.get("requires_manual_review")) for r in current)
+          after_manual=sum(bool(r.get("requires_manual_review")) for r in candidate)
+          if (before_manual,after_manual)!=(11,8):
+              raise SystemExit(
+                  f"manual-review count mismatch: {before_manual}->{after_manual}"
+              )
+
+          by_sid=defaultdict(list)
+          for row in candidate:
+              sid=row.get("sleeper_id")
+              fpid=row.get("fantasypros_id")
+              if sid in (None,"") or fpid in (None,"") or row.get("requires_manual_review"):
+                  continue
+              by_sid[str(sid)].append(str(fpid))
+          collisions={
+              sid:fpids for sid,fpids in by_sid.items()
+              if len(fpids)>1
+          }
+          if collisions:
+              raise SystemExit(f"authoritative SID collision(s): {collisions}")
+
+          shutil.copyfile(candidate_path,current_path)
+          print("PASS: installed exact A7 passing subset: " + ", ".join(changed))
+          PY
+
+      - name: Regenerate identity-dependent artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import importlib.util,json
+          from pathlib import Path
+
+          root=Path(".")
+          resolver_path=root/"scripts/projections/resolve_fantasypros_sleeper_identity.py"
+          spec=importlib.util.spec_from_file_location(
+              "identity_prod_resolver",resolver_path
+          )
+          if spec is None or spec.loader is None:
+              raise SystemExit("cannot load production identity resolver")
+          mod=importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+
+          rows=json.loads((root/"scripts/identity_crosswalk.json").read_text())
+          report=mod.build_production_report(rows)
+          report_path=root/"scripts/artifacts/reports/identity_collision_report.md"
+          report_path.write_text(report)
+          print("PASS: regenerated identity report.")
+          PY
+
+          python3 scripts/projections/build_team_utility_lineup_projections.py --write
+          python3 scripts/projections/build_team_utility_lineup_projections.py --check
+
+      - name: Prove successor resolver preserves batch and prior mappings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import importlib.util,json,os
+          from collections import defaultdict
+          from pathlib import Path
+
+          root=Path(".")
+          resolver_path=root/"scripts/projections/resolve_fantasypros_sleeper_identity.py"
+          spec=importlib.util.spec_from_file_location(
+              "identity_prod_resolver",resolver_path
+          )
+          if spec is None or spec.loader is None:
+              raise SystemExit("cannot load production identity resolver")
+          mod=importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+
+          baseline=json.loads(
+              (Path(os.environ["RUNNER_TEMP"])/"identity_crosswalk.predeploy.json").read_text()
+          )
+          deployed=json.loads((root/"scripts/identity_crosswalk.json").read_text())
+
+          fp_doc=mod.read_json(mod.FP_PATH)
+          totals=mod.read_json(mod.SLEEPER_TOTAL_PATH)
+          raw=mod.read_json(mod.SLEEPER_RAW_PATH)
+          teams=mod.read_json(mod.TEAM_REFRESH_PATH)
+
+          control=mod.build_production_crosswalk(
+              fp_doc,totals,raw,teams,baseline
+          )
+          seeded=mod.build_production_crosswalk(
+              fp_doc,totals,raw,teams,deployed
+          )
+
+          expected={
+              "16427":"4040",
+              "25668":"11210",
+              "26397":"11821",
+          }
+          targets=set(expected)
+
+          def index(rows,label):
+              out={}
+              for row in rows:
+                  fpid=row.get("fantasypros_id")
+                  if fpid in (None,""):
+                      continue
+                  fpid=str(fpid)
+                  if fpid in out:
+                      raise SystemExit(f"{label}: duplicate FPID {fpid}")
+                  out[fpid]=row
+              return out
+
+          def canon(row):
+              return json.dumps(row,sort_keys=True,separators=(",",":"))
+
+          c=index(control,"control")
+          s=index(seeded,"seeded")
+          if set(c)!=set(s):
+              raise SystemExit("successor control/seeded universes differ")
+
+          changed=sorted(
+              fpid for fpid in c if canon(c[fpid])!=canon(s[fpid])
+          )
+          if changed!=sorted(targets):
+              raise SystemExit(
+                  f"successor exact-scope mismatch: expected={sorted(targets)} actual={changed}"
+              )
+
+          for fpid,sid in expected.items():
+              row=s[fpid]
+              if str(row.get("sleeper_id") or "")!=sid:
+                  raise SystemExit(f"successor lost pair {fpid}->{sid}")
+              if row.get("requires_manual_review") is not False:
+                  raise SystemExit(f"successor returned {fpid} to manual review")
+
+          # Earlier mappings must remain authoritative in the seeded arm.
+          prior={
+              "26313":"11760",
+              "27959":"13457",
+              "28290":"13482",
+              "26964":"12412",
+              "15697":"3369",
+              "18557":"6111",
+              "20080":"8159",
+          }
+          for fpid,sid in prior.items():
+              if str(s[fpid].get("sleeper_id") or "")!=sid:
+                  raise SystemExit(f"prior mapping lost in successor: {fpid}->{sid}")
+              if s[fpid].get("requires_manual_review") is not False:
+                  raise SystemExit(f"prior mapping returned to manual: {fpid}")
+
+          if s["26157"].get("requires_manual_review") is not True:
+              raise SystemExit("Jonah Elliss no longer held")
+          if canon(c["26157"])!=canon(s["26157"]):
+              raise SystemExit("Jonah Elliss differs between causal arms")
+
+          by_sid=defaultdict(list)
+          for row in seeded:
+              sid=row.get("sleeper_id")
+              fpid=row.get("fantasypros_id")
+              if sid in (None,"") or fpid in (None,"") or row.get("requires_manual_review"):
+                  continue
+              by_sid[str(sid)].append(str(fpid))
+          collisions={
+              sid:fpids for sid,fpids in by_sid.items()
+              if len(fpids)>1
+          }
+          if collisions:
+              raise SystemExit(f"successor authoritative SID collision(s): {collisions}")
+
+          print("PASS: successor preserves exact Batch-2 subset and all prior deployed mappings.")
+          PY
+
+      - name: Full post-deployment repository regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/repo_regression_checks.py
+
+      - name: Write Phase 15 Batch 2 deployment confirmation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json,os,subprocess
+          from datetime import datetime,timezone
+          from pathlib import Path
+
+          root=Path(".")
+          D=root/"research/identity-v2"
+          pre_path=Path(os.environ["RUNNER_TEMP"])/"identity_crosswalk.predeploy.json"
+          post_path=root/"scripts/identity_crosswalk.json"
+
+          pre=json.loads(pre_path.read_text())
+          post=json.loads(post_path.read_text())
+
+          def sha(p):
+              return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+          def index(rows):
+              return {
+                  str(r["fantasypros_id"]):r
+                  for r in rows if r.get("fantasypros_id") not in (None,"")
+              }
+
+          def canon(row):
+              return json.dumps(row,sort_keys=True,separators=(",",":"))
+
+          a=index(pre); b=index(post)
+          changed=sorted(
+              fpid for fpid in a if canon(a[fpid])!=canon(b[fpid])
+          )
+          expected_fpids=["16427","25668","26397"]
+          if changed!=expected_fpids:
+              raise SystemExit(
+                  f"deployment confirmation scope mismatch: {changed}"
+              )
+
+          before_manual=sum(bool(r.get("requires_manual_review")) for r in pre)
+          after_manual=sum(bool(r.get("requires_manual_review")) for r in post)
+          if (before_manual,after_manual)!=(11,8):
+              raise SystemExit(
+                  f"manual count mismatch {before_manual}->{after_manual}"
+              )
+
+          deployed_mappings={
+              "16427":{"name":"JuJu Smith-Schuster","sleeper_id":"4040"},
+              "25668":{"name":"Malik Heath","sleeper_id":"11210"},
+              "26397":{"name":"Tahj Washington","sleeper_id":"11821"},
+          }
+
+          result={
+              "schema_version":1,
+              "study_id":"identity-v2-phase15-batch2-three-player-exact-scope-deployment",
+              "status":"DEPLOYED_VALIDATED",
+              "decision":"PASS_IDENTITY_V2_PHASE15_BATCH2_THREE_PLAYER_DEPLOYED",
+              "generated_at_utc":datetime.now(timezone.utc).isoformat(),
+              "repo_commit_sha_before_deployment":subprocess.check_output(
+                  ["git","rev-parse","HEAD"],text=True
+              ).strip(),
+              "production_change_applied":True,
+              "deployed_mapping_count":3,
+              "deployed_mappings":deployed_mappings,
+              "changed_fpids":changed,
+              "manual_review_count_before":11,
+              "manual_review_count_after":8,
+              "jonah_elliss_remains_held":True,
+              "prior_identity_mappings_preserved":[
+                  "26313","27959","28290","26964","15697","18557","20080"
+              ],
+              "production_resolver_source_changed":False,
+              "predeploy_crosswalk_sha256":sha(pre_path),
+              "postdeploy_crosswalk_sha256":sha(post_path),
+              "identity_report_sha256":sha(
+                  root/"scripts/artifacts/reports/identity_collision_report.md"
+              ),
+              "team_utility_projection_sha256":sha(
+                  root/"scripts/artifacts/generated/team_utility_lineup_projections.json"
+              ),
+              "team_utility_report_sha256":sha(
+                  root/"scripts/artifacts/reports/team_utility_lineup_projection_report.md"
+              ),
+              "phase14_batch2_manifest_sha256":sha(
+                  D/"identity_v2_phase14_batch2_manifest.json"
+              ),
+              "full_repo_regression_passed":True,
+              "successor_resolver_exact_scope_passed":True
+          }
+
+          out_json=D/"identity_v2_phase15_batch2_deployment_confirmation.json"
+          out_md=D/"identity_v2_phase15_batch2_deployment_confirmation.md"
+          manifest=D/"identity_v2_phase15_batch2_manifest.json"
+
+          out_json.write_text(json.dumps(result,indent=2,sort_keys=True)+"\n")
+
+          lines=[
+              "# Identity V2 Phase 15 Batch 2 — Deployment Confirmation",
+              "",
+              f"**Decision:** `{result['decision']}`",
+              "",
+              "- JuJu Smith-Schuster: FPID `16427` → Sleeper `4040`",
+              "- Malik Heath: FPID `25668` → Sleeper `11210`",
+              "- Tahj Washington: FPID `26397` → Sleeper `11821`",
+              "- Exact production crosswalk diff: **3 FPIDs**",
+              "- Manual-review count: **11 → 8**",
+              "- Jonah Elliss remains held: **Yes**",
+              "- All previously deployed Identity V2 mappings preserved: **Yes**",
+              "- Successor exact-scope check: **PASS**",
+              "- Team Utility dependent artifacts regenerated: **PASS**",
+              "- Full repository regression suite: **PASS**"
+          ]
+          out_md.write_text("\n".join(lines).rstrip()+"\n")
+
+          m={
+              "schema_version":1,
+              "study_id":result["study_id"],
+              "decision":result["decision"],
+              "production_change_applied":True,
+              "deployed_mapping_count":3,
+              "predeploy_crosswalk_sha256":result["predeploy_crosswalk_sha256"],
+              "postdeploy_crosswalk_sha256":result["postdeploy_crosswalk_sha256"],
+              "phase14_batch2_manifest_sha256":result["phase14_batch2_manifest_sha256"],
+              "deployment_confirmation_json_sha256":sha(out_json),
+              "deployment_confirmation_md_sha256":sha(out_md),
+              "identity_report_sha256":result["identity_report_sha256"],
+              "team_utility_projection_sha256":result["team_utility_projection_sha256"],
+              "team_utility_report_sha256":result["team_utility_report_sha256"]
+          }
+          manifest.write_text(json.dumps(m,indent=2,sort_keys=True)+"\n")
+
+          print(json.dumps({
+              "decision":result["decision"],
+              "changed_fpids":changed,
+              "manual_review_count_after":after_manual
+          },indent=2))
+          PY
+
+      - name: Prove exact deployment file scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum -c "${RUNNER_TEMP}/immutable.sha256"
+
+          python3 - <<'PY'
+          import subprocess
+
+          allowed={
+              "scripts/identity_crosswalk.json",
+              "scripts/artifacts/reports/identity_collision_report.md",
+              "scripts/artifacts/generated/team_utility_lineup_projections.json",
+              "scripts/artifacts/reports/team_utility_lineup_projection_report.md",
+              "research/identity-v2/identity_v2_phase15_batch2_deployment_confirmation.json",
+              "research/identity-v2/identity_v2_phase15_batch2_deployment_confirmation.md",
+              "research/identity-v2/identity_v2_phase15_batch2_manifest.json"
+          }
+          s=subprocess.check_output(
+              ["git","status","--porcelain=v1","--untracked-files=all"],
+              text=True
+          )
+          touched={line[3:] for line in s.splitlines() if line.strip()}
+
+          unexpected=touched-allowed
+          if unexpected:
+              raise SystemExit(
+                  "Unexpected deployment file changes: "
+                  + ", ".join(sorted(unexpected))
+              )
+
+          required={
+              "scripts/identity_crosswalk.json",
+              "research/identity-v2/identity_v2_phase15_batch2_deployment_confirmation.json",
+              "research/identity-v2/identity_v2_phase15_batch2_deployment_confirmation.md",
+              "research/identity-v2/identity_v2_phase15_batch2_manifest.json"
+          }
+          missing=required-touched
+          if missing:
+              raise SystemExit(
+                  "Required deployment files did not change: "
+                  + ", ".join(sorted(missing))
+              )
+
+          print("PASS: A8 changed only approved production/derived/release files.")
+          PY
+
+          git diff --check
+
+      - name: Final regression proof before commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/repo_regression_checks.py
+
+      - name: Commit A8 exact-scope deployment
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$BASE_SHA" || {
+            echo "ERROR: origin/main moved during A8."
+            exit 1
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            scripts/identity_crosswalk.json \
+            scripts/artifacts/reports/identity_collision_report.md \
+            scripts/artifacts/generated/team_utility_lineup_projections.json \
+            scripts/artifacts/reports/team_utility_lineup_projection_report.md \
+            research/identity-v2/identity_v2_phase15_batch2_deployment_confirmation.json \
+            research/identity-v2/identity_v2_phase15_batch2_deployment_confirmation.md \
+            research/identity-v2/identity_v2_phase15_batch2_manifest.json
+
+          git diff --cached --check
+          git commit -m "Deploy Identity V2 Phase 15 Batch 2 exact mappings"
+          git push origin HEAD:main
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          echo "PASS: A8 exact-scope three-player deployment committed cleanly."
