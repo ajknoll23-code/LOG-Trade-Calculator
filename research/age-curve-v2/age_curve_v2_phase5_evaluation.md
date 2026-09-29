@@ -20,10 +20,10 @@ Primary target: **Frozen Fundamental Value vs cumulative future fantasy points**
 
 | Variant | Total Spearman | Total pairwise | Active-PPG Spearman | Δ total Spearman vs control | Mean pos Δ total Spearman |
 |---|---:|---:|---:|---:|---:|
-| `deployed_control` | 0.5905 | 0.7131 | 0.5668 | — | — |
-| `position_k25__w50__all_positions` | 0.5933 | 0.7137 | 0.5730 | +0.0027 | -0.0054 |
-| `position_k25__w50__qb_control` | 0.5898 | 0.7128 | 0.5726 | -0.0007 | -0.0046 |
-| `tier_k50__w25__all_positions` | 0.5906 | 0.7137 | 0.5688 | +0.0001 | -0.0022 |
+| `deployed_control` | 0.5904 | 0.7131 | 0.5667 | — | — |
+| `position_k25__w50__all_positions` | 0.5932 | 0.7136 | 0.5729 | +0.0027 | -0.0054 |
+| `position_k25__w50__qb_control` | 0.5897 | 0.7128 | 0.5725 | -0.0007 | -0.0046 |
+| `tier_k50__w25__all_positions` | 0.5905 | 0.7137 | 0.5687 | +0.0001 | -0.0021 |
 
 ## Readiness ladder
 
