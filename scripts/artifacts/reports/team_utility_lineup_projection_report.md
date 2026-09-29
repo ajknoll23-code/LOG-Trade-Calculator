@@ -15,16 +15,16 @@
 
 ## Artifact coverage
 
-- Total projected players: **1455**
-- Position counts: **{"DB": 338, "DL": 343, "LB": 223, "QB": 76, "RB": 135, "TE": 135, "WR": 205}**
-- Source counts: **{"fantasypros_normalized_fallback": 83, "idp_v1_both": 462, "idp_v1_fp_only": 7, "idp_v1_no_new_data": 3, "idp_v1_sleeper_only": 432, "sleeper_league_scored": 468}**
+- Total projected players: **1449**
+- Position counts: **{"DB": 338, "DL": 342, "LB": 223, "QB": 76, "RB": 133, "TE": 135, "WR": 202}**
+- Source counts: **{"fantasypros_normalized_fallback": 85, "idp_v1_both": 462, "idp_v1_fp_only": 7, "idp_v1_no_new_data": 3, "idp_v1_sleeper_only": 431, "sleeper_league_scored": 461}**
 
 ## Current league validation
 
 - Teams checked: **12**
 - Teams with all 17 legal slots fillable: **12 / 12**
 - Teams with a projection-complete non-K starting lineup: **12 / 12**
-- Active non-K roster projection coverage: **98.12%**
+- Active non-K roster projection coverage: **98.11%**
 - Selected non-K players needing fallback: **0**
 
 ## Team detail
