@@ -1,0 +1,720 @@
+name: IDP DL-LB Residual Reconciliation V1 - Phase 2 Prospective Validation
+
+"on":
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: idp-dl-lb-residual-reconciliation-v1-phase2
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  prospective:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Capture base
+        id: base
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13.15'
+
+      - name: Install outcome-capture dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir "requests==2.34.2"
+
+      - name: Guard exact frozen Phase 1 evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/snapshot_values.py --selftest
+          python3 scripts/validation/capture_realized_outcomes.py --selftest
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+
+          D=Path("research/idp-dl-lb-residual-reconciliation-v1")
+          p1=D/"phase1_result.json"
+          m1=D/"phase1_manifest.json"
+          assert hashlib.sha256(p1.read_bytes()).hexdigest()==(
+              "61ec5c21ad87a2c71d23977c109a416a91fd4f43e61c16fdac47bb5d8e2a56ab"
+          )
+
+          r=json.loads(p1.read_text())
+          m=json.loads(m1.read_text())
+          assert r["decision"]=="FREEZE_DL_LINEAGE_RESIDUAL_RESET_C0_FOR_PROSPECTIVE_VALIDATION"
+          assert r["primary_cohort_count"]==21
+          assert all(r["hard_gates"].values())
+          assert r["production_change_authorized"] is False
+          assert r["candidate_fit_performed"] is False
+          assert r["manual_player_override_used"] is False
+          assert len(r["structural_reset_candidate"]["rows"])==21
+
+          assert m["decision"]=="FREEZE_DL_LINEAGE_RESIDUAL_RESET_C0_FOR_PROSPECTIVE_VALIDATION"
+          assert m["production_change_authorized"] is False
+          assert m["production_changed"] is False
+          print("PASS: exact frozen Phase 1 reconciliation evidence verified.")
+          PY
+          git diff --exit-code
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Capture fresh realized outcomes without mutating repository evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="research/model-history/outcomes/2026.json"
+          cp "$OUT" "${RUNNER_TEMP}/reconciliation-outcomes-before.json"
+          restore_outcomes() {
+            cp "${RUNNER_TEMP}/reconciliation-outcomes-before.json" "$OUT"
+          }
+          trap restore_outcomes EXIT
+
+          python3 scripts/validation/capture_realized_outcomes.py
+          cp "$OUT" "${RUNNER_TEMP}/reconciliation-outcomes-current.json"
+
+          restore_outcomes
+          trap - EXIT
+          cmp -s "$OUT" "${RUNNER_TEMP}/reconciliation-outcomes-before.json"
+          git diff --exit-code -- "$OUT"
+          echo "PASS: fresh outcomes captured to runner temp; tracked outcome file restored."
+
+      - name: Freeze immutable Phase 2 protocol and candidate before eligible outcomes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json,os
+          from datetime import date,datetime,timedelta,timezone
+          from pathlib import Path
+
+          D=Path("research/idp-dl-lb-residual-reconciliation-v1")
+          p1_path=D/"phase1_result.json"
+          audit_path=Path("research/idp-dl-lb-structural-audit-v1/audit_result.json")
+          protocol_path=D/"phase2_protocol.json"
+          frozen_path=D/"phase2_frozen_candidate.json"
+          outcomes_path=Path(os.environ["RUNNER_TEMP"])/"reconciliation-outcomes-current.json"
+
+          sha=lambda p:hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+          p1=json.loads(p1_path.read_text())
+          audit=json.loads(audit_path.read_text())
+          outcomes=json.loads(outcomes_path.read_text())
+
+          FIRST_ELIGIBLE_WEEK=4
+          SEASON_START=date.fromisoformat(
+              outcomes["sleeper_state_at_refresh"]["season_start_date"]
+          )
+          refreshed=datetime.fromisoformat(
+              outcomes["refreshed_at_utc"].replace("Z","+00:00")
+          ).date()
+
+          def completion_date(week):
+              return SEASON_START+timedelta(days=6+7*(week-1))
+
+          completed=sorted(
+              int(w) for w in (outcomes.get("weeks") or {})
+              if refreshed>=completion_date(int(w))
+          )
+
+          if protocol_path.exists() or frozen_path.exists():
+              assert protocol_path.exists() and frozen_path.exists()
+              protocol=json.loads(protocol_path.read_text())
+              frozen=json.loads(frozen_path.read_text())
+              assert protocol["study_id"]=="idp-dl-lb-residual-reconciliation-v1"
+              assert protocol["phase"]==2
+              assert protocol["first_eligible_future_week"]==FIRST_ELIGIBLE_WEEK
+              assert frozen["candidate_id"]=="DL_LINEAGE_RESIDUAL_RESET_C0"
+              assert frozen["primary_cohort_count"]==21
+              assert frozen["immutable"] is True
+              assert frozen["phase1_result_sha256"]==sha(p1_path)
+              print("PASS: immutable Phase 2 freeze already exists and validates.")
+          else:
+              # Leakage guard: first freeze must precede completion of Week 4.
+              assert FIRST_ELIGIBLE_WEEK not in completed,(
+                  "REFUSE LATE FREEZE: Week 4 is already a completed outcome week",
+                  completed,refreshed.isoformat()
+              )
+
+              protocol={
+                "schema_version":1,
+                "study_id":"idp-dl-lb-residual-reconciliation-v1",
+                "phase":2,
+                "status":"FROZEN_BEFORE_FIRST_ELIGIBLE_OUTCOME",
+                "frozen_at_utc":datetime.now(timezone.utc).isoformat(),
+                "season":2026,
+                "first_eligible_future_week":FIRST_ELIGIBLE_WEEK,
+                "leakage_rule":"Weeks 1-3 are permanently excluded because the structural problem and C0 reset were discovered after those outcomes existed.",
+                "completion_rule":"A week is complete only when refreshed UTC date is on/after season_start_date + 6 + 7*(week-1) days, matching the existing model-history evaluator.",
+                "primary_target":"frozen production multiplier versus realized active-game PPG for the 21-player migrated LB-to-DL cohort",
+                "primary_metrics":[
+                  "spearman",
+                  "pairwise_ordering_accuracy",
+                  "minmax_normalized_mae"
+                ],
+                "secondary_target":"frozen fundamental value versus realized active-game PPG and total points",
+                "candidate":"DL_LINEAGE_RESIDUAL_RESET_C0",
+                "control":"EXACT_DEPLOYED_PRE_FREEZE",
+                "sensitivity_variants":[0.25,0.5,0.75],
+                "sensitivity_selection_authorized":False,
+                "readiness":{
+                  "0":"READY_WAITING_FOR_COMPLETED_WEEK_4",
+                  "1_to_3":"COLLECTION_ONLY",
+                  "4_to_7":"EARLY_DIAGNOSTIC_ONLY",
+                  "8_to_11":"CALIBRATION_REVIEW_ELIGIBLE_NOT_DEPLOYMENT",
+                  "12_plus":"STABILITY_REVIEW_ELIGIBLE_NOT_AUTO_DEPLOYMENT"
+                },
+                "review_guardrails":[
+                  "No outcome before Week 4 may enter any candidate-vs-control metric.",
+                  "The frozen C0 candidate may never be rebuilt from later index.html state.",
+                  "Partial residual-retention variants are sensitivity-only and cannot be selected by this protocol.",
+                  "No production deployment can occur from Phase 2 automatically.",
+                  "At calibration review, require independent-window consistency plus no material cohort ranking regression before any deployment study."
+                ],
+                "production_change_authorized":False
+              }
+
+              audit_rows={
+                  x["key"]:x
+                  for x in audit["lineage_transport_audit"]["all_migrated_rows"]
+                  if x["legacy_model_position"]=="LB"
+                  and x["current_position"]=="DL"
+              }
+              reset_rows={
+                  x["key"]:x for x in p1["structural_reset_candidate"]["rows"]
+              }
+              assert set(audit_rows)==set(reset_rows)
+              assert len(reset_rows)==21
+
+              sensitivity={}
+              for retention in ("0.25","0.5","0.75"):
+                  sensitivity[retention]={
+                      x["key"]:{
+                          "raw_prod_mult":float(x["candidate_raw_prod_mult"]),
+                          "fv":int(x["candidate_fv"])
+                      }
+                      for x in p1["retention_sensitivity"][retention]["rows"]
+                  }
+                  assert set(sensitivity[retention])==set(reset_rows)
+
+              players={}
+              for key in sorted(reset_rows):
+                  a=audit_rows[key]
+                  z=reset_rows[key]
+                  players[key]={
+                      "key":key,
+                      "position":"DL",
+                      "age":int(a["age"]),
+                      "role":a["role"],
+                      "control":{
+                          "raw_prod_mult":float(a["current_live_raw_prod_mult"]),
+                          "effective_prod_mult":float(a["current_live_effective_prod_mult"]),
+                          "fv":int(a["current_live_fv"])
+                      },
+                      "c0_reset":{
+                          "raw_prod_mult":float(z["candidate_raw_prod_mult"]),
+                          "fv":int(z["candidate_fv"])
+                      },
+                      "residual_removed_raw":float(a["legacy_residual_raw"]),
+                      "successor_overlay_preserved_raw":float(a["successor_overlay_delta_raw"])
+                  }
+
+              frozen={
+                  "schema_version":1,
+                  "study_id":"idp-dl-lb-residual-reconciliation-v1",
+                  "phase":2,
+                  "artifact":"immutable_prospective_candidate_freeze",
+                  "immutable":True,
+                  "candidate_id":"DL_LINEAGE_RESIDUAL_RESET_C0",
+                  "control_id":"EXACT_DEPLOYED_PRE_FREEZE",
+                  "season":2026,
+                  "first_eligible_future_week":FIRST_ELIGIBLE_WEEK,
+                  "primary_cohort_count":21,
+                  "players":players,
+                  "sensitivity_variants":sensitivity,
+                  "phase1_result_sha256":sha(p1_path),
+                  "structural_audit_sha256":sha(audit_path),
+                  "production_change_authorized":False
+              }
+
+              protocol_path.write_text(
+                  json.dumps(protocol,indent=2,sort_keys=True)+"\n"
+              )
+              frozen_path.write_text(
+                  json.dumps(frozen,indent=2,sort_keys=True)+"\n"
+              )
+              print("PASS: Phase 2 protocol and candidate frozen before any eligible Week-4 outcome.")
+
+          PY
+
+      - name: Grade immutable candidate on eligible future weeks only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import json,math,os,statistics
+          from datetime import date,datetime,timedelta,timezone
+          from pathlib import Path
+
+          D=Path("research/idp-dl-lb-residual-reconciliation-v1")
+          protocol=json.loads((D/"phase2_protocol.json").read_text())
+          frozen=json.loads((D/"phase2_frozen_candidate.json").read_text())
+          outcomes=json.loads(
+              (Path(os.environ["RUNNER_TEMP"])/"reconciliation-outcomes-current.json").read_text()
+          )
+
+          FIRST=int(protocol["first_eligible_future_week"])
+          assert FIRST==4
+          keys=sorted(frozen["players"])
+          assert len(keys)==21
+
+          def rankdata(values):
+              order=sorted(range(len(values)),key=lambda i:values[i])
+              ranks=[0.0]*len(values)
+              i=0
+              while i<len(order):
+                  j=i
+                  while j+1<len(order) and values[order[j+1]]==values[order[i]]:
+                      j+=1
+                  avg=(i+j)/2.0+1.0
+                  for k in range(i,j+1):
+                      ranks[order[k]]=avg
+                  i=j+1
+              return ranks
+
+          def pearson(xs,ys):
+              if len(xs)<3 or len(xs)!=len(ys):
+                  return None
+              mx=sum(xs)/len(xs); my=sum(ys)/len(ys)
+              vx=sum((x-mx)**2 for x in xs)
+              vy=sum((y-my)**2 for y in ys)
+              if vx<=0 or vy<=0:
+                  return None
+              return sum((x-mx)*(y-my) for x,y in zip(xs,ys))/math.sqrt(vx*vy)
+
+          def spearman(xs,ys):
+              return pearson(rankdata(xs),rankdata(ys))
+
+          def pairwise(xs,ys):
+              good=total=0
+              for i in range(len(xs)):
+                  for j in range(i+1,len(xs)):
+                      dx=xs[i]-xs[j]; dy=ys[i]-ys[j]
+                      if dx==0 or dy==0:
+                          continue
+                      total+=1
+                      if (dx>0)==(dy>0):
+                          good+=1
+              return (good/total if total else None),total
+
+          def minmax_mae(xs,ys):
+              if len(xs)<2:
+                  return None
+              xlo,xhi=min(xs),max(xs); ylo,yhi=min(ys),max(ys)
+              if xhi==xlo or yhi==ylo:
+                  return None
+              xn=[(x-xlo)/(xhi-xlo) for x in xs]
+              yn=[(y-ylo)/(yhi-ylo) for y in ys]
+              return sum(abs(a-b) for a,b in zip(xn,yn))/len(xs)
+
+          def metrics(pred,realized):
+              names=[
+                  k for k in keys
+                  if realized[k]["active_games"]>0
+              ]
+              xs=[float(pred[k]) for k in names]
+              ys=[float(realized[k]["active_ppg"]) for k in names]
+              pr=pearson(xs,ys)
+              sp=spearman(xs,ys)
+              pa,n_pairs=pairwise(xs,ys)
+              mae=minmax_mae(xs,ys)
+              return {
+                  "n":len(names),
+                  "pearson":pr,
+                  "spearman":sp,
+                  "pairwise_ordering_accuracy":pa,
+                  "comparable_pairs":n_pairs,
+                  "minmax_normalized_mae":mae
+              }
+
+          state=outcomes["sleeper_state_at_refresh"]
+          start=date.fromisoformat(state["season_start_date"])
+          refreshed=datetime.fromisoformat(
+              outcomes["refreshed_at_utc"].replace("Z","+00:00")
+          ).date()
+
+          def complete(week):
+              return refreshed>=start+timedelta(days=6+7*(week-1))
+
+          available=sorted(
+              int(w) for w in (outcomes.get("weeks") or {})
+              if int(w)>=FIRST and complete(int(w))
+          )
+          prefix=[]
+          w=FIRST
+          aset=set(available)
+          while w in aset and w<=18:
+              prefix.append(w); w+=1
+
+          # Explicit leakage proof.
+          assert all(w>=4 for w in prefix)
+
+          week_maps={}
+          for wstr,block in (outcomes.get("weeks") or {}).items():
+              w=int(wstr)
+              if w<FIRST:
+                  continue
+              m={}
+              for row in block.get("players") or []:
+                  pts=float(row.get("fantasy_points") or 0.0)
+                  for key in row.get("model_keys") or []:
+                      if key in frozen["players"]:
+                          assert key not in m,(w,key,"duplicate outcome key")
+                          m[key]=pts
+              week_maps[w]=m
+
+          control_pm={
+              k:float(frozen["players"][k]["control"]["effective_prod_mult"])
+              for k in keys
+          }
+          c0_pm={
+              k:float(frozen["players"][k]["c0_reset"]["raw_prod_mult"])
+              for k in keys
+          }
+          control_fv={
+              k:float(frozen["players"][k]["control"]["fv"])
+              for k in keys
+          }
+          c0_fv={
+              k:float(frozen["players"][k]["c0_reset"]["fv"])
+              for k in keys
+          }
+
+          sensitivity={}
+          for retention,rows in frozen["sensitivity_variants"].items():
+              sensitivity[retention]={
+                  "prod_mult":{k:float(rows[k]["raw_prod_mult"]) for k in keys},
+                  "fv":{k:float(rows[k]["fv"]) for k in keys}
+              }
+
+          def realized_for(weeks):
+              out={
+                  k:{"total_points":0.0,"active_games":0,"active_ppg":None}
+                  for k in keys
+              }
+              for week in weeks:
+                  for key,pts in week_maps.get(week,{}).items():
+                      out[key]["total_points"]+=pts
+                      out[key]["active_games"]+=1
+              for key in keys:
+                  n=out[key]["active_games"]
+                  if n:
+                      out[key]["active_ppg"]=out[key]["total_points"]/n
+              return out
+
+          def one_window(name,weeks):
+              realized=realized_for(weeks)
+              control_primary=metrics(control_pm,realized)
+              c0_primary=metrics(c0_pm,realized)
+              control_value=metrics(control_fv,realized)
+              c0_value=metrics(c0_fv,realized)
+
+              def delta(new,old,higher=True):
+                  if new is None or old is None:
+                      return None
+                  return new-old if higher else old-new
+
+              deltas={
+                  "primary_spearman_c0_minus_control":
+                      delta(c0_primary["spearman"],control_primary["spearman"]),
+                  "primary_pairwise_c0_minus_control":
+                      delta(
+                          c0_primary["pairwise_ordering_accuracy"],
+                          control_primary["pairwise_ordering_accuracy"]
+                      ),
+                  "primary_mae_improvement_control_minus_c0":
+                      delta(
+                          c0_primary["minmax_normalized_mae"],
+                          control_primary["minmax_normalized_mae"],
+                          higher=False
+                      ),
+                  "secondary_value_spearman_c0_minus_control":
+                      delta(c0_value["spearman"],control_value["spearman"])
+              }
+
+              sens={}
+              for retention,v in sensitivity.items():
+                  sens[retention]={
+                      "primary":metrics(v["prod_mult"],realized),
+                      "secondary_value":metrics(v["fv"],realized)
+                  }
+
+              return {
+                  "name":name,
+                  "weeks":weeks,
+                  "realized":realized,
+                  "control":{
+                      "primary_prod_mult_vs_active_ppg":control_primary,
+                      "secondary_fv_vs_active_ppg":control_value
+                  },
+                  "c0":{
+                      "primary_prod_mult_vs_active_ppg":c0_primary,
+                      "secondary_fv_vs_active_ppg":c0_value
+                  },
+                  "c0_vs_control":deltas,
+                  "sensitivity_only":sens
+              }
+
+          windows={}
+          n=len(prefix)
+          if n:
+              windows[f"weeks_{FIRST}_to_{prefix[-1]}_cumulative"]=one_window(
+                  f"weeks_{FIRST}_to_{prefix[-1]}_cumulative",prefix
+              )
+          if n>=4:
+              windows["weeks_4_to_7"]=one_window("weeks_4_to_7",[4,5,6,7])
+          if n>=8:
+              windows["weeks_8_to_11"]=one_window("weeks_8_to_11",[8,9,10,11])
+              windows["weeks_4_to_11"]=one_window(
+                  "weeks_4_to_11",list(range(4,12))
+              )
+          if n>=12:
+              windows["weeks_12_to_15"]=one_window(
+                  "weeks_12_to_15",[12,13,14,15]
+              )
+              windows["weeks_4_to_15"]=one_window(
+                  "weeks_4_to_15",list(range(4,16))
+              )
+
+          if n==0:
+              status="READY_WAITING_FOR_COMPLETED_WEEK_4"
+          elif n<4:
+              status="COLLECTION_ONLY"
+          elif n<8:
+              status="EARLY_DIAGNOSTIC_ONLY"
+          elif n<12:
+              status="CALIBRATION_REVIEW_ELIGIBLE_NOT_DEPLOYMENT"
+          else:
+              status="STABILITY_REVIEW_ELIGIBLE_NOT_AUTO_DEPLOYMENT"
+
+          # Phase 2 itself can never authorize deployment.
+          result={
+              "schema_version":1,
+              "study_id":"idp-dl-lb-residual-reconciliation-v1",
+              "phase":2,
+              "status":status,
+              "evaluated_at_utc":datetime.now(timezone.utc).isoformat(),
+              "first_eligible_future_week":FIRST,
+              "pre_discovery_weeks_permanently_excluded":[1,2,3],
+              "fresh_outcome_refresh_utc":outcomes["refreshed_at_utc"],
+              "fresh_outcome_identity_coverage_pct":outcomes["identity_coverage_pct"],
+              "available_completed_eligible_weeks":available,
+              "completed_consecutive_eligible_prefix":prefix,
+              "completed_consecutive_eligible_count":n,
+              "windows":windows,
+              "candidate_id":"DL_LINEAGE_RESIDUAL_RESET_C0",
+              "control_id":"EXACT_DEPLOYED_PRE_FREEZE",
+              "sensitivity_selection_authorized":False,
+              "calibration_claim_authorized":n>=8,
+              "stability_claim_authorized":n>=12,
+              "deployment_authorized":False,
+              "production_change_authorized":False,
+              "interpretation":(
+                  "Candidate is frozen prospectively. No eligible future week is complete yet."
+                  if n==0 else
+                  "Collecting future evidence only; do not select or deploy."
+                  if n<4 else
+                  "Early diagnostic only; do not select or deploy."
+                  if n<8 else
+                  "Calibration review is now eligible, but deployment still requires a separate preregistered decision study."
+                  if n<12 else
+                  "Stability review is eligible; any deployment still requires a separate preregistered decision study."
+              )
+          }
+
+          (D/"phase2_evaluation.json").write_text(
+              json.dumps(result,indent=2,sort_keys=True)+"\n"
+          )
+
+          lines=[
+              "# IDP DL/LB Residual Reconciliation V1 — Phase 2 Prospective Validation",
+              "",
+              f"**Status:** `{status}`",
+              "",
+              f"- First eligible future week: **{FIRST}**",
+              f"- Pre-discovery weeks excluded forever: **1, 2, 3**",
+              f"- Completed eligible prefix: **{prefix}**",
+              f"- Eligible completed-week count: **{n}**",
+              "- Production changed: **No**",
+              "- Deployment authorized: **No**",
+              "",
+              result["interpretation"],
+              ""
+          ]
+          for name,w in windows.items():
+              d=w["c0_vs_control"]
+              lines += [
+                  f"## {name}",
+                  "",
+                  f"- C0 − control Spearman: **{d['primary_spearman_c0_minus_control']}**",
+                  f"- C0 − control pairwise accuracy: **{d['primary_pairwise_c0_minus_control']}**",
+                  f"- MAE improvement (control − C0): **{d['primary_mae_improvement_control_minus_c0']}**",
+                  ""
+              ]
+          (D/"phase2_report.md").write_text("\n".join(lines)+"\n")
+          print("\n".join(lines[:20]))
+          PY
+
+      - name: Validate prospective evaluation guardrails
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          D=Path("research/idp-dl-lb-residual-reconciliation-v1")
+          p=json.loads((D/"phase2_protocol.json").read_text())
+          f=json.loads((D/"phase2_frozen_candidate.json").read_text())
+          e=json.loads((D/"phase2_evaluation.json").read_text())
+
+          assert p["first_eligible_future_week"]==4
+          assert f["first_eligible_future_week"]==4
+          assert e["first_eligible_future_week"]==4
+          assert e["pre_discovery_weeks_permanently_excluded"]==[1,2,3]
+          assert all(
+              w>=4 for w in e["completed_consecutive_eligible_prefix"]
+          )
+          for window in e["windows"].values():
+              assert all(w>=4 for w in window["weeks"])
+          assert f["immutable"] is True
+          assert f["primary_cohort_count"]==21
+          assert e["sensitivity_selection_authorized"] is False
+          assert e["deployment_authorized"] is False
+          assert e["production_change_authorized"] is False
+          print("PASS: leakage and no-auto-deployment guardrails validated.")
+          PY
+
+      - name: Freeze/update Phase 2 manifest
+        shell: bash
+        env:
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json,os
+          from pathlib import Path
+
+          D=Path("research/idp-dl-lb-residual-reconciliation-v1")
+          sha=lambda p:hashlib.sha256(Path(p).read_bytes()).hexdigest()
+          e=json.loads((D/"phase2_evaluation.json").read_text())
+
+          files=[
+              "phase2_protocol.json",
+              "phase2_frozen_candidate.json",
+              "phase2_evaluation.json",
+              "phase2_report.md"
+          ]
+          m={
+              "schema_version":1,
+              "study_id":"idp-dl-lb-residual-reconciliation-v1",
+              "phase":2,
+              "status":e["status"],
+              "workflow_run_id":os.environ["RUN_ID"],
+              "workflow_run_attempt":os.environ["RUN_ATTEMPT"],
+              "files":{f:sha(D/f) for f in files},
+              "candidate_freeze_immutable":True,
+              "first_eligible_future_week":4,
+              "pre_discovery_weeks_excluded":[1,2,3],
+              "deployment_authorized":False,
+              "production_change_authorized":False,
+              "production_changed":False
+          }
+          (D/"phase2_manifest.json").write_text(
+              json.dumps(m,indent=2,sort_keys=True)+"\n"
+          )
+          print("PASS: Phase 2 manifest written.")
+          PY
+
+      - name: Prove research-only scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import subprocess
+
+          prefix="research/idp-dl-lb-residual-reconciliation-v1/"
+          allowed={
+              prefix+"phase2_protocol.json",
+              prefix+"phase2_frozen_candidate.json",
+              prefix+"phase2_evaluation.json",
+              prefix+"phase2_report.md",
+              prefix+"phase2_manifest.json"
+          }
+          s=subprocess.check_output(
+              ["git","status","--porcelain=v1","--untracked-files=all"],
+              text=True
+          )
+          touched={line[3:] for line in s.splitlines() if line.strip()}
+          assert touched.issubset(allowed),(sorted(touched),sorted(allowed))
+          for forbidden in (
+              "index.html","free-agent-board.html",
+              "trade-desk-preview.html",
+              "research/model-history/outcomes/2026.json"
+          ):
+              assert forbidden not in touched
+          print("PASS: Phase 2 changes are research-only.")
+          PY
+
+      - name: Commit Phase 2 freeze/evaluation if changed
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$BASE_SHA" || {
+            echo "ERROR: origin/main moved during Phase 2 evaluation."
+            exit 1
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            research/idp-dl-lb-residual-reconciliation-v1/phase2_protocol.json \
+            research/idp-dl-lb-residual-reconciliation-v1/phase2_frozen_candidate.json \
+            research/idp-dl-lb-residual-reconciliation-v1/phase2_evaluation.json \
+            research/idp-dl-lb-residual-reconciliation-v1/phase2_report.md \
+            research/idp-dl-lb-residual-reconciliation-v1/phase2_manifest.json
+
+          if git diff --cached --quiet; then
+            echo "PASS: no semantic Phase 2 change to commit."
+            exit 0
+          fi
+
+          git commit -m "Update IDP DL-LB residual reconciliation V1 Phase 2"
+          git push origin HEAD:main
+          test "$(git status --porcelain)" = ""
+          echo "PASS: Phase 2 prospective evidence committed; production untouched."
