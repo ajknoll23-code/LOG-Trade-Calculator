@@ -1,0 +1,1226 @@
+name: B1 DB Structural Integrity Audit V1
+
+# Read-only positional audit. No fitting. No production mutation.
+# Kickers are explicitly excluded from this audit series.
+"on":
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  db-structural-integrity-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Capture base
+        id: base
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install regression dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir \
+            "requests==2.34.2"
+
+      - name: Guard A20 handoff and frozen IDP inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+          declare -A EXPECTED=(
+            ["research/te-structural-integrity-audit-v1/manifest.json"]="f199e9f8c5dad8aed958a59d34faf514aab9c69b"
+            ["research/te-structural-integrity-audit-v1/audit_result.json"]="baddb290330b4f6e3a7215c6a387929880542048"
+            ["research/identity-v2/identity_v2_phase22_closure_freeze.json"]="3584e0e83f4a65a21730c745cd843c3011bfccc6"
+            ["index.html"]="21af37c43ff6ede4b346a530ea65f0ca91d605bb"
+            ["scripts/validation/snapshot_values.py"]="1efca4c35e910a95974c1bec0b06a106196618b3"
+            ["research/production-v2/production_v2_phase1_audit.json"]="bdd4657ff45e0c64f1406f27c1ffe6ad2e597d31"
+            ["research/legacy-prod-mult/prod_mult_lineage_audit.json"]="5be77a42610708464ea31508dd31daa0f4739b74"
+            ["research/age-curve-v2/age_curve_v2_phase5_evaluation.json"]="e0de6d0c63f30f58bb8e889847b1f7c71c5eae44"
+            ["research/position-weight-v2/position_weight_v2_phase5_evaluation.json"]="74b6b19147f49245001392d461f3a01b1c05d87a"
+            ["research/idp-position-lineage-v1/phase3_production_confirmation.json"]="47d3026329e89d8bb6a469fea0447c6f61ac2bc7"
+            ["research/idp-dl-lb-structural-audit-v1/manifest.json"]="8a6bb214eeaaf37048e35921e61c27291a330e90"
+            ["research/idp-dl-lb-structural-audit-v1/audit_result.json"]="57190c53b5bea707b96114d38142d696ad56ab91"
+          )
+
+          for p in "${!EXPECTED[@]}"; do
+            actual="$(git hash-object "$p")"
+            test "$actual" = "${EXPECTED[$p]}" || {
+              echo "ERROR: B1 frozen input drift: $p expected=${EXPECTED[$p]} actual=$actual"
+              exit 1
+            }
+          done
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          close=json.loads(
+              Path("research/identity-v2/identity_v2_phase22_closure_freeze.json").read_text()
+          )
+          assert close["decision"]=="PASS_IDENTITY_V2_CLOSE_AND_FREEZE_WITH_JONAH_ELLISS_HOLD"
+          assert close["identity_v2_closed"] is True
+          assert close["deployable_identity_work_complete"] is True
+
+          a20=json.loads(
+              Path("research/te-structural-integrity-audit-v1/audit_result.json").read_text()
+          )
+          assert a20["decision"]=="PASS_TE_STRUCTURAL_AUDIT_FREEZE_REVIEW_REQUIRED_BEFORE_ANY_MODEL_CHANGE"
+          assert a20["production_changed"] is False
+          assert a20["production_change_authorized"] is False
+          assert all(a20["hard_integrity_gates"].values())
+
+          dl_lb=json.loads(
+              Path("research/idp-dl-lb-structural-audit-v1/audit_result.json").read_text()
+          )
+          assert dl_lb["decision"]==(
+              "STOP_TRUSTING_ABSOLUTE_FV_CALIBRATION_FOR_MIGRATED_DL_COHORT_"
+              "AUTHORIZE_RECONCILIATION_RESEARCH"
+          )
+          assert dl_lb["production_changed"] is False
+          assert dl_lb["production_change_authorized"] is False
+
+          idp3=json.loads(
+              Path("research/idp-position-lineage-v1/phase3_production_confirmation.json").read_text()
+          )
+          assert idp3["decision"]=="PASS_IDP_POSITION_LINEAGE_V1_PHASE3_CONFIRMED_AND_DEPLOYED"
+          assert idp3["candidate_count_deployed"]==24
+          assert idp3["noncohort_prod_mult_changed"]==0
+          assert idp3["offense_prod_mult_changed"]==0
+
+          positions=[]
+          def walk(x):
+              if isinstance(x,dict):
+                  p=x.get("current_position")
+                  if isinstance(p,str):
+                      positions.append(p)
+                  for v in x.values():
+                      walk(v)
+              elif isinstance(x,list):
+                  for v in x:
+                      walk(v)
+          walk(idp3)
+          assert "DB" not in positions, (
+              "DB unexpectedly appears in the frozen DL/LB position-lineage deployment"
+          )
+
+          print(
+              "PASS: A20 is frozen green; Identity V2 is closed; "
+              "prior DL/LB audit remains research-only; DB was outside the "
+              "frozen IDP position-lineage deployment cohort."
+          )
+          PY
+
+      - name: Prove current production math and repository baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/snapshot_values.py --selftest
+          python3 scripts/validation/repo_regression_checks.py
+
+          sha256sum \
+            index.html \
+            scripts/validation/snapshot_values.py \
+            research/production-v2/production_v2_phase1_audit.json \
+            research/legacy-prod-mult/prod_mult_lineage_audit.json \
+            research/age-curve-v2/age_curve_v2_phase5_evaluation.json \
+            research/position-weight-v2/position_weight_v2_phase5_evaluation.json \
+            research/idp-position-lineage-v1/phase3_production_confirmation.json \
+            research/idp-dl-lb-structural-audit-v1/manifest.json \
+            research/idp-dl-lb-structural-audit-v1/audit_result.json \
+            research/te-structural-integrity-audit-v1/manifest.json \
+            > "${RUNNER_TEMP}/b1-immutable-production-and-inputs.sha256"
+
+      - name: Freeze DB audit protocol before scoring
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p research/db-structural-integrity-audit-v1
+
+          python3 - <<'PY'
+          import json,subprocess
+          from pathlib import Path
+
+          D=Path("research/db-structural-integrity-audit-v1")
+          outputs=[
+              D/"audit_protocol.json",
+              D/"audit_result.json",
+              D/"audit_report.md",
+              D/"manifest.json",
+          ]
+          for p in outputs:
+              assert not p.exists(),f"refusing to overwrite prior B1 output: {p}"
+
+          protocol={
+              "schema_version":1,
+              "study_id":"db-structural-integrity-audit-v1",
+              "status":"FROZEN_BEFORE_AUDIT_SCORING",
+              "repo_commit_sha":subprocess.check_output(
+                  ["git","rev-parse","HEAD"],text=True
+              ).strip(),
+              "scope":"All current PLAYER_DB defensive backs in the deployed calculator.",
+              "positions_in_scope":["DB"],
+              "excluded_positions":["K"],
+              "audit_series_complete_after_this_position":True,
+              "research_only":True,
+              "production_change_authorized":False,
+              "production_mutation_allowed":False,
+              "fitting_allowed":False,
+              "named_player_targeting_allowed":False,
+              "primary_questions":[
+                  "Does the live DB board reproduce the exact deployed FV formula with no hidden DB-only mutation?",
+                  "How much of within-DB spacing comes from production multiplier versus age multiplier?",
+                  "Does the DB upper tail contain statistically unusual FV, production-multiplier, or adjacent-rank gaps?",
+                  "Do DB age anchors create sharp discontinuities or age-floor cliffs?",
+                  "Do elite floors, no-history role rescue, production clamps, or age floors materially shape the DB board?",
+                  "Does the transparent Production V2 benchmark materially reorder DBs or mostly preserve current ordering?",
+                  "Does legacy production-multiplier lineage show unusual DB drift relative to the overall player pool?",
+                  "Do frozen Weeks 1-3 outcome diagnostics support only descriptive monitoring rather than model selection?",
+                  "Does current DB position weight show cross-position tension in frozen pairwise diagnostics?",
+                  "Was DB isolated from the frozen DL/LB position-lineage deployment and subsequent DL/LB structural issue?"
+              ],
+              "hard_integrity_gates":{
+                  "minimum_live_db_count":60,
+                  "all_live_db_values_positive":True,
+                  "unique_live_db_keys":True,
+                  "minimum_phase1_db_candidate_coverage_share":0.90,
+                  "minimum_phase1_current_vs_candidate_spearman":0.95,
+                  "minimum_phase1_top_n_overlap_share":0.90,
+                  "age_v2_must_not_authorize_deployment":True,
+                  "position_weight_v2_must_not_authorize_deployment":True,
+                  "db_must_be_outside_idp_position_lineage_deployment":True,
+                  "prior_dl_lb_audit_must_not_have_changed_production":True,
+                  "kicker_excluded_from_scope":True
+              },
+              "outlier_diagnostics":{
+                  "robust_z_abs_flag":3.5,
+                  "tukey_upper_fence_multiplier":1.5,
+                  "top32_adjacent_ratio_review_threshold":1.20
+              },
+              "interpretation_rules":[
+                  "Position weight is a common multiplicative factor within DB and cannot explain DB1-versus-DB32 spacing.",
+                  "The prior DL/LB transport-residual finding must not be generalized to DB without direct DB evidence.",
+                  "A statistical outlier is a review signal, not proof that a named DB is mispriced.",
+                  "A structural audit may identify compression, discontinuities, lineage drift, or counterfactual sensitivity but cannot choose a new DB scale or age curve.",
+                  "Weeks 1-3 realized outcomes are descriptive only and cannot authorize a model change.",
+                  "Production V2 Phase 1 is an uncalibrated transparent benchmark, not a validated replacement.",
+                  "No named DB may be manually raised or lowered from this audit.",
+                  "Any follow-up model change requires a separately preregistered broad-cohort calibration/validation study.",
+                  "Kickers are excluded from the positional structural-audit series."
+              ],
+              "decision_rule":{
+                  "if_any_hard_integrity_gate_fails":
+                      "STOP_DB_AUDIT_DATA_OR_LINEAGE_INTEGRITY_FAILURE",
+                  "otherwise":
+                      "PASS_DB_STRUCTURAL_AUDIT_FREEZE_REVIEW_REQUIRED_BEFORE_ANY_MODEL_CHANGE"
+              }
+          }
+          (D/"audit_protocol.json").write_text(
+              json.dumps(protocol,indent=2,sort_keys=True)+"\n"
+          )
+          print("PASS: B1 DB audit protocol frozen before scoring; kickers excluded.")
+          PY
+
+      - name: Run comprehensive DB structural audit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import importlib.util
+          import json
+          import math
+          import statistics
+          import subprocess
+          from collections import Counter
+          from datetime import datetime,timezone
+          from pathlib import Path
+
+          ROOT=Path(".")
+          D=ROOT/"research/db-structural-integrity-audit-v1"
+          protocol=json.loads((D/"audit_protocol.json").read_text())
+
+          def load_module(path,name):
+              spec=importlib.util.spec_from_file_location(name,path)
+              if spec is None or spec.loader is None:
+                  raise RuntimeError(f"cannot import {path}")
+              mod=importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(mod)
+              return mod
+
+          sv=load_module(
+              ROOT/"scripts/validation/snapshot_values.py",
+              "b1_snapshot_values"
+          )
+          cfg=sv.load_from_html(ROOT/"index.html")
+          live_values=sv.compute_all_values(cfg)
+
+          phase1=json.loads(
+              (ROOT/"research/production-v2/production_v2_phase1_audit.json").read_text()
+          )
+          legacy=json.loads(
+              (ROOT/"research/legacy-prod-mult/prod_mult_lineage_audit.json").read_text()
+          )
+          age_eval=json.loads(
+              (ROOT/"research/age-curve-v2/age_curve_v2_phase5_evaluation.json").read_text()
+          )
+          pw_eval=json.loads(
+              (ROOT/"research/position-weight-v2/position_weight_v2_phase5_evaluation.json").read_text()
+          )
+          idp3=json.loads(
+              (ROOT/"research/idp-position-lineage-v1/phase3_production_confirmation.json").read_text()
+          )
+          dl_lb=json.loads(
+              (ROOT/"research/idp-dl-lb-structural-audit-v1/audit_result.json").read_text()
+          )
+
+          def js_round(x):
+              return math.floor(float(x)+0.5)
+
+          def qtile(values,q):
+              vals=sorted(float(x) for x in values)
+              if not vals:
+                  return None
+              if len(vals)==1:
+                  return vals[0]
+              pos=(len(vals)-1)*q
+              lo=math.floor(pos); hi=math.ceil(pos)
+              if lo==hi:
+                  return vals[lo]
+              t=pos-lo
+              return vals[lo]*(1-t)+vals[hi]*t
+
+          def summary(values):
+              vals=[float(x) for x in values]
+              if not vals:
+                  return {"n":0}
+              return {
+                  "n":len(vals),
+                  "min":min(vals),
+                  "p10":qtile(vals,0.10),
+                  "p25":qtile(vals,0.25),
+                  "median":statistics.median(vals),
+                  "mean":statistics.mean(vals),
+                  "p75":qtile(vals,0.75),
+                  "p90":qtile(vals,0.90),
+                  "p95":qtile(vals,0.95),
+                  "max":max(vals),
+              }
+
+          def cv(values):
+              vals=[float(x) for x in values]
+              if len(vals)<2:
+                  return 0.0
+              m=statistics.mean(vals)
+              return None if m==0 else statistics.pstdev(vals)/abs(m)
+
+          def rankdata(values):
+              indexed=sorted(enumerate(values),key=lambda z:z[1])
+              ranks=[0.0]*len(values)
+              i=0
+              while i<len(indexed):
+                  j=i+1
+                  while j<len(indexed) and indexed[j][1]==indexed[i][1]:
+                      j+=1
+                  avg=(i+1+j)/2.0
+                  for k in range(i,j):
+                      ranks[indexed[k][0]]=avg
+                  i=j
+              return ranks
+
+          def pearson(x,y):
+              if len(x)!=len(y) or len(x)<2:
+                  return None
+              mx=statistics.mean(x); my=statistics.mean(y)
+              num=sum((a-mx)*(b-my) for a,b in zip(x,y))
+              dx=sum((a-mx)**2 for a in x)
+              dy=sum((b-my)**2 for b in y)
+              if dx<=0 or dy<=0:
+                  return None
+              return num/math.sqrt(dx*dy)
+
+          def spearman(x,y):
+              return pearson(rankdata(x),rankdata(y))
+
+          def robust_z_rows(rows,field):
+              vals=[float(r[field]) for r in rows]
+              med=statistics.median(vals)
+              mad=statistics.median(abs(v-med) for v in vals)
+              out=[]
+              for r in rows:
+                  z=0.0 if mad==0 else 0.6744897501960817*(float(r[field])-med)/mad
+                  if abs(z)>=protocol["outlier_diagnostics"]["robust_z_abs_flag"]:
+                      out.append({
+                          "player":r["key"],
+                          "rank":r["live_rank"],
+                          "value":r[field],
+                          "robust_z":z,
+                      })
+              return {
+                  "median":med,
+                  "mad":mad,
+                  "threshold":protocol["outlier_diagnostics"]["robust_z_abs_flag"],
+                  "flagged":sorted(out,key=lambda x:-abs(x["robust_z"])),
+              }
+
+          def tukey_upper(rows,field):
+              vals=[float(r[field]) for r in rows]
+              q1=qtile(vals,0.25); q3=qtile(vals,0.75)
+              iqr=q3-q1
+              fence=q3+protocol["outlier_diagnostics"][
+                  "tukey_upper_fence_multiplier"
+              ]*iqr
+              flagged=[
+                  {
+                      "player":r["key"],
+                      "rank":r["live_rank"],
+                      "value":r[field],
+                  }
+                  for r in rows if float(r[field])>fence
+              ]
+              return {
+                  "q1":q1,
+                  "q3":q3,
+                  "iqr":iqr,
+                  "upper_fence":fence,
+                  "flagged":flagged,
+              }
+
+          pw=float(cfg["position_weight"]["DB"])
+          age_curve=dict(cfg["age_curve"]["DB"])
+
+          dbs=[]
+          for key,info in cfg["player_db"].items():
+              if info["pos"]!="DB":
+                  continue
+
+              role=info["role"]
+              age=int(info["age"])
+              rm,raw_rm=sv.production_multiplier(
+                  key,role,cfg["prod_mult"],cfg["no_real_history"],cfg["role_mult"]
+              )
+              am=sv.effective_age_multiplier(
+                  "DB",age,role,key,rm,raw_rm,cfg
+              )
+              expected=js_round(100*pw*am*rm*55)
+              actual=live_values[key]["value"]
+              assert expected==actual,(key,expected,actual)
+
+              role_estimate=float(cfg["role_mult"].get(role,1.0))
+              elite_floor=(
+                  role=="Elite"
+                  and isinstance(raw_rm,(int,float))
+                  and raw_rm<0.65
+                  and abs(rm-0.65)<1e-12
+              )
+              no_history_rescue=(
+                  key in cfg["no_real_history"]
+                  and isinstance(raw_rm,(int,float))
+                  and raw_rm<=0.15
+                  and role_estimate>raw_rm
+                  and abs(rm-role_estimate)<1e-12
+              )
+
+              dbs.append({
+                  "key":key,
+                  "name":key,
+                  "age":age,
+                  "role":role,
+                  "fv":expected,
+                  "prod_mult":float(rm),
+                  "raw_prod_mult":(
+                      float(raw_rm) if isinstance(raw_rm,(int,float)) else None
+                  ),
+                  "age_mult":float(am),
+                  "has_real_prod_data":raw_rm is not None,
+                  "no_real_production_history":key in cfg["no_real_history"],
+                  "elite_floor_applied":elite_floor,
+                  "no_history_role_rescue_applied":no_history_rescue,
+                  "raw_at_floor":(
+                      isinstance(raw_rm,(int,float)) and raw_rm<=0.15+1e-12
+                  ),
+                  "raw_at_ceiling":(
+                      isinstance(raw_rm,(int,float)) and raw_rm>=1.55-1e-12
+                  ),
+                  "age_floor_applied":abs(float(am)-0.62)<1e-12,
+              })
+
+          dbs.sort(key=lambda r:(-r["fv"],r["key"]))
+          assert len({r["key"] for r in dbs})==len(dbs)
+          for i,r in enumerate(dbs,1):
+              r["live_rank"]=i
+
+          top12=dbs[:12]
+          top24=dbs[:24]
+          top32=dbs[:32]
+          top48=dbs[:48]
+          db1=dbs[0]
+
+          rank_bands={}
+          for lo,hi in (
+              (1,3),(1,6),(1,12),(1,24),(1,32),(1,48),
+              (13,24),(25,32),(33,48),(49,64)
+          ):
+              rows=dbs[lo-1:min(hi,len(dbs))]
+              if not rows:
+                  continue
+              rank_bands[f"DB{lo}-DB{hi}"]={
+                  "n":len(rows),
+                  "fv":summary([r["fv"] for r in rows]),
+                  "prod_mult":summary([r["prod_mult"] for r in rows]),
+                  "age_mult":summary([r["age_mult"] for r in rows]),
+                  "ages":summary([r["age"] for r in rows]),
+                  "roles":dict(Counter(r["role"] for r in rows)),
+                  "elite_floor_count":sum(r["elite_floor_applied"] for r in rows),
+                  "no_history_rescue_count":sum(
+                      r["no_history_role_rescue_applied"] for r in rows
+                  ),
+                  "age_floor_count":sum(r["age_floor_applied"] for r in rows),
+              }
+
+          reference_ranks={}
+          for rank in (2,3,6,12,24,32,48,60):
+              if len(dbs)>=rank:
+                  row=dbs[rank-1]
+                  reference_ranks[str(rank)]={
+                      "player":row["key"],
+                      "fv":row["fv"],
+                      "db1_to_rank_fv_ratio":db1["fv"]/row["fv"] if row["fv"] else None,
+                      "absolute_gap_from_db1":db1["fv"]-row["fv"],
+                      "pct_below_db1":(
+                          (db1["fv"]-row["fv"])/db1["fv"]
+                          if db1["fv"] else None
+                      ),
+                  }
+
+          within_db1={}
+          for pct in (0.02,0.05,0.10,0.15,0.20,0.25,0.30,0.40,0.50):
+              within_db1[str(int(pct*100))]=sum(
+                  r["fv"]>=db1["fv"]*(1-pct) for r in dbs
+              )
+
+          adjacent=[]
+          for i in range(min(31,len(dbs)-1)):
+              a=dbs[i]; b=dbs[i+1]
+              ratio=a["fv"]/b["fv"] if b["fv"] else None
+              adjacent.append({
+                  "higher_rank":a["live_rank"],
+                  "higher_player":a["key"],
+                  "higher_fv":a["fv"],
+                  "lower_rank":b["live_rank"],
+                  "lower_player":b["key"],
+                  "lower_fv":b["fv"],
+                  "ratio":ratio,
+                  "absolute_gap":a["fv"]-b["fv"],
+                  "review_threshold_exceeded":(
+                      ratio is not None and ratio>=protocol[
+                          "outlier_diagnostics"
+                      ]["top32_adjacent_ratio_review_threshold"]
+                  ),
+              })
+          largest_adjacent=max(adjacent,key=lambda x:x["ratio"])
+
+          outlier_diagnostics={
+              "fv_robust_z":robust_z_rows(dbs,"fv"),
+              "prod_mult_robust_z":robust_z_rows(dbs,"prod_mult"),
+              "fv_tukey_upper":tukey_upper(dbs,"fv"),
+              "prod_mult_tukey_upper":tukey_upper(dbs,"prod_mult"),
+              "top32_adjacent_rank_gaps":adjacent,
+              "largest_top32_adjacent_ratio":largest_adjacent,
+              "interpretation":"Outlier flags are descriptive review signals only; they do not authorize named-player corrections."
+          }
+
+          decomposition={
+              "position_weight":pw,
+              "position_weight_is_constant_within_db":True,
+              "global_value_scale":55,
+              "top12_fv_cv":cv([r["fv"] for r in top12]),
+              "top12_prod_mult_cv":cv([r["prod_mult"] for r in top12]),
+              "top12_age_mult_cv":cv([r["age_mult"] for r in top12]),
+              "top24_fv_vs_prod_mult_spearman":spearman(
+                  [r["fv"] for r in top24],[r["prod_mult"] for r in top24]
+              ),
+              "top24_fv_vs_age_mult_spearman":spearman(
+                  [r["fv"] for r in top24],[r["age_mult"] for r in top24]
+              ),
+              "top32_fv_vs_prod_mult_spearman":spearman(
+                  [r["fv"] for r in top32],[r["prod_mult"] for r in top32]
+              ),
+              "top32_fv_vs_age_mult_spearman":spearman(
+                  [r["fv"] for r in top32],[r["age_mult"] for r in top32]
+              ),
+              "all_db_fv_vs_prod_mult_spearman":spearman(
+                  [r["fv"] for r in dbs],[r["prod_mult"] for r in dbs]
+              ),
+              "all_db_fv_vs_age_mult_spearman":spearman(
+                  [r["fv"] for r in dbs],[r["age_mult"] for r in dbs]
+              ),
+          }
+
+          live_semantics={
+              "db_count":len(dbs),
+              "has_real_prod_data_count":sum(r["has_real_prod_data"] for r in dbs),
+              "no_real_production_history_count":sum(
+                  r["no_real_production_history"] for r in dbs
+              ),
+              "elite_floor_applied_count":sum(
+                  r["elite_floor_applied"] for r in dbs
+              ),
+              "no_history_role_rescue_applied_count":sum(
+                  r["no_history_role_rescue_applied"] for r in dbs
+              ),
+              "raw_at_floor_count":sum(r["raw_at_floor"] for r in dbs),
+              "raw_at_ceiling_count":sum(r["raw_at_ceiling"] for r in dbs),
+              "age_floor_applied_count":sum(r["age_floor_applied"] for r in dbs),
+              "top32_elite_floor_count":sum(
+                  r["elite_floor_applied"] for r in top32
+              ),
+              "top32_no_history_role_rescue_count":sum(
+                  r["no_history_role_rescue_applied"] for r in top32
+              ),
+              "top32_age_floor_count":sum(
+                  r["age_floor_applied"] for r in top32
+              ),
+              "position_weight":pw,
+              "age_curve":age_curve,
+          }
+
+          # Mechanical sensitivity only; no fitting.
+          sensitivity=[]
+          for r in top32:
+              def fv_at(prod=None,age=None):
+                  prod=r["prod_mult"] if prod is None else float(prod)
+                  age=r["age"] if age is None else int(age)
+                  prod=max(0.15,min(1.55,prod))
+                  am=sv.effective_age_multiplier(
+                      "DB",age,r["role"],r["key"],prod,r["raw_prod_mult"],cfg
+                  )
+                  return {
+                      "fv":js_round(100*pw*am*prod*55),
+                      "age_mult":float(am),
+                      "prod_mult":prod,
+                  }
+
+              base=fv_at()
+              plus_age=fv_at(age=r["age"]+1)
+              minus_age=fv_at(age=max(18,r["age"]-1))
+              plus_prod=fv_at(prod=r["prod_mult"]+0.05)
+              minus_prod=fv_at(prod=r["prod_mult"]-0.05)
+
+              sensitivity.append({
+                  "player":r["key"],
+                  "rank":r["live_rank"],
+                  "age":r["age"],
+                  "base_fv":base["fv"],
+                  "age_plus_1_fv":plus_age["fv"],
+                  "age_plus_1_delta":plus_age["fv"]-base["fv"],
+                  "age_minus_1_fv":minus_age["fv"],
+                  "age_minus_1_delta":minus_age["fv"]-base["fv"],
+                  "prod_plus_0_05_fv":plus_prod["fv"],
+                  "prod_plus_0_05_delta":plus_prod["fv"]-base["fv"],
+                  "prod_minus_0_05_fv":minus_prod["fv"],
+                  "prod_minus_0_05_delta":minus_prod["fv"]-base["fv"],
+              })
+
+          sensitivity_summary={
+              "top32_age_plus_1_delta":summary(
+                  [x["age_plus_1_delta"] for x in sensitivity]
+              ),
+              "top32_age_minus_1_delta":summary(
+                  [x["age_minus_1_delta"] for x in sensitivity]
+              ),
+              "top32_prod_plus_0_05_delta":summary(
+                  [x["prod_plus_0_05_delta"] for x in sensitivity]
+              ),
+              "top32_prod_minus_0_05_delta":summary(
+                  [x["prod_minus_0_05_delta"] for x in sensitivity]
+              ),
+              "largest_absolute_age_plus_1_delta":max(
+                  sensitivity,key=lambda x:abs(x["age_plus_1_delta"])
+              ),
+          }
+
+          # DB age mechanics are production-sensitive before peakStart, so inspect
+          # the full integer-age surface at several fixed production anchors.
+          # This is mechanical sensitivity only; the anchors are not fit.
+          age_surfaces={}
+          for probe_prod in (0.35,0.65,1.00,1.30):
+              pts=[]
+              for probe_age in range(
+                  21,int(age_curve["floor"])+3
+              ):
+                  am=sv.effective_age_multiplier(
+                      "DB",
+                      probe_age,
+                      "Starter",
+                      "__b1_db_age_probe__",
+                      probe_prod,
+                      probe_prod,
+                      cfg,
+                  )
+                  pts.append({
+                      "age":probe_age,
+                      "age_multiplier":float(am),
+                  })
+              steps=[]
+              for a,b in zip(pts,pts[1:]):
+                  steps.append({
+                      "from_age":a["age"],
+                      "to_age":b["age"],
+                      "from_multiplier":a["age_multiplier"],
+                      "to_multiplier":b["age_multiplier"],
+                      "delta":b["age_multiplier"]-a["age_multiplier"],
+                      "pct_change":(
+                          None
+                          if a["age_multiplier"]==0
+                          else b["age_multiplier"]/a["age_multiplier"]-1
+                      ),
+                  })
+              age_surfaces[f"prod_{probe_prod:.2f}"]={
+                  "probe_prod_mult":probe_prod,
+                  "role":"Starter",
+                  "points":pts,
+                  "steps":steps,
+                  "largest_absolute_step":(
+                      max(steps,key=lambda x:abs(x["delta"]))
+                      if steps else None
+                  ),
+              }
+
+          age_surface={
+              "deployed_curve_parameters":age_curve,
+              "mechanical_probe_surfaces":age_surfaces,
+              "interpretation":"Probe surfaces use fixed production anchors only to expose integer-age discontinuities; no anchor is a fitted candidate."
+          }
+
+          p1_cov=phase1["coverage_by_position"]["DB"]
+          p1_rank=phase1["rank_stability_by_position"]["DB"]
+          p1_move=phase1["movement_summary_by_position"]["DB"]
+          current_n=int(p1_cov["current_players"])
+          candidate_n=int(p1_cov["candidate_final_value"])
+          phase1_coverage=candidate_n/current_n
+
+          phase1_diag={
+              "db_count":current_n,
+              "candidate_count":candidate_n,
+              "candidate_coverage_share":phase1_coverage,
+              "reported_coverage":p1_cov,
+              "rank_stability":p1_rank,
+              "movement_summary":p1_move,
+              "benchmark_transform":phase1["benchmark_assumptions"]["prod_mult_transform"],
+              "benchmark_idp_forward":phase1["benchmark_assumptions"]["idp_forward"],
+              "replacement_rank":phase1["benchmark_assumptions"]["replacement_rank"]["DB"],
+          }
+
+          legacy_db=legacy["by_position_abs_diff"]["DB"]
+          legacy_diag={
+              "db_live_vs_generated_abs_diff":legacy_db,
+              "overall_live_vs_generated_abs_diff":legacy["overall_abs_diff"],
+              "db_median_abs_diff_vs_overall_ratio":(
+                  legacy_db["median"]/legacy["overall_abs_diff"]["median"]
+                  if legacy["overall_abs_diff"]["median"] else None
+              ),
+              "db_median_drift_above_overall":(
+                  legacy_db["median"]>legacy["overall_abs_diff"]["median"]
+              ),
+              "interpretation":"Legacy DB lineage drift is diagnostic only; it cannot authorize deployment."
+          }
+
+          age_db=age_eval["metrics"]["deployed_control"]["by_position"]["DB"]
+          db_pair_metrics={
+              k:v for k,v in
+              pw_eval["variant_scores"]["deployed_control"][
+                  "cross_position_pairwise"
+              ]["by_position_pair"].items()
+              if "DB" in k
+          }
+          prospective_diag={
+              "completed_outcome_weeks_age_v2":age_eval["completed_outcome_weeks"],
+              "completed_outcome_weeks_position_weight_v2":
+                  pw_eval["completed_outcome_weeks"],
+              "age_v2_deployed_control_db_metrics":age_db,
+              "position_weight_v2_deployed_control_db_cross_position_pairs":
+                  db_pair_metrics,
+              "age_curve_change_authorized":
+                  age_eval.get("age_curve_change_authorized"),
+              "age_v2_deployment_authorized":
+                  age_eval.get("deployment_authorized"),
+              "position_weight_change_authorized":
+                  pw_eval.get("position_weight_change_authorized"),
+              "position_weight_v2_deployment_authorized":
+                  pw_eval.get("deployment_authorized"),
+              "interpretation":"Weeks 1-3 are early descriptive evidence under frozen upstream studies and cannot authorize a DB model change."
+          }
+
+          lineage_positions=[]
+          def walk_positions(x):
+              if isinstance(x,dict):
+                  p=x.get("current_position")
+                  if isinstance(p,str):
+                      lineage_positions.append(p)
+                  for v in x.values():
+                      walk_positions(v)
+              elif isinstance(x,list):
+                  for v in x:
+                      walk_positions(v)
+          walk_positions(idp3)
+
+          idp_isolation_diag={
+              "position_lineage_phase3_decision":idp3["decision"],
+              "position_lineage_candidate_count_deployed":
+                  idp3["candidate_count_deployed"],
+              "positions_observed_in_phase3_rows":
+                  sorted(set(lineage_positions)),
+              "db_observed_in_phase3_rows":"DB" in lineage_positions,
+              "noncohort_prod_mult_changed":
+                  idp3["noncohort_prod_mult_changed"],
+              "prior_dl_lb_audit_decision":dl_lb["decision"],
+              "prior_dl_lb_audit_production_changed":
+                  dl_lb["production_changed"],
+              "prior_dl_lb_audit_production_change_authorized":
+                  dl_lb["production_change_authorized"],
+              "interpretation":"The prior DL/LB transport-residual finding is preserved as context but is not transferred to DB absent direct DB evidence."
+          }
+
+          gates={
+              "minimum_live_db_count":
+                  len(dbs)>=protocol["hard_integrity_gates"]["minimum_live_db_count"],
+              "all_live_db_values_positive":
+                  all(r["fv"]>0 for r in dbs),
+              "unique_live_db_keys":
+                  len({r["key"] for r in dbs})==len(dbs),
+              "minimum_phase1_db_candidate_coverage_share":
+                  phase1_coverage>=protocol["hard_integrity_gates"][
+                      "minimum_phase1_db_candidate_coverage_share"
+                  ],
+              "minimum_phase1_current_vs_candidate_spearman":
+                  p1_rank["spearman_current_vs_phase1"]>=protocol[
+                      "hard_integrity_gates"
+                  ]["minimum_phase1_current_vs_candidate_spearman"],
+              "minimum_phase1_top_n_overlap_share":
+                  p1_rank["top_n_overlap_share"]>=protocol[
+                      "hard_integrity_gates"
+                  ]["minimum_phase1_top_n_overlap_share"],
+              "age_v2_must_not_authorize_deployment":
+                  age_eval.get("deployment_authorized") is False
+                  and age_eval.get("age_curve_change_authorized") is False,
+              "position_weight_v2_must_not_authorize_deployment":
+                  pw_eval.get("deployment_authorized") is False
+                  and pw_eval.get("position_weight_change_authorized") is False,
+              "db_must_be_outside_idp_position_lineage_deployment":
+                  "DB" not in lineage_positions,
+              "prior_dl_lb_audit_must_not_have_changed_production":
+                  dl_lb.get("production_changed") is False
+                  and dl_lb.get("production_change_authorized") is False,
+              "kicker_excluded_from_scope":
+                  protocol["positions_in_scope"]==["DB"]
+                  and "K" in protocol["excluded_positions"],
+          }
+
+          decision=(
+              protocol["decision_rule"]["otherwise"]
+              if all(gates.values())
+              else protocol["decision_rule"]["if_any_hard_integrity_gate_fails"]
+          )
+
+          result={
+              "schema_version":1,
+              "study_id":"db-structural-integrity-audit-v1",
+              "status":"AUDIT_COMPLETE",
+              "decision":decision,
+              "generated_at_utc":datetime.now(timezone.utc).isoformat(),
+              "repo_commit_sha":subprocess.check_output(
+                  ["git","rev-parse","HEAD"],text=True
+              ).strip(),
+              "research_only":True,
+              "production_change_authorized":False,
+              "production_changed":False,
+              "fitting_performed":False,
+              "named_player_adjustment_performed":False,
+              "positions_in_scope":["DB"],
+              "excluded_positions":["K"],
+              "audit_series_complete_after_this_position":True,
+              "hard_integrity_gates":gates,
+              "deployed_formula":{
+                  "formula":"FV = JS-round(5500 * POSITION_WEIGHT[DB] * age_multiplier * effective_production_multiplier)",
+                  "db_position_weight":pw,
+                  "db_age_curve":age_curve,
+                  "global_scale":55,
+                  "fractional_age_used":False,
+                  "rb_youth_bonus_used":False,
+                  "lb_post_peak_decay_used":False,
+              },
+              "structural_findings":{
+                  "within_db_position_weight_cancels":True,
+                  "db1":db1,
+                  "reference_ranks":reference_ranks,
+                  "counts_within_percent_of_db1":within_db1,
+                  "rank_bands":rank_bands,
+                  "decomposition":decomposition,
+                  "live_semantics":live_semantics,
+                  "outlier_diagnostics":outlier_diagnostics,
+                  "sensitivity_summary":sensitivity_summary,
+                  "age_surface":age_surface,
+                  "phase1_rank_order_is_highly_stable":(
+                      p1_rank["spearman_current_vs_phase1"]>=0.95
+                  ),
+                  "phase1_top_n_membership_overlap_share":
+                      p1_rank["top_n_overlap_share"],
+                  "legacy_db_lineage_drift_above_overall_median":
+                      legacy_diag["db_median_drift_above_overall"],
+                  "db_isolated_from_prior_dl_lb_lineage_deployment":
+                      "DB" not in lineage_positions,
+                  "weeks_1_3_are_not_model_selection_evidence":True,
+              },
+              "top_60_live_dbs":dbs[:60],
+              "all_live_dbs":dbs,
+              "top32_sensitivity":sensitivity,
+              "production_v2_phase1_diagnostic":phase1_diag,
+              "legacy_production_lineage_diagnostic":legacy_diag,
+              "existing_prospective_evidence":prospective_diag,
+              "idp_lineage_isolation_diagnostic":idp_isolation_diag,
+              "scientific_limits":[
+                  "This audit can identify mechanical compression, discontinuities, age sensitivity, coverage gaps, statistical outliers, and lineage instability.",
+                  "It cannot establish the true market price of DB scarcity.",
+                  "It cannot infer that a specific named DB is too high or too low.",
+                  "The prior DL/LB transport-residual finding cannot be generalized to DB without direct evidence.",
+                  "Production V2 Phase 1 is transparent but uncalibrated.",
+                  "Weeks 1-3 realized outcomes are too early under frozen prospective protocols to select or deploy a DB model change.",
+                  "No new DB weight, age curve, production transform, youth premium, or player-specific adjustment is fit here.",
+                  "Kickers are excluded from this audit series."
+              ],
+              "next_step_if_green":"Review B1 findings. If no material DB calibration concern is established, freeze no-change and close the positional structural-audit series. Kickers are excluded. If a material concern remains, preregister a broad-cohort DB calibration study before fitting or validation."
+          }
+
+          (D/"audit_result.json").write_text(
+              json.dumps(result,indent=2,sort_keys=True)+"\n"
+          )
+
+          lines=[
+              "# DB Structural Integrity Audit V1",
+              "",
+              f"**Decision:** `{decision}`",
+              "",
+              "## Scope",
+              "",
+              f"- Live DB count: **{len(dbs)}**",
+              f"- Production V2 Phase 1 DB benchmark coverage: **{candidate_n}/{current_n} ({phase1_coverage:.1%})**",
+              f"- Live DB position weight: **{pw:.6f}**",
+              f"- DB age curve: **{age_curve}**",
+              "- Production changes: **None**",
+              "- Fitting: **None**",
+              "- Named-player adjustments: **None**",
+              "- Kickers: **Excluded from this audit series**",
+              "",
+              "## Hard integrity gates",
+              "",
+          ]
+          for k,v in gates.items():
+              lines.append(f"- {k}: **{'PASS' if v else 'FAIL'}**")
+
+          lines += [
+              "",
+              "## Mechanical interpretation",
+              "",
+              "Within DB, position weight is constant. DB-vs-DB spacing therefore comes from production and age mechanics.",
+              "",
+              f"- Current DB1: **{db1['key']} — {db1['fv']} FV**",
+          ]
+          for rank,rec in reference_ranks.items():
+              lines.append(
+                  f"- DB1 / DB{rank} FV ratio: **{rec['db1_to_rank_fv_ratio']:.3f}** "
+                  f"(DB{rank}: {rec['player']} — {rec['fv']})"
+              )
+
+          lines += [
+              "",
+              "## Upper-DB decomposition",
+              "",
+              f"- Top-12 FV coefficient of variation: **{decomposition['top12_fv_cv']:.4f}**",
+              f"- Top-12 production-multiplier coefficient of variation: **{decomposition['top12_prod_mult_cv']:.4f}**",
+              f"- Top-12 age-multiplier coefficient of variation: **{decomposition['top12_age_mult_cv']:.4f}**",
+              f"- Top-24 FV vs production-multiplier Spearman: **{decomposition['top24_fv_vs_prod_mult_spearman']:.4f}**",
+              f"- Top-24 FV vs age-multiplier Spearman: **{decomposition['top24_fv_vs_age_mult_spearman']:.4f}**",
+              "",
+              "## Outlier diagnostics",
+              "",
+              f"- Largest top-32 adjacent FV ratio: **{largest_adjacent['ratio']:.3f}x** "
+              f"between DB{largest_adjacent['higher_rank']} {largest_adjacent['higher_player']} "
+              f"and DB{largest_adjacent['lower_rank']} {largest_adjacent['lower_player']}",
+              f"- FV robust-z flags (|z| >= 3.5): **{len(outlier_diagnostics['fv_robust_z']['flagged'])}**",
+              f"- Production-multiplier robust-z flags (|z| >= 3.5): **{len(outlier_diagnostics['prod_mult_robust_z']['flagged'])}**",
+              f"- FV Tukey upper-fence flags: **{len(outlier_diagnostics['fv_tukey_upper']['flagged'])}**",
+              f"- Production-multiplier Tukey upper-fence flags: **{len(outlier_diagnostics['prod_mult_tukey_upper']['flagged'])}**",
+              "- Statistical flags are review signals only, not correction authority.",
+              "",
+              "## Live fallback / floor semantics",
+              "",
+              f"- Elite production floor applied: **{live_semantics['elite_floor_applied_count']} DBs**",
+              f"- No-history role rescue applied: **{live_semantics['no_history_role_rescue_applied_count']} DBs**",
+              f"- Raw production at floor: **{live_semantics['raw_at_floor_count']} DBs**",
+              f"- Raw production at ceiling: **{live_semantics['raw_at_ceiling_count']} DBs**",
+              f"- Age multiplier at 0.62 floor: **{live_semantics['age_floor_applied_count']} DBs**",
+              "",
+              "## Production lineage and benchmark stability",
+              "",
+              f"- Phase 1 current-vs-transparent-candidate Spearman: **{p1_rank['spearman_current_vs_phase1']:.6f}**",
+              f"- Phase 1 top-{p1_rank['top_n']} overlap: **{p1_rank['top_n_overlap_count']}/{p1_rank['top_n']} ({p1_rank['top_n_overlap_share']:.1%})**",
+              f"- Legacy DB live-vs-generated median absolute PM drift: **{legacy_db['median']:.4f}**",
+              f"- Legacy overall median absolute PM drift: **{legacy['overall_abs_diff']['median']:.4f}**",
+              f"- DB / overall median drift ratio: **{legacy_diag['db_median_abs_diff_vs_overall_ratio']:.3f}x**",
+              "",
+              "## IDP lineage isolation",
+              "",
+              f"- Frozen IDP position-lineage deployed cohort positions observed: **{sorted(set(lineage_positions))}**",
+              f"- DB present in that cohort: **{'YES' if 'DB' in lineage_positions else 'NO'}**",
+              f"- Prior DL/LB structural audit changed production: **{dl_lb['production_changed']}**",
+              "- The DL/LB transport-residual finding is not presumed to apply to DB.",
+              "",
+              "## Existing prospective evidence",
+              "",
+              f"- Completed Age V2 outcome weeks: **{age_eval['completed_outcome_weeks']}**",
+              f"- DB FV vs active PPG Spearman: **{age_db['value_vs_active_ppg']['spearman']:.4f}**",
+              f"- DB FV vs total points Spearman: **{age_db['value_vs_total_points']['spearman']:.4f}**",
+              "- These Weeks 1-3 results are descriptive only under frozen upstream protocols.",
+              "",
+              "## Top 60 live DBs",
+              "",
+              "| Rank | DB | Age | Role | FV | Prod mult | Age mult | Elite floor | No-history rescue |",
+              "|---:|---|---:|---|---:|---:|---:|:---:|:---:|",
+          ]
+          for r in dbs[:60]:
+              lines.append(
+                  f"| {r['live_rank']} | {r['key']} | {r['age']} | {r['role']} | "
+                  f"{r['fv']} | {r['prod_mult']:.4f} | {r['age_mult']:.4f} | "
+                  f"{'Y' if r['elite_floor_applied'] else 'N'} | "
+                  f"{'Y' if r['no_history_role_rescue_applied'] else 'N'} |"
+              )
+
+          lines += [
+              "",
+              "## Scientific limit / next step",
+              "",
+              "This audit does not decide that the DB scale or age curve is correct merely because "
+              "the deployed mechanics are internally consistent. Any material calibration concern "
+              "must be preregistered at the broad-cohort level before fitting or validation.",
+              "",
+              "If B1 is green and review finds no material DB concern, the positional structural-audit "
+              "series closes here. Kickers are intentionally excluded.",
+          ]
+
+          (D/"audit_report.md").write_text(
+              "\n".join(lines).rstrip()+"\n"
+          )
+
+          print(json.dumps({
+              "decision":decision,
+              "live_db_count":len(dbs),
+              "phase1_candidate_coverage_share":phase1_coverage,
+              "phase1_spearman":p1_rank["spearman_current_vs_phase1"],
+              "phase1_top_n_overlap_share":p1_rank["top_n_overlap_share"],
+              "db1":{"player":db1["key"],"fv":db1["fv"]},
+              "db1_to_db32_ratio":reference_ranks["32"]["db1_to_rank_fv_ratio"],
+              "largest_top32_adjacent_ratio":largest_adjacent["ratio"],
+              "fv_robust_z_flag_count":
+                  len(outlier_diagnostics["fv_robust_z"]["flagged"]),
+              "legacy_db_median_abs_pm_drift":legacy_db["median"],
+              "legacy_db_to_overall_median_drift_ratio":
+                  legacy_diag["db_median_abs_diff_vs_overall_ratio"],
+              "db_in_prior_lineage_deployment":"DB" in lineage_positions,
+              "kickers_excluded":True,
+              "all_hard_gates_pass":all(gates.values()),
+          },indent=2))
+          PY
+
+      - name: Validate audit result and write manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+
+          D=Path("research/db-structural-integrity-audit-v1")
+          protocol=json.loads((D/"audit_protocol.json").read_text())
+          result=json.loads((D/"audit_result.json").read_text())
+
+          assert result["status"]=="AUDIT_COMPLETE"
+          assert result["research_only"] is True
+          assert result["production_change_authorized"] is False
+          assert result["production_changed"] is False
+          assert result["fitting_performed"] is False
+          assert result["named_player_adjustment_performed"] is False
+          assert result["positions_in_scope"]==["DB"]
+          assert result["excluded_positions"]==["K"]
+          assert result["audit_series_complete_after_this_position"] is True
+          assert result["decision"] in set(protocol["decision_rule"].values())
+          assert len(result["all_live_dbs"])>=60
+          assert len(result["top_60_live_dbs"])==60
+          assert result["deployed_formula"]["fractional_age_used"] is False
+          assert result["deployed_formula"]["rb_youth_bonus_used"] is False
+          assert result["deployed_formula"]["lb_post_peak_decay_used"] is False
+          assert result["idp_lineage_isolation_diagnostic"][
+              "db_observed_in_phase3_rows"
+          ] is False
+
+          if all(result["hard_integrity_gates"].values()):
+              assert result["decision"]==(
+                  "PASS_DB_STRUCTURAL_AUDIT_FREEZE_REVIEW_REQUIRED_BEFORE_ANY_MODEL_CHANGE"
+              )
+          else:
+              assert result["decision"]==(
+                  "STOP_DB_AUDIT_DATA_OR_LINEAGE_INTEGRITY_FAILURE"
+              )
+
+          def sha(p):
+              return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+          manifest={
+              "schema_version":1,
+              "study_id":"db-structural-integrity-audit-v1",
+              "decision":result["decision"],
+              "research_only":True,
+              "production_change_authorized":False,
+              "production_changed":False,
+              "positions_in_scope":["DB"],
+              "excluded_positions":["K"],
+              "audit_series_complete_after_this_position":True,
+              "files":{
+                  "audit_protocol.json":sha(D/"audit_protocol.json"),
+                  "audit_result.json":sha(D/"audit_result.json"),
+                  "audit_report.md":sha(D/"audit_report.md"),
+              },
+              "frozen_inputs":{
+                  "a20_te_audit_manifest.json":sha(
+                      Path("research/te-structural-integrity-audit-v1/manifest.json")
+                  ),
+                  "idp_dl_lb_structural_audit_manifest.json":sha(
+                      Path("research/idp-dl-lb-structural-audit-v1/manifest.json")
+                  ),
+                  "idp_position_lineage_phase3_confirmation.json":sha(
+                      Path("research/idp-position-lineage-v1/phase3_production_confirmation.json")
+                  ),
+                  "index.html":sha(Path("index.html")),
+                  "snapshot_values.py":sha(
+                      Path("scripts/validation/snapshot_values.py")
+                  ),
+                  "production_v2_phase1_audit.json":sha(
+                      Path("research/production-v2/production_v2_phase1_audit.json")
+                  ),
+                  "prod_mult_lineage_audit.json":sha(
+                      Path("research/legacy-prod-mult/prod_mult_lineage_audit.json")
+                  ),
+                  "age_curve_v2_phase5_evaluation.json":sha(
+                      Path("research/age-curve-v2/age_curve_v2_phase5_evaluation.json")
+                  ),
+                  "position_weight_v2_phase5_evaluation.json":sha(
+                      Path("research/position-weight-v2/position_weight_v2_phase5_evaluation.json")
+                  ),
+              }
+          }
+          (D/"manifest.json").write_text(
+              json.dumps(manifest,indent=2,sort_keys=True)+"\n"
+          )
+          print("PASS: B1 DB audit manifest frozen; kickers excluded.")
+          PY
+
+      - name: Prove production and audit inputs remained immutable
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum -c "${RUNNER_TEMP}/b1-immutable-production-and-inputs.sha256"
+
+          python3 scripts/validation/snapshot_values.py --selftest
+          python3 scripts/validation/repo_regression_checks.py
+
+          echo "PASS: B1 made no production or upstream research changes."
+
+      - name: Prove exact B1 research-only scope
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import subprocess
+
+          allowed={
+              "research/db-structural-integrity-audit-v1/audit_protocol.json",
+              "research/db-structural-integrity-audit-v1/audit_result.json",
+              "research/db-structural-integrity-audit-v1/audit_report.md",
+              "research/db-structural-integrity-audit-v1/manifest.json",
+          }
+
+          s=subprocess.check_output(
+              ["git","status","--porcelain=v1","--untracked-files=all"],
+              text=True
+          )
+          touched={line[3:] for line in s.splitlines() if line.strip()}
+
+          unexpected=touched-allowed
+          missing=allowed-touched
+          if unexpected:
+              raise SystemExit(
+                  "Unexpected B1 file changes: "
+                  + ", ".join(sorted(unexpected))
+              )
+          if missing:
+              raise SystemExit(
+                  "Missing B1 research files: "
+                  + ", ".join(sorted(missing))
+              )
+
+          print("PASS: B1 touched exactly four DB research files.")
+          PY
+
+          git diff --check
+
+      - name: Commit B1 DB audit freeze
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$BASE_SHA" || {
+            echo "ERROR: origin/main moved during B1."
+            exit 1
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add research/db-structural-integrity-audit-v1/
+
+          git diff --cached --check
+          git commit -m "Freeze DB structural integrity audit V1"
+          git push origin HEAD:main
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          echo "PASS: B1 DB structural integrity audit committed cleanly."
