@@ -1,0 +1,778 @@
+name: B7 Draft Class Strength V1 - Stage A Null Autopsy and Defect Confirmation
+
+"on":
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  B6_V3_RUN_ID: "36648176714"
+
+jobs:
+  stage_a:
+    name: B7 Stage A null autopsy
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Capture B7 base SHA
+        id: base
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13.15"
+
+      - name: Install regression dependency
+        run: python3 -m pip install --disable-pip-version-check --no-cache-dir "requests==2.34.2"
+
+      - name: Guard frozen B5 and final B6 V3 result
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          D = Path("research/draft-class-strength-v1")
+          b5m = json.loads((D / "b5_manifest.json").read_text())
+          b5p = json.loads(
+              (D / "b5_option_d_historical_fundamental_target_preregistration.json").read_text()
+          )
+          b6m = json.loads((D / "b6_manifest.json").read_text())
+          b6r = json.loads((D / "b6_formal_option_d_result.json").read_text())
+          b6v = json.loads((D / "b6_formal_v0_and_bridge.json").read_text())
+          b6p = json.loads((D / "b6_option_d_historical_target_panel.json").read_text())
+
+          assert b5m["decision"] == "PASS_B5_OPTION_D_PREREGISTRATION_FROZEN_B6_NEXT"
+          assert b5p["historical_range_contract"]["candidate_years"] == list(range(2010, 2024))
+          assert b5p["formal_v0_next_stage"]["permutations"] == 50000
+          assert b5p["formal_v0_next_stage"]["seed"] == 20260930
+          assert b5p["formal_v0_next_stage"]["reliability_bootstrap"]["replicates"] == 10000
+
+          assert b6m["decision"] == "STOP_B6_FORMAL_V0_FAILED_RETAIN_NEUTRAL_1_00"
+          for name, expected in b6m["output_hashes"].items():
+              got = hashlib.sha256((D / name).read_bytes()).hexdigest()
+              assert got == expected, (name, expected, got)
+
+          assert b6r["complete_class_n"] == 14
+          assert b6r["complete_years"] == list(range(2010, 2024))
+          assert b6r["formal_v0_run"] is True
+          assert b6r["formal_v0_gate_pass"] is False
+          assert b6r["predictor_source_feasibility_authorized"] is False
+          assert b6r["predictor_fit_performed"] is False
+          assert b6r["2027_class_scored"] is False
+          assert b6r["production_change_authorized"] is False
+
+          assert b6v["primary_null"]["permutations"] == 50000
+          assert b6v["primary_null"]["seed"] == 20260930
+          assert abs(b6v["primary_null"]["mean_variance"] - 0.03448779842008359) < 1e-15
+          assert abs(b6v["primary_null"]["permutation_p_value"] - 0.99580008399832) < 1e-15
+          assert abs(b6v["observed_class_score_variance"] - 0.010169620604437407) < 1e-15
+          assert b6v["reliability"] == 0.0
+
+          assert b6p["complete_class_n"] == 14
+          assert b6p["complete_years"] == list(range(2010, 2024))
+          assert b6p["fantasy_rookie_adp_used"] is False
+          assert b6p["ktc_used"] is False
+          assert b6p["2027_class_scored"] is False
+          assert b6p["production_change_authorized"] is False
+
+          print("PASS: B5 and final B6 V3 artifacts/hash lineage guarded.")
+          PY
+
+      - name: Run repository regression baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/repo_regression_checks.py
+          git reset --hard HEAD
+          git clean -fd
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          echo "PASS: repository regression baseline."
+
+      - name: Download exact B6 V3 pre-outcome source artifact
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          repository: ajknoll23-code/LOG-Trade-Calculator
+          run-id: 36648176714
+          name: dcs-b6-preoutcome-source
+          path: /tmp/b7-b6-source
+
+      - name: Download exact B6 V3 season artifacts
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          repository: ajknoll23-code/LOG-Trade-Calculator
+          run-id: 36648176714
+          pattern: dcs-b6-season-*
+          path: /tmp/b7-b6-seasons
+          merge-multiple: true
+
+      - name: Run Stage A null autopsy diagnostics and frozen kill-switch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import importlib.util
+          import json
+          import math
+          import random
+          import statistics
+          from collections import defaultdict
+          from datetime import date
+          from pathlib import Path
+
+          ROOT = Path.cwd()
+          D = ROOT / "research/draft-class-strength-v1"
+          SRC = Path("/tmp/b7-b6-source")
+          SD = Path("/tmp/b7-b6-seasons")
+
+          pre = json.loads(
+              (D / "b5_option_d_historical_fundamental_target_preregistration.json").read_text()
+          )
+          b6 = json.loads((D / "b6_formal_v0_and_bridge.json").read_text())
+          b6_panel = json.loads((D / "b6_option_d_historical_target_panel.json").read_text())
+          pop = json.loads((SRC / "population_source_gate.json").read_text())
+
+          YEARS = list(range(2010, 2024))
+          PRIMARY = ("QB", "RB", "WR", "TE")
+          B6_SEED = 20260930
+          PERMUTATIONS = 50000
+          BOOTSTRAPS = 10000
+          SIZE_DRIVEN_SHARE_GATE = 0.40
+
+          assert pre["historical_range_contract"]["candidate_years"] == YEARS
+          assert pre["formal_v0_next_stage"]["seed"] == B6_SEED
+          assert pre["formal_v0_next_stage"]["permutations"] == PERMUTATIONS
+          assert pre["formal_v0_next_stage"]["reliability_bootstrap"]["replicates"] == BOOTSTRAPS
+          assert pop["candidate_years"] == YEARS
+          assert pop["primary_positions"] == list(PRIMARY)
+          assert pop["population_branch"] == "DRAFTED_ONLY_PRIMARY_UDFA_SENSITIVITY"
+          assert pop["source_gate_pass"] is True
+          assert pop["2027_class_scored"] is False
+          assert pop["production_change_authorized"] is False
+
+          # Exact B6 V3 season artifacts only; no new outcome endpoints are called.
+          arts = {}
+          for season in range(2010, 2026):
+              p = SD / f"season_{season}.json"
+              assert p.exists(), p
+              a = json.loads(p.read_text())
+              assert a["season"] == season
+              assert a["provider"] == "Sleeper historical weekly NFL stats"
+              assert a["availability_pass"] is True
+              assert a["2027_class_scored"] is False
+              assert a["production_change_authorized"] is False
+              arts[season] = a
+
+          v5 = json.loads(
+              (ROOT / "research/draft-pick-fv-v5/r1_r2_bridge_preregistration_v5.json").read_text()
+          )
+          bridge = v5["frozen_scale_bridge"]
+          h3 = pre["h3o2_value_contract"]
+          weights = {
+              k: float(v) for k, v in h3["position_weights_primary_subset"].items()
+          }
+          ranks = {
+              k: int(v) for k, v in h3["replacement_ranks_primary_subset"].items()
+          }
+          prod = bridge["production_transform"]
+          base = float(h3["o2_scale"]["base_scale"])
+
+          age_path = ROOT / "scripts/validation/snapshot_values.py"
+          spec = importlib.util.spec_from_file_location("dcs_b7_age", age_path)
+          age_mod = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(age_mod)
+          age_cfg = {
+              "age_curve": bridge["age_curve"],
+              "qb_post_peak_floor": float(bridge["qb_post_peak_floor"]),
+              "lb_post_peak_decay_power": float(bridge["lb_post_peak_decay_power"]),
+          }
+
+          def clamp(v, lo, hi):
+              return max(lo, min(hi, v))
+
+          def sched_games(season):
+              return 17 if season >= 2021 else 16
+
+          def age_sep1(birth, season):
+              d = date.fromisoformat(str(birth)[:10])
+              a = date(season, 9, 1)
+              return a.year - d.year - ((a.month, a.day) < (d.month, d.day))
+
+          # Reconstruct exact B6 replacement baselines.
+          baselines = {}
+          for season, art in arts.items():
+              by_pos = defaultdict(list)
+              for sid, rec in art["players"].items():
+                  pos = rec.get("season_position")
+                  if pos not in PRIMARY or int(rec["games"]) < 3:
+                      continue
+                  by_pos[pos].append(
+                      (float(rec["season_total"]) / int(rec["games"]), sid)
+                  )
+              bb = {}
+              for pos in PRIMARY:
+                  arr = sorted(by_pos[pos], key=lambda x: (-x[0], x[1]))
+                  rank = ranks[pos]
+                  assert len(arr) >= rank, (season, pos, len(arr), rank)
+                  bb[pos] = {
+                      "replacement_ppg": arr[rank - 1][0],
+                      "eligible_n": len(arr),
+                  }
+              baselines[season] = bb
+
+          # Reconstruct every B6 H3.O2-ready drafted player, not just the saved top 48.
+          class_rows = defaultdict(list)
+          for row in pop["players"]:
+              y = int(row["draft_year"])
+              pos = row["position"]
+              sid = row.get("sleeper_id")
+              birth = row.get("birth_date")
+              req = [y, y + 1, y + 2]
+              ready = bool(sid) and bool(birth) and all(s in baselines for s in req)
+              annual = []
+              if ready:
+                  for season in req:
+                      rec = arts[season]["players"].get(str(sid))
+                      games = int(rec["games"]) if rec else 0
+                      total = float(rec["season_total"]) if rec else 0.0
+                      denom = (
+                          float(baselines[season][pos]["replacement_ppg"])
+                          * sched_games(season)
+                      )
+                      realized = (
+                          float(prod["zero_games_override"])
+                          if games == 0
+                          else clamp(
+                              float(prod["intercept"])
+                              + float(prod["slope"]) * (total / denom),
+                              float(prod["floor"]),
+                              float(prod["ceiling"]),
+                          )
+                      )
+                      age = age_sep1(birth, season)
+                      age_mult = float(
+                          age_mod.age_multiplier(
+                              pos, age, "Starter", realized, realized, age_cfg
+                          )
+                      )
+                      annual.append(base * weights[pos] * age_mult * realized)
+              h3o2 = statistics.fmean(annual) if ready and len(annual) == 3 else None
+              class_rows[y].append({
+                  **row,
+                  "h3_o2_ready": h3o2 is not None,
+                  "H3_O2": h3o2,
+              })
+
+          ready_values = {
+              y: [float(r["H3_O2"]) for r in class_rows[y] if r["h3_o2_ready"]]
+              for y in YEARS
+          }
+          ready_counts = {y: len(ready_values[y]) for y in YEARS}
+
+          expected_counts = {
+              int(y): int(b6_panel["classes"][str(y)]["h3_o2_ready_n"])
+              for y in YEARS
+          }
+          assert ready_counts == expected_counts, (ready_counts, expected_counts)
+
+          def class_totals_and_scores(values_by_year, years):
+              totals = {}
+              for y in years:
+                  vals = sorted(values_by_year[y], reverse=True)[:48]
+                  assert len(vals) >= 48, (y, len(vals))
+                  totals[y] = sum(vals)
+              scores = {}
+              for y in years:
+                  loo = statistics.fmean(totals[o] for o in years if o != y)
+                  scores[y] = math.log(totals[y] / loo)
+              return totals, scores
+
+          def score_variance(values_by_year, years):
+              _, scores = class_totals_and_scores(values_by_year, years)
+              return statistics.variance(scores.values())
+
+          obs_totals, obs_scores = class_totals_and_scores(ready_values, YEARS)
+          observed_var = statistics.variance(obs_scores.values())
+
+          # Tight replay: target panel itself must match.
+          for y in YEARS:
+              saved = b6_panel["classes"][str(y)]
+              assert abs(obs_totals[y] - float(saved["top48_total"])) < 1e-7, (
+                  y, obs_totals[y], saved["top48_total"]
+              )
+              assert abs(obs_scores[y] - float(saved["class_log_strength"])) < 1e-12, (
+                  y, obs_scores[y], saved["class_log_strength"]
+              )
+          assert abs(observed_var - float(b6["observed_class_score_variance"])) < 1e-15
+
+          def b6_null(years, permutations, seed, capture_class_means=False):
+              rng = random.Random(seed)
+              pooled = []
+              sizes = []
+              for y in years:
+                  vals = list(ready_values[y])
+                  pooled.extend(vals)
+                  sizes.append((y, len(vals)))
+
+              # Recompute the observed leave-one-out scores inside the exact
+              # requested window. This matters for A2/A3 because their baselines
+              # differ from the 14-class B6 baseline.
+              _, observed_scores_local = class_totals_and_scores(
+                  ready_values, years
+              )
+              observed_var_local = statistics.variance(
+                  observed_scores_local.values()
+              )
+
+              work = list(pooled)
+              null_vars = []
+              exceed = 0
+              score_sums = {y: 0.0 for y in years}
+
+              for _ in range(permutations):
+                  rng.shuffle(work)
+                  off = 0
+                  pv = {}
+                  for y, n in sizes:
+                      pv[y] = work[off:off+n]
+                      off += n
+                  _, scores = class_totals_and_scores(pv, years)
+                  nv = statistics.variance(scores.values())
+                  null_vars.append(nv)
+                  if nv >= observed_var_local:
+                      exceed += 1
+                  if capture_class_means:
+                      for y in years:
+                          score_sums[y] += scores[y]
+
+              p = (exceed + 1) / (permutations + 1)
+              mean_var = statistics.fmean(null_vars)
+              means = (
+                  {y: score_sums[y] / permutations for y in years}
+                  if capture_class_means else None
+              )
+              return {
+                  "p_value": p,
+                  "mean_null_variance": mean_var,
+                  "null_variances": null_vars,
+                  "per_class_null_mean_log_strength": means,
+              }
+
+          # A1: exact 14-class B6 replay and null autopsy.
+          a1 = b6_null(YEARS, PERMUTATIONS, B6_SEED, capture_class_means=True)
+
+          # Reproduce B6 exactly before interpreting anything.
+          replay_mean_delta = abs(
+              a1["mean_null_variance"] - float(b6["primary_null"]["mean_variance"])
+          )
+          replay_p_delta = abs(
+              a1["p_value"] - float(b6["primary_null"]["permutation_p_value"])
+          )
+          assert replay_mean_delta < 1e-15, replay_mean_delta
+          assert replay_p_delta < 1e-15, replay_p_delta
+
+          per_class_means = a1["per_class_null_mean_log_strength"]
+          deterministic_size_variance = statistics.variance(per_class_means.values())
+          size_driven_share = (
+              deterministic_size_variance / a1["mean_null_variance"]
+              if a1["mean_null_variance"] > 0 else 0.0
+          )
+
+          # Correlation diagnostic: ready-set size vs mean score under the B6 null.
+          def pearson(x, y):
+              mx, my = statistics.fmean(x), statistics.fmean(y)
+              num = sum((a-mx)*(b-my) for a,b in zip(x,y))
+              dx = math.sqrt(sum((a-mx)**2 for a in x))
+              dy = math.sqrt(sum((b-my)**2 for b in y))
+              return num/(dx*dy) if dx and dy else 0.0
+
+          size_null_mean_pearson = pearson(
+              [ready_counts[y] for y in YEARS],
+              [per_class_means[y] for y in YEARS],
+          )
+
+          def subset_diagnostic(years):
+              _, scores = class_totals_and_scores(ready_values, years)
+              obs = statistics.variance(scores.values())
+              result = b6_null(years, PERMUTATIONS, B6_SEED, False)
+              reliability = max(
+                  0.0,
+                  1.0 - result["mean_null_variance"] / obs
+              ) if obs > 0 else 0.0
+
+              # Same B6 bootstrap concept and same frozen B6 bootstrap seed.
+              brng = random.Random(20261001)
+              boot_rel = []
+              for _ in range(BOOTSTRAPS):
+                  bv = {}
+                  for y in years:
+                      vals = ready_values[y]
+                      bv[y] = [
+                          vals[brng.randrange(len(vals))]
+                          for __ in range(len(vals))
+                      ]
+                  vv = score_variance(bv, years)
+                  rr = (
+                      max(0.0, 1.0 - result["mean_null_variance"] / vv)
+                      if vv > 0 else 0.0
+                  )
+                  boot_rel.append(rr)
+              boot_rel.sort()
+
+              def q(arr, p):
+                  return arr[int(round((len(arr)-1)*p))]
+
+              return {
+                  "years": years,
+                  "ready_counts": {str(y): ready_counts[y] for y in years},
+                  "observed_variance": obs,
+                  "permutations": PERMUTATIONS,
+                  "seed": B6_SEED,
+                  "mean_null_variance": result["mean_null_variance"],
+                  "permutation_p_value": result["p_value"],
+                  "excess_variance_ratio_b6_formula": reliability,
+                  "bootstrap_replicates": BOOTSTRAPS,
+                  "bootstrap_seed": 20261001,
+                  "interval_80": [q(boot_rel, .10), q(boot_rel, .90)],
+                  "interval_95": [q(boot_rel, .025), q(boot_rel, .975)],
+                  "diagnostic_only": True,
+              }
+
+          # A2 / A3. Same B6 procedure, predeclared windows, and exact B6
+          # random seeds. These are diagnostic only and cannot change the Stage A gate.
+          a2 = subset_diagnostic(list(range(2014, 2024)))
+          a3 = subset_diagnostic(list(range(2018, 2024)))
+
+          # A4: outcome-independent first-48 NFL-drafted skill cohort coverage audit.
+          coverage = {}
+          for y in YEARS:
+              rows = sorted(class_rows[y], key=lambda r: int(r["draft_pick"]))
+              first48 = rows[:48]
+              assert len(first48) == 48, (y, len(first48))
+              missing = [r for r in first48 if not r["h3_o2_ready"]]
+              coverage[str(y)] = {
+                  "drafted_skill_player_n": len(rows),
+                  "first48_n": 48,
+                  "first48_h3_o2_ready_n": 48 - len(missing),
+                  "first48_not_h3_o2_ready_n": len(missing),
+                  "first48_not_h3_o2_ready_share": len(missing) / 48,
+                  "missing_first48": [
+                      {
+                          "draft_pick": r["draft_pick"],
+                          "draft_round": r["draft_round"],
+                          "name": r["name"],
+                          "position": r["position"],
+                          "stable_id": r["stable_id"],
+                          "sleeper_id": r.get("sleeper_id"),
+                          "birth_date_present": bool(r.get("birth_date")),
+                      }
+                      for r in missing
+                  ],
+              }
+
+          proceed = size_driven_share >= SIZE_DRIVEN_SHARE_GATE
+          decision = (
+              "PASS_B7_STAGE_A_DEFECT_CONFIRMED_AUTHORIZE_STAGE_B_PREREGISTRATION"
+              if proceed
+              else
+              "STOP_B7_STAGE_A_DEFECT_NOT_CONFIRMED_CLOSE_DRAFT_CLASS_STRENGTH_V1_NEUTRAL_1_00"
+          )
+
+          null_autopsy = {
+              "schema_version": 1,
+              "study_id": "draft-class-strength-v1",
+              "stage": "b7_stage_a_null_autopsy",
+              "source_b6_v3_run_id": 36648176714,
+              "b6_exact_replay_pass": True,
+              "years": YEARS,
+              "ready_counts": {str(y): ready_counts[y] for y in YEARS},
+              "observed_variance": observed_var,
+              "permutations": PERMUTATIONS,
+              "seed": B6_SEED,
+              "replayed_mean_null_variance": a1["mean_null_variance"],
+              "replayed_permutation_p_value": a1["p_value"],
+              "per_class_null_mean_log_strength": {
+                  str(y): per_class_means[y] for y in YEARS
+              },
+              "variance_of_per_class_null_means": deterministic_size_variance,
+              "size_driven_share": size_driven_share,
+              "size_driven_share_gate": SIZE_DRIVEN_SHARE_GATE,
+              "ready_count_vs_null_mean_pearson": size_null_mean_pearson,
+              "stage_b_authorized_by_stage_a": proceed,
+              "2027_class_scored": False,
+              "production_change_authorized": False,
+          }
+
+          diagnostics = {
+              "schema_version": 1,
+              "study_id": "draft-class-strength-v1",
+              "stage": "b7_stage_a_equal_size_diagnostics",
+              "a2_2014_2023": a2,
+              "a3_2018_2023": a3,
+              "gating_authority": False,
+              "2027_class_scored": False,
+              "production_change_authorized": False,
+          }
+
+          coverage_audit = {
+              "schema_version": 1,
+              "study_id": "draft-class-strength-v1",
+              "stage": "b7_stage_a_fixed_cohort_coverage_audit",
+              "population_definition": (
+                  "first 48 NFL-drafted QB/RB/WR/TE players by overall NFL draft pick "
+                  "within each year; selection is outcome-independent"
+              ),
+              "years": YEARS,
+              "coverage": coverage,
+              "gating_authority": False,
+              "purpose": "Stage B feasibility and missingness diagnosis only",
+              "2027_class_scored": False,
+              "production_change_authorized": False,
+          }
+
+          result = {
+              "schema_version": 1,
+              "study_id": "draft-class-strength-v1",
+              "stage": "b7_stage_a_defect_confirmation",
+              "decision": decision,
+              "source_b6_v3_run_id": 36648176714,
+              "b6_exact_replay_pass": True,
+              "size_driven_share": size_driven_share,
+              "size_driven_share_gate": SIZE_DRIVEN_SHARE_GATE,
+              "gate_operator": ">=",
+              "stage_b_preregistration_authorized": proceed,
+              "stage_b_execution_authorized": False,
+              "predictor_source_feasibility_authorized": False,
+              "predictor_fit_performed": False,
+              "2027_features_read": False,
+              "2027_class_scored": False,
+              "production_change_authorized": False,
+              "if_pass": (
+                  "Freeze B7 Stage B fixed first-48 cohort and rank-stratified null "
+                  "before any Stage B outcome analysis."
+              ),
+              "if_stop": (
+                  "Close Draft Class Strength V1 permanently at neutral multiplier 1.00. "
+                  "Do not fit predictors or score 2027."
+              ),
+          }
+
+          outputs = {
+              "b7_stage_a_null_autopsy.json": null_autopsy,
+              "b7_stage_a_equal_size_diagnostics.json": diagnostics,
+              "b7_stage_a_fixed_cohort_coverage_audit.json": coverage_audit,
+              "b7_stage_a_result.json": result,
+          }
+          for name, obj in outputs.items():
+              (D / name).write_text(
+                  json.dumps(obj, indent=2, sort_keys=True) + "\n",
+                  encoding="utf-8",
+              )
+
+          report = [
+              "# Draft Class Strength V1 — B7 Stage A",
+              "",
+              f"**Decision:** `{decision}`",
+              "",
+              "## Gate",
+              f"- B6 exact replay: **PASS**",
+              f"- Size-driven share: **{size_driven_share:.6f}**",
+              f"- Frozen Stage B threshold: **>= {SIZE_DRIVEN_SHARE_GATE:.2f}**",
+              f"- Stage B preregistration authorized: **{'Yes' if proceed else 'No'}**",
+              "",
+              "## Non-gating diagnostics",
+              f"- 2014–2023 permutation p: **{a2['permutation_p_value']:.6f}**",
+              f"- 2018–2023 permutation p: **{a3['permutation_p_value']:.6f}**",
+              "",
+              "No predictors were fit. No 2027 data were scored. No production values changed.",
+              "",
+          ]
+          (D / "b7_stage_a_report.md").write_text(
+              "\n".join(report),
+              encoding="utf-8",
+          )
+
+          print(json.dumps({
+              "decision": decision,
+              "b6_exact_replay_pass": True,
+              "size_driven_share": size_driven_share,
+              "stage_b_preregistration_authorized": proceed,
+              "a2_2014_2023_p": a2["permutation_p_value"],
+              "a3_2018_2023_p": a3["permutation_p_value"],
+              "2027_class_scored": False,
+              "production_change_authorized": False,
+          }, indent=2))
+          PY
+
+      - name: Validate Stage A decision and freeze manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          D = Path("research/draft-class-strength-v1")
+          a1 = json.loads((D / "b7_stage_a_null_autopsy.json").read_text())
+          d = json.loads((D / "b7_stage_a_equal_size_diagnostics.json").read_text())
+          c = json.loads((D / "b7_stage_a_fixed_cohort_coverage_audit.json").read_text())
+          r = json.loads((D / "b7_stage_a_result.json").read_text())
+
+          assert a1["b6_exact_replay_pass"] is True
+          assert a1["permutations"] == 50000
+          assert a1["seed"] == 20260930
+          assert abs(a1["replayed_mean_null_variance"] - 0.03448779842008359) < 1e-15
+          assert abs(a1["replayed_permutation_p_value"] - 0.99580008399832) < 1e-15
+          assert a1["size_driven_share_gate"] == 0.40
+
+          expected_pass = a1["size_driven_share"] >= 0.40
+          assert r["stage_b_preregistration_authorized"] is expected_pass
+          assert r["stage_b_execution_authorized"] is False
+          assert r["predictor_source_feasibility_authorized"] is False
+          assert r["predictor_fit_performed"] is False
+          assert r["2027_features_read"] is False
+          assert r["2027_class_scored"] is False
+          assert r["production_change_authorized"] is False
+
+          if expected_pass:
+              assert r["decision"] == (
+                  "PASS_B7_STAGE_A_DEFECT_CONFIRMED_AUTHORIZE_STAGE_B_PREREGISTRATION"
+              )
+          else:
+              assert r["decision"] == (
+                  "STOP_B7_STAGE_A_DEFECT_NOT_CONFIRMED_CLOSE_DRAFT_CLASS_STRENGTH_V1_NEUTRAL_1_00"
+              )
+
+          assert d["gating_authority"] is False
+          assert c["gating_authority"] is False
+          assert c["purpose"] == "Stage B feasibility and missingness diagnosis only"
+
+          output_names = [
+              "b7_stage_a_null_autopsy.json",
+              "b7_stage_a_equal_size_diagnostics.json",
+              "b7_stage_a_fixed_cohort_coverage_audit.json",
+              "b7_stage_a_result.json",
+              "b7_stage_a_report.md",
+          ]
+          manifest = {
+              "schema_version": 1,
+              "study_id": "draft-class-strength-v1",
+              "stage": "b7_stage_a_manifest",
+              "decision": r["decision"],
+              "source_b6_v3_run_id": 36648176714,
+              "output_hashes": {
+                  name: hashlib.sha256((D / name).read_bytes()).hexdigest()
+                  for name in output_names
+              },
+              "stage_b_preregistration_authorized":
+                  r["stage_b_preregistration_authorized"],
+              "stage_b_execution_authorized": False,
+              "predictor_fit_performed": False,
+              "2027_class_scored": False,
+              "production_change_authorized": False,
+          }
+          (D / "b7_stage_a_manifest.json").write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          all_text = "\n".join(
+              p.read_text(encoding="utf-8")
+              for p in D.glob("b7_stage_a_*")
+              if p.is_file()
+          ).lower()
+          assert '"stage_b_execution_authorized": true' not in all_text
+          assert '"predictor_fit_performed": true' not in all_text
+          assert '"2027_class_scored": true' not in all_text
+          assert '"production_change_authorized": true' not in all_text
+
+          print("PASS: B7 Stage A result validated and manifest frozen.")
+          PY
+
+      - name: Prove B7 Stage A research-only mutation scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import subprocess
+
+          raw = subprocess.check_output(
+              ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+              text=True,
+          )
+          touched = [line[3:] for line in raw.splitlines() if line.strip()]
+          assert touched, "Expected B7 Stage A research artifacts."
+          assert all(
+              p.startswith("research/draft-class-strength-v1/b7_stage_a_")
+              for p in touched
+          ), touched
+          assert not any(p.startswith(("model/", "scripts/", "data/")) for p in touched)
+          assert "index.html" not in touched
+          assert "free-agent-board.html" not in touched
+
+          print("PASS: B7 Stage A mutation scope is research-only.")
+          PY
+
+      - name: Commit frozen B7 Stage A artifacts
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$BASE_SHA" || {
+            echo "ERROR: origin/main moved during B7 Stage A."
+            exit 1
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            research/draft-class-strength-v1/b7_stage_a_null_autopsy.json \
+            research/draft-class-strength-v1/b7_stage_a_equal_size_diagnostics.json \
+            research/draft-class-strength-v1/b7_stage_a_fixed_cohort_coverage_audit.json \
+            research/draft-class-strength-v1/b7_stage_a_result.json \
+            research/draft-class-strength-v1/b7_stage_a_report.md \
+            research/draft-class-strength-v1/b7_stage_a_manifest.json
+
+          if git diff --cached --quiet; then
+            echo "PASS: B7 Stage A artifacts already match; no commit required."
+            exit 0
+          fi
+
+          git commit -m "Run Draft Class Strength V1 B7 Stage A null autopsy"
+          git push origin HEAD:main
+
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$(git rev-parse HEAD)"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+          echo "PASS: B7 Stage A artifacts committed."
