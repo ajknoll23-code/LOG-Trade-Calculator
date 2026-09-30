@@ -1,0 +1,483 @@
+name: B11 Draft Class Strength V1 - Top-60 Priority Identity Recovery V2
+
+"on":
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  DP_REF: "09098a1c9def0f7e8844762cc2500a8426c359bc"
+  FDK_REF: "c39b555fff010cd745e92ed1e1fd0e77ec5ab5c9"
+
+jobs:
+  top60_identity:
+    name: B11 recover only unresolved NFL top-60 picks
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Capture B11 base SHA
+        id: base
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13.15"
+
+      - name: Install regression dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir "requests==2.34.2"
+
+      - name: Guard B10 V2 and freeze top-60 scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+
+          D=Path("research/draft-class-strength-v1")
+          m=json.loads((D/"b10_v2_manifest.json").read_text())
+          r=json.loads((D/"b10_v2_identity_recovery_result.json").read_text())
+          q=json.loads((D/"b10_v2_remaining_manual_identity_queue.json").read_text())
+
+          assert m["decision"]=="STOP_B10_V2_IDENTITY_RECOVERY_ABOVE_B8_TOLERANCE_BOUNDED_B11_REVIEW_ONLY"
+          for name,expected in m["output_hashes"].items():
+              got=hashlib.sha256((D/name).read_bytes()).hexdigest()
+              assert got==expected,(name,expected,got)
+          assert r["recovered_n"]==0
+          assert r["remaining_unresolved_n"]==29
+          assert q["remaining_unresolved_n"]==29
+
+          top60=sorted(
+              [x for x in q["players"] if int(x["draft_pick"])<=60],
+              key=lambda x:(int(x["draft_year"]),int(x["draft_pick"]))
+          )
+          expected=[
+              ("Montario Hardesty",2010,59),
+              ("Jake Locker",2011,8),
+              ("Jonathan Baldwin",2011,26),
+              ("Titus Young",2011,44),
+              ("Mikel Leshoure",2011,57),
+              ("David Wilson",2012,32),
+          ]
+          got=[(x["name"],int(x["draft_year"]),int(x["draft_pick"])) for x in top60]
+          assert got==expected,(got,expected)
+          assert len(top60)==6
+
+          print("PASS: top-60 recovery scope frozen at exactly 6 players.")
+          for x in top60:
+              print(f'  {x["draft_year"]} pick {x["draft_pick"]}: {x["name"]}')
+          PY
+
+      - name: Run repository regression baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/repo_regression_checks.py
+          git reset --hard HEAD
+          git clean -fd
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Clone frozen identity sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/b11top60-dp /tmp/b11top60-fdk /tmp/b11top60
+          git clone --quiet https://github.com/dynastyprocess/data.git /tmp/b11top60-dp
+          cd /tmp/b11top60-dp
+          git checkout --quiet "$DP_REF"
+          test "$(git rev-parse HEAD)" = "$DP_REF"
+
+          git clone --quiet https://github.com/nathanbraun/fantasy-developer-kit.git /tmp/b11top60-fdk
+          cd /tmp/b11top60-fdk
+          git checkout --quiet "$FDK_REF"
+          test "$(git rev-parse HEAD)" = "$FDK_REF"
+          test -f projects/integration/raw/sleeper/lookup.csv
+
+          mkdir -p /tmp/b11top60
+          echo "PASS: frozen identity sources available."
+
+      - name: Recover only top-60 unresolved players
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+          import csv,json,re,subprocess,unicodedata,hashlib
+          from collections import defaultdict
+          from pathlib import Path
+
+          ROOT=Path.cwd()
+          D=ROOT/"research/draft-class-strength-v1"
+          DP=Path("/tmp/b11top60-dp")
+          FDK=Path("/tmp/b11top60-fdk/projects/integration/raw/sleeper/lookup.csv")
+          OUT=Path("/tmp/b11top60")
+
+          q=json.loads((D/"b10_v2_remaining_manual_identity_queue.json").read_text())
+          targets=sorted(
+              [x for x in q["players"] if int(x["draft_pick"])<=60],
+              key=lambda x:(int(x["draft_year"]),int(x["draft_pick"]))
+          )
+          assert len(targets)==6
+
+          def clean(v):
+              s=str(v or "").strip()
+              return None if s.upper() in {"","NA","N/A","NULL","NONE","NAN"} else s
+
+          def canon(v):
+              s=clean(v)
+              if s is None:return None
+              try:
+                  f=float(s)
+                  if f.is_integer():return str(int(f))
+              except Exception:
+                  pass
+              return s
+
+          def norm_name(v):
+              s=unicodedata.normalize("NFKD",str(v or "")).encode("ascii","ignore").decode("ascii").lower()
+              toks=re.findall(r"[a-z0-9]+",s)
+              while toks and toks[-1] in {"jr","sr","ii","iii","iv","v"}:
+                  toks.pop()
+              return "".join(toks)
+
+          def npos(v):
+              s=(clean(v) or "").upper()
+              return "RB" if s=="FB" else s
+
+          def sh(args):
+              return subprocess.check_output(args,cwd=DP,text=True,stderr=subprocess.DEVNULL)
+
+          # Identity-only third-party ID history from DynastyProcess.
+          providers=["espn_id","yahoo_id","fleaflicker_id"]
+          commits=[x.strip() for x in sh(
+              ["git","log","--all","--format=%H","--","files/db_playerids.csv"]
+          ).splitlines() if x.strip()]
+          assert len(commits)>10
+
+          hist={t["stable_id"]:{p:set() for p in providers} for t in targets}
+          for sha in commits:
+              try:
+                  raw=sh(["git","show",f"{sha}:files/db_playerids.csv"])
+              except subprocess.CalledProcessError:
+                  continue
+              rd=csv.DictReader(raw.splitlines())
+              if not rd.fieldnames or "gsis_id" not in rd.fieldnames or "pfr_id" not in rd.fieldnames:
+                  continue
+              for row in rd:
+                  rg=clean(row.get("gsis_id")); rp=clean(row.get("pfr_id"))
+                  for t in targets:
+                      hit=(rg and rg==t["gsis_id"]) or (rp and rp==t["pfr_id"])
+                      if not hit:continue
+                      if rg and rg!=t["gsis_id"]:continue
+                      if rp and rp!=t["pfr_id"]:continue
+                      for p in providers:
+                          v=canon(row.get(p))
+                          if v:hist[t["stable_id"]][p].add(v)
+
+          with FDK.open(newline="",encoding="utf-8-sig") as f:
+              rd=csv.DictReader(f)
+              assert rd.fieldnames==["name","player_id","pos","fleaflicker_id","espn_id","yahoo_id","sleeper_id"]
+              rows=list(rd)
+
+          idx={p:defaultdict(list) for p in providers}
+          sleeper_rows=defaultdict(list)
+          for i,row in enumerate(rows):
+              for p in providers:
+                  v=canon(row.get(p))
+                  if v:idx[p][v].append(i)
+              sid=canon(row.get("sleeper_id"))
+              if sid:sleeper_rows[sid].append(i)
+
+          accepted={}
+          results=[]
+          for t in targets:
+              usable={}
+              conflicts={}
+              for p,vals in hist[t["stable_id"]].items():
+                  vals=sorted(vals)
+                  if len(vals)==1: usable[p]=vals[0]
+                  elif len(vals)>1: conflicts[p]=vals
+
+              votes=defaultdict(set)
+              for p,v in usable.items():
+                  for row_i in idx[p].get(v,[]):
+                      votes[row_i].add(p)
+
+              candidates=[]
+              for row_i,nspaces in votes.items():
+                  row=rows[row_i]
+                  sid=canon(row.get("sleeper_id"))
+                  candidates.append({
+                      "row_index":row_i,
+                      "source_name":row.get("name"),
+                      "source_position":row.get("pos"),
+                      "sleeper_id":sid,
+                      "matched_namespaces":sorted(nspaces),
+                      "namespace_match_n":len(nspaces),
+                      "name_ok":norm_name(row.get("name"))==norm_name(t["name"]),
+                      "position_ok":npos(row.get("pos"))==npos(t["position"]),
+                      "source_sleeper_unique": bool(sid) and len(sleeper_rows[sid])==1,
+                  })
+
+              auto=[
+                  c for c in candidates
+                  if c["sleeper_id"]
+                  and c["namespace_match_n"]>=2
+                  and c["name_ok"]
+                  and c["position_ok"]
+                  and c["source_sleeper_unique"]
+              ]
+              resolved=None
+              if len(auto)==1:
+                  resolved=auto[0]["sleeper_id"]
+                  status="RESOLVED_TOP60_EXACT_ID_CHAIN"
+                  accepted[t["stable_id"]]=resolved
+              elif len(auto)>1:
+                  status="REJECT_MULTIPLE_QUALIFYING_ROWS"
+              elif candidates:
+                  status="TOP60_MANUAL_IDENTITY_REVIEW_NEEDED"
+              else:
+                  status="TOP60_NO_INDEPENDENT_CHAIN"
+
+              results.append({
+                  **t,
+                  "historical_exact_third_ids":usable,
+                  "historical_third_id_conflicts":conflicts,
+                  "source_candidates":candidates,
+                  "resolved_sleeper_id":resolved,
+                  "status":status,
+              })
+
+          # Never permit two target players to resolve to the same Sleeper ID.
+          rev=defaultdict(list)
+          for stable,sid in accepted.items():rev[sid].append(stable)
+          duplicates={sid:ids for sid,ids in rev.items() if len(ids)>1}
+          if duplicates:
+              for r in results:
+                  if r["resolved_sleeper_id"] in duplicates:
+                      accepted.pop(r["stable_id"],None)
+                      r["resolved_sleeper_id"]=None
+                      r["status"]="REJECT_TARGET_SLEEPER_COLLISION"
+
+          unresolved=[r for r in results if not r["resolved_sleeper_id"]]
+
+          recovery={
+              "schema_version":1,
+              "study_id":"draft-class-strength-v1",
+              "stage":"b11_top60_priority_identity_recovery",
+              "scope_rule":"Only unresolved QB/RB/WR/TE players drafted within NFL overall picks 1-60 receive further identity-recovery effort.",
+              "top60_target_n":6,
+              "top60_recovered_n":len(accepted),
+              "top60_remaining_n":len(unresolved),
+              "accepted_overrides":accepted,
+              "identity_only":True,
+              "fantasy_outcomes_used":False,
+              "outcome_provider_stats_read":False,
+              "players":results,
+              "source_fdk_sha256":hashlib.sha256(FDK.read_bytes()).hexdigest(),
+              "lower_pick_unresolved_players_intentionally_not_researched_further_n":23,
+              "lower_pick_players_are_not_deleted_from_v1_cohort":True,
+              "v1_b8_unresolved_threshold_still_applies":True,
+              "2027_class_scored":False,
+              "production_change_authorized":False,
+          }
+          (OUT/"recovery.json").write_text(json.dumps(recovery,indent=2,sort_keys=True)+"\n")
+
+          packet={
+              "schema_version":1,
+              "study_id":"draft-class-strength-v1",
+              "stage":"b11_top60_manual_identity_packet",
+              "identity_only":True,
+              "reviewers_required":2,
+              "reviewers_work_independently":True,
+              "agreement_required":True,
+              "players":[{
+                  "stable_id":r["stable_id"],
+                  "gsis_id":r["gsis_id"],
+                  "pfr_id":r["pfr_id"],
+                  "name":r["name"],
+                  "position":r["position"],
+                  "draft_year":r["draft_year"],
+                  "draft_pick":r["draft_pick"],
+                  "historical_exact_third_ids":r["historical_exact_third_ids"],
+                  "source_candidates":r["source_candidates"],
+                  "status":r["status"],
+              } for r in unresolved],
+              "forbidden":["fantasy points","weekly statistics","games played","career production","H3.O2"],
+              "formal_stage_b_test_run":False,
+              "2027_class_scored":False,
+              "production_change_authorized":False,
+          }
+          (OUT/"manual_packet.json").write_text(json.dumps(packet,indent=2,sort_keys=True)+"\n")
+
+          # Important: top-60 prioritization does not magically satisfy B8.
+          # Even if all 6 recover, 23 lower-pick unresolved players remain.
+          projected_v1_unresolved=23+len(unresolved)
+          v1_unblocked=projected_v1_unresolved<=13
+          assert v1_unblocked is False
+
+          result={
+              "schema_version":1,
+              "study_id":"draft-class-strength-v1",
+              "stage":"b11_top60_result",
+              "decision":(
+                  "PASS_B11_TOP60_IDENTITIES_COMPLETE_V1_STILL_BLOCKED_TOP60_V2_PREREGISTRATION_NEXT"
+                  if not unresolved else
+                  "STOP_B11_TOP60_MANUAL_IDENTITY_REVIEW_REMAINS_TOP60_V2_PREREGISTRATION_STILL_ALLOWED"
+              ),
+              "top60_target_n":6,
+              "top60_recovered_n":len(accepted),
+              "top60_remaining_n":len(unresolved),
+              "projected_v1_total_unresolved_n":projected_v1_unresolved,
+              "v1_b9_rerun_authorized":False,
+              "top60_v2_preregistration_authorized":True,
+              "top60_v2_execution_authorized":False,
+              "formal_stage_b_test_run":False,
+              "predictor_fit_performed":False,
+              "2027_class_scored":False,
+              "production_change_authorized":False,
+          }
+          (OUT/"result.json").write_text(json.dumps(result,indent=2,sort_keys=True)+"\n")
+          print(json.dumps(result,indent=2))
+          PY
+
+      - name: Import B11 top-60 artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          D="research/draft-class-strength-v1"
+          cp /tmp/b11top60/recovery.json "$D/b11_top60_identity_recovery.json"
+          cp /tmp/b11top60/manual_packet.json "$D/b11_top60_manual_identity_packet.json"
+          cp /tmp/b11top60/result.json "$D/b11_top60_result.json"
+
+      - name: Validate scope and freeze manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+
+          D=Path("research/draft-class-strength-v1")
+          x=json.loads((D/"b11_top60_identity_recovery.json").read_text())
+          p=json.loads((D/"b11_top60_manual_identity_packet.json").read_text())
+          r=json.loads((D/"b11_top60_result.json").read_text())
+
+          assert x["top60_target_n"]==6
+          assert x["lower_pick_unresolved_players_intentionally_not_researched_further_n"]==23
+          assert x["lower_pick_players_are_not_deleted_from_v1_cohort"] is True
+          assert x["v1_b8_unresolved_threshold_still_applies"] is True
+          assert x["identity_only"] is True
+          assert x["fantasy_outcomes_used"] is False
+          assert x["outcome_provider_stats_read"] is False
+          assert p["reviewers_required"]==2
+          assert p["reviewers_work_independently"] is True
+
+          assert r["top60_target_n"]==6
+          assert r["top60_recovered_n"]+r["top60_remaining_n"]==6
+          assert r["projected_v1_total_unresolved_n"]==23+r["top60_remaining_n"]
+          assert r["projected_v1_total_unresolved_n"]>13
+          assert r["v1_b9_rerun_authorized"] is False
+          assert r["top60_v2_preregistration_authorized"] is True
+          assert r["top60_v2_execution_authorized"] is False
+          assert r["formal_stage_b_test_run"] is False
+          assert r["2027_class_scored"] is False
+          assert r["production_change_authorized"] is False
+
+          names=[
+              "b11_top60_identity_recovery.json",
+              "b11_top60_manual_identity_packet.json",
+              "b11_top60_result.json",
+          ]
+          m={
+              "schema_version":1,
+              "study_id":"draft-class-strength-v1",
+              "stage":"b11_top60_manifest",
+              "decision":r["decision"],
+              "output_hashes":{n:hashlib.sha256((D/n).read_bytes()).hexdigest() for n in names},
+              "top60_v2_preregistration_authorized":True,
+              "v1_b9_rerun_authorized":False,
+              "formal_stage_b_test_run":False,
+              "predictor_fit_performed":False,
+              "2027_class_scored":False,
+              "production_change_authorized":False,
+          }
+          (D/"b11_top60_manifest.json").write_text(json.dumps(m,indent=2,sort_keys=True)+"\n")
+          print("PASS: B11 top-60 scope frozen; V1 remains blocked; V2 preregistration authorized.")
+          PY
+
+      - name: Run post-recovery repository regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/repo_regression_checks.py
+
+      - name: Prove research-only mutation scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import subprocess
+          raw=subprocess.check_output(
+              ["git","status","--porcelain=v1","--untracked-files=all"],text=True
+          )
+          touched=[line[3:] for line in raw.splitlines() if line.strip()]
+          assert touched,touched
+          assert all(p.startswith("research/draft-class-strength-v1/b11_top60_") for p in touched),touched
+          assert not any(p.startswith(("model/","scripts/","data/")) for p in touched),touched
+          assert "index.html" not in touched and "free-agent-board.html" not in touched
+          PY
+
+      - name: Commit frozen B11 top-60 artifacts
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$BASE_SHA" || {
+            echo "ERROR: origin/main moved during B11 top-60 recovery."
+            exit 1
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            research/draft-class-strength-v1/b11_top60_identity_recovery.json \
+            research/draft-class-strength-v1/b11_top60_manual_identity_packet.json \
+            research/draft-class-strength-v1/b11_top60_result.json \
+            research/draft-class-strength-v1/b11_top60_manifest.json
+
+          if git diff --cached --quiet; then
+            echo "PASS: B11 top-60 artifacts already match; no commit required."
+            exit 0
+          fi
+
+          git commit -m "Run Draft Class Strength V1 B11 top-60 identity recovery"
+          git push origin HEAD:main
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$(git rev-parse HEAD)"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          echo "PASS: B11 top-60 identity artifacts committed."
