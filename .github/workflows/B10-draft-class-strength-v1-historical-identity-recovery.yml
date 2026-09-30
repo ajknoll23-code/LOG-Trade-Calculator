@@ -1,0 +1,449 @@
+name: B10 Draft Class Strength V1 - Historical Identity Recovery
+
+"on":
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  identity_recovery:
+    name: B10 exact-identity historical Sleeper recovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Capture B10 base SHA
+        id: base
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13.15"
+
+      - name: Install dependency
+        run: python3 -m pip install --disable-pip-version-check --no-cache-dir "requests==2.34.2"
+
+      - name: Guard B8 final contract and B9 manual-review stop
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+
+          D=Path("research/draft-class-strength-v1")
+          b8m=json.loads((D/"b8_manifest.json").read_text())
+          b8=json.loads((D/"b8_stage_b_fixed_cohort_preregistration.json").read_text())
+          b9=json.loads((D/"b9_stage_b_result.json").read_text())
+          b9m=json.loads((D/"b9_manifest.json").read_text())
+          q=json.loads((D/"b9_manual_identity_review_queue.json").read_text())
+
+          assert b8m["decision"]=="PASS_B8_STAGE_B_PREREGISTRATION_FROZEN_B9_EXECUTION_NEXT"
+          for name,expected in b8m["output_hashes"].items():
+              got=hashlib.sha256((D/name).read_bytes()).hexdigest()
+              assert got==expected,(name,expected,got)
+
+          assert b8["finality_policy"]["this_is_final_v1_target_null_audit"] is True
+          assert b8["cohort_contract"]["total_players"]==672
+          assert b8["cohort_contract"]["players_per_class"]==48
+          assert b8["cohort_contract"]["outcome_sorting_forbidden"] is True
+          assert b8["cohort_contract"]["backfill_player_49_if_missing_forbidden"] is True
+          assert b8["missing_outcome_contract"]["max_unresolved_fraction_after_manual_review"]==0.02
+          assert b8["missing_outcome_contract"]["max_unresolved_n_equivalent_for_672"]==13
+          assert b8["registry_identity_contract"]["manual_resolution_allowed"] is True
+          assert b8["registry_identity_contract"]["manual_resolution_must_be_identity_only"] is True
+          assert b8["registry_identity_contract"]["manual_resolution_may_not_use_fantasy_success_to_choose_identity"] is True
+
+          assert b9["decision"]=="STOP_B9_MANUAL_IDENTITY_REVIEW_REQUIRED_BEFORE_FORMAL_TEST"
+          assert b9["formal_test_run"] is False
+          assert b9["unresolved_n"]==29
+          assert q["unresolved_n"]==29
+          assert q["formal_test_run"] is False
+          assert all(p.get("gsis_id") and p.get("pfr_id") for p in q["players"])
+
+          for name,expected in b9m["output_hashes"].items():
+              got=hashlib.sha256((D/name).read_bytes()).hexdigest()
+              assert got==expected,(name,expected,got)
+
+          assert b9["2027_class_scored"] is False
+          assert b9["production_change_authorized"] is False
+          print("PASS: exact B8/B9 lineage guarded; 29-player identity-only queue frozen.")
+          PY
+
+      - name: Run repository regression baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/repo_regression_checks.py
+          git reset --hard HEAD
+          git clean -fd
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          echo "PASS: repository regression baseline."
+
+      - name: Clone full DynastyProcess identity history
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/dp-history
+          git clone --quiet --no-checkout https://github.com/dynastyprocess/data.git /tmp/dp-history
+          cd /tmp/dp-history
+          git config advice.detachedHead false
+          echo "DP_HEAD=$(git rev-parse HEAD)"
+          git log --all --format='%H %cI' -- files/db_playerids.csv | head -5
+          test "$(git log --all --format='%H' -- files/db_playerids.csv | wc -l)" -gt 10
+          echo "PASS: DynastyProcess full history available."
+
+      - name: Recover historical Sleeper IDs from exact GSIS or PFR identity only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import io
+          import json
+          import subprocess
+          from collections import defaultdict
+          from pathlib import Path
+
+          ROOT=Path.cwd()
+          D=ROOT/"research/draft-class-strength-v1"
+          DP=Path("/tmp/dp-history")
+          q=json.loads((D/"b9_manual_identity_review_queue.json").read_text())
+          b8=json.loads((D/"b8_stage_b_fixed_cohort_preregistration.json").read_text())
+
+          assert q["unresolved_n"]==29
+          targets=q["players"]
+
+          def clean(v):
+              s=str(v or "").strip()
+              return None if s.upper() in {"","NA","N/A","NULL","NONE","NAN"} else s
+
+          def sh(cmd, cwd=DP):
+              return subprocess.check_output(cmd,cwd=cwd,text=True,stderr=subprocess.DEVNULL)
+
+          # Source universe is frozen BEFORE inspecting any outcome:
+          # every historical revision in DynastyProcess that changed the canonical
+          # player-ID crosswalk. This is a pure identity table, not player performance.
+          commits=sh(["git","log","--all","--format=%H|%cI","--","files/db_playerids.csv"]).splitlines()
+          history=[tuple(x.split("|",1)) for x in commits if "|" in x]
+          assert len(history)>10
+
+          # For each exact PFR/GSIS target, inspect only revisions whose row changed.
+          # git -G catches modifications to a row even when the stable PFR/GSIS token
+          # stays constant. A mapping is accepted only if every non-null historical
+          # sleeper_id observed for that exact identity agrees.
+          results=[]
+          accepted={}
+          for t in targets:
+              pfr=str(t["pfr_id"])
+              gsis=str(t["gsis_id"])
+              candidate_commits=set()
+              for token in (pfr,gsis):
+                  try:
+                      out=sh(["git","log","--all","-G",token,"--format=%H","--","files/db_playerids.csv"])
+                      candidate_commits.update(x.strip() for x in out.splitlines() if x.strip())
+                  except subprocess.CalledProcessError:
+                      pass
+
+              observed=defaultdict(list)
+              inspected=0
+              parse_failures=[]
+              for sha in sorted(candidate_commits):
+                  try:
+                      raw=sh(["git","show",f"{sha}:files/db_playerids.csv"])
+                  except subprocess.CalledProcessError:
+                      continue
+                  inspected+=1
+                  try:
+                      rd=csv.DictReader(io.StringIO(raw))
+                      fields=set(rd.fieldnames or [])
+                      if "sleeper_id" not in fields:
+                          continue
+                      for row in rd:
+                          rp=clean(row.get("pfr_id"))
+                          rg=clean(row.get("gsis_id"))
+                          if rp!=pfr and rg!=gsis:
+                              continue
+                          sid=clean(row.get("sleeper_id"))
+                          if sid:
+                              observed[sid].append({
+                                  "commit":sha,
+                                  "pfr_id":rp,
+                                  "gsis_id":rg,
+                                  "name":clean(row.get("name")),
+                              })
+                  except Exception as e:
+                      parse_failures.append({"commit":sha,"error":f"{type(e).__name__}: {e}"})
+
+              sleeper_ids=sorted(observed)
+              status=(
+                  "RESOLVED_UNANIMOUS_HISTORICAL_CROSSWALK"
+                  if len(sleeper_ids)==1 else
+                  "NO_HISTORICAL_SLEEPER_ID"
+                  if len(sleeper_ids)==0 else
+                  "CONFLICT_HISTORICAL_SLEEPER_IDS"
+              )
+              if len(sleeper_ids)==1:
+                  accepted[t["stable_id"]]=sleeper_ids[0]
+
+              results.append({
+                  "stable_id":t["stable_id"],
+                  "gsis_id":gsis,
+                  "pfr_id":pfr,
+                  "name":t["name"],
+                  "position":t["position"],
+                  "draft_year":t["draft_year"],
+                  "draft_pick":t["draft_pick"],
+                  "skill_pick_rank":t["skill_pick_rank"],
+                  "status":status,
+                  "resolved_sleeper_id":sleeper_ids[0] if len(sleeper_ids)==1 else None,
+                  "non_null_historical_sleeper_ids":sleeper_ids,
+                  "evidence_by_sleeper_id":dict(observed),
+                  "candidate_revision_n":len(candidate_commits),
+                  "inspected_revision_n":inspected,
+                  "parse_failures":parse_failures,
+              })
+
+          initial_n=len(targets)
+          recovered_n=len(accepted)
+          remaining=[r for r in results if not r["resolved_sleeper_id"]]
+          conflict=[r for r in results if r["status"]=="CONFLICT_HISTORICAL_SLEEPER_IDS"]
+          remaining_n=len(remaining)
+
+          # B8's post-manual-review tolerance is <=13 unresolved of 672.
+          eligible_for_b9_rerun=(remaining_n<=int(b8["missing_outcome_contract"]["max_unresolved_n_equivalent_for_672"]))
+
+          source_head=sh(["git","rev-parse","HEAD"]).strip()
+          source_history_digest=hashlib.sha256(
+              "\n".join(f"{sha}|{dt}" for sha,dt in history).encode()
+          ).hexdigest()
+
+          recovery={
+              "schema_version":1,
+              "study_id":"draft-class-strength-v1",
+              "stage":"b10_historical_identity_recovery",
+              "method":"exact GSIS/PFR join across every DynastyProcess db_playerids.csv revision; accept only unanimous non-null historical sleeper_id",
+              "identity_only":True,
+              "fantasy_outcomes_used_for_identity_resolution":False,
+              "dynastyprocess_repository_head":source_head,
+              "dynastyprocess_crosswalk_revision_n":len(history),
+              "dynastyprocess_crosswalk_history_digest":source_history_digest,
+              "initial_unresolved_n":initial_n,
+              "recovered_n":recovered_n,
+              "remaining_unresolved_n":remaining_n,
+              "remaining_unresolved_fraction_of_672":remaining_n/672,
+              "conflict_n":len(conflict),
+              "b8_max_remaining_unresolved_n":13,
+              "eligible_for_b9_rerun":eligible_for_b9_rerun,
+              "accepted_overrides":accepted,
+              "players":results,
+              "2027_class_scored":False,
+              "production_change_authorized":False,
+          }
+          (D/"b10_historical_identity_recovery.json").write_text(
+              json.dumps(recovery,indent=2,sort_keys=True)+"\n"
+          )
+
+          remaining_queue={
+              "schema_version":1,
+              "study_id":"draft-class-strength-v1",
+              "stage":"b10_remaining_manual_identity_queue",
+              "remaining_unresolved_n":remaining_n,
+              "players":[{
+                  "stable_id":r["stable_id"],
+                  "gsis_id":r["gsis_id"],
+                  "pfr_id":r["pfr_id"],
+                  "name":r["name"],
+                  "position":r["position"],
+                  "draft_year":r["draft_year"],
+                  "draft_pick":r["draft_pick"],
+                  "skill_pick_rank":r["skill_pick_rank"],
+                  "status":r["status"],
+              } for r in remaining],
+              "formal_stage_b_test_run":False,
+              "2027_class_scored":False,
+              "production_change_authorized":False,
+          }
+          (D/"b10_remaining_manual_identity_queue.json").write_text(
+              json.dumps(remaining_queue,indent=2,sort_keys=True)+"\n"
+          )
+
+          decision=(
+              "PASS_B10_IDENTITY_RECOVERY_WITHIN_B8_TOLERANCE_AUTHORIZE_B9_RERUN_WITH_FROZEN_OVERRIDES"
+              if eligible_for_b9_rerun else
+              "STOP_B10_IDENTITY_RECOVERY_STILL_ABOVE_B8_TOLERANCE_MANUAL_REVIEW_REMAINS"
+          )
+          result={
+              "schema_version":1,
+              "study_id":"draft-class-strength-v1",
+              "stage":"b10_identity_recovery_result",
+              "decision":decision,
+              "initial_unresolved_n":initial_n,
+              "recovered_n":recovered_n,
+              "remaining_unresolved_n":remaining_n,
+              "remaining_unresolved_fraction_of_672":remaining_n/672,
+              "b8_max_remaining_unresolved_n":13,
+              "b9_rerun_authorized":eligible_for_b9_rerun,
+              "formal_stage_b_test_run":False,
+              "primary_stage_b_verdict_frozen":False,
+              "predictor_fit_performed":False,
+              "2027_class_scored":False,
+              "production_change_authorized":False,
+          }
+          (D/"b10_identity_recovery_result.json").write_text(
+              json.dumps(result,indent=2,sort_keys=True)+"\n"
+          )
+
+          print(json.dumps(result,indent=2))
+          PY
+
+      - name: Validate identity-only scope and freeze B10 manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+
+          D=Path("research/draft-class-strength-v1")
+          r=json.loads((D/"b10_identity_recovery_result.json").read_text())
+          h=json.loads((D/"b10_historical_identity_recovery.json").read_text())
+          q=json.loads((D/"b10_remaining_manual_identity_queue.json").read_text())
+
+          assert h["identity_only"] is True
+          assert h["fantasy_outcomes_used_for_identity_resolution"] is False
+          assert h["initial_unresolved_n"]==29
+          assert h["recovered_n"]+h["remaining_unresolved_n"]==29
+          assert h["conflict_n"]>=0
+          assert q["remaining_unresolved_n"]==h["remaining_unresolved_n"]
+
+          eligible=h["remaining_unresolved_n"]<=13
+          assert h["eligible_for_b9_rerun"] is eligible
+          assert r["b9_rerun_authorized"] is eligible
+          assert r["formal_stage_b_test_run"] is False
+          assert r["primary_stage_b_verdict_frozen"] is False
+          assert r["predictor_fit_performed"] is False
+          assert r["2027_class_scored"] is False
+          assert r["production_change_authorized"] is False
+
+          if eligible:
+              assert r["decision"]=="PASS_B10_IDENTITY_RECOVERY_WITHIN_B8_TOLERANCE_AUTHORIZE_B9_RERUN_WITH_FROZEN_OVERRIDES"
+          else:
+              assert r["decision"]=="STOP_B10_IDENTITY_RECOVERY_STILL_ABOVE_B8_TOLERANCE_MANUAL_REVIEW_REMAINS"
+
+          names=[
+              "b10_historical_identity_recovery.json",
+              "b10_remaining_manual_identity_queue.json",
+              "b10_identity_recovery_result.json",
+          ]
+          m={
+              "schema_version":1,
+              "study_id":"draft-class-strength-v1",
+              "stage":"b10_manifest",
+              "decision":r["decision"],
+              "output_hashes":{n:hashlib.sha256((D/n).read_bytes()).hexdigest() for n in names},
+              "b9_rerun_authorized":r["b9_rerun_authorized"],
+              "formal_stage_b_test_run":False,
+              "predictor_fit_performed":False,
+              "2027_class_scored":False,
+              "production_change_authorized":False,
+          }
+          (D/"b10_manifest.json").write_text(json.dumps(m,indent=2,sort_keys=True)+"\n")
+
+          all_text="\n".join(p.read_text(errors="ignore") for p in D.glob("b10_*") if p.is_file()).lower()
+          assert '"formal_stage_b_test_run": true' not in all_text
+          assert '"predictor_fit_performed": true' not in all_text
+          assert '"2027_class_scored": true' not in all_text
+          assert '"production_change_authorized": true' not in all_text
+
+          print("PASS: B10 identity-only recovery frozen; no Stage B outcomes were run.")
+          PY
+
+      - name: Run post-recovery repository regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/repo_regression_checks.py
+          echo "PASS: post-recovery repository regression."
+
+      - name: Prove B10 research-only mutation scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import subprocess
+          raw=subprocess.check_output(
+              ["git","status","--porcelain=v1","--untracked-files=all"],text=True
+          )
+          touched=[line[3:] for line in raw.splitlines() if line.strip()]
+          assert touched,touched
+          assert all(
+              p.startswith("research/draft-class-strength-v1/b10_")
+              for p in touched
+          ),touched
+          assert not any(
+              p.startswith(("model/","scripts/","data/",".github/"))
+              for p in touched
+          ),touched
+          assert "index.html" not in touched
+          assert "free-agent-board.html" not in touched
+          print("PASS: B10 mutation scope is research-only.")
+          PY
+
+      - name: Commit frozen B10 identity artifacts
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$BASE_SHA" || {
+            echo "ERROR: origin/main moved during B10."
+            exit 1
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            research/draft-class-strength-v1/b10_historical_identity_recovery.json \
+            research/draft-class-strength-v1/b10_remaining_manual_identity_queue.json \
+            research/draft-class-strength-v1/b10_identity_recovery_result.json \
+            research/draft-class-strength-v1/b10_manifest.json
+
+          if git diff --cached --quiet; then
+            echo "PASS: B10 artifacts already match; no commit required."
+            exit 0
+          fi
+
+          git commit -m "Run Draft Class Strength V1 B10 historical identity recovery"
+          git push origin HEAD:main
+
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$(git rev-parse HEAD)"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+          echo "PASS: B10 identity artifacts committed."
