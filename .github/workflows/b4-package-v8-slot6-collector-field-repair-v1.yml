@@ -1,0 +1,274 @@
+name: B4 Package Adjustment V8 - Slot 6 Collector Field Repair V1
+
+"on":
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: package-adjustment-v8-slot6-collector-field-repair
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir "requests==2.34.2"
+
+      - name: Verify current regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path("index.html").read_text(encoding="utf-8")
+          assert 'missing_challenge_id":"pkgv8dev_028"' in s
+          assert '"missing_display_order":25' in s
+          start=s.index("async function packageVoteSubmit(displaySide)")
+          end=s.index("function renderPackageVote()",start)
+          submit=s[start:end]
+          assert "roster_id:voter" in submit
+          assert "voter_roster_id:voter" in submit
+          assert "voterRosterId:voter" not in submit
+          assert "body: JSON.stringify({ voterRosterId: ktcCurrentVoterId(), keep, trade, cut })" in s
+          print("PASS: B3 collector field regression reproduced.")
+          PY
+
+      - name: Reconfirm slot 6 is still 39 of 40
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/pkgv8-b4
+          python3 - <<'PY'
+          import csv, hashlib, io, json, re
+          from collections import Counter
+          from datetime import datetime, timezone
+          from pathlib import Path
+          import requests
+
+          D=Path("research/package-adjustment-v8")
+          act=json.loads((D/"development_voting_activation_manifest_v1.json").read_text())
+          sched=json.loads((D/"voting_randomization_schedule_v1.json").read_text())
+          url="https://docs.google.com/spreadsheets/d/e/2PACX-1vTuKORGumlKJmUmBdeNWPstkj8VRjPoVkylbqHv1KqwoyziJYOUlkZUKRsSxzB3qHXmyjjLpGpH6W03/pub?gid=458294959&single=true&output=csv"
+
+          def parse_utc(v):
+              x=str(v or "").strip()
+              if x.endswith("Z"):
+                  x=x[:-1]+"+00:00"
+              try:
+                  dt=datetime.fromisoformat(x)
+              except Exception:
+                  return None
+              if dt.tzinfo is None:
+                  dt=dt.replace(tzinfo=timezone.utc)
+              return dt.astimezone(timezone.utc)
+
+          cutoff=parse_utc(act["valid_ballot_start_utc"])
+          now=datetime.now(timezone.utc)
+          r=requests.get(url,timeout=30)
+          r.raise_for_status()
+          rows=list(csv.DictReader(io.StringIO(r.text)))
+
+          spec=sched["slots"]["6"]
+          expected=[str(x) for x in spec["challenge_order"]]
+          meta_re=re.compile(r"^__pkgv8dev_meta__\|[AB]\|6\|([0-9]|[1-2][0-9]|3[0-9])$")
+          observed=[]
+          voters=[]
+
+          for row in rows:
+              keep=str(row.get("keep") or "")
+              if not keep.startswith("__pkgv8dev__|"):
+                  continue
+              ts=parse_utc(row.get("timestamp"))
+              if ts is None or ts<=cutoff or ts>now:
+                  continue
+              if str(row.get("cut") or "")!="__pkgv8dev_schema__|1":
+                  continue
+              mm=meta_re.fullmatch(str(row.get("trade") or ""))
+              if not mm:
+                  continue
+              payload=keep[len("__pkgv8dev__|"):]
+              cid,sep,_choice=payload.partition("|")
+              if not sep or cid not in expected:
+                  continue
+              if int(mm.group(1))!=expected.index(cid):
+                  continue
+              voter=str(row.get("voter_roster_id") or "").strip()
+              if not voter:
+                  continue
+              observed.append(cid)
+              voters.append(voter)
+
+          counts=Counter(observed)
+          missing=[cid for cid in expected if cid not in set(observed)]
+          assert len(set(voters))==1
+          assert len(observed)==39
+          assert len(set(observed))==39
+          assert all(v==1 for v in counts.values())
+          assert missing==["pkgv8dev_028"], missing
+          assert expected.index("pkgv8dev_028")==25
+
+          evidence={
+              "schema_version":2,
+              "study_id":"package-adjustment-v8",
+              "stage":"slot6_collector_field_repair_v1",
+              "generated_at_utc":now.isoformat(),
+              "outcome_blind":True,
+              "human_choice_payload_read":False,
+              "human_choice_payload_stored":False,
+              "slot":6,
+              "remote_structural_row_count":39,
+              "remote_unique_challenge_count":39,
+              "remote_duplicate_challenge_count":0,
+              "missing_challenge_id":"pkgv8dev_028",
+              "missing_display_order":25,
+              "sheet_sha256":hashlib.sha256(r.content).hexdigest(),
+              "transport_regression":"B3 changed voterRosterId to unsupported aliases",
+              "repair":"restore exact voterRosterId and rotate recovery acknowledgement key",
+              "recovery_attempt_id":"slot6_collector_field_repair_v2",
+              "production_change_authorized":False
+          }
+          Path("/tmp/pkgv8-b4/voting_transport_recovery_v2.json").write_text(json.dumps(evidence,indent=2,sort_keys=True)+"\n")
+          print(json.dumps(evidence,indent=2))
+          PY
+
+      - name: Restore collector field and reopen recovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,re
+          from pathlib import Path
+
+          p=Path("index.html")
+          s=p.read_text(encoding="utf-8")
+          evidence=json.loads(Path("/tmp/pkgv8-b4/voting_transport_recovery_v2.json").read_text())
+
+          pat=re.compile(r'const PACKAGE_VOTE_RECOVERY = Object\.freeze\((\{.*?\})\);')
+          m=pat.search(s)
+          assert m
+          old=json.loads(m.group(1))
+          assert old["slot"]==6
+          assert old["missing_challenge_id"]=="pkgv8dev_028"
+          assert old["missing_display_order"]==25
+
+          new=dict(old)
+          new["stage"]="slot6_collector_field_repair_v1"
+          new["generated_at_utc"]=evidence["generated_at_utc"]
+          new["sheet_sha256"]=evidence["sheet_sha256"]
+          new["recovery_attempt_id"]="slot6_collector_field_repair_v2"
+          new["transport_field"]="voterRosterId"
+          repl="const PACKAGE_VOTE_RECOVERY = Object.freeze("+json.dumps(new,separators=(",",":"))+");"
+          s=s[:m.start()]+repl+s[m.end():]
+
+          old_key="return `package_votes_v8dev_recovery_ack_${voter}_slot_6`;"
+          new_key="return `package_votes_v8dev_recovery_ack_${voter}_slot_6_r2`;"
+          assert s.count(old_key)==1
+          s=s.replace(old_key,new_key,1)
+
+          body_pat=re.compile(r'(?m)^\s*roster_id:voter,\n\s*voter_roster_id:voter,\n(\s*)keep:`__pkgv8dev__\|\$\{id\}\|\$\{choice\}`,')
+          bm=body_pat.search(s)
+          assert bm, "broken package submit body not found"
+          replacement=bm.group(1)+"voterRosterId:voter,\n"+bm.group(1)+"keep:`__pkgv8dev__|${id}|${choice}`,"
+          s=s[:bm.start()]+replacement+s[bm.end():]
+
+          p.write_text(s,encoding="utf-8")
+
+          check=p.read_text(encoding="utf-8")
+          start=check.index("async function packageVoteSubmit(displaySide)")
+          end=check.index("function renderPackageVote()",start)
+          submit=check[start:end]
+          assert "voterRosterId:voter" in submit
+          assert "roster_id:voter" not in submit
+          assert "voter_roster_id:voter" not in submit
+          assert "slot_6_r2" in check
+          assert '"recovery_attempt_id":"slot6_collector_field_repair_v2"' in check
+          print("PASS: exact collector field restored; failed local ACK bypassed.")
+          PY
+
+      - name: Persist recovery evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp /tmp/pkgv8-b4/voting_transport_recovery_v2.json research/package-adjustment-v8/voting_transport_recovery_v2.json
+
+      - name: Verify patch semantics
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          s=Path("index.html").read_text(encoding="utf-8")
+          start=s.index("async function packageVoteSubmit(displaySide)")
+          end=s.index("function renderPackageVote()",start)
+          submit=s[start:end]
+          assert "voterRosterId:voter" in submit
+          assert "body: JSON.stringify({ voterRosterId: ktcCurrentVoterId(), keep, trade, cut })" in s
+          assert submit.index("const response=await fetch(KTC_SUBMIT_URL") < submit.index("packageVoteRemember(id);")
+          ev=json.loads(Path("research/package-adjustment-v8/voting_transport_recovery_v2.json").read_text())
+          assert ev["missing_challenge_id"]=="pkgv8dev_028"
+          assert ev["missing_display_order"]==25
+          assert ev["remote_structural_row_count"]==39
+          assert ev["production_change_authorized"] is False
+          print("PASS: V8 transport now matches proven collector schema.")
+          PY
+
+      - name: Run package adjustment live regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/check_package_adjustment_live.py
+
+      - name: Run repository regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/repo_regression_checks.py
+
+      - name: Commit repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.html research/package-adjustment-v8/voting_transport_recovery_v2.json
+          git diff --cached --check
+          git diff --cached --stat
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 1
+          fi
+          git commit -m "Restore V8 collector field and reopen slot 6 recovery"
+          git pull --rebase origin main
+          git push origin HEAD:main
+
+      - name: Final confirmation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          echo "B4 COMPLETE"
+          echo "Wait for GitHub Pages deployment."
+          echo "Then original slot-6 voter uses same browser/device:"
+          echo "index.html?pkgv8slot=6&v=slot6-r2#market-research"
+          echo "It should reopen only pkgv8dev_028."
