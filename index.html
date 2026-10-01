@@ -11891,6 +11891,9 @@ const PACKAGE_VOTE_DAILY_LIMIT = 40;
 const PACKAGE_VOTE_TOTAL_CHALLENGES = 40;
 const PACKAGE_VOTE_TOTAL_SLOTS = 50;
 const PACKAGE_VOTE_VALID_AFTER_UTC = '2026-09-27T13:08:00.705011+00:00';
+const PACKAGE_VOTE_RECOVERY = Object.freeze({"active":true,"generated_at_utc":"2026-10-01T15:40:18.419769+00:00","human_choice_payload_read":false,"human_choice_payload_stored":false,"missing_challenge_id":"pkgv8dev_028","missing_display_order":25,"outcome_blind":true,"production_change_authorized":false,"remote_duplicate_challenge_count":0,"remote_structural_row_count":39,"remote_unique_challenge_count":39,"repair_scope":"one missing structural challenge only","schema_version":1,"sheet_sha256":"1f2ba4836a631d199fe770666d879923e6cc3a6f048ea905f6894c7324d9d7d4","slot":6,"stage":"slot6_transport_recovery_v1","study_id":"package-adjustment-v8","voter_hash":"d80a0592a03d4ff2"});
+let packageVoteSubmitInFlight = false;
+let packageVoteSubmitError = '';
 let PACKAGE_VOTE_CHALLENGES = null;
 let PACKAGE_VOTE_SCHEDULE = null;
 let PACKAGE_VOTE_STATUS = 'idle';
@@ -12410,6 +12413,30 @@ if(!completed.includes(String(id))) completed.push(String(id));
 localStorage.setItem(packageVoteCompletedKey(),JSON.stringify(completed.slice(0,PACKAGE_VOTE_TOTAL_CHALLENGES)));
 }
 
+function packageVoteRecoveryAckKey(){
+const voter=ktcCurrentVoterId() || 'unconfirmed';
+return `package_votes_v8dev_recovery_ack_${voter}_slot_6`;
+}
+function packageVoteRecoveryPending(){
+if(!PACKAGE_VOTE_RECOVERY || !PACKAGE_VOTE_RECOVERY.active) return false;
+const voter=ktcCurrentVoterId();
+const slot=packageVoteAssignedSlot();
+if(!voter || slot!==Number(PACKAGE_VOTE_RECOVERY.slot)) return false;
+if(localStorage.getItem(packageVoteRecoveryAckKey())==='1') return false;
+return Boolean(PACKAGE_VOTE_RECOVERY.missing_challenge_id);
+}
+function packageVoteEffectiveCompleted(){
+const completed=packageVoteCompleted();
+if(!packageVoteRecoveryPending()) return completed;
+const missing=String(PACKAGE_VOTE_RECOVERY.missing_challenge_id);
+return completed.filter(id=>String(id)!==missing);
+}
+function packageVoteAcknowledgeRecovery(id){
+if(packageVoteRecoveryPending() && String(id)===String(PACKAGE_VOTE_RECOVERY.missing_challenge_id)){
+  localStorage.setItem(packageVoteRecoveryAckKey(),'1');
+}
+}
+
 /* PACKAGE_VOTE_V6P1_EXACT_CELL_SAMPLING_V1
    Frozen V6P1 prospective schedule:
    1) select one of the 24 preregistered research cells uniformly;
@@ -12426,7 +12453,7 @@ const slot=packageVoteAssignedSlot();
 if(!voter || !slot) return null;
 const spec=PACKAGE_VOTE_SCHEDULE.slots[String(slot)];
 if(!spec || Number(spec.accepted_voter_slot)!==slot) return null;
-const completed=new Set(packageVoteCompleted());
+const completed=new Set(packageVoteEffectiveCompleted());
 const id=spec.challenge_order.find(cid=>!completed.has(String(cid)));
 if(!id) return null;
 const challenge=PACKAGE_VOTE_CHALLENGES.find(c=>String(c.id)===String(id));
@@ -12515,9 +12542,11 @@ return `<div class="need-cell" style="text-align:left;padding:10px;">
 </div>`;
 }
 
-function packageVoteSubmit(displaySide){
+async function packageVoteSubmit(displaySide){
 if(Date.now()<Date.parse(PACKAGE_VOTE_VALID_AFTER_UTC)) return;
-if(!packageVoteCurrent || packageVotesToday()>=PACKAGE_VOTE_DAILY_LIMIT) return;
+const recoveryPending=packageVoteRecoveryPending();
+if(!packageVoteCurrent || packageVoteSubmitInFlight) return;
+if(!recoveryPending && packageVotesToday()>=PACKAGE_VOTE_DAILY_LIMIT) return;
 const left=packageVoteCurrent.left;
 const choice=displaySide==='L' ? left : (left==='A' ? 'B' : 'A');
 const id=String(packageVoteCurrent.challenge.id);
@@ -12527,23 +12556,37 @@ const displayOrder=packageVoteCurrent.displayOrder;
 if(!voter || !Number.isInteger(slot) || slot<1 || slot>50) return;
 if(!Number.isInteger(displayOrder) || displayOrder<0 || displayOrder>=40) return;
 if(packageVoteAssignedSlot()!==slot) return;
-if(packageVoteCompleted().includes(id)) return;
+if(packageVoteEffectiveCompleted().includes(id)) return;
 
-fetch(KTC_SUBMIT_URL,{
-  method:'POST',
-  headers:{'Content-Type':'text/plain;charset=utf-8'},
-  body:JSON.stringify({
-    voterRosterId:voter,
-    keep:`__pkgv8dev__|${id}|${choice}`,
-    trade:`__pkgv8dev_meta__|${left}|${slot}|${displayOrder}`,
-    cut:'__pkgv8dev_schema__|1'
-  })
-}).catch(()=>{});
-
-localStorage.setItem(packageVoteTodayKey(),String(packageVotesToday()+1));
-packageVoteRemember(id);
-packageVoteCurrent=packageVoteSelectChallenge();
+packageVoteSubmitInFlight=true;
+packageVoteSubmitError='';
 renderPackageVote();
+try{
+  const response=await fetch(KTC_SUBMIT_URL,{
+    method:'POST',
+    headers:{'Content-Type':'text/plain;charset=utf-8'},
+    body:JSON.stringify({
+      roster_id:voter,
+      voter_roster_id:voter,
+      keep:`__pkgv8dev__|${id}|${choice}`,
+      trade:`__pkgv8dev_meta__|${left}|${slot}|${displayOrder}`,
+      cut:'__pkgv8dev_schema__|1'
+    })
+  });
+  if(response && response.type!=='opaque' && !response.ok){
+    throw new Error(`vote collector HTTP ${response.status}`);
+  }
+  localStorage.setItem(packageVoteTodayKey(),String(packageVotesToday()+1));
+  packageVoteRemember(id);
+  packageVoteAcknowledgeRecovery(id);
+  packageVoteCurrent=packageVoteSelectChallenge();
+}catch(err){
+  console.warn('Package Adjustment V8 vote submission not confirmed:',err);
+  packageVoteSubmitError='Submission was not confirmed. Do not vote again or clear this browser. Ask the league admin to run the outcome-blind B2 monitor.';
+}finally{
+  packageVoteSubmitInFlight=false;
+  renderPackageVote();
+}
 }
 
 function renderPackageVote(){
@@ -12579,7 +12622,11 @@ if(Date.now()<Date.parse(PACKAGE_VOTE_VALID_AFTER_UTC)){
   return;
 }
 
-const completedCount=packageVoteCompleted().length;
+const completedCount=packageVoteEffectiveCompleted().length;
+if(packageVoteSubmitError){
+  el.innerHTML=`<div style="border:1px solid var(--red);border-radius:8px;padding:10px;color:var(--text-muted);font-size:13px;"><b style="color:var(--red);">Vote submission status uncertain.</b><br>${escapeHtml(packageVoteSubmitError)}</div>`;
+  return;
+}
 if(completedCount>=PACKAGE_VOTE_TOTAL_CHALLENGES){
   el.innerHTML=`<div style="color:var(--green);font-size:13px;padding:8px 0;">You've completed all ${PACKAGE_VOTE_TOTAL_CHALLENGES} V8 comparisons for research slot ${slot}. Thank you.</div>`;
   return;
