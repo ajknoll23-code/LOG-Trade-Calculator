@@ -1,0 +1,308 @@
+name: B5 Package Adjustment V8 - Brave No-CORS Transport Repair V1
+
+"on":
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: package-adjustment-v8-brave-no-cors-transport-repair
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir "requests==2.34.2"
+
+      - name: Verify current transport state
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path("index.html").read_text(encoding="utf-8")
+          a=s.index("async function packageVoteSubmit(displaySide)")
+          b=s.index("function renderPackageVote()",a)
+          sub=s[a:b]
+          assert "voterRosterId:voter" in sub
+          assert "const response=await fetch(KTC_SUBMIT_URL" in sub
+          assert "mode:'no-cors'" not in sub
+          assert "packageVoteSubmitInFlight=true;" in sub
+          assert "packageVoteRemember(id);" in sub
+          assert sub.index("packageVoteSubmitInFlight=true;") < sub.index("const response=await fetch")
+          assert sub.index("const response=await fetch") < sub.index("packageVoteRemember(id);")
+          print("PASS: current Brave/CORS-sensitive transport reproduced.")
+          PY
+
+      - name: Outcome-blind verify slot 9 reset and slots 1 through 8 complete
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/pkgv8-b5
+          python3 - <<'PY'
+          import csv, io, json, re, hashlib
+          from collections import defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+          import requests
+
+          D=Path("research/package-adjustment-v8")
+          act=json.loads((D/"development_voting_activation_manifest_v1.json").read_text())
+          sched=json.loads((D/"voting_randomization_schedule_v1.json").read_text())
+
+          url=(
+              "https://docs.google.com/spreadsheets/d/e/"
+              "2PACX-1vTuKORGumlKJmUmBdeNWPstkj8VRjPoVkylbqHv1KqwoyziJYOUlkZUKRsSxzB3qHXmyjjLpGpH6W03/"
+              "pub?gid=458294959&single=true&output=csv"
+          )
+
+          def parse_utc(v):
+              x=str(v or "").strip()
+              if not x:
+                  return None
+              if x.endswith("Z"):
+                  x=x[:-1]+"+00:00"
+              try:
+                  dt=datetime.fromisoformat(x)
+              except Exception:
+                  return None
+              if dt.tzinfo is None:
+                  dt=dt.replace(tzinfo=timezone.utc)
+              return dt.astimezone(timezone.utc)
+
+          cutoff=parse_utc(act["valid_ballot_start_utc"])
+          now=datetime.now(timezone.utc)
+          r=requests.get(url,timeout=30)
+          r.raise_for_status()
+          rows=list(csv.DictReader(io.StringIO(r.text)))
+
+          structural=defaultdict(list)
+          meta_re=re.compile(r"^__pkgv8dev_meta__\|[AB]\|([1-9]|[1-4][0-9]|50)\|([0-9]|[1-2][0-9]|3[0-9])$")
+          prefix="__pkgv8dev__|"
+
+          for row in rows:
+              keep=str(row.get("keep") or "")
+              if not keep.startswith(prefix):
+                  continue
+              ts=parse_utc(row.get("timestamp"))
+              if ts is None or ts<=cutoff or ts>now:
+                  continue
+              if str(row.get("cut") or "")!="__pkgv8dev_schema__|1":
+                  continue
+              mm=meta_re.fullmatch(str(row.get("trade") or ""))
+              if not mm:
+                  continue
+              slot=int(mm.group(1))
+              order=int(mm.group(2))
+              payload=keep[len(prefix):]
+              cid,sep,_ignored=payload.partition("|")
+              if not sep:
+                  continue
+              cid=cid.strip()
+              spec=sched["slots"].get(str(slot))
+              if not spec or cid not in spec["challenge_order"]:
+                  continue
+              if spec["challenge_order"].index(cid)!=order:
+                  continue
+              voter=str(row.get("voter_roster_id") or "").strip()
+              if not voter:
+                  continue
+              structural[slot].append((voter,cid,order))
+
+          for slot in range(1,9):
+              sr=structural[slot]
+              assert len({x[0] for x in sr})==1, (slot,"voter count")
+              assert len(sr)==40, (slot,len(sr))
+              assert len({x[1] for x in sr})==40, (slot,"unique challenges")
+              assert {x[2] for x in sr}==set(range(40)), (slot,"orders")
+
+          assert len(structural[9])==0, structural[9]
+
+          evidence={
+              "schema_version":1,
+              "study_id":"package-adjustment-v8",
+              "stage":"brave_no_cors_transport_repair_v1",
+              "generated_at_utc":now.isoformat(),
+              "outcome_blind":True,
+              "human_choice_payload_read":False,
+              "human_choice_payload_stored":False,
+              "accepted_complete_slots_before_patch":list(range(1,9)),
+              "slot9_structural_rows_before_patch":0,
+              "slot9_reset_authorized_by_user":True,
+              "transport_problem":"successful Google Apps Script POST can reject in Brave because response is not CORS-readable",
+              "repair":"explicit fetch mode no-cors; preserve in-flight lock; advance locally only after fetch promise resolves",
+              "payload_voter_field":"voterRosterId",
+              "frozen_schedule_changed":False,
+              "production_change_authorized":False,
+              "sheet_sha256":hashlib.sha256(r.content).hexdigest()
+          }
+          Path("/tmp/pkgv8-b5/voting_transport_no_cors_repair_v1.json").write_text(
+              json.dumps(evidence,indent=2,sort_keys=True)+"\n"
+          )
+          print(json.dumps(evidence,indent=2))
+          PY
+
+      - name: Patch V8 submit to explicit no-cors transport
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          p=Path("index.html")
+          s=p.read_text(encoding="utf-8")
+          a=s.index("async function packageVoteSubmit(displaySide)")
+          b=s.index("function renderPackageVote()",a)
+          sub=s[a:b]
+
+          pat=re.compile(
+              r"const response=await fetch\(KTC_SUBMIT_URL,\{\n"
+              r"\s*method:'POST',\n"
+              r"\s*headers:\{'Content-Type':'text/plain;charset=utf-8'\},"
+          )
+          m=pat.search(sub)
+          assert m, "V8 fetch anchor not found"
+          replacement=(
+              "await fetch(KTC_SUBMIT_URL,{\n"
+              "    method:'POST',\n"
+              "    mode:'no-cors',\n"
+              "    headers:{'Content-Type':'text/plain;charset=utf-8'},"
+          )
+          sub=sub[:m.start()]+replacement+sub[m.end():]
+
+          status_check=re.compile(
+              r"\n\s*if\(response && response\.type!=='opaque' && !response\.ok\)\{\n"
+              r"\s*throw new Error\(`vote collector HTTP \$\{response\.status\}`\);\n"
+              r"\s*\}\n"
+          )
+          sub,n=status_check.subn("\n",sub,count=1)
+          assert n==1, "response status block not found"
+
+          old="Submission was not confirmed. Do not vote again or clear this browser. Ask the league admin to run the outcome-blind B2 monitor."
+          new="Vote could not be dispatched. Do not tap repeatedly. Check your connection, then ask the league admin to run the outcome-blind B2 monitor before retrying."
+          assert old in sub
+          sub=sub.replace(old,new,1)
+
+          s=s[:a]+sub+s[b:]
+          p.write_text(s,encoding="utf-8")
+
+          check=p.read_text(encoding="utf-8")
+          a=check.index("async function packageVoteSubmit(displaySide)")
+          b=check.index("function renderPackageVote()",a)
+          sub=check[a:b]
+
+          assert "mode:'no-cors'" in sub
+          assert "voterRosterId:voter" in sub
+          assert "const response=await fetch" not in sub
+          assert "response.type" not in sub
+          assert "response.status" not in sub
+          assert "packageVoteSubmitInFlight=true;" in sub
+          assert sub.index("await fetch(KTC_SUBMIT_URL") < sub.index("packageVoteRemember(id);")
+          assert sub.index("packageVoteRemember(id);") < sub.index("packageVoteCurrent=packageVoteSelectChallenge();")
+          print("PASS: explicit no-cors transport installed.")
+          PY
+
+      - name: Persist transport evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp /tmp/pkgv8-b5/voting_transport_no_cors_repair_v1.json \
+            research/package-adjustment-v8/voting_transport_no_cors_repair_v1.json
+
+      - name: Static transport regression checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          s=Path("index.html").read_text(encoding="utf-8")
+          a=s.index("async function packageVoteSubmit(displaySide)")
+          b=s.index("function renderPackageVote()",a)
+          sub=s[a:b]
+
+          for token in (
+              "voterRosterId:voter",
+              "keep:`__pkgv8dev__|${id}|${choice}`",
+              "trade:`__pkgv8dev_meta__|${left}|${slot}|${displayOrder}`",
+              "cut:'__pkgv8dev_schema__|1'",
+          ):
+              assert token in sub, token
+
+          assert "mode:'no-cors'" in sub
+          assert "if(!packageVoteCurrent || packageVoteSubmitInFlight) return;" in sub
+          assert sub.index("await fetch(KTC_SUBMIT_URL") < sub.index("packageVoteRemember(id);")
+          assert sub.index("packageVoteRemember(id);") < sub.index("packageVoteCurrent=packageVoteSelectChallenge();")
+
+          ev=json.loads(Path("research/package-adjustment-v8/voting_transport_no_cors_repair_v1.json").read_text())
+          assert ev["outcome_blind"] is True
+          assert ev["slot9_structural_rows_before_patch"]==0
+          assert ev["frozen_schedule_changed"] is False
+          assert ev["production_change_authorized"] is False
+          print("PASS: frozen payload and schedule untouched.")
+          PY
+
+      - name: Run package adjustment live regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/check_package_adjustment_live.py
+
+      - name: Run repository regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/repo_regression_checks.py
+
+      - name: Commit repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            index.html \
+            research/package-adjustment-v8/voting_transport_no_cors_repair_v1.json
+
+          git diff --cached --check
+          git diff --cached --stat
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 1
+          fi
+
+          git commit -m "Use no-cors transport for V8 package voting"
+          git pull --rebase origin main
+          git push origin HEAD:main
+
+      - name: Final confirmation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          echo "B5 COMPLETE"
+          echo "Wait for GitHub Pages deployment."
+          echo "Then slot 9 may restart from 0/40 with the same slot-9 link."
