@@ -1,0 +1,337 @@
+# PREFLIGHTED: B29C_COMPLETION_GAP_AUDIT_V1
+name: B29C Draft Capital Outlook V3 - Completion Gap Audit
+
+"on":
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  audit:
+    name: Classify frozen B29 unresolved completion gaps
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13.15"
+
+      - name: Install repository regression dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir "requests==2.32.5"
+
+      - name: Guard frozen B29 inconclusive state
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          root=Path("research/draft-capital-outlook-v3/b29")
+          m=json.loads((root/"b29_manifest.json").read_text())
+          r=json.loads((root/"b29_result.json").read_text())
+          c=json.loads((root/"b29_execution_contract.json").read_text())
+
+          assert m["decision"]=="INCONCLUSIVE_B29_HISTORICAL_ENUMERATION_REQUIRES_TRANSPORT_OR_TEMPLATE_COMPLETION"
+          assert m["b29_completion_only_followup_authorized"] is True
+          assert m["b30_2027_source_feasibility_authorized"] is False
+          assert m["2027_candidate_enumeration_authorized"] is False
+          assert m["historical_actual_capital_open_authorized"] is False
+          assert m["predictor_target_association_authorized"] is False
+          assert m["production_change_authorized"] is False
+          assert m["draft_capital_outlook_multiplier"]==1.0
+          assert r["selected_K"] is None
+          assert r["selected_N"] is None
+          assert c["transport_or_template_failure_policy"]=="UNRESOLVED_NOT_SOURCE_FAILURE"
+          assert c["candidate_truncation_policy"]=="UNRESOLVED_NOT_NEGATIVE_EVIDENCE"
+          assert c["2027_enumeration_authorized"] is False
+          assert c["historical_actual_capital_open_authorized"] is False
+          assert c["predictor_target_association_authorized"] is False
+          assert not Path("research/draft-capital-outlook-v3/b29c").exists()
+          PY
+
+      - name: Inventory unresolved causes without changing measurement
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p research/draft-capital-outlook-v3/b29c
+          python3 - <<'PY'
+          import collections, hashlib, json
+          from pathlib import Path
+
+          B29=Path("research/draft-capital-outlook-v3/b29")
+          OUT=Path("research/draft-capital-outlook-v3/b29c")
+          YEARS=list(range(2013,2027))
+
+          sha=lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+
+          def norm(v):
+              if v is None:
+                  return "null"
+              if isinstance(v,bool):
+                  return str(v).lower()
+              if isinstance(v,(int,float,str)):
+                  s=str(v).strip()
+                  return s[:300] if s else "<empty>"
+              if isinstance(v,list):
+                  if not v:
+                      return "[]"
+                  vals=[]
+                  for x in v[:5]:
+                      vals.append(norm(x))
+                  return "["+" | ".join(vals)+(" | ..." if len(v)>5 else "")+"]"
+              if isinstance(v,dict):
+                  keys=sorted(v)[:8]
+                  return "{"+",".join(keys)+("..." if len(v)>8 else "")+"}"
+              return type(v).__name__
+
+          # Generic reason/status fields only. This audit does not reinterpret qualification.
+          reason_tokens=("error","reason","status","failure","transport","template","capture","http","archive","wayback")
+          summary=[]
+          global_reason_counts=collections.Counter()
+          global_unmeasurable_keys=collections.Counter()
+          global_channel_errors=collections.Counter()
+
+          for y in YEARS:
+              p=B29/"years"/f"b29_{y}.json"
+              assert p.is_file(),p
+              j=json.loads(p.read_text())
+              assert j["class_year"]==y
+              assert j["unresolved_measurement_or_truncation"] is True
+              assert j["2027_source_enumerated"] is False
+              assert j["historical_actual_capital_loaded"] is False
+              assert j["predictor_target_association_computed"] is False
+              assert j["production_change_authorized"] is False
+
+              rows=j["page_rows"]
+              un=[r for r in rows if r.get("unmeasurable")]
+              reason_counts=collections.Counter()
+              key_counts=collections.Counter()
+              samples=[]
+
+              for r in un:
+                  for k,v in r.items():
+                      key_counts[k]+=1
+                      global_unmeasurable_keys[k]+=1
+                      kl=k.lower()
+                      if any(t in kl for t in reason_tokens):
+                          val=norm(v)
+                          reason_counts[f"{k}={val}"]+=1
+                          global_reason_counts[f"{k}={val}"]+=1
+                  if len(samples)<12:
+                      samples.append({
+                          "global_index":r.get("global_index"),
+                          "url":r.get("url"),
+                          "canonical_domain":r.get("canonical_domain"),
+                          "reason_fields":{
+                              k:r.get(k) for k in sorted(r)
+                              if any(t in k.lower() for t in reason_tokens)
+                          }
+                      })
+
+              channel_rows=[]
+              for ch in j.get("channel_status",[]):
+                  errs=ch.get("errors",[])
+                  for e in errs:
+                      global_channel_errors[norm(e)]+=1
+                  channel_rows.append({
+                      "domain":ch.get("domain"),
+                      "channel":ch.get("channel"),
+                      "truncated":bool(ch.get("truncated")),
+                      "error_count":len(errs),
+                      "errors":[norm(e) for e in errs[:10]]
+                  })
+
+              rec={
+                  "class_year":y,
+                  "input_sha256":sha(p),
+                  "candidate_url_count_total":j.get("candidate_url_count_total"),
+                  "candidate_url_count_evaluated":j.get("candidate_url_count_evaluated"),
+                  "candidate_cap_truncated":bool(j.get("candidate_cap_truncated")),
+                  "channel_truncated_count":sum(1 for x in j.get("channel_status",[]) if x.get("truncated")),
+                  "channel_error_count":sum(len(x.get("errors",[])) for x in j.get("channel_status",[])),
+                  "page_row_count":len(rows),
+                  "unmeasurable_row_count":len(un),
+                  "measurable_row_count":len(rows)-len(un),
+                  "K60_lower_bound":j.get("independent_qualifying_count_K60"),
+                  "K32_lower_bound":j.get("independent_qualifying_count_K32"),
+                  "unmeasurable_key_frequency":dict(key_counts.most_common()),
+                  "unmeasurable_reason_frequency":dict(reason_counts.most_common()),
+                  "unmeasurable_samples":samples,
+                  "channel_status":channel_rows,
+                  "unresolved_components":{
+                      "candidate_cap_truncated":bool(j.get("candidate_cap_truncated")),
+                      "any_channel_truncated":any(x.get("truncated") for x in j.get("channel_status",[])),
+                      "any_unmeasurable_row":bool(un)
+                  }
+              }
+              summary.append(rec)
+
+          cause_matrix=[]
+          for r in summary:
+              c=r["unresolved_components"]
+              cause_matrix.append({
+                  "class_year":r["class_year"],
+                  "candidate_cap_truncated":c["candidate_cap_truncated"],
+                  "channel_truncated":c["any_channel_truncated"],
+                  "unmeasurable_rows":r["unmeasurable_row_count"],
+                  "channel_errors":r["channel_error_count"],
+                  "K60_lower_bound":r["K60_lower_bound"],
+                  "K32_lower_bound":r["K32_lower_bound"]
+              })
+
+          payload={
+              "schema_version":1,
+              "study_id":"draft-capital-outlook-v3",
+              "stage":"b29c_completion_gap_audit",
+              "source_b29_decision":"INCONCLUSIVE_B29_HISTORICAL_ENUMERATION_REQUIRES_TRANSPORT_OR_TEMPLATE_COMPLETION",
+              "scientific_semantics_changed":False,
+              "completion_only":True,
+              "network_access_used":False,
+              "new_sources_added":False,
+              "candidate_set_changed":False,
+              "qualification_rules_changed":False,
+              "K_N_rules_changed":False,
+              "2027_candidate_enumerated":False,
+              "player_identity_opened":False,
+              "historical_actual_capital_opened":False,
+              "predictor_target_association_computed":False,
+              "production_change_authorized":False,
+              "draft_capital_outlook_multiplier":1.0,
+              "per_year":summary,
+              "cause_matrix":cause_matrix,
+              "global_unmeasurable_reason_frequency":dict(global_reason_counts.most_common()),
+              "global_unmeasurable_key_frequency":dict(global_unmeasurable_keys.most_common()),
+              "global_channel_error_frequency":dict(global_channel_errors.most_common())
+          }
+
+          out=OUT/"b29c_gap_audit.json"
+          out.write_text(json.dumps(payload,indent=2,sort_keys=True)+"\n")
+
+          # Decision is intentionally diagnostic only.
+          manifest={
+              "schema_version":1,
+              "study_id":"draft-capital-outlook-v3",
+              "stage":"b29c_manifest",
+              "decision":"PASS_B29C_GAP_CLASSIFICATION_ONLY_NO_SCIENCE_DECISION",
+              "source_b29_decision":"INCONCLUSIVE_B29_HISTORICAL_ENUMERATION_REQUIRES_TRANSPORT_OR_TEMPLATE_COMPLETION",
+              "completion_repair_design_authorized":True,
+              "b30_2027_source_feasibility_authorized":False,
+              "2027_candidate_enumeration_authorized":False,
+              "historical_actual_capital_open_authorized":False,
+              "predictor_target_association_authorized":False,
+              "production_change_authorized":False,
+              "draft_capital_outlook_multiplier":1.0,
+              "scientific_semantics_changed":False,
+              "gap_audit_sha256":sha(out)
+          }
+          (OUT/"b29c_manifest.json").write_text(json.dumps(manifest,indent=2,sort_keys=True)+"\n")
+
+          report=[
+              "# Draft Capital Outlook V3 — B29C Completion Gap Audit","",
+              "Decision: **PASS_B29C_GAP_CLASSIFICATION_ONLY_NO_SCIENCE_DECISION**","",
+              "This stage classifies the already-frozen B29 unresolved flags only. It does not retry sources, add sources, change candidate sets, alter K/N rules, open 2027, open historical actual capital, compute associations, or change production.","",
+              "## Per-year unresolved causes","",
+              "| Year | Candidate cap | Channel trunc. | Unmeasurable rows | Channel errors | K60 LB | K32 LB |",
+              "|---:|:---:|---:|---:|---:|---:|---:|"
+          ]
+          for r in cause_matrix:
+              report.append(
+                  f"| {r['class_year']} | {'YES' if r['candidate_cap_truncated'] else 'no'} | "
+                  f"{'YES' if r['channel_truncated'] else 'no'} | {r['unmeasurable_rows']} | "
+                  f"{r['channel_errors']} | {r['K60_lower_bound']} | {r['K32_lower_bound']} |"
+              )
+
+          report += ["","## Most common unmeasurable reason/status fields",""]
+          for k,v in global_reason_counts.most_common(25):
+              report.append(f"- {v} × `{k}`")
+          if not global_reason_counts:
+              report.append("- No reason/status-like fields were present on unmeasurable rows; inspect key-frequency inventory in JSON.")
+
+          report += ["","## Most common channel errors",""]
+          for k,v in global_channel_errors.most_common(25):
+              report.append(f"- {v} × `{k}`")
+          if not global_channel_errors:
+              report.append("- None recorded.")
+
+          (OUT/"b29c_report.md").write_text("\n".join(report)+"\n")
+          print(json.dumps(manifest,indent=2))
+          PY
+
+      - name: Verify audit firewall
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          m=json.loads(Path("research/draft-capital-outlook-v3/b29c/b29c_manifest.json").read_text())
+          assert m["decision"]=="PASS_B29C_GAP_CLASSIFICATION_ONLY_NO_SCIENCE_DECISION"
+          assert m["completion_repair_design_authorized"] is True
+          assert m["b30_2027_source_feasibility_authorized"] is False
+          assert m["2027_candidate_enumeration_authorized"] is False
+          assert m["historical_actual_capital_open_authorized"] is False
+          assert m["predictor_target_association_authorized"] is False
+          assert m["production_change_authorized"] is False
+          assert m["draft_capital_outlook_multiplier"]==1.0
+          assert m["scientific_semantics_changed"] is False
+          PY
+
+      - name: Run repository regression preserving B29C
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="research/draft-capital-outlook-v3/b29c"
+          P="$(mktemp -d)"
+          A="$P/b29c.tar"
+          tar -C "$ROOT" -cf "$A" .
+          restore() {
+            rm -rf "$ROOT"
+            mkdir -p "$ROOT"
+            tar -C "$ROOT" -xf "$A"
+            rm -rf "$P"
+          }
+          trap restore EXIT
+          python3 scripts/validation/repo_regression_checks.py
+          restore
+          trap - EXIT
+
+      - name: Commit B29C diagnostic artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add research/draft-capital-outlook-v3/b29c
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            echo "No B29C changes to commit."
+            exit 1
+          fi
+          git commit -m "B29C classify historical enumeration completion gaps"
+          git pull --rebase origin main
+          git push origin HEAD:main
+
+      - name: Final clean-state confirmation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          echo "B29C complete. Read b29c_report.md before designing any completion repair."
