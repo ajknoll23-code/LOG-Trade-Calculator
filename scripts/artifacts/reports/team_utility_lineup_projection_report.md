@@ -35,8 +35,8 @@
 | Sunday Brunson  | 100.0% | 17/17 | 0 |
 | Narroway Farms M714 | 100.0% | 17/17 | 0 |
 | Landry's Hat | 100.0% | 17/17 | 0 |
-| Pullham Bluecocks  | 97.2% | 17/17 | 0 |
-| Cock Mchorse 🐴 | 94.1% | 17/17 | 0 |
+| Pullham Bluecocks  | 97.1% | 17/17 | 0 |
+| Cock Mchorse 🐴 | 94.4% | 17/17 | 0 |
 | Jersey Bagels | 91.2% | 17/17 | 0 |
 | Apex Predators | 100.0% | 17/17 | 0 |
 | Toddy2times | 100.0% | 17/17 | 0 |
