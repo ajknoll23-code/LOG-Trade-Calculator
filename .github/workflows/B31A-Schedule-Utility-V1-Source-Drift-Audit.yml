@@ -1,0 +1,623 @@
+name: B31A Schedule Utility V1 - Historical Source Snapshot Drift Audit
+
+"on":
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: b31a-schedule-utility-v1-source-drift-audit
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  B29_FREEZE_COMMIT: "46e0da275b797e4d7140cc33c2a452c2906d4408"
+  B30_FREEZE_COMMIT: "875ff12e7bf3622b95276bc8996489cccbbcec9e"
+  FAILED_B31_HEAD: "5132215eee3eaafd532fa0d21f2862e84562abf6"
+  FROZEN_LOG_SAPA_SHA256: "9ab4ec5b21ef9ef57e476e861a7293dbc886b9bc9d7cc5f0bd5cc982cc729ee6"
+  B30_FROZEN_GAMES_SHA256: "ae8bdaccb1b46f01c04fd161697ee95de793b0a39834308024f4fc7a97055429"
+
+jobs:
+  source_drift_audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Verify frozen lineage and confirm B31 never opened outcomes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git merge-base --is-ancestor "$B29_FREEZE_COMMIT" HEAD
+          git merge-base --is-ancestor "$B30_FREEZE_COMMIT" HEAD
+          git cat-file -e "$FAILED_B31_HEAD^{commit}"
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path("research/schedule-utility-v1")
+          pre = json.loads(
+              (root / "schedule_utility_v1_phase2b_preflight.json")
+              .read_text(encoding="utf-8")
+          )
+          amend = json.loads(
+              (root / "schedule_utility_v1_phase2a_amendment_1.json")
+              .read_text(encoding="utf-8")
+          )
+
+          assert pre["status"] == (
+              "PASS_PREDICTOR_ONLY_PREFLIGHT_READY_TO_UNSEAL_PHASE2_TARGETS"
+          )
+          assert pre["target_outcome_evaluation_performed"] is False
+          assert pre["predictor_target_association_computed"] is False
+          assert pre["mae_or_rmse_computed"] is False
+          assert pre["phase2_primary_pass_stop_computed"] is False
+          assert pre["source_snapshot_sha256"]["games_csv"] == (
+              "ae8bdaccb1b46f01c04fd161697ee95de793b0a39834308024f4fc7a97055429"
+          )
+
+          assert amend["status"] == "OUTCOME_BLIND_AMENDMENT_FROZEN"
+          assert amend["amd_8_governance"][
+              "historical_outcomes_opened_before_this_amendment"
+          ] is False
+          assert amend["amd_8_governance"][
+              "threshold_or_predictor_retuning_after_outcomes_authorized"
+          ] is False
+
+          # B31 failed before evaluation and therefore committed no evaluation JSON.
+          assert not (
+              root / "schedule_utility_v1_phase2b_evaluation.json"
+          ).exists()
+
+          print("PASS: lineage verified; B31 did not commit an evaluation result.")
+          PY
+
+      - name: Snapshot production
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "INDEX_SHA=$(sha256sum index.html | awk '{print $1}')" >> "$GITHUB_ENV"
+          echo "FA_SHA=$(sha256sum free-agent-board.html | awk '{print $1}')" >> "$GITHUB_ENV"
+
+      - name: Materialize exact frozen B30 implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/schedule-utility-v1/frozen
+
+          git show "$B30_FREEZE_COMMIT:research/schedule-utility-v1/schedule_utility_v1_phase2b_preflight.py" \
+            > /tmp/schedule-utility-v1/frozen/b30_preflight.py
+
+          git show "$B29_FREEZE_COMMIT:research/schedule-utility-v1/log_sapa_v1.py" \
+            > /tmp/schedule-utility-v1/frozen/log_sapa_v1.py
+
+          test "$(sha256sum /tmp/schedule-utility-v1/frozen/log_sapa_v1.py | awk '{print $1}')" \
+            = "$FROZEN_LOG_SAPA_SHA256"
+
+          python3 -m py_compile /tmp/schedule-utility-v1/frozen/b30_preflight.py
+          python3 /tmp/schedule-utility-v1/frozen/b30_preflight.py --selftest
+
+      - name: Download current mutable nflverse release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/schedule-utility-v1/current-stats
+
+          curl --fail --location --retry 3 --retry-delay 2 \
+            --output /tmp/schedule-utility-v1/current-games.csv \
+            https://github.com/nflverse/nflverse-data/releases/download/schedules/games.csv
+
+          for season in $(seq 2015 2025); do
+            curl --fail --location --retry 3 --retry-delay 2 \
+              --output "/tmp/schedule-utility-v1/current-stats/stats_player_week_${season}.csv" \
+              "https://github.com/nflverse/nflverse-data/releases/download/stats_player/stats_player_week_${season}.csv"
+            test -s "/tmp/schedule-utility-v1/current-stats/stats_player_week_${season}.csv"
+          done
+
+          test -s /tmp/schedule-utility-v1/current-games.csv
+
+      - name: Audit byte-level drift before any replay
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p research/schedule-utility-v1
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          def sha(path):
+              h = hashlib.sha256()
+              with Path(path).open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          root = Path("research/schedule-utility-v1")
+          frozen = json.loads(
+              (root / "schedule_utility_v1_phase2b_preflight.json")
+              .read_text(encoding="utf-8")
+          )
+          frozen_hashes = frozen["source_snapshot_sha256"]
+
+          current_games_sha = sha("/tmp/schedule-utility-v1/current-games.csv")
+          player = {}
+          mismatched = []
+
+          for season in range(2015, 2026):
+              path = (
+                  f"/tmp/schedule-utility-v1/current-stats/"
+                  f"stats_player_week_{season}.csv"
+              )
+              current = sha(path)
+              expected = frozen_hashes["stats_player_week"][str(season)]
+              same = current == expected
+              player[str(season)] = {
+                  "frozen_sha256": expected,
+                  "current_sha256": current,
+                  "byte_identical": same,
+              }
+              if not same:
+                  mismatched.append(season)
+
+          result = {
+              "frozen_games_sha256": frozen_hashes["games_csv"],
+              "current_games_sha256": current_games_sha,
+              "games_byte_identical":
+                  current_games_sha == frozen_hashes["games_csv"],
+              "player_stat_hashes": player,
+              "player_stat_mismatch_seasons": mismatched,
+              "all_11_player_stat_files_byte_identical": not mismatched,
+          }
+
+          Path("/tmp/schedule-utility-v1/byte-audit.json").write_text(
+              json.dumps(result, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          print(json.dumps(result, indent=2))
+          PY
+
+      - name: Replay exact frozen B30 against current source bytes
+        shell: bash
+        run: |
+          set -u
+
+          python3 /tmp/schedule-utility-v1/frozen/b30_preflight.py \
+            --schedule /tmp/schedule-utility-v1/current-games.csv \
+            --stats-dir /tmp/schedule-utility-v1/current-stats \
+            --frozen /tmp/schedule-utility-v1/frozen/log_sapa_v1.py \
+            --out /tmp/schedule-utility-v1/current-preflight.json \
+            > /tmp/schedule-utility-v1/replay.stdout.txt \
+            2> /tmp/schedule-utility-v1/replay.stderr.txt
+          rc=$?
+
+          echo "$rc" > /tmp/schedule-utility-v1/replay.exitcode
+          cat /tmp/schedule-utility-v1/replay.stdout.txt || true
+          cat /tmp/schedule-utility-v1/replay.stderr.txt || true
+
+          # A nonzero replay is recorded as a frozen scientific STOP below.
+          exit 0
+
+      - name: Decide semantic equivalence without opening outcomes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import csv
+          import json
+          from pathlib import Path
+
+          root = Path("research/schedule-utility-v1")
+          frozen = json.loads(
+              (root / "schedule_utility_v1_phase2b_preflight.json")
+              .read_text(encoding="utf-8")
+          )
+          byte_audit = json.loads(
+              Path("/tmp/schedule-utility-v1/byte-audit.json")
+              .read_text(encoding="utf-8")
+          )
+          replay_rc = int(
+              Path("/tmp/schedule-utility-v1/replay.exitcode")
+              .read_text(encoding="utf-8")
+              .strip()
+          )
+
+          current_path = Path("/tmp/schedule-utility-v1/current-preflight.json")
+          current = (
+              json.loads(current_path.read_text(encoding="utf-8"))
+              if current_path.exists()
+              else None
+          )
+
+          # Only the outer games.csv byte hash may differ. Player-stat bytes
+          # and every listed predictor-only semantic output must match B30.
+          semantic_fields = [
+              "status",
+              "metric_id",
+              "seasons",
+              "target_weeks",
+              "schedule_audit",
+              "player_stat_ingestion_audit",
+              "aggregate_completeness_audit",
+              "predictor_availability",
+              "predictor_availability_failures",
+              "timestamp_firewall",
+              "structural_centering_diagnostic",
+              "next_phase",
+          ]
+
+          mismatches = []
+          if replay_rc != 0:
+              mismatches.append({
+                  "field": "frozen_b30_replay",
+                  "reason": f"exit_code_{replay_rc}",
+              })
+          elif current is None:
+              mismatches.append({
+                  "field": "frozen_b30_replay",
+                  "reason": "no_current_preflight_json",
+              })
+          else:
+              for field in semantic_fields:
+                  if current.get(field) != frozen.get(field):
+                      mismatches.append({
+                          "field": field,
+                          "reason": "semantic_output_changed",
+                      })
+
+              if (
+                  current["source_snapshot_sha256"]["stats_player_week"]
+                  != frozen["source_snapshot_sha256"]["stats_player_week"]
+              ):
+                  mismatches.append({
+                      "field": "source_snapshot_sha256.stats_player_week",
+                      "reason": "player_stat_hash_map_changed",
+                  })
+
+          # Independent reconciliation: frozen player-stat bytes anchor
+          # game_id/season/week/team/opponent. Current schedule must agree.
+          schedule_reconciliation = {
+              "checked_player_rows": 0,
+              "game_id_missing": 0,
+              "season_week_mismatch": 0,
+              "team_membership_mismatch": 0,
+              "opponent_mismatch": 0,
+          }
+
+          games = {}
+          with open(
+              "/tmp/schedule-utility-v1/current-games.csv",
+              encoding="utf-8-sig",
+              newline="",
+          ) as f:
+              for row in csv.DictReader(f):
+                  try:
+                      season = int(row["season"])
+                      week = int(row["week"])
+                  except (TypeError, ValueError):
+                      continue
+                  if not (2015 <= season <= 2025):
+                      continue
+                  if str(row.get("game_type", "")).upper() != "REG":
+                      continue
+                  gid = str(row.get("game_id", "")).strip()
+                  if not gid:
+                      continue
+                  games[gid] = {
+                      "season": season,
+                      "week": week,
+                      "away": str(row.get("away_team", "")).strip().upper(),
+                      "home": str(row.get("home_team", "")).strip().upper(),
+                  }
+
+          aliases = {
+              "ARZ":"ARI","BLT":"BAL","CLV":"CLE","HST":"HOU","JAC":"JAX",
+              "LA":"LAR","LAR":"LAR","OAK":"LV","SD":"LAC","STL":"LAR",
+              "WSH":"WAS",
+          }
+          def canon(x):
+              s = str(x or "").strip().upper()
+              return aliases.get(s, s)
+
+          for season in range(2015, 2026):
+              path = (
+                  f"/tmp/schedule-utility-v1/current-stats/"
+                  f"stats_player_week_{season}.csv"
+              )
+              with open(path, encoding="utf-8-sig", newline="") as f:
+                  for row in csv.DictReader(f):
+                      try:
+                          s = int(row["season"])
+                          w = int(row["week"])
+                      except (TypeError, ValueError):
+                          continue
+                      if s != season:
+                          continue
+                      if str(row.get("season_type", "")).upper() not in {
+                          "REG", "REGULAR"
+                      }:
+                          continue
+
+                      gid = str(row.get("game_id", "")).strip()
+                      g = games.get(gid)
+                      schedule_reconciliation["checked_player_rows"] += 1
+
+                      if g is None:
+                          schedule_reconciliation["game_id_missing"] += 1
+                          continue
+                      if g["season"] != s or g["week"] != w:
+                          schedule_reconciliation["season_week_mismatch"] += 1
+
+                      team = canon(row.get("recent_team") or row.get("team"))
+                      away = canon(g["away"])
+                      home = canon(g["home"])
+                      if team not in {away, home}:
+                          schedule_reconciliation[
+                              "team_membership_mismatch"
+                          ] += 1
+                          continue
+
+                      opp_raw = row.get("opponent_team")
+                      if opp_raw not in (None, ""):
+                          expected_opp = home if team == away else away
+                          if canon(opp_raw) != expected_opp:
+                              schedule_reconciliation["opponent_mismatch"] += 1
+
+          reconciliation_failures = sum(
+              schedule_reconciliation[k]
+              for k in (
+                  "game_id_missing",
+                  "season_week_mismatch",
+                  "team_membership_mismatch",
+                  "opponent_mismatch",
+              )
+          )
+
+          if reconciliation_failures:
+              mismatches.append({
+                  "field": "schedule_stat_identity_reconciliation",
+                  "reason": f"{reconciliation_failures}_mismatches",
+              })
+
+          if not byte_audit["all_11_player_stat_files_byte_identical"]:
+              mismatches.append({
+                  "field": "player_stat_source_bytes",
+                  "reason": "one_or_more_frozen_player_stat_files_drifted",
+              })
+
+          if current is not None and current.get("status") != (
+              "PASS_PREDICTOR_ONLY_PREFLIGHT_READY_TO_UNSEAL_PHASE2_TARGETS"
+          ):
+              mismatches.append({
+                  "field": "current_preflight_status",
+                  "reason": str(current.get("status")),
+              })
+
+          semantically_equivalent = not mismatches
+          status = (
+              "PASS_SCHEDULE_CONTAINER_DRIFT_SEMANTICALLY_EQUIVALENT"
+              if semantically_equivalent
+              else "STOP_SOURCE_DRIFT_MATERIAL_OR_UNRESOLVED"
+          )
+
+          audit = {
+              "schema_version": 1,
+              "study_id": "schedule-utility-v1",
+              "phase": "2B-source-drift-audit",
+              "status": status,
+              "historical_target_outcomes_opened": False,
+              "target_outcome_evaluation_performed": False,
+              "mae_or_rmse_computed": False,
+              "predictor_target_association_computed": False,
+              "phase2_primary_pass_stop_computed": False,
+              "production_change_authorized": False,
+              "predictor_or_primary_gate_changed": False,
+              "b30_frozen_games_sha256":
+                  byte_audit["frozen_games_sha256"],
+              "current_games_sha256":
+                  byte_audit["current_games_sha256"],
+              "games_byte_identical":
+                  byte_audit["games_byte_identical"],
+              "all_11_player_stat_files_byte_identical":
+                  byte_audit["all_11_player_stat_files_byte_identical"],
+              "player_stat_mismatch_seasons":
+                  byte_audit["player_stat_mismatch_seasons"],
+              "frozen_b30_replay_exit_code": replay_rc,
+              "semantic_fields_compared": semantic_fields,
+              "semantic_mismatches": mismatches,
+              "schedule_stat_identity_reconciliation":
+                  schedule_reconciliation,
+              "scientific_interpretation": (
+                  "Current games.csv bytes may replace the vanished mutable "
+                  "release container ONLY because all frozen player-stat bytes "
+                  "remain identical and every frozen predictor-only semantic "
+                  "output replays identically."
+                  if semantically_equivalent
+                  else
+                  "Current source bytes are not authorized for retrospective "
+                  "evaluation. Do not open outcomes and do not retune."
+              ),
+              "next_phase": {
+                  "name": "B31 V2 frozen retrospective predictive evaluation",
+                  "authorized": semantically_equivalent,
+                  "required_games_sha256":
+                      byte_audit["current_games_sha256"]
+                      if semantically_equivalent else None,
+                  "required_player_stat_sha256":
+                      frozen["source_snapshot_sha256"]["stats_player_week"]
+                      if semantically_equivalent else None,
+                  "may_change_predictor_or_primary_gate": False,
+              },
+          }
+
+          (root / "schedule_utility_v1_phase2b_source_drift_audit.json").write_text(
+              json.dumps(audit, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          lines = [
+              "# Schedule Utility V1 — Phase 2B Source Snapshot Drift Audit",
+              "",
+              f"**Decision:** `{status}`",
+              "",
+              "## Outcome firewall",
+              "",
+              "- Historical target outcomes opened: **NO**",
+              "- MAE/RMSE computed: **NO**",
+              "- Predictor-target association computed: **NO**",
+              "- Phase 2 predictive PASS/STOP computed: **NO**",
+              "",
+              "## Source audit",
+              "",
+              f"- Frozen B30 games.csv SHA256: "
+              f"`{byte_audit['frozen_games_sha256']}`",
+              f"- Current games.csv SHA256: "
+              f"`{byte_audit['current_games_sha256']}`",
+              f"- games.csv byte-identical: "
+              f"`{byte_audit['games_byte_identical']}`",
+              f"- All 11 player-stat files byte-identical: "
+              f"`{byte_audit['all_11_player_stat_files_byte_identical']}`",
+              f"- Frozen B30 replay exit code: `{replay_rc}`",
+              f"- Semantic mismatch count: `{len(mismatches)}`",
+              f"- Schedule/stat reconciliation failures: "
+              f"`{reconciliation_failures}`",
+              "",
+              "## Governance",
+              "",
+              f"- B31 V2 authorized: `{semantically_equivalent}`",
+              "- Predictor changed: **NO**",
+              "- Primary thresholds changed: **NO**",
+              "- Production change: **NONE**",
+              "",
+          ]
+          (root / "schedule_utility_v1_phase2b_source_drift_audit.md").write_text(
+              "\n".join(lines),
+              encoding="utf-8",
+          )
+
+          print(json.dumps(audit, indent=2))
+          PY
+
+      - name: Validate audit artifact and production firewall
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path("research/schedule-utility-v1")
+          a = json.loads(
+              (root / "schedule_utility_v1_phase2b_source_drift_audit.json")
+              .read_text(encoding="utf-8")
+          )
+
+          assert a["status"] in {
+              "PASS_SCHEDULE_CONTAINER_DRIFT_SEMANTICALLY_EQUIVALENT",
+              "STOP_SOURCE_DRIFT_MATERIAL_OR_UNRESOLVED",
+          }
+          assert a["historical_target_outcomes_opened"] is False
+          assert a["target_outcome_evaluation_performed"] is False
+          assert a["mae_or_rmse_computed"] is False
+          assert a["predictor_target_association_computed"] is False
+          assert a["phase2_primary_pass_stop_computed"] is False
+          assert a["production_change_authorized"] is False
+          assert a["predictor_or_primary_gate_changed"] is False
+          assert a["next_phase"]["may_change_predictor_or_primary_gate"] is False
+
+          if a["next_phase"]["authorized"]:
+              assert a["status"] == (
+                  "PASS_SCHEDULE_CONTAINER_DRIFT_SEMANTICALLY_EQUIVALENT"
+              )
+              assert a["all_11_player_stat_files_byte_identical"] is True
+              assert a["semantic_mismatches"] == []
+              assert a["frozen_b30_replay_exit_code"] == 0
+              assert a["next_phase"]["required_games_sha256"]
+              assert len(a["next_phase"]["required_player_stat_sha256"]) == 11
+          else:
+              assert a["status"] == (
+                  "STOP_SOURCE_DRIFT_MATERIAL_OR_UNRESOLVED"
+              )
+
+          print("PASS: B31A audit artifact is internally consistent.")
+          PY
+
+          test "$(sha256sum index.html | awk '{print $1}')" = "$INDEX_SHA"
+          test "$(sha256sum free-agent-board.html | awk '{print $1}')" = "$FA_SHA"
+          test -z "$(git diff --name-only -- index.html free-agent-board.html)"
+
+          if find research/schedule-utility-v1 -maxdepth 1 -type f \
+            \( -name '*.csv' -o -name '*.csv.gz' -o -name '*.parquet' \) \
+            -print -quit | grep -q .; then
+            echo "Raw historical source leakage detected."
+            exit 1
+          fi
+
+      - name: Commit frozen B31A drift audit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git add \
+            research/schedule-utility-v1/schedule_utility_v1_phase2b_source_drift_audit.json \
+            research/schedule-utility-v1/schedule_utility_v1_phase2b_source_drift_audit.md
+
+          if git diff --cached --quiet; then
+            echo "B31A drift audit already frozen; no commit required."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Freeze Schedule Utility V1 B31A source snapshot drift audit"
+          git push origin HEAD:main
+
+      - name: Closeout
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          a = json.loads(
+              Path(
+                  "research/schedule-utility-v1/"
+                  "schedule_utility_v1_phase2b_source_drift_audit.json"
+              ).read_text(encoding="utf-8")
+          )
+
+          print("=== B31A COMPLETE ===")
+          print("Decision:", a["status"])
+          print(
+              "All 11 player-stat files byte-identical:",
+              a["all_11_player_stat_files_byte_identical"],
+          )
+          print("games.csv byte-identical:", a["games_byte_identical"])
+          print("Semantic mismatch count:", len(a["semantic_mismatches"]))
+          print(
+              "Schedule/stat reconciliation:",
+              a["schedule_stat_identity_reconciliation"],
+          )
+          print("B31 V2 authorized:", a["next_phase"]["authorized"])
+          print("Historical outcomes opened: False")
+          print("Production change authorized: False")
+          PY
