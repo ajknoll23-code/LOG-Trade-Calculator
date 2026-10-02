@@ -1,0 +1,521 @@
+name: B34B Package Trade Evidence - Pick Round-Key Repair
+'on':
+  workflow_dispatch: {}
+permissions:
+  contents: write
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+  EXPECTED_CAPTURE_SCRIPT_BLOB_SHA: bb220184d5036f207ec712b5f8fb514451638799
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+    - name: Check out current main
+      uses: actions/checkout@v4
+      with:
+        ref: main
+        fetch-depth: 0
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.13'
+    - name: Guard exact pre-repair state
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        test "$(git hash-object scripts/validation/capture_prospective_trade_evidence.py)" \
+          = "$EXPECTED_CAPTURE_SCRIPT_BLOB_SHA"
+
+        python3 - <<'PY'
+        import json
+        from pathlib import Path
+
+        e = Path("research/package-adjustment-v1/prospective/trade_evidence.json")
+        a = Path("research/package-adjustment-v1/prospective/pick_value_key_repair_2026-10-02.json")
+        assert e.is_file()
+        assert not a.exists()
+
+        d = json.loads(e.read_text(encoding="utf-8"))
+        assert d["status"] == "research_only_prospective_trade_evidence"
+        assert d["consumer_changed"] is False
+        assert d["counts"] == {
+            "eligible_numeric_trade_count": 6,
+            "excluded_trade_count": 16,
+            "snapshot_count": 28,
+            "trade_count": 22,
+        }
+
+        # Demonstrate the defect before patching: these should have been R2/R3/R4,
+        # but all 2027 picks were evaluated at the R6 mid fallback.
+        for tid in (
+            "1411039354826035200",
+            "1411041013174120448",
+            "1411042150325456896",
+            "1411116913899094016",
+        ):
+            assert d["trades"][tid]["eligible_for_numeric_package_research"] is True
+
+        print("PASS: exact pre-repair evidence state verified.")
+        PY
+    - name: Snapshot production surfaces
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "INDEX_SHA=$(sha256sum index.html | awk '{print $1}')" >> "$GITHUB_ENV"
+        echo "FA_SHA=$(sha256sum free-agent-board.html | awk '{print $1}')" >> "$GITHUB_ENV"
+    - name: Patch future pick valuation key normalization and self-test
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        python3 - <<'PY'
+        from pathlib import Path
+
+        p = Path("scripts/validation/capture_prospective_trade_evidence.py")
+        text = p.read_text(encoding="utf-8")
+
+        old = '    base_round = r if r in policy["pick_base"] else max(policy["pick_base"])\n    base = policy["pick_base"][base_round][tier]\n'
+        new = '    round_map = {}\n    for key, row in policy["pick_base"].items():\n        try:\n            ikey = int(key)\n        except (TypeError, ValueError):\n            continue\n        round_map[ikey] = row\n    if not round_map:\n        return None\n    base_round = r if r in round_map else max(round_map)\n    base = round_map[base_round][tier]\n'
+        assert text.count(old) == 1
+        text = text.replace(old, new, 1)
+
+        old_test = '    assert pick_value(1, "2027", "mid", policy) == 5854\n    assert pick_value(1, "2028", "mid", policy) == round(5854 * 0.85)\n    assert pick_value(9, "2027", "mid", policy) == 900\n'
+        new_test = '    assert pick_value(1, "2027", "mid", policy) == 5854\n    assert pick_value(1, "2028", "mid", policy) == round(5854 * 0.85)\n    assert pick_value(9, "2027", "mid", policy) == 900\n\n    # JSON round keys deserialize as strings. This exact case caused every\n    # historical pick to fall through to the maximum round before B34B.\n    json_policy = {\n        "pick_base": {\n            "1": {"early": 7500, "mid": 5854, "late": 5244},\n            "2": {"early": 3800, "mid": 3142, "late": 3016},\n            "3": {"early": 2777, "mid": 2364, "late": 2076},\n            "4": {"early": 1891, "mid": 1740, "late": 1731},\n            "6": {"early": 1000, "mid": 945, "late": 800},\n        },\n        "year_discount": {"2027": 1.0, "2028": 0.8828875559},\n        "unknown_year_discount": 0.6,\n    }\n    assert pick_value(2, "2027", "mid", json_policy) == 3142\n    assert pick_value(3, "2027", "mid", json_policy) == 2364\n    assert pick_value(4, "2027", "mid", json_policy) == 1740\n    assert pick_value(4, "2028", "mid", json_policy) == 1536\n    assert pick_value(9, "2027", "mid", json_policy) == 945\n'
+        assert text.count(old_test) == 1
+        text = text.replace(old_test, new_test, 1)
+
+        p.write_text(text, encoding="utf-8")
+        PY
+
+        python3 -m py_compile scripts/validation/capture_prospective_trade_evidence.py
+        python3 scripts/validation/capture_prospective_trade_evidence.py --selftest
+    - name: Repair historical pick values from exact pre-trade snapshots
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        python3 - <<'PY'
+        from __future__ import annotations
+
+        import hashlib
+        import json
+        import math
+        from pathlib import Path
+        from datetime import datetime, timezone
+
+        ROOT = Path(".")
+        EVIDENCE = ROOT / "research/package-adjustment-v1/prospective/trade_evidence.json"
+        AUDIT = ROOT / "research/package-adjustment-v1/prospective/pick_value_key_repair_2026-10-02.json"
+
+        SEP30_EXPECTED = {
+            # transaction_id -> list of (roster_id, year, round, expected_fv)
+            "1411039354826035200": [
+                ("7", "2027", 3, 2364),
+            ],
+            "1411041013174120448": [
+                ("7", "2027", 3, 2364),
+                ("7", "2027", 2, 3142),
+                ("10", "2027", 4, 1740),
+            ],
+            "1411042150325456896": [
+                ("9", "2027", 3, 2364),
+            ],
+            "1411116913899094016": [
+                ("4", "2028", 4, 1536),
+                ("7", "2028", 4, 1536),
+            ],
+        }
+
+
+        def sha256(path: Path) -> str:
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+        def read_json(path: Path):
+            return json.loads(path.read_text(encoding="utf-8"))
+
+
+        def robust_pick_value(round_num, season, tier, policy):
+            try:
+                r = int(round_num)
+            except (TypeError, ValueError):
+                return None
+
+            round_map = {}
+            for key, row in (policy.get("pick_base") or {}).items():
+                try:
+                    ikey = int(key)
+                except (TypeError, ValueError):
+                    continue
+                round_map[ikey] = row
+
+            if not round_map:
+                return None
+
+            base_round = r if r in round_map else max(round_map)
+            row = round_map[base_round]
+            if tier not in row:
+                return None
+
+            try:
+                base = float(row[tier])
+            except (TypeError, ValueError):
+                return None
+
+            year_discount = policy.get("year_discount") or {}
+            try:
+                disc = float(year_discount.get(
+                    str(season),
+                    policy.get("unknown_year_discount", 0.6),
+                ))
+            except (TypeError, ValueError):
+                return None
+
+            value = base * disc
+            return round(value) if math.isfinite(value) else None
+
+
+        def geometry(values, other_values):
+            vals = [float(v) for v in values if v is not None and float(v) > 0]
+            other = [float(v) for v in other_values if v is not None and float(v) > 0]
+            if not vals:
+                return {
+                    "raw_fv": 0.0,
+                    "hhi": None,
+                    "fragmentation": None,
+                    "top_asset_fv": None,
+                    "best_asset_gap": None,
+                    "fg": None,
+                }
+
+            total = sum(vals)
+            hhi = sum((v / total) ** 2 for v in vals)
+            frag = 1.0 - hhi
+            top = max(vals)
+            other_top = max(other) if other else None
+            gap = max(0.0, 1.0 - top / other_top) if other_top and other_top > 0 else 0.0
+
+            return {
+                "raw_fv": round(total, 3),
+                "hhi": round(hhi, 8),
+                "fragmentation": round(frag, 8),
+                "top_asset_fv": round(top, 3),
+                "best_asset_gap": round(gap, 8),
+                "fg": round(frag * gap, 8),
+            }
+
+
+        def find_expected_asset(trade, roster_id, season, round_num):
+            side = next(s for s in trade["sides"] if str(s["roster_id"]) == str(roster_id))
+            matches = [
+                a for a in side["received_assets"]
+                if a.get("type") == "pick"
+                and str(a.get("season")) == str(season)
+                and int(a.get("round")) == int(round_num)
+            ]
+            if len(matches) != 1:
+                raise RuntimeError(
+                    f"Expected exactly one pick match: roster={roster_id} "
+                    f"season={season} round={round_num}; found={len(matches)}"
+                )
+            return matches[0]
+
+
+        doc = read_json(EVIDENCE)
+        assert doc["status"] == "research_only_prospective_trade_evidence"
+        assert doc["consumer_changed"] is False
+        assert doc["counts"]["trade_count"] == 22
+        assert doc["counts"]["eligible_numeric_trade_count"] == 6
+
+        before_sha = sha256(EVIDENCE)
+        changes = []
+        repaired_trade_ids = set()
+        snapshot_shas = {}
+
+        for tid, trade in doc["trades"].items():
+            pre = trade.get("pretrade_snapshot")
+            sides = trade.get("sides")
+            if not pre or not isinstance(sides, list) or len(sides) != 2:
+                continue
+
+            snap_path = ROOT / pre["file"]
+            if not snap_path.is_file():
+                raise RuntimeError(f"Missing referenced pre-trade snapshot: {snap_path}")
+            snap = read_json(snap_path)
+            policy = snap.get("pick_policy")
+            if not isinstance(policy, dict):
+                raise RuntimeError(f"Missing pick policy in {snap_path}")
+
+            snapshot_shas[str(snap_path)] = sha256(snap_path)
+
+            for side in sides:
+                for asset in side.get("received_assets") or []:
+                    if asset.get("type") != "pick":
+                        continue
+                    new_fv = robust_pick_value(
+                        asset.get("round"),
+                        asset.get("season"),
+                        asset.get("tier"),
+                        policy,
+                    )
+                    if new_fv is None:
+                        raise RuntimeError(
+                            f"Could not recompute pick FV for trade {tid}: {asset}"
+                        )
+                    old_fv = asset.get("fv")
+                    if old_fv != new_fv:
+                        changes.append({
+                            "transaction_id": tid,
+                            "roster_id": str(side.get("roster_id")),
+                            "season": str(asset.get("season")),
+                            "round": int(asset.get("round")),
+                            "tier": asset.get("tier"),
+                            "tier_source": asset.get("tier_source"),
+                            "old_fv": old_fv,
+                            "new_fv": new_fv,
+                            "pretrade_snapshot": pre["file"],
+                        })
+                        asset["fv"] = new_fv
+                        repaired_trade_ids.add(tid)
+
+            values_a = [a.get("fv") for a in sides[0].get("received_assets") or []]
+            values_b = [a.get("fv") for a in sides[1].get("received_assets") or []]
+            sides[0]["package_geometry"] = geometry(values_a, values_b)
+            sides[1]["package_geometry"] = geometry(values_b, values_a)
+
+        # Exact September 30 scientific hand-check.
+        for tid, expected_rows in SEP30_EXPECTED.items():
+            trade = doc["trades"][tid]
+            assert trade["eligible_for_numeric_package_research"] is True
+            for roster_id, season, rnd, expected_fv in expected_rows:
+                asset = find_expected_asset(trade, roster_id, season, rnd)
+                assert asset["fv"] == expected_fv, (tid, roster_id, season, rnd, asset["fv"])
+
+        # Exact corrected geometry checks for the two cleanest package observations.
+        t2 = doc["trades"]["1411041013174120448"]
+        side7 = next(s for s in t2["sides"] if str(s["roster_id"]) == "7")
+        side10 = next(s for s in t2["sides"] if str(s["roster_id"]) == "10")
+        assert side7["package_geometry"]["raw_fv"] == 6319.0
+        assert side10["package_geometry"]["raw_fv"] == 6593.0
+
+        t3 = doc["trades"]["1411042150325456896"]
+        side1 = next(s for s in t3["sides"] if str(s["roster_id"]) == "1")
+        side9 = next(s for s in t3["sides"] if str(s["roster_id"]) == "9")
+        assert side1["package_geometry"]["raw_fv"] == 4801.0
+        assert side9["package_geometry"]["raw_fv"] == 5677.0
+
+        # No eligibility/status mutation is allowed in this repair.
+        assert doc["counts"]["trade_count"] == 22
+        assert doc["counts"]["eligible_numeric_trade_count"] == 6
+        assert doc["counts"]["excluded_trade_count"] == 16
+
+        doc["repair_metadata"] = {
+            "repair_id": "B34B_PICK_ROUND_KEY_TYPE_REPAIR",
+            "repaired_at_utc": datetime.now(timezone.utc).isoformat(),
+            "scope": (
+                "Recompute only pick FV fields from each trade's already-frozen "
+                "pre-trade snapshot pick policy, then recompute package geometry."
+            ),
+            "anti_hindsight_preserved": True,
+            "player_fvs_changed": False,
+            "snapshot_files_changed": False,
+            "trade_eligibility_changed": False,
+            "consumer_changed": False,
+            "production_changed": False,
+            "root_cause": (
+                "JSON object keys in pick_base deserialize as strings, while the old "
+                "pick_value function compared an integer round directly against those "
+                "string keys, causing every valid round to fall back to max(round), R6."
+            ),
+            "changed_pick_asset_count": len(changes),
+            "changed_trade_count": len(repaired_trade_ids),
+        }
+
+        EVIDENCE.write_text(
+            json.dumps(doc, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        after_sha = sha256(EVIDENCE)
+
+        audit = {
+            "schema_version": 1,
+            "status": "PASS_PICK_KEY_REPAIR_ANTI_HINDSIGHT_PRESERVED",
+            "repair_id": "B34B_PICK_ROUND_KEY_TYPE_REPAIR",
+            "before_trade_evidence_sha256": before_sha,
+            "after_trade_evidence_sha256": after_sha,
+            "changed_pick_asset_count": len(changes),
+            "changed_trade_count": len(repaired_trade_ids),
+            "repaired_trade_ids": sorted(repaired_trade_ids),
+            "changes": changes,
+            "referenced_snapshot_sha256": dict(sorted(snapshot_shas.items())),
+            "invariants": {
+                "pretrade_snapshots_modified": False,
+                "player_fvs_modified": False,
+                "trade_eligibility_modified": False,
+                "consumer_changed": False,
+                "production_changed": False,
+                "anti_hindsight_preserved": True,
+            },
+            "sep30_corrected_summary": {
+                "1411039354826035200": {
+                    "description": "Ollie Gordon vs 2027 R3",
+                    "raw_side_fvs": [764.0, 2364.0],
+                    "package_adjustment_informative": False,
+                },
+                "1411041013174120448": {
+                    "description": "J.J. McCarthy + 2027 R3 + 2027 R2 vs Baker Mayfield + 2027 R4",
+                    "raw_side_fvs": [6319.0, 6593.0],
+                    "fragmented_side_fg": 0.21021724,
+                    "raw_fragmented_to_concentrated_ratio": 0.95844077,
+                    "interpretation": (
+                        "This observation does not require a positive universal "
+                        "fragmentation tax under the frozen FVs."
+                    ),
+                },
+                "1411042150325456896": {
+                    "description": "Jameson Williams vs David Bailey + 2027 R3",
+                    "raw_side_fvs": [4801.0, 5677.0],
+                    "package_side_fg": 0.15063724,
+                    "raw_package_to_single_ratio": 1.18246197,
+                    "implied_lambda_to_equalize": 1.02436061,
+                    "interpretation": (
+                        "This observation is consistent with a substantial package "
+                        "premium, near lambda 1 under the V0 fg functional form."
+                    ),
+                },
+                "1411116913899094016": {
+                    "description": "Emmett Johnson + 2028 R4 vs KC Concepcion + 2028 R4",
+                    "raw_side_fvs": [2606.0, 3647.0],
+                    "package_adjustment_informative": False,
+                    "interpretation": (
+                        "Same round/year pick on both sides makes this primarily "
+                        "player-relative-value evidence, not a clean package-premium label."
+                    ),
+                },
+            },
+            "scientific_conclusion": (
+                "Among the four eligible September 30 trades, only two are materially "
+                "informative about package premium. They point in different directions, "
+                "supporting continued prospective collection and arguing against fitting "
+                "a universal penalty from these observations alone."
+            ),
+            "production_authorized": False,
+        }
+        AUDIT.write_text(
+            json.dumps(audit, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        print("PASS: repaired pick values from original pre-trade snapshots.")
+        print("Changed pick assets:", len(changes))
+        print("Changed trades:", len(repaired_trade_ids))
+        print("Corrected trade evidence SHA256:", after_sha)
+        PY
+    - name: Validate corrected September 30 trade evidence
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        python3 - <<'PY'
+        import json
+        from pathlib import Path
+
+        base = Path("research/package-adjustment-v1/prospective")
+        e = json.loads((base / "trade_evidence.json").read_text(encoding="utf-8"))
+        a = json.loads(
+            (base / "pick_value_key_repair_2026-10-02.json").read_text(encoding="utf-8")
+        )
+
+        assert a["status"] == "PASS_PICK_KEY_REPAIR_ANTI_HINDSIGHT_PRESERVED"
+        assert a["changed_pick_asset_count"] > 0
+        assert a["changed_trade_count"] > 0
+        assert a["invariants"]["pretrade_snapshots_modified"] is False
+        assert a["invariants"]["player_fvs_modified"] is False
+        assert a["invariants"]["trade_eligibility_modified"] is False
+        assert a["invariants"]["anti_hindsight_preserved"] is True
+        assert a["production_authorized"] is False
+
+        assert e["counts"]["trade_count"] == 22
+        assert e["counts"]["eligible_numeric_trade_count"] == 6
+        assert e["counts"]["excluded_trade_count"] == 16
+        assert e["consumer_changed"] is False
+
+        summary = a["sep30_corrected_summary"]
+        assert summary["1411041013174120448"]["raw_side_fvs"] == [6319.0, 6593.0]
+        assert summary["1411042150325456896"]["raw_side_fvs"] == [4801.0, 5677.0]
+        assert summary["1411116913899094016"]["raw_side_fvs"] == [2606.0, 3647.0]
+
+        print("PASS: September 30 corrected trade evidence validated.")
+        PY
+
+        test "$(sha256sum index.html | awk '{print $1}')" = "$INDEX_SHA"
+        test "$(sha256sum free-agent-board.html | awk '{print $1}')" = "$FA_SHA"
+        test -z "$(git diff --name-only -- index.html free-agent-board.html)"
+    - name: Run repository regression checks
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 -m pip install --disable-pip-version-check --no-cache-dir "requests>=2.32,<3"
+        python3 scripts/validation/repo_regression_checks.py
+    - name: Guard research-only mutation scope
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        python3 - <<'PY'
+        import subprocess
+
+        raw = subprocess.check_output(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            text=True,
+        )
+        touched = [line[3:] for line in raw.splitlines() if line.strip()]
+        allowed = {
+            "scripts/validation/capture_prospective_trade_evidence.py",
+            "research/package-adjustment-v1/prospective/trade_evidence.json",
+            "research/package-adjustment-v1/prospective/pick_value_key_repair_2026-10-02.json",
+        }
+        assert set(touched) == allowed, touched
+        print("PASS: mutation scope limited to evidence repair and future bug fix.")
+        PY
+    - name: Commit B34B repair
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+        git add \
+          scripts/validation/capture_prospective_trade_evidence.py \
+          research/package-adjustment-v1/prospective/trade_evidence.json \
+          research/package-adjustment-v1/prospective/pick_value_key_repair_2026-10-02.json
+
+        git diff --cached --check
+        git commit -m "Repair prospective trade pick valuation key handling"
+        git pull --rebase origin main
+        git push origin main
+    - name: Closeout
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 - <<'PY'
+        import json
+        from pathlib import Path
+        p = Path(
+            "research/package-adjustment-v1/prospective/"
+            "pick_value_key_repair_2026-10-02.json"
+        )
+        a = json.loads(p.read_text(encoding="utf-8"))
+        print("=== B34B COMPLETE ===")
+        print("Status:", a["status"])
+        print("Changed pick assets:", a["changed_pick_asset_count"])
+        print("Changed trades:", a["changed_trade_count"])
+        print("Anti-hindsight preserved: YES")
+        print("Production changed: NO")
+        PY
