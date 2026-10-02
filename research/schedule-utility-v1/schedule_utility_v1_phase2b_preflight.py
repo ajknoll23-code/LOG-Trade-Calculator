@@ -1,0 +1,964 @@
+#!/usr/bin/env python3
+"""
+Schedule Utility V1 — Phase 2B predictor-only historical preflight.
+
+Purpose:
+- ingest public nflverse historical sources for 2015-2025;
+- freeze source hashes;
+- validate schedule/team/position/scoring schema;
+- construct LOG-SAPA predictors using the amended timestamp firewall;
+- audit predictor availability and source completeness;
+- emit aggregate QA ONLY.
+
+This script DOES NOT:
+- compute target-week actual fantasy outcomes for evaluation;
+- call the frozen Phase 2A outcome-analysis module;
+- calculate MAE/RMSE/correlations against target outcomes;
+- make a Phase 2 predictive PASS/STOP decision.
+
+Historical target evaluation remains sealed until a later workflow.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import datetime
+import hashlib
+import importlib.util
+import json
+import math
+from pathlib import Path
+import statistics
+import sys
+from typing import Iterable, Mapping
+
+SEASONS = tuple(range(2015, 2026))
+TARGET_WEEKS = tuple(range(4, 18))
+POSITIONS = ("QB", "RB", "WR", "TE")
+CELL_DEFS = (
+    ("QB_HALF", "QB", "HALF_PPR"),
+    ("RB_HALF", "RB", "HALF_PPR"),
+    ("WR_HALF", "WR", "HALF_PPR"),
+    ("TE_HALF", "TE", "HALF_PPR"),
+    ("RB_PPR", "RB", "PPR"),
+    ("WR_PPR", "WR", "PPR"),
+    ("TE_PPR", "TE", "PPR"),
+)
+MIN_POTENTIAL_COVERAGE = 0.95
+
+TEAM_ALIAS = {
+    "ARZ": "ARI",
+    "ARI": "ARI",
+    "BLT": "BAL",
+    "BAL": "BAL",
+    "CLV": "CLE",
+    "CLE": "CLE",
+    "HST": "HOU",
+    "HOU": "HOU",
+    "JAC": "JAX",
+    "JAX": "JAX",
+    "LA": "LAR",
+    "LAR": "LAR",
+    "STL": "LAR",
+    "OAK": "LV",
+    "LV": "LV",
+    "SD": "LAC",
+    "LAC": "LAC",
+    "WSH": "WAS",
+    "WAS": "WAS",
+}
+
+POSITION_ALIAS = {
+    "QB": "QB",
+    "RB": "RB",
+    "FB": "RB",
+    "HB": "RB",
+    "WR": "WR",
+    "TE": "TE",
+}
+
+
+@dataclass(frozen=True)
+class ScheduleGame:
+    game_id: str
+    season: int
+    week: int
+    kickoff: datetime
+    away_team: str
+    home_team: str
+    completed: bool
+
+    def opponent(self, team: str) -> str:
+        if team == self.away_team:
+            return self.home_team
+        if team == self.home_team:
+            return self.away_team
+        raise KeyError(f"{team} is not in {self.game_id}")
+
+
+def sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def read_csv(path: Path) -> list[dict[str, str]]:
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def canon_team(value: object) -> str:
+    s = str(value or "").strip().upper()
+    if not s:
+        raise ValueError("blank team")
+    return TEAM_ALIAS.get(s, s)
+
+
+def canon_position(value: object) -> str | None:
+    s = str(value or "").strip().upper()
+    if not s:
+        return None
+    return POSITION_ALIAS.get(s)
+
+
+def is_blank(value: object) -> bool:
+    return value is None or str(value).strip() == ""
+
+
+def parse_kickoff(gameday: object, gametime: object) -> datetime:
+    d = str(gameday or "").strip()
+    t = str(gametime or "").strip()
+    if not d or not t:
+        raise ValueError(f"missing gameday/gametime: {d!r} {t!r}")
+    # nflverse schedules document gametime in Eastern time.
+    try:
+        return datetime.fromisoformat(f"{d}T{t}:00")
+    except ValueError as exc:
+        raise ValueError(f"bad kickoff timestamp: {d} {t}") from exc
+
+
+def load_frozen(path: Path):
+    spec = importlib.util.spec_from_file_location("log_sapa_v1_preflight", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot import frozen LOG-SAPA: {path}")
+    mod = importlib.util.module_from_spec(spec)
+    # Python 3.13 dataclass annotation resolution requires registration before exec.
+    sys.modules[spec.name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except Exception:
+        sys.modules.pop(spec.name, None)
+        raise
+    return mod
+
+
+def load_schedule(path: Path) -> tuple[dict[str, ScheduleGame], dict]:
+    rows = read_csv(path)
+    if not rows:
+        raise ValueError("empty schedule source")
+    required = {
+        "game_id", "season", "game_type", "week", "gameday", "gametime",
+        "away_team", "away_score", "home_team", "home_score",
+    }
+    missing = required - set(rows[0])
+    if missing:
+        raise KeyError(f"schedule source missing columns: {sorted(missing)}")
+
+    games: dict[str, ScheduleGame] = {}
+    excluded_unplayed_by_season = defaultdict(int)
+
+    for row in rows:
+        try:
+            season = int(row["season"])
+            week = int(row["week"])
+        except (TypeError, ValueError):
+            continue
+        if season not in SEASONS or str(row["game_type"]).upper() != "REG":
+            continue
+
+        game_id = str(row["game_id"]).strip()
+        if not game_id:
+            raise ValueError("blank historical regular-season game_id")
+        if game_id in games:
+            raise ValueError(f"duplicate schedule game_id: {game_id}")
+
+        away = canon_team(row["away_team"])
+        home = canon_team(row["home_team"])
+        if away == home:
+            raise ValueError(f"same-team schedule game: {game_id}")
+
+        kickoff = parse_kickoff(row["gameday"], row["gametime"])
+        completed = not is_blank(row["away_score"]) and not is_blank(row["home_score"])
+        if not completed:
+            excluded_unplayed_by_season[season] += 1
+
+        games[game_id] = ScheduleGame(
+            game_id=game_id,
+            season=season,
+            week=week,
+            kickoff=kickoff,
+            away_team=away,
+            home_team=home,
+            completed=completed,
+        )
+
+    season_game_counts = {
+        season: sum(
+            g.season == season and g.completed
+            for g in games.values()
+        )
+        for season in SEASONS
+    }
+    for season, n in season_game_counts.items():
+        if n < 250:
+            raise ValueError(f"implausibly low completed regular-season game count {season}: {n}")
+
+    expected_target_rows = {}
+    for season in SEASONS:
+        n_games = sum(
+            g.season == season
+            and g.completed
+            and 4 <= g.week <= 17
+            for g in games.values()
+        )
+        expected_target_rows[season] = 2 * n_games
+        if not (380 <= expected_target_rows[season] <= 420):
+            raise ValueError(
+                f"implausible Weeks 4-17 directional denominator "
+                f"{season}: {expected_target_rows[season]}"
+            )
+
+    week_cutoffs = {}
+    for season in SEASONS:
+        for week in TARGET_WEEKS:
+            kickoffs = [
+                g.kickoff for g in games.values()
+                if g.season == season and g.week == week
+            ]
+            if not kickoffs:
+                raise ValueError(f"no scheduled games for {season} week {week}")
+            week_cutoffs[(season, week)] = min(kickoffs)
+
+    return games, {
+        "completed_regular_season_games_by_season": season_game_counts,
+        "schedule_derived_expected_directional_rows_weeks_4_17":
+            expected_target_rows,
+        "unplayed_or_no_score_regular_season_rows_by_season": {
+            str(k): int(v) for k, v in sorted(excluded_unplayed_by_season.items())
+        },
+        "week_cutoffs": week_cutoffs,
+    }
+
+
+def _parse_numeric_columns(row: Mapping[str, object], fields: Iterable[str]) -> None:
+    for field in fields:
+        value = row.get(field)
+        if is_blank(value):
+            continue
+        try:
+            x = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"non-numeric scoring field {field}={value!r}") from exc
+        if not math.isfinite(x):
+            raise ValueError(f"non-finite scoring field {field}={value!r}")
+
+
+def adapt_historical_stats(
+    path: Path,
+    *,
+    season: int,
+    games: Mapping[str, ScheduleGame],
+    frozen,
+) -> tuple[list[dict], dict]:
+    rows = read_csv(path)
+    if not rows:
+        raise ValueError(f"empty player stats file for {season}")
+
+    fields = set(rows[0])
+    required_context = {
+        "player_id", "game_id", "season", "week", "season_type", "position",
+    }
+    missing = required_context - fields
+    if missing:
+        raise KeyError(f"{season} player stats missing context fields: {sorted(missing)}")
+
+    if "team" not in fields and "recent_team" not in fields:
+        raise KeyError(f"{season} player stats missing team/recent_team")
+
+    missing_stats = set(frozen.STAT_FIELDS) - fields
+    if missing_stats:
+        raise KeyError(f"{season} player stats missing frozen scoring fields: {sorted(missing_stats)}")
+
+    adapted = []
+    duplicate_guard = set()
+    rows_seen = 0
+    rows_admitted_predictor_pool = 0
+    rows_week17_plus_physically_skipped = 0
+    nonreg_skipped = 0
+    noncanonical_position_rows = 0
+    team_alias_adaptations = 0
+    opponent_checks = 0
+    blank_player_id_rows_seen = 0
+    blank_player_id_noncanonical_rows_excluded = 0
+    blank_player_id_noncanonical_rows_with_nonzero_scoring = 0
+
+    for row in rows:
+        try:
+            row_season = int(row["season"])
+            week = int(row["week"])
+        except (TypeError, ValueError):
+            continue
+        if row_season != season:
+            continue
+        rows_seen += 1
+
+        if str(row["season_type"]).upper() not in {"REG", "REGULAR"}:
+            nonreg_skipped += 1
+            continue
+
+        # No target evaluation is possible from this preflight artifact.
+        # Week 17+ player-stat rows are not even admitted to the predictor pool.
+        if week >= 17:
+            rows_week17_plus_physically_skipped += 1
+            continue
+
+        game_id = str(row["game_id"]).strip()
+        game = games.get(game_id)
+        if game is None:
+            raise KeyError(f"{season}: player row game_id absent from schedule: {game_id}")
+        if game.season != season or game.week != week:
+            raise ValueError(
+                f"{season}: player/schedule season-week mismatch for {game_id}"
+            )
+        if not game.completed:
+            # No unplayed/no-score game can enter predictor construction.
+            continue
+
+        recent_raw = row.get("recent_team")
+        team_raw = row.get("team")
+        if not is_blank(recent_raw) and not is_blank(team_raw):
+            a = canon_team(recent_raw)
+            b = canon_team(team_raw)
+            if a != b:
+                raise ValueError(
+                    f"{season}: conflicting recent_team/team in {game_id}: {a} vs {b}"
+                )
+            team = a
+        elif not is_blank(recent_raw):
+            team = canon_team(recent_raw)
+        elif not is_blank(team_raw):
+            team = canon_team(team_raw)
+        else:
+            raise ValueError(f"{season}: blank team identity in {game_id}")
+
+        raw_team_string = str(
+            recent_raw if not is_blank(recent_raw) else team_raw
+        ).strip().upper()
+        if raw_team_string != team:
+            team_alias_adaptations += 1
+
+        if team not in {game.away_team, game.home_team}:
+            raise ValueError(
+                f"{season}: player team {team} not in scheduled game {game_id}"
+            )
+
+        if "opponent_team" in fields and not is_blank(row.get("opponent_team")):
+            opponent_checks += 1
+            opp = canon_team(row["opponent_team"])
+            if opp != game.opponent(team):
+                raise ValueError(
+                    f"{season}: opponent mismatch {game_id}: "
+                    f"row={opp}, schedule={game.opponent(team)}"
+                )
+
+        pg = canon_position(row.get("position_group"))
+        p = canon_position(row.get("position"))
+        if pg is not None and p is not None and pg != p:
+            raise ValueError(
+                f"{season}: canonical position conflict in {game_id}: "
+                f"position_group={pg}, position={p}"
+            )
+        pos = pg or p
+
+        _parse_numeric_columns(row, frozen.STAT_FIELDS)
+
+        player_id = str(row["player_id"] or "").strip()
+        if not player_id:
+            blank_player_id_rows_seen += 1
+
+            # A blank GSIS id cannot safely identify a player. Because LOG-SAPA
+            # is explicitly QB/RB/WR/TE only, a blank-id row may be excluded
+            # only when it is noncanonical for those four position buckets.
+            # If it claims a canonical fantasy position, fail closed rather
+            # than guessing identity or merging anonymous players.
+            if pos in POSITIONS:
+                raise ValueError(
+                    f"{season}: blank player_id on canonical position row "
+                    f"in {game_id}: team={team}, position={pos}"
+                )
+
+            nonzero_scoring_fields = []
+            for field in frozen.STAT_FIELDS:
+                value = row.get(field)
+                if is_blank(value):
+                    continue
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(numeric) and abs(numeric) > 0:
+                    nonzero_scoring_fields.append(field)
+
+            if nonzero_scoring_fields:
+                blank_player_id_noncanonical_rows_with_nonzero_scoring += 1
+
+            blank_player_id_noncanonical_rows_excluded += 1
+            noncanonical_position_rows += 1
+
+            # Crucially, excluded anonymous rows are NOT added to `adapted`,
+            # so they cannot establish team-game completeness for zero-fill.
+            continue
+
+        dup_key = (game_id, team, player_id)
+        if dup_key in duplicate_guard:
+            raise ValueError(f"{season}: duplicate player-game-team row: {dup_key}")
+        duplicate_guard.add(dup_key)
+
+        if pos is None:
+            noncanonical_position_rows += 1
+
+        out = dict(row)
+        out["season"] = season
+        out["week"] = week
+        out["season_type"] = "REG"
+        out["recent_team"] = team
+        out["position"] = pos or str(row.get("position") or "")
+        out["position_group"] = pos or ""
+        out["_canonical_position"] = pos
+        adapted.append(out)
+        rows_admitted_predictor_pool += 1
+
+    if not adapted:
+        raise ValueError(f"{season}: no admitted predictor-pool rows")
+
+    return adapted, {
+        "source_rows_seen": rows_seen,
+        "predictor_pool_rows_weeks_1_16": rows_admitted_predictor_pool,
+        "week17_plus_rows_physically_skipped": rows_week17_plus_physically_skipped,
+        "nonregular_rows_skipped": nonreg_skipped,
+        "noncanonical_position_rows": noncanonical_position_rows,
+        "team_alias_adaptations": team_alias_adaptations,
+        "opponent_schedule_checks": opponent_checks,
+        "blank_player_id_rows_seen": blank_player_id_rows_seen,
+        "blank_player_id_noncanonical_rows_excluded":
+            blank_player_id_noncanonical_rows_excluded,
+        "blank_player_id_noncanonical_rows_with_nonzero_scoring":
+            blank_player_id_noncanonical_rows_with_nonzero_scoring,
+        "blank_player_id_canonical_position_rows_allowed": 0,
+        "blank_player_id_rows_establish_team_game_completeness": False,
+    }
+
+
+def build_team_game_position_rows(
+    *,
+    season: int,
+    player_rows: list[dict],
+    games: Mapping[str, ScheduleGame],
+    frozen,
+    scoring_mode: str,
+) -> tuple[list, dict]:
+    """
+    Completeness-gated aggregation + zero-fill.
+
+    A team-game is complete for zero-fill only when:
+    - schedule says the game was completed,
+    - at least one weekly player-stat row exists for that team-game,
+    - all admitted rows passed schema/numeric/duplicate/identity checks upstream.
+
+    Missing canonical-position rows then become true zero team-position totals.
+    """
+    by_team_game: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for row in player_rows:
+        by_team_game[(str(row["game_id"]), str(row["recent_team"]))].append(row)
+
+    totals: dict[tuple[str, str, str], float] = defaultdict(float)
+    canonical_row_counts: dict[tuple[str, str, str], int] = defaultdict(int)
+
+    for (game_id, team), rows in by_team_game.items():
+        for row in rows:
+            pos = row["_canonical_position"]
+            if pos not in POSITIONS:
+                continue
+            pts = frozen.score_player_row(row, scoring_mode)
+            totals[(game_id, team, pos)] += pts
+            canonical_row_counts[(game_id, team, pos)] += 1
+
+    out = []
+    zero_fills = defaultdict(int)
+    source_failures = []
+
+    potential_games = [
+        g for g in games.values()
+        if g.season == season and g.completed and g.week <= 16
+    ]
+
+    for game in sorted(potential_games, key=lambda g: (g.week, g.kickoff, g.game_id)):
+        for offense, defense in (
+            (game.away_team, game.home_team),
+            (game.home_team, game.away_team),
+        ):
+            team_game_rows = by_team_game.get((game.game_id, offense), [])
+            if not team_game_rows:
+                source_failures.append({
+                    "game_id": game.game_id,
+                    "team": offense,
+                    "reason": "NO_WEEKLY_PLAYER_STAT_ROWS_FOR_COMPLETED_TEAM_GAME",
+                })
+                continue
+
+            for pos in POSITIONS:
+                key = (game.game_id, offense, pos)
+                if canonical_row_counts.get(key, 0) == 0:
+                    # Completeness-gated true zero.
+                    points = 0.0
+                    zero_fills[(pos, scoring_mode)] += 1
+                else:
+                    points = totals[key]
+
+                out.append(
+                    frozen.GamePositionPoints(
+                        season=season,
+                        week=game.week,
+                        offense_team=offense,
+                        defense_team=defense,
+                        position=pos,
+                        scoring_mode=scoring_mode,
+                        points=points,
+                    )
+                )
+
+    if source_failures:
+        raise ValueError(
+            f"{season}: team-game source completeness failures: "
+            f"{source_failures[:20]} total={len(source_failures)}"
+        )
+
+    expected_rows = len(potential_games) * 2 * len(POSITIONS)
+    if len(out) != expected_rows:
+        raise ValueError(
+            f"{season} {scoring_mode}: aggregate row count mismatch "
+            f"{len(out)} != {expected_rows}"
+        )
+
+    return out, {
+        "completed_predictor_pool_games_weeks_1_16": len(potential_games),
+        "team_position_rows": len(out),
+        "zero_fills": {
+            f"{pos}_{mode}": int(n)
+            for (pos, mode), n in sorted(zero_fills.items())
+        },
+        "source_completeness_failures": 0,
+    }
+
+
+def candidate_game_ids(
+    games: Mapping[str, ScheduleGame],
+    *,
+    season: int,
+    target_week: int,
+    week_cutoff: datetime,
+) -> tuple[set[str], list[str]]:
+    lo = max(1, target_week - 10)
+    ids = set()
+    excluded_late_kickoff = []
+
+    for g in games.values():
+        if g.season != season or not g.completed:
+            continue
+        if not (lo <= g.week <= target_week - 1):
+            continue
+        if g.kickoff >= week_cutoff:
+            excluded_late_kickoff.append(g.game_id)
+            continue
+        ids.add(g.game_id)
+
+    return ids, sorted(excluded_late_kickoff)
+
+
+def target_directional_matchups(
+    games: Mapping[str, ScheduleGame],
+    *,
+    season: int,
+    week: int,
+) -> list[tuple[str, str, str]]:
+    out = []
+    for g in sorted(
+        (
+            x for x in games.values()
+            if x.season == season
+            and x.week == week
+            and x.completed
+        ),
+        key=lambda x: (x.kickoff, x.game_id),
+    ):
+        out.append((g.game_id, g.away_team, g.home_team))
+        out.append((g.game_id, g.home_team, g.away_team))
+    return out
+
+
+def run_preflight(
+    *,
+    schedule_path: Path,
+    stats_dir: Path,
+    frozen_path: Path,
+) -> dict:
+    frozen = load_frozen(frozen_path)
+    if frozen.METRIC_ID != "LOG-SAPA-V1":
+        raise RuntimeError("unexpected frozen metric ID")
+
+    games, schedule_audit = load_schedule(schedule_path)
+    week_cutoffs = schedule_audit.pop("week_cutoffs")
+    expected_rows_by_season = (
+        schedule_audit["schedule_derived_expected_directional_rows_weeks_4_17"]
+    )
+
+    source_hashes = {
+        "games_csv": sha256(schedule_path),
+        "stats_player_week": {},
+    }
+
+    season_stats = {}
+    season_stat_audits = {}
+    rows_by_season_mode = {}
+    aggregate_audits = {}
+
+    for season in SEASONS:
+        stats_path = stats_dir / f"stats_player_week_{season}.csv"
+        if not stats_path.is_file():
+            raise FileNotFoundError(stats_path)
+        source_hashes["stats_player_week"][str(season)] = sha256(stats_path)
+
+        adapted, stat_audit = adapt_historical_stats(
+            stats_path,
+            season=season,
+            games=games,
+            frozen=frozen,
+        )
+        season_stats[season] = adapted
+        season_stat_audits[str(season)] = stat_audit
+
+        for mode in ("HALF_PPR", "PPR"):
+            agg, audit = build_team_game_position_rows(
+                season=season,
+                player_rows=adapted,
+                games=games,
+                frozen=frozen,
+                scoring_mode=mode,
+            )
+            rows_by_season_mode[(season, mode)] = agg
+            aggregate_audits[f"{season}_{mode}"] = audit
+
+    # Predictor-only availability. No target points are looked up or compared.
+    season_cell = {}
+    late_kickoff_exclusions = defaultdict(set)
+    structural_centering = {}
+
+    for season in SEASONS:
+        for cell, position, mode in CELL_DEFS:
+            expected = int(expected_rows_by_season[season])
+            baseline_available = 0
+            defense_available = 0
+            both_available = 0
+            week_rows = defaultdict(lambda: {
+                "expected": 0,
+                "baseline_available": 0,
+                "defense_available": 0,
+                "both_available": 0,
+            })
+            centering_values = []
+
+            all_game_rows = rows_by_season_mode[(season, mode)]
+
+            for week in TARGET_WEEKS:
+                cutoff = week_cutoffs[(season, week)]
+                candidate_ids, excluded = candidate_game_ids(
+                    games,
+                    season=season,
+                    target_week=week,
+                    week_cutoff=cutoff,
+                )
+                for game_id in excluded:
+                    late_kickoff_exclusions[str(season)].add(game_id)
+
+                identity_to_game_id = {}
+                for g in games.values():
+                    if g.season != season:
+                        continue
+                    identity_to_game_id[
+                        (g.season, g.week, g.away_team, g.home_team)
+                    ] = g.game_id
+                    identity_to_game_id[
+                        (g.season, g.week, g.home_team, g.away_team)
+                    ] = g.game_id
+
+                hist = []
+                for r in all_game_rows:
+                    if r.position != position:
+                        continue
+                    gid = identity_to_game_id.get(
+                        (r.season, r.week, r.offense_team, r.defense_team)
+                    )
+                    if gid is None:
+                        raise ValueError(
+                            f"cannot recover game identity for "
+                            f"{r.season} W{r.week} "
+                            f"{r.offense_team}-{r.defense_team}"
+                        )
+                    if gid in candidate_ids:
+                        hist.append(r)
+
+                # The frozen function will re-apply same-season/week bounds.
+                try:
+                    defense_snapshot = frozen.compute_log_sapa(
+                        hist,
+                        season=season,
+                        target_week=week,
+                        position=position,
+                        scoring_mode=mode,
+                    )
+                except ValueError as exc:
+                    # If there is genuinely no eligible history, everything is unavailable.
+                    if "no eligible historical game rows" in str(exc):
+                        defense_snapshot = {}
+                    else:
+                        raise
+
+                available_effects = [
+                    float(d["defense_effect"])
+                    for d in defense_snapshot.values()
+                    if d.get("status") == "AVAILABLE"
+                    and d.get("defense_effect") is not None
+                ]
+                if available_effects:
+                    centering_values.append({
+                        "week": week,
+                        "mean_defense_effect": statistics.fmean(available_effects),
+                        "available_defenses": len(available_effects),
+                    })
+
+                offense_points = defaultdict(list)
+                for r in hist:
+                    offense_points[r.offense_team].append(float(r.points))
+
+                targets = target_directional_matchups(
+                    games, season=season, week=week
+                )
+                for game_id, offense, defense in targets:
+                    week_rows[week]["expected"] += 1
+                    baseline_ok = len(offense_points.get(offense, [])) >= 2
+                    defense_payload = defense_snapshot.get(defense, {})
+                    defense_ok = (
+                        defense_payload.get("status") == "AVAILABLE"
+                        and defense_payload.get("defense_effect") is not None
+                    )
+
+                    if baseline_ok:
+                        baseline_available += 1
+                        week_rows[week]["baseline_available"] += 1
+                    if defense_ok:
+                        defense_available += 1
+                        week_rows[week]["defense_available"] += 1
+                    if baseline_ok and defense_ok:
+                        both_available += 1
+                        week_rows[week]["both_available"] += 1
+
+            if sum(x["expected"] for x in week_rows.values()) != expected:
+                raise ValueError(
+                    f"{season} {cell}: target denominator mismatch "
+                    f"{sum(x['expected'] for x in week_rows.values())} != {expected}"
+                )
+
+            potential_coverage = both_available / expected
+            season_cell[f"{season}_{cell}"] = {
+                "expected_schedule_rows": expected,
+                "baseline_predictor_available": baseline_available,
+                "defense_effect_available": defense_available,
+                "both_predictors_available": both_available,
+                "maximum_possible_common_sample_coverage_before_target_QA":
+                    potential_coverage,
+                "meets_95pct_predictor_availability_floor":
+                    potential_coverage >= MIN_POTENTIAL_COVERAGE,
+                "week_availability": {
+                    str(w): dict(v) for w, v in sorted(week_rows.items())
+                },
+            }
+
+            structural_centering[f"{season}_{cell}"] = {
+                "weeks_with_available_defense_effects": len(centering_values),
+                "max_abs_week_mean_defense_effect": (
+                    max(abs(x["mean_defense_effect"]) for x in centering_values)
+                    if centering_values else None
+                ),
+                "descriptive_only_not_gate": True,
+            }
+
+    failing_predictor_coverage = [
+        key for key, payload in season_cell.items()
+        if not payload["meets_95pct_predictor_availability_floor"]
+    ]
+
+    result = {
+        "schema_version": 1,
+        "study_id": "schedule-utility-v1",
+        "phase": "2B-preflight",
+        "status": (
+            "PASS_PREDICTOR_ONLY_PREFLIGHT_READY_TO_UNSEAL_PHASE2_TARGETS"
+            if not failing_predictor_coverage
+            else "STOP_PREDICTOR_ONLY_PREFLIGHT_COVERAGE_IMPOSSIBLE"
+        ),
+        "metric_id": "LOG-SAPA-V1",
+        "seasons": list(SEASONS),
+        "target_weeks": [4, 17],
+        "target_outcome_evaluation_performed": False,
+        "target_actual_values_emitted": False,
+        "mae_or_rmse_computed": False,
+        "predictor_target_association_computed": False,
+        "phase2_primary_pass_stop_computed": False,
+        "production_change_authorized": False,
+        "phase3_shadow_authorized": False,
+        "frozen_log_sapa_sha256": sha256(frozen_path),
+        "source_snapshot_sha256": source_hashes,
+        "schedule_audit": schedule_audit,
+        "player_stat_ingestion_audit": season_stat_audits,
+        "aggregate_completeness_audit": aggregate_audits,
+        "predictor_availability": season_cell,
+        "predictor_availability_failures": failing_predictor_coverage,
+        "timestamp_firewall": {
+            "cutoff": (
+                "earliest actual kickoff of schedule-labeled target Week W"
+            ),
+            "candidate_rule": (
+                "scheduled week max(1,W-10)..W-1 AND actual kickoff < cutoff"
+            ),
+            "late_prior_week_games_excluded_by_season": {
+                season: {
+                    "count": len(ids),
+                    "game_ids": sorted(ids),
+                }
+                for season, ids in sorted(late_kickoff_exclusions.items())
+            },
+        },
+        "structural_centering_diagnostic": structural_centering,
+        "next_phase": {
+            "phase": "2B-evaluation",
+            "authorized_only_if_preflight_pass": True,
+            "may_open_target_outcomes_for_frozen_evaluation": (
+                not failing_predictor_coverage
+            ),
+            "may_change_predictor_or_primary_gate": False,
+        },
+    }
+    return result
+
+
+def selftest() -> None:
+    # Timestamp firewall: scheduled prior-week game played after Week-4 cutoff
+    # must be excluded even though its scheduled week is < 4.
+    games = {
+        "w1": ScheduleGame(
+            "w1", 2020, 1, datetime.fromisoformat("2020-09-13T13:00:00"),
+            "A", "B", True
+        ),
+        "w2late": ScheduleGame(
+            "w2late", 2020, 2, datetime.fromisoformat("2020-10-20T13:00:00"),
+            "C", "D", True
+        ),
+        "w3": ScheduleGame(
+            "w3", 2020, 3, datetime.fromisoformat("2020-09-27T13:00:00"),
+            "E", "F", True
+        ),
+        "w4": ScheduleGame(
+            "w4", 2020, 4, datetime.fromisoformat("2020-10-04T13:00:00"),
+            "G", "H", True
+        ),
+    }
+    ids, excluded = candidate_game_ids(
+        games,
+        season=2020,
+        target_week=4,
+        week_cutoff=datetime.fromisoformat("2020-10-04T13:00:00"),
+    )
+    assert ids == {"w1", "w3"}
+    assert excluded == ["w2late"]
+
+    # Team aliases and position aliases are deterministic.
+    assert canon_team("STL") == "LAR"
+    assert canon_team("OAK") == "LV"
+    assert canon_position("FB") == "RB"
+    assert canon_position("TE") == "TE"
+    assert canon_position("K") is None
+
+    # Kickoff parser is deterministic Eastern-clock ordering.
+    assert parse_kickoff("2020-10-04", "13:00") < parse_kickoff(
+        "2020-10-04", "20:20"
+    )
+
+    # Blank-ID source policy is frozen in code:
+    # canonical QB/RB/WR/TE rows fail closed; noncanonical rows are excluded.
+    source = Path(__file__).read_text(encoding="utf-8")
+    assert "blank player_id on canonical position row" in source
+    assert "blank_player_id_noncanonical_rows_excluded" in source
+    assert "blank_player_id_rows_establish_team_game_completeness" in source
+
+    print("PASS: Phase 2B predictor-only preflight synthetic selftest")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--schedule")
+    ap.add_argument("--stats-dir")
+    ap.add_argument("--frozen")
+    ap.add_argument("--out")
+    args = ap.parse_args()
+
+    if args.selftest:
+        selftest()
+        return
+
+    required = [args.schedule, args.stats_dir, args.frozen, args.out]
+    if any(x is None for x in required):
+        ap.error("--schedule, --stats-dir, --frozen, and --out are required")
+
+    result = run_preflight(
+        schedule_path=Path(args.schedule),
+        stats_dir=Path(args.stats_dir),
+        frozen_path=Path(args.frozen),
+    )
+
+    Path(args.out).write_text(
+        json.dumps(result, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    print(json.dumps({
+        "status": result["status"],
+        "predictor_availability_failures":
+            result["predictor_availability_failures"],
+        "target_outcome_evaluation_performed": False,
+        "phase2_primary_pass_stop_computed": False,
+    }, indent=2))
+
+    if result["status"] != (
+        "PASS_PREDICTOR_ONLY_PREFLIGHT_READY_TO_UNSEAL_PHASE2_TARGETS"
+    ):
+        raise SystemExit(2)
+
+
+if __name__ == "__main__":
+    main()
