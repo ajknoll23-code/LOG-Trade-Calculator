@@ -1,0 +1,608 @@
+name: B34D Package Trade Evidence - Future Structural Maturity Monitor
+'on':
+  workflow_dispatch: {}
+  workflow_run:
+    workflows:
+    - Prospective Trade Evidence Capture
+    types:
+    - completed
+permissions:
+  contents: write
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+  EXPECTED_TAXONOMY_BLOB_SHA: 1d74e43f8abdf917432158e66ea3904bdd623316
+  EXPECTED_ANCHOR_BLOB_SHA: 3f07ed625ea70cc0147ce8479017c1c342c3171d
+  EXPECTED_CLASSIFIER_BLOB_SHA: d0836f42c925638b0299f6c4bacd28ec231fb63e
+  B34D_SCRIPT_SHA256: 0d89064d62092415c2c76ea772e86d403cd1b04961910ee4e84ba4757cd82b00
+jobs:
+  monitor:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+    - name: Check out current main
+      uses: actions/checkout@v4
+      with:
+        ref: main
+        fetch-depth: 0
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.13'
+    - name: Verify frozen B34C taxonomy contract
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        test "$(git hash-object research/package-adjustment-v1/prospective/future_trade_structural_taxonomy_v1.json)" \
+          = "$EXPECTED_TAXONOMY_BLOB_SHA"
+
+        test "$(git hash-object research/package-adjustment-v1/prospective/future_trade_structural_taxonomy_v1.freeze_anchor.json)" \
+          = "$EXPECTED_ANCHOR_BLOB_SHA"
+
+        test "$(git hash-object research/package-adjustment-v1/prospective/structural_heterogeneity_v1.py)" \
+          = "$EXPECTED_CLASSIFIER_BLOB_SHA"
+
+        python3 - <<'PY'
+        import json
+        from pathlib import Path
+
+        base = Path("research/package-adjustment-v1/prospective")
+        t = json.loads(
+            (base / "future_trade_structural_taxonomy_v1.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        a = json.loads(
+            (base / "future_trade_structural_taxonomy_v1.freeze_anchor.json").read_text(
+                encoding="utf-8"
+            )
+        )
+
+        assert t["status"] == (
+            "PREREGISTERED_FUTURE_STRUCTURAL_TAXONOMY_RESEARCH_ONLY"
+        )
+        assert a["status"] == "FUTURE_STRUCTURAL_TAXONOMY_FREEZE_ANCHORED"
+        assert a["existing_development_trade_count"] == 6
+        assert a["existing_development_trades_may_count_future"] is False
+        assert t["maturity_review_gate"]["future_primary_clean_trade_count_min"] == 12
+        assert t["maturity_review_gate"]["existing_six_count_toward_thresholds"] is False
+        assert t["governance"]["production_authorized"] is False
+        assert t["governance"]["lambda_fit_authorized_now"] is False
+
+        print("PASS: frozen B34C taxonomy/anchor/classifier verified.")
+        PY
+    - name: Snapshot production surfaces
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "INDEX_SHA=$(sha256sum index.html | awk '{print $1}')" >> "$GITHUB_ENV"
+        echo "FA_SHA=$(sha256sum free-agent-board.html | awk '{print $1}')" >> "$GITHUB_ENV"
+    - name: Freeze B34D maturity monitor implementation
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        cat > research/package-adjustment-v1/prospective/future_trade_structural_maturity_monitor.py <<'PYFILE'
+        #!/usr/bin/env python3
+        from __future__ import annotations
+
+        import argparse
+        from collections import Counter
+        import hashlib
+        import importlib.util
+        import json
+        from pathlib import Path
+        import sys
+
+        PRIMARY_CATEGORIES = {
+            "ONE_FOR_TWO_PLAYER_ONLY",
+            "ONE_FOR_TWO_WITH_PICK",
+            "ONE_FOR_THREE_PLAYER_ONLY",
+            "ONE_FOR_THREE_WITH_PICK",
+        }
+
+
+        def sha256(path: Path) -> str:
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+        def load_json(path: Path):
+            return json.loads(path.read_text(encoding="utf-8"))
+
+
+        def load_classifier(path: Path):
+            spec = importlib.util.spec_from_file_location(
+                "package_structural_classifier_b34d", path
+            )
+            if spec is None or spec.loader is None:
+                raise RuntimeError("cannot import frozen structural classifier")
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = mod
+            try:
+                spec.loader.exec_module(mod)
+            except Exception:
+                sys.modules.pop(spec.name, None)
+                raise
+            return mod
+
+
+        def category_rollups(primary_rows):
+            counts = Counter(x["category"] for x in primary_rows)
+            one_for_two = (
+                counts["ONE_FOR_TWO_PLAYER_ONLY"]
+                + counts["ONE_FOR_TWO_WITH_PICK"]
+            )
+            one_for_three = (
+                counts["ONE_FOR_THREE_PLAYER_ONLY"]
+                + counts["ONE_FOR_THREE_WITH_PICK"]
+            )
+            player_only = (
+                counts["ONE_FOR_TWO_PLAYER_ONLY"]
+                + counts["ONE_FOR_THREE_PLAYER_ONLY"]
+            )
+            with_pick = (
+                counts["ONE_FOR_TWO_WITH_PICK"]
+                + counts["ONE_FOR_THREE_WITH_PICK"]
+            )
+            targets = {
+                (x.get("clean_metrics") or {})
+                .get("singleton_target", {})
+                .get("key")
+                for x in primary_rows
+            }
+            targets.discard(None)
+
+            return {
+                "future_primary_clean_trade_count": len(primary_rows),
+                "one_for_two_count": one_for_two,
+                "one_for_three_count": one_for_three,
+                "player_only_package_count": player_only,
+                "with_pick_package_count": with_pick,
+                "distinct_singleton_target_players": len(targets),
+                "category_counts": dict(sorted(counts.items())),
+                "distinct_singleton_target_keys": sorted(targets),
+            }
+
+
+        def maturity_checks(rollups, gate):
+            checks = {
+                "future_primary_clean_trade_count": (
+                    rollups["future_primary_clean_trade_count"]
+                    >= gate["future_primary_clean_trade_count_min"]
+                ),
+                "one_for_two_count": (
+                    rollups["one_for_two_count"]
+                    >= gate["one_for_two_count_min"]
+                ),
+                "one_for_three_count": (
+                    rollups["one_for_three_count"]
+                    >= gate["one_for_three_count_min"]
+                ),
+                "player_only_package_count": (
+                    rollups["player_only_package_count"]
+                    >= gate["player_only_package_count_min"]
+                ),
+                "with_pick_package_count": (
+                    rollups["with_pick_package_count"]
+                    >= gate["with_pick_package_count_min"]
+                ),
+                "distinct_singleton_target_players": (
+                    rollups["distinct_singleton_target_players"]
+                    >= gate["distinct_singleton_target_players_min"]
+                ),
+            }
+            return checks
+
+
+        def build_status(evidence, taxonomy, anchor, classifier):
+            assert taxonomy["status"] == (
+                "PREREGISTERED_FUTURE_STRUCTURAL_TAXONOMY_RESEARCH_ONLY"
+            )
+            assert anchor["status"] == "FUTURE_STRUCTURAL_TAXONOMY_FREEZE_ANCHORED"
+            assert anchor["existing_development_trades_may_count_future"] is False
+            assert taxonomy["maturity_review_gate"][
+                "existing_six_count_toward_thresholds"
+            ] is False
+
+            cutoff = int(anchor["first_freeze_commit_epoch_ms"])
+            old_ids = set(anchor["existing_development_trade_ids"])
+            assert len(old_ids) == 6
+
+            post_anchor = []
+            post_anchor_numeric = []
+            post_anchor_excluded = []
+            primary_rows = []
+            track_only_rows = []
+
+            for tid, trade in sorted(
+                evidence["trades"].items(),
+                key=lambda kv: kv[1].get("created_epoch_ms") or 0,
+            ):
+                created = int(trade.get("created_epoch_ms") or 0)
+
+                if tid in old_ids:
+                    if created > cutoff:
+                        raise RuntimeError(
+                            f"development trade unexpectedly after cutoff: {tid}"
+                        )
+                    continue
+
+                if created <= cutoff:
+                    # Any pre-anchor non-development trade remains outside the future sample.
+                    continue
+
+                post_anchor.append(tid)
+
+                if not trade.get("eligible_for_numeric_package_research"):
+                    post_anchor_excluded.append({
+                        "transaction_id": tid,
+                        "created_at_utc": trade.get("created_at_utc"),
+                        "reason": trade.get("exclusion_reason"),
+                    })
+                    continue
+
+                pre = trade.get("pretrade_snapshot") or {}
+                age = pre.get("age_hours_at_trade")
+                if age is None or float(age) <= 0:
+                    raise RuntimeError(
+                        f"future eligible trade lacks strictly pre-trade snapshot: {tid}"
+                    )
+
+                classified = classifier.classify_trade(trade)
+                post_anchor_numeric.append(tid)
+
+                if classified["category"] in PRIMARY_CATEGORIES:
+                    if not classified["primary_clean_consolidation"]:
+                        raise RuntimeError(
+                            f"category/primary disagreement for future trade {tid}"
+                        )
+                    primary_rows.append(classified)
+                else:
+                    if classified["primary_clean_consolidation"]:
+                        raise RuntimeError(
+                            f"track-only category marked primary for future trade {tid}"
+                        )
+                    track_only_rows.append(classified)
+
+            rollups = category_rollups(primary_rows)
+            gate = taxonomy["maturity_review_gate"]
+            checks = maturity_checks(rollups, gate)
+            mature = all(checks.values())
+
+            progress = {
+                "future_primary_clean_trade_count": {
+                    "current": rollups["future_primary_clean_trade_count"],
+                    "required": gate["future_primary_clean_trade_count_min"],
+                },
+                "one_for_two_count": {
+                    "current": rollups["one_for_two_count"],
+                    "required": gate["one_for_two_count_min"],
+                },
+                "one_for_three_count": {
+                    "current": rollups["one_for_three_count"],
+                    "required": gate["one_for_three_count_min"],
+                },
+                "player_only_package_count": {
+                    "current": rollups["player_only_package_count"],
+                    "required": gate["player_only_package_count_min"],
+                },
+                "with_pick_package_count": {
+                    "current": rollups["with_pick_package_count"],
+                    "required": gate["with_pick_package_count_min"],
+                },
+                "distinct_singleton_target_players": {
+                    "current": rollups["distinct_singleton_target_players"],
+                    "required": gate["distinct_singleton_target_players_min"],
+                },
+            }
+
+            return {
+                "schema_version": 1,
+                "study_id": "package-adjustment-v1",
+                "phase": "B34D-future-structural-maturity-monitor",
+                "status": (
+                    "MATURE_ARCHITECTURE_REVIEW_ONLY"
+                    if mature
+                    else "WAITING_FOR_FUTURE_CLEAN_TRADES"
+                ),
+                "governance": {
+                    "taxonomy_frozen": True,
+                    "cutover_commit_sha": anchor["first_freeze_commit_sha"],
+                    "cutover_commit_epoch_ms": cutoff,
+                    "existing_six_counted": False,
+                    "lambda_fit_performed": False,
+                    "conditional_model_fit_performed": False,
+                    "production_authorized": False,
+                    "package_formula_change_authorized": False,
+                    "v8_voting_unchanged": True,
+                    "shadow_v2_unchanged": True,
+                },
+                "source_counts": {
+                    "total_logged_trades": evidence["counts"]["trade_count"],
+                    "total_numeric_eligible_trades": evidence["counts"][
+                        "eligible_numeric_trade_count"
+                    ],
+                    "post_anchor_trade_count": len(post_anchor),
+                    "post_anchor_numeric_trade_count": len(post_anchor_numeric),
+                    "post_anchor_excluded_trade_count": len(post_anchor_excluded),
+                    "post_anchor_track_only_count": len(track_only_rows),
+                    "post_anchor_primary_clean_count": len(primary_rows),
+                },
+                "maturity": {
+                    "all_requirements_met": mature,
+                    "checks": checks,
+                    "progress": progress,
+                    "passing_gate_authorizes": gate["passing_gate_authorizes"],
+                },
+                "primary_rollups": rollups,
+                "future_primary_trades": primary_rows,
+                "future_track_only_trades": track_only_rows,
+                "future_excluded_trades": post_anchor_excluded,
+                "next": {
+                    "if_not_mature": (
+                        "continue prospective capture without fitting or production changes"
+                    ),
+                    "if_mature": (
+                        "architecture/modeling review only; preregister candidate conditional "
+                        "model and reserve later unopened future trades as holdout before fitting"
+                    ),
+                },
+            }
+
+
+        def write_report(status, path: Path):
+            m = status["maturity"]
+            p = m["progress"]
+
+            lines = [
+                "# Package Trade Evidence — Future Structural Maturity Monitor",
+                "",
+                f"**Status:** `{status['status']}`",
+                "",
+                "Existing six development trades do not count.",
+                "",
+                "## Progress",
+                "",
+            ]
+
+            labels = [
+                ("future_primary_clean_trade_count", "Future clean trades"),
+                ("one_for_two_count", "1-for-2"),
+                ("one_for_three_count", "1-for-3"),
+                ("player_only_package_count", "Player-only packages"),
+                ("with_pick_package_count", "Pick-containing packages"),
+                (
+                    "distinct_singleton_target_players",
+                    "Distinct singleton target players",
+                ),
+            ]
+            for key, label in labels:
+                row = p[key]
+                lines.append(
+                    f"- {label}: `{row['current']} / {row['required']}`"
+                )
+
+            lines += [
+                "",
+                f"- All maturity requirements met: `{m['all_requirements_met']}`",
+                "",
+                "## Governance",
+                "",
+                "- No lambda is fit.",
+                "- No conditional package model is fit.",
+                "- No production change is authorized.",
+                "- V8 voting and Shadow V2 remain unchanged.",
+                "",
+            ]
+
+            path.write_text("\n".join(lines), encoding="utf-8")
+
+
+        def selftest():
+            roll = {
+                "future_primary_clean_trade_count": 12,
+                "one_for_two_count": 6,
+                "one_for_three_count": 6,
+                "player_only_package_count": 6,
+                "with_pick_package_count": 6,
+                "distinct_singleton_target_players": 8,
+            }
+            gate = {
+                "future_primary_clean_trade_count_min": 12,
+                "one_for_two_count_min": 3,
+                "one_for_three_count_min": 3,
+                "player_only_package_count_min": 3,
+                "with_pick_package_count_min": 3,
+                "distinct_singleton_target_players_min": 6,
+            }
+            assert all(maturity_checks(roll, gate).values())
+
+            roll["with_pick_package_count"] = 2
+            checks = maturity_checks(roll, gate)
+            assert checks["with_pick_package_count"] is False
+            assert not all(checks.values())
+
+            print("PASS: B34D maturity monitor synthetic selftest")
+
+
+        def main():
+            ap = argparse.ArgumentParser()
+            ap.add_argument("--selftest", action="store_true")
+            ap.add_argument("--evidence")
+            ap.add_argument("--taxonomy")
+            ap.add_argument("--anchor")
+            ap.add_argument("--classifier")
+            ap.add_argument("--out")
+            ap.add_argument("--report")
+            args = ap.parse_args()
+
+            if args.selftest:
+                selftest()
+                return
+
+            for name in (
+                "evidence", "taxonomy", "anchor", "classifier", "out", "report"
+            ):
+                if getattr(args, name) is None:
+                    ap.error(f"--{name} is required")
+
+            evidence = load_json(Path(args.evidence))
+            taxonomy = load_json(Path(args.taxonomy))
+            anchor = load_json(Path(args.anchor))
+            classifier = load_classifier(Path(args.classifier))
+
+            assert evidence["status"] == "research_only_prospective_trade_evidence"
+            assert evidence["consumer_changed"] is False
+
+            status = build_status(evidence, taxonomy, anchor, classifier)
+
+            Path(args.out).write_text(
+                json.dumps(status, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            write_report(status, Path(args.report))
+
+            print(json.dumps({
+                "status": status["status"],
+                "source_counts": status["source_counts"],
+                "maturity": status["maturity"]["progress"],
+                "all_requirements_met": status["maturity"]["all_requirements_met"],
+                "production_authorized": False,
+                "lambda_fit_performed": False,
+            }, indent=2))
+
+
+        if __name__ == "__main__":
+            main()
+        PYFILE
+
+        python3 -m py_compile research/package-adjustment-v1/prospective/future_trade_structural_maturity_monitor.py
+        test "$(sha256sum research/package-adjustment-v1/prospective/future_trade_structural_maturity_monitor.py | awk '{print $1}')" = "$B34D_SCRIPT_SHA256"
+        python3 research/package-adjustment-v1/prospective/future_trade_structural_maturity_monitor.py --selftest
+    - name: Evaluate future structural maturity
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        test -f research/package-adjustment-v1/prospective/trade_evidence.json
+
+        python3 \
+          research/package-adjustment-v1/prospective/future_trade_structural_maturity_monitor.py \
+          --evidence research/package-adjustment-v1/prospective/trade_evidence.json \
+          --taxonomy research/package-adjustment-v1/prospective/future_trade_structural_taxonomy_v1.json \
+          --anchor research/package-adjustment-v1/prospective/future_trade_structural_taxonomy_v1.freeze_anchor.json \
+          --classifier research/package-adjustment-v1/prospective/structural_heterogeneity_v1.py \
+          --out research/package-adjustment-v1/prospective/future_trade_structural_maturity_status.json \
+          --report research/package-adjustment-v1/prospective/future_trade_structural_maturity_status.md
+    - name: Validate monitor output and fail closed on unauthorized science
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        python3 - <<'PY'
+        import json
+        from pathlib import Path
+
+        p = Path(
+            "research/package-adjustment-v1/prospective/"
+            "future_trade_structural_maturity_status.json"
+        )
+        s = json.loads(p.read_text(encoding="utf-8"))
+
+        assert s["status"] in {
+            "WAITING_FOR_FUTURE_CLEAN_TRADES",
+            "MATURE_ARCHITECTURE_REVIEW_ONLY",
+        }
+        g = s["governance"]
+        assert g["existing_six_counted"] is False
+        assert g["lambda_fit_performed"] is False
+        assert g["conditional_model_fit_performed"] is False
+        assert g["production_authorized"] is False
+        assert g["package_formula_change_authorized"] is False
+        assert g["v8_voting_unchanged"] is True
+        assert g["shadow_v2_unchanged"] is True
+
+        m = s["maturity"]
+        assert set(m["checks"]) == {
+            "future_primary_clean_trade_count",
+            "one_for_two_count",
+            "one_for_three_count",
+            "player_only_package_count",
+            "with_pick_package_count",
+            "distinct_singleton_target_players",
+        }
+        if m["all_requirements_met"]:
+            assert s["status"] == "MATURE_ARCHITECTURE_REVIEW_ONLY"
+        else:
+            assert s["status"] == "WAITING_FOR_FUTURE_CLEAN_TRADES"
+
+        # No statistical/model fit fields are permitted in the monitor output.
+        blob = json.dumps(s, sort_keys=True).lower()
+        for forbidden in (
+            '"fitted_lambda"',
+            '"regression_coefficient"',
+            '"production_multiplier"',
+            '"recommended_lambda"',
+        ):
+            assert forbidden not in blob
+
+        print("PASS: maturity monitor output is research-only and taxonomy-bound.")
+        print(json.dumps(m["progress"], indent=2, sort_keys=True))
+        PY
+
+        test "$(sha256sum index.html | awk '{print $1}')" = "$INDEX_SHA"
+        test "$(sha256sum free-agent-board.html | awk '{print $1}')" = "$FA_SHA"
+        test -z "$(git diff --name-only -- index.html free-agent-board.html)"
+    - name: Run repository regression checks
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 -m pip install --disable-pip-version-check --no-cache-dir "requests>=2.32,<3"
+        python3 scripts/validation/repo_regression_checks.py
+    - name: Commit monitor implementation and changed status only
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+        git add \
+          research/package-adjustment-v1/prospective/future_trade_structural_maturity_monitor.py \
+          research/package-adjustment-v1/prospective/future_trade_structural_maturity_status.json \
+          research/package-adjustment-v1/prospective/future_trade_structural_maturity_status.md
+
+        if git diff --cached --quiet; then
+          echo "No maturity-state change to commit."
+        else
+          git diff --cached --check
+          git commit -m "Update future package-trade structural maturity monitor"
+          git pull --rebase origin main
+          git push origin main
+        fi
+    - name: Closeout
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        python3 - <<'PY'
+        import json
+        from pathlib import Path
+
+        s = json.loads(
+            Path(
+                "research/package-adjustment-v1/prospective/"
+                "future_trade_structural_maturity_status.json"
+            ).read_text(encoding="utf-8")
+        )
+        print("=== B34D STRUCTURAL MATURITY MONITOR ===")
+        print("Status:", s["status"])
+        for key, row in s["maturity"]["progress"].items():
+            print(f"{key}: {row['current']} / {row['required']}")
+        print("Production authorized: NO")
+        print("Lambda fit performed: NO")
+        PY
