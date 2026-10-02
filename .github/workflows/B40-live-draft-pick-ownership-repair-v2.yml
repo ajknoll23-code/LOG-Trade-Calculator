@@ -1,0 +1,78 @@
+name: B40 Live Draft Pick Ownership Repair V2
+'on':
+  workflow_dispatch: {}
+permissions:
+  contents: write
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+    - name: Check out current main
+      uses: actions/checkout@v4
+      with:
+        ref: main
+        fetch-depth: 0
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.13'
+    - name: Install regression dependencies
+      shell: bash
+      run: 'set -euo pipefail
+
+        python3 -m pip install --disable-pip-version-check --no-cache-dir "requests>=2.32,<3"
+
+        python3 - <<''PY''
+
+        import requests
+
+        print(''requests'', requests.__version__)
+
+        PY
+
+        '
+    - name: Verify source data and reproduce stale-pick defect
+      shell: bash
+      run: "set -euo pipefail\n\npython3 - <<'PY'\nimport json\nimport re\nfrom pathlib import Path\n\nindex_path = Path(\"index.html\")\npicks_path = Path(\"data/draft_picks.json\")\n\nassert index_path.exists()\nassert picks_path.exists()\n\ndata = json.loads(picks_path.read_text(encoding=\"utf-8\"))\nrows = data.get(\"traded_picks\")\nassert isinstance(rows, list) and rows\n\nsource = [\n    r for r in rows\n    if str(r.get(\"season\")) == \"2027\"\n    and int(r.get(\"round\")) == 2\n    and int(r.get(\"roster_id\")) == 4\n]\nassert len(source) == 1, source\n\nhtml = index_path.read_text(encoding=\"utf-8\")\nold = re.search(\n    r\"const TRADED_PICKS = \\[(.*?)\\n\\];\\n\\nconst PICK_ROUNDS\",\n    html,\n    flags=re.S,\n)\nassert old, \"Could not locate embedded TRADED_PICKS fallback\"\n\nstale_row = re.search(\n    r\"\\{round:2,\\s*season:'2027',\\s*roster_id:4,\\s*\"\n    r\"owner_id:(\\d+),\\s*previous_owner_id:(\\d+)\\}\",\n    old.group(1),\n)\nassert stale_row, \"Could not\
+        \ locate roster 4 / 2027 R2 in embedded fallback\"\n\nprint(\"PASS: located live Sleeper source and stale embedded ownership path.\")\nprint(\"Live source owner for roster 4 2027 R2:\", source[0][\"owner_id\"])\nprint(\"Embedded owner before repair:\", stale_row.group(1))\nPY\n"
+    - name: Patch index to use live draft-pick ownership with fallback
+      shell: bash
+      run: "set -euo pipefail\n\npython3 - <<'PY'\nfrom __future__ import annotations\n\nimport json\nimport re\nfrom pathlib import Path\n\nINDEX = Path(\"index.html\")\nPICKS = Path(\"data/draft_picks.json\")\n\nhtml = INDEX.read_text(encoding=\"utf-8\")\ndata = json.loads(PICKS.read_text(encoding=\"utf-8\"))\nraw_rows = data[\"traded_picks\"]\n\nnormalized = []\nseen = set()\nfor raw in raw_rows:\n    row = {\n        \"round\": int(raw[\"round\"]),\n        \"season\": str(raw[\"season\"]),\n        \"roster_id\": int(raw[\"roster_id\"]),\n        \"owner_id\": int(raw[\"owner_id\"]),\n        \"previous_owner_id\": int(raw[\"previous_owner_id\"]),\n    }\n    assert 1 <= row[\"round\"] <= 6\n    assert re.fullmatch(r\"\\d{4}\", row[\"season\"])\n    assert row[\"roster_id\"] >= 1\n    assert row[\"owner_id\"] >= 1\n    assert row[\"previous_owner_id\"] >= 1\n\n    key = (row[\"season\"], row[\"round\"], row[\"roster_id\"])\n    assert key not in seen, f\"Duplicate current-owner row\
+        \ for original pick {key}\"\n    seen.add(key)\n    normalized.append(row)\n\nfallback_lines = []\nfor row in normalized:\n    fallback_lines.append(\n        \"  {round:%d, season:'%s', roster_id:%d, owner_id:%d, previous_owner_id:%d},\"\n        % (\n            row[\"round\"],\n            row[\"season\"],\n            row[\"roster_id\"],\n            row[\"owner_id\"],\n            row[\"previous_owner_id\"],\n        )\n    )\n\nfallback_block = (\n    \"let TRADED_PICKS = [\\n\"\n    + \"\\n\".join(fallback_lines)\n    + \"\\n];\\n\\n\"\n    + \"const DRAFT_PICKS_SYNC_URL = \"\n    + \"'https://raw.githubusercontent.com/ajknoll23-code/\"\n      \"LOG-Trade-Calculator/refs/heads/main/data/draft_picks.json';\\n\"\n    + \"let DRAFT_PICKS_LAST_SYNCED = null;\\n\\n\"\n    + \"const PICK_ROUNDS\"\n)\n\nhtml, n = re.subn(\n    r\"const TRADED_PICKS = \\[.*?\\n\\];\\n\\nconst PICK_ROUNDS\",\n    fallback_block,\n    html,\n    count=1,\n    flags=re.S,\n)\nassert n == 1, f\"Expected\
+        \ one TRADED_PICKS replacement, got {n}\"\n\nanchor = \"function computeTeamPicks(rosterId){\"\nassert html.count(anchor) == 1\n\nloader = r\"\"\"\n/* LIVE_DRAFT_PICK_OWNERSHIP_V1\n   Source of truth for current pick ownership is data/draft_picks.json,\n   refreshed by sync_sleeper.py from Sleeper's traded_picks endpoint.\n\n   The embedded TRADED_PICKS array above is only a fail-safe fallback so the\n   calculator still works if the raw GitHub request is temporarily unavailable.\n   A successful live load replaces the fallback atomically and rerenders the UI.\n   No draft-pick FV, slot projection, year discount, or roster-strength math is\n   changed here. */\nfunction normalizeLiveTradedPicks(rows){\n  if(!Array.isArray(rows) || rows.length === 0){\n    throw new Error('draft_picks.json missing non-empty traded_picks array');\n  }\n\n  const normalized = [];\n  const seen = new Set();\n\n  for(const raw of rows){\n    const round = Number(raw && raw.round);\n    const season =\
+        \ String(raw && raw.season || '');\n    const roster_id = Number(raw && raw.roster_id);\n    const owner_id = Number(raw && raw.owner_id);\n    const previous_owner_id = Number(raw && raw.previous_owner_id);\n\n    if(\n      !Number.isInteger(round) || round < 1 || round > 6 ||\n      !/^\\d{4}$/.test(season) ||\n      !Number.isInteger(roster_id) || roster_id < 1 ||\n      !Number.isInteger(owner_id) || owner_id < 1 ||\n      !Number.isInteger(previous_owner_id) || previous_owner_id < 1\n    ){\n      throw new Error('invalid traded-pick row from live sync');\n    }\n\n    const key = `${season}|${round}|${roster_id}`;\n    if(seen.has(key)){\n      throw new Error(`duplicate traded-pick ownership row: ${key}`);\n    }\n    seen.add(key);\n\n    normalized.push({\n      round,\n      season,\n      roster_id,\n      owner_id,\n      previous_owner_id,\n    });\n  }\n\n  return normalized;\n}\n\nfunction syncDraftPicksFromGitHub(){\n  const url = `${DRAFT_PICKS_SYNC_URL}?v=${Date.now()}`;\n\
+        \  return fetch(url, {cache:'no-store'})\n    .then(r => {\n      if(!r.ok) throw new Error('HTTP ' + r.status);\n      return r.json();\n    })\n    .then(data => {\n      const live = normalizeLiveTradedPicks(data && data.traded_picks);\n      TRADED_PICKS.splice(0, TRADED_PICKS.length, ...live);\n      DRAFT_PICKS_LAST_SYNCED =\n        Number.isFinite(Number(data.synced_at)) ? Number(data.synced_at) : null;\n\n      console.info(\n        `Draft-pick ownership live sync: ${TRADED_PICKS.length} current traded picks`\n      );\n\n      render();\n      return live.length;\n    })\n    .catch(err => {\n      console.warn(\n        'Draft-pick ownership sync failed; using embedded fallback:',\n        err\n      );\n      return null;\n    });\n}\n\n\"\"\"\nhtml = html.replace(anchor, loader + anchor, 1)\n\nstartup = \"\\nsyncLeagueFromGitHub();\\n\"\nassert html.count(startup) == 1, (\n    \"Expected exactly one startup syncLeagueFromGitHub() call\"\n)\nhtml = html.replace(\n  \
+        \  startup,\n    \"\\nsyncLeagueFromGitHub();\\nsyncDraftPicksFromGitHub();\\n\",\n    1,\n)\n\nhtml = html.replace(\n    \"plus real draft picks owned, per the 2026-08-18 trade sync. \"\n    \"Picks use a mid-round estimate -- real draft slot isn't available, \"\n    \"so this can understate an early pick and overstate a late one.\",\n    \"plus current draft picks owned from the live Sleeper traded-pick sync. \"\n    \"2027 pick slots use the standings-based projection shown in each row; \"\n    \"later draft years remain mid until real slot signal exists.\",\n)\n\nINDEX.write_text(html, encoding=\"utf-8\")\nprint(f\"Patched {INDEX} with live draft-pick ownership sync.\")\nPY\n"
+    - name: Validate live pick ownership repair
+      shell: bash
+      run: "set -euo pipefail\n\npython3 - <<'PY'\nimport json\nimport re\nfrom pathlib import Path\n\nhtml = Path(\"index.html\").read_text(encoding=\"utf-8\")\ndata = json.loads(Path(\"data/draft_picks.json\").read_text(encoding=\"utf-8\"))\nrows = data[\"traded_picks\"]\n\nassert \"let TRADED_PICKS = [\" in html\nassert \"const TRADED_PICKS = [\" not in html\nassert \"const DRAFT_PICKS_SYNC_URL =\" in html\nassert \"function normalizeLiveTradedPicks(rows){\" in html\nassert \"function syncDraftPicksFromGitHub(){\" in html\nassert \"\\nsyncLeagueFromGitHub();\\nsyncDraftPicksFromGitHub();\\n\" in html\nassert \"per the 2026-08-18 trade sync\" not in html\n\nlive = [\n    r for r in rows\n    if str(r[\"season\"]) == \"2027\"\n    and int(r[\"round\"]) == 2\n    and int(r[\"roster_id\"]) == 4\n]\nassert len(live) == 1\nexpected_owner = int(live[0][\"owner_id\"])\n\nm = re.search(\n    r\"\\{round:2,\\s*season:'2027',\\s*roster_id:4,\\s*\"\n    r\"owner_id:(\\d+),\\s*previous_owner_id:(\\\
+        d+)\\}\",\n    html,\n)\nassert m\nassert int(m.group(1)) == expected_owner\n\nblock = re.search(\n    r\"let TRADED_PICKS = \\[(.*?)\\n\\];\\n\\nconst DRAFT_PICKS_SYNC_URL\",\n    html,\n    flags=re.S,\n)\nassert block\nembedded_count = len(re.findall(r\"^\\s*\\{round:\", block.group(1), flags=re.M))\nassert embedded_count == len(rows), (embedded_count, len(rows))\n\nprint(\"PASS: embedded fallback matches current synced ownership count.\")\nprint(\"PASS: roster 4 2027 R2 current owner:\", expected_owner)\nprint(\"PASS: future page loads fetch draft_picks.json live.\")\nPY\n\npython3 - <<'PY'\nimport re\nfrom pathlib import Path\n\nhtml = Path(\"index.html\").read_text(encoding=\"utf-8\")\nblocks = re.findall(\n    r\"<script(?:\\s[^>]*)?>(.*?)</script>\",\n    html,\n    flags=re.S | re.I,\n)\njs = \"\\n;\\n\".join(blocks)\nPath(\"/tmp/index-inline.js\").write_text(js, encoding=\"utf-8\")\nprint(\"Inline script blocks:\", len(blocks))\nPY\n\nnode --check /tmp/index-inline.js\n"
+    - name: Run repository regression checks
+      shell: bash
+      run: 'set -euo pipefail
+
+        python3 scripts/validation/repo_regression_checks.py
+
+        '
+    - name: Commit production repair
+      shell: bash
+      run: "set -euo pipefail\n\ngit config user.name \"github-actions[bot]\"\ngit config user.email \"41898282+github-actions[bot]@users.noreply.github.com\"\n\ngit add index.html\ngit diff --cached --check\n\nCHANGED=\"$(git diff --cached --name-only)\"\ntest \"$CHANGED\" = \"index.html\"\n\nif git diff --cached --quiet; then\n  echo \"No index.html change required.\"\nelse\n  git commit -m \"Fix live Sleeper draft pick ownership in league rankings\"\n  git push origin HEAD:main\nfi\n"
+    - name: Closeout
+      shell: bash
+      run: 'echo "B40 CLOSEOUT: PASS_LIVE_DRAFT_PICK_OWNERSHIP_REPAIR"
+
+        echo "SOURCE OF TRUTH: data/draft_picks.json"
+
+        echo "EMBEDDED PICK DATA: fallback only"
+
+        echo "PICK FV MATH CHANGED: false"
+
+        echo "DRAFT SLOT MATH CHANGED: false"
+
+        echo "LEAGUE RANKINGS OWNERSHIP: live"
+
+        '
