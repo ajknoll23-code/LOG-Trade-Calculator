@@ -1,0 +1,614 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+from collections import Counter
+from datetime import datetime, timezone
+import json
+import math
+from pathlib import Path
+import statistics
+
+PRIMARY_CATEGORIES = {
+    "ONE_FOR_TWO_PLAYER_ONLY",
+    "ONE_FOR_TWO_WITH_PICK",
+    "ONE_FOR_THREE_PLAYER_ONLY",
+    "ONE_FOR_THREE_WITH_PICK",
+}
+
+KNOWN_ELIGIBLE_IDS = {
+    "1407811159393853440",
+    "1408450659522539520",
+    "1411039354826035200",
+    "1411041013174120448",
+    "1411042150325456896",
+    "1411116913899094016",
+}
+
+KNOWN_CLEAN_ID = "1411042150325456896"
+
+
+def finite(value):
+    try:
+        x = float(value)
+    except (TypeError, ValueError):
+        return None
+    return x if math.isfinite(x) else None
+
+
+def asset_label(asset):
+    if asset.get("type") == "player":
+        return asset.get("name") or asset.get("key") or "unknown_player"
+    if asset.get("type") == "pick":
+        return (
+            f"{asset.get('season')} R{asset.get('round')} "
+            f"{asset.get('tier', 'unknown')}"
+        )
+    return str(asset.get("type") or "unknown")
+
+
+def side_summary(side):
+    assets = side.get("received_assets") or []
+    players = [a for a in assets if a.get("type") == "player"]
+    picks = [a for a in assets if a.get("type") == "pick"]
+    values = [finite(a.get("fv")) for a in assets]
+    if any(v is None or v <= 0 for v in values):
+        raise RuntimeError(
+            f"eligible side has unresolved/nonpositive FV: {side.get('roster_id')}"
+        )
+    raw = sum(values)
+    return {
+        "roster_id": str(side.get("roster_id")),
+        "team_name": side.get("team_name"),
+        "asset_count": len(assets),
+        "player_count": len(players),
+        "pick_count": len(picks),
+        "has_pick": bool(picks),
+        "raw_fv_from_assets": raw,
+        "raw_fv_geometry": finite(
+            (side.get("package_geometry") or {}).get("raw_fv")
+        ),
+        "fg": finite((side.get("package_geometry") or {}).get("fg")),
+        "fragmentation": finite(
+            (side.get("package_geometry") or {}).get("fragmentation")
+        ),
+        "best_asset_gap": finite(
+            (side.get("package_geometry") or {}).get("best_asset_gap")
+        ),
+        "top_asset_fv": finite(
+            (side.get("package_geometry") or {}).get("top_asset_fv")
+        ),
+        "assets": [asset_label(a) for a in assets],
+        "asset_types": [str(a.get("type")) for a in assets],
+        "singleton_asset": assets[0] if len(assets) == 1 else None,
+        "pick_keys": sorted(
+            {
+                (str(a.get("season")), int(a.get("round")))
+                for a in picks
+                if a.get("season") is not None and a.get("round") is not None
+            }
+        ),
+    }
+
+
+def classify_trade(trade):
+    sides = trade.get("sides")
+    if not isinstance(sides, list) or len(sides) != 2:
+        raise RuntimeError(
+            f"eligible trade is not exactly two-sided: {trade.get('transaction_id')}"
+        )
+
+    s = [side_summary(x) for x in sides]
+
+    for side in s:
+        geom = side["raw_fv_geometry"]
+        if geom is None or abs(geom - side["raw_fv_from_assets"]) > 1e-6:
+            raise RuntimeError(
+                f"geometry/raw mismatch trade {trade.get('transaction_id')}: {side}"
+            )
+
+    counts = [s[0]["asset_count"], s[1]["asset_count"]]
+    common_pick_keys = sorted(set(s[0]["pick_keys"]) & set(s[1]["pick_keys"]))
+
+    singleton_idx = None
+    package_idx = None
+    category = None
+
+    if counts == [1, 1]:
+        category = "ONE_FOR_ONE_NONPACKAGE"
+    elif 1 in counts:
+        singleton_idx = 0 if counts[0] == 1 else 1
+        package_idx = 1 - singleton_idx
+        n = counts[package_idx]
+        singleton_asset = s[singleton_idx]["singleton_asset"]
+        singleton_type = singleton_asset.get("type") if singleton_asset else None
+
+        if singleton_type != "player":
+            category = "SINGLETON_PICK_TRACK_ONLY"
+        elif n == 2:
+            category = (
+                "ONE_FOR_TWO_WITH_PICK"
+                if s[package_idx]["has_pick"]
+                else "ONE_FOR_TWO_PLAYER_ONLY"
+            )
+        elif n == 3:
+            category = (
+                "ONE_FOR_THREE_WITH_PICK"
+                if s[package_idx]["has_pick"]
+                else "ONE_FOR_THREE_PLAYER_ONLY"
+            )
+        else:
+            category = (
+                "ONE_FOR_N4PLUS_WITH_PICK"
+                if s[package_idx]["has_pick"]
+                else "ONE_FOR_N4PLUS_PLAYER_ONLY"
+            )
+    else:
+        category = "MANY_FOR_MANY_TRACK_ONLY"
+
+    primary = category in PRIMARY_CATEGORIES
+    metrics = None
+    if primary:
+        pkg = s[package_idx]
+        one = s[singleton_idx]
+        ratio = pkg["raw_fv_from_assets"] / one["raw_fv_from_assets"]
+        fg = pkg["fg"]
+        implied_lambda = None
+        if fg is not None and fg > 0 and ratio > 0:
+            implied_lambda = (1.0 - 1.0 / ratio) / fg
+
+        target_asset = one["singleton_asset"]
+        metrics = {
+            "package_side_roster_id": pkg["roster_id"],
+            "singleton_side_roster_id": one["roster_id"],
+            "package_asset_count": pkg["asset_count"],
+            "package_player_count": pkg["player_count"],
+            "package_pick_count": pkg["pick_count"],
+            "package_has_pick": pkg["has_pick"],
+            "package_raw_fv": pkg["raw_fv_from_assets"],
+            "singleton_raw_fv": one["raw_fv_from_assets"],
+            "raw_package_to_single_ratio": ratio,
+            "raw_premium_pct": (ratio - 1.0) * 100.0,
+            "package_fg": fg,
+            "package_fragmentation": pkg["fragmentation"],
+            "package_best_asset_gap": pkg["best_asset_gap"],
+            "package_top_asset_fv": pkg["top_asset_fv"],
+            "package_top_asset_share": (
+                pkg["top_asset_fv"] / pkg["raw_fv_from_assets"]
+                if pkg["top_asset_fv"] is not None
+                else None
+            ),
+            "implied_lambda_to_equalize": implied_lambda,
+            "singleton_target": {
+                "type": target_asset.get("type"),
+                "name": target_asset.get("name"),
+                "key": target_asset.get("key"),
+                "pos": target_asset.get("pos"),
+                "fv": finite(target_asset.get("fv")),
+            },
+        }
+
+    return {
+        "transaction_id": str(trade.get("transaction_id")),
+        "created_at_utc": trade.get("created_at_utc"),
+        "pretrade_snapshot": trade.get("pretrade_snapshot"),
+        "category": category,
+        "primary_clean_consolidation": primary,
+        "symmetric_same_year_round_pick_present": bool(common_pick_keys),
+        "common_pick_year_round": [
+            {"season": year, "round": rnd}
+            for year, rnd in common_pick_keys
+        ],
+        "side_asset_counts": counts,
+        "sides": [
+            {
+                k: v
+                for k, v in side.items()
+                if k not in {"singleton_asset", "pick_keys"}
+            }
+            for side in s
+        ],
+        "clean_metrics": metrics,
+    }
+
+
+def build_development(evidence, repair):
+    eligible = {
+        tid: row
+        for tid, row in evidence["trades"].items()
+        if row.get("eligible_for_numeric_package_research") is True
+    }
+
+    if set(eligible) != KNOWN_ELIGIBLE_IDS:
+        raise RuntimeError(
+            "Eligible trade set changed before B34C freeze. "
+            f"expected={sorted(KNOWN_ELIGIBLE_IDS)} actual={sorted(eligible)}"
+        )
+
+    classified = [
+        classify_trade(eligible[tid])
+        for tid in sorted(
+            eligible,
+            key=lambda x: eligible[x].get("created_epoch_ms") or 0,
+        )
+    ]
+
+    category_counts = Counter(x["category"] for x in classified)
+    clean = [x for x in classified if x["primary_clean_consolidation"]]
+    if len(clean) != 1 or clean[0]["transaction_id"] != KNOWN_CLEAN_ID:
+        raise RuntimeError(
+            "Expected exactly one clean 1-for-2/1-for-3 development trade: "
+            f"{[(x['transaction_id'], x['category']) for x in clean]}"
+        )
+
+    clean_metrics = clean[0]["clean_metrics"]
+    if abs(clean_metrics["raw_package_to_single_ratio"] - (5677.0 / 4801.0)) > 1e-9:
+        raise RuntimeError("Known Jameson trade ratio changed unexpectedly")
+
+    implied = clean_metrics["implied_lambda_to_equalize"]
+    if implied is None or abs(implied - 1.02436061) > 1e-6:
+        raise RuntimeError(f"Known Jameson implied lambda changed: {implied}")
+
+    development = {
+        "schema_version": 1,
+        "study_id": "package-adjustment-v1",
+        "phase": "B34C-existing-six-trade-structural-development-audit",
+        "status": "DEVELOPMENT_ONLY_STRUCTURAL_HETEROGENEITY_AUDIT",
+        "source_repair_status": repair["status"],
+        "governance": {
+            "existing_six_trades_consumed_for_development": True,
+            "existing_six_may_count_as_future_confirmation": False,
+            "production_authorized": False,
+            "formula_change_authorized": False,
+            "lambda_fit_authorized": False,
+            "v8_voting_gate_changed": False,
+            "shadow_v2_gate_changed": False,
+        },
+        "eligible_trade_count": len(classified),
+        "category_counts": dict(sorted(category_counts.items())),
+        "primary_clean_consolidation_trade_count": len(clean),
+        "primary_clean_trade_ids": [x["transaction_id"] for x in clean],
+        "trades": classified,
+        "key_development_finding": (
+            "Only one of the six numerically eligible prospective trades is a "
+            "clean one-asset-for-two/three-assets consolidation observation. "
+            "The other five are one-for-one or many-for-many and must not be "
+            "pooled with clean consolidation trades when learning package premium."
+        ),
+    }
+    return development
+
+
+def future_taxonomy():
+    return {
+        "schema_version": 1,
+        "study_id": "package-adjustment-v1",
+        "phase": "B34C-future-trade-structural-taxonomy-preregistration",
+        "status": "PREREGISTERED_FUTURE_STRUCTURAL_TAXONOMY_RESEARCH_ONLY",
+        "governance": {
+            "production_authorized": False,
+            "package_formula_change_authorized": False,
+            "lambda_fit_authorized_now": False,
+            "existing_six_trade_ids_are_development_only": sorted(
+                KNOWN_ELIGIBLE_IDS
+            ),
+            "future_eligibility_requires_transaction_after_freeze_anchor_commit": True,
+            "anti_hindsight_pretrade_snapshot_required": True,
+            "post_trade_values_never_substituted": True,
+            "market_value_not_validation_label": True,
+            "team_utility_not_validation_label": True,
+            "v8_voting_unchanged": True,
+            "shadow_v2_unchanged": True,
+        },
+        "primary_future_sample": {
+            "trade_must_already_be_numeric_eligible_in_trade_evidence": True,
+            "exactly_two_sided": True,
+            "one_side_asset_count": 1,
+            "other_side_asset_count_allowed": [2, 3],
+            "singleton_asset_must_be": "player",
+            "all_asset_fvs_from_strictly_pretrade_snapshot": True,
+            "all_assets_resolved": True,
+            "allowed_primary_categories": sorted(PRIMARY_CATEGORIES),
+        },
+        "primary_categories": {
+            "ONE_FOR_TWO_PLAYER_ONLY": {
+                "singleton": "one player",
+                "package": "two players, zero picks",
+            },
+            "ONE_FOR_TWO_WITH_PICK": {
+                "singleton": "one player",
+                "package": "two total assets with at least one pick",
+            },
+            "ONE_FOR_THREE_PLAYER_ONLY": {
+                "singleton": "one player",
+                "package": "three players, zero picks",
+            },
+            "ONE_FOR_THREE_WITH_PICK": {
+                "singleton": "one player",
+                "package": "three total assets with at least one pick",
+            },
+        },
+        "track_only_categories": {
+            "ONE_FOR_ONE_NONPACKAGE": (
+                "record but never treat as package-premium evidence"
+            ),
+            "MANY_FOR_MANY_TRACK_ONLY": (
+                "record separately; do not infer a single consolidation premium"
+            ),
+            "ONE_FOR_N4PLUS_PLAYER_ONLY": (
+                "record separately until enough data support a dedicated stratum"
+            ),
+            "ONE_FOR_N4PLUS_WITH_PICK": (
+                "record separately until enough data support a dedicated stratum"
+            ),
+            "SINGLETON_PICK_TRACK_ONLY": (
+                "record separately; V1 package premium target is a singleton player"
+            ),
+        },
+        "frozen_metrics_for_primary_future_trades": {
+            "raw_package_to_single_ratio": (
+                "sum(package frozen FVs) / singleton frozen FV"
+            ),
+            "raw_premium_pct": (
+                "(raw_package_to_single_ratio - 1) * 100"
+            ),
+            "package_fragmentation": "1 - HHI of package frozen FV shares",
+            "package_best_asset_gap": (
+                "max(0, 1 - package_top_asset_FV / singleton_FV)"
+            ),
+            "package_fg": "fragmentation * best_asset_gap",
+            "package_top_asset_share": (
+                "package top asset FV / package raw FV"
+            ),
+            "implied_lambda_to_equalize": (
+                "(1 - 1/raw_package_to_single_ratio) / package_fg "
+                "when package_fg > 0"
+            ),
+        },
+        "predeclared_structural_contrasts": [
+            "ONE_FOR_TWO vs ONE_FOR_THREE",
+            "PLAYER_ONLY package vs WITH_PICK package",
+        ],
+        "continuous_development_covariates": [
+            "package_fg",
+            "package_fragmentation",
+            "package_best_asset_gap",
+            "package_top_asset_share",
+            "singleton_target_fv",
+        ],
+        "prohibited_posthoc_actions_before_maturity": [
+            "drop an eligible trade because its implied lambda is inconvenient",
+            "merge many-for-many trades into clean one-for-many calibration",
+            "change one-for-two/one-for-three definitions",
+            "change pick-containing vs player-only definitions",
+            "change FV values using post-trade information",
+            "fit lambda or any conditional formula",
+            "change production Package Adjustment",
+        ],
+        "maturity_review_gate": {
+            "future_primary_clean_trade_count_min": 12,
+            "one_for_two_count_min": 3,
+            "one_for_three_count_min": 3,
+            "player_only_package_count_min": 3,
+            "with_pick_package_count_min": 3,
+            "distinct_singleton_target_players_min": 6,
+            "existing_six_count_toward_thresholds": False,
+            "passing_gate_authorizes": (
+                "architecture/modeling review only; not fitting, production, "
+                "or promotion"
+            ),
+        },
+        "after_maturity": {
+            "next_required_action": (
+                "preregister a candidate conditional model architecture and "
+                "reserve later unopened future trades as holdout before fitting"
+            ),
+            "production_without_independent_holdout": False,
+        },
+    }
+
+
+def write_md(development, taxonomy, path):
+    lines = [
+        "# Package Trade Evidence — B34C Structural Audit",
+        "",
+        "**Status:** Development-only audit + future taxonomy frozen.",
+        "",
+        "## Existing six eligible trades",
+        "",
+        f"- Eligible numeric trades: `{development['eligible_trade_count']}`",
+        (
+            "- Clean 1-for-2/1-for-3 consolidation trades: "
+            f"`{development['primary_clean_consolidation_trade_count']}`"
+        ),
+        "- Existing six are permanently development-only.",
+        "",
+        "### Structural classification",
+        "",
+    ]
+    for category, count in development["category_counts"].items():
+        lines.append(f"- `{category}`: {count}")
+
+    clean = development["trades"]
+    clean = [x for x in clean if x["primary_clean_consolidation"]]
+    if clean:
+        m = clean[0]["clean_metrics"]
+        lines += [
+            "",
+            "### Only clean consolidation observation",
+            "",
+            (
+                f"- Transaction `{clean[0]['transaction_id']}`: "
+                f"{m['singleton_target']['name']} vs "
+                f"{m['package_asset_count']}-asset package"
+            ),
+            f"- Raw package/single ratio: `{m['raw_package_to_single_ratio']:.4f}`",
+            f"- Raw premium: `{m['raw_premium_pct']:.2f}%`",
+            f"- Package FG: `{m['package_fg']:.6f}`",
+            (
+                "- Implied lambda to equalize under the V0 functional form: "
+                f"`{m['implied_lambda_to_equalize']:.4f}`"
+            ),
+        ]
+
+    lines += [
+        "",
+        "## Future taxonomy",
+        "",
+        "Primary future evidence is restricted to:",
+        "",
+        "- one player on one side;",
+        "- exactly two or three resolved assets on the other side;",
+        "- frozen pre-trade FVs only;",
+        "- transactions strictly after the B34C freeze-anchor commit.",
+        "",
+        "Primary categories:",
+    ]
+    for category in sorted(taxonomy["primary_categories"]):
+        lines.append(f"- `{category}`")
+
+    g = taxonomy["maturity_review_gate"]
+    lines += [
+        "",
+        "## Maturity review gate",
+        "",
+        f"- Future clean trades: `{g['future_primary_clean_trade_count_min']}`",
+        f"- 1-for-2: at least `{g['one_for_two_count_min']}`",
+        f"- 1-for-3: at least `{g['one_for_three_count_min']}`",
+        f"- Player-only packages: at least `{g['player_only_package_count_min']}`",
+        f"- Pick-containing packages: at least `{g['with_pick_package_count_min']}`",
+        (
+            "- Distinct singleton target players: at least "
+            f"`{g['distinct_singleton_target_players_min']}`"
+        ),
+        "",
+        "Crossing this gate authorizes only a new modeling preregistration.",
+        "It does not authorize fitting or production.",
+        "",
+    ]
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def selftest():
+    def asset(kind, fv, name=None, pos=None, season=None, rnd=None):
+        row = {"type": kind, "fv": fv}
+        if kind == "player":
+            row.update({"name": name, "key": name.lower(), "pos": pos})
+        else:
+            row.update({"season": str(season), "round": rnd, "tier": "mid"})
+        return row
+
+    one = {
+        "transaction_id": "x",
+        "created_at_utc": "2026-01-01T00:00:00Z",
+        "sides": [
+            {
+                "roster_id": "1",
+                "received_assets": [asset("player", 5000, "Target", "WR")],
+                "package_geometry": {
+                    "raw_fv": 5000,
+                    "fg": 0.0,
+                    "fragmentation": 0.0,
+                    "best_asset_gap": 0.0,
+                    "top_asset_fv": 5000,
+                },
+            },
+            {
+                "roster_id": "2",
+                "received_assets": [
+                    asset("player", 4000, "A", "RB"),
+                    asset("pick", 1500, season=2027, rnd=2),
+                ],
+                "package_geometry": {
+                    "raw_fv": 5500,
+                    "fg": 0.10,
+                    "fragmentation": 0.40,
+                    "best_asset_gap": 0.25,
+                    "top_asset_fv": 4000,
+                },
+            },
+        ],
+    }
+    r = classify_trade(one)
+    assert r["category"] == "ONE_FOR_TWO_WITH_PICK"
+    assert r["primary_clean_consolidation"] is True
+    assert abs(r["clean_metrics"]["raw_package_to_single_ratio"] - 1.1) < 1e-12
+
+    many = json.loads(json.dumps(one))
+    many["sides"][0]["received_assets"].append(
+        asset("pick", 500, season=2028, rnd=4)
+    )
+    many["sides"][0]["package_geometry"]["raw_fv"] = 5500
+    many["sides"][0]["package_geometry"]["top_asset_fv"] = 5000
+    many["sides"][0]["package_geometry"]["fragmentation"] = 0.15
+    many["sides"][0]["package_geometry"]["fg"] = 0.0
+    r2 = classify_trade(many)
+    assert r2["category"] == "MANY_FOR_MANY_TRACK_ONLY"
+    assert r2["primary_clean_consolidation"] is False
+
+    print("PASS: B34C structural taxonomy synthetic selftest")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--evidence")
+    ap.add_argument("--repair")
+    ap.add_argument("--development-out")
+    ap.add_argument("--taxonomy-out")
+    ap.add_argument("--report-out")
+    args = ap.parse_args()
+
+    if args.selftest:
+        selftest()
+        return
+
+    for name in (
+        "evidence",
+        "repair",
+        "development_out",
+        "taxonomy_out",
+        "report_out",
+    ):
+        if getattr(args, name) is None:
+            ap.error(f"--{name} is required")
+
+    evidence = json.loads(Path(args.evidence).read_text(encoding="utf-8"))
+    repair = json.loads(Path(args.repair).read_text(encoding="utf-8"))
+
+    assert evidence["status"] == "research_only_prospective_trade_evidence"
+    assert evidence["consumer_changed"] is False
+    assert evidence["counts"]["eligible_numeric_trade_count"] == 6
+    assert repair["status"] == "PASS_PICK_KEY_REPAIR_ANTI_HINDSIGHT_PRESERVED"
+    assert repair["invariants"]["anti_hindsight_preserved"] is True
+    assert repair["invariants"]["production_changed"] is False
+
+    development = build_development(evidence, repair)
+    taxonomy = future_taxonomy()
+
+    Path(args.development_out).write_text(
+        json.dumps(development, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    Path(args.taxonomy_out).write_text(
+        json.dumps(taxonomy, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    write_md(development, taxonomy, Path(args.report_out))
+
+    print(json.dumps({
+        "status": "PASS_B34C_DEVELOPMENT_AUDIT_AND_TAXONOMY_FREEZE_READY",
+        "eligible_existing_trades": development["eligible_trade_count"],
+        "clean_existing_trades": development[
+            "primary_clean_consolidation_trade_count"
+        ],
+        "category_counts": development["category_counts"],
+        "future_maturity_min": taxonomy[
+            "maturity_review_gate"
+        ]["future_primary_clean_trade_count_min"],
+        "production_authorized": False,
+    }, indent=2))
+
+
+if __name__ == "__main__":
+    main()
