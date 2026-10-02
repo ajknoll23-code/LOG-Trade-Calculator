@@ -1,0 +1,1097 @@
+name: B39 Weekly Floor Ceiling Volatility V1 - Reusable Prospective Weekly Capture
+
+'on':
+  workflow_dispatch:
+    inputs:
+      origin_week:
+        description: '2026 NFL regular-season origin week to freeze'
+        required: true
+        default: '5'
+        type: choice
+        options:
+          - '5'
+          - '6'
+          - '7'
+          - '8'
+          - '9'
+          - '10'
+          - '11'
+          - '12'
+          - '13'
+          - '14'
+          - '15'
+          - '16'
+          - '17'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+  TARGET_SEASON: '2026'
+  TARGET_ORIGIN_WEEK: ${{ inputs.origin_week }}
+  REQUIRED_ELIGIBLE_ORIGINS: '8'
+  EXPECTED_FROZEN_PROTOCOL_BLOB_SHA: f6f397c590883e1a56e50d17825739faa092fb06
+  EXPECTED_FROZEN_BUILDER_BLOB_SHA: 0daff9768a2806985877b3b21675a55d8926a54a
+  EXPECTED_WEEK4_PARTIAL_SNAPSHOT_BLOB_SHA: 490e217f300efb86142fdd8844516ee92f0e17bc
+  EXPECTED_WEEK4_AMENDMENT_BLOB_SHA: 7d86e3f8e380790751adf5eef058020661808f0f
+  NEXTDYNE_URL: https://www.nextdyne.io/tools/dynasty-weekly-projections
+
+jobs:
+  reusable_weekly_capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir \
+            "requests>=2.32,<3" \
+            "beautifulsoup4>=4.12,<5"
+
+      - name: Verify frozen study and Week 4 salvage
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE="research/weekly-floor-ceiling-volatility-v1"
+          PROTOCOL="$BASE/weekly_floor_ceiling_volatility_v1_b38_prospective_prereg.json"
+          FROZEN_BUILDER="$BASE/weekly_floor_ceiling_volatility_v1_snapshot_builder.py"
+          AMENDMENT="$BASE/weekly_floor_ceiling_volatility_v1_b38a_week4_partial_origin_amendment.json"
+          WEEK4="$BASE/prospective-snapshots/2026-W04.partial.json"
+
+          test -f "$PROTOCOL"
+          test -f "$FROZEN_BUILDER"
+          test -f "$AMENDMENT"
+          test -f "$WEEK4"
+
+          test "$(git hash-object "$PROTOCOL")" = "$EXPECTED_FROZEN_PROTOCOL_BLOB_SHA"
+          test "$(git hash-object "$FROZEN_BUILDER")" = "$EXPECTED_FROZEN_BUILDER_BLOB_SHA"
+          test "$(git hash-object "$AMENDMENT")" = "$EXPECTED_WEEK4_AMENDMENT_BLOB_SHA"
+          test "$(git hash-object "$WEEK4")" = "$EXPECTED_WEEK4_PARTIAL_SNAPSHOT_BLOB_SHA"
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          base = Path("research/weekly-floor-ceiling-volatility-v1")
+          p = json.loads(
+              (base / "weekly_floor_ceiling_volatility_v1_b38_prospective_prereg.json")
+              .read_text(encoding="utf-8")
+          )
+          a = json.loads(
+              (base / "weekly_floor_ceiling_volatility_v1_b38a_week4_partial_origin_amendment.json")
+              .read_text(encoding="utf-8")
+          )
+          w4 = json.loads(
+              (base / "prospective-snapshots/2026-W04.partial.json")
+              .read_text(encoding="utf-8")
+          )
+
+          assert p["status"] == "PREREGISTERED_PROSPECTIVE_ONLY_VALIDATION"
+          assert p["season"] == 2026
+          assert p["first_candidate_origin_week"] == 4
+          assert p["prospective_origin_contract"]["primary_origin_count_required"] == 8
+          assert p["prospective_origin_contract"]["optional_stopping"] is False
+          assert p["prospective_origin_contract"]["no_backfill"] is True
+          assert p["inference"]["no_interim_testing"] is True
+          assert p["inference"]["no_threshold_retuning_after_outcomes"] is True
+
+          assert a["week4_only_origin_amendment"]["applies_only_to_origin"] == "2026-W04"
+          assert a["week4_only_origin_amendment"]["excluded_teams"] == ["CLE", "PIT"]
+          assert a["unchanged_scientific_architecture"]["predictor_definitions_changed"] is False
+
+          assert w4["status"] == "FROZEN_PREKICKOFF_PARTIAL_ORIGIN_SNAPSHOT"
+          assert w4["counts_as_one_origin_under_amended_contract"] is True
+          assert w4["coverage"]["included_game_count"] == 15
+          assert w4["coverage"]["excluded_game_count"] == 1
+          assert all(r["team"] not in {"CLE", "PIT"} for r in w4["rows"])
+          assert w4["governance"]["realized_outcomes_read"] is False
+          assert w4["governance"]["outcome_association_opened"] is False
+          assert w4["governance"]["production_change_authorized"] is False
+
+          print("PASS: frozen protocol intact; Week 4 partial origin is eligible origin 1/8.")
+          print("PASS: CLE/PIT exclusion is explicitly scoped to 2026-W04 only.")
+          PY
+
+          python3 -m py_compile "$FROZEN_BUILDER"
+          python3 "$FROZEN_BUILDER" --selftest
+
+      - name: Freeze reusable full-week operational bridge before provider capture
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE="research/weekly-floor-ceiling-volatility-v1"
+          GENERIC="$BASE/weekly_floor_ceiling_volatility_v1_reusable_snapshot_builder.py"
+          BRIDGE="$BASE/weekly_floor_ceiling_volatility_v1_b39_reusable_capture_bridge.json"
+
+          # Start from the latest clean main before creating any preregistered operational files.
+          git fetch origin main
+          git reset --hard origin/main
+
+          cat > "$GENERIC" <<'PYFILE'
+          #!/usr/bin/env python3
+          from __future__ import annotations
+
+          import argparse
+          from collections import defaultdict
+          from datetime import datetime, timezone
+          import hashlib
+          import json
+          from pathlib import Path
+          import sys
+
+          from bs4 import BeautifulSoup
+
+          HERE = Path(__file__).resolve().parent
+          sys.path.insert(0, str(HERE))
+
+          import weekly_floor_ceiling_volatility_v1_snapshot_builder as frozen
+
+          POSITIONS = ("QB", "RB", "WR", "TE")
+          ALLOWED_ORIGIN_WEEKS = tuple(range(5, 18))
+
+
+          def sha256(path):
+              return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+          def week_cutoff(schedule_path, season, origin_week):
+              rows = frozen.read_csv(schedule_path)
+              games = []
+              for row in rows:
+                  try:
+                      row_season = int(row.get("season"))
+                      row_week = int(row.get("week"))
+                  except (TypeError, ValueError):
+                      continue
+                  if row_season != season:
+                      continue
+                  if frozen.norm(row.get("game_type")).upper() != "REG":
+                      continue
+                  if row_week != origin_week:
+                      continue
+                  games.append(
+                      (
+                          frozen.parse_kickoff_utc(
+                              row.get("gameday"), row.get("gametime")
+                          ),
+                          frozen.norm(row.get("game_id")),
+                      )
+                  )
+
+              if not games:
+                  raise RuntimeError(
+                      f"NO_{season}_WEEK{origin_week}_REG_GAMES_IN_SCHEDULE"
+                  )
+              games.sort()
+              return games[0][0], [g[1] for g in games]
+
+
+          def build(
+              html_path,
+              schedule_path,
+              protocol_path,
+              bridge_path,
+              season,
+              origin_week,
+              out_path,
+              manifest_path,
+          ):
+              if origin_week not in ALLOWED_ORIGIN_WEEKS:
+                  raise RuntimeError(
+                      f"ORIGIN_WEEK_OUTSIDE_B39_SCOPE week={origin_week}"
+                  )
+
+              protocol = json.loads(
+                  Path(protocol_path).read_text(encoding="utf-8")
+              )
+              bridge = json.loads(
+                  Path(bridge_path).read_text(encoding="utf-8")
+              )
+
+              assert protocol["status"] == "PREREGISTERED_PROSPECTIVE_ONLY_VALIDATION"
+              assert protocol["season"] == season
+              assert protocol["first_candidate_origin_week"] == 4
+              assert protocol["prospective_origin_contract"][
+                  "primary_origin_count_required"
+              ] == 8
+              assert protocol["prospective_origin_contract"]["no_backfill"] is True
+
+              assert bridge["status"] == (
+                  "PREREGISTERED_OPERATIONAL_GENERALIZATION_BEFORE_WEEK5_CAPTURE"
+              )
+              assert bridge["full_week_capture_contract"]["allowed_origin_weeks"] == list(
+                  ALLOWED_ORIGIN_WEEKS
+              )
+              assert bridge["full_week_capture_contract"][
+                  "persistent_team_exclusions"
+              ] == []
+              assert bridge["week4_exception_propagates_forward"] is False
+
+              now = datetime.now(timezone.utc)
+              cutoff, game_ids = week_cutoff(
+                  schedule_path, season, origin_week
+              )
+              if not now < cutoff:
+                  raise RuntimeError(
+                      f"FREEZE_DEADLINE_MISSED_NO_BACKFILL "
+                      f"season={season} week={origin_week} "
+                      f"now={now.isoformat()} cutoff={cutoff.isoformat()}"
+                  )
+
+              raw = Path(html_path).read_bytes()
+              soup = BeautifulSoup(raw, "html.parser")
+              text = frozen.norm(soup.get_text(" ", strip=True))
+              lower = text.lower()
+
+              if "logged-out mode uses half-ppr" not in lower:
+                  raise RuntimeError(
+                      "HALF_PPR_PUBLIC_MODE_NOT_VERIFIED_AT_FREEZE"
+                  )
+
+              snap = frozen.extract_snapshot_meta(text)
+              if snap["season"] != season or snap["week"] != origin_week:
+                  raise RuntimeError(
+                      f"NEXTDYNE_WRONG_ORIGIN "
+                      f"expected={season}-W{origin_week} "
+                      f"current={snap['season']}-W{snap['week']}"
+                  )
+
+              _, headers, resolved, trs = frozen.resolve_table(soup)
+
+              raw_rows = []
+              seen = set()
+              duplicate_count = 0
+
+              for tr in trs:
+                  cells = [
+                      frozen.norm(x.get_text(" ", strip=True))
+                      for x in tr.find_all(["th", "td"])
+                  ]
+                  if len(cells) < len(headers):
+                      continue
+
+                  def cell(key):
+                      idx = resolved[key]
+                      return cells[idx] if idx is not None and idx < len(cells) else None
+
+                  pos = frozen.norm(cell("pos")).upper()
+                  if pos not in POSITIONS:
+                      continue
+
+                  name = frozen.norm(cell("player"))
+                  team = frozen.canon_team(cell("team"))
+                  floor = frozen.safe_float(cell("floor"))
+                  proj = frozen.safe_float(cell("proj"))
+                  ceiling = frozen.safe_float(cell("ceiling"))
+
+                  if not name or not team:
+                      continue
+                  if floor is None or proj is None or ceiling is None:
+                      continue
+                  if ceiling < floor or proj < floor or proj > ceiling:
+                      continue
+
+                  # IMPORTANT: no team is excluded in the reusable Week 5+ path.
+                  key = f"{frozen.norm_name(name)}|{team}|{pos}"
+                  if key in seen:
+                      duplicate_count += 1
+                      continue
+                  seen.add(key)
+
+                  width = ceiling - floor
+                  commitment_payload = json.dumps(
+                      [name, team, pos, floor, proj, ceiling],
+                      separators=(",", ":"),
+                      ensure_ascii=False,
+                  ).encode("utf-8")
+
+                  raw_rows.append({
+                      "stable_key": key,
+                      "player_name": name,
+                      "team": team,
+                      "position": pos,
+                      "floor": floor,
+                      "projection": proj,
+                      "ceiling": ceiling,
+                      "width": width,
+                      "source_row_commitment_sha256": frozen.sha256_bytes(
+                          commitment_payload
+                      ),
+                  })
+
+              if len(raw_rows) < 150:
+                  raise RuntimeError(
+                      f"IMPLAUSIBLY_FEW_VALID_ROWS {len(raw_rows)}"
+                  )
+
+              by_pos = defaultdict(list)
+              for row in raw_rows:
+                  by_pos[row["position"]].append(row)
+
+              output_rows = []
+              counts = {}
+
+              for pos in POSITIONS:
+                  rows = by_pos[pos]
+                  if not rows:
+                      raise RuntimeError(f"NO_ROWS_FOR_POSITION {pos}")
+                  counts[pos] = len(rows)
+
+                  pct_floor = frozen.midrank_percentiles(
+                      [(r["stable_key"], r["floor"]) for r in rows]
+                  )
+                  pct_proj = frozen.midrank_percentiles(
+                      [(r["stable_key"], r["projection"]) for r in rows]
+                  )
+                  pct_ceil = frozen.midrank_percentiles(
+                      [(r["stable_key"], r["ceiling"]) for r in rows]
+                  )
+                  pct_width = frozen.midrank_percentiles(
+                      [(r["stable_key"], r["width"]) for r in rows]
+                  )
+
+                  for r in sorted(rows, key=lambda x: x["stable_key"]):
+                      k = r["stable_key"]
+                      output_rows.append({
+                          "stable_key": k,
+                          "player_name": r["player_name"],
+                          "team": r["team"],
+                          "position": r["position"],
+                          "projection_strength_pct": round(pct_proj[k], 9),
+                          "floor_strength_pct": round(pct_floor[k], 9),
+                          "ceiling_strength_pct": round(pct_ceil[k], 9),
+                          "volatility_width_pct": round(pct_width[k], 9),
+                          "floor_resilience": round(
+                              pct_floor[k] - pct_proj[k], 9
+                          ),
+                          "ceiling_upside": round(
+                              pct_ceil[k] - pct_proj[k], 9
+                          ),
+                          "source_row_commitment_sha256": r[
+                              "source_row_commitment_sha256"
+                          ],
+                      })
+
+              snapshot = {
+                  "schema_version": 1,
+                  "study_id": "weekly-floor-ceiling-volatility-v1",
+                  "phase": "prospective-predictor-snapshot",
+                  "status": "FROZEN_PREKICKOFF_PREDICTOR_SNAPSHOT",
+                  "season": season,
+                  "origin_week": origin_week,
+                  "freeze_runtime_utc": now.isoformat(),
+                  "first_actual_kickoff_utc": cutoff.isoformat(),
+                  "source": {
+                      "provider": "NextDyne",
+                      "url": (
+                          "https://www.nextdyne.io/tools/"
+                          "dynasty-weekly-projections"
+                      ),
+                      "response_sha256": sha256(html_path),
+                      "model_version": snap["model_version"],
+                      "source_snapshot_display": snap["snapshot_display"],
+                      "scoring_mode": "logged-out Half-PPR",
+                  },
+                  "predictor_contract": {
+                      "raw_floor_projection_ceiling_values_persisted": False,
+                      "within_position_midrank_percentiles": True,
+                      "persistent_team_exclusions": [],
+                      "week4_partial_origin_exception_propagated": False,
+                      "floor_resilience_definition": (
+                          "floor_strength_pct - projection_strength_pct"
+                      ),
+                      "ceiling_upside_definition": (
+                          "ceiling_strength_pct - projection_strength_pct"
+                      ),
+                      "volatility_width_definition": (
+                          "within-position percentile of (ceiling - floor)"
+                      ),
+                      "overall_score_authorized": False,
+                  },
+                  "coverage": {
+                      "row_count": len(output_rows),
+                      "by_position": counts,
+                      "duplicate_rows_dropped": duplicate_count,
+                  },
+                  "rows": output_rows,
+                  "governance": {
+                      "realized_outcomes_read": False,
+                      "outcome_association_opened": False,
+                      "production_change_authorized": False,
+                      "user_facing_display_authorized": False,
+                      "fundamental_value_effect_authorized": False,
+                      "package_adjustment_effect_authorized": False,
+                      "team_utility_effect_authorized": False,
+                      "trade_value_effect_authorized": False,
+                      "trade_verdict_effect_authorized": False,
+                      "projection_adjustment_authorized": False,
+                  },
+              }
+
+              out = Path(out_path)
+              out.parent.mkdir(parents=True, exist_ok=True)
+              out.write_text(
+                  json.dumps(snapshot, indent=2, sort_keys=True) + "\n",
+                  encoding="utf-8",
+              )
+
+              manifest = {
+                  "schema_version": 1,
+                  "study_id": "weekly-floor-ceiling-volatility-v1",
+                  "origin": f"{season}-W{origin_week:02d}",
+                  "status": "PASS_PREKICKOFF_FREEZE",
+                  "protocol_sha256": sha256(protocol_path),
+                  "operational_bridge_sha256": sha256(bridge_path),
+                  "reusable_builder_sha256": sha256(Path(__file__)),
+                  "snapshot_sha256": sha256(out),
+                  "source_html_sha256": sha256(html_path),
+                  "schedule_sha256": sha256(schedule_path),
+                  "first_actual_kickoff_utc": cutoff.isoformat(),
+                  "week_game_ids": game_ids,
+                  "freeze_runtime_utc": now.isoformat(),
+                  "persistent_team_exclusions": [],
+                  "week4_exception_propagated": False,
+                  "raw_provider_values_persisted": False,
+                  "realized_outcomes_read": False,
+                  "production_change_authorized": False,
+              }
+              Path(manifest_path).write_text(
+                  json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                  encoding="utf-8",
+              )
+
+              print(json.dumps({
+                  "status": snapshot["status"],
+                  "origin": f"{season}-W{origin_week:02d}",
+                  "first_actual_kickoff_utc": cutoff.isoformat(),
+                  "row_count": len(output_rows),
+                  "by_position": counts,
+                  "persistent_team_exclusions": [],
+                  "week4_exception_propagated": False,
+                  "raw_provider_values_persisted": False,
+                  "outcomes_read": False,
+                  "production_authorized": False,
+              }, indent=2))
+
+
+          def selftest():
+              vals = [("a", 1.0), ("b", 2.0), ("c", 2.0), ("d", 4.0)]
+              expected = frozen.midrank_percentiles(vals)
+              assert expected["a"] == 0.0
+              assert abs(expected["b"] - 0.5) < 1e-12
+              assert abs(expected["c"] - 0.5) < 1e-12
+              assert expected["d"] == 1.0
+              assert 5 in ALLOWED_ORIGIN_WEEKS
+              assert 17 in ALLOWED_ORIGIN_WEEKS
+              assert 4 not in ALLOWED_ORIGIN_WEEKS
+              print("SELFTEST PASS")
+
+
+          def main():
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--html")
+              ap.add_argument("--schedule")
+              ap.add_argument("--protocol")
+              ap.add_argument("--bridge")
+              ap.add_argument("--season", type=int, default=2026)
+              ap.add_argument("--origin-week", type=int)
+              ap.add_argument("--out")
+              ap.add_argument("--manifest")
+              ap.add_argument("--selftest", action="store_true")
+              args = ap.parse_args()
+
+              if args.selftest:
+                  selftest()
+                  return
+
+              required = {
+                  "html": args.html,
+                  "schedule": args.schedule,
+                  "protocol": args.protocol,
+                  "bridge": args.bridge,
+                  "origin_week": args.origin_week,
+                  "out": args.out,
+                  "manifest": args.manifest,
+              }
+              missing = [k for k, v in required.items() if v is None]
+              if missing:
+                  raise SystemExit(f"missing required args: {missing}")
+
+              build(
+                  args.html,
+                  args.schedule,
+                  args.protocol,
+                  args.bridge,
+                  args.season,
+                  args.origin_week,
+                  args.out,
+                  args.manifest,
+              )
+
+
+          if __name__ == "__main__":
+              main()
+          PYFILE
+
+          python3 -m py_compile "$GENERIC"
+          python3 "$GENERIC" --selftest
+
+          GENERIC_SHA="$(sha256sum "$GENERIC" | awk '{print $1}')"
+          export GENERIC_SHA
+
+          if [ ! -f "$BRIDGE" ]; then
+            python3 - <<'PY'
+          from datetime import datetime, timezone
+          import json
+          import os
+          from pathlib import Path
+
+          base = Path("research/weekly-floor-ceiling-volatility-v1")
+          out = base / "weekly_floor_ceiling_volatility_v1_b39_reusable_capture_bridge.json"
+
+          bridge = {
+              "schema_version": 1,
+              "study_id": "weekly-floor-ceiling-volatility-v1",
+              "phase": "B39-reusable-full-week-capture-operational-bridge",
+              "status": (
+                  "PREREGISTERED_OPERATIONAL_GENERALIZATION_BEFORE_WEEK5_CAPTURE"
+              ),
+              "created_at_utc": datetime.now(timezone.utc).isoformat(),
+              "original_frozen_protocol_git_blob_sha": (
+                  "f6f397c590883e1a56e50d17825739faa092fb06"
+              ),
+              "original_frozen_week4_builder_git_blob_sha": (
+                  "0daff9768a2806985877b3b21675a55d8926a54a"
+              ),
+              "reusable_builder_sha256": os.environ["GENERIC_SHA"],
+              "purpose": (
+                  "Parameterize the already-frozen predictor implementation by "
+                  "origin week for prospective 2026 full-week captures after the "
+                  "special Week 4 partial-origin salvage."
+              ),
+              "full_week_capture_contract": {
+                  "season": 2026,
+                  "allowed_origin_weeks": list(range(5, 18)),
+                  "freeze_before_earliest_actual_kickoff": True,
+                  "no_backfill": True,
+                  "persistent_team_exclusions": [],
+                  "all_teams_eligible_when_frozen_pre-kickoff": True,
+              },
+              "week4_exception_propagates_forward": False,
+              "scientific_architecture_changes": {
+                  "predictor_definitions_changed": False,
+                  "within_position_midrank_percentiles_changed": False,
+                  "floor_resilience_changed": False,
+                  "ceiling_upside_changed": False,
+                  "volatility_width_changed": False,
+                  "primary_constructs_changed": False,
+                  "realized_target_definitions_changed": False,
+                  "minimum_matched_rows_changed": False,
+                  "pooling_changed": False,
+                  "position_weighting_changed": False,
+                  "sign_flip_inference_changed": False,
+                  "holm_family_control_changed": False,
+                  "family_alpha_changed": False,
+                  "effect_direction_requirement_changed": False,
+                  "week_sign_consistency_requirement_changed": False,
+                  "optional_stopping_authorized": False,
+                  "threshold_retuning_authorized": False,
+              },
+              "governance": {
+                  "outcome_association_opened": False,
+                  "production_change_authorized": False,
+                  "user_facing_display_authorized": False,
+                  "fundamental_value_effect_authorized": False,
+                  "package_adjustment_effect_authorized": False,
+                  "team_utility_effect_authorized": False,
+                  "trade_value_effect_authorized": False,
+                  "trade_verdict_effect_authorized": False,
+                  "projection_adjustment_authorized": False,
+              },
+          }
+
+          out.write_text(
+              json.dumps(bridge, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          fi
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          base = Path("research/weekly-floor-ceiling-volatility-v1")
+          generic = base / "weekly_floor_ceiling_volatility_v1_reusable_snapshot_builder.py"
+          bridge_path = base / "weekly_floor_ceiling_volatility_v1_b39_reusable_capture_bridge.json"
+          bridge = json.loads(bridge_path.read_text(encoding="utf-8"))
+
+          actual = hashlib.sha256(generic.read_bytes()).hexdigest()
+
+          assert bridge["status"] == (
+              "PREREGISTERED_OPERATIONAL_GENERALIZATION_BEFORE_WEEK5_CAPTURE"
+          )
+          assert bridge["reusable_builder_sha256"] == actual
+          assert bridge["full_week_capture_contract"]["allowed_origin_weeks"] == list(
+              range(5, 18)
+          )
+          assert bridge["full_week_capture_contract"]["persistent_team_exclusions"] == []
+          assert bridge["week4_exception_propagates_forward"] is False
+          assert all(
+              v is False
+              for v in bridge["scientific_architecture_changes"].values()
+          )
+          assert bridge["governance"]["outcome_association_opened"] is False
+          assert bridge["governance"]["production_change_authorized"] is False
+
+          print("PASS: reusable Week 5+ builder is an operational-only generalization.")
+          print("PASS: no CLE/PIT or any other persistent team exclusion.")
+          PY
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add "$GENERIC" "$BRIDGE"
+          git diff --cached --check
+
+          if git diff --cached --quiet; then
+            echo "PASS: B39 operational bridge already frozen."
+          else
+            git commit -m "Preregister reusable weekly floor ceiling capture bridge"
+            git push origin HEAD:main
+          fi
+
+      - name: Determine chronology, eligibility count, and target-week deadline
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          install -d -m 700 /tmp/log-floor-ceiling-v1
+
+          curl --fail --location --retry 3 --retry-delay 2 \
+            --output /tmp/log-floor-ceiling-v1/games.csv \
+            https://github.com/nflverse/nflverse-data/releases/download/schedules/games.csv
+
+          python3 - <<'PY'
+          from datetime import datetime, timezone
+          import csv
+          import json
+          import os
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+
+          base = Path("research/weekly-floor-ceiling-volatility-v1")
+          snapdir = base / "prospective-snapshots"
+          season = int(os.environ["TARGET_SEASON"])
+          target = int(os.environ["TARGET_ORIGIN_WEEK"])
+          required = int(os.environ["REQUIRED_ELIGIBLE_ORIGINS"])
+
+          assert season == 2026
+          assert 5 <= target <= 17
+
+          # Week 4 partial origin is the first eligible origin.
+          w4 = json.loads(
+              (snapdir / "2026-W04.partial.json").read_text(encoding="utf-8")
+          )
+          assert w4["status"] == "FROZEN_PREKICKOFF_PARTIAL_ORIGIN_SNAPSHOT"
+          assert w4["counts_as_one_origin_under_amended_contract"] is True
+
+          # Enforce chronological resolution: every prior Week 5+ origin must
+          # already be either prospectively frozen or formally missed.
+          for week in range(5, target):
+              full = snapdir / f"2026-W{week:02d}.json"
+              missed = snapdir / f"2026-W{week:02d}.missed.json"
+              assert full.exists() ^ missed.exists(), (
+                  f"PRIOR_ORIGIN_NOT_EXACTLY_ONCE_RESOLVED week={week} "
+                  f"full={full.exists()} missed={missed.exists()}"
+              )
+
+          target_full = snapdir / f"2026-W{target:02d}.json"
+          target_missed = snapdir / f"2026-W{target:02d}.missed.json"
+
+          # Count eligible origins frozen so far, before this target.
+          eligible = 1
+          for week in range(5, 18):
+              full = snapdir / f"2026-W{week:02d}.json"
+              if full.exists():
+                  d = json.loads(full.read_text(encoding="utf-8"))
+                  assert d["status"] == "FROZEN_PREKICKOFF_PREDICTOR_SNAPSHOT"
+                  eligible += 1
+
+          if eligible >= required:
+              print(
+                  f"Collection already complete: {eligible}/{required} eligible origins."
+              )
+              with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+                  f.write("B39_MODE=COLLECTION_COMPLETE\n")
+                  f.write(f"ELIGIBLE_BEFORE={eligible}\n")
+              raise SystemExit(0)
+
+          if target_full.exists() or target_missed.exists():
+              resolved = "CAPTURED" if target_full.exists() else "MISSED"
+              print(f"Target 2026-W{target:02d} already resolved as {resolved}.")
+              with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+                  f.write("B39_MODE=ALREADY_RESOLVED\n")
+                  f.write(f"ELIGIBLE_BEFORE={eligible}\n")
+              raise SystemExit(0)
+
+          EASTERN = ZoneInfo("America/New_York")
+          games = []
+          with open(
+              "/tmp/log-floor-ceiling-v1/games.csv",
+              "r",
+              encoding="utf-8-sig",
+              newline="",
+          ) as f:
+              for row in csv.DictReader(f):
+                  try:
+                      row_season = int(row.get("season") or -1)
+                      row_week = int(row.get("week") or -1)
+                  except ValueError:
+                      continue
+                  if row_season != season or row_week != target:
+                      continue
+                  if str(row.get("game_type") or "").strip().upper() != "REG":
+                      continue
+
+                  d = str(row.get("gameday") or "").strip()
+                  t = str(row.get("gametime") or "").strip()
+                  assert d and t
+                  kickoff = datetime.fromisoformat(
+                      f"{d}T{t}:00"
+                  ).replace(tzinfo=EASTERN).astimezone(timezone.utc)
+                  games.append({
+                      "game_id": str(row.get("game_id") or "").strip(),
+                      "away_team": str(row.get("away_team") or "").strip().upper(),
+                      "home_team": str(row.get("home_team") or "").strip().upper(),
+                      "kickoff_utc": kickoff,
+                  })
+
+          assert games, f"NO_SCHEDULE_GAMES_FOR_{season}_W{target}"
+          cutoff = min(g["kickoff_utc"] for g in games)
+          now = datetime.now(timezone.utc)
+          mode = "CAPTURE" if now < cutoff else "MISSED"
+
+          state = {
+              "schema_version": 1,
+              "study_id": "weekly-floor-ceiling-volatility-v1",
+              "season": season,
+              "origin_week": target,
+              "checked_at_utc": now.isoformat(),
+              "first_actual_kickoff_utc": cutoff.isoformat(),
+              "game_count": len(games),
+              "game_ids": sorted(g["game_id"] for g in games),
+              "mode": mode,
+              "eligible_origins_before_target": eligible,
+              "required_eligible_origins": required,
+          }
+          Path("/tmp/log-floor-ceiling-v1/target_state.json").write_text(
+              json.dumps(state, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              f.write(f"B39_MODE={mode}\n")
+              f.write(f"ELIGIBLE_BEFORE={eligible}\n")
+              f.write(f"TARGET_CUTOFF_UTC={cutoff.isoformat()}\n")
+
+          print(json.dumps(state, indent=2, sort_keys=True))
+          PY
+
+      - name: Record target origin as permanently missed if deadline passed
+        if: env.B39_MODE == 'MISSED'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE="research/weekly-floor-ceiling-volatility-v1"
+          TARGET="$(printf '%02d' "$TARGET_ORIGIN_WEEK")"
+          DEST="$BASE/prospective-snapshots/2026-W${TARGET}.missed.json"
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          state = json.loads(
+              Path("/tmp/log-floor-ceiling-v1/target_state.json")
+              .read_text(encoding="utf-8")
+          )
+          assert state["mode"] == "MISSED"
+
+          marker = {
+              "schema_version": 1,
+              "study_id": "weekly-floor-ceiling-volatility-v1",
+              "phase": "prospective-origin-resolution",
+              "status": "MISSED_ORIGIN_NO_BACKFILL",
+              "season": state["season"],
+              "origin_week": state["origin_week"],
+              "checked_at_utc": state["checked_at_utc"],
+              "first_actual_kickoff_utc": state["first_actual_kickoff_utc"],
+              "game_count": state["game_count"],
+              "game_ids": state["game_ids"],
+              "eligible_origin": False,
+              "counts_toward_required_8": False,
+              "reason": (
+                  "Weekly capture workflow first ran at or after the week's "
+                  "earliest actual NFL kickoff."
+              ),
+              "no_backfill": True,
+              "predictor_architecture_changed": False,
+              "inference_changed": False,
+              "thresholds_changed": False,
+              "realized_outcomes_read": False,
+              "outcome_association_opened": False,
+              "production_change_authorized": False,
+          }
+
+          target = int(os.environ["TARGET_ORIGIN_WEEK"])
+          out = Path(
+              "research/weekly-floor-ceiling-volatility-v1/"
+              f"prospective-snapshots/2026-W{target:02d}.missed.json"
+          )
+          out.write_text(
+              json.dumps(marker, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          print(json.dumps(marker, indent=2, sort_keys=True))
+          PY
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$DEST"
+          git diff --cached --check
+          git commit -m "Record Weekly Floor Ceiling V1 Week ${TARGET_ORIGIN_WEEK} no-backfill miss"
+          git push origin HEAD:main
+
+      - name: Capture current NextDyne source for target week
+        if: env.B39_MODE == 'CAPTURE'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl --fail --location --retry 3 --retry-delay 2 \
+            --user-agent "Mozilla/5.0 (compatible; LOG-Trade-Calculator-Research/1.0)" \
+            --output /tmp/log-floor-ceiling-v1/nextdyne.html \
+            "$NEXTDYNE_URL"
+
+          test -s /tmp/log-floor-ceiling-v1/nextdyne.html
+          echo "NextDyne SHA256: $(sha256sum /tmp/log-floor-ceiling-v1/nextdyne.html | awk '{print $1}')"
+
+      - name: Build full-week predictor snapshot with all teams eligible
+        if: env.B39_MODE == 'CAPTURE'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE="research/weekly-floor-ceiling-volatility-v1"
+          TARGET="$(printf '%02d' "$TARGET_ORIGIN_WEEK")"
+
+          python3 \
+            "$BASE/weekly_floor_ceiling_volatility_v1_reusable_snapshot_builder.py" \
+            --html /tmp/log-floor-ceiling-v1/nextdyne.html \
+            --schedule /tmp/log-floor-ceiling-v1/games.csv \
+            --protocol "$BASE/weekly_floor_ceiling_volatility_v1_b38_prospective_prereg.json" \
+            --bridge "$BASE/weekly_floor_ceiling_volatility_v1_b39_reusable_capture_bridge.json" \
+            --season "$TARGET_SEASON" \
+            --origin-week "$TARGET_ORIGIN_WEEK" \
+            --out "/tmp/log-floor-ceiling-v1/2026-W${TARGET}.json" \
+            --manifest "/tmp/log-floor-ceiling-v1/2026-W${TARGET}.manifest.json"
+
+      - name: Validate full-week scientific firewall and no persistent exclusions
+        if: env.B39_MODE == 'CAPTURE'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          target = int(os.environ["TARGET_ORIGIN_WEEK"])
+          p = Path(f"/tmp/log-floor-ceiling-v1/2026-W{target:02d}.json")
+          m = Path(
+              f"/tmp/log-floor-ceiling-v1/2026-W{target:02d}.manifest.json"
+          )
+          snap = json.loads(p.read_text(encoding="utf-8"))
+          manifest = json.loads(m.read_text(encoding="utf-8"))
+
+          assert snap["status"] == "FROZEN_PREKICKOFF_PREDICTOR_SNAPSHOT"
+          assert snap["season"] == 2026
+          assert snap["origin_week"] == target
+          assert snap["predictor_contract"]["persistent_team_exclusions"] == []
+          assert snap["predictor_contract"][
+              "week4_partial_origin_exception_propagated"
+          ] is False
+
+          # PIT and CLE are not filtered in Week 5+ code. Their presence in a
+          # provider table may vary by bye/injury/source coverage, so eligibility
+          # is asserted by the empty exclusion contract rather than requiring rows.
+          assert manifest["persistent_team_exclusions"] == []
+          assert manifest["week4_exception_propagated"] is False
+
+          rows = snap["rows"]
+          assert rows
+          assert all(r["position"] in {"QB", "RB", "WR", "TE"} for r in rows)
+
+          forbidden = {"floor", "projection", "ceiling", "width"}
+          assert all(not (forbidden & set(r)) for r in rows)
+
+          assert snap["governance"]["realized_outcomes_read"] is False
+          assert snap["governance"]["outcome_association_opened"] is False
+          assert snap["governance"]["production_change_authorized"] is False
+          assert manifest["realized_outcomes_read"] is False
+          assert manifest["production_change_authorized"] is False
+
+          print("PASS: full-week capture includes no persistent team exclusions.")
+          print("PASS: Week 4 CLE/PIT exception did not propagate.")
+          print(f"PASS: target origin 2026-W{target:02d} predictor firewall intact.")
+          PY
+
+      - name: Commit full-week target snapshot
+        if: env.B39_MODE == 'CAPTURE'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE="research/weekly-floor-ceiling-volatility-v1"
+          TARGET="$(printf '%02d' "$TARGET_ORIGIN_WEEK")"
+          SNAP="$BASE/prospective-snapshots/2026-W${TARGET}.json"
+          MANIFEST="$BASE/prospective-snapshots/2026-W${TARGET}.manifest.json"
+
+          # Rebase while outputs are still in /tmp, then copy them into the repo.
+          git fetch origin main
+          git rebase origin/main
+
+          test ! -e "$SNAP"
+          test ! -e "$MANIFEST"
+
+          cp "/tmp/log-floor-ceiling-v1/2026-W${TARGET}.json" "$SNAP"
+          cp "/tmp/log-floor-ceiling-v1/2026-W${TARGET}.manifest.json" "$MANIFEST"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add "$SNAP" "$MANIFEST"
+          git diff --cached --check
+
+          CHANGED="$(git diff --cached --name-only | sort)"
+          EXPECTED="$(printf '%s\n%s\n' "$MANIFEST" "$SNAP" | sort)"
+          test "$CHANGED" = "$EXPECTED"
+
+          git commit -m "Freeze Weekly Floor Ceiling V1 Week ${TARGET_ORIGIN_WEEK} predictors"
+          git push origin HEAD:main
+
+      - name: Verify production surfaces remain unauthorized and count eligible origins
+        if: env.B39_MODE == 'CAPTURE' || env.B39_MODE == 'MISSED'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch origin main
+          git reset --hard origin/main
+
+          BASE="research/weekly-floor-ceiling-volatility-v1"
+
+          test "$(git hash-object "$BASE/weekly_floor_ceiling_volatility_v1_b38_prospective_prereg.json")" = "$EXPECTED_FROZEN_PROTOCOL_BLOB_SHA"
+          test "$(git hash-object "$BASE/weekly_floor_ceiling_volatility_v1_snapshot_builder.py")" = "$EXPECTED_FROZEN_BUILDER_BLOB_SHA"
+          test "$(git hash-object "$BASE/weekly_floor_ceiling_volatility_v1_b38a_week4_partial_origin_amendment.json")" = "$EXPECTED_WEEK4_AMENDMENT_BLOB_SHA"
+          test "$(git hash-object "$BASE/prospective-snapshots/2026-W04.partial.json")" = "$EXPECTED_WEEK4_PARTIAL_SNAPSHOT_BLOB_SHA"
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          base = Path("research/weekly-floor-ceiling-volatility-v1")
+          snapdir = base / "prospective-snapshots"
+
+          eligible = 1
+          captured = [4]
+          missed = []
+
+          for week in range(5, 18):
+              full = snapdir / f"2026-W{week:02d}.json"
+              miss = snapdir / f"2026-W{week:02d}.missed.json"
+
+              assert not (full.exists() and miss.exists())
+
+              if full.exists():
+                  d = json.loads(full.read_text(encoding="utf-8"))
+                  assert d["status"] == "FROZEN_PREKICKOFF_PREDICTOR_SNAPSHOT"
+                  assert d["predictor_contract"]["persistent_team_exclusions"] == []
+                  assert d["governance"]["outcome_association_opened"] is False
+                  assert d["governance"]["production_change_authorized"] is False
+                  eligible += 1
+                  captured.append(week)
+
+              if miss.exists():
+                  d = json.loads(miss.read_text(encoding="utf-8"))
+                  assert d["status"] == "MISSED_ORIGIN_NO_BACKFILL"
+                  assert d["eligible_origin"] is False
+                  assert d["counts_toward_required_8"] is False
+                  missed.append(week)
+
+          print(f"ELIGIBLE ORIGINS FROZEN: {eligible} / 8")
+          print(f"CAPTURED ORIGINS: {captured}")
+          print(f"MISSED ORIGINS: {missed}")
+          print(f"PRIMARY PREDICTOR COLLECTION COMPLETE: {str(eligible >= 8).lower()}")
+          print("OUTCOME ASSOCIATION OPENED: false")
+          print("PRODUCTION CHANGE AUTHORIZED: false")
+          PY
+
+      - name: Closeout already-resolved or complete collection
+        if: env.B39_MODE == 'ALREADY_RESOLVED' || env.B39_MODE == 'COLLECTION_COMPLETE'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "B39 CLOSEOUT: $B39_MODE"
+          echo "ELIGIBLE ORIGINS BEFORE TARGET: $ELIGIBLE_BEFORE / $REQUIRED_ELIGIBLE_ORIGINS"
+          echo "No provider source was captured and no scientific state changed."
+
+      - name: Closeout capture or miss
+        if: env.B39_MODE == 'CAPTURE' || env.B39_MODE == 'MISSED'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "$B39_MODE" = "CAPTURE" ]; then
+            echo "B39 CLOSEOUT: PASS_PROSPECTIVE_FULL_WEEK_CAPTURE"
+            echo "TARGET ORIGIN: 2026-W$(printf '%02d' "$TARGET_ORIGIN_WEEK")"
+            echo "PERSISTENT TEAM EXCLUSIONS: none"
+            echo "WEEK 4 PIT/CLE EXCEPTION PROPAGATED: false"
+          else
+            echo "B39 CLOSEOUT: PASS_MISSED_ORIGIN_NO_BACKFILL"
+            echo "TARGET ORIGIN: 2026-W$(printf '%02d' "$TARGET_ORIGIN_WEEK")"
+            echo "COUNTS TOWARD REQUIRED 8: false"
+          fi
+
+          echo "OUTCOME ASSOCIATION OPENED: false"
+          echo "PRODUCTION CHANGE AUTHORIZED: false"
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          rm -rf /tmp/log-floor-ceiling-v1
