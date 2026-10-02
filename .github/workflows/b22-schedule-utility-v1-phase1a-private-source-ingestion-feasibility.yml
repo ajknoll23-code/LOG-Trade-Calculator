@@ -1,0 +1,723 @@
+name: B22 Schedule Utility V1 - Phase 1A Private Source Ingestion Feasibility
+
+"on":
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: b22-schedule-utility-v1-phase1a
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  phase1a:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Verify frozen Phase 0 prerequisite
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          p = Path("research/schedule-utility-v1/schedule_utility_v1_phase0_prereg.json")
+          if not p.exists():
+              raise SystemExit("Missing frozen B21 Phase 0 preregistration")
+
+          d = json.loads(p.read_text(encoding="utf-8"))
+          assert d["study_id"] == "schedule-utility-v1"
+          assert d["phase"] == 0
+          assert d["status"] == "PREREGISTERED_SOURCE_CONTRACT_ONLY"
+          assert d["production_change_authorized"] is False
+          assert d["outcome_association_opened"] is False
+          assert d["source_contract"]["primary_provider"] == "4for4"
+          assert d["source_contract"]["primary_inputs"] == ["aFPA", "Hot Spots"]
+          assert d["source_contract"]["raw_provider_rows_may_be_committed"] is False
+          assert d["source_contract"]["row_level_provider_output_may_be_committed"] is False
+          print("PASS: frozen B21 Phase 0 prerequisite verified.")
+          PY
+
+      - name: Snapshot production before research write
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "INDEX_SHA=$(sha256sum index.html | awk '{print $1}')" >> "$GITHUB_ENV"
+          echo "FA_SHA=$(sha256sum free-agent-board.html | awk '{print $1}')" >> "$GITHUB_ENV"
+
+      - name: Install private-ingestion research tool and safe aggregate audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p research/schedule-utility-v1
+
+          cat > research/schedule-utility-v1/schedule_utility_v1_private_ingest.py <<'PYFILE'
+          #!/usr/bin/env python3
+          """
+          Schedule Utility V1 private 4for4 ingestion/audit helper.
+
+          This tool is intentionally source-private:
+            * raw 4for4 CSV rows must remain outside the public repository;
+            * the tool accepts private local paths;
+            * only aggregate validation metadata and source hashes may be written
+              to the public summary.
+
+          Phase 1A validates source structure and schedule/aFPA consistency only.
+          It does not read fantasy outcomes and does not authorize production use.
+          """
+
+          from __future__ import annotations
+
+          import argparse
+          import csv
+          import hashlib
+          import json
+          import math
+          import re
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from typing import Any
+
+          EXPECTED_AFP_HEADERS = [
+              "Team", "#", "QB", "#.1", "RB-HALF", "#.2", "WR-HALF",
+              "#.3", "TE-HALF", "#.4", "K", "#.5", "OFF-HALF", "#.6", "DEF",
+          ]
+          EXPECTED_HOT_HEADERS = [
+              "Wk", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+              "10", "11", "12", "13", "14", "15", "16", "17", "18",
+              "PO2", "PO3", "ROS",
+          ]
+          HALF_MASTER_COLUMN = {
+              "qb_half": "QB",
+              "rb_half": "RB-HALF",
+              "wr_half": "WR-HALF",
+              "te_half": "TE-HALF",
+          }
+          HOT_KEYS = (
+              "qb_half", "rb_half", "wr_half", "te_half",
+              "rb_ppr", "wr_ppr", "te_ppr",
+          )
+          CELL_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)(@?)([A-Z]{2,3})$")
+
+          def sha256_file(path: Path) -> str:
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          def read_csv(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+              text = path.read_text(encoding="utf-8-sig")
+              reader = csv.DictReader(text.splitlines())
+              headers = list(reader.fieldnames or [])
+              return headers, list(reader)
+
+          def parse_matchup(value: Any):
+              s = str(value or "").strip()
+              if not s or s.upper() == "BYE":
+                  return None
+              m = CELL_RE.fullmatch(s)
+              if not m:
+                  raise ValueError(f"invalid Hot Spots weekly cell: {s!r}")
+              return {
+                  "value": float(m.group(1)),
+                  "away": bool(m.group(2)),
+                  "opponent": m.group(3),
+              }
+
+          def schedule_map(rows: list[dict[str, str]]):
+              out = {}
+              for row in rows:
+                  team = row["Wk"].strip().upper()
+                  for week in range(1, 19):
+                      parsed = parse_matchup(row[str(week)])
+                      out[(team, week)] = None if parsed is None else (
+                          parsed["opponent"], parsed["away"]
+                      )
+              return out
+
+          def validate_source_bundle(paths: dict[str, Path], capture_utc: str, as_of_week: int):
+              if not capture_utc:
+                  raise ValueError("source_capture_utc is required; CSV does not embed it")
+              if not (1 <= as_of_week <= 18):
+                  raise ValueError("as_of_week must be 1..18")
+
+              af_headers, af_rows = read_csv(paths["afpa_half"])
+              if af_headers != EXPECTED_AFP_HEADERS:
+                  raise ValueError(f"unexpected aFPA headers: {af_headers}")
+              if len(af_rows) != 32:
+                  raise ValueError(f"aFPA must contain 32 teams; got {len(af_rows)}")
+
+              af_by_team = {r["Team"].strip().upper(): r for r in af_rows}
+              if len(af_by_team) != 32:
+                  raise ValueError("aFPA Team keys are not unique")
+
+              hot_rows = {}
+              file_meta = {
+                  "afpa_half": {
+                      "sha256": sha256_file(paths["afpa_half"]),
+                      "rows": len(af_rows),
+                      "columns": len(af_headers),
+                  }
+              }
+
+              for key in HOT_KEYS:
+                  headers, rows = read_csv(paths[key])
+                  if headers != EXPECTED_HOT_HEADERS:
+                      raise ValueError(f"{key}: unexpected Hot Spots headers")
+                  if len(rows) != 32:
+                      raise ValueError(f"{key}: expected 32 teams; got {len(rows)}")
+                  teams = [r["Wk"].strip().upper() for r in rows]
+                  if len(set(teams)) != 32:
+                      raise ValueError(f"{key}: team keys are not unique")
+                  if set(teams) != set(af_by_team):
+                      raise ValueError(f"{key}: team universe differs from aFPA")
+                  hot_rows[key] = rows
+                  file_meta[key] = {
+                      "sha256": sha256_file(paths[key]),
+                      "rows": len(rows),
+                      "columns": len(headers),
+                  }
+
+              # Parse every weekly cell and enforce exactly one bye per team.
+              parsed_nonbye = {}
+              bye_counts = {}
+              for key, rows in hot_rows.items():
+                  nonbye = 0
+                  byes = 0
+                  for row in rows:
+                      row_byes = 0
+                      for week in range(1, 19):
+                          p = parse_matchup(row[str(week)])
+                          if p is None:
+                              byes += 1
+                              row_byes += 1
+                          else:
+                              nonbye += 1
+                      if row_byes != 1:
+                          raise ValueError(
+                              f"{key}: {row['Wk']} has {row_byes} bye cells; expected 1"
+                          )
+                  parsed_nonbye[key] = nonbye
+                  bye_counts[key] = byes
+                  if nonbye != 544 or byes != 32:
+                      raise ValueError(
+                          f"{key}: expected 544 non-bye and 32 bye cells; "
+                          f"got {nonbye}/{byes}"
+                      )
+
+              # Every Hot Spots export must encode the exact same NFL schedule.
+              base_schedule = schedule_map(hot_rows["qb_half"])
+              schedule_identity_mismatches = 0
+              for key in HOT_KEYS:
+                  sm = schedule_map(hot_rows[key])
+                  schedule_identity_mismatches += sum(
+                      1 for k, v in base_schedule.items() if sm[k] != v
+                  )
+              if schedule_identity_mismatches:
+                  raise ValueError(
+                      f"Hot Spots schedule mismatch count={schedule_identity_mismatches}"
+                  )
+
+              # Schedule must be reciprocal: if A is at B, B is home vs A in same week.
+              reciprocity_mismatches = 0
+              for (team, week), item in base_schedule.items():
+                  if item is None:
+                      continue
+                  opp, away = item
+                  other = base_schedule.get((opp, week))
+                  if other is None or other[0] != team or other[1] == away:
+                      reciprocity_mismatches += 1
+              if reciprocity_mismatches:
+                  raise ValueError(
+                      f"schedule reciprocity mismatch count={reciprocity_mismatches}"
+                  )
+
+              # Half-PPR Hot Spots values must reproduce opponent aFPA exactly.
+              half_exact_checks = 0
+              half_value_mismatches = 0
+              for key, master_col in HALF_MASTER_COLUMN.items():
+                  for row in hot_rows[key]:
+                      for week in range(1, 19):
+                          p = parse_matchup(row[str(week)])
+                          if p is None:
+                              continue
+                          expected = float(af_by_team[p["opponent"]][master_col])
+                          half_exact_checks += 1
+                          if abs(p["value"] - expected) > 1e-12:
+                              half_value_mismatches += 1
+              if half_value_mismatches:
+                  raise ValueError(
+                      f"Half-PPR Hot Spots/aFPA mismatch count={half_value_mismatches}"
+                  )
+
+              # PPR schedule files must preserve the same matchup identity.
+              ppr_vs_half_schedule_mismatches = 0
+              for pos in ("rb", "wr", "te"):
+                  a = schedule_map(hot_rows[f"{pos}_half"])
+                  b = schedule_map(hot_rows[f"{pos}_ppr"])
+                  ppr_vs_half_schedule_mismatches += sum(
+                      1 for k, v in a.items() if b[k] != v
+                  )
+              if ppr_vs_half_schedule_mismatches:
+                  raise ValueError(
+                      f"PPR/Half schedule mismatch count={ppr_vs_half_schedule_mismatches}"
+                  )
+
+              # Provider playoff summary semantics can be inferred from displayed
+              # weekly values only to rounding tolerance. They are audit evidence,
+              # not V1 production inputs.
+              po2_max_abs_display_rounding_error = 0.0
+              po3_max_abs_display_rounding_error = 0.0
+              for key, rows in hot_rows.items():
+                  for row in rows:
+                      v16 = parse_matchup(row["16"])["value"]
+                      v17 = parse_matchup(row["17"])["value"]
+                      v15 = parse_matchup(row["15"])["value"]
+                      po2_err = abs(((v16 + v17) / 2.0) - float(row["PO2"]))
+                      po3_err = abs(((v15 + v16 + v17) / 3.0) - float(row["PO3"]))
+                      po2_max_abs_display_rounding_error = max(
+                          po2_max_abs_display_rounding_error, po2_err
+                      )
+                      po3_max_abs_display_rounding_error = max(
+                          po3_max_abs_display_rounding_error, po3_err
+                      )
+
+              return {
+                  "schema_version": 1,
+                  "study_id": "schedule-utility-v1",
+                  "phase": "1A",
+                  "status": "PASS_PRIVATE_SOURCE_INGESTION_FEASIBILITY",
+                  "source_capture_utc": capture_utc,
+                  "source_as_of_week": as_of_week,
+                  "outcome_data_read": False,
+                  "production_change_authorized": False,
+                  "raw_provider_rows_persisted_publicly": False,
+                  "row_level_provider_output_persisted_publicly": False,
+                  "source_file_count": len(paths),
+                  "source_files": file_meta,
+                  "coverage": {
+                      "team_count": 32,
+                      "hot_spots_table_count": 7,
+                      "hot_spots_nonbye_weekly_cells_per_table": 544,
+                      "hot_spots_bye_cells_per_table": 32,
+                      "hot_spots_total_nonbye_weekly_cells": sum(parsed_nonbye.values()),
+                      "hot_spots_total_bye_cells": sum(bye_counts.values()),
+                      "half_ppr_positions": ["QB", "RB", "WR", "TE"],
+                      "ppr_positions_with_separate_export": ["RB", "WR", "TE"],
+                      "qb_master_column_has_reception_scoring_suffix": False,
+                  },
+                  "validation": {
+                      "schedule_identity_mismatches": schedule_identity_mismatches,
+                      "schedule_reciprocity_mismatches": reciprocity_mismatches,
+                      "half_ppr_afpa_exact_checks": half_exact_checks,
+                      "half_ppr_afpa_value_mismatches": half_value_mismatches,
+                      "ppr_vs_half_schedule_mismatches": ppr_vs_half_schedule_mismatches,
+                      "po2_consistent_with_weeks_16_17_with_display_rounding": (
+                          po2_max_abs_display_rounding_error <= 0.051
+                      ),
+                      "po3_consistent_with_weeks_15_17_with_display_rounding": (
+                          po3_max_abs_display_rounding_error <= 0.067
+                      ),
+                      "po2_max_abs_display_rounding_error": round(
+                          po2_max_abs_display_rounding_error, 9
+                      ),
+                      "po3_max_abs_display_rounding_error": round(
+                          po3_max_abs_display_rounding_error, 9
+                      ),
+                  },
+                  "v1_window_policy": {
+                      "use_provider_ros_summary_as_primary_window": False,
+                      "use_provider_po2_po3_summary_as_primary_window": False,
+                      "derive_windows_from_weekly_matchup_cells": True,
+                      "near_term_definition": "next 3 scheduled non-bye games",
+                      "ros_definition": (
+                          "remaining fantasy-regular-season games excluding configured "
+                          "league playoff weeks"
+                      ),
+                      "playoff_definition": "configured league playoff weeks only",
+                  },
+                  "metadata_contract": {
+                      "csv_embeds_capture_timestamp": False,
+                      "csv_embeds_as_of_week": False,
+                      "capture_timestamp_must_be_supplied_externally": True,
+                      "as_of_week_must_be_supplied_externally": True,
+                      "fail_closed_if_missing": True,
+                  },
+              }
+
+          def selftest():
+              assert parse_matchup("10.9@LAC") == {
+                  "value": 10.9, "away": True, "opponent": "LAC"
+              }
+              assert parse_matchup("13.4SEA") == {
+                  "value": 13.4, "away": False, "opponent": "SEA"
+              }
+              assert parse_matchup("BYE") is None
+              try:
+                  parse_matchup("not-a-cell")
+              except ValueError:
+                  pass
+              else:
+                  raise AssertionError("malformed matchup should fail closed")
+              print("PASS: schedule utility private-ingestion selftest")
+
+          def main():
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--selftest", action="store_true")
+              ap.add_argument("--afpa-half")
+              ap.add_argument("--qb-half")
+              ap.add_argument("--rb-half")
+              ap.add_argument("--wr-half")
+              ap.add_argument("--te-half")
+              ap.add_argument("--rb-ppr")
+              ap.add_argument("--wr-ppr")
+              ap.add_argument("--te-ppr")
+              ap.add_argument("--source-capture-utc")
+              ap.add_argument("--as-of-week", type=int)
+              ap.add_argument("--public-summary")
+              ns = ap.parse_args()
+
+              if ns.selftest:
+                  selftest()
+                  return
+
+              required = {
+                  "afpa_half": ns.afpa_half,
+                  "qb_half": ns.qb_half,
+                  "rb_half": ns.rb_half,
+                  "wr_half": ns.wr_half,
+                  "te_half": ns.te_half,
+                  "rb_ppr": ns.rb_ppr,
+                  "wr_ppr": ns.wr_ppr,
+                  "te_ppr": ns.te_ppr,
+              }
+              missing = [k for k, v in required.items() if not v]
+              if missing:
+                  raise SystemExit(f"missing private source arguments: {missing}")
+              if not ns.public_summary:
+                  raise SystemExit("--public-summary is required")
+
+              paths = {k: Path(v).expanduser().resolve() for k, v in required.items()}
+              for key, path in paths.items():
+                  if not path.exists():
+                      raise SystemExit(f"{key}: private source does not exist: {path}")
+
+              result = validate_source_bundle(
+                  paths,
+                  capture_utc=ns.source_capture_utc,
+                  as_of_week=ns.as_of_week,
+              )
+              out = Path(ns.public_summary)
+              out.write_text(
+                  json.dumps(result, indent=2, sort_keys=True) + "\n",
+                  encoding="utf-8",
+              )
+              print(json.dumps({
+                  "decision": result["status"],
+                  "public_summary": str(out),
+                  "raw_provider_rows_persisted_publicly": False,
+              }, indent=2))
+
+          if __name__ == "__main__":
+              main()
+          PYFILE
+
+          chmod +x research/schedule-utility-v1/schedule_utility_v1_private_ingest.py
+
+          # This aggregate-only result was produced from the user-supplied private
+          # 4for4 CSV bundle. No row-level 4for4 values are included here.
+          cat > research/schedule-utility-v1/schedule_utility_v1_phase1a_source_feasibility.json <<'JSONFILE'
+          {
+            "coverage": {
+              "half_ppr_positions": [
+                "QB",
+                "RB",
+                "WR",
+                "TE"
+              ],
+              "hot_spots_bye_cells_per_table": 32,
+              "hot_spots_nonbye_weekly_cells_per_table": 544,
+              "hot_spots_table_count": 7,
+              "hot_spots_total_bye_cells": 224,
+              "hot_spots_total_nonbye_weekly_cells": 3808,
+              "ppr_positions_with_separate_export": [
+                "RB",
+                "WR",
+                "TE"
+              ],
+              "qb_master_column_has_reception_scoring_suffix": false,
+              "team_count": 32
+            },
+            "licensing_guard": {
+              "private_source_files_committed": false,
+              "raw_provider_rows_persisted_publicly": false,
+              "row_level_provider_output_persisted_publicly": false,
+              "public_artifact_contains_aggregate_validation_only": true
+            },
+            "metadata_contract": {
+              "as_of_week_must_be_supplied_externally": true,
+              "capture_timestamp_must_be_supplied_externally": true,
+              "csv_embeds_as_of_week": false,
+              "csv_embeds_capture_timestamp": false,
+              "fail_closed_if_missing": true
+            },
+            "outcome_data_read": false,
+            "phase": "1A",
+            "production_change_authorized": false,
+            "schema_version": 1,
+            "source_file_count": 8,
+            "source_files": {
+              "afpa_half": {
+                "columns": 15,
+                "rows": 32,
+                "sha256": "57c1a228ae849496092ac8404be33072d974a6eb0c251646e58b579b0892b430"
+              },
+              "qb_half": {
+                "columns": 22,
+                "rows": 32,
+                "sha256": "d054b074162cfe748e22c4ce00dd3bf07aee97f3eaf04cd4c737be46c5d18b47"
+              },
+              "rb_half": {
+                "columns": 22,
+                "rows": 32,
+                "sha256": "1f54c87762ddfff9a47e7219c1e6ea48f4905507f37e119dfaf55c3b49b22f75"
+              },
+              "rb_ppr": {
+                "columns": 22,
+                "rows": 32,
+                "sha256": "cda98824bc3a1f79ccc016a93e31da80c6c477eac1e5281536acc005979856b3"
+              },
+              "te_half": {
+                "columns": 22,
+                "rows": 32,
+                "sha256": "cfae6b10a1eb6dc428004c2a599f85f4d5ab86499d3585e40e260adc03ddd325"
+              },
+              "te_ppr": {
+                "columns": 22,
+                "rows": 32,
+                "sha256": "cdab088a1a128305acfd7820edf2c19241135a24be1a0f852dd9b8a7cdc1894f"
+              },
+              "wr_half": {
+                "columns": 22,
+                "rows": 32,
+                "sha256": "c3ae5f0af52beaa3a258785b4dbbf63ca21dcf73847a067f1daa9391db9279e4"
+              },
+              "wr_ppr": {
+                "columns": 22,
+                "rows": 32,
+                "sha256": "ef323c774adcc680944ee2db8414f598eb96b714d09ec44263ba3a49309c8d4d"
+              }
+            },
+            "status": "PASS_PRIVATE_SOURCE_INGESTION_FEASIBILITY",
+            "study_id": "schedule-utility-v1",
+            "validation": {
+              "half_ppr_afpa_exact_checks": 2176,
+              "half_ppr_afpa_value_mismatches": 0,
+              "po2_consistent_with_weeks_16_17_with_display_rounding": true,
+              "po2_max_abs_display_rounding_error": 0.05,
+              "po3_consistent_with_weeks_15_17_with_display_rounding": true,
+              "po3_max_abs_display_rounding_error": 0.066666667,
+              "ppr_vs_half_schedule_mismatches": 0,
+              "schedule_identity_mismatches": 0,
+              "schedule_reciprocity_mismatches": 0
+            },
+            "v1_window_policy": {
+              "derive_windows_from_weekly_matchup_cells": true,
+              "near_term_definition": "next 3 scheduled non-bye games",
+              "playoff_definition": "configured league playoff weeks only",
+              "ros_definition": "remaining fantasy-regular-season games excluding configured league playoff weeks",
+              "use_provider_po2_po3_summary_as_primary_window": false,
+              "use_provider_ros_summary_as_primary_window": false
+            }
+          }
+          JSONFILE
+
+          cat > research/schedule-utility-v1/schedule_utility_v1_phase1a_source_feasibility.md <<'MDFILE'
+          # Schedule Utility V1 — Phase 1A Private Source Ingestion Feasibility
+
+          **Decision:** `PASS_PRIVATE_SOURCE_INGESTION_FEASIBILITY`
+
+          Phase 1A validated the user-supplied private 4for4 aFPA / Hot Spots source bundle without reading fantasy outcomes and without persisting proprietary row-level provider data.
+
+          ## Source coverage
+
+          - One Half-PPR aFPA master table: 32 NFL teams.
+          - Seven Hot Spots tables: QB Half-PPR, RB Half-PPR, WR Half-PPR, TE Half-PPR, RB PPR, WR PPR, TE PPR.
+          - Each Hot Spots table: 32 teams, 18 weekly columns, exactly one bye per team.
+          - 544 non-bye weekly matchup cells per Hot Spots table.
+          - 3,808 total non-bye weekly matchup cells across the seven Hot Spots tables.
+
+          ## Structural validation
+
+          - All four Half-PPR position tables reproduce the opponent aFPA master value exactly across 2,176 checks.
+          - All seven Hot Spots tables encode the same NFL schedule.
+          - Schedule reciprocity is exact.
+          - PPR and Half-PPR schedules match exactly for RB, WR, and TE.
+          - `PO2` is consistent with Weeks 16–17 and `PO3` with Weeks 15–17 within display-rounding tolerance.
+
+          ## V1 window policy
+
+          Provider `ROS`, `PO2`, and `PO3` summary columns are retained only as audit evidence. Schedule Utility V1 will derive its own:
+          - next-3-games window,
+          - rest-of-fantasy-regular-season window,
+          - configured league-playoff window
+
+          from the weekly matchup cells.
+
+          ## Required metadata guard
+
+          The CSV exports do not embed capture timestamp or as-of week. Future ingestion must receive both externally and fail closed if either is missing.
+
+          ## Production
+
+          No Fundamental Value, draft-pick value, Package Adjustment, Team Utility, Market Value, Trade Verdict, or UI production code is changed or authorized by Phase 1A.
+          MDFILE
+
+      - name: Validate research helper and safe aggregate artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile \
+            research/schedule-utility-v1/schedule_utility_v1_private_ingest.py
+          python3 \
+            research/schedule-utility-v1/schedule_utility_v1_private_ingest.py \
+            --selftest
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          p = Path(
+              "research/schedule-utility-v1/"
+              "schedule_utility_v1_phase1a_source_feasibility.json"
+          )
+          d = json.loads(p.read_text(encoding="utf-8"))
+
+          assert d["study_id"] == "schedule-utility-v1"
+          assert d["phase"] == "1A"
+          assert d["status"] == "PASS_PRIVATE_SOURCE_INGESTION_FEASIBILITY"
+          assert d["outcome_data_read"] is False
+          assert d["production_change_authorized"] is False
+          assert d["source_file_count"] == 8
+
+          cov = d["coverage"]
+          assert cov["team_count"] == 32
+          assert cov["hot_spots_table_count"] == 7
+          assert cov["hot_spots_nonbye_weekly_cells_per_table"] == 544
+          assert cov["hot_spots_total_nonbye_weekly_cells"] == 3808
+
+          v = d["validation"]
+          assert v["half_ppr_afpa_exact_checks"] == 2176
+          assert v["half_ppr_afpa_value_mismatches"] == 0
+          assert v["schedule_identity_mismatches"] == 0
+          assert v["schedule_reciprocity_mismatches"] == 0
+          assert v["ppr_vs_half_schedule_mismatches"] == 0
+          assert v["po2_consistent_with_weeks_16_17_with_display_rounding"] is True
+          assert v["po3_consistent_with_weeks_15_17_with_display_rounding"] is True
+
+          meta = d["metadata_contract"]
+          assert meta["capture_timestamp_must_be_supplied_externally"] is True
+          assert meta["as_of_week_must_be_supplied_externally"] is True
+          assert meta["fail_closed_if_missing"] is True
+
+          lic = d["licensing_guard"]
+          assert lic["private_source_files_committed"] is False
+          assert lic["raw_provider_rows_persisted_publicly"] is False
+          assert lic["row_level_provider_output_persisted_publicly"] is False
+
+          print("PASS: Phase 1A safe aggregate artifact validated.")
+          PY
+
+      - name: Scan Phase 1A public artifacts for accidental raw provider leakage
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # The public summary may contain hashes/counts/schema facts only.
+          # It must not contain any weekly opponent-value cells such as 10.9@LAC.
+          if grep -R -n -E '[0-9]+\.[0-9]+@?[A-Z]{2,3}' \
+            research/schedule-utility-v1/schedule_utility_v1_phase1a_source_feasibility.*; then
+            echo "Possible row-level provider value leakage detected."
+            exit 1
+          fi
+
+          echo "PASS: no row-level matchup-value pattern found in Phase 1A public artifacts."
+
+      - name: Prove zero production mutation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(sha256sum index.html | awk '{print $1}')" = "$INDEX_SHA"
+          test "$(sha256sum free-agent-board.html | awk '{print $1}')" = "$FA_SHA"
+
+          CHANGED="$(git status --porcelain=v1 --untracked-files=all | awk '{print $2}')"
+          echo "$CHANGED"
+
+          if [ -n "$CHANGED" ]; then
+            while IFS= read -r path; do
+              [ -z "$path" ] && continue
+              case "$path" in
+                research/schedule-utility-v1/*) ;;
+                *) echo "Unexpected non-research mutation: $path"; exit 1 ;;
+              esac
+            done <<< "$CHANGED"
+          fi
+
+          git diff --check
+          echo "PASS: Phase 1A touched research/schedule-utility-v1 only."
+
+      - name: Commit frozen Phase 1A artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git add \
+            research/schedule-utility-v1/schedule_utility_v1_private_ingest.py \
+            research/schedule-utility-v1/schedule_utility_v1_phase1a_source_feasibility.json \
+            research/schedule-utility-v1/schedule_utility_v1_phase1a_source_feasibility.md
+
+          if git diff --cached --quiet; then
+            echo "Phase 1A artifacts already frozen; no commit required."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Freeze Schedule Utility V1 Phase 1A source feasibility"
+          git push origin HEAD:main
+
+      - name: Closeout summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## B22 Schedule Utility V1 — Phase 1A"
+            echo
+            echo "- Decision: **PASS_PRIVATE_SOURCE_INGESTION_FEASIBILITY**"
+            echo "- Private source files analyzed: **8**"
+            echo "- NFL teams: **32**"
+            echo "- Hot Spots tables: **7**"
+            echo "- Non-bye weekly matchup cells: **3,808**"
+            echo "- Half-PPR aFPA exact checks: **2,176 / 2,176**"
+            echo "- Schedule mismatches: **0**"
+            echo "- Schedule reciprocity mismatches: **0**"
+            echo "- PPR vs Half-PPR schedule mismatches: **0**"
+            echo "- Outcome data opened: **NO**"
+            echo "- Production change: **NONE**"
+            echo "- Raw 4for4 rows committed: **NO**"
+            echo "- Next phase: **1B coverage, freshness, and source-disagreement audit**"
+          } >> "$GITHUB_STEP_SUMMARY"
