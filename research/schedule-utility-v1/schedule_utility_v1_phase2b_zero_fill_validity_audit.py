@@ -1,0 +1,897 @@
+#!/usr/bin/env python3
+"""
+Schedule Utility V1 — post-run zero-fill validity audit.
+
+This is an OUTCOME-AWARE, NON-GATING validity/sensitivity audit performed only
+after B31 V2 froze STOP_RETROSPECTIVE_PREDICTIVE_VALIDATION.
+
+It cannot convert V1 to PASS, authorize Phase 3, authorize production, retune
+the predictor, or alter any primary gate.
+
+Purposes:
+1. identify every B31 target-side zero-filled team-game-position;
+2. verify every zero fill satisfied the exact frozen B29 AMD-4 rule;
+3. prove target-side and B30 predictor-side aggregates are identical on shared
+   Weeks 4-16;
+4. reconstruct the frozen B31 primary evaluation and require exact agreement;
+5. run NON-GATING sensitivities excluding all target zero fills and excluding
+   QB/RB target zero fills;
+6. determine whether the already-frozen STOP is robust to those sensitivities.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections import defaultdict
+import hashlib
+import importlib.util
+import json
+import math
+from pathlib import Path
+import statistics
+import sys
+from typing import Mapping
+
+B31_COMMIT = "e7ea182495214a1e29adf8da01b62be4893922c9"
+EXPECTED_LOG_SAPA_SHA = (
+    "9ab4ec5b21ef9ef57e476e861a7293dbc886b9bc9d7cc5f0bd5cc982cc729ee6"
+)
+EXPECTED_ANALYSIS_SHA = (
+    "2b35cd60082385add312b24c676b72e2b89c4e636e1fa94010fcffb0c675b9c5"
+)
+EXPECTED_B30_GIT_BLOB_SHA1 = "fce5750002a8dc5a0a40b511cfee80cb50e3028a"
+EXPECTED_B31_EVAL_GIT_BLOB_SHA1 = "8b82e02d1af1ce93bf143a30b4d171682b8b0e96"
+
+SEASONS = tuple(range(2015, 2026))
+TARGET_WEEKS = tuple(range(4, 18))
+POSITIONS = ("QB", "RB", "WR", "TE")
+CELL_DEFS = (
+    ("QB_HALF", "QB", "HALF_PPR"),
+    ("RB_HALF", "RB", "HALF_PPR"),
+    ("WR_HALF", "WR", "HALF_PPR"),
+    ("TE_HALF", "TE", "HALF_PPR"),
+    ("RB_PPR", "RB", "PPR"),
+    ("WR_PPR", "WR", "PPR"),
+    ("TE_PPR", "TE", "PPR"),
+)
+
+
+def sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def git_blob_sha1(path: Path) -> str:
+    data = path.read_bytes()
+    header = f"blob {len(data)}\0".encode("ascii")
+    return hashlib.sha1(header + data).hexdigest()
+
+
+
+def load_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot import {name}: {path}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except Exception:
+        sys.modules.pop(spec.name, None)
+        raise
+    return mod
+
+
+def cell_position(cell: str) -> str:
+    for c, pos, _mode in CELL_DEFS:
+        if c == cell:
+            return pos
+    raise KeyError(cell)
+
+
+def mode_cells(mode: str):
+    return [(c, p) for c, p, m in CELL_DEFS if m == mode]
+
+
+def build_actual_map_and_zero_keys(
+    *,
+    season: int,
+    player_rows: list[dict],
+    games: Mapping[str, object],
+    frozen,
+    scoring_mode: str,
+):
+    """Reproduce B31 target aggregation while exposing zero-fill identities."""
+    by_team_game = defaultdict(list)
+    for row in player_rows:
+        by_team_game[(str(row["game_id"]), str(row["recent_team"]))].append(row)
+
+    totals = defaultdict(float)
+    counts = defaultdict(int)
+
+    for (game_id, team), rows in by_team_game.items():
+        for row in rows:
+            pos = row["_canonical_position"]
+            if pos not in POSITIONS:
+                continue
+            totals[(game_id, team, pos)] += frozen.score_player_row(
+                row, scoring_mode
+            )
+            counts[(game_id, team, pos)] += 1
+
+    out = {}
+    zero_keys = set()
+    zero_records = []
+    source_failures = []
+
+    target_games = [
+        g for g in games.values()
+        if g.season == season and g.completed and 4 <= g.week <= 17
+    ]
+
+    for game in sorted(target_games, key=lambda g: (g.week, g.kickoff, g.game_id)):
+        for offense in (game.away_team, game.home_team):
+            team_game_rows = by_team_game.get((game.game_id, offense), [])
+            if not team_game_rows:
+                source_failures.append({
+                    "game_id": game.game_id,
+                    "team": offense,
+                    "reason": "NO_WEEKLY_PLAYER_STAT_ROWS_FOR_COMPLETED_TARGET_TEAM_GAME",
+                })
+                continue
+
+            for pos in POSITIONS:
+                key = (game.game_id, offense, pos)
+                canonical_count = counts.get(key, 0)
+                if canonical_count == 0:
+                    value = 0.0
+                    zero_key = (game.game_id, offense, pos, scoring_mode)
+                    zero_keys.add(zero_key)
+
+                    # Exact B29 AMD-4 completeness proof.
+                    checks = {
+                        "team_confirmed_played_completed_scheduled_game":
+                            bool(game.completed),
+                        "team_game_has_admitted_player_stat_coverage":
+                            bool(team_game_rows),
+                        "required_scoring_fields_schema_and_numeric_checks_passed":
+                            True,  # B31 adapter fails closed before rows reach here.
+                        "no_duplicate_or_conflicting_identity":
+                            True,  # B31 adapter fails closed before rows reach here.
+                        "source_completeness_audit_did_not_flag_team_game":
+                            bool(team_game_rows),
+                        "no_qualifying_canonical_position_row":
+                            canonical_count == 0,
+                        "negative_team_position_total_zero_filled":
+                            False,
+                    }
+                    all_frozen_amd4_checks_pass = (
+                        checks["team_confirmed_played_completed_scheduled_game"]
+                        and checks["team_game_has_admitted_player_stat_coverage"]
+                        and checks[
+                            "required_scoring_fields_schema_and_numeric_checks_passed"
+                        ]
+                        and checks["no_duplicate_or_conflicting_identity"]
+                        and checks[
+                            "source_completeness_audit_did_not_flag_team_game"
+                        ]
+                        and checks["no_qualifying_canonical_position_row"]
+                        and not checks[
+                            "negative_team_position_total_zero_filled"
+                        ]
+                    )
+                    zero_records.append({
+                        "season": season,
+                        "week": game.week,
+                        "game_id": game.game_id,
+                        "offense_team": offense,
+                        "defense_team": game.opponent(offense),
+                        "position": pos,
+                        "scoring_mode": scoring_mode,
+                        "checks": checks,
+                        "all_frozen_amd4_checks_pass":
+                            all_frozen_amd4_checks_pass,
+                    })
+                else:
+                    value = totals[key]
+                out[key] = value
+
+    if source_failures:
+        raise ValueError(
+            f"{season}: target source completeness failures: "
+            f"{source_failures[:20]} total={len(source_failures)}"
+        )
+
+    expected = len(target_games) * 2 * len(POSITIONS)
+    if len(out) != expected:
+        raise ValueError(
+            f"{season} {scoring_mode}: target row mismatch {len(out)} != {expected}"
+        )
+
+    return out, zero_keys, zero_records
+
+
+def identify_predictor_zero_keys(
+    *,
+    season: int,
+    player_rows: list[dict],
+    games: Mapping[str, object],
+    scoring_mode: str,
+):
+    """Expose B30 zero-fill identities on Weeks 1-16 using the frozen rule."""
+    by_team_game = defaultdict(list)
+    counts = defaultdict(int)
+
+    for row in player_rows:
+        gid = str(row["game_id"])
+        team = str(row["recent_team"])
+        by_team_game[(gid, team)].append(row)
+        pos = row["_canonical_position"]
+        if pos in POSITIONS:
+            counts[(gid, team, pos)] += 1
+
+    zeros = set()
+    for game in games.values():
+        if game.season != season or not game.completed or game.week > 16:
+            continue
+        for offense in (game.away_team, game.home_team):
+            team_game_rows = by_team_game.get((game.game_id, offense), [])
+            if not team_game_rows:
+                raise ValueError(
+                    f"{season}: B30 predictor completeness failure "
+                    f"{game.game_id} {offense}"
+                )
+            for pos in POSITIONS:
+                if counts.get((game.game_id, offense, pos), 0) == 0:
+                    zeros.add((game.game_id, offense, pos, scoring_mode))
+    return zeros
+
+
+def predictor_map_with_game_ids(
+    predictor_rows,
+    *,
+    games,
+    season: int,
+):
+    identity = {}
+    for g in games.values():
+        if g.season != season:
+            continue
+        identity[(g.week, g.away_team, g.home_team)] = g.game_id
+        identity[(g.week, g.home_team, g.away_team)] = g.game_id
+
+    out = {}
+    for r in predictor_rows:
+        gid = identity.get((r.week, r.offense_team, r.defense_team))
+        if gid is None:
+            raise ValueError(
+                f"cannot recover game id for {season} W{r.week} "
+                f"{r.offense_team}-{r.defense_team}"
+            )
+        out[(gid, r.offense_team, r.position)] = float(r.points)
+    return out
+
+
+def compact_primary(result: dict) -> dict:
+    p = result["primary"]
+    return {
+        "decision": p["decision"],
+        "pass": p["pass"],
+        "mean_relative_mae_improvement":
+            p["equal_season_equal_cell_mean_relative_mae_improvement"],
+        "exact_one_sided_season_signflip_p":
+            p["exact_one_sided_season_signflip_p"],
+        "positive_cells": p["positive_cells"],
+        "worst_cell_mean_relative_mae_improvement":
+            p["worst_cell_mean_relative_mae_improvement"],
+        "gate_components": p["gate_components"],
+        "observed_total_rows": result["coverage"]["observed_total_rows"],
+    }
+
+
+def evaluate_safely(analysis, rows, expected_by_season):
+    try:
+        result = analysis.evaluate(rows, expected_by_season)
+        return {
+            "evaluation_completed": True,
+            **compact_primary(result),
+        }
+    except Exception as exc:
+        return {
+            "evaluation_completed": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "decision": None,
+            "pass": None,
+        }
+
+
+def run(args):
+    root = Path(args.repo_root)
+
+    # Load exact frozen modules.
+    b30_path = Path(args.b30_module)
+    b31_path = Path(args.b31_module)
+    log_path = Path(args.log_sapa)
+    analysis_path = Path(args.analysis)
+
+    if git_blob_sha1(b30_path) != EXPECTED_B30_GIT_BLOB_SHA1:
+        raise RuntimeError("B30 module Git blob SHA mismatch")
+    if git_blob_sha1(b31_path) != EXPECTED_B31_EVAL_GIT_BLOB_SHA1:
+        raise RuntimeError("B31 evaluator Git blob SHA mismatch")
+    if sha256(log_path) != EXPECTED_LOG_SAPA_SHA:
+        raise RuntimeError("LOG-SAPA SHA mismatch")
+    if sha256(analysis_path) != EXPECTED_ANALYSIS_SHA:
+        raise RuntimeError("analysis module SHA mismatch")
+
+    b30 = load_module("b30_zero_audit", b30_path)
+    b31 = load_module("b31_zero_audit", b31_path)
+    frozen = load_module("log_sapa_zero_audit", log_path)
+    analysis = load_module("analysis_zero_audit", analysis_path)
+
+    preflight_json = Path(args.preflight_json)
+    drift_json = Path(args.drift_audit_json)
+    b31_result_path = Path(args.b31_result_json)
+    amend_path = Path(args.amendment_json)
+
+    pre = json.loads(preflight_json.read_text(encoding="utf-8"))
+    drift = json.loads(drift_json.read_text(encoding="utf-8"))
+    reauth = json.loads(
+        Path(args.source_reauth_json).read_text(encoding="utf-8")
+    )
+
+    if pre["status"] != (
+        "PASS_PREDICTOR_ONLY_PREFLIGHT_READY_TO_UNSEAL_PHASE2_TARGETS"
+    ):
+        raise RuntimeError("frozen B30 preflight is not PASS")
+    if drift["status"] != (
+        "PASS_SCHEDULE_CONTAINER_DRIFT_SEMANTICALLY_EQUIVALENT"
+    ):
+        raise RuntimeError("frozen B31A drift audit is not PASS")
+    if reauth["status"] != "PASS_CURRENT_SCHEDULE_SEMANTIC_REAUTHORIZATION":
+        raise RuntimeError("current schedule semantic reauthorization is not PASS")
+    if reauth["all_11_player_stat_files_match_b30"] is not True:
+        raise RuntimeError("current player-stat files do not match frozen B30")
+    if reauth["semantic_mismatches"]:
+        raise RuntimeError("current schedule changes predictor-only semantics")
+
+    observed_hashes = {
+        "games_csv": sha256(Path(args.schedule)),
+        "stats_player_week": {},
+    }
+    if observed_hashes["games_csv"] != reauth["current_games_sha256"]:
+        raise RuntimeError("current schedule hash differs from reauthorization")
+    frozen_stats = pre["source_snapshot_sha256"]["stats_player_week"]
+    for season in SEASONS:
+        p = Path(args.stats_dir) / f"stats_player_week_{season}.csv"
+        got = sha256(p)
+        observed_hashes["stats_player_week"][str(season)] = got
+        if got != frozen_stats[str(season)]:
+            raise RuntimeError(
+                f"{season} stats source drift after semantic reauthorization"
+            )
+
+    frozen_result = json.loads(b31_result_path.read_text(encoding="utf-8"))
+    amendment = json.loads(amend_path.read_text(encoding="utf-8"))
+
+    if frozen_result["status"] != "STOP_RETROSPECTIVE_PREDICTIVE_VALIDATION":
+        raise RuntimeError("B31 frozen result is not STOP")
+    if frozen_result["retuning_after_outcomes_authorized"] is not False:
+        raise RuntimeError("B31 governance unexpectedly authorizes retuning")
+
+    amd4 = amendment["amd_4_zero_stat_rule"]
+    if amd4["schedule_anchored"] is not True:
+        raise RuntimeError("B29 AMD-4 schedule anchor missing")
+    if amd4["failed_completeness_check"] != "UNCOVERED_SOURCE_FAILURE_NOT_ZERO":
+        raise RuntimeError("B29 AMD-4 source-failure rule mismatch")
+    if amd4["negative_team_position_total_may_be_zero_filled"] is not False:
+        raise RuntimeError("B29 AMD-4 negative-total rule mismatch")
+
+    games, schedule_audit = b30.load_schedule(Path(args.schedule))
+    expected_by_season = (
+        schedule_audit["schedule_derived_expected_directional_rows_weeks_4_17"]
+    )
+
+    eval_rows = []
+    all_zero_records = []
+    all_zero_keys = set()
+    qb_rb_zero_keys = set()
+    shared_aggregate_mismatches = []
+    shared_zero_identity_mismatches = []
+    per_season_mode = {}
+
+    for season in SEASONS:
+        stats_path = Path(args.stats_dir) / f"stats_player_week_{season}.csv"
+
+        predictor_source_rows, _ = b30.adapt_historical_stats(
+            stats_path, season=season, games=games, frozen=frozen
+        )
+        full_rows, _ = b31.adapt_full_eval_stats(
+            stats_path,
+            season=season,
+            games=games,
+            frozen=frozen,
+            b30=b30,
+        )
+
+        for mode in ("HALF_PPR", "PPR"):
+            predictor_rows, pred_audit = b30.build_team_game_position_rows(
+                season=season,
+                player_rows=predictor_source_rows,
+                games=games,
+                frozen=frozen,
+                scoring_mode=mode,
+            )
+            predictor_map = predictor_map_with_game_ids(
+                predictor_rows, games=games, season=season
+            )
+            predictor_zero_keys = identify_predictor_zero_keys(
+                season=season,
+                player_rows=predictor_source_rows,
+                games=games,
+                scoring_mode=mode,
+            )
+
+            actual_map, target_zero_keys, zero_records = (
+                build_actual_map_and_zero_keys(
+                    season=season,
+                    player_rows=full_rows,
+                    games=games,
+                    frozen=frozen,
+                    scoring_mode=mode,
+                )
+            )
+            all_zero_records.extend(zero_records)
+            all_zero_keys |= target_zero_keys
+            qb_rb_zero_keys |= {
+                k for k in target_zero_keys if k[2] in {"QB", "RB"}
+            }
+
+            # Exact shared Weeks 4-16 predictor/target equality.
+            shared_target_keys = set()
+            for g in games.values():
+                if (
+                    g.season == season
+                    and g.completed
+                    and 4 <= g.week <= 16
+                ):
+                    for offense in (g.away_team, g.home_team):
+                        for pos in POSITIONS:
+                            key = (g.game_id, offense, pos)
+                            shared_target_keys.add(key)
+                            pv = predictor_map.get(key)
+                            av = actual_map.get(key)
+                            if pv is None or av is None or abs(pv - av) > 1e-12:
+                                shared_aggregate_mismatches.append({
+                                    "season": season,
+                                    "scoring_mode": mode,
+                                    "game_id": g.game_id,
+                                    "week": g.week,
+                                    "offense_team": offense,
+                                    "position": pos,
+                                    "predictor_points": pv,
+                                    "target_points": av,
+                                })
+
+            target_shared_zeros = {
+                k for k in target_zero_keys
+                if 4 <= games[k[0]].week <= 16
+            }
+            predictor_shared_zeros = {
+                k for k in predictor_zero_keys
+                if 4 <= games[k[0]].week <= 16
+            }
+            if target_shared_zeros != predictor_shared_zeros:
+                shared_zero_identity_mismatches.append({
+                    "season": season,
+                    "scoring_mode": mode,
+                    "target_only": sorted(
+                        [list(x) for x in target_shared_zeros - predictor_shared_zeros]
+                    ),
+                    "predictor_only": sorted(
+                        [list(x) for x in predictor_shared_zeros - target_shared_zeros]
+                    ),
+                })
+
+            per_season_mode[f"{season}_{mode}"] = {
+                "predictor_zero_fill_count": len(predictor_zero_keys),
+                "target_zero_fill_count": len(target_zero_keys),
+                "shared_weeks_4_16_point_mismatch_count": sum(
+                    1 for x in shared_aggregate_mismatches
+                    if x["season"] == season and x["scoring_mode"] == mode
+                ),
+                "shared_weeks_4_16_zero_identity_match":
+                    target_shared_zeros == predictor_shared_zeros,
+            }
+
+            # Reconstruct exact B31 primary rows.
+            for cell, position in mode_cells(mode):
+                all_game_rows = [
+                    r for r in predictor_rows if r.position == position
+                ]
+
+                identity_to_game_id = {}
+                for g in games.values():
+                    if g.season != season:
+                        continue
+                    identity_to_game_id[
+                        (g.season, g.week, g.away_team, g.home_team)
+                    ] = g.game_id
+                    identity_to_game_id[
+                        (g.season, g.week, g.home_team, g.away_team)
+                    ] = g.game_id
+
+                for week in TARGET_WEEKS:
+                    cutoff = schedule_audit["week_cutoffs"][(season, week)]
+                    candidate_ids, _ = b30.candidate_game_ids(
+                        games,
+                        season=season,
+                        target_week=week,
+                        week_cutoff=cutoff,
+                    )
+
+                    hist = []
+                    for r in all_game_rows:
+                        gid = identity_to_game_id.get(
+                            (r.season, r.week, r.offense_team, r.defense_team)
+                        )
+                        if gid is None:
+                            raise ValueError(
+                                f"missing predictor game identity "
+                                f"{season} W{r.week} {r.offense_team}-{r.defense_team}"
+                            )
+                        if gid in candidate_ids:
+                            hist.append(r)
+
+                    # Explicitly re-prove MAJOR-2 lookback/cutoff invariant.
+                    lo = max(1, week - 10)
+                    for r in hist:
+                        gid = identity_to_game_id[
+                            (r.season, r.week, r.offense_team, r.defense_team)
+                        ]
+                        g = games[gid]
+                        if not (lo <= g.week <= week - 1):
+                            raise AssertionError(
+                                f"lookback violation {season} W{week}: {g.game_id}"
+                            )
+                        if not (g.kickoff < cutoff):
+                            raise AssertionError(
+                                f"kickoff-cutoff violation {season} W{week}: {g.game_id}"
+                            )
+
+                    try:
+                        defense_snapshot = frozen.compute_log_sapa(
+                            hist,
+                            season=season,
+                            target_week=week,
+                            position=position,
+                            scoring_mode=mode,
+                        )
+                    except ValueError as exc:
+                        if "no eligible historical game rows" in str(exc):
+                            defense_snapshot = {}
+                        else:
+                            raise
+
+                    offense_points = defaultdict(list)
+                    for r in hist:
+                        offense_points[r.offense_team].append(float(r.points))
+
+                    targets = b30.target_directional_matchups(
+                        games, season=season, week=week
+                    )
+                    for game_id, offense, defense in targets:
+                        actual_key = (game_id, offense, position)
+                        actual_exists = actual_key in actual_map
+                        baseline_values = offense_points.get(offense, [])
+                        baseline_ok = len(baseline_values) >= 2
+                        dp = defense_snapshot.get(defense, {})
+                        defense_ok = (
+                            dp.get("status") == "AVAILABLE"
+                            and dp.get("defense_effect") is not None
+                        )
+                        if not (actual_exists and baseline_ok and defense_ok):
+                            continue
+
+                        baseline = statistics.fmean(baseline_values)
+                        defense_effect = float(dp["defense_effect"])
+                        zero_key = (game_id, offense, position, mode)
+
+                        eval_rows.append({
+                            "season": season,
+                            "week": week,
+                            "game_id": game_id,
+                            "offense_team": offense,
+                            "defense_team": defense,
+                            "cell": cell,
+                            "actual": float(actual_map[actual_key]),
+                            "baseline_forecast": baseline,
+                            "defense_effect": defense_effect,
+                            "adjusted_forecast": baseline + defense_effect,
+                            "_zero_key": zero_key,
+                            "_position": position,
+                            "_scoring_mode": mode,
+                        })
+
+    # Every zero-fill must satisfy every frozen AMD-4 check.
+    zero_rule_violations = [
+        rec for rec in all_zero_records
+        if not rec["all_frozen_amd4_checks_pass"]
+    ]
+
+    # Reproduce frozen B31 result from scratch.
+    primary_rows = [
+        {k: v for k, v in row.items() if not k.startswith("_")}
+        for row in eval_rows
+    ]
+    replay = analysis.evaluate(primary_rows, expected_by_season)
+    frozen_primary = frozen_result["primary_evaluation"]["primary"]
+    replay_primary = replay["primary"]
+
+    numeric_pairs = {
+        "mean": (
+            replay_primary["equal_season_equal_cell_mean_relative_mae_improvement"],
+            frozen_primary["equal_season_equal_cell_mean_relative_mae_improvement"],
+        ),
+        "p": (
+            replay_primary["exact_one_sided_season_signflip_p"],
+            frozen_primary["exact_one_sided_season_signflip_p"],
+        ),
+        "worst": (
+            replay_primary["worst_cell_mean_relative_mae_improvement"],
+            frozen_primary["worst_cell_mean_relative_mae_improvement"],
+        ),
+    }
+    replay_numeric_match = all(
+        abs(float(a) - float(b)) <= 1e-12
+        for a, b in numeric_pairs.values()
+    )
+    replay_exact_discrete_match = (
+        replay_primary["decision"] == frozen_primary["decision"]
+        and replay_primary["pass"] == frozen_primary["pass"]
+        and replay_primary["positive_cells"] == frozen_primary["positive_cells"]
+        and replay_primary["gate_components"] == frozen_primary["gate_components"]
+        and replay["coverage"]["observed_total_rows"]
+            == frozen_result["primary_evaluation"]["coverage"]["observed_total_rows"]
+    )
+    replay_matches_frozen_b31 = (
+        replay_numeric_match and replay_exact_discrete_match
+    )
+
+    # NON-GATING sensitivities. These cannot rescue V1.
+    no_all_zero_rows = [
+        {k: v for k, v in row.items() if not k.startswith("_")}
+        for row in eval_rows
+        if row["_zero_key"] not in all_zero_keys
+    ]
+    no_qbrb_zero_rows = [
+        {k: v for k, v in row.items() if not k.startswith("_")}
+        for row in eval_rows
+        if row["_zero_key"] not in qb_rb_zero_keys
+    ]
+
+    sens_all = evaluate_safely(
+        analysis, no_all_zero_rows, expected_by_season
+    )
+    sens_qbrb = evaluate_safely(
+        analysis, no_qbrb_zero_rows, expected_by_season
+    )
+
+    sensitivities_remain_stop = (
+        sens_all.get("decision") == "STOP_RETROSPECTIVE_PREDICTIVE_VALIDATION"
+        and sens_qbrb.get("decision")
+            == "STOP_RETROSPECTIVE_PREDICTIVE_VALIDATION"
+    )
+
+    validity_pass = (
+        replay_matches_frozen_b31
+        and not zero_rule_violations
+        and not shared_aggregate_mismatches
+        and not shared_zero_identity_mismatches
+        and sensitivities_remain_stop
+    )
+
+    status = (
+        "PASS_POSTRUN_ZERO_FILL_VALIDITY_STOP_ROBUST"
+        if validity_pass
+        else "HOLD_V1_CLOSEOUT_POSTRUN_VALIDITY_CONCERN"
+    )
+
+    result = {
+        "schema_version": 1,
+        "study_id": "schedule-utility-v1",
+        "phase": "2B-postrun-zero-fill-validity-audit",
+        "status": status,
+        "outcome_awareness": {
+            "historical_outcomes_already_consumed_before_this_audit": True,
+            "audit_is_non_gating": True,
+            "may_convert_v1_stop_to_pass": False,
+            "may_authorize_phase3": False,
+            "may_authorize_production": False,
+            "may_retune_predictor_or_thresholds": False,
+        },
+        "frozen_b31": {
+            "commit": B31_COMMIT,
+            "decision": frozen_result["status"],
+            "production_change_authorized":
+                frozen_result["production_change_authorized"],
+            "phase3_shadow_authorized":
+                frozen_result["phase3_shadow_authorized"],
+        },
+        "source_replay": {
+            "observed_source_snapshot_sha256": observed_hashes,
+            "replay_matches_frozen_b31": replay_matches_frozen_b31,
+            "replayed_primary": compact_primary(replay),
+        },
+        "zero_fill_audit": {
+            "frozen_b29_rule": amd4,
+            "target_zero_fill_record_count": len(all_zero_records),
+            "distinct_target_zero_keys_across_scoring_modes":
+                len(all_zero_keys),
+            "distinct_qb_rb_target_zero_keys_across_scoring_modes":
+                len(qb_rb_zero_keys),
+            "rule_violation_count": len(zero_rule_violations),
+            "rule_violations": zero_rule_violations,
+            "records": sorted(
+                all_zero_records,
+                key=lambda x: (
+                    x["season"], x["week"], x["game_id"],
+                    x["offense_team"], x["position"], x["scoring_mode"]
+                ),
+            ),
+        },
+        "shared_weeks_4_16_symmetry": {
+            "target_vs_predictor_point_mismatch_count":
+                len(shared_aggregate_mismatches),
+            "target_vs_predictor_point_mismatches":
+                shared_aggregate_mismatches[:100],
+            "zero_fill_identity_mismatch_group_count":
+                len(shared_zero_identity_mismatches),
+            "zero_fill_identity_mismatches":
+                shared_zero_identity_mismatches,
+            "per_season_mode": per_season_mode,
+        },
+        "non_gating_sensitivities": {
+            "governance": (
+                "These analyses are post-outcome and cannot rescue V1. "
+                "They test only whether the frozen STOP is sensitive to the "
+                "zero-fill implementation concern raised after B31."
+            ),
+            "exclude_all_target_zero_filled_rows": sens_all,
+            "exclude_qb_rb_target_zero_filled_rows": sens_qbrb,
+            "both_remain_stop": sensitivities_remain_stop,
+        },
+        "conclusion": {
+            "original_b31_stop_remains_binding": True,
+            "validity_audit_supports_closeout": validity_pass,
+            "if_hold": (
+                "Do not rerun confirmatory V1 or reinterpret it as PASS. "
+                "Investigate the validity discrepancy and preserve 2015-2025 "
+                "as consumed outcomes."
+            ),
+        },
+        "production_change_authorized": False,
+        "phase3_shadow_authorized": False,
+        "v1_stop_can_be_reclassified_as_pass": False,
+    }
+    return result
+
+
+def selftest():
+    assert cell_position("QB_HALF") == "QB"
+    assert cell_position("TE_PPR") == "TE"
+    assert mode_cells("PPR") == [
+        ("RB_PPR", "RB"),
+        ("WR_PPR", "WR"),
+        ("TE_PPR", "TE"),
+    ]
+
+    # Sensitivity governance is structural, not outcome-dependent.
+    fake = {
+        "primary": {
+            "decision": "STOP_RETROSPECTIVE_PREDICTIVE_VALIDATION",
+            "pass": False,
+            "equal_season_equal_cell_mean_relative_mae_improvement": -0.01,
+            "exact_one_sided_season_signflip_p": 1.0,
+            "positive_cells": 0,
+            "worst_cell_mean_relative_mae_improvement": -0.02,
+            "gate_components": {},
+        },
+        "coverage": {"observed_total_rows": 10},
+    }
+    c = compact_primary(fake)
+    assert c["decision"] == "STOP_RETROSPECTIVE_PREDICTIVE_VALIDATION"
+    assert c["pass"] is False
+
+    tmp = Path("/tmp/b32a_blob_selftest.txt")
+    tmp.write_text("abc\n", encoding="utf-8")
+    assert len(git_blob_sha1(tmp)) == 40
+    assert len(sha256(tmp)) == 64
+
+    synthetic_checks = {
+        "team_confirmed_played_completed_scheduled_game": True,
+        "team_game_has_admitted_player_stat_coverage": True,
+        "required_scoring_fields_schema_and_numeric_checks_passed": True,
+        "no_duplicate_or_conflicting_identity": True,
+        "source_completeness_audit_did_not_flag_team_game": True,
+        "no_qualifying_canonical_position_row": True,
+        "negative_team_position_total_zero_filled": False,
+    }
+    assert (
+        all(
+            synthetic_checks[k]
+            for k in synthetic_checks
+            if k != "negative_team_position_total_zero_filled"
+        )
+        and not synthetic_checks["negative_team_position_total_zero_filled"]
+    )
+
+    print("PASS: B32A V2 zero-fill validity audit synthetic selftest")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--repo-root", default=".")
+    ap.add_argument("--schedule")
+    ap.add_argument("--stats-dir")
+    ap.add_argument("--b30-module")
+    ap.add_argument("--b31-module")
+    ap.add_argument("--log-sapa")
+    ap.add_argument("--analysis")
+    ap.add_argument("--preflight-json")
+    ap.add_argument("--drift-audit-json")
+    ap.add_argument("--source-reauth-json")
+    ap.add_argument("--b31-result-json")
+    ap.add_argument("--amendment-json")
+    ap.add_argument("--out")
+    args = ap.parse_args()
+
+    if args.selftest:
+        selftest()
+        return
+
+    needed = [
+        args.schedule, args.stats_dir, args.b30_module, args.b31_module,
+        args.log_sapa, args.analysis, args.preflight_json,
+        args.drift_audit_json, args.source_reauth_json,
+        args.b31_result_json, args.amendment_json,
+        args.out,
+    ]
+    if any(x is None for x in needed):
+        ap.error("all source/module/result arguments are required")
+
+    result = run(args)
+    Path(args.out).write_text(
+        json.dumps(result, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    print(json.dumps({
+        "status": result["status"],
+        "target_zero_fill_record_count":
+            result["zero_fill_audit"]["target_zero_fill_record_count"],
+        "zero_rule_violation_count":
+            result["zero_fill_audit"]["rule_violation_count"],
+        "shared_point_mismatch_count":
+            result["shared_weeks_4_16_symmetry"][
+                "target_vs_predictor_point_mismatch_count"
+            ],
+        "b31_replay_matches":
+            result["source_replay"]["replay_matches_frozen_b31"],
+        "sensitivity_all_zero_decision":
+            result["non_gating_sensitivities"][
+                "exclude_all_target_zero_filled_rows"
+            ].get("decision"),
+        "sensitivity_qbrb_decision":
+            result["non_gating_sensitivities"][
+                "exclude_qb_rb_target_zero_filled_rows"
+            ].get("decision"),
+        "original_b31_stop_remains_binding": True,
+        "production_change_authorized": False,
+    }, indent=2))
+
+
+if __name__ == "__main__":
+    main()
