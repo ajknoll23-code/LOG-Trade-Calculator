@@ -1,0 +1,318 @@
+name: B20 Trade Robustness V1 - Current Production Revalidation V2
+
+"on":
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: b20-trade-robustness-v1-current-production-revalidation
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  revalidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Record immutable production hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "INDEX_BEFORE=$(sha256sum index.html | awk '{print $1}')" >> "$GITHUB_ENV"
+          echo "UNCERTAINTY_BEFORE=$(sha256sum scripts/artifacts/generated/value_uncertainty.json | awk '{print $1}')" >> "$GITHUB_ENV"
+          echo "PHASE3_BEFORE=$(sha256sum research/trade-robustness-v1/trade_robustness_v1_phase3_pick_sensitivity_shadow.json | awk '{print $1}')" >> "$GITHUB_ENV"
+
+      - name: Guard current Trade Robustness V1 contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path(".")
+          html = (root / "index.html").read_text(encoding="utf-8")
+          phase3 = json.loads(
+              (root / "research/trade-robustness-v1/trade_robustness_v1_phase3_pick_sensitivity_shadow.json")
+              .read_text(encoding="utf-8")
+          )
+          uncertainty = json.loads(
+              (root / "scripts/artifacts/generated/value_uncertainty.json")
+              .read_text(encoding="utf-8")
+          )
+
+          def function_block(name: str, next_name: str | None = None) -> str:
+              start = html.find(f"function {name}(")
+              assert start >= 0, f"missing function: {name}"
+              if next_name:
+                  end = html.find(f"function {next_name}(", start + 1)
+                  assert end > start, f"cannot isolate function: {name}"
+                  return html[start:end]
+              return html[start:]
+
+          verdict = function_block(
+              "tradeRobustnessVerdictClass",
+              "tradeRobustnessPickEnvelope",
+          )
+          picks = function_block(
+              "tradeRobustnessPickEnvelope",
+              "tradeRobustnessAssessment",
+          )
+          assess = function_block(
+              "tradeRobustnessAssessment",
+              "renderTradeRobustness",
+          )
+          render = function_block(
+              "renderTradeRobustness",
+              "syncValueUncertaintyFromGitHub",
+          )
+
+          # Exact live verdict semantics: Fair <7%, Slight 7–<20%, Strong >=20%.
+          assert "if(diffPct < 0.07)" in verdict
+          assert "if(diffPct < 0.20)" in verdict
+          assert "strength:'fair'" in verdict
+          assert "strength:'slight'" in verdict
+          assert "strength:'strong'" in verdict
+
+          # Pick support is intentionally bounded to R1-R4.
+          assert "round < 1" in picks and "round > 4" in picks
+          assert "['early','mid','late']" in picks
+          assert "draft_slot_early_late_same_round_year" in picks
+
+          # Player uncertainty remains fail-closed and stale-center guarded.
+          assert "missing_or_stale_player_uncertainty" in assess
+          assert "unsupported_or_stale_pick_sensitivity" in assess
+          assert "valueUncertaintyForPlayer(asset.name, asset.value)" in assess
+
+          # Adverse corner: favored side -> low, other side -> high.
+          assert "rowsByAsset.get(asset).range_low" in assess
+          assert "rowsByAsset.get(asset).range_high" in assess
+          assert "adverseTotals = tradeVerdictTotals();" in assess
+
+          # State restoration is mandatory.
+          assert "const originalValues = allAssets.map(asset => [asset, asset.value]);" in assess
+          assert "for(const [asset, value] of originalValues)" in assess
+
+          # Fair center verdict never receives a directional robustness badge.
+          assert "status: centerVerdict.label === 'fair' ? 'center_fair' : 'unavailable'" in assess
+          assert "result.status !== 'evaluated'" in render
+
+          # UI must remain explicitly deterministic/non-probabilistic.
+          assert "NOT a probability or confidence interval" in render
+          assert "Sensitivity Robust" in render
+          assert "Sensitivity Fragile" in render
+          assert "draft-slot stress" in render
+          assert "renderTradeRobustness();" in html
+
+          # Historical pick research anchor must still be frozen PASS.
+          assert phase3.get("decision") == "PASS_TRADE_ROBUSTNESS_V1_PHASE3_PICK_SLOT_SENSITIVITY_SHADOW"
+          assert phase3.get("production_change_authorized") is False
+          scope = phase3.get("promotion_scope") or {}
+          assert scope.get("eligible_rounds") == [1, 2, 3, 4]
+          assert scope.get("ineligible_rounds") == [5, 6]
+
+          # Current player uncertainty artifact must retain its original semantics
+          # and valid center-within-envelope structure.
+          assert uncertainty.get("range_semantics") == "sensitivity_envelope_v1_not_probability_interval"
+          players = uncertainty.get("players") or {}
+          assert len(players) >= 500
+          checked = 0
+          for key, row in players.items():
+              center = float(row["center_value"])
+              low = float(row["range_low"])
+              high = float(row["range_high"])
+              width = float(row["relative_half_width"])
+              assert 0 <= low <= center <= high, key
+              assert width >= 0, key
+              checked += 1
+
+          print(
+              "PASS: current Trade Robustness source contract intact; "
+              f"{checked} player uncertainty envelopes structurally valid."
+          )
+          PY
+
+      - name: Re-run Phase 4 behavior validator with V10-safe synthetic fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VALIDATOR="research/trade-robustness-v1/trade_robustness_v1_phase4_pick_ui_validator.py"
+          CONF_JSON="research/trade-robustness-v1/trade_robustness_v1_phase4_pick_ui_confirmation.json"
+          CONF_MD="research/trade-robustness-v1/trade_robustness_v1_phase4_pick_ui_confirmation.md"
+          MANIFEST="research/trade-robustness-v1/trade_robustness_v1_phase4_manifest.json"
+
+          cleanup() {
+            git restore -- "$VALIDATOR" "$CONF_JSON" "$CONF_MD" "$MANIFEST" || true
+          }
+          trap cleanup EXIT
+
+          # September's test 7 used a synthetic 5,000-FV player vs 2027 R1 mid.
+          # Draft Pick FV V10 now values 2027 R1 mid near 5,076, so that fixture
+          # correctly lands in the live <7% Fair Trade band and exits before the
+          # missing-uncertainty guard can be exercised. Change ONLY the synthetic
+          # test fixture to 1,000 FV so the same fail-closed branch remains tested.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("research/trade-robustness-v1/trade_robustness_v1_phase4_pick_ui_validator.py")
+          s = p.read_text(encoding="utf-8")
+          old = "A:[player('No Range','WR',5000)],"
+          new = "A:[player('No Range','WR',1000)],"
+          count = s.count(old)
+          assert count == 1, f"expected one stale Phase 4 fixture, found {count}"
+          p.write_text(s.replace(old, new, 1), encoding="utf-8")
+          print("PASS: adjusted one synthetic stale-player fixture for current V10 pick scale.")
+          PY
+
+          python3 "$VALIDATOR"             | tee /tmp/trade_robustness_phase4_current.json
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          p = Path("/tmp/trade_robustness_phase4_current.json")
+          result = json.loads(p.read_text(encoding="utf-8"))
+          assert result["decision"] == "PASS_TRADE_ROBUSTNESS_V1_PHASE4_PICK_UI_DEPLOYED"
+          assert result["js_behavior_cases_checked"] >= 7
+          assert result["supported_pick_rounds"] == [1, 2, 3, 4]
+          assert result["unsupported_pick_rounds"] == [5, 6]
+          assert result["trade_verdict_changed"] is False
+          assert result["package_adjustment_changed"] is False
+          assert result["fundamental_value_changed"] is False
+          assert result["pick_value_formula_changed"] is False
+          assert result["probability_language_allowed"] is False
+          print("PASS: seven-case Phase 4 behavior suite passes against current production source.")
+          PY
+
+          cleanup
+          trap - EXIT
+
+      - name: Validate current Package Adjustment integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/check_package_adjustment_live.py
+
+      - name: Run repository regression checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/repo_regression_checks.py
+
+      - name: Prove zero production mutation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test "$(sha256sum index.html | awk '{print $1}')" = "$INDEX_BEFORE"
+          test "$(sha256sum scripts/artifacts/generated/value_uncertainty.json | awk '{print $1}')" = "$UNCERTAINTY_BEFORE"
+          test "$(sha256sum research/trade-robustness-v1/trade_robustness_v1_phase3_pick_sensitivity_shadow.json | awk '{print $1}')" = "$PHASE3_BEFORE"
+
+          git diff --check
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+          echo "PASS: B20 changed zero tracked or untracked repository files."
+
+      - name: Build current-production closeout summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          phase4 = json.loads(
+              Path("/tmp/trade_robustness_phase4_current.json").read_text(encoding="utf-8")
+          )
+
+          def sha(path):
+              return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+          summary = {
+              "schema_version": 1,
+              "study_id": "trade-robustness-v1-current-production-revalidation",
+              "decision": "PASS_TRADE_ROBUSTNESS_V1_CURRENT_PRODUCTION_REVALIDATION",
+              "generated_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+              "production_change_authorized": False,
+              "production_files_changed": False,
+              "display_only": True,
+              "fair_trade_threshold": 0.07,
+              "strong_threshold": 0.20,
+              "supported_pick_rounds": [1, 2, 3, 4],
+              "unsupported_pick_rounds": [5, 6],
+              "player_stress": "favored side low / other side high using existing sensitivity envelopes",
+              "pick_stress": "same-round/year deterministic early-to-late slot envelope",
+              "live_package_adjustment_recomputed": True,
+              "probability_interpretation_allowed": False,
+              "historical_phase4_behavior_cases_checked": phase4["js_behavior_cases_checked"],
+              "current_index_sha256": sha("index.html"),
+              "current_uncertainty_sha256": sha("scripts/artifacts/generated/value_uncertainty.json"),
+              "phase3_anchor_sha256": sha(
+                  "research/trade-robustness-v1/trade_robustness_v1_phase3_pick_sensitivity_shadow.json"
+              ),
+          }
+
+          out = Path("/tmp/trade_robustness_v1_current_production_revalidation.json")
+          out.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+          md = [
+              "## B20 Trade Robustness V1 — Current Production Revalidation",
+              "",
+              "**Decision:** `PASS_TRADE_ROBUSTNESS_V1_CURRENT_PRODUCTION_REVALIDATION`",
+              "",
+              "- Production changes: **NONE**",
+              "- Live verdict threshold preserved: **7% Fair Trade boundary**",
+              "- Strong threshold preserved: **20%**",
+              "- Player adverse-envelope stress: **PASS**",
+              "- Draft-pick stress R1–R4: **PASS**",
+              "- R5–R6 fail closed: **PASS**",
+              "- Live Package Adjustment recomputation: **PASS**",
+              "- Phase 4 JS behavior suite (V10-safe synthetic fixture): **PASS**",
+              "- Repository regressions: **PASS**",
+              "- Probability/confidence interpretation: **NOT ALLOWED**",
+              "",
+              "Trade Robustness V1 is compatible with current production and can be closed/frozen.",
+          ]
+          Path("/tmp/trade_robustness_v1_current_production_revalidation.md").write_text(
+              "\n".join(md) + "\n",
+              encoding="utf-8",
+          )
+          print(json.dumps(summary, indent=2, sort_keys=True))
+          PY
+
+          cat /tmp/trade_robustness_v1_current_production_revalidation.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload B20 revalidation evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: b20-trade-robustness-v1-current-production-revalidation
+          path: |
+            /tmp/trade_robustness_v1_current_production_revalidation.json
+            /tmp/trade_robustness_v1_current_production_revalidation.md
+            /tmp/trade_robustness_phase4_current.json
+          if-no-files-found: error
+          retention-days: 30
