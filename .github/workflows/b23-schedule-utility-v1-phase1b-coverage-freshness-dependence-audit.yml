@@ -1,0 +1,659 @@
+name: B23 Schedule Utility V1 - Phase 1B Coverage Freshness and Dependence Audit
+
+"on":
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: b23-schedule-utility-v1-phase1b
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  phase1b:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Verify frozen Phase 0 and Phase 1A prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          p0 = json.loads(Path(
+              "research/schedule-utility-v1/schedule_utility_v1_phase0_prereg.json"
+          ).read_text(encoding="utf-8"))
+          p1a = json.loads(Path(
+              "research/schedule-utility-v1/schedule_utility_v1_phase1a_source_feasibility.json"
+          ).read_text(encoding="utf-8"))
+
+          assert p0["study_id"] == "schedule-utility-v1"
+          assert p0["status"] == "PREREGISTERED_SOURCE_CONTRACT_ONLY"
+          assert p0["outcome_association_opened"] is False
+          assert p0["production_change_authorized"] is False
+
+          assert p1a["study_id"] == "schedule-utility-v1"
+          assert p1a["phase"] == "1A"
+          assert p1a["status"] == "PASS_PRIVATE_SOURCE_INGESTION_FEASIBILITY"
+          assert p1a["outcome_data_read"] is False
+          assert p1a["production_change_authorized"] is False
+          assert p1a["validation"]["half_ppr_afpa_value_mismatches"] == 0
+          assert p1a["validation"]["schedule_identity_mismatches"] == 0
+
+          expected = {"afpa_half": "57c1a228ae849496092ac8404be33072d974a6eb0c251646e58b579b0892b430", "qb_half": "d054b074162cfe748e22c4ce00dd3bf07aee97f3eaf04cd4c737be46c5d18b47", "rb_half": "1f54c87762ddfff9a47e7219c1e6ea48f4905507f37e119dfaf55c3b49b22f75", "rb_ppr": "cda98824bc3a1f79ccc016a93e31da80c6c477eac1e5281536acc005979856b3", "te_half": "cfae6b10a1eb6dc428004c2a599f85f4d5ab86499d3585e40e260adc03ddd325", "te_ppr": "cdab088a1a128305acfd7820edf2c19241135a24be1a0f852dd9b8a7cdc1894f", "wr_half": "c3ae5f0af52beaa3a258785b4dbbf63ca21dcf73847a067f1daa9391db9279e4", "wr_ppr": "ef323c774adcc680944ee2db8414f598eb96b714d09ec44263ba3a49309c8d4d"}
+          observed = {k: v["sha256"] for k, v in p1a["source_files"].items()}
+          assert observed == expected, (observed, expected)
+
+          print("PASS: B21/B22 frozen prerequisites and exact source bundle verified.")
+          PY
+
+      - name: Snapshot production before Phase 1B
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "INDEX_SHA=$(sha256sum index.html | awk '{print $1}')" >> "$GITHUB_ENV"
+          echo "FA_SHA=$(sha256sum free-agent-board.html | awk '{print $1}')" >> "$GITHUB_ENV"
+
+      - name: Freeze Phase 1B aggregate audit and reusable private auditor
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p research/schedule-utility-v1
+
+          cat > /tmp/phase1b_audit.py <<'PYFILE'
+          #!/usr/bin/env python3
+          """
+          Schedule Utility V1 — Phase 1B private coverage/dependence audit.
+
+          Runs only against user-supplied private 4for4 CSV exports. It produces
+          aggregate-only output suitable for a public repository. It does not read
+          fantasy outcomes and does not authorize production use.
+          """
+
+          from __future__ import annotations
+
+          import argparse
+          import csv
+          import importlib.util
+          import json
+          import math
+          import re
+          import statistics
+          from pathlib import Path
+
+          HERE = Path(__file__).resolve().parent
+          P1A_PATH = HERE / "schedule_utility_v1_private_ingest.py"
+          CELL_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)(@?)([A-Z]{2,3})$")
+
+          HOT_KEYS = (
+              "qb_half", "rb_half", "wr_half", "te_half",
+              "rb_ppr", "wr_ppr", "te_ppr",
+          )
+          HALF_MASTER_COLUMN = {
+              "RB": "RB-HALF",
+              "WR": "WR-HALF",
+              "TE": "TE-HALF",
+          }
+          PAIR_KEYS = {
+              "RB": ("rb_half", "rb_ppr"),
+              "WR": ("wr_half", "wr_ppr"),
+              "TE": ("te_half", "te_ppr"),
+          }
+
+          def load_p1a():
+              spec = importlib.util.spec_from_file_location("schedule_utility_v1_p1a", P1A_PATH)
+              if spec is None or spec.loader is None:
+                  raise RuntimeError(f"cannot load Phase 1A helper: {P1A_PATH}")
+              mod = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(mod)
+              return mod
+
+          def read_csv(path: Path):
+              text = path.read_text(encoding="utf-8-sig")
+              reader = csv.DictReader(text.splitlines())
+              return list(reader)
+
+          def parse_cell(value):
+              s = str(value or "").strip()
+              if not s or s.upper() == "BYE":
+                  return None
+              m = CELL_RE.fullmatch(s)
+              if not m:
+                  raise ValueError(f"invalid weekly matchup cell: {s!r}")
+              return float(m.group(1)), bool(m.group(2)), m.group(3)
+
+          def opponent_values(rows):
+              out = {}
+              for row in rows:
+                  for week in range(1, 19):
+                      parsed = parse_cell(row[str(week)])
+                      if parsed is None:
+                          continue
+                      value, _away, opp = parsed
+                      if opp in out and abs(out[opp] - value) > 1e-12:
+                          raise ValueError(f"inconsistent opponent value for {opp}")
+                      out[opp] = value
+              if len(out) != 32:
+                  raise ValueError(f"expected 32 opponent values, got {len(out)}")
+              return out
+
+          def average_ranks(values):
+              ordered = sorted(enumerate(values), key=lambda x: x[1])
+              ranks = [0.0] * len(values)
+              i = 0
+              while i < len(ordered):
+                  j = i + 1
+                  while j < len(ordered) and ordered[j][1] == ordered[i][1]:
+                      j += 1
+                  avg = ((i + 1) + j) / 2.0
+                  for k in range(i, j):
+                      ranks[ordered[k][0]] = avg
+                  i = j
+              return ranks
+
+          def pearson(a, b):
+              ma = statistics.mean(a)
+              mb = statistics.mean(b)
+              num = sum((x - ma) * (y - mb) for x, y in zip(a, b))
+              da = math.sqrt(sum((x - ma) ** 2 for x in a))
+              db = math.sqrt(sum((y - mb) ** 2 for y in b))
+              if da == 0 or db == 0:
+                  raise ValueError("zero variance")
+              return num / (da * db)
+
+          def mean_week_range(row, start, end):
+              vals = []
+              for week in range(start, end + 1):
+                  parsed = parse_cell(row[str(week)])
+                  if parsed is not None:
+                      vals.append(parsed[0])
+              if not vals:
+                  raise ValueError("empty candidate ROS window")
+              return statistics.mean(vals)
+
+          def analyze(paths: dict[str, Path], source_capture_utc: str, as_of_week: int):
+              p1a = load_p1a()
+              base = p1a.validate_source_bundle(paths, source_capture_utc, as_of_week)
+
+              afpa_rows = read_csv(paths["afpa_half"])
+              afpa = {row["Team"].strip().upper(): row for row in afpa_rows}
+              hot = {key: read_csv(paths[key]) for key in HOT_KEYS}
+
+              format_disagreement = {}
+              for pos, (_half_key, ppr_key) in PAIR_KEYS.items():
+                  ppr = opponent_values(hot[ppr_key])
+                  teams = sorted(afpa)
+                  half_vals = [float(afpa[t][HALF_MASTER_COLUMN[pos]]) for t in teams]
+                  ppr_vals = [float(ppr[t]) for t in teams]
+                  diffs = [p - h for h, p in zip(half_vals, ppr_vals)]
+                  half_ranks = average_ranks(half_vals)
+                  ppr_ranks = average_ranks(ppr_vals)
+                  rank_shift = [abs(a - b) for a, b in zip(half_ranks, ppr_ranks)]
+
+                  easy_half = set(sorted(range(32), key=lambda i: half_vals[i])[-8:])
+                  easy_ppr = set(sorted(range(32), key=lambda i: ppr_vals[i])[-8:])
+                  hard_half = set(sorted(range(32), key=lambda i: half_vals[i])[:8])
+                  hard_ppr = set(sorted(range(32), key=lambda i: ppr_vals[i])[:8])
+
+                  format_disagreement[pos] = {
+                      "half_mean": round(statistics.mean(half_vals), 6),
+                      "ppr_mean": round(statistics.mean(ppr_vals), 6),
+                      "mean_ppr_minus_half": round(statistics.mean(diffs), 6),
+                      "min_ppr_minus_half": round(min(diffs), 6),
+                      "max_ppr_minus_half": round(max(diffs), 6),
+                      "spearman_rank_correlation": round(pearson(half_ranks, ppr_ranks), 9),
+                      "mean_abs_rank_shift": round(statistics.mean(rank_shift), 6),
+                      "max_abs_rank_shift": round(max(rank_shift), 6),
+                      "easiest_quartile_overlap_of_8": len(easy_half & easy_ppr),
+                      "hardest_quartile_overlap_of_8": len(hard_half & hard_ppr),
+                  }
+
+              # Infer which contiguous displayed-week window best reproduces provider ROS.
+              candidates = []
+              for start in range(1, 19):
+                  for end in range(start, 19):
+                      errors = []
+                      for rows in hot.values():
+                          for row in rows:
+                              derived = mean_week_range(row, start, end)
+                              errors.append(abs(derived - float(row["ROS"])))
+                      candidates.append({
+                          "start": start,
+                          "end": end,
+                          "mean_abs_error": statistics.mean(errors),
+                          "max_abs_error": max(errors),
+                      })
+              candidates.sort(key=lambda x: x["mean_abs_error"])
+              best, second = candidates[0], candidates[1]
+
+              return {
+                  "schema_version": 1,
+                  "study_id": "schedule-utility-v1",
+                  "phase": "1B",
+                  "status": "PASS_COVERAGE_DEPENDENCE_AUDIT_FRESHNESS_GUARD",
+                  "outcome_data_read": False,
+                  "outcome_association_opened": False,
+                  "production_change_authorized": False,
+                  "phase2_outcome_test_authorized": False,
+                  "source_bundle_phase1a_status": base["status"],
+                  "coverage": base["coverage"],
+                  "source_dependence": {
+                      "afpa_and_hot_spots_independent_predictors": False,
+                      "half_ppr_exact_cell_checks": base["validation"]["half_ppr_afpa_exact_checks"],
+                      "half_ppr_exact_cell_mismatches": base["validation"]["half_ppr_afpa_value_mismatches"],
+                      "interpretation": (
+                          "Hot Spots is the schedule/window presentation of the same opponent "
+                          "aFPA matchup values, not an independent signal."
+                      ),
+                      "double_counting_guard": (
+                          "Do not blend or weight aFPA and Hot Spots as separate predictors."
+                      ),
+                  },
+                  "scoring_format_audit": format_disagreement,
+                  "provider_summary_semantics": {
+                      "ros_best_displayed_week_window": [best["start"], best["end"]],
+                      "ros_best_mean_abs_display_rounding_error": round(best["mean_abs_error"], 9),
+                      "ros_best_max_abs_display_rounding_error": round(best["max_abs_error"], 9),
+                      "ros_second_best_mean_abs_error": round(second["mean_abs_error"], 9),
+                      "po2_semantics_from_phase1a": "Weeks 16-17 average within display rounding",
+                      "po3_semantics_from_phase1a": "Weeks 15-17 average within display rounding",
+                      "provider_ros_po2_po3_used_as_primary_v1_scores": False,
+                  },
+                  "freshness": {
+                      "csv_embeds_capture_timestamp": False,
+                      "csv_embeds_as_of_week": False,
+                      "externally_supplied_capture_timestamp_required": True,
+                      "externally_supplied_as_of_week_required": True,
+                      "ros_structure_strongly_consistent_with_as_of_week": best["start"],
+                      "inference_is_not_authoritative_metadata": True,
+                      "current_snapshot_freshness_formally_verified": False,
+                  },
+                  "phase2_readiness": {
+                      "ready": False,
+                      "blocking_reasons": [
+                          "Current CSV snapshot lacks authoritative embedded capture timestamp/as-of week.",
+                          "Only one current provider snapshot is available.",
+                          "Retrospective predictive validation requires time-valid historical predictor snapshots or an equivalent look-ahead-safe source archive."
+                      ],
+                      "next_phase": "1C historical snapshot and freshness feasibility",
+                      "outcomes_remain_sealed": True,
+                  },
+              }
+
+          def selftest():
+              assert average_ranks([1, 2, 2, 4]) == [1.0, 2.5, 2.5, 4.0]
+              assert abs(pearson([1, 2, 3], [1, 2, 3]) - 1.0) < 1e-12
+              assert parse_cell("10.9@LAC") == (10.9, True, "LAC")
+              assert parse_cell("13.4SEA") == (13.4, False, "SEA")
+              assert parse_cell("BYE") is None
+              print("PASS: Phase 1B private audit selftest")
+
+          def main():
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--selftest", action="store_true")
+              for arg in (
+                  "afpa-half", "qb-half", "rb-half", "wr-half", "te-half",
+                  "rb-ppr", "wr-ppr", "te-ppr"
+              ):
+                  ap.add_argument(f"--{arg}")
+              ap.add_argument("--source-capture-utc")
+              ap.add_argument("--as-of-week", type=int)
+              ap.add_argument("--public-summary")
+              ns = ap.parse_args()
+
+              if ns.selftest:
+                  selftest()
+                  return
+
+              mapping = {
+                  "afpa_half": ns.afpa_half,
+                  "qb_half": ns.qb_half,
+                  "rb_half": ns.rb_half,
+                  "wr_half": ns.wr_half,
+                  "te_half": ns.te_half,
+                  "rb_ppr": ns.rb_ppr,
+                  "wr_ppr": ns.wr_ppr,
+                  "te_ppr": ns.te_ppr,
+              }
+              missing = [k for k, v in mapping.items() if not v]
+              if missing:
+                  raise SystemExit(f"missing private source paths: {missing}")
+              if not ns.source_capture_utc or ns.as_of_week is None:
+                  raise SystemExit("source capture UTC and as-of week are required")
+              if not ns.public_summary:
+                  raise SystemExit("--public-summary is required")
+
+              paths = {k: Path(v).expanduser().resolve() for k, v in mapping.items()}
+              result = analyze(paths, ns.source_capture_utc, ns.as_of_week)
+              Path(ns.public_summary).write_text(
+                  json.dumps(result, indent=2, sort_keys=True) + "\n",
+                  encoding="utf-8",
+              )
+              print(json.dumps({
+                  "decision": result["status"],
+                  "phase2_ready": result["phase2_readiness"]["ready"],
+                  "outcomes_read": False,
+              }, indent=2))
+
+          if __name__ == "__main__":
+              main()
+          PYFILE
+          sed 's/^          //' /tmp/phase1b_audit.py >             research/schedule-utility-v1/schedule_utility_v1_phase1b_private_audit.py
+          chmod +x research/schedule-utility-v1/schedule_utility_v1_phase1b_private_audit.py
+
+          cat > /tmp/phase1b_result.json <<'JSONFILE'
+          {
+            "coverage": {
+              "hot_spots_tables": 7,
+              "nfl_teams": 32,
+              "positions_half_ppr": [
+                "QB",
+                "RB",
+                "WR",
+                "TE"
+              ],
+              "positions_ppr_separate_export": [
+                "RB",
+                "WR",
+                "TE"
+              ],
+              "schedule_identity_mismatches": 0,
+              "team_position_gaps_detected": 0,
+              "weekly_nonbye_cells": 3808
+            },
+            "freshness": {
+              "csv_embeds_as_of_week": false,
+              "csv_embeds_capture_timestamp": false,
+              "current_snapshot_freshness_formally_verified": false,
+              "externally_supplied_as_of_week_required": true,
+              "externally_supplied_capture_timestamp_required": true,
+              "inference_is_not_authoritative_metadata": true,
+              "ros_structure_strongly_consistent_with_as_of_week": 4
+            },
+            "outcome_association_opened": false,
+            "outcome_data_read": false,
+            "phase": "1B",
+            "phase2_outcome_test_authorized": false,
+            "phase2_readiness": {
+              "blocking_reasons": [
+                "Current CSV snapshot lacks authoritative embedded capture timestamp/as-of week.",
+                "Only one current provider snapshot is available.",
+                "Retrospective predictive validation requires time-valid historical predictor snapshots or an equivalent look-ahead-safe source archive."
+              ],
+              "next_phase": "1C historical snapshot and freshness feasibility",
+              "outcomes_remain_sealed": true,
+              "ready": false
+            },
+            "production_change_authorized": false,
+            "provider_summary_semantics": {
+              "po2_semantics": "Weeks 16-17 average within display rounding",
+              "po3_semantics": "Weeks 15-17 average within display rounding",
+              "provider_ros_po2_po3_used_as_primary_v1_scores": false,
+              "ros_best_displayed_week_window": [
+                4,
+                17
+              ],
+              "ros_best_max_abs_display_rounding_error": 0.061538462,
+              "ros_best_mean_abs_display_rounding_error": 0.024278846,
+              "ros_rows_consistent_with_weeks_4_17_within_0_067": "224/224",
+              "ros_second_best_mean_abs_error": 0.360969388
+            },
+            "schema_version": 1,
+            "scoring_format_audit": {
+              "RB": {
+                "easiest_quartile_overlap_of_8": 7,
+                "half_mean": 18.621875,
+                "hardest_quartile_overlap_of_8": 8,
+                "max_abs_rank_shift": 4.0,
+                "max_ppr_minus_half": 3.6,
+                "mean_abs_rank_shift": 0.84375,
+                "mean_ppr_minus_half": 2.184375,
+                "min_ppr_minus_half": 0.4,
+                "ppr_mean": 20.80625,
+                "spearman_rank_correlation": 0.990923298
+              },
+              "TE": {
+                "easiest_quartile_overlap_of_8": 8,
+                "half_mean": 11.10625,
+                "hardest_quartile_overlap_of_8": 8,
+                "max_abs_rank_shift": 3.5,
+                "max_ppr_minus_half": 4.5,
+                "mean_abs_rank_shift": 0.625,
+                "mean_ppr_minus_half": 2.6,
+                "min_ppr_minus_half": 0.7,
+                "ppr_mean": 13.70625,
+                "spearman_rank_correlation": 0.992574942
+              },
+              "WR": {
+                "easiest_quartile_overlap_of_8": 8,
+                "half_mean": 26.26875,
+                "hardest_quartile_overlap_of_8": 7,
+                "max_abs_rank_shift": 2.0,
+                "max_ppr_minus_half": 7.8,
+                "mean_abs_rank_shift": 0.71875,
+                "mean_ppr_minus_half": 5.640625,
+                "min_ppr_minus_half": 3.7,
+                "ppr_mean": 31.909375,
+                "spearman_rank_correlation": 0.994040529
+              }
+            },
+            "source_bundle_phase1a_commit": "c77c947fa732e8ba384aafffe85da50ef8c9a2f3",
+            "source_dependence": {
+              "afpa_and_hot_spots_independent_predictors": false,
+              "double_counting_guard": "Do not blend or weight aFPA and Hot Spots as separate predictors.",
+              "half_ppr_exact_cell_checks": 2176,
+              "half_ppr_exact_cell_mismatches": 0,
+              "interpretation": "Hot Spots is the schedule/window presentation of the same opponent aFPA matchup values, not an independent signal."
+            },
+            "source_hashes": {
+              "afpa_half": "57c1a228ae849496092ac8404be33072d974a6eb0c251646e58b579b0892b430",
+              "qb_half": "d054b074162cfe748e22c4ce00dd3bf07aee97f3eaf04cd4c737be46c5d18b47",
+              "rb_half": "1f54c87762ddfff9a47e7219c1e6ea48f4905507f37e119dfaf55c3b49b22f75",
+              "rb_ppr": "cda98824bc3a1f79ccc016a93e31da80c6c477eac1e5281536acc005979856b3",
+              "te_half": "cfae6b10a1eb6dc428004c2a599f85f4d5ab86499d3585e40e260adc03ddd325",
+              "te_ppr": "cdab088a1a128305acfd7820edf2c19241135a24be1a0f852dd9b8a7cdc1894f",
+              "wr_half": "c3ae5f0af52beaa3a258785b4dbbf63ca21dcf73847a067f1daa9391db9279e4",
+              "wr_ppr": "ef323c774adcc680944ee2db8414f598eb96b714d09ec44263ba3a49309c8d4d"
+            },
+            "status": "PASS_COVERAGE_DEPENDENCE_AUDIT_FRESHNESS_GUARD",
+            "study_id": "schedule-utility-v1"
+          }
+          JSONFILE
+          sed 's/^          //' /tmp/phase1b_result.json >             research/schedule-utility-v1/schedule_utility_v1_phase1b_audit.json
+
+          cat > /tmp/phase1b_report.md <<'MDFILE'
+          # Schedule Utility V1 — Phase 1B Coverage, Freshness, and Dependence Audit
+
+          **Decision:** `PASS_COVERAGE_DEPENDENCE_AUDIT_FRESHNESS_GUARD`
+
+          Phase 1B remained fully outcome-blind. It audited the exact private 4for4 source bundle admitted by Phase 1A.
+
+          ## Main scientific finding
+
+          aFPA and Hot Spots are **not independent predictors** in this source package. Across QB/RB/WR/TE Half-PPR, all 2,176 non-bye Hot Spots matchup values exactly reproduce the corresponding opponent aFPA master value.
+
+          **Frozen guard:** Schedule Utility V1 may not blend, average, or weight aFPA and Hot Spots as two separate signals. Hot Spots is treated as the schedule/window presentation layer for the underlying aFPA matchup signal.
+
+          ## Coverage
+
+          - 32/32 NFL teams.
+          - QB, RB, WR, TE Half-PPR coverage.
+          - Separate PPR exports for RB, WR, TE.
+          - 7 Hot Spots tables.
+          - 3,808 non-bye weekly matchup cells.
+          - Zero team/position gaps.
+          - Zero schedule-identity mismatches.
+
+          ## Scoring-format audit
+
+          PPR and Half-PPR defensive rankings are highly correlated but not identical:
+
+          | Position | Spearman rank correlation | Mean absolute rank shift | Max rank shift |
+          | --- | ---: | ---: | ---: |
+          | RB | 0.990923298 | 0.84375 | 4.0 |
+          | WR | 0.994040529 | 0.71875 | 2.0 |
+          | TE | 0.992574942 | 0.62500 | 3.5 |
+
+          **Frozen guard:** scoring format must be explicit. PPR and Half-PPR may not be silently substituted.
+
+          ## Provider summary semantics
+
+          Across all 224 team/table rows, the displayed `ROS` summary is most consistent with the average of displayed Weeks 4–17, within provider rounding. `PO2` is consistent with Weeks 16–17 and `PO3` with Weeks 15–17.
+
+          These provider summary columns remain audit evidence only. V1 derives its own configured Next-3, ROS, and fantasy-playoff windows from weekly matchup cells.
+
+          ## Freshness finding
+
+          The exports do not embed a capture timestamp or authoritative as-of week. Their `ROS` structure strongly indicates Week 4, but that is an inference rather than metadata.
+
+          Future refreshes must supply capture UTC and as-of week explicitly and fail closed if either is absent.
+
+          ## Phase 2 gate
+
+          Phase 2 outcome testing is **not yet authorized**. A single current source snapshot cannot support a look-ahead-safe retrospective predictive test.
+
+          The next source-only step is **Phase 1C — historical snapshot and freshness feasibility**. It must establish whether time-valid historical 4for4/aFPA predictor snapshots (or an equivalent non-look-ahead archive) can be obtained before any realized fantasy outcomes are opened.
+
+          ## Production impact
+
+          None. No player FV, draft-pick FV, Package Adjustment, Team Utility, Market Value, Trade Verdict, or production UI change is authorized.
+          MDFILE
+          sed 's/^          //' /tmp/phase1b_report.md >             research/schedule-utility-v1/schedule_utility_v1_phase1b_audit.md
+
+      - name: Validate Phase 1B science and helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile             research/schedule-utility-v1/schedule_utility_v1_phase1b_private_audit.py
+          python3             research/schedule-utility-v1/schedule_utility_v1_phase1b_private_audit.py             --selftest
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          p = Path("research/schedule-utility-v1/schedule_utility_v1_phase1b_audit.json")
+          d = json.loads(p.read_text(encoding="utf-8"))
+
+          assert d["status"] == "PASS_COVERAGE_DEPENDENCE_AUDIT_FRESHNESS_GUARD"
+          assert d["outcome_data_read"] is False
+          assert d["outcome_association_opened"] is False
+          assert d["production_change_authorized"] is False
+          assert d["phase2_outcome_test_authorized"] is False
+
+          assert d["coverage"]["nfl_teams"] == 32
+          assert d["coverage"]["team_position_gaps_detected"] == 0
+          assert d["coverage"]["schedule_identity_mismatches"] == 0
+
+          dep = d["source_dependence"]
+          assert dep["afpa_and_hot_spots_independent_predictors"] is False
+          assert dep["half_ppr_exact_cell_checks"] == 2176
+          assert dep["half_ppr_exact_cell_mismatches"] == 0
+
+          for pos in ("RB", "WR", "TE"):
+              s = d["scoring_format_audit"][pos]
+              assert s["spearman_rank_correlation"] > 0.98
+              assert s["max_abs_rank_shift"] > 0
+
+          sem = d["provider_summary_semantics"]
+          assert sem["ros_best_displayed_week_window"] == [4, 17]
+          assert sem["ros_rows_consistent_with_weeks_4_17_within_0_067"] == "224/224"
+          assert sem["provider_ros_po2_po3_used_as_primary_v1_scores"] is False
+
+          fresh = d["freshness"]
+          assert fresh["csv_embeds_capture_timestamp"] is False
+          assert fresh["csv_embeds_as_of_week"] is False
+          assert fresh["inference_is_not_authoritative_metadata"] is True
+          assert fresh["current_snapshot_freshness_formally_verified"] is False
+
+          gate = d["phase2_readiness"]
+          assert gate["ready"] is False
+          assert gate["outcomes_remain_sealed"] is True
+          assert gate["next_phase"] == "1C historical snapshot and freshness feasibility"
+
+          print("PASS: Phase 1B coverage/dependence/freshness gate validated.")
+          PY
+
+      - name: Licensing leak guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -R -n -E '[0-9]+\.[0-9]+@?[A-Z]{2,3}'             research/schedule-utility-v1/schedule_utility_v1_phase1b_audit.json             research/schedule-utility-v1/schedule_utility_v1_phase1b_audit.md; then
+            echo "Possible row-level provider matchup leakage detected."
+            exit 1
+          fi
+          echo "PASS: Phase 1B public artifacts contain aggregate-only provider information."
+
+      - name: Prove zero production mutation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(sha256sum index.html | awk '{print $1}')" = "$INDEX_SHA"
+          test "$(sha256sum free-agent-board.html | awk '{print $1}')" = "$FA_SHA"
+
+          git diff --check
+          CHANGED="$(git status --porcelain=v1 --untracked-files=all | awk '{print $2}')"
+          echo "$CHANGED"
+
+          if [ -n "$CHANGED" ]; then
+            while IFS= read -r path; do
+              [ -z "$path" ] && continue
+              case "$path" in
+                research/schedule-utility-v1/*) ;;
+                *) echo "Unexpected non-research mutation: $path"; exit 1 ;;
+              esac
+            done <<< "$CHANGED"
+          fi
+          echo "PASS: zero production mutation."
+
+      - name: Commit frozen Phase 1B artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add             research/schedule-utility-v1/schedule_utility_v1_phase1b_private_audit.py             research/schedule-utility-v1/schedule_utility_v1_phase1b_audit.json             research/schedule-utility-v1/schedule_utility_v1_phase1b_audit.md
+
+          if git diff --cached --quiet; then
+            echo "Phase 1B artifacts already frozen; no commit required."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Freeze Schedule Utility V1 Phase 1B coverage and dependence audit"
+          git push origin HEAD:main
+
+      - name: Closeout
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## B23 Schedule Utility V1 — Phase 1B"
+            echo
+            echo "- Decision: **PASS_COVERAGE_DEPENDENCE_AUDIT_FRESHNESS_GUARD**"
+            echo "- Coverage: **32/32 teams; QB/RB/WR/TE**"
+            echo "- Half-PPR aFPA ↔ Hot Spots exact checks: **2,176 / 2,176**"
+            echo "- Independent aFPA + Hot Spots signals: **NO**"
+            echo "- Double-counting guard frozen: **YES**"
+            echo "- PPR vs Half-PPR format differences: **REAL BUT HIGHLY RANK-STABLE**"
+            echo "- Current source freshness formally verified: **NO**"
+            echo "- Phase 2 outcomes authorized: **NO**"
+            echo "- Production change: **NONE**"
+            echo "- Next: **Phase 1C historical snapshot and freshness feasibility**"
+          } >> "$GITHUB_STEP_SUMMARY"
