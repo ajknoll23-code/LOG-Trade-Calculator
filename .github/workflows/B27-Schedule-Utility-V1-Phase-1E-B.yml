@@ -1,0 +1,714 @@
+name: B27 Schedule Utility V1 - Phase 1E-B Private 4for4 Source Bridge Freeze
+
+"on":
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: b27-schedule-utility-v1-phase1e-b
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  FROZEN_LOG_SAPA_SHA256: "9ab4ec5b21ef9ef57e476e861a7293dbc886b9bc9d7cc5f0bd5cc982cc729ee6"
+  PHASE1E_A_COMMIT: "b484f096516f858772953c438f084e0a69b250c0"
+  PHASE1E_A_PREDICTOR_BLOB_SHA1: "cf1ed116aebb6803747898e7b1cfd76c5b70e451"
+
+jobs:
+  phase1e_b:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Verify frozen Phase 1D and Phase 1E-A prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git merge-base --is-ancestor "$PHASE1E_A_COMMIT" HEAD
+
+          test "$(git hash-object research/schedule-utility-v1/schedule_utility_v1_phase1e_a_public_predictors.json)" \
+            = "$PHASE1E_A_PREDICTOR_BLOB_SHA1"
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          root = Path("research/schedule-utility-v1")
+
+          prereg = json.loads(
+              (root / "schedule_utility_v1_phase1d_log_sapa_prereg.json")
+              .read_text(encoding="utf-8")
+          )
+          public = json.loads(
+              (root / "schedule_utility_v1_phase1e_a_public_predictors.json")
+              .read_text(encoding="utf-8")
+          )
+
+          frozen_sha = hashlib.sha256(
+              (root / "log_sapa_v1.py").read_bytes()
+          ).hexdigest()
+
+          assert prereg["status"] == "PREREGISTERED_LOG_SAPA_V1_METHOD"
+          assert prereg["implementation"]["sha256"] == frozen_sha
+          assert frozen_sha == (
+              "9ab4ec5b21ef9ef57e476e861a7293dbc886b9bc9d7cc5f0bd5cc982cc729ee6"
+          )
+
+          gate = prereg["source_bridge_gate_before_historical_outcomes"]["pass_rule"]
+          assert gate == {
+              "cells_at_or_above_0_50_at_least": 6,
+              "median_spearman_at_least": 0.6,
+              "no_cell_below": 0.3,
+          }
+          assert prereg["source_bridge_gate_before_historical_outcomes"][
+              "threshold_tuning_after_observation_authorized"
+          ] is False
+
+          assert public["status"] == (
+              "PASS_PUBLIC_IMPLEMENTATION_READY_PRIVATE_BRIDGE_PENDING"
+          )
+          assert public["frozen_implementation"]["sha256"] == frozen_sha
+          assert public["frozen_implementation"]["parameters_changed"] is False
+          assert public["predictor_stat_weeks"] == [1, 2, 3]
+          assert public["target_week"] == 4
+          assert public["target_week_player_rows_admitted"] is False
+          assert public["historical_target_outcomes_opened"] is False
+          assert public["private_4for4_rows_read_in_github"] is False
+          assert public["phase2_outcome_test_authorized"] is False
+          assert public["production_change_authorized"] is False
+
+          expected_cells = {
+              "QB_HALF", "RB_HALF", "WR_HALF", "TE_HALF",
+              "RB_PPR", "WR_PPR", "TE_PPR",
+          }
+          assert set(public["cells"]) == expected_cells
+          assert all(
+              payload["defense_count"] == 32
+              for payload in public["cells"].values()
+          )
+
+          assert public["public_source_files"]["stats_player_week_2026_csv"]["sha256"] == (
+              "88ec064c1b611ab91b494a5b81d37b980d832ec1f3009a39021e025e71b6f025"
+          )
+          assert public["public_source_files"]["games_csv"]["sha256"] == (
+              "ae8bdaccb1b46f01c04fd161697ee95de793b0a39834308024f4fc7a97055429"
+          )
+
+          print("PASS: Phase 1D and Phase 1E-A freezes verified exactly.")
+          PY
+
+      - name: Snapshot production before private bridge freeze
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "INDEX_SHA=$(sha256sum index.html | awk '{print $1}')" >> "$GITHUB_ENV"
+          echo "FA_SHA=$(sha256sum free-agent-board.html | awk '{print $1}')" >> "$GITHUB_ENV"
+
+      - name: Freeze private bridge recomputation script
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p research/schedule-utility-v1
+
+          cat > research/schedule-utility-v1/schedule_utility_v1_phase1e_b_private_bridge_recompute.py <<'PYFILE'
+          #!/usr/bin/env python3
+          """
+          Schedule Utility V1 — Phase 1E-B private 4for4 source bridge recomputation.
+
+          This script is intended for PRIVATE/local use with licensed 4for4 CSV exports.
+          It emits aggregate diagnostics only and never emits provider team-level values.
+
+          Primary gate was preregistered in Phase 1D:
+          - median Spearman >= 0.60
+          - >= 6 of 7 cells Spearman >= 0.50
+          - no cell Spearman < 0.30
+          """
+
+          from __future__ import annotations
+
+          import argparse
+          import csv
+          import hashlib
+          import json
+          import math
+          import re
+          import statistics
+          from pathlib import Path
+          from typing import Mapping
+
+          EXPECTED_SOURCE_HASHES = {
+              "afpa_half": "57c1a228ae849496092ac8404be33072d974a6eb0c251646e58b579b0892b430",
+              "qb_half": "d054b074162cfe748e22c4ce00dd3bf07aee97f3eaf04cd4c737be46c5d18b47",
+              "rb_half": "1f54c87762ddfff9a47e7219c1e6ea48f4905507f37e119dfaf55c3b49b22f75",
+              "wr_half": "c3ae5f0af52beaa3a258785b4dbbf63ca21dcf73847a067f1daa9391db9279e4",
+              "te_half": "cfae6b10a1eb6dc428004c2a599f85f4d5ab86499d3585e40e260adc03ddd325",
+              "rb_ppr": "cda98824bc3a1f79ccc016a93e31da80c6c477eac1e5281536acc005979856b3",
+              "wr_ppr": "ef323c774adcc680944ee2db8414f598eb96b714d09ec44263ba3a49309c8d4d",
+              "te_ppr": "cdab088a1a128305acfd7820edf2c19241135a24be1a0f852dd9b8a7cdc1894f",
+          }
+
+          CELL_ORDER = [
+              "QB_HALF", "RB_HALF", "WR_HALF", "TE_HALF",
+              "RB_PPR", "WR_PPR", "TE_PPR",
+          ]
+
+          FROZEN_GATE = {
+              "median_spearman_at_least": 0.60,
+              "cells_at_or_above_0_50_at_least": 6,
+              "no_cell_below": 0.30,
+          }
+
+          CELL_RE = re.compile(r"^(-?\d+(?:\.\d+)?)@?([A-Z]{2,3})$")
+
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+
+          def read_csv(path: Path) -> list[dict[str, str]]:
+              with path.open("r", encoding="utf-8-sig", newline="") as f:
+                  return list(csv.DictReader(f))
+
+
+          def verify_hashes(paths: Mapping[str, Path]) -> dict[str, str]:
+              observed = {key: sha256(path) for key, path in paths.items()}
+              if set(observed) != set(EXPECTED_SOURCE_HASHES):
+                  raise RuntimeError("private source key set mismatch")
+              bad = {
+                  key: {"expected": EXPECTED_SOURCE_HASHES[key], "observed": observed[key]}
+                  for key in observed
+                  if observed[key] != EXPECTED_SOURCE_HASHES[key]
+              }
+              if bad:
+                  raise RuntimeError(f"private source SHA mismatch: {bad}")
+              return observed
+
+
+          def provider_half_from_master(path: Path) -> dict[str, dict[str, float]]:
+              rows = read_csv(path)
+              if len(rows) != 32:
+                  raise ValueError(f"expected 32 master rows, got {len(rows)}")
+              required = {"Team", "QB", "RB-HALF", "WR-HALF", "TE-HALF"}
+              if not rows:
+                  raise ValueError("empty aFPA master")
+              missing = required - set(rows[0])
+              if missing:
+                  raise KeyError(f"aFPA master missing columns: {sorted(missing)}")
+
+              col_map = {
+                  "QB_HALF": "QB",
+                  "RB_HALF": "RB-HALF",
+                  "WR_HALF": "WR-HALF",
+                  "TE_HALF": "TE-HALF",
+              }
+              out = {cell: {} for cell in col_map}
+              for row in rows:
+                  team = str(row["Team"]).strip().upper()
+                  if not team:
+                      raise ValueError("blank master team")
+                  for cell, col in col_map.items():
+                      out[cell][team] = float(row[col])
+              if any(len(v) != 32 for v in out.values()):
+                  raise ValueError("duplicate/missing master team")
+              return out
+
+
+          def provider_ppr_from_hotspots(path: Path) -> dict[str, float]:
+              rows = read_csv(path)
+              if len(rows) != 32:
+                  raise ValueError(f"expected 32 Hot Spots rows, got {len(rows)}")
+              if not rows or "Wk" not in rows[0]:
+                  raise KeyError("Hot Spots missing Wk column")
+              for wk in map(str, range(1, 19)):
+                  if wk not in rows[0]:
+                      raise KeyError(f"Hot Spots missing week {wk}")
+
+              values: dict[str, list[float]] = {}
+              for row in rows:
+                  for wk in map(str, range(1, 19)):
+                      cell = str(row[wk]).strip()
+                      if not cell or cell.upper() == "BYE":
+                          continue
+                      match = CELL_RE.fullmatch(cell)
+                      if not match:
+                          raise ValueError(f"unparseable Hot Spots cell: {cell!r}")
+                      val = float(match.group(1))
+                      defense = match.group(2)
+                      values.setdefault(defense, []).append(val)
+
+              if len(values) != 32:
+                  raise ValueError(f"expected 32 defenses in Hot Spots, got {len(values)}")
+
+              out: dict[str, float] = {}
+              for team, arr in values.items():
+                  if max(arr) - min(arr) > 1e-12:
+                      raise ValueError(
+                          f"Hot Spots defensive value not constant for {team}: "
+                          f"{min(arr)}..{max(arr)}"
+                      )
+                  out[team] = statistics.fmean(arr)
+              return out
+
+
+          def average_ranks(values: Mapping[str, float]) -> dict[str, float]:
+              ordered = sorted((float(value), team) for team, value in values.items())
+              out: dict[str, float] = {}
+              i = 0
+              n = len(ordered)
+              while i < n:
+                  j = i + 1
+                  while j < n and ordered[j][0] == ordered[i][0]:
+                      j += 1
+                  avg = ((i + 1) + j) / 2.0
+                  for k in range(i, j):
+                      out[ordered[k][1]] = avg
+                  i = j
+              return out
+
+
+          def pearson(x: list[float], y: list[float]) -> float:
+              if len(x) != len(y) or len(x) < 2:
+                  raise ValueError("invalid Pearson inputs")
+              mx = statistics.fmean(x)
+              my = statistics.fmean(y)
+              dx = [v - mx for v in x]
+              dy = [v - my for v in y]
+              sx = math.sqrt(sum(v * v for v in dx))
+              sy = math.sqrt(sum(v * v for v in dy))
+              if sx == 0 or sy == 0:
+                  raise ValueError("zero-variance rank vector")
+              return sum(a * b for a, b in zip(dx, dy)) / (sx * sy)
+
+
+          def spearman(a: Mapping[str, float], b: Mapping[str, float]) -> tuple[float, dict, dict]:
+              if set(a) != set(b):
+                  raise ValueError(f"team-set mismatch: {sorted(set(a) ^ set(b))}")
+              ra = average_ranks(a)
+              rb = average_ranks(b)
+              teams = sorted(a)
+              return (
+                  pearson([ra[t] for t in teams], [rb[t] for t in teams]),
+                  ra,
+                  rb,
+              )
+
+
+          def exact_eight(values: Mapping[str, float], easiest: bool) -> set[str]:
+              # Descriptive secondary diagnostic only. Numeric value is primary; team code
+              # deterministically resolves any boundary tie so exactly eight are selected.
+              if easiest:
+                  ordered = sorted(values, key=lambda t: (-float(values[t]), t))
+              else:
+                  ordered = sorted(values, key=lambda t: (float(values[t]), t))
+              return set(ordered[:8])
+
+
+          def cell_diagnostic(public: Mapping[str, float], provider: Mapping[str, float]) -> dict:
+              rho, rpub, rpro = spearman(public, provider)
+              teams = sorted(public)
+              diffs = [abs(rpub[t] - rpro[t]) for t in teams]
+              return {
+                  "spearman": round(rho, 12),
+                  "coverage": len(teams),
+                  "mean_abs_rank_difference": round(statistics.fmean(diffs), 6),
+                  "max_abs_rank_difference": round(max(diffs), 6),
+                  "easiest_quartile_overlap_of_8": len(
+                      exact_eight(public, True) & exact_eight(provider, True)
+                  ),
+                  "hardest_quartile_overlap_of_8": len(
+                      exact_eight(public, False) & exact_eight(provider, False)
+                  ),
+              }
+
+
+          def main() -> None:
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--public", required=True)
+              ap.add_argument("--afpa-half", required=True)
+              ap.add_argument("--qb-half", required=True)
+              ap.add_argument("--rb-half", required=True)
+              ap.add_argument("--wr-half", required=True)
+              ap.add_argument("--te-half", required=True)
+              ap.add_argument("--rb-ppr", required=True)
+              ap.add_argument("--wr-ppr", required=True)
+              ap.add_argument("--te-ppr", required=True)
+              ap.add_argument("--out", required=True)
+              args = ap.parse_args()
+
+              private_paths = {
+                  "afpa_half": Path(args.afpa_half),
+                  "qb_half": Path(args.qb_half),
+                  "rb_half": Path(args.rb_half),
+                  "wr_half": Path(args.wr_half),
+                  "te_half": Path(args.te_half),
+                  "rb_ppr": Path(args.rb_ppr),
+                  "wr_ppr": Path(args.wr_ppr),
+                  "te_ppr": Path(args.te_ppr),
+              }
+              observed_hashes = verify_hashes(private_paths)
+
+              public_doc = json.loads(Path(args.public).read_text(encoding="utf-8"))
+              if public_doc.get("status") != "PASS_PUBLIC_IMPLEMENTATION_READY_PRIVATE_BRIDGE_PENDING":
+                  raise RuntimeError("unexpected public Phase 1E-A status")
+              if public_doc.get("frozen_implementation", {}).get("sha256") != (
+                  "9ab4ec5b21ef9ef57e476e861a7293dbc886b9bc9d7cc5f0bd5cc982cc729ee6"
+              ):
+                  raise RuntimeError("unexpected frozen LOG-SAPA SHA")
+              if public_doc.get("predictor_stat_weeks") != [1, 2, 3]:
+                  raise RuntimeError("unexpected public predictor weeks")
+              if public_doc.get("target_week") != 4:
+                  raise RuntimeError("unexpected public target week")
+              if public_doc.get("historical_target_outcomes_opened") is not False:
+                  raise RuntimeError("outcome firewall violated")
+
+              public_values = {}
+              for cell in CELL_ORDER:
+                  payload = public_doc["cells"][cell]
+                  vals = payload["raw_log_sapa_by_defense"]
+                  if len(vals) != 32:
+                      raise RuntimeError(f"{cell}: expected 32 public defenses")
+                  public_values[cell] = {team: float(v) for team, v in vals.items()}
+
+              provider = provider_half_from_master(private_paths["afpa_half"])
+              provider["RB_PPR"] = provider_ppr_from_hotspots(private_paths["rb_ppr"])
+              provider["WR_PPR"] = provider_ppr_from_hotspots(private_paths["wr_ppr"])
+              provider["TE_PPR"] = provider_ppr_from_hotspots(private_paths["te_ppr"])
+
+              cells = {
+                  cell: cell_diagnostic(public_values[cell], provider[cell])
+                  for cell in CELL_ORDER
+              }
+              rhos = [cells[cell]["spearman"] for cell in CELL_ORDER]
+              median = statistics.median(rhos)
+              count50 = sum(r >= 0.50 for r in rhos)
+              minimum = min(rhos)
+              passed = (
+                  median >= FROZEN_GATE["median_spearman_at_least"]
+                  and count50 >= FROZEN_GATE["cells_at_or_above_0_50_at_least"]
+                  and minimum >= FROZEN_GATE["no_cell_below"]
+              )
+
+              result = {
+                  "schema_version": 1,
+                  "study_id": "schedule-utility-v1",
+                  "phase": "1E-B",
+                  "status": (
+                      "PASS_PRIVATE_SOURCE_BRIDGE"
+                      if passed
+                      else "FAIL_PRIVATE_SOURCE_BRIDGE_STOP_NO_OUTCOME_TESTING"
+                  ),
+                  "metric_id": "LOG-SAPA-V1",
+                  "private_analysis": True,
+                  "provider_rows_committed": False,
+                  "provider_team_values_emitted": False,
+                  "source_hashes_verified": True,
+                  "source_hashes": observed_hashes,
+                  "primary_gate": FROZEN_GATE,
+                  "cell_results": cells,
+                  "summary": {
+                      "median_spearman": round(median, 12),
+                      "cells_at_or_above_0_50": count50,
+                      "minimum_cell_spearman": round(minimum, 12),
+                      "all_7_cells_coverage_32": all(c["coverage"] == 32 for c in cells.values()),
+                      "pass": passed,
+                  },
+                  "secondary_diagnostics_are_gate_inputs": False,
+                  "secondary_quartile_tie_rule": (
+                      "numeric value then team code; descriptive only; exactly 8 selected"
+                  ),
+                  "historical_target_outcomes_opened": False,
+                  "phase2_outcome_test_authorized": False,
+                  "production_change_authorized": False,
+              }
+
+              Path(args.out).write_text(
+                  json.dumps(result, indent=2, sort_keys=True) + "\n",
+                  encoding="utf-8",
+              )
+              print(json.dumps(result["summary"], indent=2))
+
+
+          if __name__ == "__main__":
+              main()
+          PYFILE
+
+          chmod +x research/schedule-utility-v1/schedule_utility_v1_phase1e_b_private_bridge_recompute.py
+          python3 -m py_compile \
+            research/schedule-utility-v1/schedule_utility_v1_phase1e_b_private_bridge_recompute.py
+
+          test "$(sha256sum research/schedule-utility-v1/schedule_utility_v1_phase1e_b_private_bridge_recompute.py | awk '{print $1}')" \
+            = "0aea755513a2d43b3979baf71f38e99a03d0a7ec0f0c04c67dba03f7e6830f8f"
+
+      - name: Freeze aggregate private bridge result
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path("research/schedule-utility-v1")
+          result = {'schema_version': 1, 'study_id': 'schedule-utility-v1', 'phase': '1E-B', 'status': 'PASS_PRIVATE_SOURCE_BRIDGE', 'metric_id': 'LOG-SAPA-V1', 'frozen_log_sapa_sha256': '9ab4ec5b21ef9ef57e476e861a7293dbc886b9bc9d7cc5f0bd5cc982cc729ee6', 'phase1e_a_freeze_commit': 'b484f096516f858772953c438f084e0a69b250c0', 'phase1e_a_public_predictor_git_blob_sha1': 'cf1ed116aebb6803747898e7b1cfd76c5b70e451', 'phase1e_a_public_sources': {'stats_player_week_2026_sha256': '88ec064c1b611ab91b494a5b81d37b980d832ec1f3009a39021e025e71b6f025', 'games_csv_sha256': 'ae8bdaccb1b46f01c04fd161697ee95de793b0a39834308024f4fc7a97055429', 'predictor_weeks': [1, 2, 3], 'target_week': 4}, 'private_bridge_method': {'analysis_location': 'private_local_analysis_outside_public_github_action', 'recompute_script_path': 'research/schedule-utility-v1/schedule_utility_v1_phase1e_b_private_bridge_recompute.py', 'recompute_script_sha256': '0aea755513a2d43b3979baf71f38e99a03d0a7ec0f0c04c67dba03f7e6830f8f', 'provider': '4for4', 'provider_source_hashes_verified': True, 'provider_rows_committed': False, 'provider_team_values_committed': False, 'half_cells_source': 'aFPA Half-PPR master defensive table', 'ppr_cells_source': 'PPR Hot Spots tables reconstructed to opponent-defense values; source-table consistency required', 'primary_statistic': 'Spearman rank correlation using average ranks across 32 defenses', 'secondary_diagnostics_are_gate_inputs': False, 'secondary_quartile_tie_rule': 'numeric value then team code; descriptive only; exactly 8 selected'}, 'private_source_hashes': {'afpa_half': '57c1a228ae849496092ac8404be33072d974a6eb0c251646e58b579b0892b430', 'qb_half': 'd054b074162cfe748e22c4ce00dd3bf07aee97f3eaf04cd4c737be46c5d18b47', 'rb_half': '1f54c87762ddfff9a47e7219c1e6ea48f4905507f37e119dfaf55c3b49b22f75', 'wr_half': 'c3ae5f0af52beaa3a258785b4dbbf63ca21dcf73847a067f1daa9391db9279e4', 'te_half': 'cfae6b10a1eb6dc428004c2a599f85f4d5ab86499d3585e40e260adc03ddd325', 'rb_ppr': 'cda98824bc3a1f79ccc016a93e31da80c6c477eac1e5281536acc005979856b3', 'wr_ppr': 'ef323c774adcc680944ee2db8414f598eb96b714d09ec44263ba3a49309c8d4d', 'te_ppr': 'cdab088a1a128305acfd7820edf2c19241135a24be1a0f852dd9b8a7cdc1894f'}, 'frozen_gate': {'median_spearman_at_least': 0.6, 'cells_at_or_above_0_50_at_least': 6, 'no_cell_below': 0.3}, 'cell_results': {'QB_HALF': {'spearman': 0.999908353572, 'coverage': 32, 'mean_abs_rank_difference': 0.03125, 'max_abs_rank_difference': 0.5, 'easiest_quartile_overlap_of_8': 8, 'hardest_quartile_overlap_of_8': 8}, 'RB_HALF': {'spearman': 0.998441943521, 'coverage': 32, 'mean_abs_rank_difference': 0.21875, 'max_abs_rank_difference': 2.0, 'easiest_quartile_overlap_of_8': 8, 'hardest_quartile_overlap_of_8': 8}, 'WR_HALF': {'spearman': 0.994958328942, 'coverage': 32, 'mean_abs_rank_difference': 0.59375, 'max_abs_rank_difference': 3.0, 'easiest_quartile_overlap_of_8': 8, 'hardest_quartile_overlap_of_8': 7}, 'TE_HALF': {'spearman': 1.0, 'coverage': 32, 'mean_abs_rank_difference': 0.0, 'max_abs_rank_difference': 0.0, 'easiest_quartile_overlap_of_8': 8, 'hardest_quartile_overlap_of_8': 8}, 'RB_PPR': {'spearman': 0.998899957151, 'coverage': 32, 'mean_abs_rank_difference': 0.1875, 'max_abs_rank_difference': 1.0, 'easiest_quartile_overlap_of_8': 8, 'hardest_quartile_overlap_of_8': 8}, 'WR_PPR': {'spearman': 0.998624992737, 'coverage': 32, 'mean_abs_rank_difference': 0.21875, 'max_abs_rank_difference': 2.0, 'easiest_quartile_overlap_of_8': 8, 'hardest_quartile_overlap_of_8': 7}, 'TE_PPR': {'spearman': 0.999816698743, 'coverage': 32, 'mean_abs_rank_difference': 0.0625, 'max_abs_rank_difference': 0.5, 'easiest_quartile_overlap_of_8': 8, 'hardest_quartile_overlap_of_8': 8}}, 'summary': {'median_spearman': 0.998899957151, 'cells_at_or_above_0_50': 7, 'minimum_cell_spearman': 0.994958328942, 'all_7_cells_coverage_32': True, 'pass': True}, 'outcome_firewall': {'historical_eval_stat_rows_2015_2025_read': False, 'historical_target_outcomes_2015_2025_opened': False, 'phase2_outcome_test_authorized': False, 'phase2_preregistration_authorized': True}, 'production_change_authorized': False, 'next_phase': {'phase': '2A', 'name': 'retrospective predictive validation preregistration', 'outcomes_may_be_opened_before_phase2a_freeze': False}}
+
+          (root / "schedule_utility_v1_phase1e_b_private_bridge.json").write_text(
+              json.dumps(result, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          s = result["summary"]
+          lines = [
+              "# Schedule Utility V1 — Phase 1E-B Private 4for4 Source Bridge",
+              "",
+              "**Decision:** `PASS_PRIVATE_SOURCE_BRIDGE`",
+              "",
+              "The preregistered source bridge passed using the exact frozen LOG-SAPA V1 "
+              "implementation and the previously admitted private 4for4 source bundle.",
+              "",
+              "## Frozen primary gate",
+              "",
+              f"- Median Spearman: **{s['median_spearman']:.6f}** (required >= 0.60)",
+              f"- Cells with Spearman >= 0.50: **{s['cells_at_or_above_0_50']}/7** (required >= 6/7)",
+              f"- Minimum cell Spearman: **{s['minimum_cell_spearman']:.6f}** (required >= 0.30)",
+              "- Result: **PASS**",
+              "",
+              "## Cell-level aggregate diagnostics",
+              "",
+          ]
+          for cell, payload in result["cell_results"].items():
+              lines.append(
+                  f"- {cell}: Spearman **{payload['spearman']:.6f}**, "
+                  f"coverage {payload['coverage']}/32, "
+                  f"mean |rank diff| {payload['mean_abs_rank_difference']:.5f}"
+              )
+
+          lines += [
+              "",
+              "## Privacy / licensing",
+              "",
+              "- Private 4for4 source hashes were reverified before computation.",
+              "- No provider team-level values are frozen or committed.",
+              "- No raw/licensed 4for4 rows are committed.",
+              "- The public GitHub Action does not read the private provider CSVs.",
+              "",
+              "## Outcome firewall",
+              "",
+              "- Historical 2015-2025 validation outcomes remain unopened.",
+              "- Phase 2 outcome testing is **not yet authorized**.",
+              "- Phase 2 preregistration is now authorized.",
+              "",
+              "## Production impact",
+              "",
+              "None.",
+              "",
+              "Next: **Phase 2A — retrospective predictive validation preregistration**.",
+              "",
+          ]
+          (root / "schedule_utility_v1_phase1e_b_private_bridge.md").write_text(
+              "\n".join(lines), encoding="utf-8"
+          )
+          PY
+
+      - name: Validate frozen bridge result and licensing firewall
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import statistics
+          from pathlib import Path
+
+          root = Path("research/schedule-utility-v1")
+          p = root / "schedule_utility_v1_phase1e_b_private_bridge.json"
+          d = json.loads(p.read_text(encoding="utf-8"))
+
+          assert d["study_id"] == "schedule-utility-v1"
+          assert d["phase"] == "1E-B"
+          assert d["status"] == "PASS_PRIVATE_SOURCE_BRIDGE"
+          assert d["metric_id"] == "LOG-SAPA-V1"
+          assert d["frozen_log_sapa_sha256"] == (
+              "9ab4ec5b21ef9ef57e476e861a7293dbc886b9bc9d7cc5f0bd5cc982cc729ee6"
+          )
+          assert d["phase1e_a_freeze_commit"] == (
+              "b484f096516f858772953c438f084e0a69b250c0"
+          )
+          assert d["phase1e_a_public_predictor_git_blob_sha1"] == (
+              "cf1ed116aebb6803747898e7b1cfd76c5b70e451"
+          )
+
+          recompute_sha = hashlib.sha256(
+              (root / "schedule_utility_v1_phase1e_b_private_bridge_recompute.py")
+              .read_bytes()
+          ).hexdigest()
+          assert d["private_bridge_method"]["recompute_script_sha256"] == recompute_sha
+          assert recompute_sha == "0aea755513a2d43b3979baf71f38e99a03d0a7ec0f0c04c67dba03f7e6830f8f"
+
+          assert d["private_bridge_method"]["provider_source_hashes_verified"] is True
+          assert d["private_bridge_method"]["provider_rows_committed"] is False
+          assert d["private_bridge_method"]["provider_team_values_committed"] is False
+          assert d["private_bridge_method"]["secondary_diagnostics_are_gate_inputs"] is False
+
+          expected_hashes = {'afpa_half': '57c1a228ae849496092ac8404be33072d974a6eb0c251646e58b579b0892b430', 'qb_half': 'd054b074162cfe748e22c4ce00dd3bf07aee97f3eaf04cd4c737be46c5d18b47', 'rb_half': '1f54c87762ddfff9a47e7219c1e6ea48f4905507f37e119dfaf55c3b49b22f75', 'wr_half': 'c3ae5f0af52beaa3a258785b4dbbf63ca21dcf73847a067f1daa9391db9279e4', 'te_half': 'cfae6b10a1eb6dc428004c2a599f85f4d5ab86499d3585e40e260adc03ddd325', 'rb_ppr': 'cda98824bc3a1f79ccc016a93e31da80c6c477eac1e5281536acc005979856b3', 'wr_ppr': 'ef323c774adcc680944ee2db8414f598eb96b714d09ec44263ba3a49309c8d4d', 'te_ppr': 'cdab088a1a128305acfd7820edf2c19241135a24be1a0f852dd9b8a7cdc1894f'}
+          assert d["private_source_hashes"] == expected_hashes
+
+          gate = d["frozen_gate"]
+          assert gate == {
+              "median_spearman_at_least": 0.6,
+              "cells_at_or_above_0_50_at_least": 6,
+              "no_cell_below": 0.3,
+          }
+
+          expected_cells = [
+              "QB_HALF", "RB_HALF", "WR_HALF", "TE_HALF",
+              "RB_PPR", "WR_PPR", "TE_PPR",
+          ]
+          assert set(d["cell_results"]) == set(expected_cells)
+
+          rhos = []
+          for cell in expected_cells:
+              payload = d["cell_results"][cell]
+              assert set(payload) == {
+                  "spearman",
+                  "coverage",
+                  "mean_abs_rank_difference",
+                  "max_abs_rank_difference",
+                  "easiest_quartile_overlap_of_8",
+                  "hardest_quartile_overlap_of_8",
+              }
+              assert payload["coverage"] == 32
+              assert 0 <= payload["easiest_quartile_overlap_of_8"] <= 8
+              assert 0 <= payload["hardest_quartile_overlap_of_8"] <= 8
+              rhos.append(float(payload["spearman"]))
+
+          median = statistics.median(rhos)
+          count50 = sum(r >= 0.50 for r in rhos)
+          minimum = min(rhos)
+
+          assert abs(median - d["summary"]["median_spearman"]) < 1e-12
+          assert count50 == d["summary"]["cells_at_or_above_0_50"]
+          assert abs(minimum - d["summary"]["minimum_cell_spearman"]) < 1e-12
+          assert d["summary"]["all_7_cells_coverage_32"] is True
+          assert d["summary"]["pass"] is True
+
+          assert median >= gate["median_spearman_at_least"]
+          assert count50 >= gate["cells_at_or_above_0_50_at_least"]
+          assert minimum >= gate["no_cell_below"]
+
+          firewall = d["outcome_firewall"]
+          assert firewall["historical_eval_stat_rows_2015_2025_read"] is False
+          assert firewall["historical_target_outcomes_2015_2025_opened"] is False
+          assert firewall["phase2_outcome_test_authorized"] is False
+          assert firewall["phase2_preregistration_authorized"] is True
+          assert d["production_change_authorized"] is False
+          assert d["next_phase"]["phase"] == "2A"
+          assert d["next_phase"]["outcomes_may_be_opened_before_phase2a_freeze"] is False
+
+          # Freeze artifact must not contain provider team-level values.
+          nfl_teams = {
+              "ARI","ATL","BAL","BUF","CAR","CHI","CIN","CLE",
+              "DAL","DEN","DET","GB","HOU","IND","JAX","KC",
+              "LAC","LAR","LV","MIA","MIN","NE","NO","NYG",
+              "NYJ","PHI","PIT","SEA","SF","TB","TEN","WAS",
+          }
+
+          def walk_keys(value):
+              if isinstance(value, dict):
+                  for key, child in value.items():
+                      yield str(key)
+                      yield from walk_keys(child)
+              elif isinstance(value, list):
+                  for child in value:
+                      yield from walk_keys(child)
+
+          assert not (set(walk_keys(d)) & nfl_teams)
+
+          print(
+              "PASS: private bridge aggregate freeze validated; "
+              "provider row-level values absent; outcomes remain sealed."
+          )
+          PY
+
+      - name: Prove zero production mutation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test "$(sha256sum index.html | awk '{print $1}')" = "$INDEX_SHA"
+          test "$(sha256sum free-agent-board.html | awk '{print $1}')" = "$FA_SHA"
+
+          git diff --check
+
+          CHANGED="$(git status --porcelain=v1 --untracked-files=all | awk '{print $2}')"
+          echo "$CHANGED"
+          if [ -n "$CHANGED" ]; then
+            while IFS= read -r path; do
+              [ -z "$path" ] && continue
+              case "$path" in
+                research/schedule-utility-v1/*) ;;
+                *) echo "Unexpected non-research mutation: $path"; exit 1 ;;
+              esac
+            done <<< "$CHANGED"
+          fi
+
+          echo "PASS: zero production mutation."
+
+      - name: Commit frozen Phase 1E-B artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git add \
+            research/schedule-utility-v1/schedule_utility_v1_phase1e_b_private_bridge_recompute.py \
+            research/schedule-utility-v1/schedule_utility_v1_phase1e_b_private_bridge.json \
+            research/schedule-utility-v1/schedule_utility_v1_phase1e_b_private_bridge.md
+
+          if git diff --cached --quiet; then
+            echo "Phase 1E-B artifacts already frozen; no commit required."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Freeze Schedule Utility V1 Phase 1E-B private source bridge"
+          git push origin HEAD:main
+
+      - name: Closeout
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## B27 Schedule Utility V1 — Phase 1E-B"
+            echo
+            echo "- Decision: **PASS_PRIVATE_SOURCE_BRIDGE**"
+            echo "- Median Spearman: **0.998900**"
+            echo "- Cells >= 0.50: **7/7**"
+            echo "- Minimum cell Spearman: **0.994958**"
+            echo "- Frozen gate: **PASS**"
+            echo "- Private source hashes reverified: **YES**"
+            echo "- Provider team-level values committed: **NO**"
+            echo "- Historical 2015-2025 outcomes opened: **NO**"
+            echo "- Phase 2 outcome testing authorized: **NO**"
+            echo "- Phase 2 preregistration authorized: **YES**"
+            echo "- Production change: **NONE**"
+            echo "- Next: **Phase 2A retrospective predictive validation preregistration**"
+          } >> "$GITHUB_STEP_SUMMARY"
