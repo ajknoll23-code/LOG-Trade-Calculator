@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""
+Schedule Utility V1 — Phase 1C source-only feasibility catalog.
+
+This phase intentionally reads ONLY public GitHub release metadata.
+It must not download or inspect historical stat, schedule, play-by-play,
+fantasy-point, or outcome rows.
+
+Purpose:
+  1. Determine whether public nflverse metadata exposes enough historical
+     weekly-player-stat and schedule assets to support a future
+     look-ahead-safe reconstruction study.
+  2. Freeze the scientific distinction between proprietary 4for4 aFPA
+     and the proposed public reconstruction, LOG-SAPA V1.
+  3. Keep all realized outcomes sealed until the exact reconstruction
+     algorithm is preregistered in a later phase.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+REPO = "nflverse/nflverse-data"
+API_BASE = f"https://api.github.com/repos/{REPO}/releases/tags"
+STATS_TAG = "stats_player"
+SCHEDULES_TAG = "schedules"
+WEEKLY_RE = re.compile(
+    r"^stats_player_week_(20[0-9]{2})\.(?:csv|csv\.gz|parquet|rds|qs)$",
+    re.IGNORECASE,
+)
+
+DECISION = "PASS_PUBLIC_RECONSTRUCTION_FEASIBILITY_EXACT_PROVIDER_ARCHIVE_UNPROVEN"
+
+def api_get_json(url: str) -> dict[str, Any]:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "LOG-Trade-Calculator-Schedule-Utility-V1-Phase1C",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    token = os.environ.get("GH_TOKEN", "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"GitHub metadata request returned HTTP {resp.status}: {url}")
+            raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")[:500]
+        raise RuntimeError(
+            f"GitHub metadata request failed HTTP {exc.code}: {url}; body={body!r}"
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"GitHub metadata request failed: {url}: {exc}") from exc
+
+    value = json.loads(raw.decode("utf-8"))
+    if not isinstance(value, dict):
+        raise RuntimeError(f"Expected JSON object from {url}")
+    return value
+
+def asset_catalog(release: dict[str, Any]) -> list[dict[str, Any]]:
+    assets = release.get("assets")
+    if not isinstance(assets, list):
+        raise RuntimeError("Release metadata missing assets list")
+    out = []
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        name = str(asset.get("name") or "").strip()
+        if not name:
+            continue
+        # Metadata only. Never use browser_download_url in Phase 1C.
+        out.append({
+            "name": name,
+            "size_bytes": int(asset.get("size") or 0),
+            "updated_at": asset.get("updated_at"),
+        })
+    return sorted(out, key=lambda x: x["name"])
+
+def derive_weekly_years(assets: list[dict[str, Any]]) -> dict[int, list[str]]:
+    years: dict[int, list[str]] = {}
+    for asset in assets:
+        match = WEEKLY_RE.match(asset["name"])
+        if not match:
+            continue
+        year = int(match.group(1))
+        years.setdefault(year, []).append(asset["name"])
+    for names in years.values():
+        names.sort()
+    return dict(sorted(years.items()))
+
+def scientific_core() -> dict[str, Any]:
+    return {
+        "study_id": "schedule-utility-v1",
+        "phase": "1C",
+        "metric_reconstruction": {
+            "metric_id": "LOG-SAPA-V1",
+            "metric_name": "LOG Schedule-Adjusted Points Allowed V1",
+            "is_4for4_afpa": False,
+            "may_be_labeled_as_4for4": False,
+            "provider_equivalence_claim_authorized": False,
+            "exact_algorithm_frozen": False,
+            "algorithm_use_authorized": False,
+        },
+        "lookahead_firewall": {
+            "historical_stat_rows_downloaded_in_phase1c": False,
+            "historical_stat_rows_read_in_phase1c": False,
+            "historical_outcome_rows_read_in_phase1c": False,
+            "target_or_future_week_rows_read_in_phase1c": False,
+            "future_method_requirement": (
+                "For target week W, predictor construction may use only information "
+                "available strictly before the target game/week under a separately "
+                "preregistered algorithm."
+            ),
+        },
+        "fourforfour_historical_archive": {
+            "status": "UNPROVEN_NOT_LOCATED",
+            "nonexistence_claim": False,
+            "admission_requirements": [
+                "snapshot has authoritative capture timestamp or as-of week",
+                "snapshot predates every target outcome it is used to predict",
+                "relevant QB/RB/WR/TE source coverage is documented",
+                "licensing permits private research use and aggregate derived reporting",
+            ],
+        },
+        "next_phase": {
+            "phase": "1D",
+            "name": "public reconstruction method preregistration",
+            "historical_stat_rows_may_be_read_before_phase1d_freeze": False,
+            "goal": (
+                "Freeze the exact LOG-SAPA V1 construction, scoring-format mapping, "
+                "minimum-history rules, schedule adjustment, normalization, missing-data "
+                "policy, and validation targets before reading historical stat rows."
+            ),
+        },
+    }
+
+def build_result() -> dict[str, Any]:
+    stats_release = api_get_json(f"{API_BASE}/{STATS_TAG}")
+    schedules_release = api_get_json(f"{API_BASE}/{SCHEDULES_TAG}")
+
+    stats_assets = asset_catalog(stats_release)
+    schedule_assets = asset_catalog(schedules_release)
+    weekly_years = derive_weekly_years(stats_assets)
+
+    historical_years = sorted(y for y in weekly_years if y < 2026)
+    schedule_name_hits = [
+        a["name"] for a in schedule_assets
+        if ("game" in a["name"].lower() or "schedule" in a["name"].lower())
+    ]
+
+    # Feasibility only. We deliberately do NOT open/download any asset.
+    enough_weekly_history = len(historical_years) >= 5
+    schedules_metadata_available = len(schedule_assets) > 0 and len(schedule_name_hits) > 0
+    feasible = enough_weekly_history and schedules_metadata_available
+
+    if not feasible:
+        raise RuntimeError(
+            "Public reconstruction metadata feasibility gate failed: "
+            f"historical_years={historical_years}, "
+            f"schedule_assets={len(schedule_assets)}, "
+            f"schedule_name_hits={schedule_name_hits[:10]}"
+        )
+
+    core = scientific_core()
+    result = {
+        "schema_version": 1,
+        "generated_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "status": DECISION,
+        "outcome_data_read": False,
+        "outcome_association_opened": False,
+        "production_change_authorized": False,
+        "phase2_outcome_test_authorized": False,
+        "source_catalog_mode": "PUBLIC_RELEASE_METADATA_ONLY",
+        "data_assets_downloaded": False,
+        "historical_stat_rows_read": False,
+        "historical_schedule_rows_read": False,
+        "historical_outcome_rows_read": False,
+        "scientific_core": core,
+        "public_source_catalog": {
+            "repository": REPO,
+            "stats_release_tag": STATS_TAG,
+            "schedules_release_tag": SCHEDULES_TAG,
+            "weekly_player_stat_asset_years": sorted(weekly_years),
+            "historical_weekly_player_stat_years_pre_2026": historical_years,
+            "historical_year_count_pre_2026": len(historical_years),
+            "weekly_player_stat_asset_names_by_year": {
+                str(year): names for year, names in weekly_years.items()
+            },
+            "schedule_release_asset_names": [a["name"] for a in schedule_assets],
+            "schedule_asset_name_hits": schedule_name_hits,
+            "asset_rows_opened": 0,
+        },
+        "feasibility": {
+            "at_least_five_pre_2026_weekly_stat_seasons": enough_weekly_history,
+            "schedule_release_metadata_available": schedules_metadata_available,
+            "public_reconstruction_path_feasible": feasible,
+            "exact_4for4_historical_archive_feasible": None,
+            "exact_4for4_archive_interpretation": (
+                "Not proven from available evidence; no claim that such an archive "
+                "does not exist."
+            ),
+        },
+        "phase2_readiness": {
+            "ready": False,
+            "reason": (
+                "The public source path is feasible, but the exact LOG-SAPA V1 "
+                "algorithm must be preregistered before any historical stat rows "
+                "are read."
+            ),
+            "outcomes_remain_sealed": True,
+            "next_phase": "1D public reconstruction method preregistration",
+        },
+    }
+    # Convenience copies for simple downstream assertions.
+    result["study_id"] = core["study_id"]
+    result["phase"] = core["phase"]
+    return result
+
+def write_markdown(result: dict[str, Any], path: Path) -> None:
+    cat = result["public_source_catalog"]
+    feas = result["feasibility"]
+    core = result["scientific_core"]
+    years = cat["historical_weekly_player_stat_years_pre_2026"]
+    schedule_hits = cat["schedule_asset_name_hits"]
+
+    lines = [
+        "# Schedule Utility V1 — Phase 1C Historical Source and Reconstruction Feasibility",
+        "",
+        f"**Decision:** `{result['status']}`",
+        "",
+        "Phase 1C is source-only and outcome-blind. It queried public GitHub release "
+        "metadata only; it did not download or inspect historical stat, schedule, "
+        "play-by-play, fantasy-point, or outcome rows.",
+        "",
+        "## Public reconstruction feasibility",
+        "",
+        f"- Public source repository: `{cat['repository']}`",
+        f"- Pre-2026 weekly-stat seasons visible in release metadata: **{len(years)}**",
+        f"- Historical years cataloged: `{years}`",
+        f"- Schedule-like release assets detected: **{len(schedule_hits)}**",
+        f"- Public reconstruction path feasible: **{feas['public_reconstruction_path_feasible']}**",
+        "- Data assets downloaded: **NO**",
+        "- Historical rows read: **NO**",
+        "",
+        "## Frozen naming firewall",
+        "",
+        f"- Proposed public metric: **{core['metric_reconstruction']['metric_name']}** "
+        f"(`{core['metric_reconstruction']['metric_id']}`)",
+        "- LOG-SAPA V1 is **not** 4for4 aFPA.",
+        "- It may not be labeled, represented, or implied to be a 4for4 metric.",
+        "- Provider equivalence is not claimed.",
+        "",
+        "## 4for4 historical archive status",
+        "",
+        "Status: `UNPROVEN_NOT_LOCATED`.",
+        "",
+        "This is not a claim that an exact historical 4for4 archive does not exist. "
+        "Any future provider archive must satisfy timestamp/as-of-week, look-ahead, "
+        "coverage, and licensing requirements before admission.",
+        "",
+        "## Outcome firewall",
+        "",
+        "- Phase 2 outcome testing remains unauthorized.",
+        "- Historical stat rows remain unopened.",
+        "- Historical outcomes remain unopened.",
+        "- The exact LOG-SAPA V1 algorithm is not yet frozen.",
+        "",
+        "## Next phase",
+        "",
+        "**Phase 1D — Public Reconstruction Method Preregistration.** Freeze the exact "
+        "LOG-SAPA V1 algorithm before historical stat rows are read.",
+        "",
+        "## Production impact",
+        "",
+        "None. No player FV, pick FV, Package Adjustment, Team Utility, Market Value, "
+        "Trade Verdict, or production UI change is authorized.",
+        "",
+    ]
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+def validate_existing(path: Path) -> None:
+    existing = json.loads(path.read_text(encoding="utf-8"))
+    assert existing["study_id"] == "schedule-utility-v1"
+    assert existing["phase"] == "1C"
+    assert existing["status"] == DECISION
+    assert existing["outcome_data_read"] is False
+    assert existing["outcome_association_opened"] is False
+    assert existing["production_change_authorized"] is False
+    assert existing["phase2_outcome_test_authorized"] is False
+    assert existing["data_assets_downloaded"] is False
+    assert existing["historical_stat_rows_read"] is False
+    assert existing["historical_outcome_rows_read"] is False
+    assert existing["scientific_core"] == scientific_core()
+    assert existing["phase2_readiness"]["ready"] is False
+    assert existing["phase2_readiness"]["outcomes_remain_sealed"] is True
+
+def selftest() -> None:
+    names = [
+        {"name": "stats_player_week_2020.csv", "size_bytes": 1, "updated_at": None},
+        {"name": "stats_player_week_2020.parquet", "size_bytes": 1, "updated_at": None},
+        {"name": "stats_player_week_2021.csv.gz", "size_bytes": 1, "updated_at": None},
+        {"name": "stats_player_reg_2020.csv", "size_bytes": 1, "updated_at": None},
+    ]
+    got = derive_weekly_years(names)
+    assert got == {
+        2020: ["stats_player_week_2020.csv", "stats_player_week_2020.parquet"],
+        2021: ["stats_player_week_2021.csv.gz"],
+    }
+    core = scientific_core()
+    assert core["metric_reconstruction"]["is_4for4_afpa"] is False
+    assert core["metric_reconstruction"]["exact_algorithm_frozen"] is False
+    assert core["lookahead_firewall"]["historical_stat_rows_read_in_phase1c"] is False
+    assert core["fourforfour_historical_archive"]["status"] == "UNPROVEN_NOT_LOCATED"
+    print("PASS: Phase 1C source-catalog selftest")
+
+def main() -> None:
+    if "--selftest" in sys.argv:
+        selftest()
+        return
+
+    out_dir = Path("research/schedule-utility-v1")
+    json_path = out_dir / "schedule_utility_v1_phase1c_source_feasibility.json"
+    md_path = out_dir / "schedule_utility_v1_phase1c_source_feasibility.md"
+
+    if json_path.exists():
+        validate_existing(json_path)
+        if not md_path.exists():
+            write_markdown(json.loads(json_path.read_text(encoding="utf-8")), md_path)
+        print("PASS: existing Phase 1C freeze is scientifically identical.")
+        return
+
+    result = build_result()
+    json_path.write_text(
+        json.dumps(result, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    write_markdown(result, md_path)
+    print(json.dumps({
+        "decision": result["status"],
+        "historical_weekly_stat_year_count": (
+            result["public_source_catalog"]["historical_year_count_pre_2026"]
+        ),
+        "data_assets_downloaded": False,
+        "historical_stat_rows_read": False,
+        "outcomes_read": False,
+        "phase2_ready": False,
+    }, indent=2))
+
+if __name__ == "__main__":
+    main()
