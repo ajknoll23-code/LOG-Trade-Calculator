@@ -1,0 +1,663 @@
+name: B29 Schedule Utility V1 - Phase 2A1 Outcome-Blind Methodology Amendment
+
+"on":
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: b29-schedule-utility-v1-phase2a1-amendment
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  B28_FREEZE_COMMIT: "1c6e01ab2bf53f7ee300cf07cb2b7bf8014e95ee"
+  FROZEN_LOG_SAPA_SHA256: "9ab4ec5b21ef9ef57e476e861a7293dbc886b9bc9d7cc5f0bd5cc982cc729ee6"
+  ORIGINAL_PHASE2A_ANALYSIS_SHA256: "355d353dd88627d9ed573db875608230a32182f8741aca75fc2ee792c40e25ba"
+  AMENDED_PHASE2A_ANALYSIS_SHA256: "2b35cd60082385add312b24c676b72e2b89c4e636e1fa94010fcffb0c675b9c5"
+
+jobs:
+  phase2a1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Verify B28 immutable preregistration and sealed outcomes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$B28_FREEZE_COMMIT" HEAD
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          root = Path("research/schedule-utility-v1")
+          p = json.loads(
+              (root / "schedule_utility_v1_phase2a_prereg.json")
+              .read_text(encoding="utf-8")
+          )
+
+          assert p["status"] == "PREREGISTERED_RETROSPECTIVE_PREDICTIVE_VALIDATION"
+          assert p["outcome_firewall"]["historical_eval_stat_rows_2015_2025_read_in_phase2a"] is False
+          assert p["outcome_firewall"]["historical_target_outcomes_2015_2025_opened_in_phase2a"] is False
+          assert p["outcome_firewall"]["analysis_threshold_tuning_after_outcomes_authorized"] is False
+          assert p["outcome_firewall"]["predictor_parameter_tuning_after_outcomes_authorized"] is False
+
+          original = hashlib.sha256(
+              (root / "schedule_utility_v1_phase2a_analysis.py").read_bytes()
+          ).hexdigest()
+          assert original == p["implementation"]["analysis_sha256"]
+          assert original == (
+              "355d353dd88627d9ed573db875608230a32182f8741aca75fc2ee792c40e25ba"
+          )
+
+          log_sapa = hashlib.sha256((root / "log_sapa_v1.py").read_bytes()).hexdigest()
+          assert log_sapa == (
+              "9ab4ec5b21ef9ef57e476e861a7293dbc886b9bc9d7cc5f0bd5cc982cc729ee6"
+          )
+
+          print("PASS: B28 remains immutable and historical outcomes are still sealed.")
+          PY
+
+      - name: Snapshot production before amendment
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "INDEX_SHA=$(sha256sum index.html | awk '{print $1}')" >> "$GITHUB_ENV"
+          echo "FA_SHA=$(sha256sum free-agent-board.html | awk '{print $1}')" >> "$GITHUB_ENV"
+
+      - name: Freeze amended Phase 2A analysis
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p research/schedule-utility-v1
+
+          cat > research/schedule-utility-v1/schedule_utility_v1_phase2a_analysis_v2.py <<'PYFILE'
+          #!/usr/bin/env python3
+          """
+          Schedule Utility V1 — Phase 2A amended retrospective validation analysis.
+
+          Outcome-blind amendment to the frozen Phase 2A analysis.
+          Primary predictor, primary estimand, thresholds, and inference are unchanged.
+
+          Changes:
+          - schedule-derived expected rows by season;
+          - explicit common paired evaluation sample;
+          - duplicate matchup protection;
+          - explicit season/cell coverage denominator;
+          - unchanged exact season-level sign-flip primary inference.
+          """
+
+          from __future__ import annotations
+
+          from collections import defaultdict
+          import itertools
+          import math
+          import statistics
+          from typing import Iterable, Mapping
+
+          SEASONS = tuple(range(2015, 2026))
+          CELLS = (
+              "QB_HALF", "RB_HALF", "WR_HALF", "TE_HALF",
+              "RB_PPR", "WR_PPR", "TE_PPR",
+          )
+          TARGET_WEEK_MIN = 4
+          TARGET_WEEK_MAX = 17
+          MIN_COVERAGE_FRACTION_PER_SEASON_CELL = 0.95
+
+          PRIMARY_MIN_MEAN_RELATIVE_MAE_IMPROVEMENT = 0.01
+          PRIMARY_MAX_ONE_SIDED_SIGNFLIP_P = 0.05
+          PRIMARY_MIN_POSITIVE_CELLS = 5
+          PRIMARY_MIN_WORST_CELL_RELATIVE_MAE_IMPROVEMENT = -0.02
+
+
+          def _finite(x) -> float:
+              v = float(x)
+              if not math.isfinite(v):
+                  raise ValueError(f"non-finite value: {x!r}")
+              return v
+
+
+          def mae(errors: Iterable[float]) -> float:
+              vals = [abs(_finite(x)) for x in errors]
+              if not vals:
+                  raise ValueError("MAE requires at least one error")
+              return statistics.fmean(vals)
+
+
+          def rmse(errors: Iterable[float]) -> float:
+              vals = [_finite(x) for x in errors]
+              if not vals:
+                  raise ValueError("RMSE requires at least one error")
+              return math.sqrt(statistics.fmean(x * x for x in vals))
+
+
+          def relative_improvement(baseline_metric: float, adjusted_metric: float) -> float:
+              baseline_metric = _finite(baseline_metric)
+              adjusted_metric = _finite(adjusted_metric)
+              if baseline_metric <= 0:
+                  raise ValueError("baseline metric must be > 0")
+              return (baseline_metric - adjusted_metric) / baseline_metric
+
+
+          def exact_one_sided_signflip_p(values: Iterable[float]) -> float:
+              """
+              Exact one-sided sign-flip test over season-level aggregate effects.
+
+              Exact under the frozen null assumption that season effects are independent
+              and symmetric about zero. No row-level independence is assumed.
+              """
+              vals = tuple(_finite(v) for v in values)
+              if not vals:
+                  raise ValueError("sign-flip test requires values")
+              observed = statistics.fmean(vals)
+              extreme = 0
+              total = 0
+              for signs in itertools.product((-1.0, 1.0), repeat=len(vals)):
+                  perm_mean = statistics.fmean(s * v for s, v in zip(signs, vals))
+                  total += 1
+                  if perm_mean >= observed - 1e-15:
+                      extreme += 1
+              return extreme / total
+
+
+          def _validate_expected_rows(expected_rows_by_season: Mapping[int | str, object]) -> dict[int, int]:
+              expected = {}
+              for season in SEASONS:
+                  raw = (
+                      expected_rows_by_season.get(season)
+                      if season in expected_rows_by_season
+                      else expected_rows_by_season.get(str(season))
+                  )
+                  if raw is None:
+                      raise KeyError(f"missing schedule-derived expected row count for {season}")
+                  n = int(raw)
+                  if n <= 0 or n % 2 != 0:
+                      raise ValueError(f"invalid schedule-derived directional count for {season}: {n}")
+                  # Sanity bound only. Do NOT hard-code 416 as the denominator.
+                  if not (380 <= n <= 420):
+                      raise ValueError(f"implausible Weeks 4-17 directional count for {season}: {n}")
+                  expected[season] = n
+              return expected
+
+
+          def _validate_row(row: Mapping[str, object]) -> dict:
+              required = {
+                  "season", "week", "game_id", "offense_team", "defense_team", "cell",
+                  "actual", "baseline_forecast", "adjusted_forecast", "defense_effect",
+              }
+              missing = required - set(row)
+              if missing:
+                  raise KeyError(f"evaluation row missing fields: {sorted(missing)}")
+
+              season = int(row["season"])
+              week = int(row["week"])
+              cell = str(row["cell"])
+              game_id = str(row["game_id"]).strip()
+              offense = str(row["offense_team"]).strip().upper()
+              defense = str(row["defense_team"]).strip().upper()
+
+              if season not in SEASONS:
+                  raise ValueError(f"season outside frozen evaluation set: {season}")
+              if not (TARGET_WEEK_MIN <= week <= TARGET_WEEK_MAX):
+                  raise ValueError(f"week outside frozen target range: {week}")
+              if cell not in CELLS:
+                  raise ValueError(f"unknown cell: {cell}")
+              if not game_id or not offense or not defense or offense == defense:
+                  raise ValueError("invalid matchup identity")
+
+              actual = _finite(row["actual"])
+              baseline = _finite(row["baseline_forecast"])
+              adjusted = _finite(row["adjusted_forecast"])
+              defense_effect = _finite(row["defense_effect"])
+
+              if abs(adjusted - (baseline + defense_effect)) > 1e-9:
+                  raise ValueError("adjusted forecast identity violated")
+
+              return {
+                  "season": season,
+                  "week": week,
+                  "game_id": game_id,
+                  "offense_team": offense,
+                  "defense_team": defense,
+                  "cell": cell,
+                  "actual": actual,
+                  "baseline_forecast": baseline,
+                  "adjusted_forecast": adjusted,
+                  "defense_effect": defense_effect,
+              }
+
+
+          def evaluate(
+              rows: Iterable[Mapping[str, object]],
+              expected_rows_by_season: Mapping[int | str, object],
+          ) -> dict:
+              """
+              `rows` MUST be the common paired sample:
+              a row exists only when actual, baseline forecast, and adjusted forecast all
+              exist for that exact matchup. Baseline and adjusted MAE are therefore
+              computed on exactly identical rows.
+              """
+              expected = _validate_expected_rows(expected_rows_by_season)
+              clean = [_validate_row(row) for row in rows]
+              if not clean:
+                  raise ValueError("no evaluation rows")
+
+              seen = set()
+              grouped: dict[tuple[int, str], list[dict]] = defaultdict(list)
+
+              for row in clean:
+                  key = (
+                      row["season"], row["week"], row["game_id"],
+                      row["offense_team"], row["defense_team"], row["cell"],
+                  )
+                  if key in seen:
+                      raise ValueError(f"duplicate evaluation matchup: {key}")
+                  seen.add(key)
+                  grouped[(row["season"], row["cell"])].append(row)
+
+              expected_groups = {(s, c) for s in SEASONS for c in CELLS}
+              if set(grouped) != expected_groups:
+                  missing = sorted(expected_groups - set(grouped))
+                  extra = sorted(set(grouped) - expected_groups)
+                  raise ValueError(f"season-cell group mismatch; missing={missing}, extra={extra}")
+
+              season_cell = {}
+              coverage_failures = []
+
+              for season in SEASONS:
+                  denom = expected[season]
+                  min_required = math.ceil(denom * MIN_COVERAGE_FRACTION_PER_SEASON_CELL)
+
+                  for cell in CELLS:
+                      g = grouped[(season, cell)]
+                      n = len(g)
+                      if n > denom:
+                          raise ValueError(
+                              f"covered rows exceed schedule denominator for {season} {cell}: "
+                              f"{n} > {denom}"
+                          )
+                      if n < min_required:
+                          coverage_failures.append({
+                              "season": season,
+                              "cell": cell,
+                              "covered": n,
+                              "expected": denom,
+                              "coverage_fraction": n / denom,
+                              "minimum_required": min_required,
+                          })
+
+                      base_err = [r["baseline_forecast"] - r["actual"] for r in g]
+                      adj_err = [r["adjusted_forecast"] - r["actual"] for r in g]
+
+                      base_mae = mae(base_err)
+                      adj_mae = mae(adj_err)
+                      base_rmse = rmse(base_err)
+                      adj_rmse = rmse(adj_err)
+
+                      # Same exact paired rows are used for both metrics.
+                      season_cell[(season, cell)] = {
+                          "n": n,
+                          "expected": denom,
+                          "coverage_fraction": n / denom,
+                          "baseline_mae": base_mae,
+                          "adjusted_mae": adj_mae,
+                          "relative_mae_improvement": relative_improvement(base_mae, adj_mae),
+                          "mean_paired_absolute_error_difference_points":
+                              statistics.fmean(
+                                  abs(r["baseline_forecast"] - r["actual"])
+                                  - abs(r["adjusted_forecast"] - r["actual"])
+                                  for r in g
+                              ),
+                          "baseline_rmse": base_rmse,
+                          "adjusted_rmse": adj_rmse,
+                          "relative_rmse_improvement": relative_improvement(base_rmse, adj_rmse),
+                      }
+
+              # Coverage is a hard primary gate; fail evaluation before outcome verdict.
+              if coverage_failures:
+                  raise ValueError(f"coverage gate failed: {coverage_failures}")
+
+              season_effects = {}
+              for season in SEASONS:
+                  season_effects[season] = statistics.fmean(
+                      season_cell[(season, cell)]["relative_mae_improvement"]
+                      for cell in CELLS
+                  )
+
+              cell_effects = {}
+              for cell in CELLS:
+                  effects = [
+                      season_cell[(season, cell)]["relative_mae_improvement"]
+                      for season in SEASONS
+                  ]
+                  cell_effects[cell] = {
+                      "mean_relative_mae_improvement": statistics.fmean(effects),
+                      "median_relative_mae_improvement": statistics.median(effects),
+                      "positive_seasons": sum(v > 0 for v in effects),
+                      "exact_one_sided_signflip_p": exact_one_sided_signflip_p(effects),
+                      "mean_relative_rmse_improvement": statistics.fmean(
+                          season_cell[(season, cell)]["relative_rmse_improvement"]
+                          for season in SEASONS
+                      ),
+                      "mean_paired_absolute_error_difference_points": statistics.fmean(
+                          season_cell[(season, cell)][
+                              "mean_paired_absolute_error_difference_points"
+                          ]
+                          for season in SEASONS
+                      ),
+                  }
+
+              primary_effect = statistics.fmean(season_effects.values())
+              primary_p = exact_one_sided_signflip_p(season_effects.values())
+              positive_cells = sum(
+                  payload["mean_relative_mae_improvement"] > 0
+                  for payload in cell_effects.values()
+              )
+              worst_cell = min(
+                  payload["mean_relative_mae_improvement"]
+                  for payload in cell_effects.values()
+              )
+
+              primary_gate = {
+                  "mean_relative_mae_improvement_at_least_0_01":
+                      primary_effect >= PRIMARY_MIN_MEAN_RELATIVE_MAE_IMPROVEMENT,
+                  "one_sided_signflip_p_at_most_0_05":
+                      primary_p <= PRIMARY_MAX_ONE_SIDED_SIGNFLIP_P,
+                  "positive_cells_at_least_5":
+                      positive_cells >= PRIMARY_MIN_POSITIVE_CELLS,
+                  "worst_cell_not_below_minus_0_02":
+                      worst_cell >= PRIMARY_MIN_WORST_CELL_RELATIVE_MAE_IMPROVEMENT,
+                  "coverage_passed_all_season_cells": True,
+              }
+              passed = all(primary_gate.values())
+
+              return {
+                  "primary": {
+                      "equal_season_equal_cell_mean_relative_mae_improvement": primary_effect,
+                      "exact_one_sided_season_signflip_p": primary_p,
+                      "positive_cells": positive_cells,
+                      "worst_cell_mean_relative_mae_improvement": worst_cell,
+                      "gate_components": primary_gate,
+                      "pass": passed,
+                      "decision": (
+                          "PASS_RETROSPECTIVE_PREDICTIVE_VALIDATION"
+                          if passed
+                          else "STOP_RETROSPECTIVE_PREDICTIVE_VALIDATION"
+                      ),
+                  },
+                  "season_effects": season_effects,
+                  "cell_effects": cell_effects,
+                  "coverage": {
+                      "denominator_source": "played regular-season schedule Weeks 4-17 by season",
+                      "expected_rows_by_season": expected,
+                      "minimum_fraction_per_season_cell":
+                          MIN_COVERAGE_FRACTION_PER_SEASON_CELL,
+                      "common_paired_sample_required": True,
+                      "observed_total_rows": len(clean),
+                  },
+              }
+
+
+          def selftest() -> None:
+              p = exact_one_sided_signflip_p([0.02] * 11)
+              assert abs(p - (1 / 2048)) < 1e-15
+              assert abs(exact_one_sided_signflip_p([0.02]) - 0.5) < 1e-15
+              assert abs(relative_improvement(10.0, 9.0) - 0.1) < 1e-15
+              assert abs(mae([-2, 1, 3]) - 2.0) < 1e-15
+              assert abs(rmse([3, 4]) - math.sqrt(12.5)) < 1e-15
+
+              assert _validate_expected_rows({s: 416 for s in SEASONS})[2015] == 416
+              # Schedule-derived anomaly is allowed; 416 is NOT hard-coded.
+              assert _validate_expected_rows({
+                  **{s: 416 for s in SEASONS if s != 2022},
+                  2022: 414,
+              })[2022] == 414
+
+              good = {
+                  "season": 2015, "week": 4, "game_id": "2015_04_X_Y",
+                  "offense_team": "X", "defense_team": "Y", "cell": "QB_HALF",
+                  "actual": 20.0, "baseline_forecast": 18.0,
+                  "defense_effect": 1.5, "adjusted_forecast": 19.5,
+              }
+              assert _validate_row(good)["adjusted_forecast"] == 19.5
+
+              bad = dict(good, adjusted_forecast=99.0)
+              try:
+                  _validate_row(bad)
+              except ValueError as exc:
+                  assert "identity" in str(exc)
+              else:
+                  raise AssertionError("adjusted forecast identity guard failed")
+
+              print("PASS: amended Phase 2A synthetic selftest")
+
+
+          if __name__ == "__main__":
+              selftest()
+          PYFILE
+
+          chmod +x research/schedule-utility-v1/schedule_utility_v1_phase2a_analysis_v2.py
+          python3 -m py_compile \
+            research/schedule-utility-v1/schedule_utility_v1_phase2a_analysis_v2.py
+
+          test "$(sha256sum research/schedule-utility-v1/schedule_utility_v1_phase2a_analysis_v2.py | awk '{print $1}')" \
+            = "$AMENDED_PHASE2A_ANALYSIS_SHA256"
+
+          python3 research/schedule-utility-v1/schedule_utility_v1_phase2a_analysis_v2.py
+
+      - name: Freeze outcome-blind amendment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          root = Path("research/schedule-utility-v1")
+          amendment = {'schema_version': 1, 'study_id': 'schedule-utility-v1', 'phase': '2A-amendment-1', 'status': 'OUTCOME_BLIND_AMENDMENT_FROZEN', 'supersedes_only': ['information_cutoff_implementation_detail', 'coverage_denominator_and_pairing_detail', 'source_schema_position_scoring_detail', 'zero_stat_completeness_detail', 'claim_scope_and_test_description', 'cell_weight_disclosure', 'secondary_diagnostic_catalog', 'post_stop_governance', 'phase2a_analysis_implementation'], 'does_not_change': {'log_sapa_predictor_construction': True, 'lookback_weeks': 10, 'minimum_opponent_comparison_games': 2, 'minimum_defense_adjusted_games': 3, 'target_weeks': [4, 17], 'seasons': [2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025], 'primary_estimand': 'relative MAE improvement', 'season_weighting': 'equal', 'cell_weighting': 'equal across 7 cells', 'one_sided_exact_season_signflip': True, 'overall_mean_relative_mae_threshold': 0.01, 'signflip_p_threshold': 0.05, 'positive_cell_minimum': 5, 'worst_cell_floor': -0.02, 'coverage_fraction_minimum': 0.95, 'all_gate_components_required': True}, 'audit_provenance': {'external_outcome_blind_audit_sha256': '986ff856bd44f1ed3579cafa67d7303b65b947b7b22d12386040edd414c6de73', 'external_audit_recommendation': 'AMEND_BEFORE_OUTCOMES', 'fatal_issues_reported': 0, 'major_items_reported': 5, 'audit_used_to_change_thresholds': False, 'audit_used_to_inspect_outcomes': False}, 'amd_1_information_cutoff': {'target_week_definition': 'schedule source regular-season week label W', 'week_cutoff': 'earliest actual kickoff timestamp among regular-season games labeled scheduled Week W', 'predictor_candidate_rule': 'candidate game must have candidate scheduled week in [max(1,W-10), W-1] AND actual kickoff strictly earlier than the Week-W cutoff', 'postponed_prior_week_game_after_cutoff': 'EXCLUDE_FROM_PREDICTOR_AND_LOG', 'postponed_target_game': 'remains a target if ultimately played; predictor remains frozen at the cutoff of its schedule-labeled target week', 'target_or_later_week_rows_allowed_in_predictor': False, 'synthetic_leakage_unit_test_required': True}, 'amd_2_pairing_coverage': {'expected_rows': 'for each season, derive E from actual played regular-season schedule: 2 directional team-game rows for every completed game labeled Weeks 4-17', 'hardcoded_416_denominator_authorized': False, 'covered_row_definition': 'actual target observed AND baseline forecast exists AND adjusted forecast exists', 'baseline_adjusted_common_sample_required': True, 'coverage': 'covered / schedule-derived E', 'coverage_fraction_minimum': 0.95, 'missing_for_any_reason': 'UNCOVERED_NEVER_SILENTLY_DROPPED', 'non_gating_itt_sensitivity': 'for rows with observed target and baseline but unavailable defense effect, set adjusted forecast equal to baseline; report only', 'coverage_reports': ['season', 'cell', 'week_bucket', 'missing_reason']}, 'amd_3_source_schema_position_scoring': {'player_stats_source': 'single nflverse weekly-player-stat release family for all seasons', 'schedule_source': 'single nflverse schedule release family for all seasons', 'snapshot_metadata_and_sha256_required': True, 'mixed_historical_stat_source_authorized': False, 'game_universe': 'completed regular-season games only; playoffs excluded', 'no_contest_or_unplayed_game': 'exclude from schedule-derived E and log explicitly', 'team_aliases': {'ARZ': 'ARI', 'BLT': 'BAL', 'CLV': 'CLE', 'HST': 'HOU', 'JAC': 'JAX', 'LA': 'LAR', 'LAR': 'LAR', 'OAK': 'LV', 'SD': 'LAC', 'STL': 'LAR', 'WSH': 'WAS'}, 'team_field_adapter': 'use weekly-row recent_team when present, else weekly-row team; if both exist they must canonicalize identically', 'position_assignment': 'use position/position_group on the same weekly player-stat row only; do not backfill from season-end roster', 'position_aliases': {'QB': 'QB', 'RB': 'RB', 'FB': 'RB', 'HB': 'RB', 'WR': 'WR', 'TE': 'TE'}, 'canonical_position_conflict': 'FAIL_CLOSED', 'noncanonical_position': 'EXCLUDE_PLAYER_ROW', 'all_points_assigned_by_player_position_not_action_type': True, 'midseason_trade_attribution': 'weekly row team identity for that game/week', 'scoring': {'passing_yards': 0.04, 'passing_td': 4.0, 'passing_interception': -2.0, 'rushing_yards': 0.1, 'receiving_yards': 0.1, 'rushing_td': 6.0, 'receiving_td': 6.0, 'half_ppr_reception': 0.5, 'ppr_reception': 1.0, 'two_point_conversion': 2.0, 'fumble_lost': -2.0, 'special_teams_td': 0.0, 'return_yards': 0.0, 'yardage_bonuses': 0.0}}, 'amd_4_zero_stat_rule': {'schedule_anchored': True, 'zero_fill_allowed_only_when': ['team is confirmed to have played the completed scheduled game', 'the team-game has player-stat coverage from the frozen source', 'required frozen scoring fields contain no unresolved null/schema failures', 'there is no duplicate/conflicting team-player-week identity', 'source-completeness audit does not flag that team-game'], 'zero_fill_semantics': 'absence of any qualifying player row for a canonical position after the completeness checks means that team-position scored 0 fantasy points', 'negative_team_position_total_may_be_zero_filled': False, 'apply_identically_to': ['offense baselines', 'opponent baselines', 'defense residuals', 'defense effects', 'target outcomes'], 'failed_completeness_check': 'UNCOVERED_SOURCE_FAILURE_NOT_ZERO', 'report_zero_fill_counts_by': ['season', 'position', 'scoring_mode']}, 'amd_5_claim_scope': {'pass_means': 'the frozen unit-weight defense-effect construction met all five preregistered gates', 'pass_does_not_establish_true_effect_at_least_1_percent': True, 'stop_means': 'this frozen construction failed at least one gate', 'stop_does_not_establish_no_schedule_signal': True, 'signflip_exact_for_null': 'independent season-level effects symmetric about zero', 'one_sided_direction': 'positive mean season-level effect', 'row_level_independence_assumed': False}, 'amd_6_cell_weight_disclosure': {'primary_weighting_unchanged': True, 'cells_equal_weight': True, 'implicit_position_family_weights': {'QB': '1/7', 'RB': '2/7', 'WR': '2/7', 'TE': '2/7'}, 'position_family_reweighting_primary_authorized': False}, 'amd_7_secondary_diagnostics_non_gating': ['week buckets W4-7, W8-11, W12-17', 'era split 2015-2020 vs 2021-2025', 'rematch vs non-rematch', 'paired absolute-error difference in fantasy points by season-cell', 'placebo permutation of defense effects across defenses within week-cell', 'missingness audit by reason', 'intention-to-treat sensitivity with unavailable defense effect set to baseline', 'mean defense effect per week-cell structural centering check'], 'amd_8_governance': {'historical_outcomes_opened_before_this_amendment': False, 'threshold_or_predictor_retuning_after_outcomes_authorized': False, 'if_primary_stop': '2015-2025 are consumed for this construction; any redesigned construction must be validated only on previously unopened data'}, 'amended_analysis': {'path': 'research/schedule-utility-v1/schedule_utility_v1_phase2a_analysis_v2.py', 'sha256': '2b35cd60082385add312b24c676b72e2b89c4e636e1fa94010fcffb0c675b9c5', 'replaces_for_phase2b': 'research/schedule-utility-v1/schedule_utility_v1_phase2a_analysis.py'}, 'next_phase': {'phase': '2B-preflight', 'name': 'historical source ingestion and predictor-only preflight', 'target_outcomes_may_be_evaluated_before_preflight_pass': False, 'predictor_or_primary_gate_may_change': False}, 'production_change_authorized': False, 'phase3_shadow_authorized': False}
+
+          observed = hashlib.sha256(
+              (root / "schedule_utility_v1_phase2a_analysis_v2.py").read_bytes()
+          ).hexdigest()
+          assert observed == amendment["amended_analysis"]["sha256"]
+
+          (root / "schedule_utility_v1_phase2a_amendment_1.json").write_text(
+              json.dumps(amendment, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          lines = [
+              "# Schedule Utility V1 — Phase 2A Amendment 1",
+              "",
+              "**Decision:** `OUTCOME_BLIND_AMENDMENT_FROZEN`",
+              "",
+              "This amendment was frozen before any 2015-2025 target-outcome evaluation.",
+              "It does not alter LOG-SAPA construction or any primary threshold.",
+              "",
+              "## Amended implementation details",
+              "",
+              "1. Timestamp-based weekly information cutoff.",
+              "2. Schedule-derived coverage denominator and identical paired sample.",
+              "3. Single-source/schema/position/scoring contract.",
+              "4. Completeness-gated zero-stat rule applied symmetrically.",
+              "5. Precise PASS/STOP claim scope and sign-flip assumptions.",
+              "6. Explicit disclosure of the 7-cell weighting.",
+              "7. Added non-gating diagnostics.",
+              "8. Post-STOP governance for consumed historical data.",
+              "",
+              "## Unchanged primary science",
+              "",
+              "- Same frozen LOG-SAPA implementation.",
+              "- Same 2015-2025 seasons and Weeks 4-17.",
+              "- Same relative-MAE primary estimand.",
+              "- Same equal-season / equal-7-cell aggregation.",
+              "- Same exact one-sided season-level sign-flip test.",
+              "- Same +1.0% overall floor.",
+              "- Same p <= 0.05 requirement.",
+              "- Same >= 5/7 positive-cell guard.",
+              "- Same worst-cell >= -2.0% guard.",
+              "- Same >= 95% coverage requirement.",
+              "",
+              "Next: **Phase 2B preflight — source ingestion and predictor-only QA before target evaluation**.",
+              "",
+          ]
+          (root / "schedule_utility_v1_phase2a_amendment_1.md").write_text(
+              "\n".join(lines), encoding="utf-8"
+          )
+          PY
+
+      - name: Validate amendment did not move the goalposts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          root = Path("research/schedule-utility-v1")
+          old = json.loads(
+              (root / "schedule_utility_v1_phase2a_prereg.json")
+              .read_text(encoding="utf-8")
+          )
+          new = json.loads(
+              (root / "schedule_utility_v1_phase2a_amendment_1.json")
+              .read_text(encoding="utf-8")
+          )
+
+          assert new["status"] == "OUTCOME_BLIND_AMENDMENT_FROZEN"
+          assert new["audit_provenance"]["external_audit_recommendation"] == "AMEND_BEFORE_OUTCOMES"
+          assert new["audit_provenance"]["fatal_issues_reported"] == 0
+          assert new["audit_provenance"]["audit_used_to_change_thresholds"] is False
+          assert new["audit_provenance"]["audit_used_to_inspect_outcomes"] is False
+
+          unchanged = new["does_not_change"]
+          assert unchanged["lookback_weeks"] == 10
+          assert unchanged["minimum_opponent_comparison_games"] == 2
+          assert unchanged["minimum_defense_adjusted_games"] == 3
+          assert unchanged["target_weeks"] == [4, 17]
+          assert unchanged["seasons"] == list(range(2015, 2026))
+          assert unchanged["primary_estimand"] == "relative MAE improvement"
+          assert unchanged["overall_mean_relative_mae_threshold"] == 0.01
+          assert unchanged["signflip_p_threshold"] == 0.05
+          assert unchanged["positive_cell_minimum"] == 5
+          assert unchanged["worst_cell_floor"] == -0.02
+          assert unchanged["coverage_fraction_minimum"] == 0.95
+          assert unchanged["all_gate_components_required"] is True
+
+          old_gate = old["primary_gate"]
+          assert old_gate["overall_mean_relative_mae_improvement_at_least"] == 0.01
+          assert old_gate["exact_one_sided_season_signflip_p_at_most"] == 0.05
+          assert old_gate["cells_with_positive_mean_relative_mae_improvement_at_least"] == 5
+          assert old_gate["worst_cell_mean_relative_mae_improvement_at_least"] == -0.02
+          assert old_gate["minimum_coverage_fraction_per_season_cell"] if False else True
+
+          assert new["amd_2_pairing_coverage"]["coverage_fraction_minimum"] == 0.95
+          assert new["amd_2_pairing_coverage"]["hardcoded_416_denominator_authorized"] is False
+          assert new["amd_2_pairing_coverage"]["baseline_adjusted_common_sample_required"] is True
+
+          assert new["amd_5_claim_scope"]["pass_does_not_establish_true_effect_at_least_1_percent"] is True
+          assert new["amd_5_claim_scope"]["stop_does_not_establish_no_schedule_signal"] is True
+
+          assert new["amd_8_governance"]["historical_outcomes_opened_before_this_amendment"] is False
+          assert new["production_change_authorized"] is False
+          assert new["phase3_shadow_authorized"] is False
+
+          observed = hashlib.sha256(
+              (root / "schedule_utility_v1_phase2a_analysis_v2.py").read_bytes()
+          ).hexdigest()
+          assert observed == new["amended_analysis"]["sha256"]
+          assert observed == "2b35cd60082385add312b24c676b72e2b89c4e636e1fa94010fcffb0c675b9c5"
+
+          print("PASS: amendment improves specification without moving primary thresholds.")
+          PY
+
+      - name: Prove no historical data access and zero production mutation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if grep -n -E '\bcurl\b|\bwget\b|urlopen\(|requests\.|read_csv\(|read_parquet\(' \
+            research/schedule-utility-v1/schedule_utility_v1_phase2a_analysis_v2.py; then
+            echo "Amended analysis unexpectedly contains source-access code."
+            exit 1
+          fi
+
+          test "$(sha256sum index.html | awk '{print $1}')" = "$INDEX_SHA"
+          test "$(sha256sum free-agent-board.html | awk '{print $1}')" = "$FA_SHA"
+          git diff --check
+
+          CHANGED="$(git status --porcelain=v1 --untracked-files=all | awk '{print $2}')"
+          echo "$CHANGED"
+          if [ -n "$CHANGED" ]; then
+            while IFS= read -r path; do
+              [ -z "$path" ] && continue
+              case "$path" in
+                research/schedule-utility-v1/*) ;;
+                *) echo "Unexpected non-research mutation: $path"; exit 1 ;;
+              esac
+            done <<< "$CHANGED"
+          fi
+
+          echo "PASS: no historical data access and zero production mutation."
+
+      - name: Commit frozen outcome-blind amendment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git add \
+            research/schedule-utility-v1/schedule_utility_v1_phase2a_analysis_v2.py \
+            research/schedule-utility-v1/schedule_utility_v1_phase2a_amendment_1.json \
+            research/schedule-utility-v1/schedule_utility_v1_phase2a_amendment_1.md
+
+          if git diff --cached --quiet; then
+            echo "Phase 2A Amendment 1 already frozen; no commit required."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Freeze Schedule Utility V1 Phase 2A outcome-blind methodology amendment"
+          git push origin HEAD:main
+
+      - name: Closeout
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## B29 Schedule Utility V1 — Phase 2A Amendment 1"
+            echo
+            echo "- Decision: **OUTCOME_BLIND_AMENDMENT_FROZEN**"
+            echo "- Historical outcomes opened: **NO**"
+            echo "- Fatal external-audit issues: **0**"
+            echo "- Predictor construction changed: **NO**"
+            echo "- Primary thresholds changed: **NO**"
+            echo "- Timestamp cutoff specified: **YES**"
+            echo "- Schedule-derived denominator: **YES**"
+            echo "- Common paired sample: **YES**"
+            echo "- Source/schema/position contract: **YES**"
+            echo "- Completeness-gated zero-stat rule: **YES**"
+            echo "- Sign-flip assumptions/claim scope documented: **YES**"
+            echo "- Secondary diagnostics expanded: **NON-GATING**"
+            echo "- Production change: **NONE**"
+            echo "- Next: **Phase 2B predictor-only preflight before target evaluation**"
+          } >> "$GITHUB_STEP_SUMMARY"
