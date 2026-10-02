@@ -257,8 +257,17 @@ def pick_value(round_num, season, tier, policy):
         r = int(round_num)
     except (TypeError, ValueError):
         return None
-    base_round = r if r in policy["pick_base"] else max(policy["pick_base"])
-    base = policy["pick_base"][base_round][tier]
+    round_map = {}
+    for key, row in policy["pick_base"].items():
+        try:
+            ikey = int(key)
+        except (TypeError, ValueError):
+            continue
+        round_map[ikey] = row
+    if not round_map:
+        return None
+    base_round = r if r in round_map else max(round_map)
+    base = round_map[base_round][tier]
     disc = policy["year_discount"].get(
         str(season),
         policy["unknown_year_discount"],
@@ -664,6 +673,25 @@ def selftest():
     assert pick_value(1, "2027", "mid", policy) == 5854
     assert pick_value(1, "2028", "mid", policy) == round(5854 * 0.85)
     assert pick_value(9, "2027", "mid", policy) == 900
+
+    # JSON round keys deserialize as strings. This exact case caused every
+    # historical pick to fall through to the maximum round before B34B.
+    json_policy = {
+        "pick_base": {
+            "1": {"early": 7500, "mid": 5854, "late": 5244},
+            "2": {"early": 3800, "mid": 3142, "late": 3016},
+            "3": {"early": 2777, "mid": 2364, "late": 2076},
+            "4": {"early": 1891, "mid": 1740, "late": 1731},
+            "6": {"early": 1000, "mid": 945, "late": 800},
+        },
+        "year_discount": {"2027": 1.0, "2028": 0.8828875559},
+        "unknown_year_discount": 0.6,
+    }
+    assert pick_value(2, "2027", "mid", json_policy) == 3142
+    assert pick_value(3, "2027", "mid", json_policy) == 2364
+    assert pick_value(4, "2027", "mid", json_policy) == 1740
+    assert pick_value(4, "2028", "mid", json_policy) == 1536
+    assert pick_value(9, "2027", "mid", json_policy) == 945
 
     slot = {
         "applies_to_season": "2027",
