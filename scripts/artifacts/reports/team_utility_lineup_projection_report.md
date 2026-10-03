@@ -15,16 +15,16 @@
 
 ## Artifact coverage
 
-- Total projected players: **1464**
-- Position counts: **{"DB": 338, "DL": 342, "LB": 223, "QB": 78, "RB": 134, "TE": 138, "WR": 211}**
-- Source counts: **{"fantasypros_normalized_fallback": 99, "idp_v1_both": 462, "idp_v1_fp_only": 7, "idp_v1_no_new_data": 3, "idp_v1_sleeper_only": 431, "sleeper_league_scored": 462}**
+- Total projected players: **1468**
+- Position counts: **{"DB": 338, "DL": 341, "LB": 222, "QB": 78, "RB": 138, "TE": 139, "WR": 212}**
+- Source counts: **{"fantasypros_normalized_fallback": 96, "idp_v1_both": 462, "idp_v1_fp_only": 7, "idp_v1_no_new_data": 2, "idp_v1_sleeper_only": 430, "sleeper_league_scored": 471}**
 
 ## Current league validation
 
 - Teams checked: **12**
 - Teams with all 17 legal slots fillable: **12 / 12**
 - Teams with a projection-complete non-K starting lineup: **12 / 12**
-- Active non-K roster projection coverage: **98.12%**
+- Active non-K roster projection coverage: **98.35%**
 - Selected non-K players needing fallback: **0**
 
 ## Team detail
@@ -40,7 +40,7 @@
 | Jersey Bagels | 91.2% | 17/17 | 0 |
 | Apex Predators | 100.0% | 17/17 | 0 |
 | Toddy2times | 100.0% | 17/17 | 0 |
-| Moose Knuckles | 97.1% | 17/17 | 0 |
+| Moose Knuckles | 100.0% | 17/17 | 0 |
 | <respectable team name> | 97.2% | 17/17 | 0 |
 | Serious Gourmet Shit | 100.0% | 17/17 | 0 |
 
