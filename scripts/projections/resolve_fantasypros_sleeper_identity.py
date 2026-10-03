@@ -113,9 +113,20 @@ def stable_authoritative_name_equivalent(prior_name, current_name) -> bool:
     # Narrow equivalence for an already-authoritative stable ID pair.
     # Exact names remain valid. A recognized generational suffix may
     # exist on only one provider. If both supply suffixes, they must
-    # agree, so Sr/Jr or II/III still hard-fail.
-    prior = normalize_name(prior_name)
-    current = normalize_name(current_name)
+    # agree, so Sr/Jr or II/III still hard-fail. Provider display-name
+    # diacritics may also drift (for example Jevon -> Jevón) while the
+    # already-authoritative stable provider IDs still identify the same
+    # person. Diacritic tolerance is deliberately scoped ONLY here; new
+    # identity discovery continues to use normalize_name() unchanged.
+    import unicodedata
+
+    def stable_name(value):
+        ordinary = normalize_name(value)
+        decomposed = unicodedata.normalize("NFKD", ordinary)
+        return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+
+    prior = stable_name(prior_name)
+    current = stable_name(current_name)
     if prior == current:
         return True
 
@@ -815,6 +826,20 @@ def run_production_selftest():
     )
     assert stable_authoritative_name_equivalent(
         "Tyrique Stevenson Sr.", "Tyrique Stevenson"
+    )
+
+    # Unicode display-name diacritic drift is tolerated only for an already-
+    # authoritative stable provider-ID pair. Ordinary/new matching remains
+    # accent-sensitive because normalize_name() itself is intentionally unchanged.
+    assert stable_authoritative_name_equivalent(
+        "Jevon Holland", "Jevón Holland"
+    )
+    assert stable_authoritative_name_equivalent(
+        "Jevón Holland", "Jevon Holland"
+    )
+    assert normalize_name("Jevon Holland") != normalize_name("Jevón Holland")
+    assert not stable_authoritative_name_equivalent(
+        "Jevon Holland", "Jevón Hollander"
     )
 
     # Conflicting generational suffixes remain contradictions.
