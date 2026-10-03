@@ -1,0 +1,187 @@
+name: Scheduled Data Refresh - Stable Identity Diacritic Repair
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  EXPECTED_RESOLVER_BLOB: "fa4b0fd9b201d79173125f55f7c1eeee916b2506"
+  FAILED_REFRESH_RUN_ID: "37132377996"
+  FAILED_REFRESH_JOB_ID: "111229885264"
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Verify exact pre-repair identity state
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain --untracked-files=all)"
+          test "$(git hash-object scripts/projections/resolve_fantasypros_sleeper_identity.py)" = "$EXPECTED_RESOLVER_BLOB"
+
+          python3 scripts/projections/resolve_fantasypros_sleeper_identity.py --selftest
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          rows = json.loads(Path("scripts/identity_crosswalk.json").read_text(encoding="utf-8"))
+          matches = [r for r in rows if str(r.get("fantasypros_id")) == "22690"]
+          assert len(matches) == 1, matches
+          row = matches[0]
+          assert str(row.get("sleeper_id")) == "7666", row
+          assert row.get("requires_manual_review") is False, row
+          print("PASS: prior authoritative FPID 22690 -> Sleeper 7666 mapping verified.")
+          PY
+
+      - name: Apply narrow stable-ID diacritic continuity repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("scripts/projections/resolve_fantasypros_sleeper_identity.py")
+          text = path.read_text(encoding="utf-8")
+
+          old = '''def stable_authoritative_name_equivalent(prior_name, current_name) -> bool:\n    # Narrow equivalence for an already-authoritative stable ID pair.\n    # Exact names remain valid. A recognized generational suffix may\n    # exist on only one provider. If both supply suffixes, they must\n    # agree, so Sr/Jr or II/III still hard-fail.\n    prior = normalize_name(prior_name)\n    current = normalize_name(current_name)\n    if prior == current:\n        return True\n\n    prior_base, prior_suffix = split_generational_suffix(prior)\n    current_base, current_suffix = split_generational_suffix(current)\n    if prior_base != current_base:\n        return False\n\n    if prior_suffix and current_suffix:\n        return prior_suffix == current_suffix\n\n    return bool(prior_suffix or current_suffix)\n'''
+
+          new = '''def stable_authoritative_name_equivalent(prior_name, current_name) -> bool:\n    # Narrow equivalence for an already-authoritative stable ID pair.\n    # Exact names remain valid. A recognized generational suffix may\n    # exist on only one provider. If both supply suffixes, they must\n    # agree, so Sr/Jr or II/III still hard-fail. Provider display-name\n    # diacritics may also drift (for example Jevon -> Jevón) while the\n    # already-authoritative stable provider IDs still identify the same\n    # person. Diacritic tolerance is deliberately scoped ONLY here; new\n    # identity discovery continues to use normalize_name() unchanged.\n    import unicodedata\n\n    def stable_name(value):\n        ordinary = normalize_name(value)\n        decomposed = unicodedata.normalize("NFKD", ordinary)\n        return "".join(ch for ch in decomposed if not unicodedata.combining(ch))\n\n    prior = stable_name(prior_name)\n    current = stable_name(current_name)\n    if prior == current:\n        return True\n\n    prior_base, prior_suffix = split_generational_suffix(prior)\n    current_base, current_suffix = split_generational_suffix(current)\n    if prior_base != current_base:\n        return False\n\n    if prior_suffix and current_suffix:\n        return prior_suffix == current_suffix\n\n    return bool(prior_suffix or current_suffix)\n'''
+
+          if text.count(old) != 1:
+              raise SystemExit(f"Expected exactly one stable-authority function target; found {text.count(old)}")
+          text = text.replace(old, new, 1)
+
+          marker = '''    assert stable_authoritative_name_equivalent(\n        "Tyrique Stevenson Sr.", "Tyrique Stevenson"\n    )\n\n'''
+          tests = '''    assert stable_authoritative_name_equivalent(\n        "Tyrique Stevenson Sr.", "Tyrique Stevenson"\n    )\n\n    # Unicode display-name diacritic drift is tolerated only for an already-\n    # authoritative stable provider-ID pair. Ordinary/new matching remains\n    # accent-sensitive because normalize_name() itself is intentionally unchanged.\n    assert stable_authoritative_name_equivalent(\n        "Jevon Holland", "Jevón Holland"\n    )\n    assert stable_authoritative_name_equivalent(\n        "Jevón Holland", "Jevon Holland"\n    )\n    assert normalize_name("Jevon Holland") != normalize_name("Jevón Holland")\n    assert not stable_authoritative_name_equivalent(\n        "Jevon Holland", "Jevón Hollander"\n    )\n\n'''
+          if text.count(marker) != 1:
+              raise SystemExit(f"Expected exactly one self-test insertion marker; found {text.count(marker)}")
+          text = text.replace(marker, tests, 1)
+
+          path.write_text(text, encoding="utf-8")
+          PY
+
+      - name: Prove repair is narrow and regression-safe
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile scripts/projections/resolve_fantasypros_sleeper_identity.py
+          python3 scripts/projections/resolve_fantasypros_sleeper_identity.py --selftest
+
+          python3 - <<'PY'
+          import importlib.util
+          from pathlib import Path
+
+          path = Path("scripts/projections/resolve_fantasypros_sleeper_identity.py")
+          spec = importlib.util.spec_from_file_location("identity_resolver_repair_check", path)
+          mod = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+
+          # Exact failure mode from Scheduled Data Refresh run 37132377996.
+          assert mod.stable_authoritative_name_equivalent("jevon holland", "jevón holland")
+
+          # New/discovery normalization is untouched: no global accent folding.
+          assert mod.normalize_name("jevon holland") == "jevon holland"
+          assert mod.normalize_name("jevón holland") == "jevón holland"
+          assert mod.normalize_name("jevon holland") != mod.normalize_name("jevón holland")
+
+          # A genuinely different person still fails the stable continuity check.
+          assert not mod.stable_authoritative_name_equivalent("jevon holland", "jevón hollander")
+          assert not mod.stable_authoritative_name_equivalent("example player sr", "example player jr")
+          print("PASS: diacritic repair is stable-ID-only; strict discovery and contradiction guards remain intact.")
+          PY
+
+          git diff --check
+          git diff -- scripts/projections/resolve_fantasypros_sleeper_identity.py
+
+      - name: Record repair evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p research/identity-v2
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          resolver = Path("scripts/projections/resolve_fantasypros_sleeper_identity.py")
+          evidence = {
+              "schema_version": 1,
+              "study_id": "identity-v2-operational-maintenance",
+              "repair": "stable_authoritative_name_diacritic_continuity",
+              "trigger": {
+                  "scheduled_data_refresh_run_id": 37132377996,
+                  "job_id": 111229885264,
+                  "failed_step": "Refresh FantasyPros-Sleeper identity crosswalk",
+                  "fantasypros_id": "22690",
+                  "prior_authoritative_sleeper_id": "7666",
+                  "prior_normalized_name": "jevon holland",
+                  "current_sleeper_display_name": "jevón holland",
+              },
+              "scope": {
+                  "stable_authoritative_pair_only": True,
+                  "new_identity_discovery_changed": False,
+                  "stable_id_collision_guard_changed": False,
+                  "different_person_name_guard_changed": False,
+                  "player_value_formula_changed": False,
+                  "draft_pick_formula_changed": False,
+              },
+              "tests": {
+                  "resolver_selftest_pass_required": True,
+                  "jevon_to_jevon_accent_equivalent": True,
+                  "ordinary_normalize_name_remains_accent_sensitive": True,
+                  "different_base_name_still_rejected": True,
+              },
+              "pre_repair_git_blob": "fa4b0fd9b201d79173125f55f7c1eeee916b2506",
+              "post_repair_sha256": hashlib.sha256(resolver.read_bytes()).hexdigest(),
+              "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+              "production_change_authorized": False,
+              "interpretation": "Operational identity-maintenance repair only. Previously authoritative stable provider IDs remain sticky across display-name diacritic drift; no fuzzy or accent-insensitive new identity matching is introduced.",
+          }
+          Path("research/identity-v2/identity_v2_stable_diacritic_repair_2026-10-03.json").write_text(
+              json.dumps(evidence, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          git diff --check
+
+      - name: Commit repair to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add scripts/projections/resolve_fantasypros_sleeper_identity.py
+          git add research/identity-v2/identity_v2_stable_diacritic_repair_2026-10-03.json
+          git diff --cached --quiet && { echo "ERROR: repair produced no staged changes" >&2; exit 1; }
+          git commit -m "Repair stable identity diacritic continuity"
+          git push
+
+      - name: Closeout
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "PASS_STABLE_ID_DIACRITIC_REPAIR"
+          echo "Next action: rerun Scheduled Data Refresh in full mode."
