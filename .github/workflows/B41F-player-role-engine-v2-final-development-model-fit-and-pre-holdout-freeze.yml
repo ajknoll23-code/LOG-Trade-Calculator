@@ -1,0 +1,434 @@
+name: B41F Player Role Engine V2 - Final Development Model Fit and Pre-Holdout Freeze
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  freeze_final_fit_contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Freeze exact B41F fitter and contract before any final model fit
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="research/player-role-v2"
+
+          cat > "$BASE/player_role_v2_b41f_final_model_fitter.py" <<'PYFIT'
+          #!/usr/bin/env python3
+          from __future__ import annotations
+          import argparse, hashlib, json
+          from pathlib import Path
+          import numpy as np
+          import pandas as pd
+          from sklearn.linear_model import Ridge
+          from sklearn.metrics import mean_absolute_error
+
+          SEASONS = [2019, 2020, 2021, 2022, 2023, 2024]
+          POSITIONS = ["QB", "RB", "WR", "TE", "K", "DL", "LB", "DB"]
+
+          def sha(path):
+              return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+          def usable(df, features):
+              out = []
+              for c in features:
+                  x = pd.to_numeric(df[c], errors="coerce")
+                  finite = x[np.isfinite(x)]
+                  if len(finite) >= 2 and finite.nunique() >= 2:
+                      out.append(c)
+              return out
+
+          def frame(df, cols):
+              return df[cols].apply(pd.to_numeric, errors="coerce").astype(float)
+
+          def model(alpha):
+              return Ridge(alpha=float(alpha), fit_intercept=True, positive=True,
+                           solver="lbfgs", max_iter=5000, tol=1e-7)
+
+          def choose_alpha(df, features, alphas):
+              rows = []
+              for alpha in alphas:
+                  folds = []
+                  for season in SEASONS:
+                      tr = df[df["season"] != season].copy()
+                      va = df[df["season"] == season].copy()
+                      cols = usable(tr, features)
+                      if not cols:
+                          raise RuntimeError(f"B41F_NO_USABLE_FEATURES {season}")
+                      xtr, xva = frame(tr, cols), frame(va, cols)
+                      med = xtr.median(axis=0, skipna=True).fillna(0.5)
+                      Xtr, Xva = xtr.fillna(med).to_numpy(), xva.fillna(med).to_numpy()
+                      ytr = tr["target_percentile"].to_numpy(float)
+                      yva = va["target_percentile"].to_numpy(float)
+                      m = model(alpha)
+                      m.fit(Xtr, ytr)
+                      pred = np.clip(m.predict(Xva), 0.0, 1.0)
+                      folds.append({"validation_season": int(season), "n": int(len(va)),
+                                    "mae": float(mean_absolute_error(yva, pred)),
+                                    "feature_count": int(len(cols))})
+                  rows.append({"alpha": float(alpha),
+                               "mean_loso_mae": float(np.mean([r["mae"] for r in folds])),
+                               "folds": folds})
+              rows.sort(key=lambda r: (r["mean_loso_mae"], -r["alpha"]))
+              return float(rows[0]["alpha"]), rows
+
+          def fit_position(df, pos, features, alphas, thresholds, roles):
+              sub = df[df["position"] == pos].copy()
+              if len(sub) < 300 or sorted(sub["season"].astype(int).unique()) != SEASONS:
+                  raise RuntimeError(f"B41F_POSITION_DATA_GATE {pos}")
+              for c in features:
+                  if c not in sub.columns:
+                      raise RuntimeError(f"B41F_FEATURE_MISSING {pos} {c}")
+
+              alpha, cv = choose_alpha(sub, features, alphas)
+              cols = usable(sub, features)
+              x = frame(sub, cols)
+              med = x.median(axis=0, skipna=True).fillna(0.5)
+              X = x.fillna(med).to_numpy()
+              y = sub["target_percentile"].to_numpy(float)
+              if not np.isfinite(X).all() or not np.isfinite(y).all():
+                  raise RuntimeError(f"B41F_NONFINITE {pos}")
+
+              m1, m2 = model(alpha), model(alpha)
+              m1.fit(X, y); m2.fit(X, y)
+              if not np.allclose(m1.coef_, m2.coef_, rtol=0.0, atol=1e-12):
+                  raise RuntimeError(f"B41F_NONDETERMINISTIC_COEFFICIENTS {pos}")
+              if not np.isclose(float(m1.intercept_), float(m2.intercept_), rtol=0.0, atol=1e-12):
+                  raise RuntimeError(f"B41F_NONDETERMINISTIC_INTERCEPT {pos}")
+              if len(thresholds) != 6 or thresholds != sorted(thresholds) or len(roles) != 7:
+                  raise RuntimeError(f"B41F_TIER_ARCHITECTURE_DRIFT {pos}")
+
+              raw = m1.predict(X)
+              pred = np.clip(raw, 0.0, 1.0)
+              idx = np.searchsorted(np.asarray(thresholds), pred, side="right")
+              return {
+                  "position": pos,
+                  "n_development_rows": int(len(sub)),
+                  "selected_family": "nonnegative_ridge_linear",
+                  "alpha_selection": {"method": "six-season LOSO MAE", "selected_alpha": alpha,
+                                      "candidate_results_sorted": cv,
+                                      "tie_rule": "larger alpha wins exact MAE tie"},
+                  "feature_columns": cols,
+                  "feature_count": int(len(cols)),
+                  "imputation_medians": {c: float(med[c]) for c in cols},
+                  "fit": {"estimator": "Ridge", "positive": True, "fit_intercept": True,
+                          "solver": "lbfgs", "max_iter": 5000, "tol": 1e-7,
+                          "intercept": float(m1.intercept_),
+                          "coefficients": {c: float(v) for c, v in zip(cols, m1.coef_)}},
+                  "score_rule": "clip(intercept + sum(coef_i * imputed_feature_i), 0, 1)",
+                  "frozen_tier_thresholds": thresholds,
+                  "role_order": roles,
+                  "descriptive_full_development_fit_not_validation": {
+                      "mae": float(mean_absolute_error(y, pred)),
+                      "fraction_clipped_low": float(np.mean(raw < 0.0)),
+                      "fraction_clipped_high": float(np.mean(raw > 1.0)),
+                      "tier_counts": {roles[i]: int((idx == i).sum()) for i in range(7)}},
+                  "deterministic_refit_check": "PASS"}
+
+          def main():
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--data", required=True)
+              ap.add_argument("--development-contract", required=True)
+              ap.add_argument("--b41d-decision", required=True)
+              ap.add_argument("--b41e-thresholds", required=True)
+              ap.add_argument("--b41f-contract", required=True)
+              ap.add_argument("--out", required=True)
+              a = ap.parse_args()
+
+              dev = json.loads(Path(a.development_contract).read_text())
+              d = json.loads(Path(a.b41d_decision).read_text())
+              e = json.loads(Path(a.b41e_thresholds).read_text())
+              f = json.loads(Path(a.b41f_contract).read_text())
+              checks = [(a.data, "modeling_data_sha256"),
+                        (a.development_contract, "b41d_development_contract_sha256"),
+                        (a.b41d_decision, "b41d_decision_sha256"),
+                        (a.b41e_thresholds, "b41e_thresholds_sha256")]
+              for p, key in checks:
+                  if sha(p) != f["frozen_input"][key]:
+                      raise RuntimeError(f"B41F_SHA_MISMATCH {key}")
+              if d["2025_holdout_opened"] or d["week4_2026_opened"] or e["2025_holdout_opened"] or e["week4_2026_opened"]:
+                  raise RuntimeError("B41F_FIREWALL_BROKEN")
+
+              df = pd.read_csv(a.data, compression="gzip")
+              if len(df) != 85648 or sorted(df["season"].astype(int).unique()) != SEASONS or 2025 in set(df["season"].astype(int)):
+                  raise RuntimeError("B41F_MODELING_DATA_GATE")
+              alphas = [float(x) for x in dev["candidate_families"]["candidate_2"]["alpha_grid"]]
+              if alphas != [0.0, 0.01, 0.1, 1.0, 10.0]:
+                  raise RuntimeError("B41F_ALPHA_GRID_DRIFT")
+              roles = list(e["role_order"])
+              expected_roles = ["Speculative", "Depth", "Understudy", "Rotational", "Starter", "Every-Down", "Elite"]
+              if roles != expected_roles:
+                  raise RuntimeError("B41F_ROLE_ORDER_DRIFT")
+
+              results = {}
+              for pos in POSITIONS:
+                  if d["selected_family_by_position"][pos] != "nonnegative_ridge_linear":
+                      raise RuntimeError(f"B41F_FAMILY_DRIFT {pos}")
+                  features = list(dev["position_feature_columns"][pos])
+                  thresholds = [float(x) for x in e["position_results"][pos]["thresholds_ascending"]]
+                  results[pos] = fit_position(df, pos, features, alphas, thresholds, roles)
+
+              snapshot = {
+                  "schema_version": 1, "study_id": "player-role-v2",
+                  "phase": "B41F-final-development-model-fit",
+                  "status": "FINAL_2019_2024_MODEL_WEIGHTS_FROZEN_BEFORE_WEEK4_AND_2025_HOLDOUT",
+                  "development_seasons": SEASONS,
+                  "modeling_data_sha256": sha(a.data), "modeling_row_count": int(len(df)),
+                  "selected_family_all_positions": "nonnegative_ridge_linear",
+                  "position_models": results,
+                  "tier_threshold_source": "B41E thresholds unchanged",
+                  "2025_holdout_opened": False, "week4_2026_opened": False,
+                  "B41C3_completed": False, "production_model_fitted": True,
+                  "production_model_deployed": False, "production_change_authorized": False,
+                  "next_stage": "Complete B41C3 untouched 2026 Week 4 scorer validation after all Week 4 games are final and Sleeper scoring settles; only then open untouched 2025."}
+              Path(a.out).write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n")
+              print(json.dumps({"status": snapshot["status"],
+                                "selected_alpha_by_position": {p: results[p]["alpha_selection"]["selected_alpha"] for p in POSITIONS},
+                                "2025_holdout_opened": False, "week4_2026_opened": False,
+                                "production_authorized": False}, indent=2))
+
+          if __name__ == "__main__":
+              main()
+          PYFIT
+          chmod +x "$BASE/player_role_v2_b41f_final_model_fitter.py"
+
+          python3 - <<'PY'
+          from datetime import datetime, timezone
+          import hashlib, json
+          from pathlib import Path
+          base = Path("research/player-role-v2")
+          paths = {
+              "c2": base / "player_role_v2_b41c2_scientific_decision.json",
+              "dev": base / "player_role_v2_b41d_development_contract.json",
+              "d": base / "player_role_v2_b41d_scientific_decision.json",
+              "audit": base / "player_role_v2_b41d_modeling_data_audit.json",
+              "d_fitter": base / "player_role_v2_b41d_model_fitter.py",
+              "e": base / "player_role_v2_b41e_tier_thresholds.json",
+              "fitter": base / "player_role_v2_b41f_final_model_fitter.py"}
+          for k, p in paths.items():
+              if not p.exists(): raise RuntimeError(f"B41F_REQUIRED_INPUT_MISSING {k}")
+          c2, d, audit, e = [json.loads(paths[k].read_text()) for k in ["c2", "d", "audit", "e"]]
+          assert c2["calibration_pass"] is True and c2["week4_read"] is False and c2["week4_reserved_for_untouched_validation"] is True
+          assert d["2025_holdout_opened"] is False and d["week4_2026_opened"] is False and d["production_change_authorized"] is False
+          assert set(d["selected_family_by_position"].values()) == {"nonnegative_ridge_linear"}
+          assert audit["modeling_rows"] == 85648
+          assert audit["modeling_data_sha256"] == "a65a34ae72b3cb8e2878a410793477713535c4961368601a8f4cc35c0487e791"
+          assert e["2025_holdout_opened"] is False and e["week4_2026_opened"] is False
+          for r in e["position_results"].values():
+              assert r["tree_leaf_count"] == 7 and len(r["thresholds_ascending"]) == 6
+              assert r["target_means_monotone_non_decreasing"] is True and r["minimum_tier_share_at_least_0_05"] is True
+          def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
+          out = base / "player_role_v2_b41f_final_fit_contract.json"
+          if (base / "player_role_v2_b41f_final_model_snapshot.json").exists():
+              raise RuntimeError("B41F_FINAL_MODEL_ALREADY_EXISTS_REFUSING_REFIT")
+          contract = {
+              "schema_version": 1, "study_id": "player-role-v2", "phase": "B41F-final-fit-contract",
+              "status": "FROZEN_BEFORE_ANY_B41F_FULL_DEVELOPMENT_MODEL_FIT",
+              "created_at_utc": datetime.now(timezone.utc).isoformat(),
+              "frozen_input": {
+                  "b41d_workflow_run_id": 37093761378, "b41d_artifact_name": "b41d-modeling-data",
+                  "b41d_artifact_id_observed": 11262999354,
+                  "modeling_data_sha256": audit["modeling_data_sha256"], "modeling_row_count": 85648,
+                  "b41d_development_contract_sha256": sha(paths["dev"]),
+                  "b41d_decision_sha256": sha(paths["d"]),
+                  "b41d_original_fitter_sha256": sha(paths["d_fitter"]),
+                  "b41e_thresholds_sha256": sha(paths["e"]),
+                  "b41f_final_fitter_sha256": sha(paths["fitter"])},
+              "exact_rule": {
+                  "family": "nonnegative_ridge_linear", "fit_separately_by_position": True,
+                  "alpha_grid": [0.0, 0.01, 0.1, 1.0, 10.0],
+                  "alpha_selection": "six-season LOSO mean MAE; larger alpha wins exact tie",
+                  "estimator": "Ridge positive=True fit_intercept=True solver=lbfgs max_iter=5000 tol=1e-7",
+                  "imputation": "training median within CV; full-development median for frozen final model; fallback 0.5",
+                  "score_clip": [0.0, 1.0], "tier_thresholds": "B41E thresholds unchanged",
+                  "deterministic_double_fit_required": True},
+              "runtime": {"python": "3.13", "numpy": "2.5.3", "pandas": "2.3.3", "scipy": "1.18.1", "scikit_learn": "1.9.1"},
+              "sequencing": {"B41C3_required_before_2025_holdout_open": True,
+                             "B41C3_description": "untouched 2026 Week 4 scorer validation after all Week 4 games final and Sleeper scoring settles",
+                             "2025_holdout_opened_in_B41F": False, "2026_week4_opened_in_B41F": False},
+              "firewalls": {"2025_holdout_may_be_read": False, "2026_week4_may_be_read": False,
+                            "B41E_thresholds_may_change": False, "selected_model_family_may_change": False,
+                            "production_roles_may_change": False, "fundamental_values_may_change": False,
+                            "league_rankings_may_change": False},
+              "production_change_authorized": False}
+          if out.exists():
+              old = json.loads(out.read_text()); a, b = dict(old), dict(contract)
+              a.pop("created_at_utc", None); b.pop("created_at_utc", None)
+              if a != b: raise RuntimeError("B41F_EXISTING_CONTRACT_DIFFERS")
+          else:
+              out.write_text(json.dumps(contract, indent=2, sort_keys=True) + "\n")
+          print("B41F pre-fit contract freeze: PASS")
+          PY
+
+      - name: Commit B41F fitter and contract before model fit
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="research/player-role-v2"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$BASE/player_role_v2_b41f_final_model_fitter.py" "$BASE/player_role_v2_b41f_final_fit_contract.json"
+          if git diff --cached --quiet; then echo "B41F contract already frozen identically"; exit 0; fi
+          git diff --cached --check
+          git commit -m "Freeze Player Role V2 B41F final development fit contract"
+          git push origin HEAD:main
+
+  fit_and_freeze_final_development_model:
+    needs: freeze_final_fit_contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out latest frozen B41F implementation
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install exact B41D-compatible model runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir \
+            "numpy==2.5.3" "pandas==2.3.3" "scipy==1.18.1" "scikit-learn==1.9.1"
+
+      - name: Download exact B41D modeling dataset artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: b41d-modeling-data
+          path: /tmp/b41f-data
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: 37093761378
+
+      - name: Verify frozen artifact and fitter hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          base = Path("research/player-role-v2")
+          c = json.loads((base / "player_role_v2_b41f_final_fit_contract.json").read_text())
+          data = Path("/tmp/b41f-data/player_role_v2_b41d_modeling_data.csv.gz")
+          fitter = base / "player_role_v2_b41f_final_model_fitter.py"
+          def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
+          if not data.exists(): raise RuntimeError("B41F_MODELING_ARTIFACT_MISSING")
+          if sha(data) != c["frozen_input"]["modeling_data_sha256"]: raise RuntimeError("B41F_MODELING_ARTIFACT_SHA_MISMATCH")
+          if sha(fitter) != c["frozen_input"]["b41f_final_fitter_sha256"]: raise RuntimeError("B41F_FITTER_SHA_MISMATCH")
+          assert c["sequencing"]["B41C3_required_before_2025_holdout_open"] is True
+          assert c["firewalls"]["2025_holdout_may_be_read"] is False and c["firewalls"]["2026_week4_may_be_read"] is False
+          print("B41F frozen artifact + fitter verification: PASS")
+          PY
+
+      - name: Fit and freeze final 2019-2024 model weights
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="research/player-role-v2"
+          python3 "$BASE/player_role_v2_b41f_final_model_fitter.py" \
+            --data /tmp/b41f-data/player_role_v2_b41d_modeling_data.csv.gz \
+            --development-contract "$BASE/player_role_v2_b41d_development_contract.json" \
+            --b41d-decision "$BASE/player_role_v2_b41d_scientific_decision.json" \
+            --b41e-thresholds "$BASE/player_role_v2_b41e_tier_thresholds.json" \
+            --b41f-contract "$BASE/player_role_v2_b41f_final_fit_contract.json" \
+            --out "$BASE/player_role_v2_b41f_final_model_snapshot.json"
+
+      - name: Build B41F scientific report
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          base = Path("research/player-role-v2")
+          d = json.loads((base / "player_role_v2_b41f_final_model_snapshot.json").read_text())
+          positions = ["QB", "RB", "WR", "TE", "K", "DL", "LB", "DB"]
+          lines = ["# Player Role V2 — B41F Final Development Model Freeze", "",
+                   "- Training data: **exact B41D 2019–2024 modeling artifact**",
+                   "- Modeling rows: **85,648**",
+                   "- Selected family at every position: **nonnegative ridge linear**",
+                   "- B41E tier thresholds changed: **No**", "- 2025 holdout opened: **No**",
+                   "- 2026 Week 4 opened: **No**", "- Production model weights fitted: **Yes**",
+                   "- Production deployed: **No**", "- Production change authorized: **No**", "",
+                   "## Final alpha selected on six-season development LOSO", "",
+                   "| Position | Alpha | Features |", "|---|---:|---:|"]
+          for pos in positions:
+              r = d["position_models"][pos]
+              lines.append(f"| {pos} | {r['alpha_selection']['selected_alpha']:.6g} | {r['feature_count']} |")
+          lines += ["", "Stored in-sample fit statistics are descriptive only, not validation.",
+                    "B41C3 must pass before the 2025 holdout is opened.",
+                    "If B41C3 passes, the frozen score + B41E tier system may be evaluated once on untouched 2025 with no retuning.", ""]
+          (base / "player_role_v2_b41f_report.md").write_text("\n".join(lines))
+          PY
+
+      - name: Commit final frozen B41F model snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="research/player-role-v2"
+          git fetch origin main
+          git rebase origin/main
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$BASE/player_role_v2_b41f_final_model_snapshot.json" "$BASE/player_role_v2_b41f_report.md"
+          git diff --cached --check
+          git commit -m "Freeze Player Role V2 B41F final development model"
+          git push origin HEAD:main
+
+      - name: B41F closeout
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          d = json.loads(Path("research/player-role-v2/player_role_v2_b41f_final_model_snapshot.json").read_text())
+          assert d["status"] == "FINAL_2019_2024_MODEL_WEIGHTS_FROZEN_BEFORE_WEEK4_AND_2025_HOLDOUT"
+          assert d["modeling_row_count"] == 85648
+          assert d["2025_holdout_opened"] is False and d["week4_2026_opened"] is False
+          assert d["B41C3_completed"] is False and d["production_model_fitted"] is True
+          assert d["production_model_deployed"] is False and d["production_change_authorized"] is False
+          assert set(d["position_models"]) == {"QB", "RB", "WR", "TE", "K", "DL", "LB", "DB"}
+          for r in d["position_models"].values():
+              assert r["selected_family"] == "nonnegative_ridge_linear"
+              assert r["deterministic_refit_check"] == "PASS"
+              assert len(r["frozen_tier_thresholds"]) == 6 and len(r["role_order"]) == 7
+              assert all(v >= -1e-12 for v in r["fit"]["coefficients"].values())
+          print("B41F CLOSEOUT: PASS_FINAL_DEVELOPMENT_MODEL_FROZEN")
+          print("MODELING ROWS: 85648")
+          print("2025 HOLDOUT OPENED: false")
+          print("2026 WEEK 4 OPENED: false")
+          print("B41C3 COMPLETED: false")
+          print("PRODUCTION MODEL FITTED: true")
+          print("PRODUCTION DEPLOYED: false")
+          print("PRODUCTION CHANGE AUTHORIZED: false")
+          print("NEXT: B41C3 only after all Week 4 games are final and Sleeper scoring settles")
+          PY
