@@ -112,7 +112,7 @@ def hgb_model(params, n_features):
     )
 
 def hgb_grid(contract):
-    c = contract["model_family_preregistration"]["candidate_3"]
+    c = contract["candidate_families"]["candidate_3"]
     rows = []
     for lr in c["learning_rate_grid"]:
         for leaves in c["max_leaf_nodes_grid"]:
@@ -166,7 +166,7 @@ def fit_outer_family(family, train, test, features, contract):
         return pred, meta
 
     if family == "nonnegative_ridge_linear":
-        alphas = contract["model_family_preregistration"]["candidate_2"]["alpha_grid"]
+        alphas = contract["candidate_families"]["candidate_2"]["alpha_grid"]
         alpha, tuning = choose_ridge(train, features, alphas)
         cols = usable_columns(train, features)
         if not cols:
