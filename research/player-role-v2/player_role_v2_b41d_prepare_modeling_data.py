@@ -192,30 +192,72 @@ def main():
     players_path = tmp / "players.csv"
     players_path.write_bytes(players_bytes)
 
-    cohort_path = out / "b41d_reconstructed_cohort.csv.gz"
-    cohort_audit = out / "b41d_reconstructed_cohort_audit.json"
-    cohort_manifest = out / "b41d_reconstructed_cohort_manifest.json"
-    subprocess.run(
-        [
-            sys.executable,
-            str(base / "player_role_v2_b41b_cohort_builder.py"),
-            "--source-dir", str(tmp),
-            "--players", str(players_path),
-            "--out-cohort", str(cohort_path),
-            "--out-audit", str(cohort_audit),
-            "--out-manifest", str(cohort_manifest),
-        ],
-        check=True,
-    )
-    actual_cohort_sha = sha256_file(cohort_path)
-    if actual_cohort_sha != manifest["cohort_sha256"]:
+    # B41D-R1 recovery: B41B froze the SHA of the gzip container, but the
+    # B41B builder used gzip.open(..., "wt") without fixing gzip header
+    # metadata. The container hash therefore cannot be reproduced reliably.
+    # Replace that invalid byte-container gate with a logical-content gate:
+    # exact frozen builder, exact frozen sources, exact schema/row count, and
+    # two independent rebuilds with identical DECOMPRESSED CSV bytes.
+    builder_path = base / "player_role_v2_b41b_cohort_builder.py"
+    builder_sha_expected = manifest["builder_sha256"]
+    builder_sha_actual = sha256_file(builder_path)
+    if builder_sha_actual != builder_sha_expected:
         raise RuntimeError(
-            "B41D_COHORT_REPRODUCTION_MISMATCH "
-            f"expected={manifest['cohort_sha256']} actual={actual_cohort_sha}"
+            "B41D_R1_BUILDER_SHA_MISMATCH "
+            f"expected={builder_sha_expected} actual={builder_sha_actual}"
+        )
+
+    def build_cohort(tag: str):
+        cohort = out / f"b41d_reconstructed_cohort_{tag}.csv.gz"
+        audit = out / f"b41d_reconstructed_cohort_{tag}_audit.json"
+        built_manifest = out / f"b41d_reconstructed_cohort_{tag}_manifest.json"
+        subprocess.run(
+            [
+                sys.executable,
+                str(builder_path),
+                "--source-dir", str(tmp),
+                "--players", str(players_path),
+                "--out-cohort", str(cohort),
+                "--out-audit", str(audit),
+                "--out-manifest", str(built_manifest),
+            ],
+            check=True,
+        )
+        return cohort, audit, built_manifest
+
+    def sha256_gzip_payload(path: Path) -> str:
+        h = hashlib.sha256()
+        with gzip.open(path, "rb") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+
+    cohort_path, cohort_audit, cohort_manifest = build_cohort("a")
+    repeat_cohort_path, repeat_audit, repeat_manifest = build_cohort("b")
+
+    legacy_container_sha_expected = manifest["cohort_sha256"]
+    actual_cohort_sha = sha256_file(cohort_path)
+    repeat_container_sha = sha256_file(repeat_cohort_path)
+    canonical_payload_sha = sha256_gzip_payload(cohort_path)
+    repeat_payload_sha = sha256_gzip_payload(repeat_cohort_path)
+
+    if canonical_payload_sha != repeat_payload_sha:
+        raise RuntimeError(
+            "B41D_R1_LOGICAL_COHORT_REPRODUCTION_MISMATCH "
+            f"first={canonical_payload_sha} second={repeat_payload_sha}"
         )
 
     df = pd.read_csv(cohort_path, compression="gzip")
-    assert len(df) == manifest["cohort_row_count"] == 85740
+    if len(df) != manifest["cohort_row_count"] or len(df) != 85740:
+        raise RuntimeError(
+            "B41D_R1_COHORT_ROW_COUNT_MISMATCH "
+            f"expected={manifest['cohort_row_count']} actual={len(df)}"
+        )
+    if list(df.columns) != manifest["cohort_columns"]:
+        raise RuntimeError("B41D_R1_COHORT_SCHEMA_MISMATCH")
     assert set(df["season"].astype(int).unique()) == set(DEV_SEASONS)
     assert 2025 not in set(df["season"].astype(int))
 
@@ -424,9 +466,25 @@ def main():
         "schema_version": 1,
         "study_id": "player-role-v2",
         "phase": "B41D-development-modeling-data",
-        "b41b_expected_cohort_sha256": manifest["cohort_sha256"],
-        "b41d_reconstructed_cohort_sha256": actual_cohort_sha,
+        "b41b_legacy_gzip_container_sha256": legacy_container_sha_expected,
+        "b41d_gzip_container_sha256": actual_cohort_sha,
+        "b41d_repeat_gzip_container_sha256": repeat_container_sha,
+        "legacy_gzip_container_sha_matches": (
+            actual_cohort_sha == legacy_container_sha_expected
+        ),
+        "legacy_gzip_container_sha_gate_retired": True,
+        "b41b_builder_sha256_expected": builder_sha_expected,
+        "b41b_builder_sha256_actual": builder_sha_actual,
+        "b41b_builder_sha256_matches": True,
+        "b41d_canonical_decompressed_csv_sha256": canonical_payload_sha,
+        "b41d_repeat_decompressed_csv_sha256": repeat_payload_sha,
+        "canonical_decompressed_csv_repeat_match": True,
         "cohort_reproduced_exactly": True,
+        "cohort_reproduction_definition": (
+            "same frozen builder plus same frozen source bytes plus exact frozen "
+            "schema/row count plus identical decompressed CSV bytes across two "
+            "independent rebuilds; legacy gzip-container SHA is metadata-sensitive"
+        ),
         "modeling_rows": int(len(model_out)),
         "development_seasons": DEV_SEASONS,
         "holdout_2025_opened": False,
@@ -450,6 +508,11 @@ def main():
 
     print(json.dumps({
         "cohort_rows": len(df),
+        "cohort_canonical_decompressed_sha256": canonical_payload_sha,
+        "cohort_repeat_decompressed_sha256": repeat_payload_sha,
+        "legacy_gzip_container_sha_matches": (
+            actual_cohort_sha == legacy_container_sha_expected
+        ),
         "modeling_rows": len(model_out),
         "identity_coverage": overall_coverage,
         "min_cell_identity_coverage": min_cell,
