@@ -366,10 +366,28 @@ def load_season(stats_path: Path, snaps_path: Path, gsis_meta, pfr_to_gsis):
         "snap_unmapped_samples": snap_unmapped_samples,
     }
 
+ALL_OPPORTUNITY_FIELDS = tuple(sorted({
+    field
+    for fields in OPPORTUNITY_BY_POSITION.values()
+    for field in fields
+}))
+OPPORTUNITY_FEATURE_SUFFIXES = (
+    "last3_active_mean",
+    "season_to_date_active_mean",
+    "last3_minus_prior3",
+)
+
 def opportunity_features(history, pos):
-    fields = OPPORTUNITY_BY_POSITION[pos]
-    out = {}
-    for field in fields:
+    # Every cohort row must have one identical rectangular schema.
+    # Signals irrelevant to a position are NULL, never zero.
+    # Relevant fields retain the exact original B41B computation.
+    out = {
+        f"{field}__{suffix}": None
+        for field in ALL_OPPORTUNITY_FIELDS
+        for suffix in OPPORTUNITY_FEATURE_SUFFIXES
+    }
+
+    for field in OPPORTUNITY_BY_POSITION[pos]:
         vals = [
             finite_float(r.get("stats", {}).get(field), 0.0)
             for r in history
