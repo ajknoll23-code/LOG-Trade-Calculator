@@ -1,0 +1,932 @@
+name: B5A Package Adjustment V9 - Joint-Gate Simulation Design Sizing and Assignment Feasibility
+
+"on":
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: package-adjustment-v9-b5a-joint-gate-design-sizing
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  V8_EXPECTED_DATASET_SHA256: "e6d4beaae2699bd9a029e3d9c53d680cd30f6c2aaf4d460e6aca64dc3d18106d"
+  B5A_ANALYSIS_VERSION: "package-adjustment-v9-b5a-joint-gate-sizing-v1"
+
+jobs:
+  size-design:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install pinned planning dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir \
+            "requests==2.34.2" "numpy==2.3.3" "scipy==1.16.2"
+
+      - name: Guard durable V8 closeout and planning-only scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+          declare -A EXPECTED_BLOBS=(
+            ["research/package-adjustment-v8/package_adjustment_v8_scientific_closeout.json"]="7073583e2ad9c65757dd0c81a8741734cdbb7dc0"
+            ["research/package-adjustment-v8/development_evaluation.json"]="7d9f3814671a6d488407e57a419190d3b5fda376"
+            ["research/package-adjustment-v8/dataset_commitment.json"]="6911d06d8d977d4dd9ed79ccdc041be1290d588f"
+            ["research/package-adjustment-v8/outcome_opening_manifest.json"]="3da9878197d6ce668f4215a446265b9736c9030e"
+            ["research/package-adjustment-v8/b3b_2v2_calibration_decomposition.json"]="bb09576b65315662d663f22acb704545a643702c"
+            ["research/package-adjustment-v8/development_catalog_v1.json"]="6ec00393baf7b8a7e99df98709a66e35ffdb1d88"
+            ["research/package-adjustment-v8/package_vote_challenges_v8_development_v1.json"]="8258fe8ca41d6ccef16529ea9ade9da19d3ca2e2"
+            ["research/package-adjustment-v8/development_voting_activation_manifest_v1.json"]="938bf754c90adeda8f3a5f863acfda8967c3818d"
+            ["research/package-adjustment-v8/voting_randomization_schedule_v1.json"]="c499d85b8473798294eccfe9310ec9644c1db3fc"
+            ["research/package-adjustment-v8/evaluation_protocol_v1.json"]="263db22eb41be6b458479d7fb76ad61f55b0bcd8"
+          )
+
+          for p in "${!EXPECTED_BLOBS[@]}"; do
+            actual="$(git hash-object "$p")"
+            test "$actual" = "${EXPECTED_BLOBS[$p]}" || {
+              echo "ERROR: frozen V8 artifact drift: $p expected=${EXPECTED_BLOBS[$p]} actual=$actual"
+              exit 1
+            }
+          done
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          d=Path('research/package-adjustment-v8')
+          load=lambda n: json.loads((d/n).read_text())
+
+          close=load('package_adjustment_v8_scientific_closeout.json')
+          ev=load('development_evaluation.json')
+          dc=load('dataset_commitment.json')
+          oo=load('outcome_opening_manifest.json')
+          b3b=load('b3b_2v2_calibration_decomposition.json')
+
+          assert close['scientific_decision']=='STOP_V8_TOPOLOGY_SPLIT_NO_DEVELOPMENT_CONFIRMATION'
+          assert close['production_change_authorized'] is False
+          assert ev['decision']=='STOP_V8_TOPOLOGY_SPLIT_NO_DEVELOPMENT_CONFIRMATION'
+          assert ev['production_change_authorized'] is False
+          assert dc['dataset_sha256']=='e6d4beaae2699bd9a029e3d9c53d680cd30f6c2aaf4d460e6aca64dc3d18106d'
+          assert dc['accepted_voters']==50 and dc['accepted_ballots']==2000 and dc['accepted_slots']==50
+          assert oo['accepted_voters_exactly']==50 and oo['accepted_ballots_exactly']==2000
+          assert b3b['result']=='PASS_MECHANISM_CONFIRMED_SHARED_NUISANCE_CALIBRATION'
+
+          # Critical anti-forking-path declaration for this workflow:
+          # V8 candidate performance is NOT an input to V9 architecture selection here.
+          # The opened V8 votes are used only to estimate human/challenge nuisance variation.
+          print('PASS: V8 is durably closed; B5A is planning-only and cannot authorize a V9 candidate, design, gate, or production change.')
+          PY
+
+      - name: Reconstruct exact frozen V8 dataset for nuisance estimation only
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/package-adjustment-v9-b5a
+          mkdir -p /tmp/package-adjustment-v9-b5a
+
+          python3 - <<'PY'
+          from __future__ import annotations
+          import csv,hashlib,io,json,re
+          from collections import Counter,defaultdict
+          from datetime import datetime,timezone
+          from pathlib import Path
+          import requests
+
+          D=Path('research/package-adjustment-v8')
+          OUT=Path('/tmp/package-adjustment-v9-b5a')
+          SHEET_URL=(
+            'https://docs.google.com/spreadsheets/d/e/'
+            '2PACX-1vTuKORGumlKJmUmBdeNWPstkj8VRjPoVkylbqHv1KqwoyziJYOUlkZUKRsSxzB3qHXmyjjLpGpH6W03/'
+            'pub?gid=458294959&single=true&output=csv'
+          )
+          VOTE_PREFIX='__pkgv8dev__|'
+          SCHEMA_MARKER='__pkgv8dev_schema__|1'
+
+          def load(n): return json.loads((D/n).read_text())
+          def parse_utc(value):
+            s=str(value or '').strip()
+            if not s: return None
+            if s.endswith('Z'): s=s[:-1]+'+00:00'
+            try: dt=datetime.fromisoformat(s)
+            except ValueError: return None
+            if dt.tzinfo is None: dt=dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+
+          act=load('development_voting_activation_manifest_v1.json')
+          safe=load('package_vote_challenges_v8_development_v1.json')
+          full=load('development_catalog_v1.json')
+          sched=load('voting_randomization_schedule_v1.json')
+          opening=load('outcome_opening_manifest.json')
+          durable=load('dataset_commitment.json')
+
+          safe_ch={str(c['id']):c for c in safe['challenges']}
+          full_ch={str(c['id']):c for c in full['challenges']}
+          assert set(safe_ch)==set(full_ch) and len(safe_ch)==40
+
+          activation_cutoff=parse_utc(act['valid_ballot_start_utc']); assert activation_cutoff
+          freeze_cutoff=parse_utc(opening['source_maturity_generated_at_utc']); assert freeze_cutoff
+          reset_cutoffs={int(k):parse_utc(v) for k,v in opening['reset_cutoffs_utc'].items()}
+          expected_hashes={str(k):v for k,v in opening['expected_voter_hash_by_slot'].items()}
+          assert set(expected_hashes)=={str(i) for i in range(1,51)}
+
+          resp=requests.get(SHEET_URL,timeout=30)
+          resp.raise_for_status()
+          source_rows=list(csv.DictReader(io.StringIO(resp.text)))
+          current_sheet_sha=hashlib.sha256(resp.content).hexdigest()
+          meta_re=re.compile(r'^__pkgv8dev_meta__\|([AB])\|([1-9]|[1-4][0-9]|50)\|([0-9]|[1-2][0-9]|3[0-9])$')
+
+          reset_rows=defaultdict(list)
+          structural=[]
+          excluded=Counter()
+          post_freeze=0
+
+          for source_index,row in enumerate(source_rows):
+            keep=str(row.get('keep') or '')
+            if not keep.startswith(VOTE_PREFIX): continue
+            ts=parse_utc(row.get('timestamp'))
+            if ts is None:
+              excluded['invalid_timestamp']+=1; continue
+            if ts<=activation_cutoff:
+              excluded['pre_activation_or_at_cutoff']+=1; continue
+            if ts>freeze_cutoff:
+              post_freeze+=1; continue
+            voter=str(row.get('voter_roster_id') or '').strip()
+            if not voter:
+              excluded['missing_voter_id']+=1; continue
+
+            payload=keep[len(VOTE_PREFIX):]
+            cid,sep,choice_payload=payload.partition('|')
+            if not sep:
+              excluded['malformed_vote_transport']+=1; continue
+            cid=cid.strip()
+            if cid not in safe_ch:
+              excluded['unknown_challenge_id']+=1; continue
+
+            mm=meta_re.fullmatch(str(row.get('trade') or ''))
+            if not mm:
+              excluded['invalid_meta_transport']+=1; continue
+            display_left=mm.group(1)
+            slot=int(mm.group(2))
+            display_order=int(mm.group(3))
+            if str(row.get('cut') or '')!=SCHEMA_MARKER:
+              excluded['invalid_schema_marker']+=1; continue
+            spec=sched['slots'][str(slot)]
+            if cid not in spec['challenge_order']:
+              excluded['challenge_not_in_slot_schedule']+=1; continue
+            if display_order!=spec['challenge_order'].index(cid):
+              excluded['display_order_schedule_mismatch']+=1; continue
+            if display_left!=spec['display_left_by_challenge'][cid]:
+              excluded['display_left_schedule_mismatch']+=1; continue
+
+            item={'timestamp':ts,'source_index':source_index,'voter':voter,'challenge_id':cid,
+                  'display_left':display_left,'slot':slot,'display_order':display_order}
+            cutoff=reset_cutoffs.get(slot)
+            if cutoff is not None and ts<=cutoff:
+              reset_rows[slot].append(item)
+              excluded[f'slot{slot}_reset_pre_cutoff']+=1
+              continue
+
+            choice=choice_payload.strip()
+            if choice not in {'A','B'}:
+              excluded['invalid_choice_payload']+=1; continue
+            item['choice']=choice
+            structural.append(item)
+
+          assert len(reset_rows[16])==80 and len({r['voter'] for r in reset_rows[16]})==2
+          assert len(reset_rows[35])==42 and len({r['voter'] for r in reset_rows[35]})==1
+          assert len(reset_rows[44])==41 and len({r['voter'] for r in reset_rows[44]})==1
+          assert sorted(Counter(r['challenge_id'] for r in reset_rows[35]).values())==[1]*38+[2]*2
+          assert sorted(Counter(r['challenge_id'] for r in reset_rows[44]).values())==[1]*39+[2]
+
+          structural.sort(key=lambda r:(r['timestamp'],r['source_index']))
+          assert len(structural)==2000
+          by_voter=defaultdict(list)
+          for r in structural: by_voter[r['voter']].append(r)
+          assert len(by_voter)==50
+
+          ballots=[]
+          planning=[]
+          seen_slots=set()
+          observed={}
+
+          for voter,rows in by_voter.items():
+            assert len(rows)==40
+            assert len({r['challenge_id'] for r in rows})==40
+            slots={r['slot'] for r in rows}; assert len(slots)==1
+            slot=next(iter(slots)); assert slot not in seen_slots; seen_slots.add(slot)
+            ordered=sorted(rows,key=lambda r:r['display_order'])
+            assert [r['display_order'] for r in ordered]==list(range(40))
+            assert [r['challenge_id'] for r in ordered]==sched['slots'][str(slot)]['challenge_order']
+            voter_hash=hashlib.sha256(('v8-maturity-voter|'+voter).encode()).hexdigest()[:16]
+            assert voter_hash==expected_hashes[str(slot)]
+            observed[str(slot)]=voter_hash
+
+            for r in ordered:
+              human_choice_left=(r['choice']==r['display_left'])
+              ballots.append({
+                'voter_cluster':voter_hash,
+                'challenge_id':r['challenge_id'],
+                'display_left':r['display_left'],
+                'human_choice_left':human_choice_left,
+              })
+
+              c=full_ch[r['challenge_id']]
+              rawA=float(c['side_A']['raw_fv']); rawB=float(c['side_B']['raw_fv'])
+              if rawA>rawB: preferred='A'
+              elif rawB>rawA: preferred='B'
+              else: preferred='A'  # deterministic semantic orientation for an exact raw-FV tie
+              planning.append({
+                'voter_cluster':voter_hash,
+                'challenge_id':r['challenge_id'],
+                'topology':c['topology'],
+                'preferred_side':preferred,
+                'preferred_displayed_left':r['display_left']==preferred,
+                'human_chose_preferred':r['choice']==preferred,
+              })
+
+          assert seen_slots==set(range(1,51))
+          assert observed==expected_hashes
+          assert len(ballots)==len(planning)==2000
+          by_ch=Counter(b['challenge_id'] for b in ballots)
+          assert set(by_ch.values())=={50}
+          for cid in safe_ch:
+            lefts=Counter(b['display_left'] for b in ballots if b['challenge_id']==cid)
+            assert lefts=={'A':25,'B':25}
+
+          dataset={'schema_version':1,'study_id':act['study_id'],'ballots':ballots}
+          dataset_bytes=(json.dumps(dataset,sort_keys=True,separators=(',',':'))+'\n').encode()
+          dataset_sha=hashlib.sha256(dataset_bytes).hexdigest()
+          assert dataset_sha==durable['dataset_sha256']=="e6d4beaae2699bd9a029e3d9c53d680cd30f6c2aaf4d460e6aca64dc3d18106d"
+
+          # Human outcomes are already-open V8 exploratory evidence. They are reconstructed only
+          # for nuisance estimation, never stored in the durable B5A outputs.
+          (OUT/'v8_planning_rows.json').write_text(json.dumps(planning,separators=(',',':')))
+          witness={
+            'status':'PASS_EXACT_V8_DATASET_RECONSTRUCTED_FOR_NUISANCE_ONLY',
+            'dataset_sha256':dataset_sha,
+            'accepted_voters':50,
+            'accepted_ballots':2000,
+            'post_freeze_v8_rows_ignored':post_freeze,
+            'current_sheet_sha256':current_sheet_sha,
+            'sheet_sha256_at_maturity':durable['sheet_sha256_at_maturity'],
+            'raw_human_ballots_retained_in_durable_b5a_outputs':False,
+            'candidate_performance_used_for_v9_design_selection':False,
+          }
+          (OUT/'reconstruction_witness.json').write_text(json.dumps(witness,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(witness,indent=2,sort_keys=True))
+          PY
+
+      - name: Run joint-gate simulation sizing and assignment feasibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/package-adjustment-v9-b5a/analyze_b5a.py <<'PY'
+          from __future__ import annotations
+          import hashlib,json,math,os
+          from collections import Counter,defaultdict
+          from pathlib import Path
+          import numpy as np
+          from scipy.optimize import minimize, minimize_scalar
+          from scipy.special import expit
+          from scipy.stats import t as student_t
+
+          OUT=Path('/tmp/package-adjustment-v9-b5a')
+          VERSION=os.environ['B5A_ANALYSIS_VERSION']
+          SEED=20261005
+          TOPOLOGIES=['2v2','2v3','2v4','3v3','3v4','4v4']
+          TOPO_IDX={t:i for i,t in enumerate(TOPOLOGIES)}
+          RNG=np.random.default_rng(SEED)
+
+          # Prespecified planning grid. It is intentionally broader than the anchor simulations.
+          FEAS_CPT=[15,18,20,24,25,27,30,32]
+          FEAS_R=[6,8]
+          FEAS_WORKLOAD=[18,24,30]
+
+          # Simulation anchors are frozen here before this workflow sees V8 nuisance estimates.
+          # They span materially lighter burdens than V8 and include Claude's recommended region.
+          ANCHORS=[
+            (18,8,24),
+            (20,6,24),
+            (20,8,24),
+            (24,6,24),
+            (24,8,24),
+            (25,8,24),
+            (30,6,24),
+            (30,8,24),
+          ]
+          MARGINS=[0.002,0.005,0.010,0.020]
+          OVERALL_FLOORS=[0.000,0.005,0.010]
+          REPS=80
+          COMPARATOR_NOISE_SD=1.35  # purely generative planning comparator; NOT measured V1.7 performance
+
+          rows=json.loads((OUT/'v8_planning_rows.json').read_text())
+          assert len(rows)==2000
+
+          voters=sorted({r['voter_cluster'] for r in rows})
+          challenges=sorted({r['challenge_id'] for r in rows})
+          assert len(voters)==50 and len(challenges)==40
+          vmap={v:i for i,v in enumerate(voters)}
+          cmap={c:i for i,c in enumerate(challenges)}
+          y=np.array([1.0 if r['human_chose_preferred'] else 0.0 for r in rows])
+          vi=np.array([vmap[r['voter_cluster']] for r in rows],dtype=int)
+          ci=np.array([cmap[r['challenge_id']] for r in rows],dtype=int)
+          xleft=np.array([1.0 if r['preferred_displayed_left'] else -1.0 for r in rows])
+          ctop={c:next(r['topology'] for r in rows if r['challenge_id']==c) for c in challenges}
+          assert set(ctop.values())==set(TOPOLOGIES)
+
+          # ---- Nuisance fit ---------------------------------------------------------------
+          # Penalized crossed logistic-effects planning approximation:
+          # logit P(choose higher-raw-FV side) = challenge effect + voter effect + left bias.
+          # The semantic direction avoids the meaningless "side A preference" ICC criticized in B5.
+          nv=len(voters); nc=len(challenges)
+          def obj_grad(par):
+            ch=par[:nc]; ve=par[nc:nc+nv]; dl=par[-1]
+            eta=ch[ci]+ve[vi]+dl*xleft
+            p=expit(eta)
+            nll=float(np.logaddexp(0.0,eta).sum()-np.dot(y,eta))
+            # Tiny challenge ridge stabilizes extreme cells; voter ridge identifies location and shrinks noise.
+            rv=0.20; rc=1e-5; rd=1e-5
+            nll += 0.5*rv*float(np.dot(ve,ve))+0.5*rc*float(np.dot(ch,ch))+0.5*rd*dl*dl
+            resid=p-y
+            gch=np.bincount(ci,weights=resid,minlength=nc)+rc*ch
+            gve=np.bincount(vi,weights=resid,minlength=nv)+rv*ve
+            gdl=float(np.dot(resid,xleft)+rd*dl)
+            return nll,np.concatenate([gch,gve,[gdl]])
+
+          fit=minimize(lambda z:obj_grad(z)[0],np.zeros(nc+nv+1),jac=lambda z:obj_grad(z)[1],method='L-BFGS-B',options={'maxiter':2000,'ftol':1e-12})
+          assert fit.success,fit.message
+          ch_eff=fit.x[:nc].copy()
+          voter_eff=fit.x[nc:nc+nv].copy()
+          delta_left=float(fit.x[-1])
+          voter_eff-=voter_eff.mean()
+
+          centered=[]
+          per_topology={}
+          for t in TOPOLOGIES:
+            vals=np.array([ch_eff[cmap[c]] for c in challenges if ctop[c]==t],dtype=float)
+            vals=vals-vals.mean()
+            centered.extend(vals.tolist())
+            per_topology[t]={'challenge_count':int(len(vals)),'centered_sd':float(np.std(vals,ddof=1))}
+          sigma_ch=float(np.std(np.array(centered),ddof=1))
+          sigma_v=float(np.std(voter_eff,ddof=1))
+          assert sigma_ch>0 and sigma_v>=0
+
+          # Bootstrap the nuisance components themselves. This propagates planning uncertainty
+          # without ever feeding V8 C1/C0 performance or beta values into V9 design choice.
+          BRNG=np.random.default_rng(SEED+11)
+          B=4000
+          boot_ch=np.empty(B); boot_v=np.empty(B)
+          top_vals={}
+          for t in TOPOLOGIES:
+            vals=np.array([ch_eff[cmap[c]] for c in challenges if ctop[c]==t],dtype=float)
+            top_vals[t]=vals-vals.mean()
+          for b in range(B):
+            pooled=[]
+            for t in TOPOLOGIES:
+              vals=top_vals[t]
+              samp=BRNG.choice(vals,size=len(vals),replace=True)
+              samp=samp-samp.mean()
+              pooled.extend(samp.tolist())
+            boot_ch[b]=max(0.03,float(np.std(np.array(pooled),ddof=1)))
+            sv=BRNG.choice(voter_eff,size=len(voter_eff),replace=True)
+            boot_v[b]=max(0.0,float(np.std(sv,ddof=1)))
+          p_fit=expit(ch_eff[ci]+voter_eff[vi]+delta_left*xleft)
+          delta_info=float(np.sum(p_fit*(1-p_fit)*xleft*xleft))
+          delta_se=1.5/math.sqrt(max(delta_info,1e-9))
+
+          nuisance={
+            'analysis_version':VERSION,
+            'status':'PASS_NUISANCE_ESTIMATION_ONLY',
+            'semantic_response':'human chose side with higher raw FV; exact raw-FV ties orient deterministically to side A',
+            'model':'penalized crossed logistic-effects planning approximation',
+            'v8_dataset_sha256':os.environ['V8_EXPECTED_DATASET_SHA256'],
+            'voters':50,'challenges':40,'ballots':2000,
+            'voter_random_effect_sd_point':sigma_v,
+            'within_topology_challenge_effect_sd_point':sigma_ch,
+            'left_bias_logit_point':delta_left,
+            'left_bias_logit_planning_se_conservative':delta_se,
+            'within_topology_challenge_sd_bootstrap_p50':float(np.quantile(boot_ch,.50)),
+            'within_topology_challenge_sd_bootstrap_p80':float(np.quantile(boot_ch,.80)),
+            'within_topology_challenge_sd_bootstrap_p90':float(np.quantile(boot_ch,.90)),
+            'voter_sd_bootstrap_p50':float(np.quantile(boot_v,.50)),
+            'voter_sd_bootstrap_p80':float(np.quantile(boot_v,.80)),
+            'voter_sd_bootstrap_p90':float(np.quantile(boot_v,.90)),
+            'per_topology_descriptive_centered_sd':per_topology,
+            'explicitly_not_used':[
+              'V8 C1-vs-C0 loss-difference variance as a proxy for V9-vs-V1.7 variance',
+              'V8 per-topology C1 performance to choose topology emphasis',
+              'V8 C0/C1 fitted beta magnitudes to tune V9 architecture',
+              'production V1.7 performance on V8 outcomes',
+            ],
+          }
+
+          # ---- Assignment feasibility -----------------------------------------------------
+          def assignment_for(cpt,r,workload,seed):
+            total=6*cpt*r
+            if r%2 or workload%6 or total%workload:
+              return None,{'reason':'divisibility_or_even_left_right_failure'}
+            n=total//workload
+            k=workload//6
+            if n<r or k>cpt:
+              return None,{'reason':'simple_bipartite_degree_failure'}
+            rng=np.random.default_rng(seed)
+            best=None; best_score=None; best_diag=None
+            for trial in range(350):
+              rec=[]
+              for ti,t in enumerate(TOPOLOGIES):
+                perm=rng.permutation(n)
+                # Rotate the base voter cycle independently by topology, then relabel by perm.
+                off=int(rng.integers(0,n))
+                for j in range(cpt):
+                  sorder=rng.permutation(r)
+                  for rank,s in enumerate(sorder):
+                    base=(j*r+int(s)+off)%n
+                    voter=int(perm[base])
+                    x=1 if rank < r//2 else -1
+                    rec.append((voter,ti,j,x))
+              # Hard exactness checks.
+              vc=Counter(v for v,_,_,_ in rec)
+              vt=Counter((v,t) for v,t,_,_ in rec)
+              cj=Counter((t,j) for _,t,j,_ in rec)
+              cjl=defaultdict(Counter)
+              dup=Counter((v,t,j) for v,t,j,_ in rec)
+              for v,t,j,x in rec:cjl[(t,j)][x]+=1
+              hard=(set(vc.values())=={workload} and set(vt.values())=={k} and set(cj.values())=={r}
+                    and max(dup.values())==1 and all(z==Counter({-1:r//2,1:r//2}) for z in cjl.values()))
+              if not hard: continue
+              left_by_v=Counter()
+              sets=[set() for _ in range(n)]
+              for v,t,j,x in rec:
+                left_by_v[v]+=x
+                sets[v].add((t,j))
+              max_left_imb=max(abs(left_by_v[v]) for v in range(n))
+              overlaps=[]
+              for a in range(n):
+                for b in range(a+1,n): overlaps.append(len(sets[a]&sets[b]))
+              overlap_range=(max(overlaps)-min(overlaps)) if overlaps else 0
+              overlap_sd=float(np.std(overlaps)) if overlaps else 0.0
+              score=(max_left_imb,overlap_range,overlap_sd)
+              if best_score is None or score<best_score:
+                best_score=score;best=rec
+                best_diag={'max_abs_voter_left_minus_right':int(max_left_imb),'pairwise_overlap_range':int(overlap_range),'pairwise_overlap_sd':overlap_sd,'trials':trial+1}
+            if best is None:return None,{'reason':'randomized_constrained_generator_found_no_core_exact_assignment'}
+            return best,best_diag
+
+          feasibility=[]
+          assignment_cache={}
+          for cpt in FEAS_CPT:
+            for r in FEAS_R:
+              for w in FEAS_WORKLOAD:
+                total=6*cpt*r
+                n=(total//w) if total%w==0 else None
+                rec,diag=assignment_for(cpt,r,w,SEED+cpt*100+r*10+w)
+                if rec is None:
+                  label='INFEASIBLE'
+                else:
+                  # "EXACT" requires exact replication/topology/left-right plus good practical balance.
+                  label='EXACT' if diag['max_abs_voter_left_minus_right']<=2 and diag['pairwise_overlap_range']<=3 else 'APPROXIMATE'
+                  assignment_cache[(cpt,r,w)]=rec
+                feasibility.append({
+                  'challenges_per_topology':cpt,'total_challenges':6*cpt,'votes_per_challenge':r,
+                  'workload_per_voter':w,'total_ballots':total,'voters':n,'classification':label,
+                  'diagnostics':diag,
+                })
+
+          for a in ANCHORS:
+            if a not in assignment_cache:
+              rec,diag=assignment_for(*a,SEED+999+sum(a))
+              assert rec is not None,(a,diag)
+              assignment_cache[a]=rec
+
+          # Assignment generator self-tests independent of V8 outcomes.
+          for a in [(20,8,24),(30,8,24),(24,6,24)]:
+            rec=assignment_cache[a]
+            cpt,r,w=a; n=6*cpt*r//w; k=w//6
+            assert set(Counter(v for v,_,_,_ in rec).values())=={w}
+            assert set(Counter((v,t) for v,t,_,_ in rec).values())=={k}
+            assert set(Counter((t,j) for _,t,j,_ in rec).values())=={r}
+            assert max(Counter((v,t,j) for v,t,j,_ in rec).values())==1
+
+          # ---- Generative model calibration -----------------------------------------------
+          # The comparator is deliberately generic. No production V1.7 predictions are read.
+          # We calibrate candidate score-noise to prespecified true log-loss deltas.
+          cal_rng=np.random.default_rng(SEED+21)
+          nominal_sigma=float(np.quantile(boot_ch,.80))
+          M=180000
+          theta=cal_rng.normal(0.0,nominal_sigma,size=M)
+          ptrue=expit(theta)
+          e0=cal_rng.normal(size=M)
+          e1=cal_rng.normal(size=M)
+
+          def optimum_expected_loss(z):
+            def f(beta):
+              q=np.clip(expit(beta*z),1e-12,1-1e-12)
+              return float(np.mean(-(ptrue*np.log(q)+(1-ptrue)*np.log(1-q))))
+            rr=minimize_scalar(f,bounds=(0.05,25.0),method='bounded',options={'xatol':1e-6})
+            assert rr.success
+            return float(rr.fun),float(rr.x)
+
+          base_loss,base_beta=optimum_expected_loss(theta+COMPARATOR_NOISE_SD*e0)
+          tau_grid=np.linspace(0.04,2.80,120)
+          delta_grid=[]
+          for tau in tau_grid:
+            ll,_=optimum_expected_loss(theta+float(tau)*e1)
+            delta_grid.append(ll-base_loss)
+          delta_grid=np.array(delta_grid)
+          # Numerical monotonicity can have tiny MC wiggles; enforce monotone cumulative maximum.
+          delta_mono=np.maximum.accumulate(delta_grid)
+
+          def tau_for_target_delta(target):
+            target=float(target)
+            lo=float(delta_mono[0]); hi=float(delta_mono[-1])
+            if target<lo-1e-6 or target>hi+1e-6:
+              return None
+            return float(np.interp(target,delta_mono,tau_grid))
+
+          calibration={
+            'comparator_noise_sd':COMPARATOR_NOISE_SD,
+            'comparator_optimal_beta_large_sample':base_beta,
+            'nominal_within_topology_challenge_sd':nominal_sigma,
+            'achievable_expected_candidate_minus_comparator_logloss_delta_range':[float(delta_mono[0]),float(delta_mono[-1])],
+            'production_v1_7_predictions_read':False,
+            'note':'Generic generative planning comparator only; final V9 sizing must be rerun after exact V9/V1.7 evaluator semantics are frozen.'
+          }
+
+          # ---- Evaluation helpers ----------------------------------------------------------
+          def fit_nuisance(score,x,y):
+            def fg(z):
+              beta,dl=float(z[0]),float(z[1])
+              eta=beta*score+dl*x
+              p=expit(eta)
+              loss=float(np.logaddexp(0.0,eta).sum()-np.dot(y,eta))
+              res=p-y
+              grad=np.array([float(np.dot(res,score)),float(np.dot(res,x))])
+              return loss,grad
+            rr=minimize(lambda z:fg(z)[0],np.array([1.0,0.0]),jac=lambda z:fg(z)[1],method='L-BFGS-B',
+                        bounds=[(0.05,25.0),(-0.75,0.75)],options={'maxiter':150,'ftol':1e-10})
+            if not rr.success: raise RuntimeError(str(rr.message))
+            return float(rr.x[0]),float(rr.x[1])
+
+          def logloss_from_eta(y,eta):
+            return np.logaddexp(0.0,eta)-y*eta
+
+          def two_way_se(vals,voters_arr,challenges_arr):
+            vals=np.asarray(vals,float); n=len(vals); mu=float(vals.mean()); r=vals-mu
+            uv=np.unique(voters_arr); uc=np.unique(challenges_arr)
+            sv=np.array([r[voters_arr==g].sum() for g in uv])
+            sc=np.array([r[challenges_arr==g].sum() for g in uc])
+            term_v=(len(uv)/(len(uv)-1))*float(np.dot(sv,sv)) if len(uv)>1 else 0.0
+            term_c=(len(uc)/(len(uc)-1))*float(np.dot(sc,sc)) if len(uc)>1 else 0.0
+            term_i=(n/(n-1))*float(np.dot(r,r)) if n>1 else 0.0
+            var=max(0.0,(term_v+term_c-term_i)/(n*n))
+            return math.sqrt(var)
+
+          def simulate_one(cpt,r,w,scenario,rep):
+            rec=assignment_cache[(cpt,r,w)]
+            total=len(rec); n=6*cpt*r//w
+            rng=np.random.default_rng(SEED*100000 + cpt*1000 + r*100 + rep + {'good_min':0,'good_mod':20000,'null':40000,'unsafe':60000}[scenario])
+            sig_ch=float(rng.choice(boot_ch)); sig_v=float(rng.choice(boot_v))
+            dl=float(rng.normal(delta_left,delta_se))
+
+            # Scenario target true deltas are prespecified and independent of V8 candidate topology results.
+            if scenario=='good_min':
+              h=rng.normal(0.0,0.005,size=6); h-=h.mean(); targets=-0.020+h
+            elif scenario=='good_mod':
+              h=rng.normal(0.0,0.010,size=6); h-=h.mean(); targets=-0.050+h
+            elif scenario=='null':
+              targets=np.zeros(6)
+            elif scenario=='unsafe':
+              unsafe_idx=rep%6
+              targets=np.full(6,-0.040); targets[unsafe_idx]=0.020
+            else: raise ValueError(scenario)
+
+            taus=[]
+            for d in targets:
+              tau=tau_for_target_delta(float(d))
+              if tau is None:
+                return None
+              taus.append(tau)
+            taus=np.array(taus)
+
+            theta=rng.normal(0.0,sig_ch,size=(6,cpt))
+            voter_b=rng.normal(0.0,sig_v,size=n)
+            eps0=rng.normal(size=(6,cpt))
+            eps1=rng.normal(size=(6,cpt))
+            score0=theta+COMPARATOR_NOISE_SD*eps0
+            score1=theta+taus[:,None]*eps1
+
+            v=np.array([q[0] for q in rec],dtype=int)
+            ti=np.array([q[1] for q in rec],dtype=int)
+            j=np.array([q[2] for q in rec],dtype=int)
+            x=np.array([q[3] for q in rec],dtype=float)
+            cid=ti*cpt+j
+            latent=theta[ti,j]+voter_b[v]+dl*x
+            yy=rng.binomial(1,expit(latent)).astype(float)
+            s0=score0[ti,j]; s1=score1[ti,j]
+
+            # Deterministic topology-balanced five-fold challenge OOF nuisance fitting.
+            fold=(j+2*ti)%5
+            dloss=np.empty(total,float)
+            for f in range(5):
+              tr=fold!=f; te=~tr
+              b0,l0=fit_nuisance(s0[tr],x[tr],yy[tr])
+              b1,l1=fit_nuisance(s1[tr],x[tr],yy[tr])
+              dloss[te]=logloss_from_eta(yy[te],b1*s1[te]+l1*x[te])-logloss_from_eta(yy[te],b0*s0[te]+l0*x[te])
+
+            overall=float(dloss.mean())
+            se_all=two_way_se(dloss,v,cid)
+            df_all=max(2,min(n-1,6*cpt-1))
+            ucb_all=overall+float(student_t.ppf(.95,df_all))*se_all
+
+            topo=[]
+            for z,t in enumerate(TOPOLOGIES):
+              m=ti==z
+              mean=float(dloss[m].mean())
+              se=two_way_se(dloss[m],v[m],cid[m])
+              ucb=mean+float(student_t.ppf(.95,max(2,cpt-1)))*se
+              topo.append({'topology':t,'mean':mean,'ucb95':ucb,'true_target_delta':float(targets[z])})
+            return {'overall_mean':overall,'overall_ucb95':ucb_all,'topologies':topo}
+
+          # ---- Run simulation --------------------------------------------------------------
+          scenarios=['good_min','good_mod','null','unsafe']
+          raw=defaultdict(list)
+          skipped=defaultdict(int)
+          for cpt,r,w in ANCHORS:
+            for scenario in scenarios:
+              for rep in range(REPS):
+                sim=simulate_one(cpt,r,w,scenario,rep)
+                if sim is None: skipped[(cpt,r,w,scenario)]+=1
+                else: raw[(cpt,r,w,scenario)].append(sim)
+
+          summary=[]
+          for cpt,r,w in ANCHORS:
+            total=6*cpt*r; n=total//w
+            feas=next(x for x in feasibility if x['challenges_per_topology']==cpt and x['votes_per_challenge']==r and x['workload_per_voter']==w)
+            for margin in MARGINS:
+              for floor in OVERALL_FLOORS:
+                rec={'challenges_per_topology':cpt,'total_challenges':6*cpt,'votes_per_challenge':r,'workload_per_voter':w,
+                     'total_ballots':total,'voters':n,'assignment_classification':feas['classification'],
+                     'topology_ni_margin':margin,'overall_minimum_mean_benefit':floor}
+                for scenario in scenarios:
+                  sims=raw[(cpt,r,w,scenario)]
+                  if not sims:
+                    rec[scenario+'_n']=0; rec[scenario+'_joint_pass_rate']=None
+                    continue
+                  passes=[]
+                  for s in sims:
+                    overall_pass=(s['overall_ucb95']<0.0 and s['overall_mean']<=-floor)
+                    topology_pass=all(x['ucb95']<margin for x in s['topologies'])
+                    passes.append(overall_pass and topology_pass)
+                  rec[scenario+'_n']=len(sims)
+                  rec[scenario+'_joint_pass_rate']=float(np.mean(passes))
+                if rec.get('unsafe_joint_pass_rate') is not None:
+                  rec['unsafe_detection_rate']=1.0-rec['unsafe_joint_pass_rate']
+                summary.append(rec)
+
+          # Design-level diagnostics using the principal planning row floor=.005 margin=.010.
+          principal=[x for x in summary if abs(x['topology_ni_margin']-.010)<1e-12 and abs(x['overall_minimum_mean_benefit']-.005)<1e-12]
+          principal.sort(key=lambda x:(x['total_ballots'],x['voters']))
+
+          sizing={
+            'analysis_version':VERSION,
+            'status':'PASS_PLANNING_ONLY_NO_V9_DESIGN_FROZEN',
+            'seed':SEED,
+            'simulation_reps_per_anchor_scenario':REPS,
+            'joint_decision_rule_simulated':{
+              'overall':'candidate-minus-comparator mean log-loss delta must meet prespecified minimum benefit and one-sided 95% t-UCB < 0',
+              'topology':'all six topology candidate-minus-comparator one-sided 95% t-UCB values must be below the tested NI margin',
+              'pass_requires':'overall AND all six topology gates simultaneously',
+              'standard_error':'two-way voter/challenge cluster approximation; t reference uses conservative cluster degrees of freedom',
+              'note':'This is planning logic, not the final frozen V9 evaluator.'
+            },
+            'planning_scenarios':{
+              'good_min':'true mean candidate advantage about 0.020 log-loss with prespecified 0.005 topology heterogeneity SD',
+              'good_mod':'true mean candidate advantage about 0.050 log-loss with prespecified 0.010 topology heterogeneity SD',
+              'null':'candidate and comparator have equal generative expected loss',
+              'unsafe':'one topology is truly worse by +0.020 while the other five are better by -0.040; unsafe topology cycles across all six',
+            },
+            'tested_topology_margins':MARGINS,
+            'tested_overall_minimum_benefits':OVERALL_FLOORS,
+            'generic_comparator_calibration':calibration,
+            'principal_planning_slice_margin_0_010_floor_0_005':principal,
+            'all_joint_results':summary,
+            'skipped_uncalibratable_replicates':{'|'.join(map(str,k)):v for k,v in skipped.items()},
+            'v9_candidate_selected':False,
+            'v9_architecture_frozen':False,
+            'v9_design_frozen':False,
+            'v9_gates_frozen':False,
+            'production_change_authorized':False,
+            'required_next_scientific_step':'Review this design envelope, then preregister/freeze the exact scale-coherent V9 candidate architecture, exact V1.7 comparator semantics, nuisance fitting, final gates/margins, and one fresh design. After that freeze, rerun final simulation using the exact frozen V9 evaluator before generating any fresh V9 voting catalog.'
+          }
+
+          assignment_doc={
+            'analysis_version':VERSION,
+            'status':'PASS_ASSIGNMENT_FEASIBILITY_GRID_ONLY',
+            'requirements':{
+              'each_challenge_exactly_R_votes':True,
+              'R_even_and_exact_left_right_split_per_challenge':True,
+              'equal_topology_count_per_voter':True,
+              'workload_multiple_of_six':True,
+              'no_duplicate_voter_challenge':True,
+              'pairwise_voter_overlap_used_as_balance_diagnostic':True,
+            },
+            'classification_rule':{
+              'EXACT':'all hard constraints plus max voter left/right imbalance <=2 and pairwise overlap range <=3',
+              'APPROXIMATE':'all hard constraints exact but practical left/overlap balance misses the EXACT diagnostic threshold',
+              'INFEASIBLE':'divisibility/degree constraints fail or constrained generator finds no core-exact assignment',
+            },
+            'grid':feasibility,
+            'no_assignment_frozen_for_v9':True,
+          }
+
+          manifest={
+            'analysis_version':VERSION,
+            'status':'PASS_B5A_DESIGN_SIZING_ONLY',
+            'source_v8_dataset_sha256':os.environ['V8_EXPECTED_DATASET_SHA256'],
+            'uses_opened_v8_outcomes_only_for_nuisance_estimation':True,
+            'uses_v8_candidate_performance_to_choose_v9_architecture':False,
+            'reads_production_v1_7_predictions_on_v8_votes':False,
+            'joint_gate_probability_reported':True,
+            'variance_uncertainty_propagated':True,
+            'fold_fit_noise_included_in_simulation':True,
+            'actual_assignment_generator_used':True,
+            'outputs_permanent_repo_record_required':True,
+            'v9_outcomes_exist_or_were_read':False,
+            'v9_design_frozen':False,
+            'production_change_authorized':False,
+          }
+
+          def dump(name,obj):
+            (OUT/name).write_text(json.dumps(obj,indent=2,sort_keys=True)+'\n')
+          dump('b5a_nuisance_estimation.json',nuisance)
+          dump('b5a_assignment_feasibility.json',assignment_doc)
+          dump('b5a_joint_gate_design_sizing.json',sizing)
+          dump('b5a_design_sizing_manifest.json',manifest)
+
+          lines=[
+            '# Package Adjustment V9 — B5A Joint-Gate Design Sizing','',
+            '**Status:** `PASS_PLANNING_ONLY_NO_V9_DESIGN_FROZEN`','',
+            'This workflow is a read-only planning bridge from the durably closed V8 study to a separately preregistered V9. It does not select or freeze a V9 candidate, final gate, or sample size.','',
+            '## Corrections relative to superseded B5','',
+            '- Power is evaluated for the **joint decision rule**, not one gate at a time.',
+            '- V8 C1-vs-C0 loss-difference variance is **not** treated as V9-vs-V1.7 variance.',
+            '- V8 votes are used only to estimate semantically coded human/challenge nuisance variation and its bootstrap uncertainty.',
+            '- The simulation includes refitting nuisance calibration inside deterministic challenge folds.',
+            '- Candidate/comparator behavior is generative; production V1.7 predictions are never evaluated on V8 outcomes.',
+            '- A real constrained assignment is constructed and classified EXACT / APPROXIMATE / INFEASIBLE.',
+            '- Small-topology uncertainty uses a t reference rather than a normal-z shortcut.','',
+            '## Nuisance planning estimates','',
+            f"- Within-topology challenge-effect SD point estimate: **{sigma_ch:.4f}**",
+            f"- Challenge-effect SD bootstrap p90: **{np.quantile(boot_ch,.90):.4f}**",
+            f"- Voter-effect SD point estimate: **{sigma_v:.4f}**",
+            f"- Voter-effect SD bootstrap p90: **{np.quantile(boot_v,.90):.4f}**",
+            f"- Left-bias logit point estimate: **{delta_left:.4f}**",'',
+            '## Principal planning slice','',
+            'The table below uses a topology NI margin of 0.010 and an overall minimum mean benefit of 0.005. It is **not** a frozen V9 design decision.','',
+            '| C/topology | Votes/challenge | Voters | Workload | Ballots | Assignment | Good 0.02 joint PASS | Good 0.05 joint PASS | Null false PASS | Unsafe detection |',
+            '|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|',
+          ]
+          for x in principal:
+            fmt=lambda v:'NA' if v is None else f"{v:.3f}"
+            lines.append(f"| {x['challenges_per_topology']} | {x['votes_per_challenge']} | {x['voters']} | {x['workload_per_voter']} | {x['total_ballots']} | {x['assignment_classification']} | {fmt(x['good_min_joint_pass_rate'])} | {fmt(x['good_mod_joint_pass_rate'])} | {fmt(x['null_joint_pass_rate'])} | {fmt(x.get('unsafe_detection_rate'))} |")
+          lines += ['',
+            '## Scientific interpretation','',
+            'These probabilities are a **design envelope**, not final V9 power. The exact production V1.7 comparator behavior and exact V9 candidate/evaluator have intentionally not been tested on V8 outcomes. After architecture/comparator/gates are frozen, final design sizing must rerun the full frozen evaluator on synthetic data before any fresh V9 human vote is collected.','',
+            '**Production change authorized:** no.','',
+          ]
+          (OUT/'b5a_report.md').write_text('\n'.join(lines)+'\n')
+
+          # Durable outputs must not contain reconstructed individual ballot rows.
+          (OUT/'v8_planning_rows.json').unlink()
+          assert not (OUT/'v8_planning_rows.json').exists()
+
+          # Deterministic output commitment.
+          hashes={}
+          for n in ['b5a_nuisance_estimation.json','b5a_assignment_feasibility.json','b5a_joint_gate_design_sizing.json','b5a_design_sizing_manifest.json','b5a_report.md','reconstruction_witness.json']:
+            hashes[n]=hashlib.sha256((OUT/n).read_bytes()).hexdigest()
+          dump('b5a_output_hashes.json',{'analysis_version':VERSION,'sha256':hashes})
+          print(json.dumps({'status':sizing['status'],'principal_rows':len(principal),'output_hashes':hashes},indent=2,sort_keys=True))
+          PY
+
+          python3 /tmp/package-adjustment-v9-b5a/analyze_b5a.py
+
+      - name: Validate planning-only scientific firewall
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          p=Path('/tmp/package-adjustment-v9-b5a')
+          m=json.loads((p/'b5a_design_sizing_manifest.json').read_text())
+          s=json.loads((p/'b5a_joint_gate_design_sizing.json').read_text())
+          a=json.loads((p/'b5a_assignment_feasibility.json').read_text())
+          n=json.loads((p/'b5a_nuisance_estimation.json').read_text())
+          w=json.loads((p/'reconstruction_witness.json').read_text())
+
+          assert m['status']=='PASS_B5A_DESIGN_SIZING_ONLY'
+          assert s['status']=='PASS_PLANNING_ONLY_NO_V9_DESIGN_FROZEN'
+          assert a['status']=='PASS_ASSIGNMENT_FEASIBILITY_GRID_ONLY'
+          assert n['status']=='PASS_NUISANCE_ESTIMATION_ONLY'
+          assert w['dataset_sha256']=='e6d4beaae2699bd9a029e3d9c53d680cd30f6c2aaf4d460e6aca64dc3d18106d'
+          assert m['reads_production_v1_7_predictions_on_v8_votes'] is False
+          assert m['uses_v8_candidate_performance_to_choose_v9_architecture'] is False
+          assert m['joint_gate_probability_reported'] is True
+          assert m['variance_uncertainty_propagated'] is True
+          assert m['fold_fit_noise_included_in_simulation'] is True
+          assert m['actual_assignment_generator_used'] is True
+          assert m['v9_outcomes_exist_or_were_read'] is False
+          assert s['v9_candidate_selected'] is False
+          assert s['v9_architecture_frozen'] is False
+          assert s['v9_design_frozen'] is False
+          assert s['v9_gates_frozen'] is False
+          assert s['production_change_authorized'] is False
+          assert not (p/'v8_planning_rows.json').exists()
+          print('PASS: B5A remains design-sizing only; no V9 design/candidate/gate/production authorization occurred.')
+          PY
+
+      - name: Commit durable B5A planning record to main
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          DEST="research/package-adjustment-v9/b5a-design-sizing"
+          mkdir -p "$DEST"
+
+          ALLOW=(
+            b5a_nuisance_estimation.json
+            b5a_assignment_feasibility.json
+            b5a_joint_gate_design_sizing.json
+            b5a_design_sizing_manifest.json
+            b5a_report.md
+            reconstruction_witness.json
+            b5a_output_hashes.json
+          )
+          for f in "${ALLOW[@]}"; do
+            cp "/tmp/package-adjustment-v9-b5a/$f" "$DEST/$f"
+          done
+
+          # Exact allow-list: no reconstructed ballot-level data may enter the repository.
+          test "$(find "$DEST" -maxdepth 1 -type f | wc -l)" -eq 7
+          test ! -e "$DEST/v8_planning_rows.json"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- "${ALLOW[@]/#/$DEST/}"
+
+          staged="$(git diff --cached --name-only)"
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              "$DEST/b5a_nuisance_estimation.json"|\
+              "$DEST/b5a_assignment_feasibility.json"|\
+              "$DEST/b5a_joint_gate_design_sizing.json"|\
+              "$DEST/b5a_design_sizing_manifest.json"|\
+              "$DEST/b5a_report.md"|\
+              "$DEST/reconstruction_witness.json"|\
+              "$DEST/b5a_output_hashes.json") ;;
+              *) echo "ERROR: unexpected staged file: $f"; exit 1 ;;
+            esac
+          done <<< "$staged"
+
+          if git diff --cached --quiet; then
+            echo "B5A durable planning record already identical on main; no commit needed."
+            exit 0
+          fi
+
+          git commit -m "Record Package Adjustment V9 B5A joint-gate design sizing"
+          git pull --rebase origin main
+          git push origin HEAD:main
+
+      - name: Upload convenience artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-adjustment-v9-b5a-joint-gate-design-sizing
+          retention-days: 30
+          if-no-files-found: error
+          path: |
+            /tmp/package-adjustment-v9-b5a/b5a_nuisance_estimation.json
+            /tmp/package-adjustment-v9-b5a/b5a_assignment_feasibility.json
+            /tmp/package-adjustment-v9-b5a/b5a_joint_gate_design_sizing.json
+            /tmp/package-adjustment-v9-b5a/b5a_design_sizing_manifest.json
+            /tmp/package-adjustment-v9-b5a/b5a_report.md
+            /tmp/package-adjustment-v9-b5a/reconstruction_witness.json
+            /tmp/package-adjustment-v9-b5a/b5a_output_hashes.json
