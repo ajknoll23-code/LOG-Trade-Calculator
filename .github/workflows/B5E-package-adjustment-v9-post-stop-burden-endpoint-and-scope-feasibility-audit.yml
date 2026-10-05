@@ -1,0 +1,626 @@
+name: B5E Package Adjustment V9 - Post-STOP Burden Endpoint and Scope Feasibility Audit
+
+"on":
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: package-adjustment-v9-b5e-post-stop-feasibility-forks
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  B5E_ANALYSIS_VERSION: "package-adjustment-v9-b5e-post-stop-feasibility-forks-v1"
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install pinned audit dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir \
+            "numpy==2.3.3" "scipy==1.16.2"
+
+      - name: Guard exact B5C diagnostics and B5D scientific STOP
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+          declare -A EXPECTED_BLOBS=(
+            ["research/package-adjustment-v9/b5c-calibration-diagnostics/b5c_diagnostic_manifest.json"]="f19f1f0d579a2621a437c7e060d14b7537c934d8"
+            ["research/package-adjustment-v9/b5c-calibration-diagnostics/b5c_effect_calibration_check.json"]="799ae15913262bcfe6e0463dfdd972395827feb3"
+            ["research/package-adjustment-v9/b5c-calibration-diagnostics/b5c_joint_nuisance_draws.json"]="8c2422b9dd37bd84a2bfed2994d024236bd4e4a1"
+            ["research/package-adjustment-v9/b5c-calibration-diagnostics/b5c_uncertainty_coverage_check.json"]="4db8097673d3265c552f49732699e0088bb14596"
+            ["research/package-adjustment-v9/b5d-operating-characteristic-screen/b5d_effect_recalibration.json"]="7f1845f78e966f5fc0e011cdea4c16fe57b02299"
+            ["research/package-adjustment-v9/b5d-operating-characteristic-screen/b5d_operating_characteristics.json"]="85f8e6a2b874d4a156c0989c3d4487bfb8cc141f"
+            ["research/package-adjustment-v9/b5d-operating-characteristic-screen/b5d_preregistered_screen_protocol.json"]="74523dcba148313d0b068e294a7d142c8b4bf8cd"
+            ["research/package-adjustment-v9/b5d-operating-characteristic-screen/b5d_report.md"]="d378b26ed7d9aca79e662e3bd93e7187963c30c8"
+            ["research/package-adjustment-v9/b5d-operating-characteristic-screen/b5d_screen_manifest.json"]="1ebb44e8bff4af8adf790b32d509c74aa0cd75b9"
+          )
+
+          for p in "${!EXPECTED_BLOBS[@]}"; do
+            actual="$(git hash-object "$p")"
+            test "$actual" = "${EXPECTED_BLOBS[$p]}" || {
+              echo "ERROR: durable planning artifact drift: $p expected=${EXPECTED_BLOBS[$p]} actual=$actual"
+              exit 1
+            }
+          done
+
+          python3 - <<'PY1'
+          import json
+          from pathlib import Path
+          load=lambda p: json.loads(Path(p).read_text())
+          c=load('research/package-adjustment-v9/b5c-calibration-diagnostics/b5c_diagnostic_manifest.json')
+          d=load('research/package-adjustment-v9/b5d-operating-characteristic-screen/b5d_screen_manifest.json')
+          oc=load('research/package-adjustment-v9/b5d-operating-characteristic-screen/b5d_operating_characteristics.json')
+          assert c['status']=='PASS_B5C_CALIBRATION_INTEGRITY_AND_COVERAGE_DIAGNOSTICS_ONLY'
+          assert c['v9_outcomes_exist_or_were_read'] is False
+          assert d['status']=='PASS_B5D_PROSPECTIVE_OPERATING_CHARACTERISTIC_SCREEN_ONLY'
+          assert d['decision']=='STOP_NO_RULE_DESIGN_COMBINATION_MEETS_OC_TARGETS_WITHIN_PREFERRED_BURDEN'
+          assert d['qualifying_shortlist_count']==0
+          assert d['v9_outcomes_exist_or_were_read'] is False
+          assert d['production_change_authorized'] is False
+          assert oc['qualifying_shortlist']==[]
+          assert oc['final_rule_selected'] is False
+          assert oc['final_estimator_selected'] is False
+          assert oc['final_sample_size_selected'] is False
+          print('PASS: B5C diagnostics and B5D scientific STOP are exact; B5E remains post-STOP planning only.')
+          PY1
+
+      - name: Run preregistered post-STOP feasibility fork audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/package-adjustment-v9-b5e
+          mkdir -p /tmp/package-adjustment-v9-b5e
+
+          cat > /tmp/package-adjustment-v9-b5e/analyze_b5e.py <<'PY2'
+          from __future__ import annotations
+          import hashlib,json,math,os
+          from collections import Counter,defaultdict
+          from itertools import combinations
+          from pathlib import Path
+          import numpy as np
+          from scipy.optimize import minimize
+          from scipy.special import expit
+          from scipy.stats import t as student_t
+
+          ROOT=Path('.')
+          OUT=Path('/tmp/package-adjustment-v9-b5e')
+          B5C=ROOT/'research/package-adjustment-v9/b5c-calibration-diagnostics'
+          B5D=ROOT/'research/package-adjustment-v9/b5d-operating-characteristic-screen'
+          VERSION=os.environ['B5E_ANALYSIS_VERSION']
+          SEED=2026100505
+          ALL_TOPO=['2v2','2v3','2v4','3v3','3v4','4v4']
+          ASYM_TOPO=['2v3','2v4','3v4']
+          ASYM_IDX=[ALL_TOPO.index(x) for x in ASYM_TOPO]
+
+          c_manifest=json.loads((B5C/'b5c_diagnostic_manifest.json').read_text())
+          joint=json.loads((B5C/'b5c_joint_nuisance_draws.json').read_text())
+          d_protocol=json.loads((B5D/'b5d_preregistered_screen_protocol.json').read_text())
+          d_recal=json.loads((B5D/'b5d_effect_recalibration.json').read_text())
+          d_manifest=json.loads((B5D/'b5d_screen_manifest.json').read_text())
+          d_oc=json.loads((B5D/'b5d_operating_characteristics.json').read_text())
+
+          assert c_manifest['v9_outcomes_exist_or_were_read'] is False
+          assert d_manifest['decision']=='STOP_NO_RULE_DESIGN_COMBINATION_MEETS_OC_TARGETS_WITHIN_PREFERRED_BURDEN'
+          assert d_oc['qualifying_shortlist']==[]
+          draws=np.array([[float(x['sigma_challenge']),float(x['sigma_voter']),float(x['delta_left'])] for x in joint['draws']],float)
+          assert draws.shape==(500,3)
+
+          comp_sd=float(d_recal['generic_comparator_noise_sd'])
+          tau_benefit_all=np.asarray(d_recal['scenarios']['benefit_0p020']['candidate_noise_sd_by_topology'],float)
+          tau_unsafe=np.asarray(d_recal['scenarios']['unsafe_one_topology']['candidate_noise_sd_by_topology'],float)
+          assert tau_benefit_all.shape==(6,) and tau_unsafe.shape==(6,)
+          unsafe_bad=float(tau_unsafe[0]); unsafe_good=float(np.mean(tau_unsafe[1:]))
+
+          # -----------------------------------------------------------------
+          # B5E is a post-STOP PLANNING FORK AUDIT. Nothing here may freeze a
+          # V9 evaluator, metric, scope, sample size, candidate, or catalog.
+          # The three forks are preregistered before synthetic B5E outcomes:
+          # A) quantify burden needed for the all-six claim using B5D's fixed
+          #    hierarchical rule (no threshold changes);
+          # B) compare Brier vs log-loss only as an endpoint-efficiency
+          #    diagnostic on identical generated predictions (no Brier gate);
+          # C) quantify the separate product claim limited to asymmetric-count
+          #    trades 2v3/2v4/3v4 using the same fixed rule/targets.
+          # -----------------------------------------------------------------
+          PROTOCOL={
+            'analysis_version':VERSION,
+            'status':'PREREGISTERED_B5E_POST_STOP_FORK_AUDIT_ONLY',
+            'source_stop':'STOP_NO_RULE_DESIGN_COMBINATION_MEETS_OC_TARGETS_WITHIN_PREFERRED_BURDEN',
+            'primary_oc_targets':{
+              'benefit_0p020_power_min':0.80,
+              'null_false_pass_max':0.05,
+              'unsafe_one_topology_detection_min':0.95,
+              'unsafe_two_topology_detection_min':0.95,
+            },
+            'fixed_rule':{
+              'name':'hierarchical_ucb_plus_contrast_veto',
+              'overall_ucb_threshold':-0.005,
+              'hierarchical_topology_ni_margin':0.010,
+              'hierarchical_one_sided_confidence':0.95,
+              'worst_vs_rest_harm_contrast':0.015,
+              'contrast_familywise_alpha':0.05,
+              'estimator':'challenge_unit_t',
+              'source':'exact B5D preregistered rule; no B5E threshold tuning',
+            },
+            'fork_A_all6_extended_burden':{
+              'scope':ALL_TOPO,
+              'voters':[60,90,120,150,180,240],
+              'votes_per_challenge':[2,4],
+              'workload_per_voter':24,
+              'screen_replicates_per_scenario':120,
+              'maximum_ballots_examined':5760,
+            },
+            'fork_B_bounded_endpoint_efficiency':{
+              'scope':ALL_TOPO,
+              'canvas':[{'voters':60,'votes_per_challenge':2},{'voters':60,'votes_per_challenge':4}],
+              'endpoints':['log_loss','brier_score'],
+              'same_generated_predictions':True,
+              'no_brier_pass_gate_defined':True,
+              'promising_only_if':{
+                'benefit_median_snr_ratio_brier_over_logloss_min':1.15,
+                'unsafe_contrast_median_snr_ratio_brier_over_logloss_min':0.90,
+                'null_one_sided_95_coverage_min':0.93,
+              },
+              'interpretation':'efficiency diagnostic only; any Brier rule requires a new preregistered rule study',
+            },
+            'fork_C_asymmetric_scope':{
+              'scope':ASYM_TOPO,
+              'claim_change':'Package Adjustment would be validated only for unequal asset-count topologies 2v3/2v4/3v4; this is a product-scope change, not a statistical rescue of the all-six claim.',
+              'voters':[36,48,60],
+              'votes_per_challenge':[2,4],
+              'workload_per_voter':24,
+              'screen_replicates_per_scenario':120,
+              'maximum_ballots':1440,
+            },
+            'scenarios':['benefit_0p020','null','unsafe_one_topology','unsafe_two_topologies'],
+            'nuisance_assurance':'integrate over exact B5C crossed-bootstrap joint draws',
+            'candidate_or_production_predictions_used':False,
+            'v9_human_outcomes_used':False,
+            'planning_only':True,
+            'production_change_authorized':False,
+          }
+          protocol_bytes=(json.dumps(PROTOCOL,sort_keys=True,separators=(',',':'))+'\n').encode()
+          protocol_sha=hashlib.sha256(protocol_bytes).hexdigest()
+          (OUT/'b5e_preregistered_fork_protocol.json').write_text(json.dumps(PROTOCOL,indent=2,sort_keys=True)+'\n')
+
+          def assignment(nv:int,r:int,n_topo:int):
+            assert nv%2==0 and r in {2,4}
+            assert 24%n_topo==0
+            per_top=24//n_topo
+            assert (per_top*nv)%r==0
+            cpt=(per_top*nv)//r
+            half=r//2
+            rec=[]
+            for t in range(n_topo):
+              for j in range(cpt):
+                for s in range(half):
+                  q=j*half+s
+                  base=(q+7*t)%nv
+                  rec.append((base,t,j,1))
+                  rec.append(((base+nv//2)%nv,t,j,-1))
+            vc=Counter(v for v,_,_,_ in rec)
+            vt=Counter((v,t) for v,t,_,_ in rec)
+            cj=Counter((t,j) for _,t,j,_ in rec)
+            dup=Counter((v,t,j) for v,t,j,_ in rec)
+            lr_ch=defaultdict(Counter);lr_vt=defaultdict(Counter)
+            for v,t,j,x in rec:
+              lr_ch[(t,j)][x]+=1;lr_vt[(v,t)][x]+=1
+            assert set(vc.values())=={24}
+            assert set(vt.values())=={per_top}
+            assert set(cj.values())=={r}
+            assert max(dup.values())==1
+            assert all(z==Counter({-1:half,1:half}) for z in lr_ch.values())
+            assert all(z[1]==z[-1]==per_top//2 for z in lr_vt.values())
+            return rec,cpt
+
+          def fit_nuisance(score,xx,yy):
+            bounds=[(0.05,25.0),(-0.75,0.75)]
+            def fg(z):
+              beta,dl=float(z[0]),float(z[1])
+              eta=beta*score+dl*xx
+              p=expit(eta)
+              loss=float(np.mean(np.logaddexp(0.0,eta)-yy*eta))
+              resid=(p-yy)/len(yy)
+              return loss,np.array([float(np.dot(resid,score)),float(np.dot(resid,xx))])
+            best=None
+            for start in ([1.0,0.0],[0.2,0.0],[3.0,0.0],[10.0,0.0]):
+              rr=minimize(lambda z:fg(z)[0],np.array(start,float),jac=lambda z:fg(z)[1],method='L-BFGS-B',bounds=bounds,options={'maxiter':1200,'ftol':1e-12})
+              if best is None or (np.isfinite(rr.fun) and rr.fun<best.fun): best=rr
+              if rr.success: return float(rr.x[0]),float(rr.x[1])
+            rr=minimize(lambda z:fg(z)[0],np.asarray(best.x,float),method='Powell',bounds=bounds,options={'maxiter':2200,'xtol':1e-9,'ftol':1e-11})
+            assert rr.success
+            return float(rr.x[0]),float(rr.x[1])
+
+          def simulate_metrics(rec,cpt,taus,rng,ndraw,n_topo):
+            nv=max(v for v,_,_,_ in rec)+1
+            sig_ch,sig_v,dl=map(float,ndraw)
+            theta=rng.normal(0.0,sig_ch,size=(n_topo,cpt))
+            vb=rng.normal(0.0,sig_v,size=nv);vb-=vb.mean()
+            score0=theta+comp_sd*rng.normal(size=(n_topo,cpt))
+            score1=theta+np.asarray(taus,float)[:,None]*rng.normal(size=(n_topo,cpt))
+            v=np.array([q[0] for q in rec],int)
+            tt=np.array([q[1] for q in rec],int)
+            jj=np.array([q[2] for q in rec],int)
+            xx=np.array([q[3] for q in rec],float)
+            cid=tt*cpt+jj
+            eta_true=theta[tt,jj]+vb[v]+dl*xx
+            y=rng.binomial(1,expit(eta_true)).astype(float)
+            s0=score0[tt,jj];s1=score1[tt,jj]
+            dlog=np.empty(len(y),float); dbrier=np.empty(len(y),float)
+            fold=(cid*2654435761+1013904223)%5
+            for f in range(5):
+              tr=fold!=f;te=~tr
+              b0,l0=fit_nuisance(s0[tr],xx[tr],y[tr]);b1,l1=fit_nuisance(s1[tr],xx[tr],y[tr])
+              e0=b0*s0[te]+l0*xx[te];e1=b1*s1[te]+l1*xx[te]
+              p0=expit(e0);p1=expit(e1)
+              dlog[te]=(np.logaddexp(0.0,e1)-y[te]*e1)-(np.logaddexp(0.0,e0)-y[te]*e0)
+              dbrier[te]=(p1-y[te])**2-(p0-y[te])**2
+            return {'log_loss':dlog,'brier_score':dbrier},v,cid,tt
+
+          def challenge_unit_se(vals,cid):
+            ids=np.unique(cid)
+            means=np.array([float(np.mean(vals[cid==g])) for g in ids],float)
+            return float(np.std(means,ddof=1)/math.sqrt(len(means)))
+
+          def summarize(vals,cid,tt,cpt,n_topo):
+            vals=np.asarray(vals,float)
+            mu=float(vals.mean()); se=challenge_unit_se(vals,cid)
+            crit_all=float(student_t.ppf(.95,max(2,n_topo*cpt-1)))
+            overall_ucb=mu+crit_all*se
+            means=[];ses=[]
+            for k in range(n_topo):
+              m=tt==k
+              means.append(float(vals[m].mean()))
+              ses.append(challenge_unit_se(vals[m],cid[m]))
+            means=np.asarray(means,float);ses=np.asarray(ses,float)
+            crit_top=float(student_t.ppf(.95,max(2,cpt-1)))
+            mu_top=float(means.mean())
+            tau2=max(1e-8,float(np.var(means,ddof=1)-np.mean(ses**2))) if n_topo>1 else 1e-8
+            w=tau2/(tau2+ses**2)
+            post=w*means+(1.0-w)*mu_top
+            se_mu=float(math.sqrt(max(1e-12,np.sum(ses**2)/(n_topo*n_topo))))
+            post_se=np.sqrt((tau2*ses**2)/(tau2+ses**2)+(1.0-w)**2*se_mu**2)
+            hier_ucb=post+crit_top*post_se
+            crit_con=float(student_t.ppf(1.0-0.05/n_topo,max(2,cpt-1)))
+            contrast=[];contrast_se=[];contrast_lcb=[]
+            for k in range(n_topo):
+              others=[j for j in range(n_topo) if j!=k]
+              c=float(means[k]-np.mean(means[others]))
+              cs=float(math.sqrt(ses[k]**2+np.sum(ses[others]**2)/(len(others)**2)))
+              contrast.append(c);contrast_se.append(cs);contrast_lcb.append(c-crit_con*cs)
+            worst=int(np.argmax(means))
+            return {
+              'overall_mean':mu,'overall_se':se,'overall_ucb':float(overall_ucb),
+              'topology_means':means,'topology_ses':ses,'hierarchical_ucb':hier_ucb,
+              'worst_topology':worst,'worst_contrast':float(contrast[worst]),
+              'worst_contrast_se':float(contrast_se[worst]),'worst_contrast_lcb':float(contrast_lcb[worst]),
+            }
+
+          def fixed_rule_pass(st):
+            return bool(st['overall_ucb']<=-0.005 and np.max(st['hierarchical_ucb'])<=0.010 and st['worst_contrast_lcb']<=0.015)
+
+          # Scope-3 candidate calibration: preserve the same scientific target
+          # (-0.020 macro log-loss) after redefining the product scope.
+          def scaled_tau(base,scale):
+            return np.clip(comp_sd+scale*(np.asarray(base,float)-comp_sd),0.05,3.0)
+
+          asym_base=tau_benefit_all[ASYM_IDX]
+          ref_rec3,ref_cpt3=assignment(60,4,3)
+          def estimate_scope3(taus,reps,seed):
+            rng=np.random.default_rng(seed);z=[]
+            for i in range(reps):
+              nd=draws[int(rng.integers(0,len(draws)))]
+              m,_,_,_=simulate_metrics(ref_rec3,ref_cpt3,taus,rng,nd,3)
+              z.append(float(np.mean(m['log_loss'])))
+            a=np.asarray(z,float)
+            return float(a.mean()),float(a.std(ddof=1)/math.sqrt(len(a)))
+          scale=1.0;hist=[]
+          for it in range(3):
+            ttau=scaled_tau(asym_base,scale)
+            mm,se=estimate_scope3(ttau,90,SEED+100)
+            hist.append({'iteration':it,'scale':scale,'mean':mm,'mc_se':se,'taus':ttau.tolist()})
+            if mm<-1e-6: scale=max(.05,min(2.5,scale*(-.020)/mm))
+            else: scale=min(2.5,scale*1.25)
+          tau_benefit_asym=scaled_tau(asym_base,scale)
+          verify3,se3=estimate_scope3(tau_benefit_asym,180,SEED+101)
+          assert abs(verify3+0.020)<=0.0045,(verify3,se3,scale)
+
+          # Unsafe patterns. Bad/good scales are inherited from the B5D
+          # full-process unsafe calibration; B5E does not retune their harm size.
+          def unsafe_pattern(n_topo,bad_positions):
+            a=np.full(n_topo,unsafe_good,float)
+            for k in bad_positions: a[k]=unsafe_bad
+            return a
+
+          def scenario_taus(scope,scenario,rep):
+            n=len(scope)
+            if scenario=='benefit_0p020':
+              return tau_benefit_all.copy() if n==6 else tau_benefit_asym.copy()
+            if scenario=='null': return np.full(n,comp_sd,float)
+            if scenario=='unsafe_one_topology': return unsafe_pattern(n,[rep%n])
+            if scenario=='unsafe_two_topologies':
+              pairs=list(combinations(range(n),2)); return unsafe_pattern(n,list(pairs[rep%len(pairs)]))
+            raise KeyError(scenario)
+
+          TARGET=PROTOCOL['primary_oc_targets']
+          SCEN=['benefit_0p020','null','unsafe_one_topology','unsafe_two_topologies']
+
+          def run_grid(scope,voter_grid,r_grid,reps,seed):
+            n_topo=len(scope);rng=np.random.default_rng(seed);rows=[];endpoint_diag={}
+            for nv in voter_grid:
+              for r in r_grid:
+                rec,cpt=assignment(nv,r,n_topo)
+                counts={s:0 for s in SCEN}; passes={s:0 for s in SCEN}
+                # Endpoint diagnostics are collected only on 60-voter all-six canvases.
+                ed={ep:{'benefit_snr':[],'unsafe_snr':[],'null_cover':[]} for ep in ['log_loss','brier_score']} if (n_topo==6 and nv==60) else None
+                for s in SCEN:
+                  for rep in range(reps):
+                    nd=draws[int(rng.integers(0,len(draws)))]
+                    taus=scenario_taus(scope,s,rep)
+                    metrics,v,cid,tt=simulate_metrics(rec,cpt,taus,rng,nd,n_topo)
+                    st=summarize(metrics['log_loss'],cid,tt,cpt,n_topo)
+                    counts[s]+=1; passes[s]+=int(fixed_rule_pass(st))
+                    if ed is not None and s in {'benefit_0p020','null','unsafe_one_topology'}:
+                      for ep in ['log_loss','brier_score']:
+                        se=summarize(metrics[ep],cid,tt,cpt,n_topo)
+                        if s=='benefit_0p020':
+                          ed[ep]['benefit_snr'].append(float(-se['overall_mean']/max(se['overall_se'],1e-12)))
+                        elif s=='unsafe_one_topology':
+                          ed[ep]['unsafe_snr'].append(float(se['worst_contrast']/max(se['worst_contrast_se'],1e-12)))
+                        else:
+                          crit=float(student_t.ppf(.95,max(2,n_topo*cpt-1)))
+                          ed[ep]['null_cover'].append(bool(se['overall_mean']+crit*se['overall_se']>=0.0))
+                row={
+                  'scope':scope,'voters':nv,'workload_per_voter':24,'votes_per_challenge':r,
+                  'challenges_per_topology':cpt,'total_challenges':n_topo*cpt,'total_ballots':nv*24,
+                  'rule_family':'hierarchical_ucb_plus_contrast_veto','estimator':'challenge_unit_t',
+                  'benefit_0p020_joint_pass_rate':passes['benefit_0p020']/counts['benefit_0p020'],
+                  'null_joint_pass_rate':passes['null']/counts['null'],
+                  'unsafe_one_topology_detection_rate':1.0-passes['unsafe_one_topology']/counts['unsafe_one_topology'],
+                  'unsafe_two_topology_detection_rate':1.0-passes['unsafe_two_topologies']/counts['unsafe_two_topologies'],
+                  'replicates_per_scenario':reps,
+                }
+                row['qualifies_targets']=bool(
+                  row['benefit_0p020_joint_pass_rate']>=TARGET['benefit_0p020_power_min'] and
+                  row['null_joint_pass_rate']<=TARGET['null_false_pass_max'] and
+                  row['unsafe_one_topology_detection_rate']>=TARGET['unsafe_one_topology_detection_min'] and
+                  row['unsafe_two_topology_detection_rate']>=TARGET['unsafe_two_topology_detection_min']
+                )
+                rows.append(row)
+                if ed is not None:
+                  endpoint_diag[str(r)]={}
+                  for ep,z in ed.items():
+                    endpoint_diag[str(r)][ep]={
+                      'benefit_median_snr':float(np.median(z['benefit_snr'])),
+                      'unsafe_contrast_median_snr':float(np.median(z['unsafe_snr'])),
+                      'null_one_sided_95_coverage':float(np.mean(z['null_cover'])),
+                      'n_per_scenario':reps,
+                    }
+            return rows,endpoint_diag
+
+          REPS=120
+          all6_rows,endpoint=run_grid(ALL_TOPO,[60,90,120,150,180,240],[2,4],REPS,SEED+1000)
+          asym_rows,_=run_grid(ASYM_TOPO,[36,48,60],[2,4],REPS,SEED+2000)
+
+          all6_qual=[x for x in all6_rows if x['qualifies_targets']]
+          all6_qual.sort(key=lambda x:(x['total_ballots'],-x['benefit_0p020_joint_pass_rate'],x['votes_per_challenge']))
+          asym_qual=[x for x in asym_rows if x['qualifies_targets']]
+          asym_qual.sort(key=lambda x:(x['total_ballots'],-x['benefit_0p020_joint_pass_rate'],x['votes_per_challenge']))
+
+          # Endpoint-efficiency decision is deliberately not a validation PASS.
+          endpoint_eval={}
+          brier_promising=False
+          for r,z in endpoint.items():
+            ll=z['log_loss'];br=z['brier_score']
+            benefit_ratio=br['benefit_median_snr']/max(ll['benefit_median_snr'],1e-12)
+            unsafe_ratio=br['unsafe_contrast_median_snr']/max(ll['unsafe_contrast_median_snr'],1e-12)
+            promising=bool(
+              benefit_ratio>=1.15 and unsafe_ratio>=0.90 and br['null_one_sided_95_coverage']>=0.93
+            )
+            brier_promising|=promising
+            endpoint_eval[r]={
+              'log_loss':ll,'brier_score':br,
+              'benefit_snr_ratio_brier_over_logloss':float(benefit_ratio),
+              'unsafe_snr_ratio_brier_over_logloss':float(unsafe_ratio),
+              'brier_promising_diagnostic_only':promising,
+            }
+
+          if all6_qual:
+            fork_decision='ALL6_FEASIBLE_ONLY_ABOVE_OR_AT_EXPANDED_BURDEN_REQUIRES_INDEPENDENT_CONFIRMATION'
+          elif asym_qual:
+            fork_decision='ASYMMETRIC_SCOPE_FEASIBLE_REQUIRES_PRODUCT_SCOPE_DECISION_AND_INDEPENDENT_CONFIRMATION'
+          elif brier_promising:
+            fork_decision='NO_LOGLOSS_FORK_FEASIBLE_BUT_BRIER_EFFICIENCY_SIGNAL_REQUIRES_SEPARATE_PREREGISTERED_RULE_STUDY'
+          else:
+            fork_decision='STOP_NO_TESTED_POST_STOP_FORK_RESTORES_FEASIBILITY'
+
+          outputs={
+            'analysis_version':VERSION,
+            'status':'PASS_B5E_POST_STOP_FEASIBILITY_FORK_AUDIT_ONLY',
+            'decision':fork_decision,
+            'protocol_sha256':protocol_sha,
+            'fork_A_all6_extended_burden':{
+              'all_results':all6_rows,
+              'minimum_qualifying_design':all6_qual[0] if all6_qual else None,
+              'qualifying_count':len(all6_qual),
+            },
+            'fork_B_bounded_endpoint_efficiency':{
+              'results':endpoint_eval,
+              'brier_promising_diagnostic_only':brier_promising,
+              'brier_rule_or_threshold_selected':False,
+            },
+            'fork_C_asymmetric_scope':{
+              'scope':ASYM_TOPO,
+              'scope3_benefit_recalibration':{
+                'target_macro_logloss_delta':-0.020,
+                'candidate_noise_sd_by_topology':tau_benefit_asym.tolist(),
+                'verification_mean':verify3,'verification_mc_se':se3,'iterations':hist,
+              },
+              'all_results':asym_rows,
+              'minimum_qualifying_design':asym_qual[0] if asym_qual else None,
+              'qualifying_count':len(asym_qual),
+            },
+            'planning_only':True,
+            'final_scope_selected':False,
+            'final_endpoint_selected':False,
+            'final_rule_selected':False,
+            'final_sample_size_selected':False,
+            'v9_candidate_selected':False,
+            'v9_catalog_generated':False,
+            'v9_outcomes_exist_or_were_read':False,
+            'production_change_authorized':False,
+          }
+
+          manifest={
+            'analysis_version':VERSION,
+            'status':'PASS_B5E_POST_STOP_FEASIBILITY_FORK_AUDIT_ONLY',
+            'decision':fork_decision,
+            'protocol_sha256':protocol_sha,
+            'all6_minimum_qualifying_design':all6_qual[0] if all6_qual else None,
+            'asymmetric_scope_minimum_qualifying_design':asym_qual[0] if asym_qual else None,
+            'brier_promising_diagnostic_only':brier_promising,
+            'scientific_next_step':(
+              'If an all-six burden or asymmetric-scope fork qualifies, make the product/burden choice explicitly and run a separately preregistered high-rep independent confirmation. If only Brier is promising, preregister a Brier-specific rule/threshold study first. If none are promising, stop Package Adjustment V9 research rather than weakening targets.'
+            ),
+            'v9_architecture_frozen':False,
+            'v9_candidate_selected':False,
+            'v9_comparator_implementation_frozen':False,
+            'v9_primary_metric_frozen':False,
+            'v9_gate_frozen':False,
+            'v9_sample_size_frozen':False,
+            'v9_scope_frozen':False,
+            'v9_catalog_generated':False,
+            'v9_outcomes_exist_or_were_read':False,
+            'production_change_authorized':False,
+          }
+
+          def dump(name,obj):
+            (OUT/name).write_text(json.dumps(obj,indent=2,sort_keys=True)+'\n')
+          dump('b5e_post_stop_feasibility_forks.json',outputs)
+          dump('b5e_screen_manifest.json',manifest)
+
+          lines=[
+            '# Package Adjustment V9 — B5E Post-STOP Burden, Endpoint and Scope Feasibility Audit','',
+            f"**Decision:** `{fork_decision}`",'',
+            'B5E is planning-only after B5D scientifically stopped every screened six-topology design within the preferred 60-voter / 1,440-ballot burden. It does not weaken B5D thresholds and cannot authorize V9 voting or production.','',
+            '## Fixed operating-characteristic targets','',
+            '- >=80% joint PASS power for a true full-process 0.020 macro log-loss benefit.',
+            '- <=5% false PASS under the null.',
+            '- >=95% detection with one unsafe topology.',
+            '- >=95% detection with two unsafe topologies.','',
+            '## Fork A — all six topologies, expanded burden','',
+            '| Voters | R | C/topology | Ballots | Power | Null | Unsafe-1 detect | Unsafe-2 detect | Qualifies |',
+            '|---:|---:|---:|---:|---:|---:|---:|---:|---|',
+          ]
+          for z in all6_rows:
+            lines.append(f"| {z['voters']} | {z['votes_per_challenge']} | {z['challenges_per_topology']} | {z['total_ballots']} | {z['benefit_0p020_joint_pass_rate']:.3f} | {z['null_joint_pass_rate']:.3f} | {z['unsafe_one_topology_detection_rate']:.3f} | {z['unsafe_two_topology_detection_rate']:.3f} | {'yes' if z['qualifies_targets'] else 'no'} |")
+          lines += ['', '## Fork B — bounded endpoint efficiency diagnostic','', 'Brier score is compared with log loss on identical generated predictions. No Brier validation threshold or pass gate is selected in B5E.','', '| R | Brier/log-loss benefit SNR | Brier/log-loss unsafe SNR | Brier null coverage | Promising diagnostic |', '|---:|---:|---:|---:|---|']
+          for r,z in sorted(endpoint_eval.items(),key=lambda kv:int(kv[0])):
+            lines.append(f"| {r} | {z['benefit_snr_ratio_brier_over_logloss']:.3f} | {z['unsafe_snr_ratio_brier_over_logloss']:.3f} | {z['brier_score']['null_one_sided_95_coverage']:.3f} | {'yes' if z['brier_promising_diagnostic_only'] else 'no'} |")
+          lines += ['', '## Fork C — asymmetric-count scope only (2v3 / 2v4 / 3v4)','', 'This fork changes the product claim. A qualifying result would not validate 2v2, 3v3 or 4v4.','', '| Voters | R | C/topology | Ballots | Power | Null | Unsafe-1 detect | Unsafe-2 detect | Qualifies |', '|---:|---:|---:|---:|---:|---:|---:|---:|---|']
+          for z in asym_rows:
+            lines.append(f"| {z['voters']} | {z['votes_per_challenge']} | {z['challenges_per_topology']} | {z['total_ballots']} | {z['benefit_0p020_joint_pass_rate']:.3f} | {z['null_joint_pass_rate']:.3f} | {z['unsafe_one_topology_detection_rate']:.3f} | {z['unsafe_two_topology_detection_rate']:.3f} | {'yes' if z['qualifies_targets'] else 'no'} |")
+          lines += ['', '## Firewall','', '- No V9 human outcomes exist or were read.', '- No production V1.7 predictions were evaluated on V8 votes.', '- No actual V9 candidate/comparator predictions were used.', '- No endpoint, scope, rule, design, sample size, architecture, or catalog is frozen.', '- No production change is authorized.', '']
+          (OUT/'b5e_report.md').write_text('\n'.join(lines))
+
+          names=['b5e_preregistered_fork_protocol.json','b5e_post_stop_feasibility_forks.json','b5e_screen_manifest.json','b5e_report.md']
+          hashes={n:hashlib.sha256((OUT/n).read_bytes()).hexdigest() for n in names}
+          dump('b5e_output_hashes.json',{'analysis_version':VERSION,'sha256':hashes})
+          print(json.dumps(manifest,indent=2,sort_keys=True))
+          PY2
+
+          python3 /tmp/package-adjustment-v9-b5e/analyze_b5e.py
+
+      - name: Validate B5E scientific firewall and durable output allowlist
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY3'
+          import json
+          from pathlib import Path
+          d=Path('/tmp/package-adjustment-v9-b5e')
+          expected={
+            'analyze_b5e.py',
+            'b5e_preregistered_fork_protocol.json',
+            'b5e_post_stop_feasibility_forks.json',
+            'b5e_screen_manifest.json',
+            'b5e_report.md',
+            'b5e_output_hashes.json',
+          }
+          got={p.name for p in d.iterdir() if p.is_file()}
+          assert got==expected,(sorted(got),sorted(expected))
+          m=json.loads((d/'b5e_screen_manifest.json').read_text())
+          assert m['status']=='PASS_B5E_POST_STOP_FEASIBILITY_FORK_AUDIT_ONLY'
+          assert m['decision'] in {
+            'ALL6_FEASIBLE_ONLY_ABOVE_OR_AT_EXPANDED_BURDEN_REQUIRES_INDEPENDENT_CONFIRMATION',
+            'ASYMMETRIC_SCOPE_FEASIBLE_REQUIRES_PRODUCT_SCOPE_DECISION_AND_INDEPENDENT_CONFIRMATION',
+            'NO_LOGLOSS_FORK_FEASIBLE_BUT_BRIER_EFFICIENCY_SIGNAL_REQUIRES_SEPARATE_PREREGISTERED_RULE_STUDY',
+            'STOP_NO_TESTED_POST_STOP_FORK_RESTORES_FEASIBILITY',
+          }
+          for k in ['v9_architecture_frozen','v9_candidate_selected','v9_comparator_implementation_frozen','v9_primary_metric_frozen','v9_gate_frozen','v9_sample_size_frozen','v9_scope_frozen','v9_catalog_generated','v9_outcomes_exist_or_were_read','production_change_authorized']:
+            assert m[k] is False,(k,m[k])
+          p=json.loads((d/'b5e_preregistered_fork_protocol.json').read_text())
+          assert p['planning_only'] is True
+          assert p['production_change_authorized'] is False
+          assert p['fork_B_bounded_endpoint_efficiency']['no_brier_pass_gate_defined'] is True
+          print('PASS: B5E planning-only outputs validated; no V9 freeze, voting, or production authorization exists.')
+          PY3
+
+      - name: Commit durable B5E planning record to main
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          DEST="research/package-adjustment-v9/b5e-post-stop-feasibility-forks"
+          mkdir -p "$DEST"
+          ALLOW=(
+            b5e_preregistered_fork_protocol.json
+            b5e_post_stop_feasibility_forks.json
+            b5e_screen_manifest.json
+            b5e_report.md
+            b5e_output_hashes.json
+          )
+          for f in "${ALLOW[@]}"; do cp "/tmp/package-adjustment-v9-b5e/$f" "$DEST/$f"; done
+          git add "$DEST"
+          if git diff --cached --quiet; then
+            echo "B5E durable outputs already identical; no commit needed."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "Record Package Adjustment V9 B5E post-STOP feasibility forks"
+            git push origin HEAD:main
+          fi
+
+      - name: Upload B5E planning artifact copy
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-adjustment-v9-b5e-post-stop-feasibility-forks
+          path: |
+            /tmp/package-adjustment-v9-b5e/b5e_preregistered_fork_protocol.json
+            /tmp/package-adjustment-v9-b5e/b5e_post_stop_feasibility_forks.json
+            /tmp/package-adjustment-v9-b5e/b5e_screen_manifest.json
+            /tmp/package-adjustment-v9-b5e/b5e_report.md
+            /tmp/package-adjustment-v9-b5e/b5e_output_hashes.json
+          retention-days: 30
