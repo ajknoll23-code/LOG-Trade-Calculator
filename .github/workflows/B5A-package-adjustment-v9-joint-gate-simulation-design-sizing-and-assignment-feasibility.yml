@@ -13,7 +13,7 @@ concurrency:
 env:
   PYTHONDONTWRITEBYTECODE: "1"
   V8_EXPECTED_DATASET_SHA256: "e6d4beaae2699bd9a029e3d9c53d680cd30f6c2aaf4d460e6aca64dc3d18106d"
-  B5A_ANALYSIS_VERSION: "package-adjustment-v9-b5a-joint-gate-sizing-v1"
+  B5A_ANALYSIS_VERSION: "package-adjustment-v9-b5a-joint-gate-sizing-v2-numerical-repair"
 
 jobs:
   size-design:
@@ -575,7 +575,14 @@ jobs:
           }
 
           # ---- Evaluation helpers ----------------------------------------------------------
+          OPT_DIAGNOSTICS=Counter()
+
           def fit_nuisance(score,x,y):
+            # Same frozen planning likelihood and parameter bounds as B5A V1/V2.
+            # Repair is numerical only: L-BFGS-B can occasionally return ABNORMAL
+            # on a finite convex two-parameter fold. Retry deterministically, then
+            # fall back to bounded Powell on the identical objective.
+            bounds=[(0.05,25.0),(-0.75,0.75)]
             def fg(z):
               beta,dl=float(z[0]),float(z[1])
               eta=beta*score+dl*x
@@ -584,10 +591,35 @@ jobs:
               res=p-y
               grad=np.array([float(np.dot(res,score)),float(np.dot(res,x))])
               return loss,grad
-            rr=minimize(lambda z:fg(z)[0],np.array([1.0,0.0]),jac=lambda z:fg(z)[1],method='L-BFGS-B',
-                        bounds=[(0.05,25.0),(-0.75,0.75)],options={'maxiter':150,'ftol':1e-10})
-            if not rr.success: raise RuntimeError(str(rr.message))
-            return float(rr.x[0]),float(rr.x[1])
+
+            starts=[np.array([1.0,0.0]),np.array([0.20,0.0]),np.array([5.0,0.0])]
+            best=None
+            messages=[]
+            for start in starts:
+              rr=minimize(lambda z:fg(z)[0],start,jac=lambda z:fg(z)[1],method='L-BFGS-B',
+                          bounds=bounds,options={'maxiter':300,'ftol':1e-12,'gtol':1e-8,'maxls':50})
+              messages.append(str(rr.message))
+              if np.isfinite(rr.fun) and np.all(np.isfinite(rr.x)):
+                if best is None or float(rr.fun)<float(best.fun): best=rr
+              if rr.success:
+                OPT_DIAGNOSTICS['lbfgsb_success']+=1
+                return float(rr.x[0]),float(rr.x[1])
+
+            # Deterministic derivative-free fallback for the same bounded convex objective.
+            x0=np.array(best.x if best is not None else [1.0,0.0],dtype=float)
+            rr2=minimize(lambda z:fg(z)[0],x0,method='Powell',bounds=bounds,
+                         options={'maxiter':2000,'xtol':1e-10,'ftol':1e-12})
+            if not rr2.success or not np.isfinite(rr2.fun) or not np.all(np.isfinite(rr2.x)):
+              OPT_DIAGNOSTICS['all_solvers_failed']+=1
+              raise RuntimeError(f"bounded nuisance optimization failed: lbfgsb={messages}; powell={rr2.message}")
+
+            # If L-BFGS-B returned a finite point despite its status, preserve the
+            # lower objective when it is at least as good as Powell to numerical tolerance.
+            if best is not None and float(best.fun)<=float(rr2.fun)+1e-10:
+              OPT_DIAGNOSTICS['lbfgsb_finite_status_fallback']+=1
+              return float(best.x[0]),float(best.x[1])
+            OPT_DIAGNOSTICS['powell_fallback_success']+=1
+            return float(rr2.x[0]),float(rr2.x[1])
 
           def logloss_from_eta(y,eta):
             return np.logaddexp(0.0,eta)-y*eta
@@ -705,6 +737,15 @@ jobs:
                   rec['unsafe_detection_rate']=1.0-rec['unsafe_joint_pass_rate']
                 summary.append(rec)
 
+          nuisance['simulation_nuisance_optimizer_diagnostics']=dict(sorted(OPT_DIAGNOSTICS.items()))
+          nuisance['simulation_nuisance_optimizer_contract']={
+            'objective_changed_from_b5a_v2':False,
+            'bounds_changed_from_b5a_v2':False,
+            'primary_solver':'L-BFGS-B with deterministic multi-start',
+            'fallback_solver':'bounded Powell on identical objective',
+            'repair_reason':'prevent finite convex nuisance fits from aborting the full planning simulation on L-BFGS-B ABNORMAL status',
+          }
+
           # Design-level diagnostics using the principal planning row floor=.005 margin=.010.
           principal=[x for x in summary if abs(x['topology_ni_margin']-.010)<1e-12 and abs(x['overall_minimum_mean_benefit']-.005)<1e-12]
           principal.sort(key=lambda x:(x['total_ballots'],x['voters']))
@@ -771,6 +812,7 @@ jobs:
             'joint_gate_probability_reported':True,
             'variance_uncertainty_propagated':True,
             'fold_fit_noise_included_in_simulation':True,
+            'nuisance_optimizer_numerical_fallback_only_same_objective_and_bounds':True,
             'actual_assignment_generator_used':True,
             'outputs_permanent_repo_record_required':True,
             'v9_outcomes_exist_or_were_read':False,
