@@ -1,7 +1,7 @@
 # No-History / Rookie Value V2 — Phase 3 Prospective Evaluator
 
 Method: `no-history-rookie-v2-phase3-prospective-v1`  
-Status: **`COLLECTION_ONLY`**
+Status: **`EARLY_DIAGNOSTIC_ONLY`**
 
 ## Guardrail
 
@@ -10,9 +10,9 @@ Status: **`COLLECTION_ONLY`**
 - Frozen candidate SHA256: `e720f1e26c1dd137f9b3d14110cd2fe1a28843a012d5b01f2d185291398a70c6`
 - Frozen at: **2026-09-03T18:50:10.024333Z**
 - First eligible future week: **1**
-- Completed consecutive weeks used: **[1, 2, 3]**
+- Completed consecutive weeks used: **[1, 2, 3, 4]**
 - Eligible preseason cohort: **95**
-- Players with an active game in current window: **71**
+- Players with an active game in current window: **72**
 
 ## Prospective metrics
 
@@ -20,18 +20,18 @@ Primary target: **Fundamental Value vs cumulative future fantasy points**.
 
 | Prior weight | Total-points Spearman | Active-PPG FV Spearman | Active-PPG PM Spearman | Total-points pairwise |
 |---:|---:|---:|---:|---:|
-| 0.00 | 0.4898 | 0.4360 | 0.4679 | 0.6928 |
-| 0.15 | 0.4825 | 0.4596 | 0.4816 | 0.6893 |
-| 0.30 | 0.4750 | 0.4990 | 0.4983 | 0.6876 |
-| 0.45 | 0.4446 | 0.5060 | 0.5018 | 0.6762 |
+| 0.00 | 0.5085 | 0.4591 | 0.5191 | 0.6961 |
+| 0.15 | 0.4999 | 0.4874 | 0.5362 | 0.6934 |
+| 0.30 | 0.4893 | 0.5282 | 0.5544 | 0.6911 |
+| 0.45 | 0.4606 | 0.5395 | 0.5587 | 0.6800 |
 
 ## Difference vs frozen 0% prospect-prior control
 
 | Prior weight | Δ total-points Spearman | Δ active-PPG FV Spearman | Δ active-PPG PM Spearman | Δ total-points pairwise |
 |---:|---:|---:|---:|---:|
-| 0.15 | -0.0073 | +0.0236 | +0.0137 | -0.0035 |
-| 0.30 | -0.0148 | +0.0630 | +0.0304 | -0.0051 |
-| 0.45 | -0.0452 | +0.0700 | +0.0339 | -0.0166 |
+| 0.15 | -0.0086 | +0.0283 | +0.0171 | -0.0026 |
+| 0.30 | -0.0191 | +0.0691 | +0.0353 | -0.0050 |
+| 0.45 | -0.0478 | +0.0804 | +0.0396 | -0.0161 |
 
 ## Readiness ladder
 
