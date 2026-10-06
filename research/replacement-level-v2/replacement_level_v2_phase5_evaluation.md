@@ -1,7 +1,7 @@
 # Replacement Level / Positional Scale V2 — Phase 5 Prospective Evaluator
 
 Method: `replacement-level-v2-phase5-prospective-v1`  
-Status: **`COLLECTION_ONLY`**
+Status: **`EARLY_DIAGNOSTIC_ONLY`**
 
 ## Guardrail
 
@@ -10,10 +10,10 @@ Status: **`COLLECTION_ONLY`**
 - Frozen candidate SHA256: `ab24d5d1a1483ada04c6ce44154dc58bba6b1ba16c520fbeaf71e199851297e6`
 - Frozen at: **2026-09-05T22:16:28.841347Z**
 - First eligible future week: **1**
-- Completed consecutive weeks used: **[1, 2, 3]**
+- Completed consecutive weeks used: **[1, 2, 3, 4]**
 - Full frozen candidate universe: **518**
 - Primary real-history cohort: **426**
-- Primary players with an active game: **394**
+- Primary players with an active game: **395**
 
 ## Frozen replacement-rank families
 
@@ -34,22 +34,22 @@ The future replacement point is derived from the realized future data itself via
 
 | Family | Pos-balanced MAE | Pos-balanced RMSE | Pooled MAE | Δ MAE vs control | Positions available |
 |---|---:|---:|---:|---:|---:|
-| `legacy_control` | 0.3870 | 0.4855 | 0.3854 | — | 7 |
-| `prior_limited_evidence` | 0.3714 | 0.4691 | 0.3672 | -0.0156 | 7 |
-| `stable_positions_only` | 0.3571 | 0.4547 | 0.3497 | -0.0299 | 7 |
-| `full_phase2_leaders` | 0.3406 | 0.4384 | 0.3387 | -0.0464 | 7 |
+| `legacy_control` | 0.3691 | 0.4653 | 0.3610 | — | 7 |
+| `prior_limited_evidence` | 0.3492 | 0.4434 | 0.3378 | -0.0199 | 7 |
+| `stable_positions_only` | 0.3395 | 0.4325 | 0.3253 | -0.0296 | 7 |
+| `full_phase2_leaders` | 0.3281 | 0.4181 | 0.3171 | -0.0410 | 7 |
 
 ## Future-only replacement structure
 
 | Pos | Future split rank | Replacement player | Active PPG at split |
 |---|---:|---|---:|
-| QB | 29 | baker mayfield | 12.4333 |
-| RB | 22 | bucky irving | 14.2000 |
-| WR | 11 | jalen coker | 15.0667 |
-| TE | 14 | sam laporta | 9.1333 |
-| DL | 15 | tuli tuipulotu | 12.1667 |
-| LB | 11 | nick bolton | 15.6667 |
-| DB | 26 | christian gonzalez | 8.7500 |
+| QB | 30 | malik willis | 11.3700 |
+| RB | 14 | breece hall | 16.5667 |
+| WR | 13 | devonta smith | 14.1667 |
+| TE | 19 | brenton strange | 7.4250 |
+| DL | 18 | jadeveon clowney | 11.2500 |
+| LB | 25 | azeez alshaair | 13.0000 |
+| DB | 34 | antoine winfield | 8.5625 |
 
 ## Secondary availability-inclusive metric
 
@@ -57,10 +57,10 @@ The same candidate-independent future-relative-production test using cumulative 
 
 | Family | Pos-balanced MAE | Δ MAE vs control | Pooled MAE |
 |---|---:|---:|---:|
-| `legacy_control` | 0.4413 | — | 0.4354 |
-| `prior_limited_evidence` | 0.4269 | -0.0143 | 0.4175 |
-| `stable_positions_only` | 0.4157 | -0.0256 | 0.4036 |
-| `full_phase2_leaders` | 0.4034 | -0.0379 | 0.3944 |
+| `legacy_control` | 0.3917 | — | 0.3948 |
+| `prior_limited_evidence` | 0.3747 | -0.0170 | 0.3735 |
+| `stable_positions_only` | 0.3619 | -0.0298 | 0.3578 |
+| `full_phase2_leaders` | 0.3584 | -0.0334 | 0.3545 |
 
 ## Readiness ladder
 
