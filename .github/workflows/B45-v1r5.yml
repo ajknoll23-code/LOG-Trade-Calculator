@@ -1,0 +1,1006 @@
+name: B45 Identity Tail Audit R5
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Dry-run source adjudication first; commit only after reviewing R5 evidence
+        required: true
+        default: dry_run
+        type: choice
+        options:
+          - dry_run
+          - commit
+      attestation:
+        description: Exact B45 R5 attestation
+        required: true
+        type: string
+      adjudications_json:
+        description: JSON keyed by residual Sleeper ID with adjudicated_dob and exactly two source URLs
+        required: false
+        type: string
+      dry_run_adjudications_sha256:
+        description: Commit only - canonical adjudications SHA printed by the reviewed R5 dry run
+        required: false
+        type: string
+      owner_confirmation:
+        description: Required only in commit mode after manual review of R5 source adjudication
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install frozen runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --no-cache-dir \
+            'numpy==2.5.3' \
+            'pandas==2.3.3' \
+            'scipy==1.18.1' \
+            'requests==2.34.2'
+
+      - name: Run B45 R5 source adjudication
+        shell: bash
+        env:
+          MODE: ${{ inputs.mode }}
+          ATTEST: ${{ inputs.attestation }}
+          ADJUDICATIONS_JSON: ${{ inputs.adjudications_json }}
+          DRY_RUN_ADJUDICATIONS_SHA256: ${{ inputs.dry_run_adjudications_sha256 }}
+          OWNER_CONFIRMATION: ${{ inputs.owner_confirmation }}
+        run: |
+          set -euo pipefail
+
+          test "$ATTEST" = 'I_CONFIRM_B45_V1R5_IS_POSTHOC_SOURCE_ADJUDICATION_FOR_ONLY_THE_THREE_B44W4_RESIDUALS_AND_AUTHORIZES_NO_PRODUCTION_CHANGE'
+
+          BASE='research/player-role-v2'
+          test "$MODE" = 'dry_run' -o "$MODE" = 'commit'
+          if [ "$MODE" = 'commit' ]; then
+            test ! -e "$BASE/b45_identity_overrides.csv"
+            test ! -e "$BASE/b45_evidence.json"
+          fi
+
+          INDEX_SHA_BEFORE="$(sha256sum index.html | awk '{print $1}')"
+          FA_SHA_BEFORE="$(sha256sum free-agent-board.html | awk '{print $1}')"
+
+          cat > /tmp/b45_r5.py <<'PY'
+          #!/usr/bin/env python3
+          import csv, hashlib, html, importlib.util, io, json, os, re, subprocess, sys, time
+          from collections import defaultdict
+          from datetime import date, datetime, timezone
+          from pathlib import Path
+          from urllib.parse import urlparse
+
+          import requests
+
+          BASE = Path("research/player-role-v2")
+          B42_EVAL = BASE / "player_role_v2_b42_v4_owner_blind_parity_evaluator.py"
+          V1_EVAL = BASE / "player_role_v2_b43_v1_identity_bridge_evaluator.py"
+          B44_DECISION = BASE / "player_role_v2_b44w4_v1_scientific_decision.json"
+          B44_EVIDENCE = BASE / "player_role_v2_b44w4_v1_owner_blind_evidence.json"
+          B44_ELIG = BASE / "player_role_v2_b44w4_v1_role_eligibility.csv"
+          B44_SHADOW = BASE / "player_role_v2_b44w4_v1_shadow_refresh.csv"
+          B44_OVERLAY = BASE / "player_role_v2_b44w4_v1_identity_overlay.csv"
+          B44_IDVAL = BASE / "player_role_v2_b44w4_v1_identity_validation.json"
+          B44_SOURCE = BASE / "player_role_v2_b44w4_v1_source_preflight.json"
+          B44_PROTOCOL = BASE / "player_role_v2_b44w4_v1_protocol_freeze.json"
+          B41I = BASE / "frozen_inputs/players_b41i_snapshot.csv"
+          OUT_CSV = BASE / "b45_identity_overrides.csv"
+          OUT_JSON = BASE / "b45_evidence.json"
+
+          B42_SHA = "418e0807471cdf644afeaf2c5a3ee0211068667fce057317ec29a3962a836396"
+          V1_SHA = "44e2585dbb84a7c62b274b5ed0bc63d1881b4e48e940e65ad04a5c8905475bab"
+          B41I_SHA = "d531dcff2d3ff681f02210d314f6e9f16c671c0beefa85fd311a55363675d4cc"
+          EXPECTED_B44_RESULT = "SCIENTIFIC_STOP_B44W4_V1_OWNER_BLIND_ROLE_PARITY_FAILED"
+          EXPECTED_PENDING_REASON = "stable_id_crosswalk_absent_name_bridge"
+          SLEEPER_URL = "https://api.sleeper.app/v1/players/nfl"
+          MAX_SOURCE_BYTES = 6_000_000
+
+          OWNER_CONFIRMATION = (
+              "I_CONFIRM_B45_R5_AUTHORITATIVE_SOURCE_ADJUDICATION_WAS_MANUALLY_REVIEWED_"
+              "AND_DOES_NOT_CHANGE_B44_OR_B45_R3_RESULTS"
+          )
+
+          EXPECTED_RESIDUAL_PAIRS = {
+              "13395": {"gsis_id":"00-0041508","model_position":"DL"},
+              "13372": {"gsis_id":"00-0041501","model_position":"DL"},
+              "13545": {"gsis_id":"00-0040899","model_position":"K"},
+          }
+
+          ORG_RULES = [
+              ("NFL", "A", lambda h: h == "nfl.com" or h.endswith(".nfl.com")),
+              ("TEAM_TITANS", "A", lambda h: h == "tennesseetitans.com" or h.endswith(".tennesseetitans.com")),
+              ("TEAM_CHIEFS", "A", lambda h: h == "chiefs.com" or h.endswith(".chiefs.com")),
+              ("TEAM_PACKERS", "A", lambda h: h == "packers.com" or h.endswith(".packers.com")),
+              ("COLLEGE_AUBURN", "A", lambda h: h == "auburntigers.com" or h.endswith(".auburntigers.com")),
+              ("COLLEGE_OKLAHOMA", "A", lambda h: h == "soonersports.com" or h.endswith(".soonersports.com")),
+              ("COLLEGE_FLORIDA", "A", lambda h: h == "floridagators.com" or h.endswith(".floridagators.com")),
+              ("ESPN", "B", lambda h: h == "espn.com" or h.endswith(".espn.com")),
+              ("SPORTS_REFERENCE", "B", lambda h: h == "pro-football-reference.com" or h.endswith(".pro-football-reference.com")),
+              ("OURLADS", "B", lambda h: h == "ourlads.com" or h.endswith(".ourlads.com")),
+          ]
+
+          def sha256_bytes(b): return hashlib.sha256(b).hexdigest()
+          def sha256_file(p): return sha256_bytes(Path(p).read_bytes())
+          def load_json(p): return json.loads(Path(p).read_text(encoding="utf-8"))
+
+          def load_mod(p, name):
+              spec = importlib.util.spec_from_file_location(name, p)
+              if spec is None or spec.loader is None:
+                  raise RuntimeError(f"B45_R5_MODULE_LOAD_FAILED {p}")
+              m = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(m)
+              return m
+
+          def get_response(session, url, attempts=4, max_bytes=50_000_000):
+              err = None
+              for i in range(attempts):
+                  r = None
+                  try:
+                      r = session.get(url, timeout=60, allow_redirects=True, stream=True)
+                      r.raise_for_status()
+                      chunks = []
+                      total = 0
+                      for chunk in r.iter_content(chunk_size=64 * 1024):
+                          if not chunk:
+                              continue
+                          total += len(chunk)
+                          if total > max_bytes:
+                              raise RuntimeError(f"B45_R5_SOURCE_TOO_LARGE url={url} bytes_gt={max_bytes}")
+                          chunks.append(chunk)
+                      payload = b"".join(chunks)
+                      r._content = payload
+                      r._content_consumed = True
+                      return r
+                  except Exception as exc:
+                      err = exc
+                      if r is not None:
+                          try: r.close()
+                          except Exception: pass
+                      if i + 1 < attempts:
+                          time.sleep(2 ** i)
+              raise RuntimeError(f"B45_R5_SOURCE_FETCH_FAILED url={url} error={err}")
+
+          def truthy(x): return str(x or "").strip().lower() in {"1","true","yes"}
+
+          def load_csv(p):
+              with Path(p).open(newline="", encoding="utf-8") as f:
+                  return list(csv.DictReader(f))
+
+          def roster_list(raw):
+              if isinstance(raw, dict):
+                  raw = raw.get("rosters")
+              if not isinstance(raw, list):
+                  raise RuntimeError("B45_R5_ROSTER_SNAPSHOT_SCHEMA")
+              return raw
+
+          def sleeper_full_name(rec):
+              return str(rec.get("full_name") or "").strip() or " ".join(
+                  x for x in [str(rec.get("first_name") or "").strip(),
+                              str(rec.get("last_name") or "").strip()] if x
+              ).strip()
+
+          def current_team_from_stats(payload, gsis_id, v1):
+              reader = csv.DictReader(io.StringIO(payload.decode("utf-8-sig")))
+              if not reader.fieldnames:
+                  raise RuntimeError("B45_R5_STATS_NO_HEADER")
+              id_col = next((c for c in ("player_id","gsis_id") if c in reader.fieldnames), None)
+              team_col = next((c for c in ("recent_team","team","team_abbr","club") if c in reader.fieldnames), None)
+              if id_col is None or team_col is None or "week" not in reader.fieldnames:
+                  raise RuntimeError(f"B45_R5_STATS_SCHEMA fields={reader.fieldnames}")
+              vals=[]
+              for row in reader:
+                  if str(row.get(id_col) or "").strip() != gsis_id:
+                      continue
+                  try:
+                      season=int(str(row.get("season") or "2026"))
+                      week=int(str(row.get("week") or "0"))
+                  except ValueError:
+                      continue
+                  if season != 2026:
+                      continue
+                  if str(row.get("season_type") or "REG").strip().upper() not in {"REG","REGULAR"}:
+                      continue
+                  vals.append((week,v1.team_key(row.get(team_col))))
+              if not vals:
+                  return {"team":"","max_week":None}
+              max_week=max(w for w,_ in vals)
+              teams=sorted({t for w,t in vals if w==max_week and t})
+              return {"team":teams[0] if len(teams)==1 else "","max_week":max_week}
+
+          def normalize_host(host):
+              return str(host or "").strip().lower().rstrip(".")
+
+          def classify_url(url):
+              raw = str(url or "").strip()
+              try:
+                  p = urlparse(raw)
+                  port = p.port
+              except Exception:
+                  return {"url":raw,"valid":False,"reason":"url_parse_failed","host":"","organization":"","tier":""}
+              if p.scheme != "https" or not p.hostname:
+                  return {"url":raw,"valid":False,"reason":"https_required","host":"","organization":"","tier":""}
+              if p.username is not None or p.password is not None:
+                  return {"url":raw,"valid":False,"reason":"url_credentials_forbidden","host":normalize_host(p.hostname),"organization":"","tier":""}
+              if port not in (None,443):
+                  return {"url":raw,"valid":False,"reason":"non_443_explicit_port_forbidden","host":normalize_host(p.hostname),"organization":"","tier":""}
+              host = normalize_host(p.hostname)
+              for org,tier,pred in ORG_RULES:
+                  if pred(host):
+                      return {"url":raw,"valid":True,"reason":"","host":host,"organization":org,"tier":tier}
+              return {"url":raw,"valid":False,"reason":"source_domain_not_allowlisted","host":host,"organization":"","tier":""}
+
+          def parse_iso_date(value):
+              try: return date.fromisoformat(str(value or "").strip())
+              except Exception: return None
+
+          def normalize_machine_date(value):
+              raw = str(value or "").strip()
+              if not re.match(r"^\d{4}-\d{2}-\d{2}", raw):
+                  return raw, None
+              try:
+                  return raw, date.fromisoformat(raw[:10])
+              except Exception:
+                  return raw, None
+
+          def reconcile_machine_dobs(sleeper_raw, nflverse_raw, adj_dob):
+              s_raw, s_date = normalize_machine_date(sleeper_raw)
+              n_raw, n_date = normalize_machine_date(nflverse_raw)
+              reasons=[]
+              if s_date is None or n_date is None:
+                  reasons.append("machine_dob_unparseable")
+              positive_conflict = bool(s_date is not None and n_date is not None and s_date != n_date)
+              if not positive_conflict:
+                  reasons.append("r5_requires_positive_machine_dob_conflict")
+              matches=[]
+              if adj_dob is not None and s_date is not None and n_date is not None:
+                  if s_date == adj_dob: matches.append("sleeper")
+                  if n_date == adj_dob: matches.append("nflverse")
+              if len(matches) != 1:
+                  reasons.append("adjudicated_dob_must_equal_exactly_one_machine_dob")
+              error_source = ""
+              if matches == ["sleeper"]:
+                  error_source = "nflverse"
+              elif matches == ["nflverse"]:
+                  error_source = "sleeper"
+              return {
+                  "sleeper_raw":s_raw,
+                  "nflverse_raw":n_raw,
+                  "sleeper_normalized":s_date.isoformat() if s_date else "",
+                  "nflverse_normalized":n_date.isoformat() if n_date else "",
+                  "positive_conflict":positive_conflict,
+                  "matches":matches,
+                  "dob_error_source":error_source,
+                  "reasons":reasons,
+              }
+
+          def dob_variants(d):
+              months=["","January","February","March","April","May","June","July","August","September","October","November","December"]
+              ab=["","Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+              yy=str(d.year)[2:]
+              vals={
+                  d.isoformat(), f"{d.month}/{d.day}/{d.year}", f"{d.month:02d}/{d.day:02d}/{d.year}",
+                  f"{d.month}/{d.day}/{yy}", f"{d.month:02d}/{d.day:02d}/{yy}",
+                  f"{months[d.month]} {d.day}, {d.year}", f"{ab[d.month]} {d.day}, {d.year}",
+                  f"{ab[d.month]}. {d.day}, {d.year}", f"{d.day} {months[d.month]} {d.year}",
+              }
+              if d.month==9:
+                  vals.update({f"Sept {d.day}, {d.year}",f"Sept. {d.day}, {d.year}"})
+              return sorted(vals, key=lambda x:(-len(x),x))
+
+          def visible_text(raw_html):
+              t=re.sub(r"(?is)<script\b.*?>.*?</script>"," ",raw_html)
+              t=re.sub(r"(?is)<style\b.*?>.*?</style>"," ",t)
+              t=re.sub(r"(?s)<[^>]+>"," ",t)
+              return " ".join(html.unescape(t).split())
+
+          def strip_tags(fragment):
+              return " ".join(html.unescape(re.sub(r"(?s)<[^>]+>"," ",fragment or "")).split())
+
+          def extract_page_labels(raw_html):
+              labels=[]
+              m=re.search(r"(?is)<title\b[^>]*>(.*?)</title>",raw_html)
+              if m: labels.append(("title",strip_tags(m.group(1))))
+              pats = [
+                  r"(?is)<meta\b[^>]*property\s*=\s*[\"']og:title[\"'][^>]*content\s*=\s*[\"']([^\"']+)[\"'][^>]*>",
+                  r"(?is)<meta\b[^>]*content\s*=\s*[\"']([^\"']+)[\"'][^>]*property\s*=\s*[\"']og:title[\"'][^>]*>",
+              ]
+              for pat in pats:
+                  m=re.search(pat,raw_html)
+                  if m:
+                      labels.append(("og:title",html.unescape(m.group(1)).strip()))
+                      break
+              m=re.search(r"(?is)<h1\b[^>]*>(.*?)</h1>",raw_html)
+              if m: labels.append(("h1",strip_tags(m.group(1))))
+              return labels
+
+          def name_regex(player_name, v1):
+              toks=v1.canonical_name(player_name).split()
+              if not toks: return None
+              return re.compile(r"\b" + r"[^A-Za-z0-9]+".join(re.escape(t) for t in toks) + r"\b", re.I)
+
+          def find_variant_spans(text, variants):
+              out=[]
+              low=text.casefold()
+              for variant in variants:
+                  needle=variant.casefold()
+                  start=0
+                  while True:
+                      i=low.find(needle,start)
+                      if i<0: break
+                      out.append((i,i+len(variant),variant))
+                      start=i+1
+              return out
+
+          def sanitized_excerpt(text, a, b, limit=400):
+              a=max(0,a); b=min(len(text),b)
+              if b-a > limit:
+                  mid=(a+b)//2
+                  a=max(0,mid-limit//2); b=min(len(text),a+limit)
+              else:
+                  extra=limit-(b-a)
+                  a=max(0,a-extra//2)
+                  b=min(len(text),b+(extra-extra//2))
+              s=text[a:b]
+              s="".join(ch if (ch==" " or ord(ch)>=32) else " " for ch in s)
+              return " ".join(s.split())
+
+          def iter_json_objects(obj):
+              if isinstance(obj,dict):
+                  yield obj
+                  for v in obj.values():
+                      yield from iter_json_objects(v)
+              elif isinstance(obj,list):
+                  for v in obj:
+                      yield from iter_json_objects(v)
+
+          def jsonld_person_candidates(raw_html, player_name, adjudicated_dob, competing_dob, v1):
+              accepted=[]
+              ambiguous=False
+              malformed=0
+              pat = r"(?is)<script\b[^>]*type\s*=\s*[\"']application/ld\+json[\"'][^>]*>(.*?)</script>"
+              for m in re.finditer(pat, raw_html):
+                  block=html.unescape(m.group(1)).strip()
+                  try:
+                      payload=json.loads(block)
+                  except Exception:
+                      malformed+=1
+                      continue
+                  for obj in iter_json_objects(payload):
+                      typ=obj.get("@type")
+                      types={str(x).strip().lower() for x in (typ if isinstance(typ,list) else [typ]) if x is not None}
+                      if "person" not in types:
+                          continue
+                      nm=str(obj.get("name") or "").strip()
+                      bd=str(obj.get("birthDate") or "").strip()
+                      if v1.canonical_name(nm)!=v1.canonical_name(player_name):
+                          continue
+                      if not re.match(r"^\d{4}-\d{2}-\d{2}",bd):
+                          continue
+                      if bd[:10] != adjudicated_dob.isoformat():
+                          continue
+                      serialized=json.dumps(obj,sort_keys=True,ensure_ascii=False)
+                      if competing_dob and any(v.casefold() in serialized.casefold() for v in dob_variants(competing_dob)):
+                          ambiguous=True
+                          continue
+                      accepted.append({
+                          "method":"JSON_LD_PERSON",
+                          "matched_name":nm,
+                          "matched_birthDate":bd[:10],
+                          "evidence_excerpt":{"name":nm,"birthDate":bd[:10]},
+                      })
+              return accepted,ambiguous,malformed
+
+          def evaluate_source_content(payload, player_name, adjudicated_dob, competing_dob, v1):
+              raw=payload.decode("utf-8",errors="ignore")
+              text=visible_text(raw)
+              nre=name_regex(player_name,v1)
+              labels=extract_page_labels(raw)
+              player_page=bool(nre and any(nre.search(label) for _,label in labels))
+              visible_candidate=None
+              visible_ambiguous=False
+              if player_page and nre:
+                  name_spans=[(m.start(),m.end()) for m in nre.finditer(text)]
+                  date_spans=find_variant_spans(text,dob_variants(adjudicated_dob))
+                  for ns,ne in name_spans:
+                      for ds,de,dv in date_spans:
+                          if abs(ds-ns) <= 400 or (ds <= ne+400 and ns <= de+400):
+                              a=min(ns,ds); b=max(ne,de)
+                              excerpt=sanitized_excerpt(text,a,b,limit=400)
+                              if competing_dob and any(v.casefold() in excerpt.casefold() for v in dob_variants(competing_dob)):
+                                  visible_ambiguous=True
+                                  continue
+                              visible_candidate={
+                                  "method":"PLAYER_PAGE_VISIBLE_TEXT_PROXIMITY",
+                                  "matched_name":text[ns:ne],
+                                  "matched_dob_variant":dv,
+                                  "page_identity_fields":[{"field":k,"value":v} for k,v in labels],
+                                  "evidence_excerpt":excerpt,
+                              }
+                              break
+                      if visible_candidate: break
+
+              jsonld, jsonld_ambiguous, malformed = jsonld_person_candidates(
+                  raw,player_name,adjudicated_dob,competing_dob,v1
+              )
+              candidate=visible_candidate or (jsonld[0] if jsonld else None)
+              contradiction=bool(visible_ambiguous or jsonld_ambiguous)
+              if contradiction:
+                  return {
+                      "pass":False,
+                      "reason":"source_also_contains_competing_machine_dob",
+                      "match_method":"",
+                      "matched_name":"",
+                      "matched_dob_variant":"",
+                      "evidence_excerpt":"",
+                      "page_identity_fields":[{"field":k,"value":v} for k,v in labels],
+                      "malformed_jsonld_blocks_ignored":malformed,
+                      "source_also_contains_competing_machine_dob":True,
+                  }
+              if candidate:
+                  return {
+                      "pass":True,
+                      "reason":"",
+                      "match_method":candidate["method"],
+                      "matched_name":candidate["matched_name"],
+                      "matched_dob_variant":candidate.get("matched_dob_variant",adjudicated_dob.isoformat()),
+                      "evidence_excerpt":candidate["evidence_excerpt"],
+                      "page_identity_fields":candidate.get("page_identity_fields",[]),
+                      "malformed_jsonld_blocks_ignored":malformed,
+                      "source_also_contains_competing_machine_dob":False,
+                  }
+              if not player_page and not jsonld:
+                  reason="source_not_bound_to_target_player"
+              else:
+                  reason="source_content_does_not_support_claim"
+              return {
+                  "pass":False,
+                  "reason":reason,
+                  "match_method":"",
+                  "matched_name":"",
+                  "matched_dob_variant":"",
+                  "evidence_excerpt":"",
+                  "page_identity_fields":[{"field":k,"value":v} for k,v in labels],
+                  "malformed_jsonld_blocks_ignored":malformed,
+                  "source_also_contains_competing_machine_dob":contradiction,
+              }
+
+          def source_support(session,url,player_name,adjudicated_dob,competing_dob,v1):
+              initial=classify_url(url)
+              if not initial["valid"]:
+                  return {
+                      "url":url,"host":initial.get("host",""),"organization":initial.get("organization",""),
+                      "tier":initial.get("tier",""),"pass":False,"reason":initial["reason"]
+                  }
+              r=get_response(session,url,max_bytes=MAX_SOURCE_BYTES)
+              final=classify_url(r.url)
+              content_type=str(r.headers.get("content-type") or "").lower()
+              fetched_at=datetime.now(timezone.utc).isoformat()
+              result={
+                  "url":url,"final_url":r.url,
+                  "host":initial["host"],"final_host":final.get("host",""),
+                  "organization":initial["organization"],"final_organization":final.get("organization",""),
+                  "tier":initial["tier"],"final_tier":final.get("tier",""),
+                  "http_status":int(r.status_code),
+                  "fetched_at_utc":fetched_at,
+                  "sha256":sha256_bytes(r.content),
+                  "bytes":len(r.content),
+                  "content_type":content_type,
+              }
+              if not final.get("valid") or final.get("organization") != initial["organization"]:
+                  result.update({"pass":False,"reason":"redirect_left_allowlisted_organization"})
+                  return result
+              if "pdf" in content_type or r.url.lower().endswith(".pdf"):
+                  result.update({"pass":False,"reason":"pdf_not_machine_verifiable_in_r5"})
+                  return result
+              if not any(x in content_type for x in ("text/html","text/plain","application/xhtml")):
+                  result.update({"pass":False,"reason":"unsupported_content_type"})
+                  return result
+              content=evaluate_source_content(r.content,player_name,adjudicated_dob,competing_dob,v1)
+              result.update(content)
+              result["redirect_stayed_in_same_organization"]=True
+              return result
+
+          def parse_adjudications(raw):
+              raw=str(raw or "").strip()
+              if not raw: return {}
+              try: obj=json.loads(raw)
+              except Exception as exc: raise RuntimeError(f"B45_R5_ADJUDICATION_JSON_INVALID {exc}")
+              if not isinstance(obj,dict):
+                  raise RuntimeError("B45_R5_ADJUDICATION_JSON_MUST_BE_OBJECT")
+              return {str(k):v for k,v in obj.items()}
+
+          def canonical_json_sha(obj):
+              payload=json.dumps(obj,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode("utf-8")
+              return sha256_bytes(payload)
+
+          def selftest():
+              class V:
+                  @staticmethod
+                  def team_key(x): return str(x or "").strip()
+                  @staticmethod
+                  def canonical_name(x): return " ".join(re.sub(r"[^a-z0-9]+"," ",str(x or "").lower()).split())
+              fake=b"season,week,season_type,player_id,recent_team\n2026,3,REG,G1,ARI\n2026,4,REG,G1,BUF\n"
+              assert current_team_from_stats(fake,"G1",V)["team"]=="BUF"
+
+              assert classify_url("https://www.espn.com/nfl/player/x")["organization"]=="ESPN"
+              assert classify_url("https://africa.espn.com/nfl/player/x")["organization"]=="ESPN"
+              assert classify_url("https://www.nfl.com/players/x")["organization"]=="NFL"
+              assert classify_url("https://static.clubs.nfl.com/x")["organization"]=="NFL"
+              assert classify_url("https://user@nfl.com/x")["valid"] is False
+              assert classify_url("http://nfl.com/x")["valid"] is False
+              assert classify_url("https://nfl.com:444/x")["valid"] is False
+
+              x=reconcile_machine_dobs("2004-08-25","2004-08-26",date(2004,8,25))
+              assert x["matches"]==["sleeper"] and x["dob_error_source"]=="nflverse" and not x["reasons"]
+              x=reconcile_machine_dobs("2004-08-25T00:00:00","2004-08-26",date(2004,8,26))
+              assert x["matches"]==["nflverse"] and x["dob_error_source"]=="sleeper" and not x["reasons"]
+              x=reconcile_machine_dobs("2004-08-25","2004-08-26",date(2004,8,27))
+              assert "adjudicated_dob_must_equal_exactly_one_machine_dob" in x["reasons"]
+              x=reconcile_machine_dobs("08/25/2004","2004-08-26",date(2004,8,26))
+              assert "machine_dob_unparseable" in x["reasons"]
+
+              good_html=b"""<html><head><title>John Smith - Player Bio</title></head>
+              <body><h1>John Smith</h1><p>John Smith was born August 25, 2004 and plays defense.</p></body></html>"""
+              e=evaluate_source_content(good_html,"John Smith",date(2004,8,25),date(2004,8,26),V)
+              assert e["pass"] and e["match_method"]=="PLAYER_PAGE_VISIBLE_TEXT_PROXIMITY"
+
+              bad_html=b"""<html><head><title>John Smith - Player Bio</title></head>
+              <body><h1>John Smith</h1><p>John Smith plays defense.</p>""" + b"x"*1000 + b"""<p>Other Player born August 25, 2004.</p></body></html>"""
+              assert evaluate_source_content(bad_html,"John Smith",date(2004,8,25),date(2004,8,26),V)["pass"] is False
+
+              j=b"""<html><head><script type="application/ld+json">
+              {"@context":"https://schema.org","@type":"Person","name":"John Smith","birthDate":"2004-08-25"}
+              </script></head><body></body></html>"""
+              e=evaluate_source_content(j,"John Smith",date(2004,8,25),date(2004,8,26),V)
+              assert e["pass"] and e["match_method"]=="JSON_LD_PERSON"
+
+              c=b"""<html><head><title>John Smith</title></head><body><h1>John Smith</h1>
+              <p>John Smith DOB: August 25, 2004. Correction notice also lists August 26, 2004.</p></body></html>"""
+              e=evaluate_source_content(c,"John Smith",date(2004,8,25),date(2004,8,26),V)
+              assert e["pass"] is False and e["reason"]=="source_also_contains_competing_machine_dob"
+
+              assert parse_adjudications('{"123":{"adjudicated_dob":"2000-01-01","sources":[]}}')["123"]
+              print("PASS B45 R5 selftest")
+
+          def run():
+              repo=Path(".")
+              mode=str(os.environ.get("MODE") or "dry_run").strip()
+              if mode not in {"dry_run","commit"}:
+                  raise RuntimeError(f"B45_R5_MODE_INVALID {mode!r}")
+              for p in [B42_EVAL,V1_EVAL,B44_DECISION,B44_EVIDENCE,B44_ELIG,B44_SHADOW,
+                        B44_OVERLAY,B44_IDVAL,B44_SOURCE,B44_PROTOCOL,B41I]:
+                  if not p.exists(): raise RuntimeError(f"B45_R5_REQUIRED_FILE_MISSING {p}")
+              if sha256_file(B42_EVAL)!=B42_SHA: raise RuntimeError("B45_R5_B42_EVALUATOR_SHA_DRIFT")
+              if sha256_file(V1_EVAL)!=V1_SHA: raise RuntimeError("B45_R5_V1_EVALUATOR_SHA_DRIFT")
+              if sha256_file(B41I)!=B41I_SHA: raise RuntimeError("B45_R5_B41I_SHA_DRIFT")
+
+              b42=load_mod(B42_EVAL,"b45_r5_b42")
+              v1=load_mod(V1_EVAL,"b45_r5_v1")
+              lineage=b42.load_and_verify_frozen_lineage(repo)
+              dec,ev,src,proto,idval=[load_json(p) for p in
+                  [B44_DECISION,B44_EVIDENCE,B44_SOURCE,B44_PROTOCOL,B44_IDVAL]]
+
+              if dec.get("result")!=EXPECTED_B44_RESULT or ev.get("result")!=EXPECTED_B44_RESULT:
+                  raise RuntimeError("B45_R5_PARENT_B44W4_NOT_EXPECTED_STOP")
+              if dec.get("production_change_authorized") is not False or ev.get("production_change_authorized") is not False:
+                  raise RuntimeError("B45_R5_PARENT_PRODUCTION_FIREWALL_DRIFT")
+              if int(dec.get("team_count") or 0)!=12: raise RuntimeError("B45_R5_PARENT_TEAM_COUNT_DRIFT")
+              if ev.get("league_position_eligible_counts",{}).get("DL")!=38 or ev.get("league_position_covered_counts",{}).get("DL")!=36:
+                  raise RuntimeError("B45_R5_PARENT_DL_TAIL_DRIFT")
+              if ev.get("league_position_eligible_counts",{}).get("K")!=17 or ev.get("league_position_covered_counts",{}).get("K")!=16:
+                  raise RuntimeError("B45_R5_PARENT_K_TAIL_DRIFT")
+              if proto.get("framing",{}).get("B42_week4_outcomes_previously_observed") is not True:
+                  raise RuntimeError("B45_R5_PARENT_WEEK4_FRAMING_DRIFT")
+
+              linked=[(B44_EVIDENCE,dec["evidence_sha256"]),(B44_ELIG,ev["role_eligibility_sha256"]),
+                      (B44_SHADOW,ev["shadow_refresh_sha256"]),(B44_OVERLAY,ev["identity_overlay_sha256"]),
+                      (B44_IDVAL,ev["identity_validation_sha256"]),(B44_PROTOCOL,ev["protocol_sha256"])]
+              for p,expected in linked:
+                  if sha256_file(p)!=expected:
+                      raise RuntimeError(f"B45_R5_PARENT_SHA_DRIFT {p}")
+
+              start_commit=str(src.get("main_at_start") or "").strip()
+              roster_sha=str(src.get("roster_snapshot_sha256") or "").strip()
+              roster_blob=str(src.get("roster_snapshot_git_blob") or "").strip()
+              roster_bytes=subprocess.check_output(["git","show",f"{start_commit}:data/league_rosters.json"])
+              if sha256_bytes(roster_bytes)!=roster_sha: raise RuntimeError("B45_R5_RECOVERED_ROSTER_SHA_MISMATCH")
+              if subprocess.check_output(["git","hash-object","--stdin"],input=roster_bytes).decode().strip()!=roster_blob:
+                  raise RuntimeError("B45_R5_RECOVERED_ROSTER_BLOB_MISMATCH")
+              rosters=roster_list(json.loads(roster_bytes))
+
+              eligibility,shadow,overlay=load_csv(B44_ELIG),load_csv(B44_SHADOW),load_csv(B44_OVERLAY)
+              by_sid={str(r.get("sleeper_id") or "").strip():r for r in eligibility if str(r.get("sleeper_id") or "").strip()}
+              name_groups=defaultdict(list)
+              for r in eligibility:
+                  k=str(r.get("exact_name_key") or "").strip()
+                  if k and truthy(r.get("exact_name_unique")): name_groups[k].append(r)
+              by_name={k:v[0] for k,v in name_groups.items() if len(v)==1}
+              shadow_sids={str(r.get("sleeper_id") or "").strip() for r in shadow if str(r.get("sleeper_id") or "").strip()}
+
+              residuals=[]; seen=set()
+              for roster in rosters:
+                  players={}
+                  for slot in ("starters","bench","taxi","reserve_ir"):
+                      for pl in roster.get(slot) or []:
+                          pid=str(pl.get("player_id") or "").strip()
+                          if pid: players.setdefault(pid,pl)
+                  for pid,pl in sorted(players.items()):
+                      if pid in seen: continue
+                      pos=lineage["builder"].canon_pos(pl.get("position"))
+                      if pos not in b42.POSITIONS or pid in by_sid: continue
+                      elig=by_name.get(b42.exact_name_key(pl.get("name") or ""))
+                      if elig is None: continue
+                      if pid in shadow_sids: raise RuntimeError("B45_R5_EXACT_NAME_MATCH_UNEXPECTEDLY_HAS_SHADOW_ROLE")
+                      bridged=str(elig.get("sleeper_id") or "").strip()
+                      residuals.append({
+                          "sleeper_id":pid,"roster_name":str(pl.get("name") or "").strip(),
+                          "roster_position":pos,"gsis_id":str(elig.get("gsis_id") or "").strip(),
+                          "model_position":str(elig.get("position") or "").strip(),
+                          "pending_reason":"crosswalk_sleeper_id_disagrees_with_roster_id_name_bridge" if bridged else EXPECTED_PENDING_REASON
+                      }); seen.add(pid)
+              residuals.sort(key=lambda x:(x["model_position"],v1.canonical_name(x["roster_name"]),x["sleeper_id"]))
+              if len(residuals)!=3 or sorted(x["model_position"] for x in residuals)!=["DL","DL","K"]:
+                  raise RuntimeError(f"B45_R5_RESIDUAL_SET_DRIFT {residuals}")
+              if any(x["pending_reason"]!=EXPECTED_PENDING_REASON for x in residuals):
+                  raise RuntimeError(f"B45_R5_RESIDUAL_REASON_DRIFT {residuals}")
+              derived_pairs={x["sleeper_id"]:{"gsis_id":x["gsis_id"],"model_position":x["model_position"]} for x in residuals}
+              if derived_pairs!=EXPECTED_RESIDUAL_PAIRS:
+                  raise RuntimeError(f"B45_R5_EXPLICIT_POSTHOC_POPULATION_MISMATCH {derived_pairs}")
+
+              adjudications=parse_adjudications(os.environ.get("ADJUDICATIONS_JSON"))
+              adjudications_sha=canonical_json_sha(adjudications)
+              residual_sids=set(derived_pairs)
+              if set(adjudications)-residual_sids:
+                  raise RuntimeError("B45_R5_ADJUDICATION_CONTAINS_NONRESIDUAL_SLEEPER_ID")
+              supplied_dry_sha=str(os.environ.get("DRY_RUN_ADJUDICATIONS_SHA256") or "").strip().lower()
+              if mode=="commit":
+                  if not re.fullmatch(r"[0-9a-f]{64}", supplied_dry_sha):
+                      raise RuntimeError("B45_R5_DRY_RUN_ADJUDICATIONS_SHA256_REQUIRED_FOR_COMMIT")
+                  if supplied_dry_sha != adjudications_sha:
+                      raise RuntimeError("B45_R5_ADJUDICATION_JSON_CHANGED_SINCE_DRY_RUN")
+
+              session=requests.Session()
+              session.headers.update({"User-Agent":"LOG-Trade-Calculator-B45-R5-Source-Adjudication"})
+              sleeper_bytes=get_response(session,SLEEPER_URL).content
+              sleeper_raw=json.loads(sleeper_bytes)
+              stats_bytes=get_response(session,b42.CURRENT_STATS_URL).content
+              stable,stable_inverse,_,cross_sha,_=b42.load_stable_id_crosswalk(lineage,session)
+
+              b41i={}
+              with B41I.open(newline="",encoding="utf-8") as f:
+                  for row in csv.DictReader(f):
+                      g=str(row.get("gsis_id") or "").strip()
+                      if g: b41i[g]=row
+              overlay_g={str(r.get("gsis_id") or "").strip() for r in overlay}
+              overlay_s={str(r.get("sleeper_id") or "").strip() for r in overlay}
+              quarantined=idval.get("quarantined") or []
+              qg={str(r.get("gsis_id") or "").strip() for r in quarantined}
+              qs={str(r.get("sleeper_id") or "").strip() for r in quarantined}
+
+              checks=[]; accepted=[]
+              for residual in residuals:
+                  sid,gsis=residual["sleeper_id"],residual["gsis_id"]
+                  rec,nfl=sleeper_raw.get(sid),b41i.get(gsis)
+                  if not isinstance(rec,dict) or not isinstance(nfl,dict):
+                      raise RuntimeError(f"B45_R5_MACHINE_IDENTITY_RECORD_MISSING sid={sid} gsis={gsis}")
+                  sleeper_name=sleeper_full_name(rec); nfl_name=str(nfl.get("display_name") or "").strip()
+                  sleeper_bd=str(rec.get("birth_date") or "").strip(); nfl_bd=str(nfl.get("birth_date") or "").strip()
+                  sleeper_team=v1.team_key(rec.get("team")); weekly=current_team_from_stats(stats_bytes,gsis,v1); nfl_team=weekly["team"]
+                  nfl_pos=str(nfl.get("position") or "").strip(); nfl_group=str(nfl.get("position_group") or "").strip()
+                  name_ok=(v1.canonical_name(residual["roster_name"])==v1.canonical_name(sleeper_name)==v1.canonical_name(nfl_name))
+                  fam=v1.position_family(residual["model_position"])
+                  pos_ok=bool(fam and fam==v1.position_family(rec.get("position"))==(v1.position_family(nfl_pos) or v1.position_family(nfl_group)))
+                  team_ok=bool(sleeper_team and nfl_team and sleeper_team==nfl_team)
+
+                  reasons=[]
+                  if not name_ok: reasons.append("canonical_name_mismatch")
+                  if not pos_ok: reasons.append("position_family_mismatch")
+                  if not team_ok: reasons.append("current_team_mismatch_or_missing")
+                  if gsis in stable: reasons.append("gsis_already_stable_mapped")
+                  if sid in stable_inverse and stable_inverse[sid]!=gsis: reasons.append("sleeper_id_stable_owned_by_other_gsis")
+                  if gsis in overlay_g or sid in overlay_s: reasons.append("pair_component_present_in_B44_DOB_overlay")
+                  if gsis in qg or sid in qs: reasons.append("pair_component_present_in_B44_quarantine")
+
+                  adj=adjudications.get(sid)
+                  source_results=[]; adj_dob_text=""; source_gate=False; source_path=""
+                  dob_rec={
+                      "sleeper_raw":sleeper_bd,"nflverse_raw":nfl_bd,
+                      "sleeper_normalized":"","nflverse_normalized":"","positive_conflict":False,
+                      "matches":[],"dob_error_source":"","reasons":[]
+                  }
+                  if not isinstance(adj,dict):
+                      reasons.append("authoritative_adjudication_not_supplied")
+                      adj_dob=None
+                      sources=[]
+                  else:
+                      adj_dob_text=str(adj.get("adjudicated_dob") or "").strip()
+                      adj_dob=parse_iso_date(adj_dob_text)
+                      sources=adj.get("sources")
+                      if adj_dob is None:
+                          reasons.append("adjudicated_dob_invalid")
+                      if not isinstance(sources,list) or len(sources)!=2:
+                          reasons.append("exactly_two_authoritative_sources_required")
+                          sources=[]
+
+                  if adj_dob is not None:
+                      dob_rec=reconcile_machine_dobs(sleeper_bd,nfl_bd,adj_dob)
+                      reasons.extend(x for x in dob_rec["reasons"] if x not in reasons)
+
+                  machine_gate=bool(adj_dob is not None and not dob_rec["reasons"] and len(dob_rec["matches"])==1)
+                  if machine_gate and len(sources)==2:
+                      competing_iso=(dob_rec["nflverse_normalized"] if dob_rec["matches"]==["sleeper"]
+                                     else dob_rec["sleeper_normalized"])
+                      competing_dob=parse_iso_date(competing_iso)
+                      seen_urls=set()
+                      for srcobj in sources:
+                          if isinstance(srcobj,str):
+                              url=srcobj.strip()
+                          elif isinstance(srcobj,dict):
+                              url=str(srcobj.get("url") or "").strip()
+                          else:
+                              url=""
+                          if not url or url in seen_urls:
+                              source_results.append({"url":url,"pass":False,"reason":"missing_or_duplicate_source_url"})
+                              continue
+                          seen_urls.add(url)
+                          source_results.append(source_support(
+                              session,url,residual["roster_name"],adj_dob,competing_dob,v1
+                          ))
+                      both_pass=bool(len(source_results)==2 and all(x.get("pass") for x in source_results))
+                      orgs={x.get("organization") for x in source_results if x.get("pass")}
+                      tiers=[x.get("tier") for x in source_results if x.get("pass")]
+                      distinct_orgs=(len(orgs)==2)
+                      if both_pass and distinct_orgs:
+                          if "A" in tiers:
+                              source_path="PATH_A_AT_LEAST_ONE_TIER_A"
+                          elif len(tiers)==2 and all(t=="B" for t in tiers):
+                              source_path="PATH_B_TWO_DISTINCT_TIER_B_ORGS"
+                      source_gate=bool(both_pass and distinct_orgs and source_path)
+                      if not source_gate:
+                          reasons.append("authoritative_two_source_gate_failed")
+                  elif len(sources)==2 and not machine_gate:
+                      source_results=[{"url":str(x.get("url") if isinstance(x,dict) else x or "").strip(),
+                                       "pass":False,"reason":"source_not_evaluated_machine_dob_gate_failed"} for x in sources]
+
+                  accepted_flag=not reasons and source_gate
+                  detail={**residual,
+                          "sleeper_full_name":sleeper_name,"nflverse_display_name":nfl_name,
+                          "sleeper_birth_date_raw":sleeper_bd,"nflverse_birth_date_raw":nfl_bd,
+                          "sleeper_birth_date_normalized":dob_rec["sleeper_normalized"],
+                          "nflverse_birth_date_normalized":dob_rec["nflverse_normalized"],
+                          "sleeper_team":sleeper_team,"nflverse_team":nfl_team,
+                          "canonical_name_match":name_ok,"position_family_match":pos_ok,
+                          "current_team_match":team_ok,
+                          "positive_machine_dob_conflict":dob_rec["positive_conflict"],
+                          "adjudicated_birth_date":adj_dob_text,
+                          "adjudicated_dob_matches":dob_rec["matches"],
+                          "dob_error_source":dob_rec["dob_error_source"],
+                          "machine_dob_gate_pass":machine_gate,
+                          "authoritative_source_results":source_results,
+                          "authoritative_two_source_gate_pass":source_gate,
+                          "authoritative_source_policy_path":source_path,
+                          "verification_method":"AUTHORITATIVE_TWO_SOURCE_DOB_ADJUDICATION_R5" if accepted_flag else "",
+                          "accepted":accepted_flag,"rejection_reasons":reasons}
+                  checks.append(detail)
+                  if accepted_flag:
+                      accepted.append({
+                          "gsis_id":gsis,"sleeper_id":sid,"model_position":residual["model_position"],
+                          "verification_method":"AUTHORITATIVE_TWO_SOURCE_DOB_ADJUDICATION_R5",
+                          "sleeper_birth_date":dob_rec["sleeper_normalized"],
+                          "nflverse_birth_date":dob_rec["nflverse_normalized"],
+                          "adjudicated_birth_date":adj_dob.isoformat(),
+                          "adjudicated_dob_matches":"|".join(dob_rec["matches"]),
+                          "dob_error_source":dob_rec["dob_error_source"],
+                          "sleeper_team":sleeper_team,"nflverse_team":nfl_team,
+                          "manual_source_url":"|".join(x["url"] for x in source_results),
+                      })
+
+              if len({x["gsis_id"] for x in accepted})!=len(accepted): raise RuntimeError("B45_R5_ACCEPTED_GSIS_NOT_ONE_TO_ONE")
+              if len({x["sleeper_id"] for x in accepted})!=len(accepted): raise RuntimeError("B45_R5_ACCEPTED_SLEEPER_NOT_ONE_TO_ONE")
+
+              print("B45 R5 authoritative-source adjudication preview:")
+              print(f"ADJUDICATIONS_CANONICAL_SHA256={adjudications_sha}")
+              for x in checks:
+                  print(f"- sleeper={x['sleeper_id']} | name={x['roster_name']} | gsis={x['gsis_id']} | "
+                        f"pos={x['model_position']} | sleeper_dob={x['sleeper_birth_date_normalized'] or x['sleeper_birth_date_raw']} | "
+                        f"nflverse_dob={x['nflverse_birth_date_normalized'] or x['nflverse_birth_date_raw']} | "
+                        f"adjudicated_dob={x['adjudicated_birth_date'] or 'NONE'} | matches={x['adjudicated_dob_matches']} | "
+                        f"dob_error_source={x['dob_error_source'] or 'NONE'} | source_gate={x['authoritative_two_source_gate_pass']} | "
+                        f"would_accept={x['accepted']} | reasons={','.join(x['rejection_reasons']) or 'NONE'}")
+                  for s in x["authoritative_source_results"]:
+                      print(f"  source={s.get('url')} | org={s.get('organization')} | tier={s.get('tier')} | "
+                            f"sha256={s.get('sha256','')} | method={s.get('match_method','')} | "
+                            f"pass={s.get('pass')} | reason={s.get('reason','')}")
+
+              if mode=="dry_run":
+                  print("B45 R5 DRY RUN: no files written and no commit performed.")
+                  print("Commit requires all three residuals to pass and the same canonical adjudications JSON SHA.")
+                  return
+
+              if str(os.environ.get("OWNER_CONFIRMATION") or "").strip()!=OWNER_CONFIRMATION:
+                  raise RuntimeError("B45_R5_OWNER_CONFIRMATION_MISSING_OR_INCORRECT")
+              if len(accepted)!=3:
+                  raise RuntimeError(f"B45_R5_INCOMPLETE_ADJUDICATION_NO_COMMIT accepted={len(accepted)} required=3")
+
+              fields=["gsis_id","sleeper_id","model_position","verification_method","sleeper_birth_date",
+                      "nflverse_birth_date","adjudicated_birth_date","adjudicated_dob_matches","dob_error_source",
+                      "sleeper_team","nflverse_team","manual_source_url"]
+              with OUT_CSV.open("w",newline="",encoding="utf-8") as f:
+                  w=csv.DictWriter(f,fieldnames=fields,lineterminator="\n"); w.writeheader(); w.writerows(accepted)
+
+              evidence={
+                  "schema_version":1,"study_id":"player-role-v2",
+                  "phase":"B45-v1r5-authoritative-source-adjudication",
+                  "decision":"B45_R5_OVERRIDES_FROZEN",
+                  "framing":"POST_HOC_SOURCE_QUALITY_ADJUDICATION_AFTER_B45_R3_DOB_CONFLICTS",
+                  "B44W4_parent_result":EXPECTED_B44_RESULT,
+                  "B44W4_scientific_stop_preserved":True,
+                  "B45_R3_dob_conflict_hard_veto_preserved_as_historical_result":True,
+                  "B45_R5_is_new_posthoc_adjudication_not_reinterpretation_of_R3":True,
+                  "B44W4_residual_count_observed":3,"B44W4_residuals":residuals,
+                  "verification_results":checks,"accepted_override_count":3,
+                  "adjudications_canonical_sha256":adjudications_sha,
+                  "dry_run_adjudications_sha256_confirmed":supplied_dry_sha,
+                  "overrides_targeted_at_B44W4_residual_after_result_known":True,
+                  "positive_machine_DOB_conflicts_required_for_R5_path":True,
+                  "authoritative_source_policy":{
+                      "source_count_per_override":2,
+                      "exactly_two_submitted_sources_both_must_pass":True,
+                      "distinct_organizations_required":True,
+                      "tier_A_or_tier_B_policy":"Path A: >=1 Tier A organization + 1 other distinct allowed organization; Path B: 2 distinct Tier B organizations",
+                      "allowed_organizations":[{"organization":o,"tier":t} for o,t,_ in ORG_RULES],
+                      "adjudicated_dob_must_equal_exactly_one_machine_dob":True,
+                      "machine_dobs_strictly_normalized_before_comparison":True,
+                      "player_binding_methods":["PLAYER_PAGE_VISIBLE_TEXT_PROXIMITY","JSON_LD_PERSON"],
+                      "arbitrary_raw_html_or_non_jsonld_script_matches_forbidden":True,
+                      "competing_machine_dob_in_evidence_rejected":True,
+                      "pdf_sources_rejected":True,
+                      "https_only":True,
+                      "credentials_in_url_forbidden":True,
+                      "explicit_non_443_ports_forbidden":True,
+                      "redirect_must_remain_same_organization":True,
+                      "streamed_decompressed_download_cap_bytes":MAX_SOURCE_BYTES,
+                      "commit_refetches_and_revalidates_content_claim":True,
+                      "commit_exact_page_sha_pin_required":False,
+                      "commit_records_page_sha_timestamp_final_url_org_tier_http_status_and_excerpt":True,
+                  },
+                  "no_new_general_identity_rule_created":True,
+                  "stable_crosswalk_precedence_preserved":True,
+                  "B44_DOB_overlay_and_quarantine_not_overridden":True,
+                  "one_to_one_mapping_required":True,
+                  "sources":{"B44W4_main_at_start":start_commit,"B44W4_roster_snapshot_sha256":roster_sha,
+                             "fresh_sleeper_player_map_sha256":sha256_bytes(sleeper_bytes),
+                             "nflverse_2026_weekly_stats_sha256":sha256_bytes(stats_bytes),
+                             "stable_crosswalk_sha256":cross_sha,"B41I_snapshot_sha256":sha256_file(B41I)},
+                  "override_csv_sha256":sha256_file(OUT_CSV),
+                  "production_change_authorized":False,"production_model_deployed":False,
+                  "B46_may_run":True,"B46_must_be_fresh_week":True,
+                  "B46_acceptance_gates_must_remain_unchanged":True,
+              }
+              OUT_JSON.write_text(json.dumps(evidence,indent=2,sort_keys=True)+"\n",encoding="utf-8")
+              print("B45 R5 decision: B45_R5_OVERRIDES_FROZEN")
+              print("Accepted overrides: 3")
+              print("Production authorized: false")
+
+          if __name__=="__main__":
+              selftest() if "--selftest" in sys.argv else run()
+          PY
+
+          python /tmp/b45_r5.py --selftest
+          python -m py_compile /tmp/b45_r5.py
+          python /tmp/b45_r5.py
+
+          if [ "$MODE" = 'dry_run' ]; then
+            test ! -e "$BASE/b45_identity_overrides.csv"
+            test ! -e "$BASE/b45_evidence.json"
+            test -z "$(git status --porcelain)"
+            test "$(sha256sum index.html | awk '{print $1}')" = "$INDEX_SHA_BEFORE"
+            test "$(sha256sum free-agent-board.html | awk '{print $1}')" = "$FA_SHA_BEFORE"
+            echo 'PASS: B45 R5 dry run completed without writing or committing.'
+            exit 0
+          fi
+
+          test -f "$BASE/b45_identity_overrides.csv"
+          test -f "$BASE/b45_evidence.json"
+
+          python - <<'PYVERIFY'
+          import csv, hashlib, json
+          from pathlib import Path
+          base=Path('research/player-role-v2')
+          csvp=base/'b45_identity_overrides.csv'
+          evp=base/'b45_evidence.json'
+          e=json.loads(evp.read_text())
+          rows=list(csv.DictReader(csvp.open(newline='',encoding='utf-8')))
+          assert e['decision']=='B45_R5_OVERRIDES_FROZEN'
+          assert e['accepted_override_count']==3==len(rows)
+          assert e['B44W4_scientific_stop_preserved'] is True
+          assert e['B45_R3_dob_conflict_hard_veto_preserved_as_historical_result'] is True
+          assert e['B45_R5_is_new_posthoc_adjudication_not_reinterpretation_of_R3'] is True
+          assert e['production_change_authorized'] is False
+          assert e['production_model_deployed'] is False
+          assert e['B46_may_run'] is True
+          assert e['B46_must_be_fresh_week'] is True
+          assert hashlib.sha256(csvp.read_bytes()).hexdigest()==e['override_csv_sha256']
+          for x in e['verification_results']:
+              assert x['accepted'] is True
+              assert x['machine_dob_gate_pass'] is True
+              assert len(x['adjudicated_dob_matches'])==1
+              assert x['dob_error_source'] in {'sleeper','nflverse'}
+              assert x['authoritative_two_source_gate_pass'] is True
+              good=x['authoritative_source_results']
+              assert len(good)==2 and all(s['pass'] for s in good)
+              assert len(set(s['organization'] for s in good))==2
+              assert all(s['match_method'] in {'PLAYER_PAGE_VISIBLE_TEXT_PROXIMITY','JSON_LD_PERSON'} for s in good)
+              assert all(not s.get('source_also_contains_competing_machine_dob',False) for s in good)
+              assert all(s.get('redirect_stayed_in_same_organization') is True for s in good)
+          print('PASS: B45 R5 committed evidence is internally consistent.')
+          PYVERIFY
+
+          git add "$BASE/b45_identity_overrides.csv" "$BASE/b45_evidence.json"
+
+          EXPECTED="$(printf '%s\n' "$BASE/b45_evidence.json" "$BASE/b45_identity_overrides.csv" | sort)"
+          ACTUAL="$(git diff --cached --name-only | sort)"
+          test "$ACTUAL" = "$EXPECTED"
+
+          test "$(sha256sum index.html | awk '{print $1}')" = "$INDEX_SHA_BEFORE"
+          test "$(sha256sum free-agent-board.html | awk '{print $1}')" = "$FA_SHA_BEFORE"
+
+          git config user.name 'player-role-v2-b45-r5-bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git commit -m 'Freeze B45 R5 authoritative identity overrides'
+
+          git fetch origin main
+          git rebase origin/main
+
+          COMMIT_CHANGED="$(git diff-tree --no-commit-id --name-only -r HEAD | sort)"
+          test "$COMMIT_CHANGED" = "$EXPECTED"
+          if git diff-tree --no-commit-id --name-only -r HEAD | grep -Eq '^(index\.html|free-agent-board\.html)$'; then
+            echo 'ERROR: production file changed by B45 R5 commit'
+            exit 1
+          fi
+
+          git push origin HEAD:main
+
+
+      - name: Verify durable B45 R5 decision
+        if: ${{ inputs.mode == 'commit' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git reset --hard origin/main
+          python - <<'PY'
+          import csv, hashlib, json
+          from pathlib import Path
+          base=Path('research/player-role-v2')
+          csvp=base/'b45_identity_overrides.csv'
+          evp=base/'b45_evidence.json'
+          e=json.loads(evp.read_text())
+          rows=list(csv.DictReader(csvp.open(newline='',encoding='utf-8')))
+          assert e['decision']=='B45_R5_OVERRIDES_FROZEN'
+          assert len(rows)==e['accepted_override_count']==3
+          assert hashlib.sha256(csvp.read_bytes()).hexdigest()==e['override_csv_sha256']
+          assert e['production_change_authorized'] is False
+          assert e['B46_may_run'] is True
+          print('PASS: durable B45 R5 overrides frozen; B46 remains separate and fresh-week.')
+          PY
