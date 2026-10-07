@@ -336,6 +336,7 @@ def check_aliases_and_ktc_positions():
         "__pkgv4c1__|",
         "__pkgv7dev__|",
         "__pkgv8dev__|",
+        "__pkgv9val__|",
     )
     assert package_prefixes == expected_package_prefixes, (
         "KTC/package-vote transport isolation drift: "
