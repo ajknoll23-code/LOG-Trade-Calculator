@@ -16,7 +16,9 @@ Raw/private 4for4 rows never enter the repository.
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
+import csv
+import hashlib
+from collections import Counter, defaultdict
 import hashlib
 import importlib.util
 import json
@@ -35,6 +37,8 @@ OUT = ROOT / "data" / "free_agent_utility_v1.json"
 TRACKED = ("QB", "RB", "WR", "TE", "DL", "LB", "DB")
 TRANSPORT_STRENGTH = 0.15
 SHIFT_CAP = 0.04
+PHASE2_QUALIFICATION_COVERAGE_REFERENCE = 0.50
+MIN_PROVIDER_ROW_FRACTION = 0.50
 POLICY_ID = "phase3-selected-15pct-cap040"
 
 EXPECTED_PHASE4_BLOB = "2492711ce73eb0203025a5fe20c2a5b88a5887c1"
@@ -57,6 +61,172 @@ def load_phase1():
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     return mod
+
+
+def file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _csv_rows(path: Path) -> list[dict]:
+    with path.open(newline="", encoding="utf-8-sig") as fh:
+        return list(csv.DictReader(fh))
+
+
+def _validate_points(label: str, points: list[float]):
+    if not points:
+        raise RuntimeError(f"{label}: no finite FF Pts values")
+    if not any(abs(x) > 1e-12 for x in points):
+        raise RuntimeError(f"{label}: all FF Pts values are zero")
+    if len({round(x, 9) for x in points}) < 2:
+        raise RuntimeError(f"{label}: FF Pts values are constant")
+
+
+def read_current_provider(phase1, offense: Path, dl: Path, lb: Path, db: Path):
+    # Production refresh adapter around the frozen Phase 1 readers.
+    # The frozen research file is never modified. For the current
+    # private source bundle only, expected SHA/count metadata are
+    # overridden in memory so exact frozen parsing/normalization
+    # semantics are reused for weekly refreshes.
+    paths = {"offense": offense, "DL": dl, "LB": lb, "DB": db}
+
+    original_sha = dict(phase1.EXPECTED_SHA256)
+    original_rows = dict(phase1.EXPECTED_ROW_COUNTS)
+    original_offense_by_pos = dict(phase1.EXPECTED_OFFENSE_BY_POS)
+
+    offense_rows = _csv_rows(offense)
+    if not offense_rows:
+        raise RuntimeError("offense: provider export is empty")
+    required_offense = {"PID", "Player", "Pos", "Team", "FF Pts"}
+    missing = required_offense - set(offense_rows[0])
+    if missing:
+        raise RuntimeError(
+            f"offense: missing required columns: {sorted(missing)}"
+        )
+
+    offense_counts = Counter()
+    offense_points = {pos: [] for pos in ("QB", "RB", "WR", "TE")}
+    for row in offense_rows:
+        pos = str(row.get("Pos") or "").strip().upper()
+        if pos not in offense_points:
+            continue
+        pts = phase1.finite(row.get("FF Pts"))
+        if pts is None:
+            raise RuntimeError(
+                f"offense/{pos}: non-finite FF Pts in tracked row"
+            )
+        offense_counts[pos] += 1
+        offense_points[pos].append(float(pts))
+
+    for pos, historical_n in original_offense_by_pos.items():
+        floor = max(
+            1,
+            int(int(historical_n) * MIN_PROVIDER_ROW_FRACTION + 0.999999),
+        )
+        if offense_counts[pos] < floor:
+            raise RuntimeError(
+                f"offense/{pos}: provider row count below 50% historical "
+                f"floor: {offense_counts[pos]} < {floor}"
+            )
+        _validate_points(f"offense/{pos}", offense_points[pos])
+
+    idp_rows = {}
+    for bucket, path in (("DL", dl), ("LB", lb), ("DB", db)):
+        rows = _csv_rows(path)
+        idp_rows[bucket] = rows
+        if not rows:
+            raise RuntimeError(f"{bucket}: provider export is empty")
+        required = {"Player", "Team", "FF Pts"}
+        missing = required - set(rows[0])
+        if missing:
+            raise RuntimeError(
+                f"{bucket}: missing required columns: {sorted(missing)}"
+            )
+        floor = max(
+            1,
+            int(
+                int(original_rows[bucket])
+                * MIN_PROVIDER_ROW_FRACTION
+                + 0.999999
+            ),
+        )
+        if len(rows) < floor:
+            raise RuntimeError(
+                f"{bucket}: provider row count below 50% historical "
+                f"floor: {len(rows)} < {floor}"
+            )
+        points = []
+        for row in rows:
+            pts = phase1.finite(row.get("FF Pts"))
+            if pts is None:
+                raise RuntimeError(
+                    f"{bucket}: non-finite FF Pts in provider row"
+                )
+            points.append(float(pts))
+        _validate_points(bucket, points)
+
+    current_sha = {
+        label: file_sha256(path)
+        for label, path in paths.items()
+    }
+    current_rows = {
+        "offense": len(offense_rows),
+        "DL": len(idp_rows["DL"]),
+        "LB": len(idp_rows["LB"]),
+        "DB": len(idp_rows["DB"]),
+    }
+    current_offense_by_pos = {
+        pos: offense_counts[pos]
+        for pos in ("QB", "RB", "WR", "TE")
+    }
+
+    try:
+        phase1.EXPECTED_SHA256.clear()
+        phase1.EXPECTED_SHA256.update(current_sha)
+        phase1.EXPECTED_ROW_COUNTS.clear()
+        phase1.EXPECTED_ROW_COUNTS.update(current_rows)
+        phase1.EXPECTED_OFFENSE_BY_POS.clear()
+        phase1.EXPECTED_OFFENSE_BY_POS.update(current_offense_by_pos)
+
+        provider = (
+            phase1.read_offense(offense)
+            + phase1.read_idp(dl, "DL")
+            + phase1.read_idp(lb, "LB")
+            + phase1.read_idp(db, "DB")
+        )
+    finally:
+        phase1.EXPECTED_SHA256.clear()
+        phase1.EXPECTED_SHA256.update(original_sha)
+        phase1.EXPECTED_ROW_COUNTS.clear()
+        phase1.EXPECTED_ROW_COUNTS.update(original_rows)
+        phase1.EXPECTED_OFFENSE_BY_POS.clear()
+        phase1.EXPECTED_OFFENSE_BY_POS.update(original_offense_by_pos)
+
+    provider_counts = Counter(r["pos"] for r in provider)
+    expected_counts = dict(current_offense_by_pos)
+    expected_counts.update({
+        "DL": current_rows["DL"],
+        "LB": current_rows["LB"],
+        "DB": current_rows["DB"],
+    })
+    if dict(provider_counts) != expected_counts:
+        raise RuntimeError(
+            "production refresh adapter output-count mismatch: "
+            f"expected={expected_counts} actual={dict(provider_counts)}"
+        )
+
+    print(
+        "PASS: current provider bundle reused exact frozen Phase 1 "
+        "reader semantics; source SHA/count metadata were rebound "
+        "in memory only."
+    )
+    print(
+        "Provider counts: "
+        + ", ".join(
+            f"{pos}={provider_counts[pos]}"
+            for pos in ("QB", "RB", "WR", "TE", "DL", "LB", "DB")
+        )
+    )
+    return provider, current_sha
 
 
 def clamp(x, lo, hi):
@@ -92,11 +262,8 @@ def build_artifact(offense: Path, dl: Path, lb: Path, db: Path) -> dict:
     current, _runtime_meta = phase1.current_board_rows()
     data_backed = [r for r in current if r["has_real_data"]]
 
-    provider = (
-        phase1.read_offense(offense)
-        + phase1.read_idp(dl, "DL")
-        + phase1.read_idp(lb, "LB")
-        + phase1.read_idp(db, "DB")
+    provider, current_private_sha = read_current_provider(
+        phase1, offense, dl, lb, db
     )
     provider_idx = phase1.index_provider(provider)
 
@@ -112,6 +279,10 @@ def build_artifact(offense: Path, dl: Path, lb: Path, db: Path) -> dict:
 
     for pos in TRACKED:
         cohort = by_pos[pos]
+        if not cohort:
+            raise RuntimeError(
+                f"{pos}: current data-backed free-agent cohort is empty"
+            )
         current_values = {r["sleeper_id"]: float(r["value"]) for r in cohort}
         full_log_pct = phase1.midrank_percentiles(current_values)
 
@@ -127,6 +298,29 @@ def build_artifact(offense: Path, dl: Path, lb: Path, db: Path) -> dict:
                     f"ambiguous private-provider identity: {r['name']} {pos} {r['team']}"
                 )
 
+        # Governance correction after B47 V3:
+        # Phase 2's >=50% match coverage was a research qualification
+        # gate, not a recurring Phase 4 production requirement.
+        # Weekly refreshes therefore report coverage diagnostically;
+        # unmatched players retain the frozen exact-LOG fallback.
+        #
+        # V3 first exposed this at RB 17/36 (47.2%). Removing that
+        # repair-added stop restores the frozen production contract.
+        # No frozen threshold, weight, cap, identity rule, fallback
+        # rule, or section policy is changed.
+        coverage = len(matched) / len(cohort)
+        print(
+            f"INFO {pos} provider match coverage: "
+            f"{len(matched)}/{len(cohort)} ({coverage:.1%})"
+        )
+        if coverage < PHASE2_QUALIFICATION_COVERAGE_REFERENCE:
+            print(
+                f"WARN {pos} coverage {coverage:.1%} < "
+                f"{PHASE2_QUALIFICATION_COVERAGE_REFERENCE:.0%} "
+                "Phase-2 qualification level; unmatched players use "
+                "frozen exact-LOG fallback."
+            )
+
         matched_values = {r["sleeper_id"]: float(r["value"]) for r in matched}
         matched_log_pct = phase1.midrank_percentiles(matched_values)
         matched_f4_pct = phase1.midrank_percentiles(provider_points)
@@ -134,6 +328,19 @@ def build_artifact(offense: Path, dl: Path, lb: Path, db: Path) -> dict:
             sid: matched_f4_pct[sid] - matched_log_pct[sid]
             for sid in matched_log_pct
         }
+        if len(matched) == 0 and deltas:
+            raise RuntimeError(f"{pos}: zero matches unexpectedly produced deltas")
+        if len(matched) == 1 and any(
+            abs(float(v)) > 1e-12 for v in deltas.values()
+        ):
+            raise RuntimeError(
+                f"{pos}: one-match cohort must produce zero transport delta"
+            )
+        if len(matched) < 2:
+            print(
+                f"INFO {pos}: {len(matched)} exact matches; frozen "
+                "matched-subset math yields no 4for4 transport."
+            )
         if deltas and abs(statistics.fmean(deltas.values())) > 1e-12:
             raise RuntimeError(f"{pos}: matched-cohort delta lost mean-zero property")
 
@@ -189,11 +396,16 @@ def build_artifact(offense: Path, dl: Path, lb: Path, db: Path) -> dict:
     # agents" as a proxy for the frozen Phase 4 snapshot. That cardinality can
     # legitimately recur after free-agent membership/sync data change.
     #
-    # Run the byte-for-byte Phase 4 proof only when the public free-agent
-    # source is the exact historical Phase 4 source. The private 4for4 inputs
-    # are independently SHA-pinned by the frozen Phase 1 reader.
+    # Run the byte-for-byte Phase 4 proof only when BOTH the public
+    # free-agent source and private provider bundle are the exact historical
+    # Phase 4 sources. Current weekly provider refreshes intentionally use
+    # the frozen parser with source metadata rebound in memory.
     current_free_agents_blob = git_blob_sha(FREE_AGENTS)
-    if current_free_agents_blob == EXPECTED_PHASE4_FREE_AGENTS_BLOB:
+    historical_private_sha = dict(phase1.EXPECTED_SHA256)
+    if (
+        current_free_agents_blob == EXPECTED_PHASE4_FREE_AGENTS_BLOB
+        and current_private_sha == historical_private_sha
+    ):
         if phase4["source_integrity"].get("data_backed_free_agent_count") != 408:
             raise RuntimeError("frozen Phase 4 data-backed cohort count drifted")
         if len(players) != 408:
@@ -442,6 +654,8 @@ def run_selftest():
     validate_artifact(sample)
     assert clamp(0.1, -SHIFT_CAP, SHIFT_CAP) == SHIFT_CAP
     assert clamp(-0.1, -SHIFT_CAP, SHIFT_CAP) == -SHIFT_CAP
+    assert PHASE2_QUALIFICATION_COVERAGE_REFERENCE == 0.50
+    assert MIN_PROVIDER_ROW_FRACTION == 0.50
 
     # Historical reproduction must be bound to the exact source snapshot,
     # never to a row-count coincidence.
