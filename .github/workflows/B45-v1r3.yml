@@ -1,0 +1,714 @@
+name: B45 Identity Tail Audit R3
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Run dry_run first; use commit only after reviewing dry-run output
+        required: true
+        default: dry_run
+        type: choice
+        options:
+          - dry_run
+          - commit
+      attestation:
+        description: Exact B45 R1 attestation
+        required: true
+        type: string
+      manual_sources:
+        description: "Optional Sleeper-ID keyed URLs: sleeper_id=url;sleeper_id=url"
+        required: false
+        type: string
+      manual_confirmation:
+        description: Required only when commit uses a manual source URL
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --no-cache-dir             'numpy==2.5.3'             'pandas==2.3.3'             'scipy==1.18.1'             'requests==2.34.2'
+
+      - name: Audit and freeze verified identity overrides
+        shell: bash
+        env:
+          MODE: ${{ inputs.mode }}
+          ATTEST: ${{ inputs.attestation }}
+          MANUAL_SOURCES: ${{ inputs.manual_sources }}
+          MANUAL_CONFIRM: ${{ inputs.manual_confirmation }}
+        run: |
+          set -euo pipefail
+
+          test "$ATTEST" = 'I_CONFIRM_B45_V1R3_TARGETS_ONLY_THE_THREE_B44W4_RESIDUALS_DRY_RUNS_BEFORE_COMMIT_AND_AUTHORIZES_NO_PRODUCTION_CHANGE'
+
+          BASE='research/player-role-v2'
+          test "$MODE" = 'dry_run' -o "$MODE" = 'commit'
+          if [ "$MODE" = 'commit' ]; then
+            test ! -e "$BASE/b45_identity_overrides.csv"
+            test ! -e "$BASE/b45_evidence.json"
+          fi
+
+          INDEX_SHA_BEFORE="$(sha256sum index.html | awk '{print $1}')"
+          FA_SHA_BEFORE="$(sha256sum free-agent-board.html | awk '{print $1}')"
+
+          cat > /tmp/b45.py <<'PY'
+          #!/usr/bin/env python3
+          import csv
+          import hashlib
+          import importlib.util
+          import io
+          import json
+          import os
+          import subprocess
+          import sys
+          import time
+          from collections import Counter, defaultdict
+          from pathlib import Path
+
+          import requests
+
+          BASE = Path("research/player-role-v2")
+          B42_EVAL = BASE / "player_role_v2_b42_v4_owner_blind_parity_evaluator.py"
+          V1_EVAL = BASE / "player_role_v2_b43_v1_identity_bridge_evaluator.py"
+          B44_DECISION = BASE / "player_role_v2_b44w4_v1_scientific_decision.json"
+          B44_EVIDENCE = BASE / "player_role_v2_b44w4_v1_owner_blind_evidence.json"
+          B44_ELIG = BASE / "player_role_v2_b44w4_v1_role_eligibility.csv"
+          B44_SHADOW = BASE / "player_role_v2_b44w4_v1_shadow_refresh.csv"
+          B44_OVERLAY = BASE / "player_role_v2_b44w4_v1_identity_overlay.csv"
+          B44_IDVAL = BASE / "player_role_v2_b44w4_v1_identity_validation.json"
+          B44_SOURCE = BASE / "player_role_v2_b44w4_v1_source_preflight.json"
+          B44_PROTOCOL = BASE / "player_role_v2_b44w4_v1_protocol_freeze.json"
+          B41I = BASE / "frozen_inputs/players_b41i_snapshot.csv"
+
+          OUT_CSV = BASE / "b45_identity_overrides.csv"
+          OUT_JSON = BASE / "b45_evidence.json"
+
+          B42_SHA = "418e0807471cdf644afeaf2c5a3ee0211068667fce057317ec29a3962a836396"
+          V1_SHA = "44e2585dbb84a7c62b274b5ed0bc63d1881b4e48e940e65ad04a5c8905475bab"
+          B41I_SHA = "d531dcff2d3ff681f02210d314f6e9f16c671c0beefa85fd311a55363675d4cc"
+
+          EXPECTED_B44_RESULT = "SCIENTIFIC_STOP_B44W4_V1_OWNER_BLIND_ROLE_PARITY_FAILED"
+          EXPECTED_PENDING_REASON = "stable_id_crosswalk_absent_name_bridge"
+
+          SLEEPER_URL = "https://api.sleeper.app/v1/players/nfl"
+
+          def sha256_bytes(b):
+              return hashlib.sha256(b).hexdigest()
+
+          def sha256_file(p):
+              return sha256_bytes(Path(p).read_bytes())
+
+          def load_json(p):
+              return json.loads(Path(p).read_text(encoding="utf-8"))
+
+          def load_mod(p, name):
+              spec = importlib.util.spec_from_file_location(name, p)
+              if spec is None or spec.loader is None:
+                  raise RuntimeError(f"B45_MODULE_LOAD_FAILED {p}")
+              m = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(m)
+              return m
+
+          def get_bytes(session, url, attempts=4):
+              err = None
+              for i in range(attempts):
+                  try:
+                      r = session.get(url, timeout=60)
+                      r.raise_for_status()
+                      return r.content
+                  except Exception as exc:
+                      err = exc
+                      if i + 1 < attempts:
+                          time.sleep(2 ** i)
+              raise RuntimeError(f"B45_SOURCE_FETCH_FAILED url={url} error={err}")
+
+          def truthy(x):
+              return str(x or "").strip().lower() in {"1","true","yes"}
+
+          def load_csv(p):
+              with Path(p).open(newline="", encoding="utf-8") as f:
+                  return list(csv.DictReader(f))
+
+          def roster_list(raw):
+              if isinstance(raw, dict):
+                  raw = raw.get("rosters")
+              if not isinstance(raw, list):
+                  raise RuntimeError("B45_ROSTER_SNAPSHOT_SCHEMA")
+              return raw
+
+          def sleeper_full_name(rec):
+              return (
+                  str(rec.get("full_name") or "").strip()
+                  or " ".join(x for x in [
+                      str(rec.get("first_name") or "").strip(),
+                      str(rec.get("last_name") or "").strip(),
+                  ] if x).strip()
+              )
+
+          def current_team_from_stats(payload, gsis_id, v1):
+              text = payload.decode("utf-8-sig")
+              reader = csv.DictReader(io.StringIO(text))
+              if not reader.fieldnames:
+                  raise RuntimeError("B45_STATS_NO_HEADER")
+              id_col = next((c for c in ("player_id","gsis_id") if c in reader.fieldnames), None)
+              team_col = next((c for c in ("recent_team","team","team_abbr","club") if c in reader.fieldnames), None)
+              if id_col is None or team_col is None or "week" not in reader.fieldnames:
+                  raise RuntimeError(f"B45_STATS_SCHEMA id={id_col} team={team_col} fields={reader.fieldnames}")
+              candidates = []
+              for row in reader:
+                  if str(row.get(id_col) or "").strip() != gsis_id:
+                      continue
+                  try:
+                      season = int(str(row.get("season") or "2026"))
+                      week = int(str(row.get("week") or "0"))
+                  except ValueError:
+                      continue
+                  if season != 2026:
+                      continue
+                  season_type = str(row.get("season_type") or "REG").strip().upper()
+                  if season_type not in {"REG","REGULAR"}:
+                      continue
+                  team = v1.team_key(row.get(team_col))
+                  candidates.append((week, team))
+              if not candidates:
+                  return {"team":"","max_week":None,"known_teams_at_max_week":[]}
+              max_week = max(w for w,_ in candidates)
+              teams = sorted({t for w,t in candidates if w == max_week and t})
+              return {
+                  "team": teams[0] if len(teams) == 1 else "",
+                  "max_week": max_week,
+                  "known_teams_at_max_week": teams,
+              }
+
+          def selftest():
+              assert truthy("True")
+              assert not truthy("")
+              fake = b"season,week,season_type,player_id,recent_team\n2026,3,REG,G1,ARI\n2026,4,REG,G1,BUF\n"
+              class V:
+                  @staticmethod
+                  def team_key(x): return str(x or "").strip()
+              got = current_team_from_stats(fake, "G1", V)
+              assert got["team"] == "BUF" and got["max_week"] == 4
+              assert current_team_from_stats(fake, "G2", V)["team"] == ""
+              print("PASS B45 selftest")
+
+          def run():
+              repo = Path(".")
+              mode = str(os.environ.get("MODE") or "dry_run").strip()
+              if mode not in {"dry_run","commit"}:
+                  raise RuntimeError(f"B45_MODE_INVALID {mode!r}")
+              for p in [B42_EVAL,V1_EVAL,B44_DECISION,B44_EVIDENCE,B44_ELIG,B44_SHADOW,
+                        B44_OVERLAY,B44_IDVAL,B44_SOURCE,B44_PROTOCOL,B41I]:
+                  if not p.exists():
+                      raise RuntimeError(f"B45_REQUIRED_FILE_MISSING {p}")
+
+              if sha256_file(B42_EVAL) != B42_SHA:
+                  raise RuntimeError("B45_B42_EVALUATOR_SHA_DRIFT")
+              if sha256_file(V1_EVAL) != V1_SHA:
+                  raise RuntimeError("B45_V1_EVALUATOR_SHA_DRIFT")
+              if sha256_file(B41I) != B41I_SHA:
+                  raise RuntimeError("B45_B41I_SHA_DRIFT")
+
+              b42 = load_mod(B42_EVAL, "b45_b42")
+              v1 = load_mod(V1_EVAL, "b45_v1")
+              lineage = b42.load_and_verify_frozen_lineage(repo)
+
+              dec = load_json(B44_DECISION)
+              ev = load_json(B44_EVIDENCE)
+              src = load_json(B44_SOURCE)
+              proto = load_json(B44_PROTOCOL)
+              idval = load_json(B44_IDVAL)
+
+              if dec.get("result") != EXPECTED_B44_RESULT or ev.get("result") != EXPECTED_B44_RESULT:
+                  raise RuntimeError("B45_PARENT_B44W4_NOT_EXPECTED_STOP")
+              if dec.get("production_change_authorized") is not False or ev.get("production_change_authorized") is not False:
+                  raise RuntimeError("B45_PARENT_PRODUCTION_FIREWALL_DRIFT")
+              if int(dec.get("team_count") or 0) != 12:
+                  raise RuntimeError("B45_PARENT_TEAM_COUNT_DRIFT")
+              if ev.get("league_position_eligible_counts",{}).get("DL") != 38 or ev.get("league_position_covered_counts",{}).get("DL") != 36:
+                  raise RuntimeError("B45_PARENT_DL_TAIL_DRIFT")
+              if ev.get("league_position_eligible_counts",{}).get("K") != 17 or ev.get("league_position_covered_counts",{}).get("K") != 16:
+                  raise RuntimeError("B45_PARENT_K_TAIL_DRIFT")
+              if proto.get("framing",{}).get("B42_week4_outcomes_previously_observed") is not True:
+                  raise RuntimeError("B45_PARENT_WEEK4_FRAMING_DRIFT")
+
+              # Verify artifact links frozen by B44W4.
+              linked = [
+                  (B44_EVIDENCE, dec["evidence_sha256"], "B44_EVIDENCE"),
+                  (B44_ELIG, ev["role_eligibility_sha256"], "B44_ROLE_ELIGIBILITY"),
+                  (B44_SHADOW, ev["shadow_refresh_sha256"], "B44_SHADOW"),
+                  (B44_OVERLAY, ev["identity_overlay_sha256"], "B44_OVERLAY"),
+                  (B44_IDVAL, ev["identity_validation_sha256"], "B44_IDENTITY_VALIDATION"),
+                  (B44_PROTOCOL, ev["protocol_sha256"], "B44_PROTOCOL"),
+              ]
+              for p, expected, label in linked:
+                  actual = sha256_file(p)
+                  if actual != expected:
+                      raise RuntimeError(f"B45_PARENT_SHA_DRIFT {label} expected={expected} actual={actual}")
+
+              # Recover the exact B44W4 roster snapshot from the frozen start commit.
+              start_commit = str(src.get("main_at_start") or "").strip()
+              expected_roster_sha = str(src.get("roster_snapshot_sha256") or "").strip()
+              expected_roster_blob = str(src.get("roster_snapshot_git_blob") or "").strip()
+              if not start_commit or not expected_roster_sha or not expected_roster_blob:
+                  raise RuntimeError("B45_PARENT_ROSTER_FREEZE_METADATA_MISSING")
+              roster_bytes = subprocess.check_output(
+                  ["git","show",f"{start_commit}:data/league_rosters.json"]
+              )
+              if sha256_bytes(roster_bytes) != expected_roster_sha:
+                  raise RuntimeError("B45_RECOVERED_ROSTER_SHA_MISMATCH")
+              blob = subprocess.check_output(["git","hash-object","--stdin"], input=roster_bytes).decode().strip()
+              if blob != expected_roster_blob:
+                  raise RuntimeError("B45_RECOVERED_ROSTER_BLOB_MISMATCH")
+              rosters = roster_list(json.loads(roster_bytes))
+
+              eligibility = load_csv(B44_ELIG)
+              shadow = load_csv(B44_SHADOW)
+              overlay = load_csv(B44_OVERLAY)
+              if not eligibility or not shadow:
+                  raise RuntimeError("B45_PARENT_ARTIFACT_EMPTY")
+
+              by_sid = {
+                  str(r.get("sleeper_id") or "").strip(): r
+                  for r in eligibility if str(r.get("sleeper_id") or "").strip()
+              }
+              name_groups = defaultdict(list)
+              for r in eligibility:
+                  key = str(r.get("exact_name_key") or "").strip()
+                  if key and truthy(r.get("exact_name_unique")):
+                      name_groups[key].append(r)
+              by_exact_name = {k:v[0] for k,v in name_groups.items() if len(v) == 1}
+              shadow_sids = {str(r.get("sleeper_id") or "").strip() for r in shadow if str(r.get("sleeper_id") or "").strip()}
+
+              # Reproduce exactly the B44W4 residual condition: exact-name denominator match,
+              # no stable/overlay Sleeper ID match, and no shadow role for that roster ID.
+              residuals = []
+              seen = set()
+              for roster in rosters:
+                  players_by_id = {}
+                  for slot in ("starters","bench","taxi","reserve_ir"):
+                      for player in roster.get(slot) or []:
+                          pid = str(player.get("player_id") or "").strip()
+                          if pid:
+                              players_by_id.setdefault(pid, player)
+                  for pid, player in sorted(players_by_id.items()):
+                      if pid in seen:
+                          continue
+                      roster_pos = lineage["builder"].canon_pos(player.get("position"))
+                      if roster_pos not in b42.POSITIONS:
+                          continue
+                      if pid in by_sid:
+                          continue
+                      key = b42.exact_name_key(player.get("name") or "")
+                      elig = by_exact_name.get(key)
+                      if elig is None:
+                          continue
+                      if pid in shadow_sids:
+                          raise RuntimeError("B45_EXACT_NAME_MATCH_UNEXPECTEDLY_HAS_SHADOW_ROLE")
+                      bridged_sid = str(elig.get("sleeper_id") or "").strip()
+                      reason = (
+                          "crosswalk_sleeper_id_disagrees_with_roster_id_name_bridge"
+                          if bridged_sid else EXPECTED_PENDING_REASON
+                      )
+                      residuals.append({
+                          "sleeper_id":pid,
+                          "roster_name":str(player.get("name") or "").strip(),
+                          "roster_position":roster_pos,
+                          "gsis_id":str(elig.get("gsis_id") or "").strip(),
+                          "model_position":str(elig.get("position") or "").strip(),
+                          "eligible_player_name":str(elig.get("player_name") or "").strip(),
+                          "exact_name_key":str(elig.get("exact_name_key") or "").strip(),
+                          "pending_reason":reason,
+                      })
+                      seen.add(pid)
+
+              residuals.sort(key=lambda x:(x["model_position"], v1.canonical_name(x["roster_name"]), x["sleeper_id"]))
+              if len(residuals) != 3:
+                  raise RuntimeError(f"B45_RESIDUAL_COUNT_NOT_3 count={len(residuals)} residuals={residuals}")
+              if sorted(x["model_position"] for x in residuals) != ["DL","DL","K"]:
+                  raise RuntimeError(f"B45_RESIDUAL_POSITION_MULTISET_DRIFT {residuals}")
+              if any(x["pending_reason"] != EXPECTED_PENDING_REASON for x in residuals):
+                  raise RuntimeError(f"B45_RESIDUAL_PENDING_REASON_DRIFT {residuals}")
+
+              session = requests.Session()
+              session.headers.update({"User-Agent":"LOG-Trade-Calculator-B45-Identity-Tail-Audit"})
+
+              sleeper_bytes = get_bytes(session, SLEEPER_URL)
+              sleeper_raw = json.loads(sleeper_bytes)
+              if not isinstance(sleeper_raw, dict) or len(sleeper_raw) < 5000:
+                  raise RuntimeError("B45_SLEEPER_MAP_INVALID")
+
+              stats_bytes = get_bytes(session, b42.CURRENT_STATS_URL)
+
+              # Stable crosswalk is the exact frozen lineage source.
+              stable, stable_inverse, _, stable_crosswalk_sha, _ = b42.load_stable_id_crosswalk(lineage, session)
+
+              b41i = {}
+              with B41I.open(newline="", encoding="utf-8") as f:
+                  for row in csv.DictReader(f):
+                      g = str(row.get("gsis_id") or "").strip()
+                      if g:
+                          b41i[g] = row
+
+              overlay_gsis = {str(r.get("gsis_id") or "").strip() for r in overlay}
+              overlay_sid = {str(r.get("sleeper_id") or "").strip() for r in overlay}
+              quarantined = idval.get("quarantined") or []
+              quarantine_gsis = {str(r.get("gsis_id") or "").strip() for r in quarantined}
+              quarantine_sid = {str(r.get("sleeper_id") or "").strip() for r in quarantined}
+
+              manual_sources_raw = str(os.environ.get("MANUAL_SOURCES") or "").strip()
+              manual_sources = {}
+              if manual_sources_raw:
+                  for item in manual_sources_raw.split(";"):
+                      item = item.strip()
+                      if not item:
+                          continue
+                      if "=" not in item:
+                          raise RuntimeError(f"B45_MANUAL_SOURCE_FORMAT_INVALID item={item!r}")
+                      sid_key, url = item.split("=", 1)
+                      sid_key = sid_key.strip()
+                      url = url.strip()
+                      if not sid_key or not url:
+                          raise RuntimeError(f"B45_MANUAL_SOURCE_FORMAT_INVALID item={item!r}")
+                      if sid_key in manual_sources:
+                          raise RuntimeError(f"B45_MANUAL_SOURCE_DUPLICATE_SLEEPER_ID {sid_key}")
+                      manual_sources[sid_key] = url
+
+              residual_sids = {x["sleeper_id"] for x in residuals}
+              extra_manual_keys = sorted(set(manual_sources) - residual_sids)
+              if extra_manual_keys:
+                  raise RuntimeError(f"B45_MANUAL_SOURCE_NONRESIDUAL_SLEEPER_IDS {extra_manual_keys}")
+
+              manual_confirm = str(os.environ.get("MANUAL_CONFIRM") or "").strip()
+              manual_expected = "I_CONFIRM_ANY_MISSING_DOB_OVERRIDE_WITH_A_SOURCE_URL_WAS_MANUALLY_VERIFIED_AS_THE_SAME_PLAYER"
+
+              checks = []
+              accepted = []
+              for residual in residuals:
+                  sid = residual["sleeper_id"]
+                  gsis = residual["gsis_id"]
+                  rec = sleeper_raw.get(sid)
+                  if not isinstance(rec, dict):
+                      checks.append({**residual,"accepted":False,"rejection_reasons":["sleeper_record_missing"]})
+                      continue
+                  nfl = b41i.get(gsis)
+                  if not isinstance(nfl, dict):
+                      checks.append({**residual,"accepted":False,"rejection_reasons":["b41i_record_missing"]})
+                      continue
+
+                  sleeper_name = sleeper_full_name(rec)
+                  nfl_name = str(nfl.get("display_name") or "").strip()
+                  sleeper_bd = str(rec.get("birth_date") or "").strip()
+                  nfl_bd = str(nfl.get("birth_date") or "").strip()
+                  sleeper_pos = str(rec.get("position") or "").strip()
+                  nfl_position_raw = str(nfl.get("position") or "").strip()
+                  nfl_position_group_raw = str(nfl.get("position_group") or "").strip()
+                  nfl_pos = nfl_position_raw or nfl_position_group_raw
+                  sleeper_team = v1.team_key(rec.get("team"))
+                  weekly = current_team_from_stats(stats_bytes, gsis, v1)
+                  nfl_team = weekly["team"]
+                  manual_url = manual_sources.get(sid, '')
+
+                  name_ok = (
+                      bool(v1.canonical_name(residual["roster_name"]))
+                      and v1.canonical_name(residual["roster_name"]) == v1.canonical_name(sleeper_name)
+                      and v1.canonical_name(residual["roster_name"]) == v1.canonical_name(nfl_name)
+                  )
+                  model_fam = v1.position_family(residual["model_position"])
+                  sleeper_fam = v1.position_family(sleeper_pos)
+                  nfl_fam = (
+                      v1.position_family(nfl_position_raw)
+                      or v1.position_family(nfl_position_group_raw)
+                  )
+                  pos_ok = bool(model_fam and sleeper_fam and nfl_fam and model_fam == sleeper_fam == nfl_fam)
+
+                  conflicts = []
+                  if gsis in stable:
+                      conflicts.append("gsis_already_stable_mapped")
+                  if sid in stable_inverse and stable_inverse[sid] != gsis:
+                      conflicts.append("sleeper_id_stable_owned_by_other_gsis")
+                  if gsis in overlay_gsis or sid in overlay_sid:
+                      conflicts.append("pair_component_present_in_B44_DOB_overlay")
+                  if gsis in quarantine_gsis or sid in quarantine_sid:
+                      conflicts.append("pair_component_present_in_B44_quarantine")
+
+                  exact_dob = bool(sleeper_bd and nfl_bd and sleeper_bd == nfl_bd)
+                  manual_method = False
+                  if not exact_dob and (not sleeper_bd or not nfl_bd):
+                      manual_method = bool(
+                          sleeper_team and nfl_team and sleeper_team == nfl_team
+                          and manual_url
+                          and manual_confirm == manual_expected
+                      )
+
+                  reasons = []
+                  if not name_ok:
+                      reasons.append("canonical_name_mismatch")
+                  if not pos_ok:
+                      reasons.append("position_family_mismatch")
+                  reasons.extend(conflicts)
+                  if sleeper_bd and nfl_bd and sleeper_bd != nfl_bd:
+                      reasons.append("birth_date_conflict")
+                  if not exact_dob and not manual_method:
+                      reasons.append("identity_evidence_insufficient")
+
+                  accepted_flag = not reasons and (exact_dob or manual_method)
+                  verification_method = "EXACT_DOB" if exact_dob else ("MANUAL_TEAM_PLUS_SOURCE_URL" if manual_method else "")
+
+                  detail = {
+                      **residual,
+                      "sleeper_full_name":sleeper_name,
+                      "nflverse_display_name":nfl_name,
+                      "sleeper_birth_date":sleeper_bd,
+                      "nflverse_birth_date":nfl_bd,
+                      "sleeper_team":sleeper_team,
+                      "nflverse_team":nfl_team,
+                      "nflverse_latest_2026_week":weekly["max_week"],
+                      "nflverse_known_teams_at_latest_week":weekly["known_teams_at_max_week"],
+                      "sleeper_position":sleeper_pos,
+                      "nflverse_position":nfl_pos,
+                      "nflverse_position_raw":nfl_position_raw,
+                      "nflverse_position_group_raw":nfl_position_group_raw,
+                      "sleeper_years_exp":rec.get("years_exp"),
+                      "canonical_name_match":name_ok,
+                      "position_family_match":pos_ok,
+                      "stable_gsis_conflict":gsis in stable,
+                      "stable_sleeper_inverse_conflict":sid in stable_inverse and stable_inverse[sid] != gsis,
+                      "B44_overlay_component_conflict":gsis in overlay_gsis or sid in overlay_sid,
+                      "B44_quarantine_component_conflict":gsis in quarantine_gsis or sid in quarantine_sid,
+                      "exact_birth_date_match":exact_dob,
+                      "manual_source_url":manual_url if manual_method else "",
+                      "verification_method":verification_method,
+                      "accepted":accepted_flag,
+                      "rejection_reasons":reasons,
+                  }
+                  checks.append(detail)
+                  if accepted_flag:
+                      accepted.append({
+                          "gsis_id":gsis,
+                          "sleeper_id":sid,
+                          "model_position":residual["model_position"],
+                          "verification_method":verification_method,
+                          "sleeper_birth_date":sleeper_bd,
+                          "nflverse_birth_date":nfl_bd,
+                          "sleeper_team":sleeper_team,
+                          "nflverse_team":nfl_team,
+                          "manual_source_url":manual_url if manual_method else "",
+                      })
+
+              # One-to-one freeze, fail closed.
+              if len({x["gsis_id"] for x in accepted}) != len(accepted):
+                  raise RuntimeError("B45_ACCEPTED_GSIS_NOT_ONE_TO_ONE")
+              if len({x["sleeper_id"] for x in accepted}) != len(accepted):
+                  raise RuntimeError("B45_ACCEPTED_SLEEPER_NOT_ONE_TO_ONE")
+
+              fields = [
+                  "gsis_id","sleeper_id","model_position","verification_method",
+                  "sleeper_birth_date","nflverse_birth_date","sleeper_team",
+                  "nflverse_team","manual_source_url",
+              ]
+
+              decision = "B45_OVERRIDES_FROZEN" if accepted else "B45_NO_VERIFIABLE_OVERRIDES"
+
+              if mode == "dry_run":
+                  print("B45 DRY RUN — nothing will be written or committed.")
+                  print("Residual verification preview:")
+                  for x in checks:
+                      needs_manual = bool(
+                          not x["exact_birth_date_match"]
+                          and (not x["sleeper_birth_date"] or not x["nflverse_birth_date"])
+                      )
+                      print(
+                          f"- sleeper={x['sleeper_id']} | name={x['roster_name']} | "
+                          f"gsis={x['gsis_id']} | pos={x['model_position']} | "
+                          f"sleeper_dob={x['sleeper_birth_date'] or 'MISSING'} | "
+                          f"nflverse_dob={x['nflverse_birth_date'] or 'MISSING'} | "
+                          f"sleeper_team={x['sleeper_team'] or 'UNKNOWN'} | "
+                          f"nflverse_team={x['nflverse_team'] or 'UNKNOWN'} | "
+                          f"manual_needed={needs_manual} | "
+                          f"would_accept_now={x['accepted']} | "
+                          f"reasons={','.join(x['rejection_reasons']) or 'NONE'}"
+                      )
+                  print("If manual_needed=True, rerun commit mode with manual_sources keyed by Sleeper ID.")
+                  return
+
+              OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
+              with OUT_CSV.open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=fields, lineterminator="\n")
+                  w.writeheader()
+                  w.writerows(accepted)
+
+              evidence = {
+                  "schema_version":1,
+                  "study_id":"player-role-v2",
+                  "phase":"B45-identity-tail-audit-r1",
+                  "run_mode":"commit",
+                  "decision":decision,
+                  "B44W4_parent_result":EXPECTED_B44_RESULT,
+                  "B44W4_residual_count_required":3,
+                  "B44W4_residual_position_multiset_required":["DL","DL","K"],
+                  "B44W4_residual_count_observed":len(residuals),
+                  "B44W4_residuals":residuals,
+                  "verification_results":checks,
+                  "accepted_override_count":len(accepted),
+                  "rejected_residual_count":len(residuals)-len(accepted),
+                  "overrides_targeted_at_B44W4_residual_after_result_known":True,
+                  "no_new_general_identity_rule_created":True,
+                  "stable_crosswalk_precedence_preserved":True,
+                  "B44_DOB_overlay_and_quarantine_not_overridden":True,
+                  "one_to_one_mapping_required":True,
+                  "sources":{
+                      "B44W4_main_at_start":start_commit,
+                      "B44W4_roster_snapshot_sha256":expected_roster_sha,
+                      "B44W4_roster_snapshot_git_blob":expected_roster_blob,
+                      "fresh_sleeper_player_map_sha256":sha256_bytes(sleeper_bytes),
+                      "nflverse_2026_weekly_stats_sha256":sha256_bytes(stats_bytes),
+                      "stable_crosswalk_sha256":stable_crosswalk_sha,
+                      "B41I_snapshot_sha256":sha256_file(B41I),
+                  },
+                  "override_csv_sha256":sha256_file(OUT_CSV),
+                  "production_change_authorized":False,
+                  "production_model_deployed":False,
+                  "B46_may_run":bool(accepted),
+              }
+              OUT_JSON.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+              print("B45 residual identities:")
+              for x in checks:
+                  print(
+                      f"- {x['roster_name']} | {x['model_position']} | sleeper={x['sleeper_id']} | "
+                      f"gsis={x['gsis_id']} | accepted={x['accepted']} | method={x['verification_method'] or 'NONE'}"
+                  )
+              print(f"B45 decision: {decision}")
+              print(f"B45 accepted overrides: {len(accepted)}")
+
+          if __name__ == "__main__":
+              if "--selftest" in sys.argv:
+                  selftest()
+              else:
+                  run()
+          PY
+
+          python /tmp/b45.py --selftest
+          python -m py_compile /tmp/b45.py
+          python /tmp/b45.py
+
+          if [ "$MODE" = 'dry_run' ]; then
+            test ! -e "$BASE/b45_identity_overrides.csv"
+            test ! -e "$BASE/b45_evidence.json"
+            test -z "$(git status --porcelain)"
+            test "$(sha256sum index.html | awk '{print $1}')" = "$INDEX_SHA_BEFORE"
+            test "$(sha256sum free-agent-board.html | awk '{print $1}')" = "$FA_SHA_BEFORE"
+            echo 'PASS: B45 dry run completed with no writes or commits.'
+            exit 0
+          fi
+
+          test -f "$BASE/b45_identity_overrides.csv"
+          test -f "$BASE/b45_evidence.json"
+
+          python - <<'PYVERIFY'
+          import csv, hashlib, json
+          from pathlib import Path
+          base=Path('research/player-role-v2')
+          csvp=base/'b45_identity_overrides.csv'
+          evp=base/'b45_evidence.json'
+          e=json.loads(evp.read_text())
+          rows=list(csv.DictReader(csvp.open(newline='',encoding='utf-8')))
+          sha=hashlib.sha256(csvp.read_bytes()).hexdigest()
+          assert e['override_csv_sha256']==sha
+          assert e['B44W4_residual_count_observed']==3
+          assert e['B44W4_residual_position_multiset_required']==['DL','DL','K']
+          assert e['accepted_override_count']==len(rows)
+          assert e['overrides_targeted_at_B44W4_residual_after_result_known'] is True
+          assert e['no_new_general_identity_rule_created'] is True
+          assert e['production_change_authorized'] is False
+          assert e['production_model_deployed'] is False
+          assert e['decision'] in ('B45_OVERRIDES_FROZEN','B45_NO_VERIFIABLE_OVERRIDES')
+          if e['decision']=='B45_OVERRIDES_FROZEN':
+              assert len(rows)>=1
+              assert e['B46_may_run'] is True
+          else:
+              assert len(rows)==0
+              assert e['B46_may_run'] is False
+          print('PASS: B45 evidence and override table internally consistent.')
+          PYVERIFY
+
+          git add "$BASE/b45_identity_overrides.csv" "$BASE/b45_evidence.json"
+
+          EXPECTED="$(printf '%s\n' "$BASE/b45_evidence.json" "$BASE/b45_identity_overrides.csv" | sort)"
+          ACTUAL="$(git diff --cached --name-only | sort)"
+          test "$ACTUAL" = "$EXPECTED"
+
+          test "$(sha256sum index.html | awk '{print $1}')" = "$INDEX_SHA_BEFORE"
+          test "$(sha256sum free-agent-board.html | awk '{print $1}')" = "$FA_SHA_BEFORE"
+
+          git config user.name 'player-role-v2-b45-bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git commit -m 'Freeze B45 verified identity overrides'
+
+          git fetch origin main
+          git rebase origin/main
+
+          COMMIT_CHANGED="$(git diff-tree --no-commit-id --name-only -r HEAD | sort)"
+          test "$COMMIT_CHANGED" = "$EXPECTED"
+          if git diff-tree --no-commit-id --name-only -r HEAD | grep -Eq '^(index\.html|free-agent-board\.html)$'; then
+            echo 'ERROR: production file changed by B45 commit'
+            exit 1
+          fi
+
+          git push origin HEAD:main
+
+      - name: Verify durable decision
+        if: ${{ inputs.mode == 'commit' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git reset --hard origin/main
+
+          python - <<'PY'
+          import csv, hashlib, json
+          from pathlib import Path
+          base=Path('research/player-role-v2')
+          csvp=base/'b45_identity_overrides.csv'
+          evp=base/'b45_evidence.json'
+          e=json.loads(evp.read_text())
+          rows=list(csv.DictReader(csvp.open(newline='',encoding='utf-8')))
+          assert hashlib.sha256(csvp.read_bytes()).hexdigest()==e['override_csv_sha256']
+          print('B45 decision:',e['decision'])
+          print('Accepted overrides:',e['accepted_override_count'])
+          for x in e['verification_results']:
+              print(
+                  f"{x['roster_name']} | {x['model_position']} | "
+                  f"sleeper={x['sleeper_id']} | gsis={x['gsis_id']} | "
+                  f"accepted={x['accepted']} | method={x['verification_method'] or 'NONE'}"
+              )
+          if e['decision']=='B45_OVERRIDES_FROZEN':
+              assert len(rows)>=1 and e['B46_may_run'] is True
+              raise SystemExit(0)
+          assert e['decision']=='B45_NO_VERIFIABLE_OVERRIDES'
+          assert len(rows)==0 and e['B46_may_run'] is False
+          raise SystemExit('B45_NO_VERIFIABLE_OVERRIDES')
+          PY
