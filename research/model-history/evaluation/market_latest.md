@@ -5,9 +5,9 @@ Protocol SHA256: `fe6ccf0d5b05bf15038e9239f4c7b18c1d8a40ba93f4f9db8cb01fcec6b076
 
 ## Status
 
-- Full snapshots seen: **31**
+- Full snapshots seen: **32**
 - Weekly market states after deduplication: **6**
-- Same-week snapshots deduplicated: **25**
+- Same-week snapshots deduplicated: **26**
 - Evaluated origin/horizon pairs: **11**
 - Pending origin/horizon pairs: **7**
 

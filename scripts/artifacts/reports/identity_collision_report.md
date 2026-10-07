@@ -22,9 +22,9 @@ Production resolver covering QB / RB / WR / TE / DL / LB / DB.
 
 - `name_collision_resolved_by_position_team`: **4**
 - `name_found_position_incompatible`: **1**
-- `name_position_team_confirmed`: **957**
+- `name_position_team_confirmed`: **955**
 - `no_sleeper_name_candidate`: **98**
-- `previous_authoritative_stable_id_preserved`: **20**
+- `previous_authoritative_stable_id_preserved`: **22**
 - `previous_authoritative_stable_id_preserved_position_changed`: **3**
 
 ## Manual-review rows
