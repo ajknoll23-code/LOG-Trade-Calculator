@@ -1,0 +1,1717 @@
+name: B46 Fresh Week 5 Acceptance V1R1
+
+on:
+  workflow_dispatch:
+    inputs:
+      attestation:
+        description: Exact B46 V1 fresh Week-5 acceptance attestation
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  acceptance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      BASE: research/player-role-v2
+      OUT: /tmp/b46-v1
+    steps:
+      - name: Check out durable main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install frozen scientific runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir \
+            'requests==2.34.2' 'numpy==2.5.3' 'pandas==2.3.3' 'scipy==1.18.1'
+          python3 - <<'PYRUNTIME'
+          import importlib.metadata as md
+          expected={'requests':'2.34.2','numpy':'2.5.3','pandas':'2.3.3','scipy':'1.18.1'}
+          for pkg,ver in expected.items():
+              assert md.version(pkg)==ver,(pkg,md.version(pkg),ver)
+          print('PASS: B46 V1 runtime pinned.')
+          PYRUNTIME
+
+      - name: Week 5 source-only readiness preflight and protocol freeze
+        shell: bash
+        env:
+          OWNER_ATTEST: ${{ inputs.attestation }}
+        run: |
+          set -euo pipefail
+          test "$OWNER_ATTEST" = 'I_CONFIRM_B46_V1R1_USES_FIXED_WEEK5_DATA_SLICED_THROUGH_WEEK5_WITH_A_FRESH_MAIN_ROSTER_SNAPSHOT_UNCHANGED_B44_GATES_AND_FROZEN_B45_R6_OVERRIDES_AND_A_PASS_ONLY_MAKES_B47_PRODUCTION_AUTHORIZATION_ELIGIBLE'
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+          if find "$BASE" -maxdepth 1 -type f -name 'player_role_v2_b46_v1_*' -print -quit | grep -q .; then
+            echo 'B46_V1_NAMESPACE_ALREADY_CONSUMED'
+            find "$BASE" -maxdepth 1 -type f -name 'player_role_v2_b46_v1_*' -print
+            exit 1
+          fi
+
+          mkdir -p "$OUT/source_cache"
+          INDEX_SHA_BEFORE="$(sha256sum index.html | awk '{print $1}')"
+          FA_SHA_BEFORE="$(sha256sum free-agent-board.html | awk '{print $1}')"
+          echo "INDEX_SHA_BEFORE=$INDEX_SHA_BEFORE" >> "$GITHUB_ENV"
+          echo "FA_SHA_BEFORE=$FA_SHA_BEFORE" >> "$GITHUB_ENV"
+
+          # Fresh dispatch roster: exact current durable main bytes.
+          # Copy/hash only; do not semantically parse before shadow freeze.
+          cp data/league_rosters.json "$OUT/fresh_roster_snapshot.json"
+          test "$(sha256sum "$OUT/fresh_roster_snapshot.json" | awk '{print $1}')" = "$(sha256sum data/league_rosters.json | awk '{print $1}')"
+          test "$(git hash-object "$OUT/fresh_roster_snapshot.json")" = "$(git hash-object data/league_rosters.json)"
+
+          cat > "$BASE/player_role_v2_b46_v1_evaluator.py" <<'PYB46'
+          #!/usr/bin/env python3
+          from __future__ import annotations
+
+          import argparse
+          import ast
+          import csv
+          import hashlib
+          import importlib.util
+          import io
+          import json
+          import math
+          import secrets
+          import subprocess
+          import time
+          from collections import Counter, defaultdict
+          from pathlib import Path
+
+          import pandas as pd
+          import requests
+
+          STUDY_ID = "player-role-v2"
+          PHASE = "B46-v1-fresh-week-5-acceptance"
+          BASE = Path("research/player-role-v2")
+          TARGET_WEEK = 5
+          PRIOR_WEEK = 4
+          EXPECTED_WEEK5_GAME_COUNT = 15
+
+          REQUIRED_TEAM_COUNT = 12
+          MIN_TEAM_ROLE_COVERAGE = 0.98
+          MAX_TEAM_COVERAGE_RANGE = 0.02
+          ALLOWED_STRUCTURAL_ROLE_CHANGES = 0
+          MIN_ROSTER_NAME_AVAILABILITY = 0.95
+          MIN_PARTICIPANT_CONFIRMATION = 0.95
+
+          PASS_RESULT = "PASS_B46_V1_FRESH_WEEK_ACCEPTANCE"
+          STOP_RESULT = "SCIENTIFIC_STOP_B46_V1_FRESH_WEEK_ACCEPTANCE_FAILED"
+          PRE_ROSTER_STOP_RESULT = "SCIENTIFIC_STOP_B46_V1_PRE_ROSTER_IDENTITY_OR_DATA_INTEGRITY"
+
+          B44_MAIN_AT_START = "373b1f948dbaedd2faadbb05851653a0b4a3913e"
+          B44_ROSTER_SHA256 = "692be469f4c4bd5215ad4f426302bb73a7d48a7840519b4873eac4bc35cebc7d"
+          B44_EXPECTED_STOP = "SCIENTIFIC_STOP_B44W4_V1_OWNER_BLIND_ROLE_PARITY_FAILED"
+          B44_EVALUATOR_SHA256 = "3540959281424e103cf172d66cb63401066187b1dccb86c587a662254cf8be1c"
+          B44_EVALUATOR = BASE / "player_role_v2_b44w4_v1_evaluator.py"
+          B44_DECISION = BASE / "player_role_v2_b44w4_v1_scientific_decision.json"
+          B44_PARITY = BASE / "player_role_v2_b44w4_v1_implementation_parity.json"
+          B44_WITNESS = BASE / "player_role_v2_b44w4_v1_shadow_refresh_witness.json"
+
+          B45_EVIDENCE = BASE / "b45_evidence.json"
+          B45_OVERRIDES = BASE / "b45_identity_overrides.csv"
+          B45_EVIDENCE_BLOB = "5a168821327afc7939ff05f5f50c3f3dff7137d9"
+          B45_OVERRIDES_BLOB = "15d5be73433591860d058e0b0221812f43b7e473"
+          B45_OVERRIDES_SHA256 = "35b207f2e0b0837207774be6a1f9091c33b3c9384befb01666c05faf739bd655"
+          B45_EXPECTED_DECISION = "B45_R6_OVERRIDES_FROZEN"
+
+          B46W4_DECISION = BASE / "player_role_v2_b46w4_v2_scientific_decision.json"
+          B46W4_EVIDENCE = BASE / "player_role_v2_b46w4_v2_owner_blind_evidence.json"
+          B46W4_PROTOCOL = BASE / "player_role_v2_b46w4_v2_protocol.json"
+          B46W4_DECISION_BLOB = "70950d11efa9d749c644807b28ed56f425de1850"
+          B46W4_EVIDENCE_BLOB = "55e10d132b81e84c794b713df309b3543996d3a2"
+          B46W4_PROTOCOL_BLOB = "b873f122f8ef29fcae7b826a2b2ed1f76896e34d"
+          B46W4_EXPECTED_PASS = "PASS_B46W4_V2_REVISED_WEEK4_INTEGRATION_AUDIT"
+
+          EXPECTED_STABLE_CROSSWALK_SHA256 = "de241875e4ae91d43bbc7fbff682521da2abc9535028f952a35cb3305106c0a5"
+
+          OUT_EVALUATOR = BASE / "player_role_v2_b46_v1_evaluator.py"
+          OUT_PREFLIGHT = BASE / "player_role_v2_b46_v1_source_preflight.json"
+          OUT_PROTOCOL = BASE / "player_role_v2_b46_v1_protocol.json"
+          OUT_IDENTITY_VALIDATION = BASE / "player_role_v2_b46_v1_identity_validation.json"
+          OUT_IDENTITY_OVERLAY = BASE / "player_role_v2_b46_v1_identity_overlay.csv"
+          OUT_SLEEPER_SNAPSHOT = BASE / "player_role_v2_b46_v1_sleeper_identity_snapshot.csv"
+          OUT_ELIGIBILITY = BASE / "player_role_v2_b46_v1_role_eligibility.csv"
+          OUT_CONTEXT = BASE / "player_role_v2_b46_v1_eligibility_context.json"
+          OUT_SHADOW = BASE / "player_role_v2_b46_v1_shadow.csv"
+          OUT_WITNESS = BASE / "player_role_v2_b46_v1_shadow_witness.json"
+          OUT_EVIDENCE = BASE / "player_role_v2_b46_v1_owner_blind_evidence.json"
+          OUT_DECISION = BASE / "player_role_v2_b46_v1_scientific_decision.json"
+
+          SLEEPER_STATE_URL = "https://api.sleeper.app/v1/state/nfl"
+          SLEEPER_PLAYERS_URL = "https://api.sleeper.app/v1/players/nfl"
+
+
+          def sha256_bytes(data: bytes) -> str:
+              return hashlib.sha256(data).hexdigest()
+
+
+          def sha256_file(path: Path) -> str:
+              return sha256_bytes(path.read_bytes())
+
+
+          def git_blob(path: Path) -> str:
+              return subprocess.check_output(["git", "hash-object", str(path)], text=True).strip()
+
+
+          def load_json(path: Path):
+              return json.loads(path.read_text(encoding="utf-8"))
+
+
+          def write_json(path: Path, obj) -> None:
+              path.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+          def load_module(path: Path, name: str):
+              spec = importlib.util.spec_from_file_location(name, path)
+              if spec is None or spec.loader is None:
+                  raise RuntimeError(f"B46_MODULE_LOAD_FAILED {path}")
+              mod = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(mod)
+              return mod
+
+
+          def boolish(v) -> bool:
+              return str(v).strip().lower() in {"true", "1", "yes"}
+
+
+          def get_bytes(session: requests.Session, url: str, timeout: int = 180, attempts: int = 5) -> bytes:
+              last = None
+              for attempt in range(attempts):
+                  try:
+                      r = session.get(url, timeout=timeout)
+                      r.raise_for_status()
+                      return r.content
+                  except Exception as exc:
+                      last = exc
+                      if attempt + 1 < attempts:
+                          time.sleep(2 * (attempt + 1))
+              raise RuntimeError(f"B46_SOURCE_FETCH_FAILED url={url} error={last}")
+
+
+          class FrozenResponse:
+              def __init__(self, content: bytes, url: str):
+                  self.content = content
+                  self.url = url
+                  self.status_code = 200
+
+              def raise_for_status(self):
+                  return None
+
+              def json(self):
+                  return json.loads(self.content.decode("utf-8"))
+
+
+          class FrozenSourceSession:
+              def __init__(self, delegate: requests.Session, payloads: dict[str, bytes]):
+                  self.delegate = delegate
+                  self.payloads = dict(payloads)
+                  self.headers = delegate.headers
+
+              def get(self, url, *args, **kwargs):
+                  if url in self.payloads:
+                      return FrozenResponse(self.payloads[url], url)
+                  return self.delegate.get(url, *args, **kwargs)
+
+
+          def verify_closed_parents(repo: Path) -> dict:
+              b44_eval = repo / B44_EVALUATOR
+              if sha256_file(b44_eval) != B44_EVALUATOR_SHA256:
+                  raise RuntimeError("B46_B44_EVALUATOR_SHA_DRIFT")
+              b44d = load_json(repo / B44_DECISION)
+              if b44d.get("result") != B44_EXPECTED_STOP:
+                  raise RuntimeError("B46_B44_STOP_NOT_PRESERVED")
+              if b44d.get("production_change_authorized") is not False:
+                  raise RuntimeError("B46_B44_PRODUCTION_STATE_DRIFT")
+
+              if git_blob(repo / B45_EVIDENCE) != B45_EVIDENCE_BLOB:
+                  raise RuntimeError("B46_B45_EVIDENCE_BLOB_DRIFT")
+              if git_blob(repo / B45_OVERRIDES) != B45_OVERRIDES_BLOB:
+                  raise RuntimeError("B46_B45_OVERRIDE_BLOB_DRIFT")
+              if sha256_file(repo / B45_OVERRIDES) != B45_OVERRIDES_SHA256:
+                  raise RuntimeError("B46_B45_OVERRIDE_SHA_DRIFT")
+              b45e = load_json(repo / B45_EVIDENCE)
+              if b45e.get("decision") != B45_EXPECTED_DECISION:
+                  raise RuntimeError("B46_B45_R6_NOT_FROZEN")
+              if int(b45e.get("accepted_override_count", -1)) != 3:
+                  raise RuntimeError("B46_B45_OVERRIDE_COUNT_DRIFT")
+              if b45e.get("B46_must_be_fresh_week") is not True:
+                  raise RuntimeError("B46_B45_FRESH_WEEK_REQUIREMENT_DRIFT")
+              if b45e.get("production_change_authorized") is not False:
+                  raise RuntimeError("B46_B45_PRODUCTION_STATE_DRIFT")
+
+              for path, expected_blob, label in [
+                  (B46W4_DECISION, B46W4_DECISION_BLOB, "B46W4_DECISION"),
+                  (B46W4_EVIDENCE, B46W4_EVIDENCE_BLOB, "B46W4_EVIDENCE"),
+                  (B46W4_PROTOCOL, B46W4_PROTOCOL_BLOB, "B46W4_PROTOCOL"),
+              ]:
+                  if git_blob(repo / path) != expected_blob:
+                      raise RuntimeError(f"B46_{label}_BLOB_DRIFT")
+              w4d = load_json(repo / B46W4_DECISION)
+              if w4d.get("result") != B46W4_EXPECTED_PASS:
+                  raise RuntimeError("B46_B46W4_GREEN_PARENT_NOT_PRESERVED")
+              if w4d.get("production_change_authorized") is not False:
+                  raise RuntimeError("B46_B46W4_PRODUCTION_STATE_DRIFT")
+              if w4d.get("B46_fresh_week_acceptance_remains_mandatory") is not True:
+                  raise RuntimeError("B46_B46W4_FRESH_WEEK_REQUIREMENT_DRIFT")
+
+              return {"b45_evidence": b45e, "b46w4_decision": w4d}
+
+
+          def load_b45_rows(repo: Path) -> list[dict]:
+              with (repo / B45_OVERRIDES).open(newline="", encoding="utf-8") as f:
+                  rows = list(csv.DictReader(f))
+              if len(rows) != 3:
+                  raise RuntimeError(f"B46_REQUIRES_EXACTLY_3_B45_OVERRIDES got={len(rows)}")
+              gsis = [str(x["gsis_id"]) for x in rows]
+              sid = [str(x["sleeper_id"]) for x in rows]
+              if len(set(gsis)) != 3 or len(set(sid)) != 3:
+                  raise RuntimeError("B46_B45_OVERRIDE_NOT_ONE_TO_ONE")
+              for x in rows:
+                  if str(x.get("model_position") or "") not in {"DL", "K"}:
+                      raise RuntimeError("B46_B45_POSITION_SCOPE_DRIFT")
+                  if str(x.get("adjudicated_dob_matches") or "") not in {"sleeper", "nflverse"}:
+                      raise RuntimeError("B46_B45_DOB_MATCH_FIELD_DRIFT")
+                  if str(x.get("dob_error_source") or "") not in {"sleeper", "nflverse"}:
+                      raise RuntimeError("B46_B45_DOB_ERROR_FIELD_DRIFT")
+              return rows
+
+
+          def csv_max_week(payload: bytes, *, type_col: str, type_value: str) -> tuple[int, pd.DataFrame]:
+              df = pd.read_csv(io.BytesIO(payload), low_memory=False)
+              required = {"season", "week", type_col}
+              if not required.issubset(df.columns):
+                  raise RuntimeError(f"B46_SOURCE_SCHEMA_MISSING required={sorted(required)}")
+              season = pd.to_numeric(df["season"], errors="coerce")
+              typ = df[type_col].astype(str)
+              sub = df[(season == 2026) & (typ == type_value)].copy()
+              sub["week"] = pd.to_numeric(sub["week"], errors="coerce")
+              if sub.empty or sub["week"].dropna().empty:
+                  raise RuntimeError("B46_SOURCE_2026_REG_EMPTY")
+              return int(sub["week"].max()), sub
+
+
+          def preflight(repo: Path, cache: Path, roster_snapshot: Path, evaluator_sha: str) -> None:
+              verify_closed_parents(repo)
+              cache.mkdir(parents=True, exist_ok=True)
+
+              roster_sha = sha256_file(roster_snapshot)
+              roster_blob = subprocess.check_output(
+                  ["git", "hash-object", str(roster_snapshot)], text=True
+              ).strip()
+              current_repo_roster = repo / "data/league_rosters.json"
+              if not current_repo_roster.exists():
+                  raise RuntimeError("B46_CURRENT_ROSTER_FILE_MISSING")
+              current_sha = sha256_file(current_repo_roster)
+              current_blob = git_blob(current_repo_roster)
+              if roster_sha != current_sha or roster_blob != current_blob:
+                  raise RuntimeError(
+                      "B46_DISPATCH_ROSTER_SNAPSHOT_NOT_CURRENT_MAIN "
+                      f"snapshot_sha={roster_sha} current_sha={current_sha} "
+                      f"snapshot_blob={roster_blob} current_blob={current_blob}"
+                  )
+
+              raw_log = subprocess.check_output(
+                  ["git", "log", "-1", "--format=%H%x00%cI", "--", "data/league_rosters.json"],
+                  text=True,
+              ).rstrip("\n")
+              if "\x00" not in raw_log:
+                  raise RuntimeError("B46_CURRENT_ROSTER_LAST_COMMIT_METADATA_MISSING")
+              roster_last_commit, roster_last_commit_time = raw_log.split("\x00", 1)
+
+              session = requests.Session()
+              session.headers.update({"User-Agent": "LOG-Trade-Calculator-player-role-v2-b46-v1-preflight"})
+
+              state_bytes = get_bytes(session, SLEEPER_STATE_URL, timeout=90)
+              players_bytes = get_bytes(session, SLEEPER_PLAYERS_URL, timeout=180)
+              stats_bytes = get_bytes(
+                  session,
+                  "https://github.com/nflverse/nflverse-data/releases/download/stats_player/stats_player_week_2026.csv",
+                  timeout=240,
+              )
+              snaps_bytes = get_bytes(
+                  session,
+                  "https://github.com/nflverse/nflverse-data/releases/download/snap_counts/snap_counts_2026.csv",
+                  timeout=240,
+              )
+
+              state = json.loads(state_bytes.decode("utf-8"))
+              if str(state.get("season")) != "2026" or str(state.get("season_type")) != "regular":
+                  raise RuntimeError(f"B46_SLEEPER_STATE_SEASON_DRIFT {state}")
+              state_week = int(state.get("week") or 0)
+              state_leg = int(state.get("leg") or state_week or 0)
+              sleeper_latest_completed = min(state_week, state_leg) - 1
+
+              stats_max, stats_df = csv_max_week(stats_bytes, type_col="season_type", type_value="REG")
+              snaps_max, snaps_df = csv_max_week(snaps_bytes, type_col="game_type", type_value="REG")
+
+              target_snaps = snaps_df[pd.to_numeric(snaps_df["week"], errors="coerce") == TARGET_WEEK]
+              if "game_id" in target_snaps.columns:
+                  week5_game_count = int(target_snaps["game_id"].astype(str).nunique())
+                  game_count_method = "snap_counts_unique_game_id"
+              elif "team" in target_snaps.columns:
+                  team_count = int(target_snaps["team"].astype(str).nunique())
+                  week5_game_count = team_count // 2
+                  game_count_method = "snap_counts_unique_team_count_div_2"
+              else:
+                  raise RuntimeError("B46_SNAP_COUNTS_CANNOT_PROVE_WEEK5_GAME_COMPLETENESS")
+
+              readiness = {
+                  "sleeper_contains_completed_week5": sleeper_latest_completed >= TARGET_WEEK,
+                  "stats_contain_week5_or_later": stats_max >= TARGET_WEEK,
+                  "snaps_contain_week5_or_later": snaps_max >= TARGET_WEEK,
+                  "week5_snap_game_count_exactly_15": week5_game_count == EXPECTED_WEEK5_GAME_COUNT,
+              }
+              if not all(readiness.values()):
+                  raise RuntimeError(
+                      "B46_V1_NOT_READY_FOR_FRESH_WEEK_5 "
+                      f"state_week={state_week} state_leg={state_leg} "
+                      f"sleeper_completed={sleeper_latest_completed} "
+                      f"stats_max={stats_max} snaps_max={snaps_max} "
+                      f"week5_snap_games={week5_game_count} readiness={readiness}"
+                  )
+
+              sleeper_week_hashes = {}
+              sleeper_week_counts = {}
+              for week in range(1, TARGET_WEEK + 1):
+                  url = f"https://api.sleeper.app/v1/stats/nfl/regular/2026/{week}"
+                  payload = get_bytes(session, url, timeout=120)
+                  parsed = json.loads(payload.decode("utf-8"))
+                  if not isinstance(parsed, dict):
+                      raise RuntimeError(f"B46_SLEEPER_WEEK_NOT_DICT week={week}")
+                  if week == TARGET_WEEK and not parsed:
+                      raise RuntimeError("B46_SLEEPER_WEEK5_STATS_EMPTY")
+                  (cache / f"sleeper_stats_week_{week}.json").write_bytes(payload)
+                  sleeper_week_hashes[str(week)] = sha256_bytes(payload)
+                  sleeper_week_counts[str(week)] = len(parsed)
+
+              (cache / "sleeper_state.json").write_bytes(state_bytes)
+              (cache / "sleeper_players.json").write_bytes(players_bytes)
+              (cache / "stats_player_week_2026.csv").write_bytes(stats_bytes)
+              (cache / "snap_counts_2026.csv").write_bytes(snaps_bytes)
+
+              player_obj = json.loads(players_bytes.decode("utf-8"))
+              if not isinstance(player_obj, dict) or len(player_obj) < 1000:
+                  raise RuntimeError("B46_SLEEPER_PLAYER_MAP_SCHEMA_OR_SIZE_FAILED")
+
+              pre = {
+                  "schema_version": 1,
+                  "study_id": STUDY_ID,
+                  "phase": "B46-v1-source-only-readiness-preflight",
+                  "target_week": TARGET_WEEK,
+                  "prior_validation_week": PRIOR_WEEK,
+                  "target_week_strictly_later_than_prior": TARGET_WEEK > PRIOR_WEEK,
+                  "week_selection_policy": "FIXED_TARGET_WEEK5_SOURCES_MAY_EXTEND_LATER_BUT_ANALYSIS_SLICE_IS_WEEK_LE_5",
+                  "source_may_contain_later_weeks": True,
+                  "analysis_target_week_fixed": TARGET_WEEK,
+                  "analysis_never_uses_week_after_target": True,
+                  "source_readiness_all_pass": all(readiness.values()),
+                  "source_readiness": readiness,
+                  "sleeper_state": state,
+                  "sleeper_latest_completed_week_observed": sleeper_latest_completed,
+                  "nflverse_weekly_stats_max_available_week": stats_max,
+                  "nflverse_snap_counts_max_available_week": snaps_max,
+                  "week5_snap_game_count": week5_game_count,
+                  "week5_game_count_method": game_count_method,
+                  "expected_week5_game_count": EXPECTED_WEEK5_GAME_COUNT,
+                  "nflverse_weekly_stats_raw_sha256": sha256_bytes(stats_bytes),
+                  "nflverse_snap_counts_raw_sha256": sha256_bytes(snaps_bytes),
+                  "sleeper_state_sha256": sha256_bytes(state_bytes),
+                  "sleeper_player_map_sha256": sha256_bytes(players_bytes),
+                  "sleeper_player_map_raw_object_count": len(player_obj),
+                  "sleeper_weekly_stats_sha256": sleeper_week_hashes,
+                  "sleeper_weekly_stats_object_count": sleeper_week_counts,
+                  "roster_snapshot_sha256": roster_sha,
+                  "roster_snapshot_git_blob": roster_blob,
+                  "roster_source": "CURRENT_DATA_LEAGUE_ROSTERS_JSON_FROM_MAIN_AT_DISPATCH",
+                  "roster_last_commit": roster_last_commit,
+                  "roster_last_commit_time": roster_last_commit_time,
+                  "roster_identical_to_B44W4_snapshot": roster_sha == B44_ROSTER_SHA256,
+                  "roster_freshness_disclosed_not_time_gated": True,
+                  "roster_snapshot_semantically_parsed": False,
+                  "rostered_coverage_tally_computed": False,
+                  "team_partition_metric_computed": False,
+                  "evaluator_sha256": evaluator_sha,
+                  "production_change_authorized": False,
+              }
+              write_json(repo / OUT_PREFLIGHT, pre)
+
+              protocol = {
+                  "schema_version": 1,
+                  "study_id": STUDY_ID,
+                  "phase": PHASE,
+                  "status": "FROZEN_BEFORE_FRESH_WEEK_ROLE_COVERAGE_OR_TEAM_METRIC",
+                  "classification": "PROSPECTIVE_FRESH_WEEK_ACCEPTANCE_AFTER_WEEK4_REMEDIATION",
+                  "target_week": TARGET_WEEK,
+                  "prior_validation_week": PRIOR_WEEK,
+                  "target_week_strictly_later_than_prior": True,
+                  "week_selection_policy": "FIXED_TARGET_WEEK5_SOURCES_MAY_ADVANCE_BUT_ALL_MODEL_INPUTS_SLICE_TO_WEEK5",
+                  "source_slice_contract": {
+                      "nflverse_rows_used": "season_2026_REG_and_week_le_5_only",
+                      "sleeper_weeks_used": [1, 2, 3, 4, 5],
+                      "origin_week": 5,
+                      "future_week_data_allowed_in_raw_source_but_forbidden_from_analysis": True,
+                  },
+                  "fresh_week_result_not_opened_before_protocol_freeze": True,
+                  "B44W4_stop_preserved": True,
+                  "B45_R6_overrides_fixed_before_week5_result": True,
+                  "B46W4_revised_week4_pass_preserved_as_same_week_evidence_only": True,
+                  "evaluator_sha256": evaluator_sha,
+                  "source_preflight_sha256": sha256_file(repo / OUT_PREFLIGHT),
+                  "source_hashes": {
+                      "nflverse_weekly_stats_raw_sha256": pre["nflverse_weekly_stats_raw_sha256"],
+                      "nflverse_snap_counts_raw_sha256": pre["nflverse_snap_counts_raw_sha256"],
+                      "sleeper_state_sha256": pre["sleeper_state_sha256"],
+                      "sleeper_player_map_sha256": pre["sleeper_player_map_sha256"],
+                      "sleeper_weekly_stats_sha256": pre["sleeper_weekly_stats_sha256"],
+                      "roster_snapshot_sha256": pre["roster_snapshot_sha256"],
+                      "roster_snapshot_git_blob": pre["roster_snapshot_git_blob"],
+                  },
+                  "roster_policy": {
+                      "source": "CURRENT_DATA_LEAGUE_ROSTERS_JSON_FROM_MAIN_AT_DISPATCH",
+                      "fresh_snapshot_hash_frozen_before_semantic_parse": True,
+                      "historical_B44_roster_not_required": True,
+                      "roster_identical_to_B44W4_snapshot_is_descriptive_only": True,
+                      "roster_last_commit_and_time_recorded": True,
+                  },
+                  "identity_precedence": [
+                      "B41G_PINNED_STABLE_CROSSWALK",
+                      "B45_R6_VERIFIED_OVERRIDE",
+                      "B43_V1R1_DOB_POSITION_RULE_FRESH_APPLICATION",
+                  ],
+                  "DOB_POSITION_policy": {
+                      "fresh_rule_application_not_frozen_pair_reuse": True,
+                      "same_frozen_B43_candidate_function": True,
+                      "known_pair_reference_precision_revalidation_required": True,
+                      "historical_supersession_allowed": False,
+                      "B45_collision_or_contradiction": "FAIL_CLOSED",
+                  },
+                  "B45_policy": {
+                      "exact_override_count": 3,
+                      "pairs_fixed_not_tunable": True,
+                      "stable_crosswalk_same_pair_allowed_as_higher_precedence": True,
+                      "stable_crosswalk_conflicting_pair": "FAIL_CLOSED",
+                      "all_three_must_resolve_without_contradiction": True,
+                  },
+                  "acceptance_gates": {
+                      "required_team_count": REQUIRED_TEAM_COUNT,
+                      "minimum_role_coverage_each_team": MIN_TEAM_ROLE_COVERAGE,
+                      "maximum_coverage_range": MAX_TEAM_COVERAGE_RANGE,
+                      "structural_owner_slot_role_changes_allowed": ALLOWED_STRUCTURAL_ROLE_CHANGES,
+                      "fallback_roles_allowed": 0,
+                      "model_or_tier_retuning_allowed": False,
+                      "participant_confirmation_minimum": MIN_PARTICIPANT_CONFIRMATION,
+                      "roster_name_availability_minimum": MIN_ROSTER_NAME_AVAILABILITY,
+                      "B41J_implementation_parity_required": True,
+                      "owner_blind_source_firewall_required": True,
+                  },
+                  "no_peek_ordering": [
+                      "SOURCE_ONLY_WEEK5_READINESS_AND_RAW_HASH_FREEZE",
+                      "PROTOCOL_AND_EVALUATOR_DURABLE_COMMIT",
+                      "OWNER_BLIND_FRESH_IDENTITY_OVERLAY_AND_SHADOW",
+                      "SHADOW_DURABLE_COMMIT",
+                      "FIRST_ROSTER_SEMANTIC_PARSE",
+                      "ROSTERED_IDENTITY_PRECISION_CHECKS",
+                      "FRESH_WEEK_TEAM_ACCEPTANCE_METRICS",
+                  ],
+                  "pass_semantics": {
+                      "eligible_for_separate_production_authorization": True,
+                      "production_change_authorized_by_B46": False,
+                      "production_model_deployed_by_B46": False,
+                  },
+                  "stop_semantics": {
+                      "do_not_retune_gates_after_result": True,
+                      "eligible_for_separate_production_authorization": False,
+                  },
+                  "production_change_authorized": False,
+                  "production_model_deployed": False,
+              }
+              write_json(repo / OUT_PROTOCOL, protocol)
+              print("PASS: B46 V1 Week-5 source-only preflight ready; protocol materialized without roster semantic parse.")
+
+
+          def verify_protocol_freeze(repo: Path, protocol_commit: str) -> dict:
+              protocol = load_json(repo / OUT_PROTOCOL)
+              if protocol.get("status") != "FROZEN_BEFORE_FRESH_WEEK_ROLE_COVERAGE_OR_TEAM_METRIC":
+                  raise RuntimeError("B46_PROTOCOL_STATUS_DRIFT")
+              if protocol.get("target_week") != TARGET_WEEK:
+                  raise RuntimeError("B46_PROTOCOL_TARGET_WEEK_DRIFT")
+              if protocol.get("source_preflight_sha256") != sha256_file(repo / OUT_PREFLIGHT):
+                  raise RuntimeError("B46_PROTOCOL_PREFLIGHT_SHA_DRIFT")
+              if protocol.get("evaluator_sha256") != sha256_file(repo / OUT_EVALUATOR):
+                  raise RuntimeError("B46_PROTOCOL_EVALUATOR_SHA_DRIFT")
+              if protocol.get("production_change_authorized") is not False:
+                  raise RuntimeError("B46_PROTOCOL_PRODUCTION_DRIFT")
+
+              head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+              if head != protocol_commit:
+                  raise RuntimeError(f"B46_NOT_AT_PROTOCOL_FREEZE_COMMIT expected={protocol_commit} actual={head}")
+              changed = sorted(subprocess.check_output(
+                  ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", protocol_commit],
+                  text=True,
+              ).splitlines())
+              expected = sorted([str(OUT_EVALUATOR), str(OUT_PREFLIGHT), str(OUT_PROTOCOL)])
+              if changed != expected:
+                  raise RuntimeError(f"B46_PROTOCOL_FREEZE_SCOPE_DRIFT expected={expected} actual={changed}")
+              return protocol
+
+
+          def verify_cache(repo: Path, cache: Path) -> dict[str, bytes]:
+              pre = load_json(repo / OUT_PREFLIGHT)
+              payloads = {
+                  "state": (cache / "sleeper_state.json").read_bytes(),
+                  "players": (cache / "sleeper_players.json").read_bytes(),
+                  "stats": (cache / "stats_player_week_2026.csv").read_bytes(),
+                  "snaps": (cache / "snap_counts_2026.csv").read_bytes(),
+              }
+              if sha256_bytes(payloads["state"]) != pre["sleeper_state_sha256"]:
+                  raise RuntimeError("B46_CACHE_SLEEPER_STATE_SHA_DRIFT")
+              if sha256_bytes(payloads["players"]) != pre["sleeper_player_map_sha256"]:
+                  raise RuntimeError("B46_CACHE_SLEEPER_PLAYERS_SHA_DRIFT")
+              if sha256_bytes(payloads["stats"]) != pre["nflverse_weekly_stats_raw_sha256"]:
+                  raise RuntimeError("B46_CACHE_STATS_SHA_DRIFT")
+              if sha256_bytes(payloads["snaps"]) != pre["nflverse_snap_counts_raw_sha256"]:
+                  raise RuntimeError("B46_CACHE_SNAPS_SHA_DRIFT")
+
+              frozen_urls = {SLEEPER_PLAYERS_URL: payloads["players"]}
+              for week in range(1, TARGET_WEEK + 1):
+                  p = (cache / f"sleeper_stats_week_{week}.json").read_bytes()
+                  if sha256_bytes(p) != pre["sleeper_weekly_stats_sha256"][str(week)]:
+                      raise RuntimeError(f"B46_CACHE_SLEEPER_WEEK_SHA_DRIFT week={week}")
+                  frozen_urls[f"https://api.sleeper.app/v1/stats/nfl/regular/2026/{week}"] = p
+              return frozen_urls
+
+
+          def load_fresh_identity_inputs(repo: Path, cache: Path, b44, b42, v1, lineage, session):
+              stats_path = cache / "stats_player_week_2026.csv"
+              snaps_path = cache / "snap_counts_2026.csv"
+              stats_filtered = cache / "stats_player_week_2026_through_week5.csv"
+              snaps_filtered = cache / "snap_counts_2026_through_week5.csv"
+
+              stats_meta = b42.filter_csv_to_completed_weeks(
+                  stats_path.read_bytes(), season_col="season", week_col="week",
+                  type_col="season_type", type_value="REG",
+                  latest_completed_week=TARGET_WEEK, out_path=stats_filtered,
+              )
+              snaps_meta = b42.filter_csv_to_completed_weeks(
+                  snaps_path.read_bytes(), season_col="season", week_col="week",
+                  type_col="game_type", type_value="REG",
+                  latest_completed_week=TARGET_WEEK, out_path=snaps_filtered,
+              )
+              if int(stats_meta["latest_completed_week_included"]) != TARGET_WEEK:
+                  raise RuntimeError("B46_FILTERED_STATS_TARGET_WEEK_MISSING")
+              if int(snaps_meta["latest_completed_week_included"]) != TARGET_WEEK:
+                  raise RuntimeError("B46_FILTERED_SNAPS_TARGET_WEEK_MISSING")
+
+              features, feature_audit, all_current_rows = b42.build_feature_rows_for_origins(
+                  lineage["builder"], stats_filtered, snaps_filtered,
+                  repo / b44.B41I_PLAYERS_REL, 2026, [TARGET_WEEK],
+              )
+              eligible_base = b44.eligible_base_from_rows(all_current_rows, TARGET_WEEK, b42)
+              current = b44.make_current_identity_rows(eligible_base, all_current_rows, repo, v1)
+
+              stable, stable_inverse, stable_sids, cross_sha, cross_audit = b42.load_stable_id_crosswalk(
+                  lineage, session
+              )
+              if cross_sha != EXPECTED_STABLE_CROSSWALK_SHA256:
+                  raise RuntimeError(
+                      f"B46_STABLE_CROSSWALK_SHA_DRIFT expected={EXPECTED_STABLE_CROSSWALK_SHA256} actual={cross_sha}"
+                  )
+
+              sleeper_bytes = (cache / "sleeper_players.json").read_bytes()
+              _, sleeper_records = v1.sleeper_records_from_payload(sleeper_bytes)
+              sleeper_by_id = {x["sleeper_id"]: x for x in sleeper_records}
+              sleeper_by_name = defaultdict(list)
+              for x in sleeper_records:
+                  sleeper_by_name[x["name_key"]].append(x)
+
+              with (repo / b44.V1_BRIDGE_REL).open(newline="", encoding="utf-8") as f:
+                  v1_bridge = {str(r["gsis_id"]): str(r["sleeper_id"]) for r in csv.DictReader(f)}
+              prior_collision_ids = {
+                  str(x["gsis_id"])
+                  for x in lineage["v1_evidence"].get("supplemental_collision_details", [])
+              }
+              if len(prior_collision_ids) != 2:
+                  raise RuntimeError("B46_V1R1_COLLISION_ID_SET_DRIFT")
+
+              b41j_ref = pd.read_csv(
+                  BASE / "player_role_v2_b41j_scored_holdout_rows.csv",
+                  usecols=["gsis_id", "sleeper_id"],
+                  dtype={"gsis_id": str, "sleeper_id": str},
+                  keep_default_na=False,
+              )
+              b41j_gsis = set(str(x) for x in b41j_ref["gsis_id"] if str(x))
+              b41j_sid = set(str(x) for x in b41j_ref["sleeper_id"] if str(x))
+
+              overlay_eval = b44.compute_overlay(
+                  current, stable, stable_inverse, sleeper_by_id, sleeper_by_name,
+                  v1.candidate_for, v1_bridge, prior_collision_ids, b41j_gsis, b41j_sid,
+              )
+              return {
+                  "features": features,
+                  "feature_audit": feature_audit,
+                  "all_current_rows": all_current_rows,
+                  "current": current,
+                  "stable": stable,
+                  "stable_inverse": stable_inverse,
+                  "cross_sha": cross_sha,
+                  "sleeper_records": sleeper_records,
+                  "overlay_eval": overlay_eval,
+                  "stats_meta": stats_meta,
+                  "snaps_meta": snaps_meta,
+              }
+
+
+          def resolve_identity_layers(inputs: dict, b45_rows: list[dict]) -> dict:
+              stable = inputs["stable"]
+              stable_inverse = inputs["stable_inverse"]
+              accepted = list(inputs["overlay_eval"]["accepted"])
+              b45_by_g = {str(x["gsis_id"]): str(x["sleeper_id"]) for x in b45_rows}
+              b45_by_sid = {str(x["sleeper_id"]): str(x["gsis_id"]) for x in b45_rows}
+
+              b45_status = []
+              b45_effective = {}
+              for x in b45_rows:
+                  g, sid = str(x["gsis_id"]), str(x["sleeper_id"])
+                  stable_sid = stable.get(g)
+                  stable_g = stable_inverse.get(sid)
+                  if stable_sid and stable_sid != sid:
+                      raise RuntimeError(f"B46_B45_GSIS_CONTRADICTED_BY_STABLE_CROSSWALK gsis={g}")
+                  if stable_g and stable_g != g:
+                      raise RuntimeError(f"B46_B45_SLEEPER_CONTRADICTED_BY_STABLE_CROSSWALK sleeper={sid}")
+                  if stable_sid == sid and stable_g == g:
+                      source = "STABLE_CROSSWALK_SAME_PAIR"
+                  else:
+                      source = "B45_VERIFIED_OVERRIDE"
+                      b45_effective[g] = sid
+                  b45_status.append({"gsis_id": g, "sleeper_id": sid, "resolution_source": source, "pass": True})
+
+              dob_overlay = {}
+              filtered_accepted = []
+              collisions = []
+              for x in accepted:
+                  g, sid = str(x["gsis_id"]), str(x["sleeper_id"])
+                  if g in b45_by_g or sid in b45_by_sid:
+                      if b45_by_g.get(g) == sid and b45_by_sid.get(sid) == g:
+                          continue
+                      collisions.append({"gsis_id": g, "sleeper_id": sid})
+                      continue
+                  dob_overlay[g] = sid
+                  filtered_accepted.append(x)
+              if collisions:
+                  raise RuntimeError(f"B46_DOB_POSITION_COLLIDES_WITH_B45 {collisions}")
+
+              combined = dict(b45_effective)
+              for g, sid in dob_overlay.items():
+                  if g in combined and combined[g] != sid:
+                      raise RuntimeError("B46_COMBINED_OVERLAY_GSIS_COLLISION")
+                  if sid in combined.values() and combined.get(g) != sid:
+                      raise RuntimeError("B46_COMBINED_OVERLAY_SLEEPER_COLLISION")
+                  combined[g] = sid
+              if len(set(combined.values())) != len(combined):
+                  raise RuntimeError("B46_COMBINED_OVERLAY_NOT_ONE_TO_ONE")
+
+              return {
+                  "b45_status": b45_status,
+                  "b45_effective": b45_effective,
+                  "dob_overlay": dob_overlay,
+                  "dob_accepted_rows": filtered_accepted,
+              }
+
+
+          def augmented_attach_fresh_factory(b42, identity_layers: dict):
+              b45_effective = identity_layers["b45_effective"]
+              dob_overlay = identity_layers["dob_overlay"]
+
+              def attach(df: pd.DataFrame, lineage: dict, session: requests.Session):
+                  exact, sid_to_gsis, mapped_sids, cross_sha, audit = b42.load_stable_id_crosswalk(
+                      lineage, session
+                  )
+                  if cross_sha != EXPECTED_STABLE_CROSSWALK_SHA256:
+                      raise RuntimeError("B46_ATTACH_STABLE_CROSSWALK_SHA_DRIFT")
+
+                  augmented = dict(exact)
+                  inverse = dict(sid_to_gsis)
+                  for g, sid in b45_effective.items():
+                      if g in augmented and augmented[g] != sid:
+                          raise RuntimeError("B46_ATTACH_B45_GSIS_COLLISION")
+                      if sid in inverse and inverse[sid] != g:
+                          raise RuntimeError("B46_ATTACH_B45_SLEEPER_COLLISION")
+                      augmented[g] = sid
+                      inverse[sid] = g
+                  for g, sid in dob_overlay.items():
+                      if g in augmented:
+                          raise RuntimeError("B46_ATTACH_DOB_GSIS_ALREADY_MAPPED")
+                      if sid in inverse:
+                          raise RuntimeError("B46_ATTACH_DOB_SLEEPER_ALREADY_MAPPED")
+                      augmented[g] = sid
+                      inverse[sid] = g
+
+                  out = df.copy()
+                  out["sleeper_id"] = out["gsis_id"].map(augmented)
+                  out["identity_mapped"] = out["sleeper_id"].notna()
+                  out["identity_source"] = [
+                      "STABLE_CROSSWALK" if str(g) in exact
+                      else "B45_VERIFIED_OVERRIDE" if str(g) in b45_effective
+                      else "DOB_POSITION_OVERLAY" if str(g) in dob_overlay
+                      else "UNMAPPED"
+                      for g in out["gsis_id"].astype(str)
+                  ]
+                  overall = float(out["identity_mapped"].mean()) if len(out) else 0.0
+                  pos_cov = (
+                      out.groupby("position", observed=True)["identity_mapped"].mean().to_dict()
+                      if len(out) else {}
+                  )
+                  audit2 = dict(audit)
+                  audit2["B45_effective_override_count"] = len(b45_effective)
+                  audit2["fresh_DOB_POSITION_overlay_count"] = len(dob_overlay)
+                  audit2["combined_mapped_sleeper_id_count"] = len(inverse)
+                  return out, cross_sha, overall, {k: float(v) for k, v in pos_cov.items()}, inverse, set(inverse), audit2
+              return attach
+
+
+          def write_identity_overlay_csv(path: Path, identity_layers: dict, b45_rows: list[dict]) -> None:
+              b45_meta = {str(x["gsis_id"]): x for x in b45_rows}
+              fields = [
+                  "gsis_id","sleeper_id","identity_source","rule","name_key","model_position",
+                  "position_family","birth_date","nfl_team","sleeper_position",
+                  "sleeper_position_family","sleeper_birth_date","sleeper_nfl_team",
+              ]
+              rows = []
+              for x in identity_layers["dob_accepted_rows"]:
+                  row = dict(x)
+                  row["identity_source"] = "DOB_POSITION_OVERLAY"
+                  rows.append(row)
+              for s in identity_layers["b45_status"]:
+                  if s["resolution_source"] != "B45_VERIFIED_OVERRIDE":
+                      continue
+                  x = b45_meta[s["gsis_id"]]
+                  rows.append({
+                      "gsis_id": s["gsis_id"], "sleeper_id": s["sleeper_id"],
+                      "identity_source": "B45_VERIFIED_OVERRIDE",
+                      "rule": "B45_R6_AUTHORITATIVE_SOURCE_ADJUDICATION",
+                      "name_key": "", "model_position": x["model_position"],
+                      "position_family": x["model_position"],
+                      "birth_date": x["adjudicated_birth_date"],
+                      "nfl_team": x["nflverse_team"],
+                      "sleeper_position": x["model_position"],
+                      "sleeper_position_family": x["model_position"],
+                      "sleeper_birth_date": x["sleeper_birth_date"],
+                      "sleeper_nfl_team": x["sleeper_team"],
+                  })
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=fields)
+                  w.writeheader()
+                  for row in sorted(rows, key=lambda z: (z["identity_source"], z["gsis_id"])):
+                      w.writerow({k: row.get(k, "") for k in fields})
+
+
+          def write_sleeper_snapshot(path: Path, records: list[dict]) -> None:
+              fields = ["sleeper_id","full_name","name_key","birth_date","position","position_family","nfl_team","status"]
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=fields)
+                  w.writeheader()
+                  for x in sorted(records, key=lambda z: (str(z["sleeper_id"]), z["name_key"])):
+                      w.writerow({k: x.get(k, "") for k in fields})
+
+
+          def pre_roster_source_firewall(evaluator_path: Path) -> dict:
+              tree = ast.parse(evaluator_path.read_text(encoding="utf-8"))
+              protected = {"load_fresh_identity_inputs", "resolve_identity_layers", "augmented_attach_fresh_factory", "build_fresh_shadow"}
+              forbidden = {"owner_id","owner_username","roster_id","dynasty_team","fantasy_roster_slot","team_name","starters","bench","taxi","reserve_ir","league_rosters"}
+              found = {}
+              class Visitor(ast.NodeVisitor):
+                  def __init__(self):
+                      self.hits = set()
+                  def hit(self, value):
+                      low = str(value or "").lower()
+                      for tok in forbidden:
+                          if tok in low:
+                              self.hits.add(tok)
+                  def visit_Name(self, node):
+                      self.hit(node.id); self.generic_visit(node)
+                  def visit_Attribute(self, node):
+                      self.hit(node.attr); self.generic_visit(node)
+                  def visit_arg(self, node):
+                      self.hit(node.arg); self.generic_visit(node)
+                  def visit_keyword(self, node):
+                      if node.arg: self.hit(node.arg)
+                      self.generic_visit(node)
+                  def visit_Constant(self, node):
+                      if isinstance(node.value, str): self.hit(node.value)
+                      self.generic_visit(node)
+              for node in tree.body:
+                  if isinstance(node, ast.FunctionDef) and node.name in protected:
+                      v = Visitor(); v.visit(node); found[node.name] = sorted(v.hits)
+              missing = sorted(protected - set(found))
+              bad = {k: v for k, v in found.items() if v}
+              return {"protected_functions": sorted(protected), "forbidden_tokens": sorted(forbidden), "hits": found, "missing_functions": missing, "pass": not bad and not missing}
+
+
+          def write_pre_roster_stop(repo: Path, stage: str, reason: str, extra: dict | None = None) -> None:
+              payload = {
+                  "schema_version": 1, "study_id": STUDY_ID, "phase": PHASE,
+                  "result": PRE_ROSTER_STOP_RESULT, "stop_stage": stage, "reason": reason,
+                  "target_week": TARGET_WEEK, "team_partition_metric_computed": False,
+                  "roster_semantic_parse_performed": False, "all_primary_gates_pass": False,
+                  "eligible_for_separate_production_authorization": False,
+                  "production_change_authorized": False, "production_model_deployed": False,
+              }
+              if extra: payload.update(extra)
+              write_json(repo / OUT_DECISION, payload)
+
+
+          def build_fresh_shadow(repo: Path, cache: Path, protocol_commit: str) -> None:
+              parents = verify_closed_parents(repo)
+              verify_protocol_freeze(repo, protocol_commit)
+              frozen_urls = verify_cache(repo, cache)
+
+              b44 = load_module(repo / B44_EVALUATOR, "b46_parent_b44")
+              b42, v1, lineage, adoption, v1_evidence = b44.load_verified_parents(repo)
+
+              delegate = requests.Session()
+              delegate.headers.update({"User-Agent": "LOG-Trade-Calculator-player-role-v2-b46-v1"})
+              session = FrozenSourceSession(delegate, frozen_urls)
+
+              firewall = pre_roster_source_firewall(repo / OUT_EVALUATOR)
+              if firewall["pass"] is not True:
+                  raise RuntimeError(f"B46_PRE_ROSTER_SOURCE_FIREWALL_FAILED {firewall}")
+
+              cbs_check = verify_b45_cbs_evidence(parents["b45_evidence"])
+              if cbs_check["pass"] is not True:
+                  raise RuntimeError("B46_B45_DURABLE_EVIDENCE_RECHECK_FAILED")
+              b45_rows = load_b45_rows(repo)
+
+              inputs = load_fresh_identity_inputs(repo, cache, b44, b42, v1, lineage, session)
+              overlay_eval = inputs["overlay_eval"]
+              identity_validation = {
+                  "schema_version": 1, "study_id": STUDY_ID,
+                  "phase": "B46-v1-fresh-week-pre-roster-identity-validation",
+                  "target_week": TARGET_WEEK,
+                  "DOB_POSITION_reference_validation": overlay_eval["reference_validation"],
+                  "DOB_POSITION_proposal_count": len(overlay_eval["proposals"]),
+                  "DOB_POSITION_accepted_before_B45_precedence": len(overlay_eval["accepted"]),
+                  "DOB_POSITION_quarantined_count": len(overlay_eval["quarantined"]),
+                  "DOB_POSITION_quarantined": overlay_eval["quarantined"],
+                  "DOB_POSITION_hard_precision_gates": overlay_eval["hard_precision_gates"],
+                  "DOB_POSITION_all_hard_precision_gates_pass": overlay_eval["all_hard_precision_gates_pass"],
+                  "B45_durable_evidence_recheck": cbs_check,
+                  "B45_exact_override_count": len(b45_rows),
+                  "owner_or_roster_context_used": False,
+                  "pre_roster_source_firewall": firewall,
+                  "production_change_authorized": False,
+              }
+              write_json(repo / OUT_IDENTITY_VALIDATION, identity_validation)
+              if overlay_eval["all_hard_precision_gates_pass"] is not True:
+                  write_pre_roster_stop(repo, "fresh_DOB_POSITION_reference_precision", "fresh Week-5 DOB_POSITION precision/consistency/protection gate failed", {"identity_validation_sha256": sha256_file(repo / OUT_IDENTITY_VALIDATION)})
+                  return
+
+              identity_layers = resolve_identity_layers(inputs, b45_rows)
+              identity_validation["B45_resolution_status"] = identity_layers["b45_status"]
+              identity_validation["B45_all_three_resolve_without_contradiction"] = bool(len(identity_layers["b45_status"]) == 3 and all(x["pass"] for x in identity_layers["b45_status"]))
+              identity_validation["B45_effective_override_count"] = len(identity_layers["b45_effective"])
+              identity_validation["DOB_POSITION_effective_overlay_count"] = len(identity_layers["dob_overlay"])
+              write_json(repo / OUT_IDENTITY_VALIDATION, identity_validation)
+
+              write_identity_overlay_csv(repo / OUT_IDENTITY_OVERLAY, identity_layers, b45_rows)
+              write_sleeper_snapshot(repo / OUT_SLEEPER_SNAPSHOT, inputs["sleeper_records"])
+
+              attach = augmented_attach_fresh_factory(b42, identity_layers)
+              original_attach = b42.attach_stable_ids_row_guarded
+              b42.attach_stable_ids_row_guarded = attach
+              try:
+                  eligibility, eligibility_audit = b42.build_role_eligibility(inputs["all_current_rows"], lineage["builder"], lineage, session, TARGET_WEEK)
+                  with_ids, cross_sha, overall_cov, pos_cov, sid_to_gsis, mapped_sids, crosswalk_audit = attach(inputs["features"], lineage, session)
+              finally:
+                  b42.attach_stable_ids_row_guarded = original_attach
+
+              if cross_sha != EXPECTED_STABLE_CROSSWALK_SHA256:
+                  raise RuntimeError("B46_CROSSWALK_CHANGED_WITHIN_SHADOW_BUILD")
+              eligibility["sleeper_id"] = eligibility["sleeper_id"].fillna("").astype(str)
+              eligibility.to_csv(repo / OUT_ELIGIBILITY, index=False, lineterminator="\n")
+
+              model = with_ids[with_ids["identity_mapped"]].copy()
+              if model.empty: raise RuntimeError("B46_FRESH_MODEL_EMPTY_AFTER_IDENTITY")
+              model["sleeper_id"] = model["sleeper_id"].astype(str)
+
+              scored_history, sleeper_hashes, missing_stats, participant_ids = b42.score_current_history(
+                  model, lineage["scorer"], lineage["scoring"]["scoring_settings"], session,
+                  TARGET_WEEK, 2026, include_all_weeks_for_participation=True,
+              )
+              pre = load_json(repo / OUT_PREFLIGHT)
+              if sleeper_hashes != pre["sleeper_weekly_stats_sha256"]:
+                  raise RuntimeError("B46_SLEEPER_SCORING_BYTES_DRIFT_FROM_PREFLIGHT")
+
+              stable_mapped_eligible_ids = {
+                  str(row["sleeper_id"]) for _, row in eligibility.iterrows()
+                  if str(row["identity_source"]) == "STABLE_CROSSWALK" and str(row["sleeper_id"]).strip()
+              }
+              participant_confirmed = stable_mapped_eligible_ids & participant_ids
+              confirmation_rate = len(participant_confirmed) / len(stable_mapped_eligible_ids) if stable_mapped_eligible_ids else 0.0
+              participant_pass = bool(stable_mapped_eligible_ids and confirmation_rate >= MIN_PARTICIPANT_CONFIRMATION)
+
+              exclusion_reason = {
+                  str(r["gsis_id"]): str(r["reason"])
+                  for r in inputs["feature_audit"].get("excluded_records", [])
+                  if int(r.get("origin_week", -1)) == TARGET_WEEK
+              }
+              gsis_present = sorted({
+                  str(r.get("gsis_id") or "").strip()
+                  for r in inputs["all_current_rows"]
+                  if str(r.get("gsis_id") or "").strip() and int(r.get("week") or 0) <= TARGET_WEEK
+              })
+              context = {
+                  "schema_version": 1, "study_id": STUDY_ID,
+                  "phase": "B46-v1-fresh-week-owner-blind-eligibility-context",
+                  "target_week": TARGET_WEEK,
+                  "gsis_mapped_sleeper_ids": sorted(mapped_sids),
+                  "sid_to_gsis": dict(sorted((str(k), str(v)) for k, v in sid_to_gsis.items())),
+                  "gsis_present_in_2026_sources": gsis_present,
+                  "sleeper_2026_participant_ids": sorted(participant_ids),
+                  "stable_mapped_role_eligible_sleeper_id_count": len(stable_mapped_eligible_ids),
+                  "stable_mapped_participant_confirmed_count": len(participant_confirmed),
+                  "participant_confirmation_rate": confirmation_rate,
+                  "participant_confirmation_minimum": MIN_PARTICIPANT_CONFIRMATION,
+                  "participant_confirmation_pass": participant_pass,
+                  "feature_exclusion_reason_by_gsis": dict(sorted(exclusion_reason.items())),
+                  "B45_resolution_status": identity_layers["b45_status"],
+                  "B45_effective_override_count": len(identity_layers["b45_effective"]),
+                  "fresh_DOB_POSITION_overlay_count": len(identity_layers["dob_overlay"]),
+                  "owner_or_roster_context_used": False,
+                  "frozen_before_roster_semantic_parse": True,
+              }
+              write_json(repo / OUT_CONTEXT, context)
+              if not participant_pass:
+                  write_pre_roster_stop(repo, "fresh_week_participant_confirmation", "fresh Week-5 participant confirmation rate failed", {"participant_confirmation_rate": confirmation_rate, "participant_confirmation_minimum": MIN_PARTICIPANT_CONFIRMATION})
+                  return
+
+              scored, aggregate_imputation = b42.normalize_and_apply_frozen_models(scored_history, lineage["b41h"], lineage["baseline"], lineage["b41f"])
+              rows = []
+              for _, row in scored.iterrows():
+                  pos = str(row["position"])
+                  idx, label = b42.role_from_score(pos, float(row["model_score"]), lineage["b41f"])
+                  if idx != int(row["tier_index"]) or label != str(row["role_tier"]):
+                      raise RuntimeError("B46_SHADOW_TIER_RECOMPUTATION_MISMATCH")
+                  g = str(row["gsis_id"])
+                  source = "B45_VERIFIED_OVERRIDE" if g in identity_layers["b45_effective"] else "DOB_POSITION_OVERLAY" if g in identity_layers["dob_overlay"] else "STABLE_CROSSWALK"
+                  rows.append({
+                      "sleeper_id": str(row["sleeper_id"]), "gsis_id": g, "identity_source": source,
+                      "position": pos, "origin_week": int(row["origin_week"]),
+                      "model_score": float(row["model_score"]), "tier_index": idx, "role_tier": label,
+                      "prior_active_games": int(row["prior_active_games"]),
+                      "frozen_feature_missing_count_before_imputation": int(row["frozen_feature_missing_count_before_imputation"]),
+                      "frozen_feature_count": int(row["frozen_feature_count"]),
+                      "evidence_source": b42.EVIDENCE_SOURCE, "confidence_status": b42.CONFIDENCE_STATUS,
+                  })
+              shadow = pd.DataFrame(rows)
+              if shadow.empty or shadow["sleeper_id"].duplicated().any(): raise RuntimeError("B46_FRESH_SHADOW_INVALID")
+              if sorted(shadow["position"].unique()) != sorted(b42.POSITIONS): raise RuntimeError("B46_FRESH_SHADOW_POSITION_SCOPE_MISMATCH")
+              shadow = shadow.sort_values(["position","model_score","sleeper_id"], ascending=[True,False,True], kind="mergesort").reset_index(drop=True)
+              shadow.to_csv(repo / OUT_SHADOW, index=False, lineterminator="\n", float_format="%.17g")
+
+              b45_pairs = {(str(x["gsis_id"]), str(x["sleeper_id"])) for x in b45_rows}
+              resolved_pairs = {(str(r["gsis_id"]), str(r["sleeper_id"])) for _, r in eligibility.iterrows() if (str(r["gsis_id"]), str(r["sleeper_id"])) in b45_pairs}
+              witness = {
+                  "schema_version": 1, "study_id": STUDY_ID,
+                  "phase": "B46-v1-fresh-week-owner-blind-shadow-freeze",
+                  "target_week": TARGET_WEEK, "protocol_freeze_commit": protocol_commit,
+                  "protocol_sha256": sha256_file(repo / OUT_PROTOCOL),
+                  "source_preflight_sha256": sha256_file(repo / OUT_PREFLIGHT),
+                  "evaluator_sha256": sha256_file(repo / OUT_EVALUATOR),
+                  "identity_validation_sha256": sha256_file(repo / OUT_IDENTITY_VALIDATION),
+                  "identity_overlay_sha256": sha256_file(repo / OUT_IDENTITY_OVERLAY),
+                  "sleeper_identity_snapshot_sha256": sha256_file(repo / OUT_SLEEPER_SNAPSHOT),
+                  "role_eligibility_sha256": sha256_file(repo / OUT_ELIGIBILITY),
+                  "eligibility_context_sha256": sha256_file(repo / OUT_CONTEXT),
+                  "shadow_sha256": sha256_file(repo / OUT_SHADOW),
+                  "pre_roster_source_firewall": firewall,
+                  "roster_assignment_semantics_parsed_before_shadow_freeze": False,
+                  "participant_confirmation_pass": participant_pass,
+                  "participant_confirmation_rate": confirmation_rate,
+                  "B45_resolution_status": identity_layers["b45_status"],
+                  "B45_all_three_pairs_present_in_fresh_eligibility": len(resolved_pairs) == 3,
+                  "B45_resolved_pairs": sorted([list(x) for x in resolved_pairs]),
+                  "fresh_DOB_POSITION_overlay_count": len(identity_layers["dob_overlay"]),
+                  "feature_audit": inputs["feature_audit"],
+                  "aggregate_frozen_imputation": aggregate_imputation,
+                  "current_sources": {
+                      "nflverse_weekly_stats": inputs["stats_meta"],
+                      "nflverse_snap_counts": inputs["snaps_meta"],
+                      "sleeper_weekly_stats_sha256": sleeper_hashes,
+                      "stable_id_crosswalk_sha256": cross_sha,
+                      "sleeper_player_map_sha256": pre["sleeper_player_map_sha256"],
+                  },
+                  "model_or_tier_retuning_performed": False,
+                  "production_change_authorized": False, "production_model_deployed": False,
+              }
+              write_json(repo / OUT_WITNESS, witness)
+              print("PASS: B46 V1 fresh Week-5 owner-blind shadow frozen before roster semantic parse.")
+
+
+          def validate_b45_fresh_roster_binding(rosters, rows, eligibility, lineage, b42) -> dict:
+              details = []
+              all_pass = True
+              rostered_count = 0
+              unrostered_count = 0
+
+              for x in rows:
+                  sid = str(x["sleeper_id"])
+                  g = str(x["gsis_id"])
+                  pos = str(x["model_position"])
+
+                  found = []
+                  for roster in rosters:
+                      players_by_id = {}
+                      for slot in ("starters", "bench", "taxi", "reserve_ir"):
+                          for player in roster.get(slot) or []:
+                              pid = str(player.get("player_id") or "").strip()
+                              if pid:
+                                  players_by_id.setdefault(pid, player)
+                      if sid in players_by_id:
+                          found.append(players_by_id[sid])
+
+                  erow = eligibility.loc[eligibility["gsis_id"].astype(str) == g]
+                  fresh_name_key = str(erow.iloc[0]["exact_name_key"]) if len(erow) == 1 else ""
+                  fresh_sid = str(erow.iloc[0]["sleeper_id"]) if len(erow) == 1 else ""
+                  fresh_source = str(erow.iloc[0]["identity_source"]) if len(erow) == 1 else ""
+
+                  eligibility_ok = bool(
+                      len(erow) == 1
+                      and fresh_sid == sid
+                      and fresh_source in {"B45_VERIFIED_OVERRIDE", "STABLE_CROSSWALK"}
+                  )
+
+                  if len(found) == 0:
+                      unrostered_count += 1
+                      status = "not_rostered_in_fresh_snapshot"
+                      roster_pos = ""
+                      roster_name_key = ""
+                      roster_binding_ok = True
+                  elif len(found) == 1:
+                      rostered_count += 1
+                      status = "rostered"
+                      roster_pos = lineage["builder"].canon_pos(found[0].get("position"))
+                      roster_name_key = b42.exact_name_key(found[0].get("name") or "")
+                      roster_binding_ok = bool(
+                          roster_pos == pos
+                          and roster_name_key == fresh_name_key
+                      )
+                  else:
+                      status = "duplicate_roster_occurrence"
+                      roster_pos = ""
+                      roster_name_key = ""
+                      roster_binding_ok = False
+
+                  ok = bool(eligibility_ok and roster_binding_ok)
+                  details.append({
+                      "gsis_id": g,
+                      "sleeper_id": sid,
+                      "model_position": pos,
+                      "fresh_identity_source": fresh_source,
+                      "status": status,
+                      "roster_occurrences": len(found),
+                      "roster_position": roster_pos,
+                      "roster_name_key_matches_fresh_week_identity":
+                          (roster_name_key == fresh_name_key) if len(found) == 1 else None,
+                      "fresh_eligibility_pair_exact": eligibility_ok,
+                      "pass": ok,
+                  })
+                  all_pass = all_pass and ok
+
+              return {
+                  "pass": all_pass,
+                  "all_three_checked": len(details) == 3,
+                  "rostered_B45_count": rostered_count,
+                  "unrostered_B45_count": unrostered_count,
+                  "unrostered_is_not_failure": True,
+                  "details": details,
+              }
+
+
+          def verify_shadow_freeze(repo: Path, shadow_commit: str) -> None:
+              head = subprocess.check_output(["git","rev-parse","HEAD"], text=True).strip()
+              if head != shadow_commit: raise RuntimeError(f"B46_NOT_AT_SHADOW_FREEZE_COMMIT expected={shadow_commit} actual={head}")
+              expected = sorted([str(OUT_IDENTITY_VALIDATION),str(OUT_IDENTITY_OVERLAY),str(OUT_SLEEPER_SNAPSHOT),str(OUT_ELIGIBILITY),str(OUT_CONTEXT),str(OUT_SHADOW),str(OUT_WITNESS)])
+              changed = sorted(subprocess.check_output(["git","diff-tree","--no-commit-id","--name-only","-r",shadow_commit], text=True).splitlines())
+              if changed != expected: raise RuntimeError(f"B46_SHADOW_FREEZE_SCOPE_DRIFT expected={expected} actual={changed}")
+
+
+          def audit_fresh_week(repo: Path, roster_snapshot: Path, shadow_commit: str) -> None:
+              verify_closed_parents(repo)
+              verify_shadow_freeze(repo, shadow_commit)
+              b44 = load_module(repo / B44_EVALUATOR, "b46_audit_parent_b44")
+              b42, v1, lineage, adoption, v1_evidence = b44.load_verified_parents(repo)
+              protocol = load_json(repo / OUT_PROTOCOL); pre = load_json(repo / OUT_PREFLIGHT)
+              witness = load_json(repo / OUT_WITNESS); identity_validation = load_json(repo / OUT_IDENTITY_VALIDATION)
+              if witness.get("roster_assignment_semantics_parsed_before_shadow_freeze") is not False: raise RuntimeError("B46_NO_PEEK_WITNESS_DRIFT")
+              if witness.get("target_week") != TARGET_WEEK: raise RuntimeError("B46_WITNESS_TARGET_WEEK_DRIFT")
+              pre_roster_sha = str(pre.get("roster_snapshot_sha256") or "")
+              pre_roster_blob = str(pre.get("roster_snapshot_git_blob") or "")
+              if sha256_file(roster_snapshot) != pre_roster_sha:
+                  raise RuntimeError("B46_AUDIT_ROSTER_SHA_DRIFT")
+              if git_blob(roster_snapshot) != pre_roster_blob:
+                  raise RuntimeError("B46_AUDIT_ROSTER_BLOB_DRIFT")
+
+              eligibility = pd.read_csv(repo / OUT_ELIGIBILITY, dtype={"sleeper_id":str,"gsis_id":str}, keep_default_na=False)
+              shadow = pd.read_csv(repo / OUT_SHADOW, dtype={"sleeper_id":str,"gsis_id":str}, keep_default_na=False)
+              ctx = load_json(repo / OUT_CONTEXT)
+
+              roster_payload = json.loads(roster_snapshot.read_text(encoding="utf-8"))
+              rosters = roster_payload.get("rosters") or []
+              if not isinstance(rosters, list): raise RuntimeError("B46_ROSTER_PAYLOAD_NOT_LIST")
+
+              supported = named = 0
+              for roster in rosters:
+                  players = {}
+                  for slot in ("starters","bench","taxi","reserve_ir"):
+                      for player in roster.get(slot) or []:
+                          pid = str(player.get("player_id") or "").strip()
+                          if pid: players.setdefault(pid, player)
+                  for player in players.values():
+                      pos = lineage["builder"].canon_pos(player.get("position"))
+                      if pos not in b42.POSITIONS: continue
+                      supported += 1
+                      if str(player.get("name") or "").strip(): named += 1
+              name_availability = named / supported if supported else 0.0
+
+              with (repo / OUT_IDENTITY_OVERLAY).open(newline="", encoding="utf-8") as f:
+                  overlay_rows = list(csv.DictReader(f))
+              dob_rows = [x for x in overlay_rows if x.get("identity_source") == "DOB_POSITION_OVERLAY"]
+              rostered_dob_precision = b44.rostered_overlay_precision(rosters, dob_rows, b42, v1)
+              b45_binding = validate_b45_fresh_roster_binding(rosters, load_b45_rows(repo), eligibility, lineage, b42)
+
+              ordered_rosters = list(rosters); secrets.SystemRandom().shuffle(ordered_rosters)
+              audit = audit_rosters(rosters, eligibility, shadow, ctx, b42, lineage, ordered_rosters)
+
+              team_keys = set()
+              for t in audit["team_results"]: team_keys.update(t.keys())
+              privacy_pass = bool(
+                  not (team_keys & {"owner_id","owner_username","team_name","roster_id"})
+                  and len(audit["team_results"]) == REQUIRED_TEAM_COUNT
+                  and all(str(t["opaque_team"]).startswith("Team") for t in audit["team_results"])
+                  and len({str(t["opaque_team"]) for t in audit["team_results"]}) == REQUIRED_TEAM_COUNT
+              )
+              parity = load_json(repo / B44_PARITY); b44_witness = load_json(repo / B44_WITNESS)
+
+              gates = {
+                  "source_preflight_week5_exact_and_complete": bool(pre.get("source_readiness_all_pass") is True and pre.get("target_week")==TARGET_WEEK and pre.get("sleeper_latest_completed_week_observed")>=TARGET_WEEK and pre.get("nflverse_weekly_stats_max_available_week")>=TARGET_WEEK and pre.get("nflverse_snap_counts_max_available_week")>=TARGET_WEEK and pre.get("week5_snap_game_count")==EXPECTED_WEEK5_GAME_COUNT),
+                  "target_week_strictly_later_than_B44_week4": TARGET_WEEK > PRIOR_WEEK,
+                  "protocol_frozen_before_fresh_week_coverage": protocol.get("status")=="FROZEN_BEFORE_FRESH_WEEK_ROLE_COVERAGE_OR_TEAM_METRIC",
+                  "shadow_frozen_before_roster_semantic_parse": witness.get("roster_assignment_semantics_parsed_before_shadow_freeze") is False,
+                  "owner_blind_pre_roster_source_firewall": (witness.get("pre_roster_source_firewall") or {}).get("pass") is True,
+                  "DOB_POSITION_reference_precision_revalidation": identity_validation.get("DOB_POSITION_all_hard_precision_gates_pass") is True,
+                  "rostered_DOB_POSITION_zero_contradictions": rostered_dob_precision.get("pass") is True,
+                  "B45_all_three_resolve_without_contradiction": identity_validation.get("B45_all_three_resolve_without_contradiction") is True,
+                  "B45_rostered_pairs_bind_or_unrostered_explicitly": bool(b45_binding.get("pass") is True and b45_binding.get("all_three_checked") is True),
+                  "B45_all_three_pairs_present_in_fresh_eligibility": witness.get("B45_all_three_pairs_present_in_fresh_eligibility") is True,
+                  "participant_confirmation_minimum": witness.get("participant_confirmation_pass") is True,
+                  "roster_name_availability_minimum": bool(supported > 0 and name_availability >= MIN_ROSTER_NAME_AVAILABILITY),
+                  "exactly_12_teams": len(rosters)==REQUIRED_TEAM_COUNT,
+                  "every_team_has_supported_position_denominator": bool(audit["team_results"] and all(int(t["role_eligible_supported_position_players"])>0 for t in audit["team_results"])),
+                  "minimum_98pct_role_coverage_every_team": bool(audit["team_results"] and all(bool(t["coverage_pass_98pct"]) for t in audit["team_results"])),
+                  "maximum_2_percentage_point_coverage_range": bool(audit["coverage_range"] is not None and audit["coverage_range"] <= MAX_TEAM_COVERAGE_RANGE + 1e-12),
+                  "structural_owner_slot_role_invariance": audit["structural_counterfactual"]["role_changes"] == 0,
+                  "no_owner_blind_fallback": all(int(t["fallback_role_count"])==0 for t in audit["team_results"]),
+                  "all_eight_positions_in_declared_scope": sorted(lineage["b41f"]["position_models"]) == sorted(b42.POSITIONS),
+                  "B41J_implementation_parity_preserved": bool((parity.get("exact_parity") or {}).get("pass") is True),
+                  "B44_parent_source_firewall_preserved": bool((b44_witness.get("pre_roster_static_source_firewall") or {}).get("pass") is True),
+                  "opaque_team_privacy_pass": privacy_pass,
+                  "model_or_tier_retuning_absent": witness.get("model_or_tier_retuning_performed") is False,
+                  "production_change_authorized_false": True,
+              }
+              all_pass = all(gates.values()); result = PASS_RESULT if all_pass else STOP_RESULT
+              evidence = {
+                  "schema_version":1,"study_id":STUDY_ID,"phase":PHASE,"result":result,
+                  "classification":"PROSPECTIVE_FRESH_WEEK_ACCEPTANCE_AFTER_WEEK4_REMEDIATION",
+                  "target_week":TARGET_WEEK,"prior_validation_week":PRIOR_WEEK,"fresh_week":True,
+                  "B44W4_historical_stop_preserved":True,"B45_R6_overrides_frozen_before_target_result":True,
+                  "B46W4_same_week_pass_preserved_but_not_counted_as_fresh_validation":True,
+                  "protocol_sha256":sha256_file(repo / OUT_PROTOCOL),"source_preflight_sha256":sha256_file(repo / OUT_PREFLIGHT),
+                  "identity_validation_sha256":sha256_file(repo / OUT_IDENTITY_VALIDATION),"identity_overlay_sha256":sha256_file(repo / OUT_IDENTITY_OVERLAY),
+                  "role_eligibility_sha256":sha256_file(repo / OUT_ELIGIBILITY),"eligibility_context_sha256":sha256_file(repo / OUT_CONTEXT),
+                  "shadow_sha256":sha256_file(repo / OUT_SHADOW),"shadow_witness_sha256":sha256_file(repo / OUT_WITNESS),
+                  "shadow_freeze_commit":shadow_commit,"source_preflight":pre,"identity_validation":identity_validation,
+                  "rostered_DOB_POSITION_precision":rostered_dob_precision,"B45_roster_binding":b45_binding,
+                  "participant_confirmation_rate":witness.get("participant_confirmation_rate"),
+                  "roster_name_availability":name_availability,"supported_position_roster_player_count":supported,
+                  "supported_position_roster_named_player_count":named,"team_results":audit["team_results"],
+                  "league_position_eligible_counts":audit["league_position_eligible_counts"],
+                  "league_position_covered_counts":audit["league_position_covered_counts"],
+                  "minimum_team_role_coverage":audit["minimum_team_role_coverage"],
+                  "maximum_team_role_coverage":audit["maximum_team_role_coverage"],
+                  "coverage_range":audit["coverage_range"],"structural_counterfactual":audit["structural_counterfactual"],
+                  "primary_gates":gates,"all_primary_gates_pass":all_pass,"model_or_tier_retuning_performed":False,
+                  "fallback_policy":"NONE","eligible_for_separate_production_authorization":all_pass,
+                  "production_change_authorized":False,"production_model_deployed":False,
+              }
+              write_json(repo / OUT_EVIDENCE, evidence)
+              decision = {
+                  "schema_version":1,"study_id":STUDY_ID,"phase":PHASE,"result":result,
+                  "classification":"PROSPECTIVE_FRESH_WEEK_ACCEPTANCE_AFTER_WEEK4_REMEDIATION",
+                  "target_week":TARGET_WEEK,"fresh_week":True,"all_primary_gates_pass":all_pass,
+                  "team_count":len(audit["team_results"]),"minimum_team_role_coverage":audit["minimum_team_role_coverage"],
+                  "maximum_team_role_coverage":audit["maximum_team_role_coverage"],"coverage_range":audit["coverage_range"],
+                  "structural_role_changes":audit["structural_counterfactual"]["role_changes"],
+                  "evidence_sha256":sha256_file(repo / OUT_EVIDENCE),
+                  "eligible_for_separate_production_authorization":all_pass,
+                  "production_change_authorized":False,"production_model_deployed":False,
+                  "next_stage":"B47_PRODUCTION_AUTHORIZATION_AND_DEPLOYMENT" if all_pass else "STOP_CONFIGURATION_DO_NOT_RETUNE_ACCEPTANCE_GATES_AFTER_RESULT",
+              }
+              write_json(repo / OUT_DECISION, decision)
+              print("B46 V1 decision:", result)
+              print("Week:", TARGET_WEEK)
+              print("Min team coverage:", audit["minimum_team_role_coverage"])
+              print("Max team coverage:", audit["maximum_team_role_coverage"])
+              print("Coverage range:", audit["coverage_range"])
+              print("Structural role changes:", audit["structural_counterfactual"]["role_changes"])
+              print("Production authorization eligible:", all_pass)
+              print("Production change authorized by B46: false")
+
+
+          def run_selftest():
+              assert TARGET_WEEK == PRIOR_WEEK + 1 == 5
+              assert REQUIRED_TEAM_COUNT == 12
+              assert MIN_TEAM_ROLE_COVERAGE == 0.98
+              assert MAX_TEAM_COVERAGE_RANGE == 0.02
+              good = [1.0]*12
+              assert min(good) >= MIN_TEAM_ROLE_COVERAGE and max(good)-min(good) <= MAX_TEAM_COVERAGE_RANGE
+              bad = [1.0]*11+[0.97]
+              assert min(bad) < MIN_TEAM_ROLE_COVERAGE and max(bad)-min(bad) > MAX_TEAM_COVERAGE_RANGE
+              print("PASS B46 V1 selftest")
+
+          def audit_rosters(rosters, eligibility, shadow, ctx, b42, lineage, ordered_rosters):
+              shadow_lookup = {str(r["sleeper_id"]): r for _, r in shadow.iterrows()}
+              if len(shadow_lookup) != len(shadow):
+                  raise RuntimeError("B46W4_SHADOW_SLEEPER_DUPLICATE")
+
+              eligible_by_sleeper = {
+                  str(r["sleeper_id"]): r for _, r in eligibility.iterrows()
+                  if str(r.get("sleeper_id") or "").strip()
+              }
+              name_groups = defaultdict(list)
+              for _, r in eligibility.iterrows():
+                  key = str(r.get("exact_name_key") or "")
+                  if key and boolish(r.get("exact_name_unique")):
+                      name_groups[key].append(r)
+              eligible_by_exact_name = {k: rs[0] for k, rs in name_groups.items() if len(rs) == 1}
+
+              mapped_sids = set(str(x) for x in ctx.get("gsis_mapped_sleeper_ids", []))
+              sid_to_gsis = {str(k): str(v) for k, v in (ctx.get("sid_to_gsis") or {}).items()}
+              gsis_present = set(str(x) for x in ctx.get("gsis_present_in_2026_sources", []))
+              participant_ids = set(str(x) for x in ctx.get("sleeper_2026_participant_ids", []))
+              exclusion_reason = {str(k): str(v) for k, v in (ctx.get("feature_exclusion_reason_by_gsis") or {}).items()}
+
+              team_labels = {id(r): f"Team{i:02d}" for i, r in enumerate(ordered_rosters, start=1)}
+              team_results = []
+              covered_shadow_rows = []
+              league_pos_eligible = Counter()
+              league_pos_covered = Counter()
+
+              for roster in ordered_rosters:
+                  label = team_labels[id(roster)]
+                  players_by_id = {}
+                  for slot in ("starters", "bench", "taxi", "reserve_ir"):
+                      for player in roster.get(slot) or []:
+                          pid = str(player.get("player_id") or "").strip()
+                          if pid:
+                              players_by_id.setdefault(pid, player)
+
+                  eligible_count = covered = position_mismatch = eligible_pending = no_current_evidence = 0
+                  source_disagreement = identity_gap_unknown_model_position = 0
+                  supported_named = supported_total = 0
+                  tier_counts = Counter()
+                  evidence_counts = Counter()
+                  confidence_counts = Counter()
+                  active_game_buckets = Counter()
+                  eligibility_methods = Counter()
+                  pending_reasons = Counter()
+                  team_pos_eligible = Counter()
+                  team_pos_covered = Counter()
+
+                  for pid, player in sorted(players_by_id.items()):
+                      roster_pos = lineage["builder"].canon_pos(player.get("position"))
+                      if roster_pos not in b42.POSITIONS:
+                          continue
+                      supported_total += 1
+                      if str(player.get("name") or "").strip():
+                          supported_named += 1
+
+                      elig = eligible_by_sleeper.get(pid)
+                      match_method = None
+                      if elig is not None:
+                          src = str(elig.get("identity_source") or "")
+                          if src == "B45_VERIFIED_OVERRIDE":
+                              match_method = "b45_verified_override"
+                          elif src == "DOB_POSITION_OVERLAY":
+                              match_method = "dob_position_overlay"
+                          else:
+                              match_method = "stable_sleeper_id"
+                      else:
+                          name_key = b42.exact_name_key(player.get("name") or "")
+                          elig = eligible_by_exact_name.get(name_key)
+                          if elig is not None:
+                              match_method = "unique_exact_name_denominator_only"
+
+                      if elig is None:
+                          if pid in participant_ids:
+                              mapped_gsis = sid_to_gsis.get(pid)
+                              mapped_into_source = bool(pid in mapped_sids and mapped_gsis and mapped_gsis in gsis_present)
+                              if not mapped_into_source:
+                                  eligible_count += 1
+                                  eligible_pending += 1
+                                  identity_gap_unknown_model_position += 1
+                                  eligibility_methods["sleeper_participation_identity_gap"] += 1
+                                  pending_reasons[
+                                      "crosswalk_mapped_gsis_absent_from_2026_nflverse" if mapped_gsis
+                                      else "stable_id_crosswalk_missing_gsis_bridge"
+                                  ] += 1
+                                  continue
+                              source_disagreement += 1
+                              continue
+                          no_current_evidence += 1
+                          continue
+
+                      eligible_count += 1
+                      eligibility_methods[match_method] += 1
+                      model_pos = str(elig["position"])
+                      if model_pos in b42.POSITIONS:
+                          team_pos_eligible[model_pos] += 1
+                          league_pos_eligible[model_pos] += 1
+
+                      role = shadow_lookup.get(pid)
+                      if match_method == "unique_exact_name_denominator_only" and role is not None:
+                          raise RuntimeError("B46W4_EXACT_NAME_DENOMINATOR_MUST_NOT_RESCUE_ROLE")
+                      if role is None:
+                          eligible_pending += 1
+                          if match_method == "unique_exact_name_denominator_only":
+                              bridged_sid = str(elig.get("sleeper_id") or "").strip()
+                              pending_reasons[
+                                  "crosswalk_sleeper_id_disagrees_with_roster_id_name_bridge"
+                                  if bridged_sid else "stable_id_crosswalk_absent_name_bridge"
+                              ] += 1
+                          else:
+                              g = str(elig.get("gsis_id") or "")
+                              pending_reasons[exclusion_reason.get(g, "other_pipeline_drop")] += 1
+                          continue
+
+                      role_pos = str(role["position"])
+                      if role_pos != roster_pos:
+                          position_mismatch += 1
+                      covered += 1
+                      team_pos_covered[role_pos] += 1
+                      league_pos_covered[role_pos] += 1
+                      tier_counts[str(role["role_tier"])] += 1
+                      evidence_counts[str(role["evidence_source"])] += 1
+                      confidence_counts[str(role["confidence_status"])] += 1
+                      games = int(role["prior_active_games"])
+                      active_game_buckets["3+" if games >= 3 else str(games)] += 1
+                      covered_shadow_rows.append(role)
+
+                  coverage = (covered / eligible_count) if eligible_count else 0.0
+                  team_results.append({
+                      "opaque_team": label,
+                      "role_eligible_supported_position_players": eligible_count,
+                      "data_driven_role_count": covered,
+                      "fallback_role_count": 0,
+                      "eligible_pending_without_role_count": eligible_pending,
+                      "no_current_season_evidence_count": no_current_evidence,
+                      "position_label_mismatch_count": position_mismatch,
+                      "role_coverage": coverage,
+                      "coverage_pass_98pct": bool(eligible_count > 0 and coverage >= MIN_TEAM_ROLE_COVERAGE),
+                      "eligibility_match_method_counts": dict(sorted(eligibility_methods.items())),
+                      "eligible_pending_reason_counts": dict(sorted(pending_reasons.items())),
+                      "sleeper_participation_crosswalk_present_source_disagreement_count": source_disagreement,
+                      "identity_gap_unknown_model_position_count": identity_gap_unknown_model_position,
+                      "supported_position_roster_name_available_count": supported_named,
+                      "supported_position_roster_player_count": supported_total,
+                      "supported_position_roster_name_availability": (supported_named / supported_total if supported_total else 0.0),
+                      "evidence_source_counts": dict(sorted(evidence_counts.items())),
+                      "confidence_status_counts": dict(sorted(confidence_counts.items())),
+                      "active_game_evidence_depth_counts": dict(sorted(active_game_buckets.items())),
+                      "role_tier_counts": {role: int(tier_counts.get(role, 0)) for role in b42.ROLE_ORDER},
+                      "eligible_by_model_position": {p: int(team_pos_eligible.get(p, 0)) for p in b42.POSITIONS},
+                      "covered_by_model_position": {p: int(team_pos_covered.get(p, 0)) for p in b42.POSITIONS},
+                  })
+
+              coverages = [float(t["role_coverage"]) for t in team_results]
+              coverage_range = (max(coverages) - min(coverages)) if coverages else float("inf")
+
+              context_labels = [f"Team{i:02d}" for i in range(1, REQUIRED_TEAM_COUNT + 1)]
+              synthetic_slots = ["STARTER", "BENCH", "TAXI", "RESERVE_IR"]
+              changes = comparisons = 0
+              for role in covered_shadow_rows:
+                  base_idx = int(role["tier_index"])
+                  base_label = str(role["role_tier"])
+                  for team_label in context_labels:
+                      for slot in synthetic_slots:
+                          idx, label = b42.counterfactual_role_assignment(
+                              str(role["position"]), float(role["model_score"]), lineage["b41f"], team_label, slot
+                          )
+                          comparisons += 1
+                          if idx != base_idx or label != base_label:
+                              changes += 1
+
+              return {
+                  "team_results": team_results,
+                  "league_position_eligible_counts": {p: int(league_pos_eligible.get(p, 0)) for p in b42.POSITIONS},
+                  "league_position_covered_counts": {p: int(league_pos_covered.get(p, 0)) for p in b42.POSITIONS},
+                  "coverage_range": float(coverage_range) if math.isfinite(coverage_range) else None,
+                  "minimum_team_role_coverage": min(coverages) if coverages else None,
+                  "maximum_team_role_coverage": max(coverages) if coverages else None,
+                  "structural_counterfactual": {
+                      "comparisons": comparisons,
+                      "role_changes": changes,
+                      "pass": changes == 0,
+                      "synthetic_team_contexts": 12,
+                      "synthetic_slot_contexts": 4,
+                  },
+              }
+
+          def verify_b45_cbs_evidence(b45e: dict) -> dict:
+              expected = {
+                  "13372": {"name": "R Mason Thomas", "dob": "2004-08-25"},
+                  "13545": {"name": "Trey Smack", "dob": "2003-07-12"},
+              }
+              details = []
+              for result in b45e.get("verification_results") or []:
+                  sid = str(result.get("sleeper_id") or "")
+                  if sid not in expected:
+                      continue
+                  cbs = [
+                      x for x in (result.get("authoritative_source_results") or [])
+                      if str(x.get("organization") or "") == "CBS_SPORTS"
+                  ]
+                  exp = expected[sid]
+                  ok = len(cbs) == 1
+                  row = cbs[0] if cbs else {}
+                  excerpt = str(row.get("evidence_excerpt") or "")
+                  matched_name = str(row.get("matched_name") or "")
+                  matched_dob = str(row.get("matched_dob_variant") or "")
+                  dob_variants = {
+                      exp["dob"],
+                      f"{int(exp['dob'][5:7])}/{int(exp['dob'][8:10])}/{exp['dob'][:4]}",
+                      f"{exp['dob'][5:7]}/{exp['dob'][8:10]}/{exp['dob'][:4]}",
+                  }
+                  ok = bool(
+                      ok
+                      and row.get("pass") is True
+                      and row.get("match_method") == "STRUCTURED_ROSTER_ROW"
+                      and row.get("source_also_contains_competing_machine_dob") is False
+                      and matched_name == exp["name"]
+                      and matched_dob in dob_variants
+                      and exp["name"].casefold() in excerpt.casefold()
+                      and any(v.casefold() in excerpt.casefold() for v in dob_variants)
+                  )
+                  details.append({
+                      "sleeper_id": sid,
+                      "player": exp["name"],
+                      "expected_dob": exp["dob"],
+                      "match_method": row.get("match_method"),
+                      "matched_name": matched_name,
+                      "matched_dob_variant": matched_dob,
+                      "evidence_excerpt": excerpt,
+                      "source_also_contains_competing_machine_dob":
+                          row.get("source_also_contains_competing_machine_dob"),
+                      "pass": ok,
+                  })
+              details.sort(key=lambda x: x["sleeper_id"])
+              overall = len(details) == 2 and all(x["pass"] for x in details)
+              return {
+                  "pass": overall,
+                  "manual_pre_run_review_completed": True,
+                  "manual_review_conclusion":
+                      "Both durable CBS STRUCTURED_ROSTER_ROW excerpts are single-player excerpts "
+                      "containing the correct target name and adjudicated DOB; neither records the competing DOB.",
+                  "details": details,
+              }
+
+
+          def main():
+              ap=argparse.ArgumentParser()
+              ap.add_argument("--selftest",action="store_true")
+              ap.add_argument("--preflight",action="store_true")
+              ap.add_argument("--build-shadow",action="store_true")
+              ap.add_argument("--audit",action="store_true")
+              ap.add_argument("--repo",default=".")
+              ap.add_argument("--cache")
+              ap.add_argument("--roster-snapshot")
+              ap.add_argument("--evaluator-sha256")
+              ap.add_argument("--protocol-freeze-commit")
+              ap.add_argument("--shadow-freeze-commit")
+              args=ap.parse_args()
+              if args.selftest:
+                  run_selftest(); return
+              repo=Path(args.repo)
+              if args.preflight:
+                  if not args.cache or not args.roster_snapshot or not args.evaluator_sha256: raise SystemExit("preflight args missing")
+                  preflight(repo,Path(args.cache),Path(args.roster_snapshot),args.evaluator_sha256); return
+              if args.build_shadow:
+                  if not args.cache or not args.protocol_freeze_commit: raise SystemExit("build-shadow args missing")
+                  build_fresh_shadow(repo,Path(args.cache),args.protocol_freeze_commit); return
+              if args.audit:
+                  if not args.roster_snapshot or not args.shadow_freeze_commit: raise SystemExit("audit args missing")
+                  audit_fresh_week(repo,Path(args.roster_snapshot),args.shadow_freeze_commit); return
+              raise SystemExit("choose --selftest, --preflight, --build-shadow, or --audit")
+
+          if __name__=="__main__":
+              main()
+          PYB46
+          chmod +x "$BASE/player_role_v2_b46_v1_evaluator.py"
+
+          EVAL_SHA="$(sha256sum "$BASE/player_role_v2_b46_v1_evaluator.py" | awk '{print $1}')"
+          test "$EVAL_SHA" = '737633ab521e0090eae1244f2eda0f58b215fcd2d3f613876c8a779cb7171740'
+          python3 -m py_compile "$BASE/player_role_v2_b46_v1_evaluator.py"
+          python3 "$BASE/player_role_v2_b46_v1_evaluator.py" --selftest
+
+          python3 "$BASE/player_role_v2_b46_v1_evaluator.py" \
+            --preflight --repo . --cache "$OUT/source_cache" \
+            --roster-snapshot "$OUT/fresh_roster_snapshot.json" \
+            --evaluator-sha256 "$EVAL_SHA"
+
+          test -f "$BASE/player_role_v2_b46_v1_source_preflight.json"
+          test -f "$BASE/player_role_v2_b46_v1_protocol.json"
+
+          git add "$BASE/player_role_v2_b46_v1_evaluator.py" "$BASE/player_role_v2_b46_v1_source_preflight.json" "$BASE/player_role_v2_b46_v1_protocol.json"
+          EXPECTED="$(printf '%s\n' "$BASE/player_role_v2_b46_v1_evaluator.py" "$BASE/player_role_v2_b46_v1_source_preflight.json" "$BASE/player_role_v2_b46_v1_protocol.json" | sort)"
+          ACTUAL="$(git diff --cached --name-only | sort)"
+          test "$ACTUAL" = "$EXPECTED"
+          test "$(sha256sum index.html | awk '{print $1}')" = "$INDEX_SHA_BEFORE"
+          test "$(sha256sum free-agent-board.html | awk '{print $1}')" = "$FA_SHA_BEFORE"
+
+          git config user.name 'player-role-v2-b46-bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git commit -m 'Freeze B46 fresh Week 5 acceptance protocol before results'
+          git fetch origin main
+          git rebase origin/main
+          CHANGED="$(git diff-tree --no-commit-id --name-only -r HEAD | sort)"
+          test "$CHANGED" = "$EXPECTED"
+          git push origin HEAD:main
+          echo "B46_PROTOCOL_FREEZE_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Build owner-blind Week 5 identity and shadow before roster parse
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$B46_PROTOCOL_FREEZE_COMMIT"
+          python3 "$BASE/player_role_v2_b46_v1_evaluator.py" \
+            --build-shadow --repo . --cache "$OUT/source_cache" \
+            --protocol-freeze-commit "$B46_PROTOCOL_FREEZE_COMMIT"
+
+          if test -f "$BASE/player_role_v2_b46_v1_scientific_decision.json"; then
+            echo "B46_PRE_ROSTER_STOP=true" >> "$GITHUB_ENV"
+          else
+            echo "B46_PRE_ROSTER_STOP=false" >> "$GITHUB_ENV"
+            test -f "$BASE/player_role_v2_b46_v1_shadow.csv"
+            test -f "$BASE/player_role_v2_b46_v1_shadow_witness.json"
+          fi
+
+          mapfile -t NEW_FILES < <(git status --porcelain=v1 --untracked-files=all | awk '{print substr($0,4)}' | grep '^research/player-role-v2/player_role_v2_b46_v1_' | sort)
+          test "${#NEW_FILES[@]}" -gt 0
+          ALLOWED_RE='^research/player-role-v2/player_role_v2_b46_v1_(identity_validation\.json|identity_overlay\.csv|sleeper_identity_snapshot\.csv|role_eligibility\.csv|eligibility_context\.json|shadow\.csv|shadow_witness\.json|scientific_decision\.json)$'
+          for f in "${NEW_FILES[@]}"; do echo "$f" | grep -Eq "$ALLOWED_RE"; done
+
+          git add "${NEW_FILES[@]}"
+          EXPECTED="$(printf '%s\n' "${NEW_FILES[@]}" | sort)"
+          ACTUAL="$(git diff --cached --name-only | sort)"
+          test "$ACTUAL" = "$EXPECTED"
+          test "$(sha256sum index.html | awk '{print $1}')" = "$INDEX_SHA_BEFORE"
+          test "$(sha256sum free-agent-board.html | awk '{print $1}')" = "$FA_SHA_BEFORE"
+
+          git commit -m 'Freeze B46 owner-blind Week 5 shadow before roster audit'
+          git fetch origin main
+          git rebase origin/main
+          CHANGED="$(git diff-tree --no-commit-id --name-only -r HEAD | sort)"
+          test "$CHANGED" = "$EXPECTED"
+          git push origin HEAD:main
+          echo "B46_SHADOW_FREEZE_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Run fresh Week 5 owner-blind acceptance audit
+        if: env.B46_PRE_ROSTER_STOP != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git reset --hard origin/main
+          test "$(git rev-parse HEAD)" = "$B46_SHADOW_FREEZE_COMMIT"
+
+          python3 "$BASE/player_role_v2_b46_v1_evaluator.py" \
+            --audit --repo . --roster-snapshot "$OUT/fresh_roster_snapshot.json" \
+            --shadow-freeze-commit "$B46_SHADOW_FREEZE_COMMIT"
+
+          test -f "$BASE/player_role_v2_b46_v1_owner_blind_evidence.json"
+          test -f "$BASE/player_role_v2_b46_v1_scientific_decision.json"
+
+          git add "$BASE/player_role_v2_b46_v1_owner_blind_evidence.json" "$BASE/player_role_v2_b46_v1_scientific_decision.json"
+          EXPECTED="$(printf '%s\n' "$BASE/player_role_v2_b46_v1_owner_blind_evidence.json" "$BASE/player_role_v2_b46_v1_scientific_decision.json" | sort)"
+          ACTUAL="$(git diff --cached --name-only | sort)"
+          test "$ACTUAL" = "$EXPECTED"
+          test "$(sha256sum index.html | awk '{print $1}')" = "$INDEX_SHA_BEFORE"
+          test "$(sha256sum free-agent-board.html | awk '{print $1}')" = "$FA_SHA_BEFORE"
+
+          git commit -m 'Freeze B46 fresh Week 5 acceptance result'
+          git fetch origin main
+          git rebase origin/main
+          CHANGED="$(git diff-tree --no-commit-id --name-only -r HEAD | sort)"
+          test "$CHANGED" = "$EXPECTED"
+          git push origin HEAD:main
+
+      - name: Verify durable B46 result
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git reset --hard origin/main
+          test "$(sha256sum index.html | awk '{print $1}')" = "$INDEX_SHA_BEFORE"
+          test "$(sha256sum free-agent-board.html | awk '{print $1}')" = "$FA_SHA_BEFORE"
+
+          python3 - <<'PYVERIFY'
+          import hashlib, json
+          from pathlib import Path
+          base=Path('research/player-role-v2')
+          d=json.loads((base/'player_role_v2_b46_v1_scientific_decision.json').read_text())
+          assert d.get('target_week')==5
+          assert d.get('production_change_authorized') is False
+          assert d.get('production_model_deployed') is False
+          if d.get('result')=='PASS_B46_V1_FRESH_WEEK_ACCEPTANCE':
+              e=json.loads((base/'player_role_v2_b46_v1_owner_blind_evidence.json').read_text())
+              assert d.get('fresh_week') is True
+              assert d.get('all_primary_gates_pass') is True
+              assert d.get('eligible_for_separate_production_authorization') is True
+              assert d.get('next_stage')=='B47_PRODUCTION_AUTHORIZATION_AND_DEPLOYMENT'
+              assert d.get('evidence_sha256')==hashlib.sha256((base/'player_role_v2_b46_v1_owner_blind_evidence.json').read_bytes()).hexdigest()
+              assert e.get('all_primary_gates_pass') is True
+              assert e.get('production_change_authorized') is False
+          else:
+              assert d.get('eligible_for_separate_production_authorization') is False
+          print('PASS: durable B46 result verified.')
+          print('B46_RESULT='+str(d.get('result')))
+          print('PRODUCTION_ELIGIBLE='+str(d.get('eligible_for_separate_production_authorization')))
+          PYVERIFY
+
+      - name: Surface B46 scientific STOP as red
+        shell: bash
+        run: |
+          set -euo pipefail
+          RESULT="$(python3 - <<'PY'
+          import json
+          print(json.load(open('research/player-role-v2/player_role_v2_b46_v1_scientific_decision.json'))['result'])
+          PY
+          )"
+          echo "B46 final result: $RESULT"
+          if [ "$RESULT" != 'PASS_B46_V1_FRESH_WEEK_ACCEPTANCE' ]; then
+            echo "B46 scientific/data-integrity STOP durably recorded. Do not retune frozen acceptance gates."
+            exit 1
+          fi
+          echo "PASS: B46 fresh Week-5 acceptance. B47 production authorization/deployment is now eligible."
