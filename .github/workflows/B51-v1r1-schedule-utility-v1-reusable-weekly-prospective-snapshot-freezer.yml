@@ -1,0 +1,1181 @@
+name: B51 Schedule Utility V1 - Reusable Weekly Prospective Snapshot Freezer V1R1
+
+on:
+  schedule:
+    - cron: '30 16 * * 3,4'
+  workflow_dispatch:
+    inputs:
+      target_week:
+        description: 'Origin week to freeze; auto uses the next preregistered week whose first kickoff is still in the future.'
+        required: true
+        type: choice
+        default: auto
+        options:
+          - auto
+          - '5'
+          - '6'
+          - '7'
+          - '8'
+          - '9'
+          - '10'
+          - '11'
+          - '12'
+          - '13'
+          - '14'
+          - '15'
+          - '16'
+          - '17'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+  TARGET_SEASON: '2026'
+  B29_FREEZE_COMMIT: '46e0da275b797e4d7140cc33c2a452c2906d4408'
+  LOG_SAPA_SHA256: '9ab4ec5b21ef9ef57e476e861a7293dbc886b9bc9d7cc5f0bd5cc982cc729ee6'
+  B33_PREREG_SHA256: '35bbb6de644eede31728089196c97d5494491ea72dfc9c59ae4bfdd05ccfc662'
+  B34_REFERENCE_BUILDER_SHA256: 'adddb0b49850868f796081dcf437cff89bf0ce5110d7a193331e553b2b27237c'
+  B51_BUILDER_SHA256: 'e594b2128acf7b6827ea430b3f20b57768c670a66c00d5b1394edb6cd53cb109'
+
+jobs:
+  freeze-weekly-origin:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out durable main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Guard frozen B33 contract and production baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git branch --show-current)" = "main"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+          ROOT="research/schedule-utility-v1"
+          B33="$ROOT/schedule_utility_v1_b33_ordinal_prospective_shadow_prereg.json"
+          B34="$ROOT/schedule_utility_v1_b34_week5_snapshot_builder.py"
+
+          test -f "$B33"
+          test -f "$B34"
+          test "$(sha256sum "$B33" | awk '{print $1}')" = "$B33_PREREG_SHA256"
+          test "$(sha256sum "$B34" | awk '{print $1}')" = "$B34_REFERENCE_BUILDER_SHA256"
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          p = Path("research/schedule-utility-v1/schedule_utility_v1_b33_ordinal_prospective_shadow_prereg.json")
+          d = json.loads(p.read_text(encoding="utf-8"))
+
+          assert d["status"] == "PREREGISTERED_ORDINAL_PROSPECTIVE_SHADOW"
+          c = d["prospective_origin_contract"]
+          assert c["season"] == 2026
+          assert c["first_candidate_origin_week"] == 5
+          assert c["last_candidate_origin_week"] == 17
+          assert c["primary_origin_count_required"] == 10
+          assert c["primary_origins_selection_rule"] == (
+              "first 10 chronologically eligible origin weeks whose snapshot is "
+              "frozen before that week's first actual NFL kickoff"
+          )
+          assert c["missed_origin_rule"] == (
+              "a snapshot not committed before first actual kickoff is permanently "
+              "ineligible and cannot be reconstructed or backfilled"
+          )
+          assert d["information_cutoff"]["history_candidate_rule"] == (
+              "scheduled week in [max(1,W-10),W-1] AND actual kickoff strictly earlier than origin cutoff"
+          )
+          assert d["future_target_mapping"]["week_18_targets"] == "EXCLUDED"
+          assert d["governance"]["ordinal_v1_status"] == "PROSPECTIVE_SHADOW_ONLY"
+          assert d["governance"]["user_facing_production_authorized"] is False
+          assert d["governance"]["fv_change_authorized"] is False
+          print("PASS: frozen B33 prospective-origin contract verified.")
+          PY
+
+          mkdir -p "$RUNNER_TEMP/schedule-utility-v1"
+          git show "$B29_FREEZE_COMMIT:research/schedule-utility-v1/log_sapa_v1.py"             > "$RUNNER_TEMP/schedule-utility-v1/log_sapa_v1.py"
+          test "$(sha256sum "$RUNNER_TEMP/schedule-utility-v1/log_sapa_v1.py" | awk '{print $1}')" = "$LOG_SAPA_SHA256"
+          python3 -m py_compile "$RUNNER_TEMP/schedule-utility-v1/log_sapa_v1.py"
+
+          echo "INDEX_SHA_BEFORE=$(sha256sum index.html | awk '{print $1}')" >> "$GITHUB_ENV"
+          echo "FA_SHA_BEFORE=$(sha256sum free-agent-board.html | awk '{print $1}')" >> "$GITHUB_ENV"
+          echo "MAIN_AT_START=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Download current public schedule and 2026 weekly stats
+        shell: bash
+        run: |
+          set -euo pipefail
+          TMP="$RUNNER_TEMP/schedule-utility-v1"
+
+          curl --fail --location --retry 3 --retry-delay 2             --output "$TMP/games.csv"             https://github.com/nflverse/nflverse-data/releases/download/schedules/games.csv
+
+          curl --fail --location --retry 3 --retry-delay 2             --output "$TMP/stats_player_week_2026.csv"             https://github.com/nflverse/nflverse-data/releases/download/stats_player/stats_player_week_2026.csv
+
+          test -s "$TMP/games.csv"
+          test -s "$TMP/stats_player_week_2026.csv"
+
+      - name: Resolve origin week and enforce immutable no-backfill guard
+        shell: bash
+        env:
+          REQUESTED_WEEK: ${{ github.event_name == 'workflow_dispatch' && inputs.target_week || 'auto' }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import csv
+          import hashlib
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+
+          season = 2026
+          requested = os.environ.get("REQUESTED_WEEK", "auto").strip().lower()
+          tmp = Path(os.environ["RUNNER_TEMP"]) / "schedule-utility-v1"
+          schedule = tmp / "games.csv"
+          root = Path("research/schedule-utility-v1/prospective-snapshots")
+          eastern = ZoneInfo("America/New_York")
+          now = datetime.now(timezone.utc)
+
+          cutoffs = {}
+          with schedule.open("r", encoding="utf-8-sig", newline="") as f:
+              for row in csv.DictReader(f):
+                  try:
+                      s = int(row["season"])
+                      w = int(row["week"])
+                  except Exception:
+                      continue
+                  if s != season or str(row.get("game_type", "")).upper() != "REG":
+                      continue
+                  if not 5 <= w <= 17:
+                      continue
+                  d = str(row.get("gameday") or "").strip()
+                  t = str(row.get("gametime") or "").strip()
+                  if not d or not t:
+                      raise SystemExit(f"MISSING_KICKOFF_FOR_WEEK_{w}")
+                  dt = datetime.fromisoformat(f"{d}T{t}:00").replace(tzinfo=eastern).astimezone(timezone.utc)
+                  cutoffs[w] = min(cutoffs.get(w, dt), dt)
+
+          if set(cutoffs) != set(range(5, 18)):
+              raise SystemExit(f"INCOMPLETE_2026_WEEK5_17_SCHEDULE_MAP: {sorted(cutoffs)}")
+
+          season_complete = False
+          if requested == "auto":
+              future = [w for w in range(5, 18) if now < cutoffs[w]]
+              if future:
+                  target = min(future)
+              else:
+                  target = 17
+                  season_complete = True
+          else:
+              target = int(requested)
+              if target < 5 or target > 17:
+                  raise SystemExit("TARGET_WEEK_OUTSIDE_PREREGISTERED_RANGE_5_17")
+
+          snap = root / f"{season}-W{target:02d}.json"
+          manifest = root / f"{season}-W{target:02d}.manifest.json"
+          if snap.exists() != manifest.exists():
+              raise SystemExit("PARTIAL_EXISTING_SNAPSHOT_NAMESPACE")
+
+          already = snap.exists() and manifest.exists()
+          if already:
+              m = json.loads(manifest.read_text(encoding="utf-8"))
+              s = json.loads(snap.read_text(encoding="utf-8"))
+              h = hashlib.sha256(snap.read_bytes()).hexdigest()
+              assert m["snapshot_sha256"] == h
+              assert int(m["season"]) == season
+              assert int(m["origin_week"]) == target
+              assert s["study_id"] == "schedule-utility-v1"
+              assert int(s["origin_week"]) == target
+              assert s["outcome_evaluation_performed"] is False
+              assert s["production_authorized"] is False
+              assert m["outcome_evaluation_performed"] is False
+              assert m["production_authorized"] is False
+              assert m["may_overwrite_snapshot"] is False
+              print(f"PASS: Week {target} snapshot already frozen and internally valid.")
+          elif season_complete:
+              print("PASS: no remaining preregistered 2026 origin week before first kickoff; capture season complete.")
+          else:
+              cutoff = cutoffs[target]
+              if not now < cutoff:
+                  raise SystemExit(
+                      f"WEEK_{target}_SNAPSHOT_DEADLINE_MISSED_NO_BACKFILL "
+                      f"now={now.isoformat()} cutoff={cutoff.isoformat()}"
+                  )
+              print(f"PASS: Week {target} is eligible for a fresh pre-kickoff freeze.")
+              print("Cutoff UTC:", cutoff.isoformat())
+
+          env_path = Path(os.environ["GITHUB_ENV"])
+          with env_path.open("a", encoding="utf-8") as f:
+              f.write(f"TARGET_WEEK={target}\n")
+              f.write(f"ORIGIN_CUTOFF_UTC={cutoffs[target].isoformat()}\n")
+              f.write(f"SNAP_PATH={snap}\n")
+              f.write(f"MANIFEST_PATH={manifest}\n")
+              f.write(f"ALREADY_FROZEN={str(already).lower()}\n")
+              f.write(f"SEASON_COMPLETE={str(season_complete).lower()}\n")
+          PY
+
+      - name: Materialize and self-test reusable frozen builder
+        if: env.ALREADY_FROZEN != 'true' && env.SEASON_COMPLETE != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUILDER="$RUNNER_TEMP/schedule-utility-v1/b51_reusable_builder.py"
+
+          cat > "$BUILDER" <<'PYBUILDER'
+          #!/usr/bin/env python3
+          from __future__ import annotations
+
+          import argparse
+          import csv
+          from collections import defaultdict
+          from dataclasses import dataclass
+          from datetime import datetime, timezone
+          import hashlib
+          import importlib.util
+          import json
+          import math
+          from pathlib import Path
+          import statistics
+          import sys
+          from zoneinfo import ZoneInfo
+
+          SEASON = 2026
+          POSITIONS = ("QB", "RB", "WR", "TE")
+          SCORING_MODE = "HALF_PPR"
+          EASTERN = ZoneInfo("America/New_York")
+
+          TEAM_ALIAS = {
+              "ARZ": "ARI", "ARI": "ARI",
+              "BLT": "BAL", "BAL": "BAL",
+              "CLV": "CLE", "CLE": "CLE",
+              "HST": "HOU", "HOU": "HOU",
+              "JAC": "JAX", "JAX": "JAX",
+              "LA": "LAR", "LAR": "LAR", "STL": "LAR",
+              "OAK": "LV", "LV": "LV",
+              "SD": "LAC", "LAC": "LAC",
+              "WSH": "WAS", "WAS": "WAS",
+          }
+
+          POSITION_ALIAS = {
+              "QB": "QB", "RB": "RB", "FB": "RB", "HB": "RB",
+              "WR": "WR", "TE": "TE",
+          }
+
+
+          @dataclass(frozen=True)
+          class Game:
+              game_id: str
+              season: int
+              week: int
+              kickoff_utc: datetime
+              away_team: str
+              home_team: str
+              completed: bool
+
+              def opponent(self, team: str) -> str:
+                  if team == self.away_team:
+                      return self.home_team
+                  if team == self.home_team:
+                      return self.away_team
+                  raise KeyError(team)
+
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+
+          def read_csv(path: Path) -> list[dict[str, str]]:
+              with path.open("r", encoding="utf-8-sig", newline="") as f:
+                  return list(csv.DictReader(f))
+
+
+          def is_blank(v) -> bool:
+              return v is None or str(v).strip() == ""
+
+
+          def canon_team(v) -> str:
+              s = str(v or "").strip().upper()
+              if not s:
+                  raise ValueError("blank team")
+              return TEAM_ALIAS.get(s, s)
+
+
+          def canon_position(v):
+              s = str(v or "").strip().upper()
+              if not s:
+                  return None
+              return POSITION_ALIAS.get(s)
+
+
+          def parse_kickoff_utc(gameday, gametime) -> datetime:
+              d = str(gameday or "").strip()
+              t = str(gametime or "").strip()
+              if not d or not t:
+                  raise ValueError(f"missing gameday/gametime: {d!r} {t!r}")
+              local = datetime.fromisoformat(f"{d}T{t}:00").replace(tzinfo=EASTERN)
+              return local.astimezone(timezone.utc)
+
+
+          def history_weeks(origin_week: int) -> tuple[int, ...]:
+              return tuple(range(max(1, origin_week - 10), origin_week))
+
+
+          def load_frozen(path: Path):
+              spec = importlib.util.spec_from_file_location("log_sapa_v1_b51", path)
+              if spec is None or spec.loader is None:
+                  raise RuntimeError("cannot import frozen LOG-SAPA")
+              mod = importlib.util.module_from_spec(spec)
+              sys.modules[spec.name] = mod
+              try:
+                  spec.loader.exec_module(mod)
+              except Exception:
+                  sys.modules.pop(spec.name, None)
+                  raise
+              return mod
+
+
+          def load_schedule(path: Path):
+              rows = read_csv(path)
+              if not rows:
+                  raise ValueError("empty schedule source")
+              required = {
+                  "game_id", "season", "game_type", "week", "gameday", "gametime",
+                  "away_team", "home_team", "away_score", "home_score",
+              }
+              missing = required - set(rows[0])
+              if missing:
+                  raise KeyError(f"schedule missing columns: {sorted(missing)}")
+
+              games = {}
+              for row in rows:
+                  try:
+                      season = int(row["season"])
+                      week = int(row["week"])
+                  except (TypeError, ValueError):
+                      continue
+                  if season != SEASON or str(row["game_type"]).upper() != "REG":
+                      continue
+
+                  gid = str(row["game_id"]).strip()
+                  if not gid:
+                      raise ValueError("blank 2026 REG game_id")
+                  if gid in games:
+                      raise ValueError(f"duplicate game_id: {gid}")
+
+                  away = canon_team(row["away_team"])
+                  home = canon_team(row["home_team"])
+                  if away == home:
+                      raise ValueError(f"same-team game: {gid}")
+
+                  games[gid] = Game(
+                      game_id=gid,
+                      season=season,
+                      week=week,
+                      kickoff_utc=parse_kickoff_utc(row["gameday"], row["gametime"]),
+                      away_team=away,
+                      home_team=home,
+                      completed=(
+                          not is_blank(row["away_score"])
+                          and not is_blank(row["home_score"])
+                      ),
+                  )
+
+              if len(games) < 250:
+                  raise ValueError(f"implausibly few 2026 REG schedule games: {len(games)}")
+              return games
+
+
+          def origin_cutoff(games, origin_week: int) -> datetime:
+              rows = [g for g in games.values() if g.week == origin_week]
+              if not rows:
+                  raise ValueError(f"missing Week {origin_week} schedule rows")
+              return min(g.kickoff_utc for g in rows)
+
+
+          def source_readiness(games, origin_week: int, cutoff: datetime):
+              hweeks = history_weeks(origin_week)
+              target_games = sorted(
+                  [g for g in games.values() if g.week == origin_week],
+                  key=lambda g: (g.kickoff_utc, g.game_id),
+              )
+              if not target_games:
+                  raise ValueError(f"missing Week {origin_week} schedule rows")
+
+              now = datetime.now(timezone.utc)
+              if not now < cutoff:
+                  raise RuntimeError(
+                      f"ORIGIN_WEEK_{origin_week}_FREEZE_DEADLINE_MISSED: "
+                      f"now={now.isoformat()} cutoff={cutoff.isoformat()}"
+                  )
+
+              completed_target = [g.game_id for g in target_games if g.completed]
+              if completed_target:
+                  raise RuntimeError(
+                      f"ORIGIN_WEEK_{origin_week}_OUTCOME_ALREADY_PRESENT_NO_BACKFILL: "
+                      + ",".join(completed_target)
+                  )
+
+              history_candidates = sorted(
+                  [
+                      g for g in games.values()
+                      if g.week in hweeks and g.kickoff_utc < cutoff
+                  ],
+                  key=lambda g: (g.week, g.kickoff_utc, g.game_id),
+              )
+              incomplete_history = [g.game_id for g in history_candidates if not g.completed]
+              if incomplete_history:
+                  raise RuntimeError(
+                      "ELIGIBLE_HISTORY_NOT_COMPLETE_DO_NOT_FREEZE: "
+                      + ",".join(incomplete_history[:30])
+                  )
+
+              excluded_post_cutoff = sorted(
+                  g.game_id
+                  for g in games.values()
+                  if g.week in hweeks and g.kickoff_utc >= cutoff
+              )
+
+              return {
+                  "origin_week": origin_week,
+                  "history_week_start": min(hweeks),
+                  "history_week_end": max(hweeks),
+                  "history_candidate_games": len(history_candidates),
+                  "history_incomplete_games": 0,
+                  "history_post_cutoff_games_excluded": excluded_post_cutoff,
+                  "origin_week_scheduled_games": len(target_games),
+                  "origin_week_completed_games_at_freeze": 0,
+                  "origin_cutoff_utc": cutoff.isoformat(),
+                  "freeze_runtime_utc": now.isoformat(),
+              }
+
+
+          def parse_numeric_fields(row, fields):
+              for field in fields:
+                  value = row.get(field)
+                  if is_blank(value):
+                      continue
+                  try:
+                      x = float(value)
+                  except (TypeError, ValueError) as exc:
+                      raise ValueError(
+                          f"non-numeric frozen scoring field {field}={value!r}"
+                      ) from exc
+                  if not math.isfinite(x):
+                      raise ValueError(f"non-finite frozen scoring field {field}")
+
+
+          def adapt_stats(path: Path, games, frozen, origin_week: int, cutoff: datetime):
+              rows = read_csv(path)
+              if not rows:
+                  raise ValueError("empty 2026 weekly stats source")
+
+              fields = set(rows[0])
+              required = {
+                  "player_id", "game_id", "season", "week", "season_type", "position",
+              }
+              missing = required - fields
+              if missing:
+                  raise KeyError(f"2026 stats missing context fields: {sorted(missing)}")
+              if "team" not in fields and "recent_team" not in fields:
+                  raise KeyError("2026 stats missing team/recent_team")
+              missing_scoring = set(frozen.STAT_FIELDS) - fields
+              if missing_scoring:
+                  raise KeyError(
+                      f"2026 stats missing frozen scoring fields: {sorted(missing_scoring)}"
+                  )
+
+              hweeks = set(history_weeks(origin_week))
+              adapted = []
+              duplicate_guard = set()
+              audit = defaultdict(int)
+
+              for row in rows:
+                  try:
+                      season = int(row["season"])
+                      week = int(row["week"])
+                  except (TypeError, ValueError):
+                      continue
+                  if season != SEASON:
+                      continue
+                  audit["source_rows_seen_2026"] += 1
+
+                  if str(row["season_type"]).upper() not in {"REG", "REGULAR"}:
+                      audit["nonregular_rows_skipped"] += 1
+                      continue
+
+                  if week not in hweeks:
+                      audit["rows_outside_frozen_history_window_excluded"] += 1
+                      continue
+
+                  gid = str(row["game_id"]).strip()
+                  game = games.get(gid)
+                  if game is None:
+                      raise KeyError(f"stats game_id absent from schedule: {gid}")
+                  if game.week != week or game.season != SEASON:
+                      raise ValueError(f"stats/schedule season-week mismatch: {gid}")
+                  if game.kickoff_utc >= cutoff:
+                      audit["post_cutoff_rows_physically_excluded"] += 1
+                      continue
+                  if not game.completed:
+                      raise ValueError(
+                          f"stats row exists for schedule-uncompleted game: {gid}"
+                      )
+
+                  recent = row.get("recent_team")
+                  team_raw = row.get("team")
+                  if not is_blank(recent) and not is_blank(team_raw):
+                      a = canon_team(recent)
+                      b = canon_team(team_raw)
+                      if a != b:
+                          raise ValueError(
+                              f"conflicting recent_team/team in {gid}: {a} vs {b}"
+                          )
+                      team = a
+                  elif not is_blank(recent):
+                      team = canon_team(recent)
+                  elif not is_blank(team_raw):
+                      team = canon_team(team_raw)
+                  else:
+                      raise ValueError(f"blank team identity: {gid}")
+
+                  if team not in {game.away_team, game.home_team}:
+                      raise ValueError(
+                          f"player team {team} not in scheduled game {gid}"
+                      )
+
+                  if "opponent_team" in fields and not is_blank(row.get("opponent_team")):
+                      opp = canon_team(row["opponent_team"])
+                      if opp != game.opponent(team):
+                          raise ValueError(
+                              f"opponent mismatch {gid}: row={opp} "
+                              f"schedule={game.opponent(team)}"
+                          )
+                      audit["opponent_schedule_checks"] += 1
+
+                  pg = canon_position(row.get("position_group"))
+                  p = canon_position(row.get("position"))
+                  if pg is not None and p is not None and pg != p:
+                      raise ValueError(
+                          f"canonical position conflict {gid}: {pg} vs {p}"
+                      )
+                  pos = pg or p
+
+                  parse_numeric_fields(row, frozen.STAT_FIELDS)
+
+                  player_id = str(row.get("player_id") or "").strip()
+                  if not player_id:
+                      audit["blank_player_id_rows_seen"] += 1
+                      if pos in POSITIONS:
+                          raise ValueError(
+                              f"blank player_id on canonical {pos} row in {gid}"
+                          )
+                      audit["blank_player_id_noncanonical_excluded"] += 1
+                      continue
+
+                  dup = (gid, team, player_id)
+                  if dup in duplicate_guard:
+                      raise ValueError(f"duplicate player-game-team row: {dup}")
+                  duplicate_guard.add(dup)
+
+                  out = dict(row)
+                  out["season"] = SEASON
+                  out["week"] = week
+                  out["season_type"] = "REG"
+                  out["recent_team"] = team
+                  out["_canonical_position"] = pos
+                  adapted.append(out)
+                  audit["rows_admitted_frozen_history_window"] += 1
+
+              if not adapted:
+                  raise ValueError("no admitted predictor rows in frozen history window")
+
+              return adapted, dict(audit)
+
+
+          def aggregate_history(
+              player_rows, games, frozen, origin_week: int, cutoff: datetime
+          ):
+              by_team_game = defaultdict(list)
+              totals = defaultdict(float)
+              counts = defaultdict(int)
+
+              for row in player_rows:
+                  gid = str(row["game_id"])
+                  team = str(row["recent_team"])
+                  by_team_game[(gid, team)].append(row)
+                  pos = row["_canonical_position"]
+                  if pos in POSITIONS:
+                      key = (gid, team, pos)
+                      totals[key] += frozen.score_player_row(row, SCORING_MODE)
+                      counts[key] += 1
+
+              hweeks = set(history_weeks(origin_week))
+              history_games = sorted(
+                  [
+                      g for g in games.values()
+                      if g.completed
+                      and g.week in hweeks
+                      and g.kickoff_utc < cutoff
+                  ],
+                  key=lambda g: (g.week, g.kickoff_utc, g.game_id),
+              )
+
+              source_failures = []
+              zero_fills = defaultdict(int)
+              out = []
+
+              for game in history_games:
+                  for offense, defense in (
+                      (game.away_team, game.home_team),
+                      (game.home_team, game.away_team),
+                  ):
+                      team_rows = by_team_game.get((game.game_id, offense), [])
+                      if not team_rows:
+                          source_failures.append({
+                              "game_id": game.game_id,
+                              "team": offense,
+                              "reason": "NO_WEEKLY_PLAYER_STAT_ROWS",
+                          })
+                          continue
+
+                      for pos in POSITIONS:
+                          key = (game.game_id, offense, pos)
+                          if counts.get(key, 0) == 0:
+                              points = 0.0
+                              zero_fills[pos] += 1
+                          else:
+                              points = totals[key]
+
+                          out.append(
+                              frozen.GamePositionPoints(
+                                  season=SEASON,
+                                  week=game.week,
+                                  offense_team=offense,
+                                  defense_team=defense,
+                                  position=pos,
+                                  scoring_mode=SCORING_MODE,
+                                  points=points,
+                              )
+                          )
+
+              if source_failures:
+                  raise RuntimeError(
+                      "WEEKLY_STATS_NOT_READY_FOR_ALL_COMPLETED_HISTORY_GAMES: "
+                      + json.dumps(source_failures[:20], sort_keys=True)
+                  )
+
+              expected = len(history_games) * 2 * len(POSITIONS)
+              if len(out) != expected:
+                  raise RuntimeError(
+                      f"history aggregate mismatch: {len(out)} != {expected}"
+                  )
+
+              return out, {
+                  "history_week_start": min(hweeks),
+                  "history_week_end": max(hweeks),
+                  "history_games": len(history_games),
+                  "team_position_history_rows": len(out),
+                  "zero_fills": dict(sorted(zero_fills.items())),
+                  "source_completeness_failures": 0,
+              }
+
+
+          def offense_baselines(game_rows, position):
+              by_offense = defaultdict(list)
+              for r in game_rows:
+                  if r.position == position and r.scoring_mode == SCORING_MODE:
+                      by_offense[r.offense_team].append(float(r.points))
+
+              out = {}
+              for team, values in sorted(by_offense.items()):
+                  out[team] = {
+                      "status": (
+                          "AVAILABLE" if len(values) >= 2
+                          else "UNAVAILABLE_LT2_GAMES"
+                      ),
+                      "eligible_games": len(values),
+                      "baseline_points": (
+                          statistics.fmean(values) if len(values) >= 2 else None
+                      ),
+                  }
+              return out
+
+
+          def future_schedule_at_origin(games, origin_week: int, cutoff: datetime):
+              future = sorted(
+                  [
+                      g for g in games.values()
+                      if origin_week <= g.week <= 17
+                      and g.kickoff_utc >= cutoff
+                  ],
+                  key=lambda g: (g.kickoff_utc, g.game_id),
+              )
+
+              per_team = defaultdict(list)
+              for game in future:
+                  per_team[game.away_team].append((game, game.home_team))
+                  per_team[game.home_team].append((game, game.away_team))
+
+              team_h = {}
+              for team, entries in per_team.items():
+                  entries = sorted(
+                      entries, key=lambda x: (x[0].kickoff_utc, x[0].game_id)
+                  )
+                  for i, (game, opponent) in enumerate(entries, start=1):
+                      team_h[(game.game_id, team)] = i
+
+              rows = []
+              for game in future:
+                  for offense, defense in (
+                      (game.away_team, game.home_team),
+                      (game.home_team, game.away_team),
+                  ):
+                      rows.append({
+                          "game_id": game.game_id,
+                          "scheduled_week_at_origin": game.week,
+                          "scheduled_kickoff_utc_at_origin": game.kickoff_utc.isoformat(),
+                          "offense_team": offense,
+                          "defense_team": defense,
+                          "planned_h_at_origin": team_h[(game.game_id, offense)],
+                      })
+              return rows
+
+
+          def build_snapshot(
+              schedule_path, stats_path, frozen_path, b33_path, origin_week: int
+          ):
+              if origin_week < 5 or origin_week > 17:
+                  raise RuntimeError("origin_week must be within preregistered range 5..17")
+
+              b33 = json.loads(Path(b33_path).read_text(encoding="utf-8"))
+              if b33["status"] != "PREREGISTERED_ORDINAL_PROSPECTIVE_SHADOW":
+                  raise RuntimeError("B33 is not frozen preregistered")
+              contract = b33["prospective_origin_contract"]
+              if contract["first_candidate_origin_week"] != 5:
+                  raise RuntimeError("B33 first origin is not Week 5")
+              if contract["last_candidate_origin_week"] != 17:
+                  raise RuntimeError("B33 last origin is not Week 17")
+              if contract["primary_origin_count_required"] != 10:
+                  raise RuntimeError("B33 origin-count requirement drift")
+              if contract["missed_origin_rule"] != (
+                  "a snapshot not committed before first actual kickoff is permanently "
+                  "ineligible and cannot be reconstructed or backfilled"
+              ):
+                  raise RuntimeError("B33 missed-origin rule drift")
+
+              frozen = load_frozen(Path(frozen_path))
+              if frozen.METRIC_ID != "LOG-SAPA-V1":
+                  raise RuntimeError("wrong frozen metric")
+              if frozen.LOOKBACK_WEEKS != 10:
+                  raise RuntimeError("frozen lookback changed")
+              if frozen.MIN_OPPONENT_COMPARISON_GAMES != 2:
+                  raise RuntimeError("frozen opponent minimum changed")
+              if frozen.MIN_DEFENSE_ADJUSTED_GAMES != 3:
+                  raise RuntimeError("frozen defense minimum changed")
+
+              games = load_schedule(Path(schedule_path))
+              cutoff = origin_cutoff(games, origin_week)
+              readiness = source_readiness(games, origin_week, cutoff)
+
+              player_rows, stats_audit = adapt_stats(
+                  Path(stats_path), games, frozen, origin_week, cutoff
+              )
+              game_rows, aggregate_audit = aggregate_history(
+                  player_rows, games, frozen, origin_week, cutoff
+              )
+
+              position_payload = {}
+              for pos in POSITIONS:
+                  baselines = offense_baselines(game_rows, pos)
+                  defense_snapshot = frozen.compute_log_sapa(
+                      game_rows,
+                      season=SEASON,
+                      target_week=origin_week,
+                      position=pos,
+                      scoring_mode=SCORING_MODE,
+                  )
+
+                  position_payload[pos] = {
+                      "offense_baselines": baselines,
+                      "defense_snapshot": defense_snapshot,
+                      "available_offense_baselines": sum(
+                          x["status"] == "AVAILABLE" for x in baselines.values()
+                      ),
+                      "available_defense_effects": sum(
+                          x.get("status") == "AVAILABLE"
+                          for x in defense_snapshot.values()
+                      ),
+                  }
+
+              future_rows = future_schedule_at_origin(games, origin_week, cutoff)
+
+              h1 = [r for r in future_rows if r["planned_h_at_origin"] == 1]
+              h1_availability = {}
+              for pos in POSITIONS:
+                  available = 0
+                  missing = []
+                  payload = position_payload[pos]
+                  for r in h1:
+                      base = payload["offense_baselines"].get(r["offense_team"], {})
+                      deff = payload["defense_snapshot"].get(r["defense_team"], {})
+                      ok = (
+                          base.get("status") == "AVAILABLE"
+                          and deff.get("status") == "AVAILABLE"
+                          and deff.get("defense_effect") is not None
+                      )
+                      if ok:
+                          available += 1
+                      else:
+                          missing.append({
+                              "game_id": r["game_id"],
+                              "offense_team": r["offense_team"],
+                              "defense_team": r["defense_team"],
+                              "baseline_status": base.get("status", "MISSING"),
+                              "defense_status": deff.get("status", "MISSING"),
+                          })
+                  h1_availability[pos] = {
+                      "expected_directional_rows": len(h1),
+                      "predictor_available_rows": available,
+                      "availability_fraction": (
+                          available / len(h1) if h1 else None
+                      ),
+                      "missing": missing,
+                  }
+
+              hweeks = history_weeks(origin_week)
+              return {
+                  "schema_version": 2,
+                  "study_id": "schedule-utility-v1",
+                  "phase": "B51-reusable-weekly-prospective-origin-snapshot",
+                  "status": "FROZEN_PROSPECTIVE_ORIGIN_SNAPSHOT",
+                  "season": SEASON,
+                  "origin_week": origin_week,
+                  "origin_cutoff_utc": cutoff.isoformat(),
+                  "history_weeks": list(hweeks),
+                  "scoring_mode": SCORING_MODE,
+                  "visibility": "NON_USER_VISIBLE",
+                  "outcome_evaluation_performed": False,
+                  "production_authorized": False,
+                  "quantitative_v1_stop_remains_binding": True,
+                  "source_snapshot": {
+                      "schedule_sha256": sha256(Path(schedule_path)),
+                      "stats_player_week_2026_sha256": sha256(Path(stats_path)),
+                      "log_sapa_sha256": sha256(Path(frozen_path)),
+                      "b33_prereg_sha256": sha256(Path(b33_path)),
+                  },
+                  "readiness": readiness,
+                  "stats_ingestion_audit": stats_audit,
+                  "history_aggregation_audit": aggregate_audit,
+                  "position_snapshots": position_payload,
+                  "future_schedule_at_origin": future_rows,
+                  "planned_h1_predictor_availability": h1_availability,
+                  "governance": {
+                      "snapshot_created_before_origin_cutoff": True,
+                      "eligible_history_complete_before_snapshot": True,
+                      "origin_week_outcomes_present_at_snapshot": False,
+                      "no_backfill": True,
+                      "baseline_and_defense_effect_frozen_for_future_targets": True,
+                      "may_recompute_predictor_after_outcomes": False,
+                      "may_change_tiers_or_thresholds": False,
+                      "user_facing_display_authorized": False,
+                      "fv_or_trade_integration_authorized": False,
+                  },
+              }
+
+
+          def selftest():
+              assert canon_team("JAC") == "JAX"
+              assert canon_team("WSH") == "WAS"
+              assert canon_position("FB") == "RB"
+              assert canon_position("K") is None
+              assert history_weeks(5) == (1, 2, 3, 4)
+              assert history_weeks(11) == tuple(range(1, 11))
+              assert history_weeks(12) == tuple(range(2, 12))
+              dt = parse_kickoff_utc("2026-10-08", "20:15")
+              assert dt == datetime.fromisoformat("2026-10-09T00:15:00+00:00")
+              print("PASS: B51 reusable Schedule Utility builder synthetic selftest")
+
+
+          def main():
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--selftest", action="store_true")
+              ap.add_argument("--schedule")
+              ap.add_argument("--stats")
+              ap.add_argument("--frozen")
+              ap.add_argument("--b33")
+              ap.add_argument("--origin-week", type=int)
+              ap.add_argument("--out")
+              args = ap.parse_args()
+
+              if args.selftest:
+                  selftest()
+                  return
+
+              for name in ("schedule", "stats", "frozen", "b33", "origin_week", "out"):
+                  if getattr(args, name) is None:
+                      ap.error(f"--{name.replace('_', '-')} is required")
+
+              result = build_snapshot(
+                  args.schedule,
+                  args.stats,
+                  args.frozen,
+                  args.b33,
+                  args.origin_week,
+              )
+              out = Path(args.out)
+              out.write_text(
+                  json.dumps(result, indent=2, sort_keys=True) + "\n",
+                  encoding="utf-8",
+              )
+
+              print(json.dumps({
+                  "status": result["status"],
+                  "origin_week": result["origin_week"],
+                  "origin_cutoff_utc": result["origin_cutoff_utc"],
+                  "freeze_runtime_utc": result["readiness"]["freeze_runtime_utc"],
+                  "history_weeks": result["history_weeks"],
+                  "history_games": result["history_aggregation_audit"]["history_games"],
+                  "h1_availability": {
+                      p: result["planned_h1_predictor_availability"][p][
+                          "availability_fraction"
+                      ]
+                      for p in POSITIONS
+                  },
+                  "production_authorized": False,
+                  "outcome_evaluation_performed": False,
+              }, indent=2))
+
+
+          if __name__ == "__main__":
+              main()
+          PYBUILDER
+
+          python3 -m py_compile "$BUILDER"
+          test "$(sha256sum "$BUILDER" | awk '{print $1}')" = "$B51_BUILDER_SHA256"
+          python3 "$BUILDER" --selftest
+
+      - name: Build fresh preregistered weekly origin snapshot
+        if: env.ALREADY_FROZEN != 'true' && env.SEASON_COMPLETE != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p research/schedule-utility-v1/prospective-snapshots
+
+          python3 "$RUNNER_TEMP/schedule-utility-v1/b51_reusable_builder.py"             --schedule "$RUNNER_TEMP/schedule-utility-v1/games.csv"             --stats "$RUNNER_TEMP/schedule-utility-v1/stats_player_week_2026.csv"             --frozen "$RUNNER_TEMP/schedule-utility-v1/log_sapa_v1.py"             --b33 research/schedule-utility-v1/schedule_utility_v1_b33_ordinal_prospective_shadow_prereg.json             --origin-week "$TARGET_WEEK"             --out "$SNAP_PATH"
+
+      - name: Validate snapshot and write immutable manifest
+        if: env.ALREADY_FROZEN != 'true' && env.SEASON_COMPLETE != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from datetime import datetime
+          from pathlib import Path
+
+          target = int(os.environ["TARGET_WEEK"])
+          snap_path = Path(os.environ["SNAP_PATH"])
+          manifest_path = Path(os.environ["MANIFEST_PATH"])
+          cutoff_expected = os.environ["ORIGIN_CUTOFF_UTC"]
+          workflow_path = Path(".github/workflows/B51-v1-schedule-utility-v1-reusable-weekly-prospective-snapshot-freezer.yml")
+          builder_path = Path(os.environ["RUNNER_TEMP"]) / "schedule-utility-v1/b51_reusable_builder.py"
+
+          snap = json.loads(snap_path.read_text(encoding="utf-8"))
+
+          assert snap["schema_version"] == 2
+          assert snap["study_id"] == "schedule-utility-v1"
+          assert snap["phase"] == "B51-reusable-weekly-prospective-origin-snapshot"
+          assert snap["status"] == "FROZEN_PROSPECTIVE_ORIGIN_SNAPSHOT"
+          assert snap["season"] == 2026
+          assert snap["origin_week"] == target
+          assert snap["origin_cutoff_utc"] == cutoff_expected
+          assert snap["scoring_mode"] == "HALF_PPR"
+          assert snap["visibility"] == "NON_USER_VISIBLE"
+          assert snap["outcome_evaluation_performed"] is False
+          assert snap["production_authorized"] is False
+          assert snap["quantitative_v1_stop_remains_binding"] is True
+
+          expected_history = list(range(max(1, target - 10), target))
+          assert snap["history_weeks"] == expected_history
+
+          ready = snap["readiness"]
+          assert ready["origin_week"] == target
+          assert ready["history_incomplete_games"] == 0
+          assert ready["origin_week_completed_games_at_freeze"] == 0
+          assert ready["origin_cutoff_utc"] == cutoff_expected
+
+          hist = snap["history_aggregation_audit"]
+          assert hist["source_completeness_failures"] == 0
+          assert hist["history_week_start"] == min(expected_history)
+          assert hist["history_week_end"] == max(expected_history)
+          assert hist["history_games"] > 0
+
+          gov = snap["governance"]
+          assert gov["snapshot_created_before_origin_cutoff"] is True
+          assert gov["eligible_history_complete_before_snapshot"] is True
+          assert gov["origin_week_outcomes_present_at_snapshot"] is False
+          assert gov["no_backfill"] is True
+          assert gov["may_recompute_predictor_after_outcomes"] is False
+          assert gov["user_facing_display_authorized"] is False
+          assert gov["fv_or_trade_integration_authorized"] is False
+
+          future = snap["future_schedule_at_origin"]
+          assert future
+          assert all(target <= int(r["scheduled_week_at_origin"]) <= 17 for r in future)
+          assert all(int(r["planned_h_at_origin"]) >= 1 for r in future)
+
+          for pos, payload in snap["planned_h1_predictor_availability"].items():
+              assert pos in {"QB", "RB", "WR", "TE"}
+              assert payload["expected_directional_rows"] > 0
+              assert 0 <= payload["predictor_available_rows"] <= payload["expected_directional_rows"]
+              frac = payload["availability_fraction"]
+              assert frac is None or 0 <= frac <= 1
+
+          h = hashlib.sha256(snap_path.read_bytes()).hexdigest()
+          workflow_sha = hashlib.sha256(workflow_path.read_bytes()).hexdigest()
+          builder_sha = hashlib.sha256(builder_path.read_bytes()).hexdigest()
+
+          manifest = {
+              "schema_version": 2,
+              "study_id": "schedule-utility-v1",
+              "season": 2026,
+              "origin_week": target,
+              "snapshot_path": str(snap_path),
+              "snapshot_sha256": h,
+              "origin_cutoff_utc": snap["origin_cutoff_utc"],
+              "freeze_runtime_utc": ready["freeze_runtime_utc"],
+              "source_snapshot": snap["source_snapshot"],
+              "outcome_evaluation_performed": False,
+              "production_authorized": False,
+              "may_overwrite_snapshot": False,
+              "workflow_path": str(workflow_path),
+              "workflow_sha256": workflow_sha,
+              "workflow_head_sha": os.environ["MAIN_AT_START"],
+              "builder_sha256": builder_sha,
+              "b34_reference_builder_sha256": os.environ["B34_REFERENCE_BUILDER_SHA256"],
+              "b33_prereg_sha256": os.environ["B33_PREREG_SHA256"],
+              "log_sapa_sha256": os.environ["LOG_SAPA_SHA256"],
+          }
+          manifest_path.write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          print("PASS: reusable Schedule Utility snapshot validated.")
+          print("Origin week:", target)
+          print("Snapshot SHA256:", h)
+          print("Builder SHA256:", builder_sha)
+          PY
+
+      - name: Guard production surfaces and raw-source persistence
+        if: env.ALREADY_FROZEN != 'true' && env.SEASON_COMPLETE != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(sha256sum index.html | awk '{print $1}')" = "$INDEX_SHA_BEFORE"
+          test "$(sha256sum free-agent-board.html | awk '{print $1}')" = "$FA_SHA_BEFORE"
+          test -z "$(git diff --name-only -- index.html free-agent-board.html)"
+
+          test ! -e research/schedule-utility-v1/games.csv
+          test ! -e research/schedule-utility-v1/stats_player_week_2026.csv
+
+          CHANGED="$(git status --porcelain=v1 --untracked-files=all | awk '{print $2}' | sort)"
+          EXPECTED="$(printf '%s\n%s\n' "$MANIFEST_PATH" "$SNAP_PATH" | sort)"
+          test "$CHANGED" = "$EXPECTED"
+
+      - name: Commit immutable weekly prospective snapshot
+        if: env.ALREADY_FROZEN != 'true' && env.SEASON_COMPLETE != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git add "$SNAP_PATH" "$MANIFEST_PATH"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Freeze Schedule Utility V1 Week $TARGET_WEEK prospective origin snapshot"
+
+          check_push_cutoff() {
+            python3 - <<'PY'
+          import os
+          from datetime import datetime, timezone
+
+          cutoff = datetime.fromisoformat(os.environ["ORIGIN_CUTOFF_UTC"])
+          if cutoff.tzinfo is None:
+              cutoff = cutoff.replace(tzinfo=timezone.utc)
+          else:
+              cutoff = cutoff.astimezone(timezone.utc)
+          if not datetime.now(timezone.utc) < cutoff:
+              raise SystemExit("PUSH_AFTER_CUTOFF_NO_BACKFILL")
+          print("PASS: still before origin cutoff immediately before push.")
+          PY
+          }
+
+          check_push_cutoff
+
+          if ! git push origin HEAD:main; then
+            echo "Initial push raced another main writer; rebasing once."
+            git pull --rebase origin main
+            check_push_cutoff
+            git push origin HEAD:main
+          fi
+
+      - name: Closeout
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if test "$SEASON_COMPLETE" = "true" && test "$ALREADY_FROZEN" != "true"; then
+            echo "PASS: Schedule Utility V1 2026 prospective capture window is complete through Week 17."
+            exit 0
+          fi
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          snap = Path(os.environ["SNAP_PATH"])
+          manifest = Path(os.environ["MANIFEST_PATH"])
+          assert snap.exists() and manifest.exists()
+
+          s = json.loads(snap.read_text(encoding="utf-8"))
+          m = json.loads(manifest.read_text(encoding="utf-8"))
+          assert hashlib.sha256(snap.read_bytes()).hexdigest() == m["snapshot_sha256"]
+          assert s["outcome_evaluation_performed"] is False
+          assert s["production_authorized"] is False
+          assert m["outcome_evaluation_performed"] is False
+          assert m["production_authorized"] is False
+          assert m["may_overwrite_snapshot"] is False
+
+          print("=== B51 SCHEDULE UTILITY WEEKLY FREEZER ===")
+          print("Origin week:", m["origin_week"])
+          print("Already frozen on entry:", os.environ["ALREADY_FROZEN"])
+          print("Snapshot SHA256:", m["snapshot_sha256"])
+          print("Outcome evaluation performed: NO")
+          print("Production authorized: NO")
+          PY
