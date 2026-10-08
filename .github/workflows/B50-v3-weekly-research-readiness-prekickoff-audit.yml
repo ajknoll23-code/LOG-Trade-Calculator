@@ -1,0 +1,684 @@
+name: B50 V3 Weekly Research Readiness - Pre-Kickoff Audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_week:
+        description: '2026 NFL week to audit; auto uses the current NFL schedule with durable repo fallbacks'
+        required: true
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - '5'
+          - '6'
+          - '7'
+          - '8'
+          - '9'
+          - '10'
+          - '11'
+          - '12'
+          - '13'
+          - '14'
+          - '15'
+          - '16'
+          - '17'
+          - '18'
+      fail_on_advisories:
+        description: 'If true, advisory misses also make the workflow red'
+        required: true
+        default: false
+        type: boolean
+  schedule:
+    # Wednesday + Thursday 17:07 UTC = 10:07 AM Arizona. Wednesday is the
+    # normal readiness check; Thursday is the last practical no-backfill safety check.
+    # The :07 offset avoids the busiest top-of-hour scheduling window.
+    - cron: '7 17 * * 3,4'
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: weekly-research-readiness-v1
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+  TARGET_SEASON: '2026'
+
+jobs:
+  readiness-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      REQUESTED_TARGET_WEEK: ${{ github.event_name == 'workflow_dispatch' && inputs.target_week || 'auto' }}
+      FAIL_ON_ADVISORIES: ${{ github.event_name == 'workflow_dispatch' && inputs.fail_on_advisories || false }}
+
+    steps:
+      - name: Check out durable main read-only
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 50
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Run weekly research readiness audit
+        id: audit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > "${RUNNER_TEMP}/weekly_research_readiness.py" <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import io
+          import json
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from datetime import datetime, timedelta, timezone
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+
+          ROOT = Path.cwd()
+          SEASON = int(os.environ.get("TARGET_SEASON", "2026"))
+          REQUESTED = str(os.environ.get("REQUESTED_TARGET_WEEK", "auto")).strip().lower()
+          FAIL_ON_ADVISORIES = str(os.environ.get("FAIL_ON_ADVISORIES", "false")).lower() == "true"
+          TOKEN = os.environ.get("GITHUB_TOKEN", "")
+          REPO = os.environ.get("REPO", "")
+          NOW = datetime.now(timezone.utc)
+          REPORT_PATH = Path(os.environ["RUNNER_TEMP"]) / "weekly-research-readiness-report.json"
+
+          rows = []
+
+          def parse_dt(value):
+              if value is None:
+                  return None
+              s = str(value).strip()
+              if not s:
+                  return None
+              if s.endswith("Z"):
+                  s = s[:-1] + "+00:00"
+              dt = datetime.fromisoformat(s)
+              if dt.tzinfo is None:
+                  dt = dt.replace(tzinfo=timezone.utc)
+              return dt.astimezone(timezone.utc)
+
+          def sha256(path: Path) -> str:
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          def load_json(path: Path):
+              return json.loads(path.read_text(encoding="utf-8"))
+
+          def add(name, severity, ok, detail, remediation=""):
+              rows.append({
+                  "name": name,
+                  "severity": severity,
+                  "pass": bool(ok),
+                  "detail": str(detail),
+                  "remediation": str(remediation),
+              })
+
+          def weeks_from(d):
+              for key in (
+                  "completed_consecutive_weeks_used",
+                  "completed_prefix_weeks",
+                  "completed_weeks",
+                  "completed_outcome_weeks",
+                  "available_completed_eligible_weeks",
+                  "evaluated_weeks",
+                  "weeks_evaluated",
+              ):
+                  v = d.get(key)
+                  if isinstance(v, list):
+                      out = []
+                      for x in v:
+                          try:
+                              out.append(int(x))
+                          except Exception:
+                              pass
+                      if out:
+                          return sorted(set(out))
+              return []
+
+          def api_json(url):
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {TOKEN}",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "LOG-Trade-Calculator-weekly-readiness-v3",
+                  },
+              )
+              with urllib.request.urlopen(req, timeout=20) as resp:
+                  return json.loads(resp.read().decode("utf-8"))
+
+          def workflow_runs(filename, limit=20):
+              if not REPO:
+                  return []
+              q = urllib.parse.quote(filename, safe="")
+              url = f"https://api.github.com/repos/{REPO}/actions/workflows/{q}/runs?per_page={limit}"
+              try:
+                  payload = api_json(url)
+                  return list(payload.get("workflow_runs") or [])
+              except urllib.error.HTTPError as e:
+                  if e.code == 404:
+                      return []
+                  return None
+              except Exception:
+                  return None
+
+          def latest_run_check(filename, label, max_success_age_hours, severity="ADVISORY"):
+              runs = workflow_runs(filename)
+              if runs is None:
+                  add(
+                      label,
+                      severity,
+                      False,
+                      f"Could not query Actions API for {filename}.",
+                      "Re-run B50; this is an API/transport issue, not a research failure.",
+                  )
+                  return
+              if not runs:
+                  add(
+                      label,
+                      severity,
+                      False,
+                      f"No Actions run history found for {filename}.",
+                      f"Confirm {filename} is active and run it if this weekly process is still required.",
+                  )
+                  return
+              latest = runs[0]
+              latest_conclusion = latest.get("conclusion")
+              latest_created = parse_dt(latest.get("created_at"))
+              successes = [r for r in runs if r.get("conclusion") == "success"]
+              if not successes:
+                  add(
+                      label,
+                      severity,
+                      False,
+                      f"Latest run={latest_conclusion}; no successful run found in the last {len(runs)} runs.",
+                      f"Inspect and repair {filename}.",
+                  )
+                  return
+              success = successes[0]
+              success_dt = parse_dt(success.get("created_at"))
+              age_h = (NOW - success_dt).total_seconds() / 3600 if success_dt else 999999
+              ok = age_h <= max_success_age_hours
+              detail = (
+                  f"Latest run={latest_conclusion} at {latest_created.isoformat() if latest_created else 'unknown'}; "
+                  f"latest success={success_dt.isoformat() if success_dt else 'unknown'} ({age_h:.1f}h old)."
+              )
+              add(
+                  label,
+                  severity,
+                  ok,
+                  detail,
+                  f"Run or repair {filename}; expected a success within {max_success_age_hours} hours.",
+              )
+
+          def schedule_manifests():
+              base = ROOT / "research/schedule-utility-v1/prospective-snapshots"
+              out = []
+              if not base.exists():
+                  return out
+              for p in sorted(base.glob(f"{SEASON}-W*.manifest.json")):
+                  try:
+                      d = load_json(p)
+                      w = int(d.get("origin_week"))
+                      cutoff = parse_dt(d.get("origin_cutoff_utc"))
+                      out.append((w, cutoff, p, d))
+                  except Exception:
+                      continue
+              return out
+
+          def current_public_schedule_cutoffs():
+              url = "https://github.com/nflverse/nflverse-data/releases/download/schedules/games.csv"
+              req = urllib.request.Request(
+                  url,
+                  headers={"User-Agent": "LOG-Trade-Calculator-weekly-readiness-v3"},
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=20) as resp:
+                      raw = resp.read().decode("utf-8-sig")
+                  rows_csv = csv.DictReader(io.StringIO(raw))
+                  eastern = ZoneInfo("America/New_York")
+                  cutoffs = {}
+                  for row in rows_csv:
+                      try:
+                          season = int(row.get("season") or -1)
+                          week = int(row.get("week") or -1)
+                      except Exception:
+                          continue
+                      if season != SEASON or str(row.get("game_type") or "").upper() != "REG":
+                          continue
+                      if not (5 <= week <= 18):
+                          continue
+                      gameday = str(row.get("gameday") or "").strip()
+                      gametime = str(row.get("gametime") or "").strip()
+                      if not gameday or not gametime:
+                          continue
+                      local = datetime.fromisoformat(f"{gameday}T{gametime}:00").replace(tzinfo=eastern)
+                      kickoff = local.astimezone(timezone.utc)
+                      prior = cutoffs.get(week)
+                      if prior is None or kickoff < prior:
+                          cutoffs[week] = kickoff
+                  if len(cutoffs) < 10:
+                      return None, f"public schedule had implausible coverage: {sorted(cutoffs)}"
+                  return cutoffs, "current nflverse public schedule"
+              except Exception as e:
+                  return None, f"current public schedule unavailable: {type(e).__name__}: {e}"
+
+          def frozen_schedule_cutoffs():
+              p = ROOT / f"research/schedule-utility-v1/prospective-snapshots/{SEASON}-W05.json"
+              if not p.exists():
+                  return {}
+              try:
+                  d = load_json(p)
+                  cutoffs = {}
+                  origin_cutoff = parse_dt(d.get("origin_cutoff_utc"))
+                  if origin_cutoff is not None:
+                      cutoffs[5] = origin_cutoff
+                  for row in d.get("future_schedule_at_origin") or []:
+                      try:
+                          week = int(row.get("scheduled_week_at_origin"))
+                          kickoff = parse_dt(row.get("scheduled_kickoff_utc_at_origin"))
+                      except Exception:
+                          continue
+                      if kickoff is None or not (5 <= week <= 18):
+                          continue
+                      prior = cutoffs.get(week)
+                      if prior is None or kickoff < prior:
+                          cutoffs[week] = kickoff
+                  return cutoffs
+              except Exception:
+                  return {}
+
+          def anchor_schedule_cutoffs():
+              # Last-resort deterministic fallback. It is independent of whether
+              # later weekly snapshots were successfully captured, so one miss
+              # cannot pin auto mode to an old week forever.
+              anchor = None
+              b33 = ROOT / "research/schedule-utility-v1/schedule_utility_v1_b33_ordinal_prospective_shadow_prereg.json"
+              if b33.exists():
+                  try:
+                      d = load_json(b33)
+                      anchor = parse_dt(
+                          d.get("prospective_origin_contract", {}).get("2026_week_5_first_kickoff_utc")
+                      )
+                  except Exception:
+                      anchor = None
+              if anchor is None:
+                  for w, cutoff, _, _ in schedule_manifests():
+                      if w == 5 and cutoff is not None:
+                          anchor = cutoff
+                          break
+              if anchor is None:
+                  anchor = datetime.fromisoformat("2026-10-09T00:15:00+00:00")
+              return {w: anchor + timedelta(days=7 * (w - 5)) for w in range(5, 19)}
+
+          def target_from_cutoffs(cutoffs):
+              for week in sorted(cutoffs):
+                  cutoff = cutoffs[week]
+                  if NOW < cutoff:
+                      return week
+              # If every known cutoff is already in the past, advance one week.
+              # This prevents a partial/stale fallback map from pinning auto mode
+              # forever to its highest recorded origin.
+              return min(max(cutoffs) + 1, 18) if cutoffs else 18
+
+          def infer_target_week():
+              if REQUESTED != "auto":
+                  w = int(REQUESTED)
+                  if not (5 <= w <= 18):
+                      raise RuntimeError(f"TARGET_WEEK_OUT_OF_SCOPE {w}")
+                  return w, "manual workflow_dispatch input", True
+
+              public, public_note = current_public_schedule_cutoffs()
+              if public:
+                  w = target_from_cutoffs(public)
+                  return w, f"auto: {public_note}; next first kickoff is W{w:02d}", True
+
+              frozen = frozen_schedule_cutoffs()
+              # Require broad future-week coverage before trusting this middle
+              # fallback. A partial W05-only map falls through to the independent
+              # deterministic anchor instead of reintroducing the stale-week pin.
+              if frozen and len(frozen) >= 10:
+                  w = target_from_cutoffs(frozen)
+                  return (
+                      w,
+                      f"auto fallback: {public_note}; used frozen W05 Schedule Utility future schedule for W{w:02d}",
+                      False,
+                  )
+
+              anchor = anchor_schedule_cutoffs()
+              w = target_from_cutoffs(anchor)
+              return (
+                  w,
+                  f"auto fallback: {public_note}; used deterministic W05 weekly anchor for W{w:02d}",
+                  False,
+              )
+
+          target_week, target_reason, target_source_current = infer_target_week()
+          previous_week = target_week - 1
+          add(
+              "Target-week schedule inference",
+              "ADVISORY",
+              target_source_current,
+              target_reason,
+              "Re-run B50 when the current public schedule source is reachable; durable repo fallbacks keep week advancement independent of capture success.",
+          )
+
+          # ------------------------------------------------------------------
+          # Critical pre-kickoff freezes for the target week.
+          # ------------------------------------------------------------------
+          b39_base = ROOT / "research/weekly-floor-ceiling-volatility-v1/prospective-snapshots"
+          b39_snap = b39_base / f"{SEASON}-W{target_week:02d}.json"
+          b39_man = b39_base / f"{SEASON}-W{target_week:02d}.manifest.json"
+          if b39_snap.exists() and b39_man.exists():
+              try:
+                  m = load_json(b39_man)
+                  snap = load_json(b39_snap)
+                  freeze = parse_dt(m.get("freeze_runtime_utc"))
+                  kickoff = parse_dt(m.get("first_actual_kickoff_utc"))
+                  hash_ok = m.get("snapshot_sha256") == sha256(b39_snap)
+                  ok = all([
+                      m.get("status") == "PASS_PREKICKOFF_FREEZE",
+                      m.get("origin") == f"{SEASON}-W{target_week:02d}",
+                      m.get("realized_outcomes_read") is False,
+                      m.get("production_change_authorized") is False,
+                      snap.get("origin_week") == target_week,
+                      snap.get("season") == SEASON,
+                      freeze is not None,
+                      kickoff is not None,
+                      freeze < kickoff,
+                      hash_ok,
+                  ])
+                  add(
+                      "B39 floor/ceiling pre-kickoff snapshot",
+                      "CRITICAL",
+                      ok,
+                      f"W{target_week:02d} snapshot present; freeze={freeze}; kickoff={kickoff}; hash_match={hash_ok}.",
+                      f"Run 'B39 Weekly Floor Ceiling Volatility V1 - Reusable Prospective Weekly Capture' with origin_week={target_week} before kickoff.",
+                  )
+              except Exception as e:
+                  add("B39 floor/ceiling pre-kickoff snapshot", "CRITICAL", False, f"Snapshot/manifest validation error: {e}", f"Run B39 for origin_week={target_week} before kickoff.")
+          else:
+              add(
+                  "B39 floor/ceiling pre-kickoff snapshot",
+                  "CRITICAL",
+                  False,
+                  f"Missing {b39_snap.relative_to(ROOT) if not b39_snap.exists() else b39_man.relative_to(ROOT)}.",
+                  f"Run 'B39 Weekly Floor Ceiling Volatility V1 - Reusable Prospective Weekly Capture' with origin_week={target_week} before kickoff.",
+              )
+
+          su_base = ROOT / "research/schedule-utility-v1/prospective-snapshots"
+          su_snap = su_base / f"{SEASON}-W{target_week:02d}.json"
+          su_man = su_base / f"{SEASON}-W{target_week:02d}.manifest.json"
+          if su_snap.exists() and su_man.exists():
+              try:
+                  m = load_json(su_man)
+                  freeze = parse_dt(m.get("freeze_runtime_utc"))
+                  cutoff = parse_dt(m.get("origin_cutoff_utc"))
+                  hash_ok = m.get("snapshot_sha256") == sha256(su_snap)
+                  ok = all([
+                      m.get("study_id") == "schedule-utility-v1",
+                      int(m.get("season")) == SEASON,
+                      int(m.get("origin_week")) == target_week,
+                      m.get("outcome_evaluation_performed") is False,
+                      m.get("production_authorized") is False,
+                      m.get("may_overwrite_snapshot") is False,
+                      freeze is not None,
+                      cutoff is not None,
+                      freeze < cutoff,
+                      hash_ok,
+                  ])
+                  add(
+                      "Schedule Utility V1 pre-kickoff snapshot",
+                      "CRITICAL",
+                      ok,
+                      f"W{target_week:02d} snapshot present; freeze={freeze}; cutoff={cutoff}; hash_match={hash_ok}.",
+                      f"Create/freeze the Schedule Utility V1 W{target_week:02d} origin snapshot before its cutoff.",
+                  )
+              except Exception as e:
+                  add("Schedule Utility V1 pre-kickoff snapshot", "CRITICAL", False, f"Snapshot/manifest validation error: {e}", f"Create/freeze Schedule Utility W{target_week:02d} before kickoff.")
+          else:
+              add(
+                  "Schedule Utility V1 pre-kickoff snapshot",
+                  "CRITICAL",
+                  False,
+                  f"Missing W{target_week:02d} Schedule Utility prospective snapshot or manifest.",
+                  f"Create/freeze Schedule Utility V1 W{target_week:02d} before kickoff.",
+              )
+
+          # ------------------------------------------------------------------
+          # Required prior-week outcome collection. These are recoverable later,
+          # unlike no-backfill snapshots, but B50 treats them as CRITICAL to the
+          # user's definition of "weekly readiness": all due weekly work is current.
+          # The audit only verifies that the completed prior week is durably seen.
+          # ------------------------------------------------------------------
+          evaluator_specs = [
+              ("Production V2 Phase 9", "research/production-v2/production_v2_phase9_evaluation.json"),
+              ("Position Weight V2 Phase 5", "research/position-weight-v2/position_weight_v2_phase5_evaluation.json"),
+              ("Replacement Level V2 Phase 5", "research/replacement-level-v2/replacement_level_v2_phase5_evaluation.json"),
+              ("Age Curve V2 Phase 5", "research/age-curve-v2/age_curve_v2_phase5_evaluation.json"),
+              ("Opportunity V2 Phase 5", "research/opportunity-v2/opportunity_v2_phase5_evaluation.json"),
+              ("No-History Rookie V2 Phase 3", "research/no-history-v2/no_history_v2_phase3_evaluation.json"),
+              ("Durability V2 Phase 5", "research/durability-v2/durability_v2_phase5_evaluation.json"),
+          ]
+          for label, rel in evaluator_specs:
+              p = ROOT / rel
+              if not p.exists():
+                  add(label + " prior-week collection", "CRITICAL", False, f"Missing {rel}.", f"Run/repair the frozen {label} weekly evaluator after Week {previous_week} completes.")
+                  continue
+              try:
+                  d = load_json(p)
+                  weeks = weeks_from(d)
+                  ok = previous_week in weeks
+                  add(
+                      label + " prior-week collection",
+                      "CRITICAL",
+                      ok,
+                      f"Observed completed weeks={weeks}; required prior week={previous_week}.",
+                      f"Run the frozen {label} evaluator so Week {previous_week} is durably included. Do not retune its frozen design.",
+                  )
+              except Exception as e:
+                  add(label + " prior-week collection", "CRITICAL", False, f"Could not validate {rel}: {e}", f"Run/repair the frozen {label} evaluator.")
+
+          if previous_week >= 4:
+              p = ROOT / "research/idp-dl-lb-residual-reconciliation-v1/phase2_evaluation.json"
+              if p.exists():
+                  try:
+                      d = load_json(p)
+                      weeks = weeks_from(d)
+                      ok = previous_week in weeks
+                      add(
+                          "IDP DL/LB Phase 2 prior-week collection",
+                          "CRITICAL",
+                          ok,
+                          f"Available completed eligible weeks={weeks}; required={previous_week}.",
+                          f"Run 'IDP DL-LB Residual Reconciliation V1 - Phase 2 Prospective Validation' after Week {previous_week} completes.",
+                      )
+                  except Exception as e:
+                      add("IDP DL/LB Phase 2 prior-week collection", "CRITICAL", False, f"Validation error: {e}", "Run/repair IDP DL/LB Phase 2.")
+              else:
+                  add("IDP DL/LB Phase 2 prior-week collection", "CRITICAL", False, "phase2_evaluation.json is missing.", "Run/repair IDP DL/LB Phase 2.")
+
+          # ------------------------------------------------------------------
+          # Historical no-backfill continuity. A prior missed origin must never
+          # pin the target week or be silently forgotten. Gaps are advisory here
+          # because they cannot be repaired by backfilling after kickoff.
+          # ------------------------------------------------------------------
+          historical_gaps = []
+          for week in range(5, target_week):
+              b39_s = b39_base / f"{SEASON}-W{week:02d}.json"
+              b39_m = b39_base / f"{SEASON}-W{week:02d}.manifest.json"
+              if not (b39_s.exists() and b39_m.exists()):
+                  historical_gaps.append(f"B39 W{week:02d}")
+              su_s = su_base / f"{SEASON}-W{week:02d}.json"
+              su_m = su_base / f"{SEASON}-W{week:02d}.manifest.json"
+              if not (su_s.exists() and su_m.exists()):
+                  historical_gaps.append(f"Schedule Utility W{week:02d}")
+          add(
+              "Historical no-backfill origin continuity",
+              "ADVISORY",
+              not historical_gaps,
+              "No prior Week 5+ B39/Schedule Utility capture gaps detected." if not historical_gaps else "Prior immutable capture gaps: " + ", ".join(historical_gaps),
+              "Do not backfill a missed pre-kickoff origin. Preserve/document the gap and continue with the current target week.",
+          )
+
+          # ------------------------------------------------------------------
+          # Operational/advisory checks. They do not contaminate or alter frozen
+          # research and do not make the default workflow red by themselves.
+          # ------------------------------------------------------------------
+          active_workflows = list((ROOT / ".github/workflows").glob("*.yml")) + list((ROOT / ".github/workflows").glob("*.yaml"))
+          schedule_capture_active = False
+          for p in active_workflows:
+              if "weekly-research-readiness" in p.name.lower():
+                  continue
+              try:
+                  text = p.read_text(encoding="utf-8", errors="replace")
+              except Exception:
+                  continue
+              if (
+                  "research/schedule-utility-v1/prospective-snapshots" in text
+                  and "git push" in text
+                  and re.search(r"contents:\s*write", text)
+              ):
+                  schedule_capture_active = True
+                  break
+          add(
+              "Active Schedule Utility weekly capture mechanism",
+              "ADVISORY",
+              schedule_capture_active,
+              "An active .github/workflows capture workflow was found." if schedule_capture_active else "No active Schedule Utility prospective snapshot capture workflow is present; the W05 capture appears to have come from a now-archived one-off workflow.",
+              "Before the next week, restore/build a reusable Schedule Utility weekly capture workflow so this readiness audit can verify rather than merely detect a missing snapshot.",
+          )
+
+          # Actions freshness. These are operational health signals rather than
+          # scientific pass/fail gates because the durable artifacts above are
+          # the binding evidence for weekly research completeness.
+          latest_run_check("scheduled-data-refresh.yml", "Scheduled Data Refresh freshness", 84, "ADVISORY")
+          latest_run_check("sync-sleeper.yml", "Sleeper Maintenance freshness", 48, "ADVISORY")
+          latest_run_check("prospective-trade-evidence-capture.yml", "Prospective Trade Evidence Capture freshness", 48, "ADVISORY")
+          latest_run_check("free-agent-utility-v1-refresh.yml", "Free Agent Utility refresh health", 96, "ADVISORY")
+          latest_run_check("market-edge-v1-prospective-study.yml", "Market Edge V1 evaluator health", 192, "ADVISORY")
+
+          # Market Edge is not a pre-kickoff no-backfill gate. Surface only
+          # its research-only governance state; do not print decision/outcome text.
+          me = ROOT / "research/market-edge-v1/market_edge_v1_evaluation.json"
+          if me.exists():
+              try:
+                  d = load_json(me)
+                  add(
+                      "Market Edge V1 collection state",
+                      "ADVISORY",
+                      d.get("production_change_authorized") is False,
+                      f"production_change_authorized={d.get('production_change_authorized')}",
+                      "Keep this study research-only and repair/rerun its evaluator separately if Actions health is red.",
+                  )
+              except Exception as e:
+                  add("Market Edge V1 collection state", "ADVISORY", False, f"Could not parse Market Edge evaluation: {e}", "Inspect Market Edge V1 artifact.")
+
+          critical_failures = [r for r in rows if r["severity"] == "CRITICAL" and not r["pass"]]
+          advisories = [r for r in rows if r["severity"] == "ADVISORY" and not r["pass"]]
+          overall = "PASS"
+          if critical_failures:
+              overall = "FAIL_CRITICAL_READINESS"
+          elif advisories:
+              overall = "PASS_WITH_ADVISORIES"
+
+          report = {
+              "schema_version": 1,
+              "audit_id": "weekly-research-readiness-v1",
+              "season": SEASON,
+              "target_week": target_week,
+              "previous_week_required": previous_week,
+              "target_resolution": target_reason,
+              "audited_at_utc": NOW.isoformat(),
+              "overall": overall,
+              "critical_failure_count": len(critical_failures),
+              "advisory_failure_count": len(advisories),
+              "read_only": True,
+              "production_change_authorized": False,
+              "scientific_design_change_authorized": False,
+              "checks": rows,
+          }
+          REPORT_PATH.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+          # GitHub step summary.
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+              with open(summary_path, "a", encoding="utf-8") as f:
+                  f.write(f"# Weekly Research Readiness — Week {target_week}\n\n")
+                  f.write(f"**Overall:** `{overall}`  \n")
+                  f.write(f"**Target resolution:** {target_reason}  \n")
+                  f.write(f"**Critical failures:** {len(critical_failures)}  \n")
+                  f.write(f"**Advisories:** {len(advisories)}\n\n")
+                  f.write("| Check | Severity | Result | Detail |\n")
+                  f.write("|---|---|---:|---|\n")
+                  for r in rows:
+                      mark = "PASS" if r["pass"] else "FAIL"
+                      detail = r["detail"].replace("|", "\\|").replace("\n", " ")
+                      f.write(f"| {r['name']} | {r['severity']} | {mark} | {detail} |\n")
+                  if critical_failures or advisories:
+                      f.write("\n## Required / suggested actions\n\n")
+                      for r in critical_failures + advisories:
+                          f.write(f"- **{r['severity']} — {r['name']}:** {r['remediation']}\n")
+                  f.write("\nThis audit is read-only. It does not run scientific evaluators, change frozen protocols, commit files, or alter production.\n")
+
+          print(json.dumps({
+              "overall": overall,
+              "target_week": target_week,
+              "critical_failures": len(critical_failures),
+              "advisories": len(advisories),
+          }, indent=2))
+
+          # Outputs for later workflow steps.
+          github_output = os.environ.get("GITHUB_OUTPUT")
+          if github_output:
+              with open(github_output, "a", encoding="utf-8") as f:
+                  f.write(f"target_week={target_week}\n")
+                  f.write(f"overall={overall}\n")
+                  f.write(f"critical_failures={len(critical_failures)}\n")
+                  f.write(f"advisories={len(advisories)}\n")
+
+          if critical_failures:
+              sys.exit(2)
+          if FAIL_ON_ADVISORIES and advisories:
+              sys.exit(3)
+          PY
+
+          python3 "${RUNNER_TEMP}/weekly_research_readiness.py"
+
+      - name: Upload readiness report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-research-readiness-${{ steps.audit.outputs.target_week || 'unknown' }}
+          path: ${{ runner.temp }}/weekly-research-readiness-report.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Verify repository remained unchanged
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          echo "PASS: B50 is read-only; repository working tree remained unchanged."
