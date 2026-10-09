@@ -1,0 +1,384 @@
+name: B54L Source Lineage Probe R1
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: b54l-lineage-probe
+  cancel-in-progress: false
+
+jobs:
+  b54l-metadata-only:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout frozen code and metadata
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Collect metadata without downloading source corpus
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p b54l-output
+          python3 - <<'PY'
+          #!/usr/bin/env python3
+          """B54L R1: metadata only; NEVER downloads or reads occurrence data.
+          
+          This file is embedded verbatim into B54L-v1r1.yml. Its separate copy is for
+          local test and Claude review. The GitHub Actions YAML is the uploadable artifact.
+          """
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+          import subprocess
+          import urllib.request
+          from datetime import datetime, timezone
+          
+          ROOT = pathlib.Path.cwd()
+          OUT = ROOT / 'b54l-output'
+          SELF = '.github/workflows/B54L-v1r1.yml'
+          HANDOFF_HEAD = 'b72b5265e7f2129b28152effac512876e69a0d29'
+          B52_COMMIT = '4b58551b4f4813b59ef558a27c8fa1452a0bb43c'
+          B53_COMMIT = HANDOFF_HEAD
+          EXPECTED = {
+              '.github/workflows/B52-v1r1-exact-rookie-slot-curve-v1-phase0-preregistration-freeze.yml':
+                  'dbaf3e8b6567578a80a902402e1110a20285d27de594c506a34923adc21b2113',
+              '.github/workflows/B53-v1r2.yml':
+                  '9768caabc0c2132169f6ea2bd0977c714495df9f7d2e0238fa3edbc731c840d5',
+              'research/exact-rookie-slot-curve-v1/phase0_preregistration.json':
+                  '0f2d49eeac7c59027073924a03095eca349f2737eb8229202e52d8a06953fc15',
+          }
+          FROZEN_HASHES = {
+              'B52_manifest_blob': 'f716cf8f8da1e61b6dc79ba7a27a7e4c83ade84c',
+              'B53_contract_sha256': '61314b546bee65daae03ac4d09a6c0deb1d7b29eebbf440402d2548b199cd9bc',
+              'B53_code_sha256': '3a3475377a1c0f68f12bbfd4f490a08f71b1c9244616a1d1c476198e62920d4c',
+              'B53_contract_md_sha256': 'f504abb04ef82724525005f73433e539ad476d0e141b1f589141c3d3a2867fbc',
+          }
+          ARTIFACT_LIMIT = 1500
+          INVENTORY_LIMIT = 1000
+          RUN_LOOKUP_LIMIT = 25
+          CODE_SCAN_HIT_LIMIT = 80
+          API_PREFIX = 'https://api.github.com/repos/'
+          SYMBOLS = ('24970', '24,970', 'canonical_rookie', 'development_fit_weight_v8', 'occurrence', 'rookie_identity')
+          RELEVANT = re.compile(r'draft|pick|rookie|historical|occurr|v7|v8|v10|phase.?0|source|freeze', re.I)
+          INVENTORY_RE = re.compile(r'occurrence|rookie|draft|corpus|source|crosswalk|weight', re.I)
+          UNRESOLVED = (
+              'exact_corpus_producing_run', 'exact_artifact_or_tracked_corpus_locator',
+              'archive_sha256_verified', 'archive_member_and_schema', 'artifact_not_expired_verified',
+              'verified_r1_r4_2018_2023_population', 'canonical_rookie_id_field_and_crosswalk',
+              'development_fit_weight_v8_field', 'provider_format_exception',
+              'mapping_conflict_ledger', 'frozen_source_definition_approval',
+          )
+          
+          
+          def git(*args):
+              result = subprocess.run(['git', *args], cwd=ROOT, capture_output=True, text=True, check=False)
+              return result.returncode == 0, result.stdout.strip()
+          
+          
+          def sha256(path):
+              h = hashlib.sha256()
+              with path.open('rb') as fd:
+                  for chunk in iter(lambda: fd.read(128 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+          
+          
+          def api_get(repo, token, suffix):
+              req = urllib.request.Request(API_PREFIX + repo + suffix,
+                  headers={'Authorization': 'Bearer ' + token,
+                           'Accept': 'application/vnd.github+json',
+                           'X-GitHub-Api-Version': '2022-11-28',
+                           'User-Agent': 'B54L-metadata-only-probe'})
+              with urllib.request.urlopen(req, timeout=12) as response:
+                  data = json.load(response)
+              return data
+          
+          
+          def safe_error(exc):
+              # No URL, response body, token, or raw exception string in output.
+              return {'exception_type': type(exc).__name__,
+                      'http_status': getattr(exc, 'code', None)}
+          
+          
+          def tracked_tree():
+              ok, output = git('ls-tree', '-r', '-l', 'HEAD')
+              if not ok:
+                  raise RuntimeError('GIT_TREE_UNAVAILABLE')
+              files = []
+              for line in output.splitlines():
+                  match = re.match(r'\d+ blob ([0-9a-f]{40})\s+(\d+)\t(.+)$', line)
+                  if match:
+                      files.append({'path': match.group(3), 'blob_sha': match.group(1),
+                                    'size_bytes': int(match.group(2))})
+              return files
+          
+          
+          def trusted_blob_pin(prefix, verified_workflows):
+              matches = set()
+              for filename in verified_workflows:
+                  content = (ROOT / filename).read_text(encoding='utf-8')
+                  matches.update(re.findall(r'(?<![0-9a-f])(' + re.escape(prefix) + r'[0-9a-f]{' + str(40-len(prefix)) + r'})(?![0-9a-f])', content, re.I))
+              return sorted(matches)
+          
+          
+          def extract_protocol(report, files, verified_workflows):
+              docs = [
+                  ('V7_V8_SOURCE_PREREG', '42e4fa45'),
+                  ('V10_PHASE0_AUDIT', '5adbdfe3'),
+              ]
+              for label, prefix in docs:
+                  entry = {'status': 'UNRESOLVED_FULL_PIN', 'full_blob_sha_candidates_from_verified_workflows': [],
+                           'matched_paths': [], 'safe_extract': None}
+                  report['frozen_protocol_discovery'][label] = entry
+                  pins = trusted_blob_pin(prefix, verified_workflows)
+                  entry['full_blob_sha_candidates_from_verified_workflows'] = pins
+                  if len(pins) != 1:
+                      continue
+                  paths = [i['path'] for i in files if i['blob_sha'] == pins[0]]
+                  entry['matched_paths'] = paths
+                  if len(paths) != 1:
+                      entry['status'] = 'UNRESOLVED_BLOB_PATH'
+                      continue
+                  path = ROOT / paths[0]
+                  if not path.is_file() or path.stat().st_size > 2_000_000:
+                      entry['status'] = 'MISSING_OR_TOO_LARGE'
+                      continue
+                  if label == 'V7_V8_SOURCE_PREREG':
+                      # Unlike code-symbol scanning, bounded protocol excerpts are permitted
+                      # ONLY when the exact full blob SHA was found inside verified prior code.
+                      lines = path.read_text(encoding='utf-8').splitlines()
+                      terms = re.compile(r'canonical|identity|weight|24,?970|provider|format|exception', re.I)
+                      hits = [{'line': n, 'text': line[:350]} for n, line in enumerate(lines, 1) if terms.search(line)]
+                      entry['safe_extract'] = hits[:40]
+                      entry['matched_line_count'] = len(hits)
+                      entry['extract_truncated'] = len(hits) > 40
+                  else:
+                      # Only JSON *keys*, not numerical/string audit values.
+                      parsed = json.loads(path.read_text(encoding='utf-8'))
+                      keys = []
+                      def visit(value, path_keys, depth):
+                          if isinstance(value, dict):
+                              for key, sub in value.items():
+                                  p = path_keys + [str(key)]
+                                  keys.append('.'.join(p))
+                                  if depth < 3:
+                                      visit(sub, p, depth + 1)
+                      visit(parsed, [], 1)
+                      entry['safe_extract'] = keys[:1000]
+                      entry['matched_key_count'] = len(keys)
+                      entry['extract_truncated'] = len(keys) > 1000
+                  entry['status'] = 'MATCHED_VERIFIED_BLOB_PROTOCOL_ONLY'
+          
+          
+          def scan_code(report, files):
+              names = [it['path'] for it in files if it['path'].startswith(('scripts/', 'research/', '.github/workflows/'))
+                       and pathlib.Path(it['path']).suffix in ('.py', '.yml', '.yaml', '.sh')
+                       and it['size_bytes'] <= 500000 and it['path'] != SELF]
+              hits = {symbol: [] for symbol in SYMBOLS}
+              full_count = {symbol: 0 for symbol in SYMBOLS}
+              for filename in names:
+                  p = ROOT / filename
+                  if not p.is_file():
+                      continue
+                  try:
+                      lines = p.read_text(encoding='utf-8').splitlines()
+                  except (UnicodeDecodeError, OSError):
+                      continue
+                  for lineno, line in enumerate(lines, 1):
+                      for symbol in SYMBOLS:
+                          if symbol.lower() in line.lower():
+                              full_count[symbol] += 1
+                              if len(hits[symbol]) < CODE_SCAN_HIT_LIMIT:
+                                  hits[symbol].append({'path': filename, 'line': lineno})
+              report['source_symbol_file_hits'] = hits
+              report['source_symbol_scan_truncated'] = {k: full_count[k] > len(hits[k]) for k in SYMBOLS}
+          
+          
+          def scan_artifacts(report):
+              api = report['artifact_api']
+              repo = os.getenv('GH_REPO', '')
+              token = os.getenv('GH_TOKEN', '')
+              if not token or not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo):
+                  api['status'] = 'TOKEN_OR_REPO_UNAVAILABLE'
+                  return
+              try:
+                  for page in range(1, ARTIFACT_LIMIT // 100 + 1):
+                      data = api_get(repo, token, '/actions/artifacts?per_page=100&page=' + str(page))
+                      if not isinstance(data, dict) or not isinstance(data.get('artifacts'), list):
+                          raise ValueError('ARTIFACT_API_JSON_SCHEMA')
+                      if isinstance(data.get('total_count'), int):
+                          api['api_total_count'] = data['total_count']
+                      results = data['artifacts']
+                      api['pages_checked'] += 1
+                      for a in results:
+                          if not isinstance(a, dict):
+                              raise ValueError('ARTIFACT_ITEM_SCHEMA')
+                          run = a.get('workflow_run') or {}
+                          entry = {key: a.get(key) for key in (
+                              'id', 'name', 'size_in_bytes', 'expired', 'expires_at',
+                              'created_at', 'updated_at', 'digest')}
+                          entry['workflow_run'] = {key: run.get(key) for key in
+                                                    ('id', 'head_sha', 'head_branch')}
+                          api['all_artifacts'].append(entry)
+                          if RELEVANT.search(str(entry['name'])):
+                              api['candidates'].append(entry)
+                      if len(results) < 100:
+                          break
+                  fetched = len(api['all_artifacts'])
+                  api['artifacts_returned'] = fetched
+                  api['truncated'] = (fetched >= ARTIFACT_LIMIT or
+                                      (isinstance(api.get('api_total_count'), int) and
+                                       fetched < api['api_total_count']))
+                  # Truncated metadata must not appear as a fully exhaustive scan.
+                  run_ids = list(dict.fromkeys(a['workflow_run']['id'] for a in api['candidates']
+                                               if isinstance(a['workflow_run']['id'], int)))
+                  api['candidate_run_lookup_truncated'] = len(run_ids) > RUN_LOOKUP_LIMIT
+                  for run_id in run_ids[:RUN_LOOKUP_LIMIT]:
+                      try:
+                          run = api_get(repo, token, '/actions/runs/' + str(run_id))
+                          if not isinstance(run, dict):
+                              raise ValueError('RUN_API_JSON_SCHEMA')
+                          api['candidate_runs'].append({'id': run_id, **{key: run.get(key) for key in
+                              ('name', 'path', 'event', 'conclusion', 'head_sha', 'created_at')}})
+                      except Exception as exc:
+                          api['candidate_runs'].append({'id': run_id, 'error': safe_error(exc)})
+                          api['run_lookup_errors'] += 1
+                  if api['truncated']:
+                      api['status'] = 'TRUNCATED_METADATA'
+                  elif fetched == 0 or len(api['candidates']) == 0:
+                      api['status'] = 'NO_CANDIDATES'
+                  elif api['candidate_run_lookup_truncated'] or api['run_lookup_errors']:
+                      api['status'] = 'PARTIAL_RUN_DETAILS'
+                  else:
+                      api['status'] = 'METADATA_ONLY_SUCCESS'
+              except Exception as exc:
+                  api['status'] = 'API_OR_PARSE_ERROR'
+                  api['error'] = safe_error(exc)
+                  api['truncated'] = True  # partial response is not complete data
+          
+          
+          def main():
+              report = {
+                  'phase': 'B54L_PRE_SOURCE_METADATA_ONLY',
+                  'recorded_utc': datetime.now(timezone.utc).isoformat(),
+                  'repository': os.getenv('GH_REPO', ''),
+                  'checked_out_head': None, 'handoff_head': HANDOFF_HEAD,
+                  'handoff_head_matches': False,
+                  'b52_ancestor': False, 'b53_ancestor': False,
+                  'workflow_self_path': SELF, 'workflow_self_sha256': None,
+                  'expected_path_hash_checks': {}, 'hash_based_file_matches': {},
+                  'frozen_protocol_discovery': {}, 'source_symbol_file_hits': {},
+                  'tracked_source_inventory': {'files': [], 'total_matches': 0, 'truncated': False},
+                  'artifact_api': {'status': 'NOT_QUERIED', 'pages_checked': 0,
+                                   'artifacts_returned': 0, 'api_total_count': None,
+                                   'all_artifacts': [], 'candidates': [], 'candidate_runs': [],
+                                   'candidate_run_lookup_truncated': False,
+                                   'run_lookup_errors': 0, 'truncated': False},
+                  'not_found_or_unverified': list(UNRESOLVED),
+                  'lineage_pins_verified': False,
+                  'source_rows_read': False, 'source_corpus_downloaded': False,
+                  'historical_outcomes_read': False, 'market_data_read': False,
+                  'holdout_read': False, 'production_change_authorized': False,
+                  'B54_SOURCE_AUDIT_AUTHORIZED': False,
+                  'decision': 'METADATA_COLLECTED_B54_STILL_BLOCKED',
+              }
+              try:
+                  ok, head = git('rev-parse', 'HEAD')
+                  report['checked_out_head'] = head if ok else None
+                  report['handoff_head_matches'] = head == HANDOFF_HEAD
+                  report['b52_ancestor'] = git('merge-base', '--is-ancestor', B52_COMMIT, 'HEAD')[0]
+                  report['b53_ancestor'] = git('merge-base', '--is-ancestor', B53_COMMIT, 'HEAD')[0]
+                  workflow_file = ROOT / SELF
+                  report['workflow_self_sha256'] = sha256(workflow_file) if workflow_file.is_file() else None
+                  for name, expected in EXPECTED.items():
+                      p = ROOT / name
+                      actual = sha256(p) if p.is_file() else None
+                      report['expected_path_hash_checks'][name] = {
+                          'exists': p.is_file(), 'expected_sha256': expected,
+                          'actual_sha256': actual, 'matched': actual == expected}
+                  files = tracked_tree()
+                  scoped_paths = {i['path'] for i in files if i['path'].startswith('research/exact-rookie-slot-curve-v1/')
+                                  or i['path'].startswith('.github/workflows/B52')
+                                  or i['path'].startswith('.github/workflows/B53')}
+                  for label, pin in FROZEN_HASHES.items():
+                      matches = []
+                      for item in files:
+                          if item['path'] not in scoped_paths or item['size_bytes'] > 2_000_000:
+                              continue
+                          if label.endswith('_blob') and item['blob_sha'] == pin:
+                              matches.append(item['path'])
+                          elif not label.endswith('_blob'):
+                              p = ROOT / item['path']
+                              if p.is_file() and sha256(p) == pin:
+                                  matches.append(item['path'])
+                      report['hash_based_file_matches'][label] = matches
+                  verified_wf = [name for name, check in report['expected_path_hash_checks'].items()
+                                 if name.endswith('.yml') and check['matched']]
+                  extract_protocol(report, files, verified_wf)
+                  inv = [i for i in files if INVENTORY_RE.search(i['path'])]
+                  report['tracked_source_inventory'] = {'files': inv[:INVENTORY_LIMIT],
+                              'total_matches': len(inv), 'truncated': len(inv) > INVENTORY_LIMIT}
+                  scan_code(report, files)
+                  report['lineage_pins_verified'] = bool(
+                      report['b52_ancestor'] and report['b53_ancestor'] and
+                      all(x['matched'] for x in report['expected_path_hash_checks'].values()) and
+                      all(report['hash_based_file_matches'].values()))
+                  scan_artifacts(report)
+              except Exception as exc:
+                  report['metadata_probe_error'] = safe_error(exc)
+                  report['decision'] = 'METADATA_PARTIAL_OR_FAILED_B54_STILL_BLOCKED'
+              finally:
+                  OUT.mkdir(parents=True, exist_ok=True)
+                  report_path = OUT / 'B54L_lineage_report.json'
+                  report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+                  api = report['artifact_api']
+                  lines = [
+                      '# B54L R1 — Source Lineage Discovery (metadata only)', '',
+                      '- Repository: `' + str(report['repository']) + '`',
+                      '- Checked-out HEAD: `' + str(report['checked_out_head']) + '`',
+                      '- B52 and B53 ancestors: ' + str(report['b52_ancestor']) + ', ' + str(report['b53_ancestor']),
+                      '- Frozen path hashes matched: ' + str(sum(x['matched'] for x in report['expected_path_hash_checks'].values())) + '/' + str(len(EXPECTED)),
+                      '- B54L workflow SHA-256: `' + str(report['workflow_self_sha256']) + '`',
+                      '- Artifact API: **' + str(api['status']) + '**; pages ' + str(api['pages_checked']),
+                      '- All artifact names returned: ' + str(len(api['all_artifacts'])),
+                      '- Candidate artifacts: ' + str(len(api['candidates'])),
+                      '- Incomplete artifact pagination: ' + str(api['truncated']),
+                      '- Candidate run detail errors: ' + str(api['run_lookup_errors']),
+                      '- Tracked source-file paths inventoried: ' + str(len(report['tracked_source_inventory']['files'])),
+                      '- Protocol blobs matched: ' + ', '.join(k + '=' + v['status'] for k,v in report['frozen_protocol_discovery'].items()),
+                      '- Unresolved items: ' + str(len(report['not_found_or_unverified'])),
+                      '- Source downloaded / outcome or market rows read: **NO**',
+                      '- **NO B54 authorization. No production change.**',
+                  ]
+                  if report.get('metadata_probe_error'):
+                      lines.append('- Probe exception class: ' + report['metadata_probe_error']['exception_type'])
+                  summary = '\n'.join(lines) + '\n'
+                  (OUT / 'B54L_summary.md').write_text(summary, encoding='utf-8')
+                  print(summary)
+          
+          
+          if __name__ == '__main__':
+              main()
+          PY
+          cat b54l-output/B54L_summary.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload metadata-only report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: B54L-v1r1-lineage-metadata
+          path: b54l-output/
+          if-no-files-found: error
+          retention-days: 30
