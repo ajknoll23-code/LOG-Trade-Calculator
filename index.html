@@ -9534,6 +9534,37 @@ function qf7VerifiedPersonalActiveKeys(data){
   return active;
 }
 
+/* QF8_A5F02_VERIFIED_SECONDARY_ELIGIBILITY_V1
+   Scoped to the legal Team Utility lineup; NOT a valuation-position rewrite.
+   A Sleeper player ID, normalized existing DB key, and explicit recognized
+   fantasy_positions are all required. Conflicting IDs fail closed. */
+const TU_SYNC_ELIGIBILITY = new Map();
+const TU_SYNC_ELIGIBILITY_CONFLICTS = new Set();
+function qf8RecordEligibility(p,key,sourceVerified){
+  if(!sourceVerified || !p || typeof p.player_id!=='string' || !p.player_id ||
+     typeof p.name!=='string' || !p.name.trim() || !Array.isArray(p.fantasy_positions)) return;
+  if(TU_SYNC_ELIGIBILITY_CONFLICTS.has(key)) return;
+  const id=p.player_id;
+  const positions=[...new Set(p.fantasy_positions.map(normalizePos).filter(Boolean))];
+  if(!positions.length) return;
+  const prior=TU_SYNC_ELIGIBILITY.get(key);
+  if(prior && prior.id!==id){
+    TU_SYNC_ELIGIBILITY.delete(key);
+    TU_SYNC_ELIGIBILITY_CONFLICTS.add(key);
+    return;
+  }
+  TU_SYNC_ELIGIBILITY.set(key,{id,positions});
+}
+function qf8PositionsForValueKey(key,primary){
+  // Preserve existing curated primary valuation position in all cases.
+  // Without consistent verified dual metadata, old single-position behavior wins.
+  if(TU_SYNC_ELIGIBILITY_CONFLICTS.has(key)) return null;
+  const record=TU_SYNC_ELIGIBILITY.get(key);
+  if(!record || record.positions.length<2 || !record.positions.includes(primary)) return null;
+  return record.positions.slice();
+}
+/* QF8_A5F02_VERIFIED_SECONDARY_ELIGIBILITY_V1_END */
+
 function mergeLiveRoster(data){
   const verifiedActive = qf7VerifiedPersonalActiveKeys(data);
   const keys = [];
@@ -9590,6 +9621,7 @@ function mergeLiveRoster(data){
         // team's players as unrostered.
         currentlyRostered: true,
       };
+      qf8RecordEligibility(p,key,Number.isFinite(data.synced_at) && data.synced_at>0);
       keys.push(key);
     }
   }
@@ -9781,6 +9813,7 @@ function mergeLeagueRosters(data){
           // losing whatever historical data they still hold.
           currentlyRostered: true,
         };
+        qf8RecordEligibility(p,key,Number.isFinite(data.synced_at) && data.synced_at>0);
         seenThisSync.add(key);
         players.push({ key, slot });
         playerCount++;
@@ -10026,7 +10059,78 @@ function tuActiveRosterKeys(){
    structure (flex sets are supersets of the dedicated sets feeding them)
    -- see the design doc's Section 6 for the actual argument, not repeated
    here. Returns {starters: [{key,pos,value}], bench: [{key,pos,value}]}. */
+/* QF8_A5F02_FLEXIBLE_LINEUP_MATCHER_V1
+   Only invoked when verified secondary eligibility exists in this pool.
+   Minimum-cost bipartite assignment over 17 roster slots and the candidate
+   players, with 17 zero-value dummy columns for genuinely missing starters.
+   Maximizes total existing Fundamental Value at legal positions; the 85/15
+   starter/bench weighting and per-player FV are unchanged. */
+function qf8ExpandedStarterSlots(){
+  const slots=[];
+  for(const spec of TU_DEDICATED_SLOTS)
+    for(let k=0;k<spec.count;k++) slots.push({name:spec.pos,eligible:[spec.pos]});
+  for(const spec of TU_FLEX_SLOTS)
+    for(let k=0;k<spec.count;k++) slots.push({name:spec.name,eligible:spec.eligible});
+  return slots;
+}
+function qf8FlexibleLineup(players){
+  const slots=qf8ExpandedStarterSlots();
+  const candidates=players.slice().sort((a,b)=>b.value-a.value || a.key.localeCompare(b.key));
+  const n=slots.length, real=candidates.length, m=real+n;
+  const BLOCK=1e12, INF=1e15;
+  const u=new Float64Array(n+1), v=new Float64Array(m+1);
+  const match=new Int32Array(m+1), prev=new Int32Array(m+1);
+  function cost(i,j){
+    if(j>real) return 0;
+    const p=candidates[j-1];
+    const legal=p.eligible || [p.pos];
+    return legal.some(pos=>slots[i-1].eligible.includes(pos)) ? -p.value : BLOCK;
+  }
+  // Rectangular Hungarian assignment: each starter slot maps to a unique
+  // eligible real player or its own 0-value dummy; no player is used twice.
+  for(let i=1;i<=n;i++){
+    match[0]=i;
+    const min=new Float64Array(m+1).fill(INF);
+    const used=new Uint8Array(m+1);
+    let j0=0;
+    do{
+      used[j0]=1;
+      const i0=match[j0];
+      let delta=INF, j1=0;
+      for(let j=1;j<=m;j++){
+        if(used[j]) continue;
+        const cur=cost(i0,j)-u[i0]-v[j];
+        if(cur<min[j]){min[j]=cur;prev[j]=j0;}
+        if(min[j]<delta){delta=min[j];j1=j;}
+      }
+      if(!j1 || !Number.isFinite(delta)) throw Error('QF8 optimizer assignment infeasible');
+      for(let j=0;j<=m;j++){
+        if(used[j]){u[match[j]]+=delta;v[j]-=delta;}
+        else min[j]-=delta;
+      }
+      j0=j1;
+    }while(match[j0]);
+    do{const j1=prev[j0];match[j0]=match[j1];j0=j1;}while(j0);
+  }
+  const starterBySlot=new Array(n).fill(null), selected=new Set();
+  for(let j=1;j<=real;j++){
+    const i=match[j];
+    if(!i || cost(i,j)===BLOCK) continue;
+    const p=candidates[j-1];
+    if(selected.has(p.key)) throw Error('QF8 optimizer assigned duplicate player');
+    selected.add(p.key);
+    starterBySlot[i-1]={...p,qf8Slot:slots[i-1].name};
+  }
+  return {
+    starters:starterBySlot.filter(Boolean),
+    bench:players.filter(p=>!selected.has(p.key)),
+  };
+}
+/* QF8_A5F02_FLEXIBLE_LINEUP_MATCHER_V1_END */
+
 function tuOptimizeLineup(players){
+  if(players.some(p=>Array.isArray(p.eligible)&&p.eligible.length>1))
+    return qf8FlexibleLineup(players);
   // players: [{key, pos, value}] -- expects real playerValueByKey() output
   // already attached, not raw PLAYER_DB entries, so this function has no
   // value-calculation logic of its own (see the architecture note above).
@@ -10113,7 +10217,10 @@ function tuPlayersFromKeys(keys){
     const info = PLAYER_DB[key];
     if(!info) continue;
     const val = playerValueByKey(key);
-    if(val && val > 0) out.push({ key, pos: info.pos, value: val });
+    if(val && val > 0){
+      const dual=qf8PositionsForValueKey(key,info.pos);
+      out.push(dual ? {key,pos:info.pos,value:val,eligible:dual} : {key,pos:info.pos,value:val});
+    }
   }
   return out;
 }
@@ -11914,6 +12021,17 @@ function renderFullRoster(){
    valuation, bench weights, projected cuts, or hidden Trade Impact behavior. */
 function qf6LineupCompleteness(keys){
   const players = tuPlayersFromKeys(keys);
+  if(players.some(p=>Array.isArray(p.eligible)&&p.eligible.length>1)){
+    // The banner must use exactly the same legal assignment as Team Utility.
+    const fit=tuOptimizeLineup(players);
+    const remainingSlots=qf8ExpandedStarterSlots();
+    for(const p of fit.starters){
+      const at=remainingSlots.findIndex(s=>s.name===p.qf8Slot);
+      if(at<0) throw Error('QF8 completeness assignment metadata missing');
+      remainingSlots.splice(at,1);
+    }
+    return {filled:fit.starters.length,required:17,missing:remainingSlots.map(s=>s.name)};
+  }
   const remaining = players.slice().sort((a,b) => b.value - a.value);
   const missing = [];
   for(const slot of TU_DEDICATED_SLOTS){
