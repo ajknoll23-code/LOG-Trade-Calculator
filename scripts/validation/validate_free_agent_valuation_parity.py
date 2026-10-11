@@ -174,22 +174,50 @@ const __sourceCounts = {{
   speculative_estimate: 0,
   fa_specific_prod: 0,
   canonical_prod: 0,
-  canonical_role_only: 0
+  canonical_role_only: 0,
+  identity_held: 0
 }};
 const __sourceById = {{}};
+const __qf5RawGroups = new Map();
+const __qf5ResolvedGroups = new Map();
+const __qf5Included = (__data.free_agents || []).filter(fa => {{
+  const raw = normalizeName(fa.name);
+  return ![['byron young','DL'],['devonta smith','DB']].some(([n,p]) => n === raw && p === fa.pos);
+}});
+for(const fa of __qf5Included) {{
+  const raw = normalizeName(fa.name);
+  const resolved = ALIASES[raw] || ALIASES_REVERSE[raw] || raw;
+  const sid = String(fa.player_id || '');
+  for(const [groups, group] of [
+    [__qf5RawGroups, raw + '|' + fa.pos],
+    [__qf5ResolvedGroups, resolved + '|' + fa.pos]
+  ]) {{
+    if(!groups.has(group)) groups.set(group, new Set());
+    groups.get(group).add(sid);
+  }}
+}}
+const __qf5ResolvedSID = {{'jaylon jones|DB':'11052'}};
 for (const fa of (__data.free_agents || [])) {{
   const rawKey = normalizeName(fa.name);
   if ([['byron young','DL'],['devonta smith','DB']].some(([n,p]) => n === rawKey && p === fa.pos)) continue;
   const key = ALIASES[rawKey] || ALIASES_REVERSE[rawKey] || rawKey;
+  const __rawGroup = rawKey + '|' + fa.pos;
+  const __resolvedGroup = key + '|' + fa.pos;
+  const __sid = String(fa.player_id || '');
+  const __held = Object.prototype.hasOwnProperty.call(__qf5ResolvedSID, __resolvedGroup)
+    ? __sid !== __qf5ResolvedSID[__resolvedGroup]
+    : ((__qf5RawGroups.get(__rawGroup)?.size || 0) > 1 ||
+       (__qf5ResolvedGroups.get(__resolvedGroup)?.size || 0) > 1);
   const candidateCurated = PLAYER_DB[key];
-  const curated = (candidateCurated && candidateCurated.pos === fa.pos) ? candidateCurated : null;
+  const curated = (!__held && candidateCurated && candidateCurated.pos === fa.pos) ? candidateCurated : null;
   const faProdRaw = FA_PROD_MULT_DATA[key];
   const faProdEntry = Array.isArray(faProdRaw)
     ? faProdRaw.find(e => e.pos === fa.pos) || null
     : faProdRaw;
-  const faProdMatch = (faProdEntry && faProdEntry.pos === fa.pos) ? faProdEntry : null;
+  const faProdMatch = (!__held && faProdEntry && faProdEntry.pos === fa.pos) ? faProdEntry : null;
   let source;
-  if (curated && Object.prototype.hasOwnProperty.call(PROD_MULT, key)) source = 'canonical_prod';
+  if (__held) source = 'identity_held';
+  else if (curated && Object.prototype.hasOwnProperty.call(PROD_MULT, key)) source = 'canonical_prod';
   else if (faProdMatch) source = 'fa_specific_prod';
   else if (curated) source = 'canonical_role_only';
   else source = 'speculative_estimate';
