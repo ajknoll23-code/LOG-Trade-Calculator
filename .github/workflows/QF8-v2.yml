@@ -1,0 +1,440 @@
+# QF8 / A5-F02 — exact-source secondary-position eligibility repair.
+# REVIEW ONLY: one-file candidate, protected FV/PA/IDP unchanged, no main push.
+# QF8 Phase 0 Green 38151611764, confirmed legal 17/17 vs deployed 16/17.
+name: QF8 V2 - Verified Dual Eligibility Lineup Review Candidate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  qf8-v2-review:
+    name: Exact real-source and browser legal eligibility review - no production write
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      QF8_TMP: /tmp/log-qf8-v2
+      QF8_REVIEW_BRANCH: qf8-a5f02-v2-secondary-eligibility-review-2026-10-11
+      QF8_PRODUCTION_BASE: 9b25b446d45fd5ec683d911877fadf95a2b422ec
+    steps:
+      - name: Checkout triggering main commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install existing browser regression dependencies
+        run: python3 -m pip install --disable-pip-version-check --no-cache-dir requests selenium
+      - name: Pin QF7 production baseline, QF8 audit, sources and no-existing-review-branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == 'refs/heads/main' ]] || exit 1
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]] || exit 1
+          [[ -z "$(git status --porcelain)" ]] || exit 1
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          [[ "$(git rev-parse origin/main)" == "$GITHUB_SHA" ]] || { echo 'STOP main moved'; exit 1; }
+          git merge-base --is-ancestor "$QF8_PRODUCTION_BASE" HEAD || { echo 'STOP QF7 release missing'; exit 1; }
+          blob(){ [[ "$(git hash-object "$1")" == "$2" ]] || { echo "STOP protected source changed $1"; exit 1; }; }
+          blob index.html f406c5dac446909384d1619f185d7bdf7de99368
+          blob data/my_roster.json 4b67e08f6c304d9d1e8cda494785875768753532
+          blob data/league_rosters.json 703ef1f651fc3debad9154001554264cd28086dd
+          blob scripts/sync/sync_sleeper.py 702ef3ecb4daa18bfc8d37ebdef11b927f90e206
+          blob scripts/team_utility_projection_runtime.js 1620edf05e56a56b4a874c71b32777a443422de5
+          blob scripts/validation/repo_regression_checks.py 5191e1160c966ed14401b70c86c6f63808e1265d
+          blob scripts/validation/validate_free_agent_valuation_parity.py a103ce70a66b3bb1a48fbbd26479b2c7013f9acc
+          blob free-agent-board.html 975efe51091a2315475678a9db0842b05c4fc3aa
+          blob data/free_agent_utility_v1.json 557b8010082a87113ecf9d5574af108f3044a1e7
+          blob model/releases/free-agent-production-v2/release.json 75c9665c0493d8ac4900479b6802c807aaa45633
+          if git ls-remote --exit-code --heads origin "$QF8_REVIEW_BRANCH" >/dev/null; then echo 'STOP QF8 review branch already exists'; exit 1; fi
+          echo 'PASS QF8 V2 exact QF7 deployed source, QF8 audit lineage and frozen protection pins'
+      - name: Write isolated patch, exact-source tests and Chrome acceptance harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d -m 700 "$QF8_TMP"
+          cat > "$QF8_TMP/patch.py" <<'QF8_PATCH_PY'
+          #!/usr/bin/env python3
+          """QF8 A5-F02 surgical review branch patch; no model or production multiplier edits."""
+          from pathlib import Path
+          p=Path('index.html'); s=p.read_text(encoding='utf8')
+          def once(old,new,label):
+           global s
+           n=s.count(old)
+           assert n==1,(label,'unexpected exact-anchor count',n)
+           s=s.replace(old,new,1)
+
+          eligibility = r'''/* QF8_A5F02_VERIFIED_SECONDARY_ELIGIBILITY_V1
+             Scoped to the legal Team Utility lineup; NOT a valuation-position rewrite.
+             A Sleeper player ID, normalized existing DB key, and explicit recognized
+             fantasy_positions are all required. Conflicting IDs fail closed. */
+          const TU_SYNC_ELIGIBILITY = new Map();
+          const TU_SYNC_ELIGIBILITY_CONFLICTS = new Set();
+          function qf8RecordEligibility(p,key,sourceVerified){
+            if(!sourceVerified || !p || typeof p.player_id!=='string' || !p.player_id ||
+               typeof p.name!=='string' || !p.name.trim() || !Array.isArray(p.fantasy_positions)) return;
+            if(TU_SYNC_ELIGIBILITY_CONFLICTS.has(key)) return;
+            const id=p.player_id;
+            const positions=[...new Set(p.fantasy_positions.map(normalizePos).filter(Boolean))];
+            if(!positions.length) return;
+            const prior=TU_SYNC_ELIGIBILITY.get(key);
+            if(prior && prior.id!==id){
+              TU_SYNC_ELIGIBILITY.delete(key);
+              TU_SYNC_ELIGIBILITY_CONFLICTS.add(key);
+              return;
+            }
+            TU_SYNC_ELIGIBILITY.set(key,{id,positions});
+          }
+          function qf8PositionsForValueKey(key,primary){
+            // Preserve existing curated primary valuation position in all cases.
+            // Without consistent verified dual metadata, old single-position behavior wins.
+            if(TU_SYNC_ELIGIBILITY_CONFLICTS.has(key)) return null;
+            const record=TU_SYNC_ELIGIBILITY.get(key);
+            if(!record || record.positions.length<2 || !record.positions.includes(primary)) return null;
+            return record.positions.slice();
+          }
+          /* QF8_A5F02_VERIFIED_SECONDARY_ELIGIBILITY_V1_END */
+
+          '''
+          anchor='function mergeLiveRoster(data){\n'
+          once(anchor,eligibility+anchor,'eligibility cache anchor')
+          once('      keys.push(key);\n',"      qf8RecordEligibility(p,key,Number.isFinite(data.synced_at) && data.synced_at>0);\n      keys.push(key);\n",'personal capture')
+          once('        seenThisSync.add(key);\n',"        qf8RecordEligibility(p,key,Number.isFinite(data.synced_at) && data.synced_at>0);\n        seenThisSync.add(key);\n",'league capture')
+
+          matcher=r'''/* QF8_A5F02_FLEXIBLE_LINEUP_MATCHER_V1
+             Only invoked when verified secondary eligibility exists in this pool.
+             Minimum-cost bipartite assignment over 17 roster slots and the candidate
+             players, with 17 zero-value dummy columns for genuinely missing starters.
+             Maximizes total existing Fundamental Value at legal positions; the 85/15
+             starter/bench weighting and per-player FV are unchanged. */
+          function qf8ExpandedStarterSlots(){
+            const slots=[];
+            for(const spec of TU_DEDICATED_SLOTS)
+              for(let k=0;k<spec.count;k++) slots.push({name:spec.pos,eligible:[spec.pos]});
+            for(const spec of TU_FLEX_SLOTS)
+              for(let k=0;k<spec.count;k++) slots.push({name:spec.name,eligible:spec.eligible});
+            return slots;
+          }
+          function qf8FlexibleLineup(players){
+            const slots=qf8ExpandedStarterSlots();
+            const candidates=players.slice().sort((a,b)=>b.value-a.value || a.key.localeCompare(b.key));
+            const n=slots.length, real=candidates.length, m=real+n;
+            const BLOCK=1e12, INF=1e15;
+            const u=new Float64Array(n+1), v=new Float64Array(m+1);
+            const match=new Int32Array(m+1), prev=new Int32Array(m+1);
+            function cost(i,j){
+              if(j>real) return 0;
+              const p=candidates[j-1];
+              const legal=p.eligible || [p.pos];
+              return legal.some(pos=>slots[i-1].eligible.includes(pos)) ? -p.value : BLOCK;
+            }
+            // Rectangular Hungarian assignment: each starter slot maps to a unique
+            // eligible real player or its own 0-value dummy; no player is used twice.
+            for(let i=1;i<=n;i++){
+              match[0]=i;
+              const min=new Float64Array(m+1).fill(INF);
+              const used=new Uint8Array(m+1);
+              let j0=0;
+              do{
+                used[j0]=1;
+                const i0=match[j0];
+                let delta=INF, j1=0;
+                for(let j=1;j<=m;j++){
+                  if(used[j]) continue;
+                  const cur=cost(i0,j)-u[i0]-v[j];
+                  if(cur<min[j]){min[j]=cur;prev[j]=j0;}
+                  if(min[j]<delta){delta=min[j];j1=j;}
+                }
+                if(!j1 || !Number.isFinite(delta)) throw Error('QF8 optimizer assignment infeasible');
+                for(let j=0;j<=m;j++){
+                  if(used[j]){u[match[j]]+=delta;v[j]-=delta;}
+                  else min[j]-=delta;
+                }
+                j0=j1;
+              }while(match[j0]);
+              do{const j1=prev[j0];match[j0]=match[j1];j0=j1;}while(j0);
+            }
+            const starterBySlot=new Array(n).fill(null), selected=new Set();
+            for(let j=1;j<=real;j++){
+              const i=match[j];
+              if(!i || cost(i,j)===BLOCK) continue;
+              const p=candidates[j-1];
+              if(selected.has(p.key)) throw Error('QF8 optimizer assigned duplicate player');
+              selected.add(p.key);
+              starterBySlot[i-1]={...p,qf8Slot:slots[i-1].name};
+            }
+            return {
+              starters:starterBySlot.filter(Boolean),
+              bench:players.filter(p=>!selected.has(p.key)),
+            };
+          }
+          /* QF8_A5F02_FLEXIBLE_LINEUP_MATCHER_V1_END */
+
+          '''
+          # Important: old greedy remains byte-for-byte unchanged unless a verified dual is present.
+          once('function tuOptimizeLineup(players){\n', matcher+'''function tuOptimizeLineup(players){
+            if(players.some(p=>Array.isArray(p.eligible)&&p.eligible.length>1))
+              return qf8FlexibleLineup(players);
+          ''','optimizer conditional dispatch')
+          once("    if(val && val > 0) out.push({ key, pos: info.pos, value: val });",'''    if(val && val > 0){
+                const dual=qf8PositionsForValueKey(key,info.pos);
+                out.push(dual ? {key,pos:info.pos,value:val,eligible:dual} : {key,pos:info.pos,value:val});
+              }''','valued player to eligible bridge')
+          once('function qf6LineupCompleteness(keys){\n  const players = tuPlayersFromKeys(keys);', '''function qf6LineupCompleteness(keys){
+            const players = tuPlayersFromKeys(keys);
+            if(players.some(p=>Array.isArray(p.eligible)&&p.eligible.length>1)){
+              // The banner must use exactly the same legal assignment as Team Utility.
+              const fit=tuOptimizeLineup(players);
+              const remainingSlots=qf8ExpandedStarterSlots();
+              for(const p of fit.starters){
+                const at=remainingSlots.findIndex(s=>s.name===p.qf8Slot);
+                if(at<0) throw Error('QF8 completeness assignment metadata missing');
+                remainingSlots.splice(at,1);
+              }
+              return {filled:fit.starters.length,required:17,missing:remainingSlots.map(s=>s.name)};
+            }''','QF6 completeness parity')
+          p.write_text(s,encoding='utf8')
+          assert s.count('QF8_A5F02_VERIFIED_SECONDARY_ELIGIBILITY_V1')==2
+          assert s.count('QF8_A5F02_FLEXIBLE_LINEUP_MATCHER_V1')==2
+          assert 'const TU_BENCH_WEIGHT = 0.15;' in s
+          print('PASS QF8 candidate: verified Sleeper metadata bridge, eligibility-only matcher, aligned QF6; index.html only')
+          QF8_PATCH_PY
+          cat > "$QF8_TMP/qa.js" <<'QF8_QA_JS'
+          'use strict';
+          const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
+          const html=fs.readFileSync('index.html','utf8');
+          const league=JSON.parse(fs.readFileSync('data/league_rosters.json','utf8'));
+          const mine=JSON.parse(fs.readFileSync('data/my_roster.json','utf8'));
+          function section(a,b){
+           const i=html.indexOf(a);assert(i>=0,'missing '+a);assert.equal(html.indexOf(a,i+1),-1,'duplicate anchor '+a);
+           const j=html.indexOf(b,i+a.length);assert(j>i,'missing end '+b);return html.slice(i,j);
+          }
+          const source=[
+           section('function normalizePos(sleeperPos){','/* Dual-eligible players'),
+           section('/* QF8_A5F02_VERIFIED_SECONDARY_ELIGIBILITY_V1','function mergeLiveRoster(data){'),
+           section('const TU_DEDICATED_SLOTS = [','/* Trade-level wrapper:'),
+           section('function qf6LineupCompleteness(keys){','function qf6ShowLineupWarning('),
+          ].join('\n');
+          const sandbox=vm.createContext({console,Set,Map});
+          vm.runInContext(`let PLAYER_DB={};function playerValueByKey(k){return PLAYER_DB[k]?.value ?? null;}`+source,sandbox,{timeout:10000});
+          function run(js){return vm.runInContext(js,sandbox,{timeout:10000});}
+          function json(x){return JSON.stringify(x);}
+          const active=[];
+          for(const r of league.rosters)for(const slot of ['starters','bench'])for(const p of r[slot])
+           if(p.fantasy_positions?.includes('DL')&&p.fantasy_positions?.includes('LB'))active.push(p);
+          assert(active.length>20,'no enough independent current dual player IDs');
+          const dual=active.find(p=>p.fantasy_positions[0]==='DL');assert(dual);
+          console.log('PASS real Sleeper ID-verified DL/LB metadata count='+active.length+' sample='+dual.name);
+          assert.equal(run('TU_ACTIVE_ROSTER_LIMIT'),41);assert.equal(run('TU_BENCH_WEIGHT'),0.15);
+          const primary=['QB','QB','RB','RB','RB','WR','WR','TE','DL','DL','DL','DL','DL','LB','DB','DB','K'];
+          assert.equal(primary.length,17);
+          const keys=primary.map((_,i)=>`qf8_fixture_${i}`);
+          const fixture=primary.map((pos,i)=>({key:keys[i],pos,value:4000-50*i}));
+          run(`PLAYER_DB=Object.fromEntries(${json(fixture)}.map(p=>[p.key,{pos:p.pos,value:p.value}]))`);
+          let original=run(`tuOptimizeLineup(tuPlayersFromKeys(${json(keys)}))`);
+          assert.equal(original.starters.length,16,'baseline expected incomplete');
+          assert.equal(run(`qf6LineupCompleteness(${json(keys)}).filled`),16);
+          assert.equal(run(`tuPlayersFromKeys(${json(keys)}).every(p=>!('eligible' in p))`),true);
+          console.log('PASS no verified multi-eligibility uses unchanged single-primary optimizer and QF6 warning');
+          run(`qf8RecordEligibility(${json(dual)},${json(keys[12])},true)`);
+          let players=run(`tuPlayersFromKeys(${json(keys)})`);
+          assert.equal(players.length,17);
+          assert.equal(players[12].pos,'DL');assert.deepEqual(Array.from(players[12].eligible),['DL','LB']);
+          const actual=run(`tuOptimizeLineup(tuPlayersFromKeys(${json(keys)}))`);
+          assert.equal(actual.starters.length,17,'missing legally usable secondary LB');
+          assert.equal(new Set(Array.from(actual.starters,p=>p.key)).size,17,'duplicate usage');
+          assert.equal(run(`qf6LineupCompleteness(${json(keys)}).filled`),17);
+          assert.equal(run(`qf6LineupCompleteness(${json(keys)}).missing.length`),0);
+          assert.equal(run(`playerValueByKey(${json(keys[12])})`),fixture[12].value,'valuation changed from secondary position');
+          assert.equal(actual.starters.find(p=>p.key===keys[12]).qf8Slot,'LB');
+          console.log('PASS controlled 17/17 legally filled by verified DL/LB while primary FV position remains DL; QF6 warning clear');
+          // Independent maximum bipartite matcher, separate from Hungarian implementation.
+          const starterSlots=Array.from(run('qf8ExpandedStarterSlots()'),p=>({name:p.name,eligible:Array.from(p.eligible)}));
+          function maxFill(pool){
+           const who=Array(pool.length).fill(-1);
+           function match(si,seen){for(let j=0;j<pool.length;j++){
+            if(seen.has(j)||!pool[j].eligible.some(x=>starterSlots[si].eligible.includes(x)))continue;
+            seen.add(j);if(who[j]<0||match(who[j],seen)){who[j]=si;return true;}
+           }return false;}
+           let n=0;for(let i=0;i<starterSlots.length;i++)if(match(i,new Set()))n++;return n;
+          }
+          assert.equal(maxFill(fixture.map((p,i)=>({...p,eligible:i===12?['DL','LB']:[p.pos]}))),17);
+          assert.equal(maxFill(fixture.map(p=>({...p,eligible:[p.pos]}))),16);
+          console.log('PASS independent legal matching oracle 17/17 vs 16/17 single-only fixture');
+          const currentVal=run(`calculateTeamUtility(${json(keys)},${json(keys)})`);
+          assert.equal(currentVal.teamUtility,0);
+          const active41=keys.concat(Array.from({length:24},(_,i)=>`qf8_bench_${i}`));
+          const additional=Array.from({length:24},(_,i)=>({key:`qf8_bench_${i}`,pos:'RB',value:120-i}));
+          run(`Object.assign(PLAYER_DB,Object.fromEntries(${json(additional)}.map(p=>[p.key,{pos:p.pos,value:p.value}])))`);
+          const expanded=active41.concat(['incoming_a','incoming_b']);
+          run(`PLAYER_DB.incoming_a={pos:'WR',value:65};PLAYER_DB.incoming_b={pos:'WR',value:75}`);
+          const pre=run(`tuOptimizeLegalRoster(tuPlayersFromKeys(${json(active41)}))`);
+          const post=run(`tuOptimizeLegalRoster(tuPlayersFromKeys(${json(expanded)}))`);
+          assert.equal(pre.rosterSize,41);assert.equal(post.rosterSize,41);assert.equal(post.cuts.length,2);
+          assert.equal(post.starters.length,17);assert.equal(new Set(Array.from(post.starters,p=>p.key)).size,17);
+          const utility=run(`calculateTeamUtility(${json(active41)},${json(expanded)})`);
+          assert.equal(utility.postCuts.length,2);
+          assert.equal(utility.rosterLimit,41);
+          console.log('PASS 17 starters, 41 active cap, two projected cuts, 85/15 weighting unchanged');
+          // Source ID conflict cannot turn into secondary eligibility for an ambiguous name.
+          const victim='collision_fixture';
+          run(`PLAYER_DB[${json(victim)}]={pos:'DL',value:500}`);
+          run(`qf8RecordEligibility({name:'Collision',player_id:'101',fantasy_positions:['DL','LB']},${json(victim)},true)`);
+          assert.equal(run(`tuPlayersFromKeys([${json(victim)}])[0].eligible.length`),2);
+          run(`qf8RecordEligibility({name:'Collision',player_id:'202',fantasy_positions:['DL','LB']},${json(victim)},true)`);
+          assert.equal(run(`tuPlayersFromKeys([${json(victim)}])[0].eligible`),undefined);
+          run(`qf8RecordEligibility({name:'Collision',player_id:'101',fantasy_positions:['DL','LB']},${json(victim)},true)`);
+          assert.equal(run(`tuPlayersFromKeys([${json(victim)}])[0].eligible`),undefined);
+          run(`PLAYER_DB.unverified={pos:'DL',value:550};qf8RecordEligibility({name:'Unknown',player_id:'999',fantasy_positions:['DL','LB']},'unverified',false)`);
+          assert.equal(run('tuPlayersFromKeys(["unverified"])[0].eligible'),undefined);
+          console.log('PASS invalid/unverified metadata and same-name different-ID collision fail closed');
+          // No drift in external valuation or marketplace code.
+          assert(html.includes('const TU_BENCH_WEIGHT = 0.15;'));
+          assert.equal((html.match(/QF8_A5F02_VERIFIED_SECONDARY_ELIGIBILITY_V1/g)||[]).length,2);
+          assert.equal((html.match(/QF8_A5F02_FLEXIBLE_LINEUP_MATCHER_V1/g)||[]).length,2);
+          console.log('QF8_V2_QA_PASS: real-source legal eligibility, no valuation rewrite, single-pos continuity, 17/41 limits, QF6 alignment');
+          QF8_QA_JS
+          cat > "$QF8_TMP/browser.py" <<'QF8_BROWSER_PY'
+          """Headless browser verifies the real, patched index.html for QF8 review only."""
+          from functools import partial
+          from http.server import ThreadingHTTPServer,SimpleHTTPRequestHandler
+          from pathlib import Path
+          import threading
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+          from selenium.webdriver.support.ui import WebDriverWait
+          class Quiet(SimpleHTTPRequestHandler):
+           def log_message(self,*args): pass
+          server=ThreadingHTTPServer(('127.0.0.1',0),partial(Quiet,directory=str(Path.cwd())))
+          threading.Thread(target=server.serve_forever,daemon=True).start()
+          opts=Options()
+          for arg in ('--headless=new','--no-sandbox','--disable-dev-shm-usage','--disable-gpu','--window-size=1365,960'):opts.add_argument(arg)
+          try:
+           with webdriver.Chrome(options=opts) as driver:
+            driver.set_page_load_timeout(45)
+            driver.get(f'http://127.0.0.1:{server.server_port}/index.html')
+            WebDriverWait(driver,25).until(lambda d:d.execute_script('return typeof qf8FlexibleLineup=== "function" && typeof tuOptimizeLineup === "function" && typeof qf6LineupCompleteness === "function"'))
+            data=driver.execute_script('''
+              const pos=['QB','QB','RB','RB','RB','WR','WR','TE','DL','DL','DL','DL','DL','LB','DB','DB','K'];
+              const keys=pos.map((_,i)=>'qf8_browser_'+i);
+              for(let i=0;i<keys.length;i++)PLAYER_DB[keys[i]]={pos:pos[i],age:25,role:'Starter',value:1000-i*25};
+              // Test the actual loaded matcher with isolated fixture FV; never rewrite real player values.
+              const hypothetical=pos.map((p,i)=>({key:keys[i],pos:p,value:2000-i*10}));
+              const before=tuOptimizeLineup(hypothetical);
+              const withEligibility=hypothetical.map((p,i)=>i===12?{...p,eligible:['DL','LB']}:p);
+              const after=tuOptimizeLineup(withEligibility);
+              const slots=qf8ExpandedStarterSlots();
+              const assigned=new Set(after.starters.map(p=>p.key));
+              const slotNames=after.starters.map(p=>p.qf8Slot);
+              return {before:before.starters.length,after:after.starters.length,
+                secondary:after.starters.find(p=>p.key===keys[12])?.qf8Slot,
+                unique:assigned.size,positions:slots.length,
+                hidden:!!document.querySelector('.td-retired-team-impact')?.hidden,
+                weight:TU_BENCH_WEIGHT,limit:TU_ACTIVE_ROSTER_LIMIT};
+            ''')
+            assert data['before']==16 and data['after']==17 and data['secondary']=='LB',data
+            assert data['unique']==17 and data['positions']==17 and data['hidden'],data
+            assert data['weight']==0.15 and data['limit']==41,data
+            print('PASS QF8 browser real index: verified-DL/LB-style fixture fills 17/17 vs 16/17; no duplicate starters; hidden B56 unchanged')
+          finally:
+           server.shutdown();server.server_close()
+          QF8_BROWSER_PY
+          python3 - <<'PY_CHECK'
+          import ast, os
+          from pathlib import Path
+          p=Path(os.environ['QF8_TMP'])
+          for name in ('patch.py','browser.py'): ast.parse((p/name).read_text())
+          print('PASS QF8 Python patch and browser syntax')
+          PY_CHECK
+          node --check "$QF8_TMP/qa.js"
+      - name: Apply candidate to disposable checkout - index.html only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$QF8_TMP/patch.py"
+          [[ "$(git diff --name-only)" == 'index.html' ]] || { echo 'STOP QF8 changed outside index.html'; exit 1; }
+          git diff --check
+          echo 'PASS QF8 one-file eligible-position patch only; no valuation/model file touched'
+      - name: Run exact patched-production JS and independent matching oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          node "$QF8_TMP/qa.js"
+          node scripts/team_utility_projection_runtime.js --selftest
+          python3 scripts/projections/build_team_utility_lineup_projections.py --check
+      - name: Exercise actual rendered candidate with headless Chrome
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$QF8_TMP/browser.py"
+      - name: Run full repo regression, valuation parity, Package Adjustment and IDP guards
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/repo_regression_checks.py
+          python3 scripts/validation/validate_free_agent_valuation_parity.py
+          python3 scripts/sync/sync_free_agent_valuation.py --check
+          python3 scripts/validation/validate_package_adjustment_v2_production.py --selftest
+          python3 - <<'PY_IDP'
+          import sys
+          sys.path.insert(0,'scripts/validation')
+          import validate_idp_v1_final_deployment as guard
+          r=guard.validate_deployment()
+          assert r['actual_changed_entry_count']==320,'STOP frozen IDP 320-changed drift'
+          print('PASS IDP V1 320 changed, 84 held; QF8 did not recalibrate IDP')
+          PY_IDP
+      - name: Exact final diff and publish one-file REVIEW branch only
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(git diff --name-only)" == 'index.html' ]] || { echo 'STOP changed-file allowlist'; exit 1; }
+          [[ -z "$(git ls-files --others --exclude-standard)" ]] || { echo 'STOP untracked files'; exit 1; }
+          python3 - <<'PY_VERIFY'
+          from pathlib import Path
+          s=Path('index.html').read_text()
+          assert s.count('QF8_A5F02_VERIFIED_SECONDARY_ELIGIBILITY_V1')==2
+          assert s.count('QF8_A5F02_FLEXIBLE_LINEUP_MATCHER_V1')==2
+          assert s.count('const TU_BENCH_WEIGHT = 0.15;')==1
+          assert s.count('const TU_ACTIVE_ROSTER_LIMIT = 41;')==1
+          assert s.count('QF7_A5F03_PERSONAL_ACTIVE_PROVENANCE_V1')==1
+          assert s.count('QF6_A5F04_VISIBLE_STARTER_WARNING_V1')==2
+          print('PASS preserved QF6/QF7/17/41/85-15 compatibility tokens')
+          PY_VERIFY
+          check_blob(){ [[ "$(git hash-object "$1")" == "$2" ]] || { echo "STOP protected drift $1"; exit 1; }; }
+          check_blob scripts/team_utility_projection_runtime.js 1620edf05e56a56b4a874c71b32777a443422de5
+          check_blob free-agent-board.html 975efe51091a2315475678a9db0842b05c4fc3aa
+          check_blob model/releases/free-agent-production-v2/release.json 75c9665c0493d8ac4900479b6802c807aaa45633
+          git diff --check
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          [[ "$(git rev-parse origin/main)" == "$GITHUB_SHA" ]] || { echo 'STOP main advanced'; exit 1; }
+          if git ls-remote --exit-code --heads origin "$QF8_REVIEW_BRANCH" >/dev/null; then echo 'STOP review branch already exists'; exit 1; fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c "$QF8_REVIEW_BRANCH"
+          git add -- index.html
+          [[ "$(git diff --cached --name-only)" == 'index.html' ]] || exit 1
+          git diff --cached --check
+          git commit -m 'QF8 A5-F02: ID-verified dual-position legal lineup matching (review)'
+          git push --force-with-lease="refs/heads/${QF8_REVIEW_BRANCH}:" origin "HEAD:refs/heads/${QF8_REVIEW_BRANCH}"
+          echo "QF8_V2_REVIEW_GREEN branch=${QF8_REVIEW_BRANCH} sha=$(git rev-parse HEAD) index=$(git rev-parse HEAD:index.html)"
+          echo 'Review only: no main push, no Pages deployment, no frozen model changes.'
+      - name: Clean temporary runner scripts
+        if: always()
+        shell: bash
+        run: rm -rf /tmp/log-qf8-v2
