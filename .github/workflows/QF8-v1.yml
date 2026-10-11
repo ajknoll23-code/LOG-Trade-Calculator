@@ -1,0 +1,179 @@
+# QF8 / A5-F02 — prove secondary defensive starter eligibility handling on real production code.
+# READ-ONLY PHASE 0: no branches, commits, pushes, deployments or model recalibration.
+name: QF8 Phase 0 - DL LB Dual Eligibility Lineup Audit (Read Only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trade-desk-read-only-audit
+  cancel-in-progress: false
+
+jobs:
+  phase0-a5f02:
+    name: Compare actual 17-slot optimizer against Sleeper eligible-position matching
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      QF8_TMP: /tmp/log-qf8-phase0
+    steps:
+      - name: Checkout owner-selected main commit without write credentials
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Configure Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Pin QF7 production source and protected model inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == refs/heads/main ]] || { echo 'STOP: run on main only'; exit 1; }
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]] || { echo 'STOP: checkout HEAD mismatch'; exit 1; }
+          [[ -z "$(git status --porcelain)" ]] || { echo 'STOP: unclean checkout'; exit 1; }
+          pin(){ [[ "$(git hash-object "$1")" == "$2" ]] || { echo "STOP: pinned source drift $1"; exit 1; }; }
+          pin index.html f406c5dac446909384d1619f185d7bdf7de99368
+          pin data/league_rosters.json 703ef1f651fc3debad9154001554264cd28086dd
+          pin data/my_roster.json 4b67e08f6c304d9d1e8cda494785875768753532
+          pin scripts/sync/sync_sleeper.py 702ef3ecb4daa18bfc8d37ebdef11b927f90e206
+          pin scripts/team_utility_projection_runtime.js 1620edf05e56a56b4a874c71b32777a443422de5
+          pin free-agent-board.html 975efe51091a2315475678a9db0842b05c4fc3aa
+          pin model/releases/free-agent-production-v2/release.json 75c9665c0493d8ac4900479b6802c807aaa45633
+          echo 'PASS: exact QF7 source and frozen inputs verified'
+      - name: Prepare exact-source Node reproduction and independent matching oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$QF8_TMP"
+          cat > "$QF8_TMP/audit.js" <<'QF8_PHASE0_JS'
+          'use strict';
+          const fs=require('node:fs');
+          const vm=require('node:vm');
+          const assert=require('node:assert/strict');
+          const html=fs.readFileSync('index.html','utf8');
+          const league=JSON.parse(fs.readFileSync('data/league_rosters.json','utf8'));
+          const own=JSON.parse(fs.readFileSync('data/my_roster.json','utf8'));
+          assert(Array.isArray(league.rosters) && league.rosters.length>=10,'missing league roster coverage');
+          const slotNames=['starters','bench','taxi','reserve_ir'];
+          const rows=[];
+          for(const team of league.rosters){
+            for(const slot of slotNames){
+              assert(Array.isArray(team[slot]),`missing ${slot} for ${team.roster_id}`);
+              for(const p of team[slot]){
+                assert(p && typeof p.player_id==='string' && Array.isArray(p.fantasy_positions),'unproven Sleeper position provenance');
+                rows.push({id:p.player_id,name:p.name,slot,roster_id:team.roster_id,positions:p.fantasy_positions});
+              }
+            }
+          }
+          const duals=rows.filter(x=>new Set(x.positions).size>1);
+          const dlLb=rows.filter(x=>x.positions.includes('DL') && x.positions.includes('LB'));
+          const activeDlLb=dlLb.filter(x=>x.slot==='starters'||x.slot==='bench');
+          assert(activeDlLb.length>0,'no actual active DL/LB rows in pinned league source');
+          const ownReal=rows.filter(x=>String(x.roster_id)===String(own.roster_id));
+          assert(ownReal.length>0,'own roster ID missing from league source');
+          for(const slot of slotNames){
+            const actual=ownReal.filter(x=>x.slot===slot).map(x=>x.id).sort();
+            const expected=own[slot].map(x=>x.player_id).sort();
+            assert.deepEqual(actual,expected,`personal/league stable IDs diverged in ${slot}`);
+          }
+          console.log(`PASS REAL SLEEPER: ${league.rosters.length} teams, ${rows.length} roster entries, ${duals.length} multi-position, ${dlLb.length} DL/LB, ${activeDlLb.length} active DL/LB`);
+          console.log('REAL EVIDENCE (sample active dual): '+JSON.stringify(activeDlLb.slice(0,4)));
+          function section(begin,end){
+            const i=html.indexOf(begin);
+            assert(i>=0,`missing production function ${begin}`);
+            assert.equal(html.indexOf(begin,i+1),-1,`ambiguous function anchor ${begin}`);
+            const j=html.indexOf(end,i+begin.length);
+            assert(j>i,`missing ending ${end}`);
+            return html.slice(i,j);
+          }
+          const production=[
+            section('const TU_DEDICATED_SLOTS = [','/* Trade-level wrapper:'),
+            section('function qf6LineupCompleteness(keys){','function qf6ShowLineupWarning('),
+          ].join('\n');
+          const context=vm.createContext({console});
+          vm.runInContext(`
+            let PLAYER_DB={};
+            function playerValueByKey(k){return PLAYER_DB[k]?.value ?? null;}
+          `+production,context,{timeout:7000});
+          const run=code=>vm.runInContext(code,context,{timeout:7000});
+          const toPairs=slot=>Array.from(slot).map(x=>({name:x.name || x.pos,eligible:x.eligible ? Array.from(x.eligible):[x.pos]}));
+          const dedicated=toPairs(run('TU_DEDICATED_SLOTS'));
+          const flex=toPairs(run('TU_FLEX_SLOTS'));
+          const slots=[];
+          for(const d of dedicated){
+            const count=run(`TU_DEDICATED_SLOTS.find(x=>x.pos===${JSON.stringify(d.name)})?.count`);
+            for(let n=0;n<count;n++)slots.push({name:d.name,eligible:[d.name]});
+          }
+          for(const f of run('TU_FLEX_SLOTS')) for(let n=0;n<f.count;n++)slots.push({name:f.name,eligible:Array.from(f.eligible)});
+          assert.equal(slots.length,17,'league mandatory starter count changed');
+          assert.equal(run('TU_ACTIVE_ROSTER_LIMIT'),41,'41 active roster limit changed');
+          assert.equal(run('TU_BENCH_WEIGHT'),0.15,'85/15 FV-based utility policy changed');
+          console.log('PASS EXACT SOURCE: 17 starter slots, 41 active limit, 0.15 bench weight unchanged');
+          // 17 real league starter archetypes except exactly one necessary LB is DL/LB dual:
+          // QB2, RB3, WR2, TE1, DL5 (one DL/LB), LB1, DB2, K1.
+          const primary=['QB','QB','RB','RB','RB','WR','WR','TE','DL','DL','DL','DL','DL','LB','DB','DB','K'];
+          assert.equal(primary.length,17);
+          const tagged=activeDlLb.find(p=>p.positions[0]==='DL') || activeDlLb[0];
+          assert(tagged && tagged.positions.includes('DL') && tagged.positions.includes('LB'));
+          const players=primary.map((pos,i)=>({key:i===12?`sleeper:${tagged.id}`:`fixture:${i}`,pos,value:2000-i*13,eligible:i===12?['DL','LB']:[pos]}));
+          const baseline=primary.map((pos,i)=>({key:`control:${i}`,pos:i===12?'LB':pos,value:2000-i*13,eligible:[i===12?'LB':pos]}));
+          // Independent maximum bipartite matching across every starter slot and player's verified eligibilities.
+          function maximumFill(pool){
+            const assigned=Array(pool.length).fill(-1);
+            function tryFill(si,seen){
+              const s=slots[si];
+              for(let pi=0;pi<pool.length;pi++){
+                if(seen.has(pi) || !pool[pi].eligible.some(pos=>s.eligible.includes(pos)))continue;
+                seen.add(pi);
+                if(assigned[pi]===-1 || tryFill(assigned[pi],seen)){
+                  assigned[pi]=si;return true;
+                }
+              }
+              return false;
+            }
+            let filled=0;
+            for(let si=0;si<slots.length;si++) if(tryFill(si,new Set()))filled++;
+            return filled;
+          }
+          assert.equal(maximumFill(baseline),17,'independent matching baseline failed');
+          assert.equal(maximumFill(players),17,'explicitly legal DL/LB fixture did not fit 17');
+          const singleOnly=players.map(p=>({...p,eligible:[p.pos]}));
+          assert.equal(maximumFill(singleOnly),16,'unexpectedly full lineup without dual eligibility');
+          const literal=JSON.stringify(players);
+          const actual=run(`tuOptimizeLineup(${literal})`);
+          assert.equal(actual.starters.length,16,'single-pos deployed behavior changed; redesign audit');
+          assert.equal(run(`qf6LineupCompleteness(${JSON.stringify(players.map(p=>p.key))}).filled`),0,'empty PLAYER_DB should not manufacture starters');
+          run(`PLAYER_DB=Object.fromEntries(${literal}.map(p=>[p.key,{pos:p.pos,value:p.value,fantasy_positions:p.eligible}]))`);
+          const actualFromKeys=run(`tuPlayersFromKeys(${JSON.stringify(players.map(p=>p.key))})`);
+          assert.equal(actualFromKeys.length,17);
+          assert(actualFromKeys.every(p=>!('eligible' in p)),'secondary eligibility already preserved; audit needs revision');
+          const pre=run(`tuOptimizeLineup(tuPlayersFromKeys(${JSON.stringify(players.map(p=>p.key))}))`);
+          assert.equal(pre.starters.length,16,'real key-to-optimizer bridge unexpectedly handles duals');
+          const warning=run(`qf6LineupCompleteness(${JSON.stringify(players.map(p=>p.key))})`);
+          assert.equal(warning.filled,16,'QF6 warning not consistent with current optimizer');
+          assert(warning.missing.includes('LB'),'LB slot was not detected as unfilled');
+          console.log(`CONFIRMED A5-F02: independent legal=17/17; production=${pre.starters.length}/17; QF6 warning=${warning.filled}/17 (missing ${warning.missing.join(',')})`);
+          console.log('PASS NEGATIVE: no secondary Sleeper eligibility yields only 16; no fabricated fallback');
+          // This Phase 0 does not choose matching/assignment objective, fantasy weight, or source-priority policy.
+          console.log('QF8_PHASE0_PASS: confirmed eligibility gap; no changes authorized to FV, 85/15 utility, role/IDP models, or production');
+          QF8_PHASE0_JS
+          node --check "$QF8_TMP/audit.js"
+      - name: Execute exact production JS and independent legal matching oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          node "$QF8_TMP/audit.js"
+      - name: Final zero-diff read-only audit guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -z "$(git status --porcelain)" ]] || { echo 'STOP: audit modified tracked or untracked sources'; exit 1; }
+          [[ "$(git hash-object index.html)" == f406c5dac446909384d1619f185d7bdf7de99368 ]] || exit 1
+          echo 'QF8 PHASE0 GREEN: no commits, branches, pushes, or deployments; QF7 production source preserved'
