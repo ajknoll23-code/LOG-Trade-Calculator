@@ -6233,6 +6233,9 @@ const MY_ROSTER_FALLBACK = [
   'devin neal','drew allar','michael trigg','bryce lance','derrick moore',
 ];
 let MY_ROSTER = MY_ROSTER_FALLBACK.slice();
+/* QF7 A5-F03: verified personal-sync active keys, NEVER the unlabelled 41-key slice. */
+let MY_ROSTER_ACTIVE_KEYS = null;
+let MY_ROSTER_ACTIVE_ID = null;
 let MY_ROSTER_ID = null; // set from live sync; used to exclude my own team from the trade-target scan
 let OWN_ROSTER_ID = null; // set ONLY by the personal sync below, never by switchToTeam —
                             // this is how addPlayerFromRoster tells "I'm looking at MY roster"
@@ -9506,7 +9509,33 @@ function resolveSyncedTeam(p, key, existing){
   return PLAYER_TEAM[key] || null;
 }
 
+/* QF7_A5F03_PERSONAL_ACTIVE_PROVENANCE_V1
+   Construct an active-only cache strictly from complete, ID-bearing personal
+   Sleeper slot metadata. Every saved active key must be disjoint from taxi/IR.
+   Missing, duplicate or malformed slot metadata returns null (unknown). */
+function qf7VerifiedPersonalActiveKeys(data){
+  if(!data || data.roster_id === undefined || data.roster_id === null ||
+     !Number.isFinite(data.synced_at) || data.synced_at <= 0) return null;
+  const slots=['starters','bench','taxi','reserve_ir'];
+  if(!slots.every(slot=>Array.isArray(data[slot]))) return null;
+  const seenIds=new Set(), seenKeys=new Set(), active=[];
+  for(const slot of slots){
+    for(const p of data[slot]){
+      if(!p || typeof p.player_id !== 'string' || !p.player_id ||
+         typeof p.name !== 'string' || !p.name.trim()) return null;
+      const key=resolveExistingKey(normalizeName(p.name));
+      const id=String(p.player_id);
+      if(!key || seenIds.has(id) || seenKeys.has(key)) return null;
+      seenIds.add(id); seenKeys.add(key);
+      if(slot==='starters' || slot==='bench') active.push(key);
+    }
+  }
+  if(!active.length) return null; // legal-roster optimizer owns any >41 cuts
+  return active;
+}
+
 function mergeLiveRoster(data){
+  const verifiedActive = qf7VerifiedPersonalActiveKeys(data);
   const keys = [];
   const slotDefaults = { starters:'Starter', bench:'Rotational', taxi:'Speculative' };
   for(const slot of ['starters','bench','taxi']){
@@ -9564,10 +9593,20 @@ function mergeLiveRoster(data){
       keys.push(key);
     }
   }
-  MY_ROSTER = keys;
+  // Refresh personal provenance whether or not the viewer switched teams.
+  MY_ROSTER_ACTIVE_KEYS = verifiedActive ? verifiedActive.slice() : null;
+  MY_ROSTER_ACTIVE_ID = verifiedActive ? String(data.roster_id) : null;
+  // A late personal-sync response may identify the owner, but must not
+  // silently overwrite a previously confirmed selection of another team.
+  const selectedOther = state.teamConfirmed && MY_ROSTER_ID !== null &&
+    String(MY_ROSTER_ID) !== String(data.roster_id) &&
+    LEAGUE_ROSTERS && LEAGUE_ROSTERS[MY_ROSTER_ID];
+  if(!selectedOther){
+    MY_ROSTER = keys;
+    if(typeof data.roster_id !== 'undefined') MY_ROSTER_ID = data.roster_id;
+  }
   if(typeof data.roster_id !== 'undefined'){
-    MY_ROSTER_ID = data.roster_id;
-    OWN_ROSTER_ID = data.roster_id; // only set here — the personal sync is the one true "this is really you" signal
+    OWN_ROSTER_ID = data.roster_id; // only set here — personal Sleeper sync verifies own identity
   }
 }
 
@@ -9957,17 +9996,27 @@ const TU_ACTIVE_ROSTER_LIMIT = 41;
 
 function tuActiveRosterKeys(){
   const team = LEAGUE_ROSTERS && LEAGUE_ROSTERS[MY_ROSTER_ID];
-  if(team && Array.isArray(team.players)){
-    const active = team.players
-      .filter(p => p.slot === 'starters' || p.slot === 'bench')
-      .map(p => p.key);
-    if(active.length) return active;
+  if(team && Array.isArray(team.players) && team.players.length){
+    const validSlots=new Set(['starters','bench','taxi','reserve_ir']);
+    const valid=team.players.every(p=>p && typeof p.key==='string' && !!p.key &&
+      validSlots.has(p.slot));
+    const distinct=new Set(team.players.map(p=>p && p.key)).size === team.players.length;
+    if(valid && distinct){
+      const active=team.players
+        .filter(p=>p.slot==='starters'||p.slot==='bench')
+        .map(p=>p.key);
+      if(active.length) return active; // legal-roster optimizer applies the 41 cap
+    }
   }
-
-  /* Fallback/live personal sync ordering is starters -> bench -> taxi,
-     so the first 41 keys are the active roster when league-wide slot
-     metadata is temporarily unavailable. */
-  return MY_ROSTER.slice(0, Math.min(TU_ACTIVE_ROSTER_LIMIT, MY_ROSTER.length));
+  // Personal fallback only when a successful complete personal sync
+  // matches the CURRENTLY selected team. Never borrow another team's
+  // roster, and never guess 41 from an unlabelled starter/bench/taxi list.
+  if(Array.isArray(MY_ROSTER_ACTIVE_KEYS) && MY_ROSTER_ACTIVE_KEYS.length &&
+     MY_ROSTER_ACTIVE_ID !== null &&
+     String(MY_ROSTER_ID) === MY_ROSTER_ACTIVE_ID){
+    return MY_ROSTER_ACTIVE_KEYS.slice();
+  }
+  return null; // unknown active-roster provenance; caller must suppress TU
 }
 
 /* Greedy lineup fill: dedicated slots first (each takes the highest-value
@@ -11995,17 +12044,30 @@ function renderTradeImpact(){
   /* Team Utility uses the ACTIVE roster only. Taxi and IR remain separate
    pools and cannot silently become free active bench depth. */
   const tuBeforeRoster = tuActiveRosterKeys();
-  const tuOutKeys = outgoing
+  const tuReady = Array.isArray(tuBeforeRoster);
+  const tuOutKeys = tuReady ? outgoing
     .map(a => normalizeName(a.name))
-    .filter(k => tuBeforeRoster.includes(k));
+    .filter(k => tuBeforeRoster.includes(k)) : [];
   const tuIncomingKeys = incoming.map(a => normalizeName(a.name));
-  const tuAfterPool = tuBeforeRoster
+  const tuAfterPool = tuReady ? tuBeforeRoster
     .filter(k => !tuOutKeys.includes(k))
-    .concat(tuIncomingKeys);
-  const teamUtil = calculateTeamUtility(tuBeforeRoster, tuAfterPool);
-  qf6ShowLineupWarning(tuBeforeRoster, tuAfterPool);
-  const tuColor = teamUtil.teamUtility >= 0 ? 'var(--green)' : 'var(--red)';
-  const tuSign = teamUtil.teamUtility >= 0 ? '+' : '';
+    .concat(tuIncomingKeys) : null;
+  const teamUtil = tuReady ? calculateTeamUtility(tuBeforeRoster, tuAfterPool) : null;
+  if(tuReady){
+    qf6ShowLineupWarning(tuBeforeRoster, tuAfterPool);
+  } else {
+    // Clear a prior QF6 banner if the active-roster source becomes unknown.
+    const staleWarning=document.getElementById('qf6LineupWarning');
+    if(staleWarning) staleWarning.remove();
+  }
+  const tuLine = teamUtil ? `
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:13px;margin-bottom:8px;">
+        Team Utility: <span style="color:${teamUtil.teamUtility >= 0 ? 'var(--green)' : 'var(--red)'};font-weight:600;">${teamUtil.teamUtility >= 0 ? '+' : ''}${teamUtil.teamUtility.toLocaleString()}</span>
+        <span style="color:var(--text-dim);"> — does this actually help your lineup</span>
+      </div>` : `
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:13px;margin-bottom:8px;color:var(--amber);">
+        Team Utility unavailable — verified active starter/bench roster not loaded. No taxi/IR players assumed active.
+      </div>`;
 
   const marketSummary = packageMarketValueSummary(outgoing, incoming);
   const marketLine = marketPackageLineHTML(marketSummary);
@@ -12016,9 +12078,11 @@ function renderTradeImpact(){
     if(giving > getting){
       packageNote = `<div style="color:var(--text-dim);margin-top:4px;">Consolidation: giving up ${giving} players for ${getting} — frees up ${giving-getting} active roster spot${giving-getting>1?'s':''}.</div>`;
     } else {
-      const projectedCuts = (teamUtil.postCuts || []).map(titleCase);
+      const projectedCuts = teamUtil ? (teamUtil.postCuts || []).map(titleCase) : [];
       const extraSlots = getting - giving;
-      if(projectedCuts.length){
+      if(!teamUtil){
+        packageNote = `<div style="color:var(--text-dim);margin-top:4px;">Expansion: receiving ${getting} players for ${giving}. Projected active-roster cuts unavailable until verified starter/bench data loads.</div>`;
+      } else if(projectedCuts.length){
         packageNote = `<div style="color:var(--text-dim);margin-top:4px;">Expansion: receiving ${getting} players for ${giving}. Legal-roster optimizer projects ${projectedCuts.length} cut${projectedCuts.length>1?'s':''}: <span style="color:var(--amber);">${projectedCuts.map(escapeHtml).join(', ')}</span>.</div>`;
       } else {
         packageNote = `<div style="color:var(--text-dim);margin-top:4px;">Expansion: receiving ${getting} players for ${giving} — uses ${extraSlots} additional active roster spot${extraSlots>1?'s':''}; no cut required at current occupancy.</div>`;
@@ -12035,10 +12099,7 @@ function renderTradeImpact(){
       </div>
       ${playerOnlyLine}
       ${marketLine}
-      <div style="font-family:'IBM Plex Mono',monospace;font-size:13px;margin-bottom:8px;">
-        Team Utility: <span style="color:${tuColor};font-weight:600;">${tuSign}${teamUtil.teamUtility.toLocaleString()}</span>
-        <span style="color:var(--text-dim);"> — does this actually help your lineup</span>
-      </div>
+      ${tuLine}
       ${[...outgoing, ...incoming].some(a => valueUncertaintyForPlayer(a.name, a.value)) ? `
         <div style="font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:var(--text-dim);margin-bottom:8px;">
           Fundamental ranges are sensitivity envelopes, not probability intervals. Model totals use Fundamental center values; eligible consolidation trades apply the separate Package Adjustment to the verdict.
