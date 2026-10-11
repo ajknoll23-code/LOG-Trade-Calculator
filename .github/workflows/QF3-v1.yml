@@ -1,0 +1,258 @@
+# QF3 V1 - Audit A3-F01 duplicate-player trade integrity repair.
+# Manual review-branch workflow only; does not deploy to main or Pages.
+# Upload to .github/workflows/QF3-v1.yml and run from Actions on main.
+name: QF3 V1 - Duplicate Player Integrity Review Branch
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  qf3-review:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    env:
+      REVIEW_BRANCH: qf3-a3f01-v1-review-2026-10-10
+      ORIGINAL_INDEX_BLOB: a076f6c7192f685d464a1e3242f7d598d49c3a28
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout triggering main revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: true
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install existing regression dependency
+        run: python3 -m pip install requests
+      - name: Fail-closed original source, clean runner and branch check
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${GITHUB_REF}" == 'refs/heads/main' ]] || exit 1
+          [[ "$(git rev-parse HEAD)" == "${GITHUB_SHA}" ]] || exit 1
+          [[ -z "$(git status --porcelain)" ]] || { git status --short; exit 1; }
+          [[ "$(git hash-object index.html)" == "${ORIGINAL_INDEX_BLOB}" ]] || {
+            echo 'STOP: index.html is not the exact verified QF2 production release'; exit 1;
+          }
+          if git ls-remote --exit-code --heads origin "${REVIEW_BRANCH}" >/dev/null; then
+            echo 'STOP: QF3 review branch already exists; never overwrite'; exit 1
+          fi
+          echo 'PASS exact QF2 production source and unused review branch'
+      - name: Apply one exact scoped A3-F01 integrity patch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+
+          path = Path('index.html')
+          original = path.read_bytes()
+          git_sha = hashlib.sha1(f'blob {len(original)}\0'.encode() + original).hexdigest()
+          assert git_sha == 'a076f6c7192f685d464a1e3242f7d598d49c3a28', 'Source drift'
+          before = original.decode('utf-8')
+          # Match the exact deployed source and leave all other bytes untouched.
+          old = '''function addPlayerAsset(side, name, pos, age, role){
+            if(!name) name = pos + ' Player';
+            const val = playerValue(pos, age, role, name);
+            const key = normalizeName(name);
+            const dataDriven = PROD_MULT.hasOwnProperty(key);
+            const injury = PLAYER_DB[key] ? PLAYER_DB[key].injury : null;
+            state[side].push({ id:uid(), type:'player', name, pos, age, role, value:val, dataDriven, injury });
+            render();
+          }'''
+          old = '\n'.join(line[10:] if line.startswith('          ') else line for line in old.split('\n'))
+          new = '''/* QF3_A3_F01_DUPLICATE_PLAYER_GUARD_V1
+             Trade-only canonical name+position identity; resolves known aliases.
+             Does not modify player values, PLAYER_DB, Free Agents, picks, or
+             package valuation. Different players with the same visible name
+             and position need a future stable-ID entry path (A7-F02). */
+          function tradePlayerIdentity(name, pos){
+            const key = normalizeName(String(name || ''));
+            if(!key) return null; // Blank synthetic placeholders are not real identities.
+            return resolveExistingKey(key) + '|' + String(pos || '').trim().toUpperCase();
+          }
+
+          function tradeAlreadyHasPlayer(name, pos){
+            const identity = tradePlayerIdentity(name, pos);
+            if(identity === null) return false;
+            return [...(state.A || []), ...(state.B || [])].some(a =>
+              a && a.type === 'player' && tradePlayerIdentity(a.name, a.pos) === identity
+            );
+          }
+
+          function addPlayerAsset(side, name, pos, age, role){
+            const providedName = String(name || '').trim();
+            if(providedName && tradeAlreadyHasPlayer(providedName, pos)){
+              const notice = `Already in trade: ${providedName}. Remove the existing player before adding again.`;
+              // Use textContent exclusively: player names may be untrusted text.
+              const tag = document.getElementById(`matchTag-${side}`);
+              const sub = document.getElementById('verdictSub');
+              if(tag){ tag.textContent = notice; tag.setAttribute('role', 'status'); }
+              if(sub) sub.textContent = notice;
+              return false; // No state mutation, no pricing, no render.
+            }
+            if(!name) name = pos + ' Player';
+            const val = playerValue(pos, age, role, name);
+            const key = normalizeName(name);
+            const dataDriven = PROD_MULT.hasOwnProperty(key);
+            const injury = PLAYER_DB[key] ? PLAYER_DB[key].injury : null;
+            state[side].push({ id:uid(), type:'player', name, pos, age, role, value:val, dataDriven, injury });
+            render();
+            return true;
+          }'''
+          new = '\n'.join(line[10:] if line.startswith('          ') else line for line in new.split('\n'))
+          assert before.count(old) == 1, f'Expected one exact addPlayerAsset anchor, got {before.count(old)}'
+          assert 'QF3_A3_F01_DUPLICATE_PLAYER_GUARD_V1' not in before
+          candidate = before.replace(old, new, 1)
+          assert candidate.count('QF3_A3_F01_DUPLICATE_PLAYER_GUARD_V1') == 1
+          assert candidate.replace(new, old, 1) == before, 'Unexpected source differences'
+          assert candidate.count('const YEAR_DISCOUNT =') == before.count('const YEAR_DISCOUNT =') == 1
+          assert candidate.count('TEAM_IMPACT_UI_RETIRED_V1') == before.count('TEAM_IMPACT_UI_RETIRED_V1')
+          assert candidate.count('PACKAGE_ADJUSTMENT_PRODUCTION_V1') == before.count('PACKAGE_ADJUSTMENT_PRODUCTION_V1')
+          path.write_text(candidate, encoding='utf-8')
+          print('PASS QF3: 1 exact source replacement; no frozen model or trade formula changes')
+          PY
+      - name: Actual source identity behavior and JavaScript syntax tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re, subprocess, tempfile, json
+          candidate = Path('index.html').read_text(encoding='utf-8')
+          original = subprocess.check_output(['git','show','HEAD:index.html'], text=True)
+          assert original != candidate
+          assert candidate.count('QF3_A3_F01_DUPLICATE_PLAYER_GUARD_V1') == 1
+          anchor = '/* QF3_A3_F01_DUPLICATE_PLAYER_GUARD_V1'
+          end_anchor = '\n\nfunction addPickAsset(side, year, round, slot){'
+          i = candidate.index(anchor)
+          j = candidate.index(end_anchor,i)
+          patched = candidate[i:j]
+          assert original[:original.index('function addPlayerAsset(side, name, pos, age, role){')] == candidate[:i]
+          # Original add-player segment was the only permitted change.
+          o1 = original.index('function addPlayerAsset(side, name, pos, age, role){')
+          o2 = original.index(end_anchor, o1)
+          assert original[:o1] == candidate[:i]
+          assert original[o2:] == candidate[j:]
+          assert 'function tradePlayerIdentity' in patched and 'function tradeAlreadyHasPlayer' in patched
+          assert 'function addPickAsset' not in patched
+          # Entire inline-script syntax, not just the extracted function.
+          scripts = re.findall(r'<script(?:\s[^>]*)?>(.*?)</script>', candidate, re.I | re.S)
+          assert scripts
+          with tempfile.NamedTemporaryFile('w',suffix='.js',delete=False,encoding='utf8') as f:
+              f.write('\n'.join(scripts)); tempjs=f.name
+          try: subprocess.run(['node','--check',tempjs],check=True)
+          finally: Path(tempjs).unlink(missing_ok=True)
+          def func(name):
+              match = re.search(r'function '+re.escape(name)+r'\([^\n]*\)\{.*?\n\}',candidate,re.S)
+              assert match, name
+              return match.group()
+          helpers = '\n'.join(func(n) for n in ['normalizeName','resolveExistingKey'])
+          harness = r'''
+          const assert = require('node:assert/strict');
+          const ALIASES = {'j greenard':'jonathan greenard'};
+          const ALIASES_REVERSE = {};
+          const PLAYER_DB = {'myles garrett': {pos:'DL'}, 'bijan robinson': {pos:'RB'}, 'jonathan greenard': {pos:'DL'}};
+          const PROD_MULT = {'myles garrett':0.8, 'bijan robinson':1.0};
+          const state = {A:[], B:[]};
+          const tags = {A:{textContent:'',setAttribute(k,v){this[k]=v}}, B:{textContent:'',setAttribute(k,v){this[k]=v}}};
+          const verdict = {textContent:''};
+          const document = {getElementById(id){return id==='matchTag-A' ? tags.A : id==='matchTag-B' ? tags.B : id==='verdictSub' ? verdict : null}};
+          let uidSeq=0, renderCount=0, valuationCalls=0;
+          function uid(){ return String(++uidSeq); }
+          function render(){ renderCount++; }
+          function playerValue(pos,age,role,name){valuationCalls++; const k=normalizeName(name);return k==='bijan robinson'?8295:k==='myles garrett'?5770:1234;}
+          const total = s => state[s].reduce((v,a)=>v+a.value,0);
+          assert.equal(addPlayerAsset('A','Bijan Robinson','RB',24,'Elite'),true);
+          assert.equal(addPlayerAsset('B','Myles Garrett','DL',30,'Elite'),true);
+          assert.equal(total('A'),8295);
+          assert.equal(total('B'),5770);
+          const before=JSON.stringify(state), calls=valuationCalls, renders=renderCount;
+          for(const [side,name] of [['B','Myles Garrett'],['B','MYLES GARRETT'],['A','Myles. Garrett'],['A','Myles Garrett']]){
+            assert.equal(addPlayerAsset(side,name,'DL',30,'Elite'),false);
+            assert.equal(JSON.stringify(state),before,'no duplicate state mutation');
+          }
+          assert.equal(valuationCalls,calls,'no revaluation for rejected duplicates');
+          assert.equal(renderCount,renders,'no rerender for rejected duplicates');
+          assert.equal(total('B'),5770,'no inflated 11,540 duplicate verdict');
+          assert.ok(total('A')>total('B'),'Bijan still wins once Myles duplicate is blocked');
+          assert.match(tags.A.textContent,/Already in trade/);
+          assert.equal(tags.A.role,'status');
+          assert.match(verdict.textContent,/Already in trade/);
+          assert.equal(addPlayerAsset('A','J Greenard','DL',29,'Starter'),true);
+          assert.equal(addPlayerAsset('B','Jonathan Greenard','DL',29,'Starter'),false,'alias and canonical cannot coexist');
+          assert.equal(state.A.length,2);
+          assert.equal(addPlayerAsset('B','Myles Garrett','LB',30,'Starter'),true,'different position bucket is a different unresolved identity');
+          assert.equal(addPlayerAsset('B','Other Player','DL',24,'Starter'),true,'independent player accepted');
+          assert.equal(addPlayerAsset('B','Other Player','DL',28,'Depth'),false,'edited age/role cannot evade duplicate');
+          assert.equal(addPlayerAsset('B','','QB',24,'Starter'),true,'anonymous synthetic player 1');
+          assert.equal(addPlayerAsset('A','','QB',24,'Starter'),true,'anonymous synthetic player 2');
+          state.A.push({type:'pick',name:'2027 Rd 1 (early)',value:6132});
+          state.B.push({type:'pick',name:'2027 Rd 1 (early)',value:6132});
+          assert.equal(state.A.filter(x=>x.type==='pick').length,1);
+          assert.equal(state.B.filter(x=>x.type==='pick').length,1);
+          assert.equal(addPlayerAsset('B','Bijan Robinson','RB',24,'Elite'),false,'cross-side duplicate blocked');
+          state.B=state.B.filter(a=>a.type!=='player'||normalizeName(a.name)!=='myles garrett');
+          assert.equal(addPlayerAsset('B','Myles Garrett','DL',30,'Elite'),true,'can readd after deleting original');
+          '''
+          harness += "\nconsole.log('PASS QF3: duplicates, aliases, both sides, repeat taps, roster/manual core, placeholders, and picks');\n"
+          js = helpers + '\n' + patched + '\n' + harness
+          with tempfile.NamedTemporaryFile('w',suffix='.cjs',delete=False,encoding='utf8') as f:
+              f.write(js); testpath=f.name
+          try: subprocess.run(['node',testpath],check=True)
+          finally: Path(testpath).unlink(missing_ok=True)
+          print('PASS complete JavaScript syntax and QF3 behavioral fixture')
+          PY
+      - name: Full repository, IDP, Free Agent and Package Adjustment regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/repo_regression_checks.py
+          python3 scripts/validation/validate_free_agent_valuation_parity.py
+          python3 scripts/validation/validate_package_adjustment_v2_production.py --selftest
+          python3 - <<'PY'
+          import sys
+          sys.path.insert(0,'scripts/validation')
+          import validate_idp_v1_final_deployment as v
+          report = v.validate_deployment()
+          assert report['actual_changed_entry_count'] == 320
+          print('PASS frozen IDP 320 approved entries')
+          PY
+      - name: Publish review branch ONLY after all gates pass
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(git diff --name-only)" == 'index.html' ]] || { git status --short; exit 1; }
+          git diff --check
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          [[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main)" ]] || {
+            echo 'STOP: main advanced; refuse stale review candidate'; exit 1;
+          }
+          if git ls-remote --exit-code --heads origin "${REVIEW_BRANCH}" >/dev/null; then
+            echo 'STOP: review branch appeared during run'; exit 1
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c "${REVIEW_BRANCH}"
+          git add -- index.html
+          [[ "$(git diff --cached --name-only)" == 'index.html' ]] || exit 1
+          git diff --cached --check
+          git commit -m 'QF3 A3-F01: refuse duplicate canonical players within either trade side'
+          git push --force-with-lease="refs/heads/${REVIEW_BRANCH}:" origin "HEAD:refs/heads/${REVIEW_BRANCH}"
+          echo "QF3 REVIEW GREEN; branch=${REVIEW_BRANCH} commit=$(git rev-parse HEAD) index_blob=$(git hash-object index.html)"
+          echo 'main and Pages unchanged: require owner review, separate preflight, separate promotion.'
