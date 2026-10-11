@@ -1,0 +1,178 @@
+# QF1 V3: one-file, manual, owner-gated production preflight and optional promotion.
+# Default mode = preflight: READ-ONLY; no changes to index.html or main.
+# Promotion requires a separate intentional run with BOTH mode=promote AND the
+# exact confirmation phrase, after the owner authorizes deploying QF1 V2.
+# Source is the 10-edit Claude-reviewed review commit. Scientific data is sealed.
+# Upload as .github/workflows/QF1-v3.yml on main, then run from Actions/main.
+name: QF1 V3 - Trade Desk Production Preflight and Explicit Promotion
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'preflight is READ-ONLY; promote will update live main'
+        required: true
+        type: choice
+        default: preflight
+        options:
+          - preflight
+          - promote
+      confirmation:
+        description: 'For promote ONLY, type PROMOTE_QF1_V2_TO_MAIN (leave blank for preflight)'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+  QF1_BASE: '4b10af11f259a6ba2c6ca2e9d76fdb285647a37e'
+  QF1_REVIEW_BRANCH: 'qf1-wave1-v2-review-2026-10-10'
+  QF1_REVIEW_SHA: '1de756692af7846e6ddc865d24e0b0e3198f08d9'
+  QF1_ORIGINAL_INDEX_BLOB: '4e42054d5d0c4845dc0b16d3fdf8cf642cbf19c8'
+  QF1_PATCHED_INDEX_BLOB: '634d1c1f18a2cec810c2b0971956307009168915'
+
+jobs:
+  qf1-production-preflight:
+    name: Verify exact reviewed candidate without deploying
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout precisely the main revision being checked
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install one existing regression dependency
+        run: python3 -m pip install requests
+      - name: Reject missing permission, missing approval or drifted source
+        shell: bash
+        env:
+          RELEASE_MODE: ${{ inputs.mode }}
+          RELEASE_CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set -euo pipefail
+          [[ "${GITHUB_REF}" == 'refs/heads/main' ]] || { echo 'STOP: Run on main only'; exit 1; }
+          [[ "${RELEASE_MODE}" == preflight || "${RELEASE_MODE}" == promote ]] || { echo 'STOP: bad mode'; exit 1; }
+          if [[ "${RELEASE_MODE}" == promote ]]; then
+            [[ "${RELEASE_CONFIRMATION}" == 'PROMOTE_QF1_V2_TO_MAIN' ]] || {
+              echo 'STOP: production promotion requires the exact explicit phrase'; exit 1;
+            }
+          fi
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          git fetch --no-tags origin "+refs/heads/${QF1_REVIEW_BRANCH}:refs/remotes/origin/${QF1_REVIEW_BRANCH}"
+          [[ "$(git rev-parse HEAD)" == "${GITHUB_SHA}" ]] || { echo 'STOP: unexpected checkout'; exit 1; }
+          [[ "$(git rev-parse origin/main)" == "${GITHUB_SHA}" ]] || { echo 'STOP: main changed since dispatch'; exit 1; }
+          [[ "$(git rev-parse origin/${QF1_REVIEW_BRANCH})" == "${QF1_REVIEW_SHA}" ]] || {
+            echo 'STOP: review branch changed after QF1 green'; exit 1;
+          }
+          [[ "$(git hash-object index.html)" == "${QF1_ORIGINAL_INDEX_BLOB}" ]] || {
+            echo 'STOP: main index.html changed; do not overwrite new work'; exit 1;
+          }
+          [[ "$(git rev-parse ${QF1_REVIEW_SHA}:index.html)" == "${QF1_PATCHED_INDEX_BLOB}" ]] || {
+            echo 'STOP: patched review blob mismatched audited result'; exit 1;
+          }
+          [[ "$(git diff --name-only "${QF1_BASE}" "${QF1_REVIEW_SHA}")" == 'index.html' ]] || {
+            echo 'STOP: review branch differs from pre-QF1 main by more than index.html'; exit 1;
+          }
+          [[ "$(git diff --name-only "${QF1_BASE}" HEAD)" == '.github/workflows/QF1-v3.yml' ]] || {
+            echo 'STOP: main drifted since review; only the QF1-v3.yml upload is allowed'; exit 1;
+          }
+          [[ -z "$(git status --porcelain)" ]] || { echo 'STOP: dirty checkout'; exit 1; }
+          echo "PASS pinned main and review SHAs; mode=${RELEASE_MODE}; no source changes yet"
+      - name: Stage audited HTML into runner's TEMPORARY working tree only
+        shell: bash
+        run: |
+          set -euo pipefail
+          git show "${QF1_REVIEW_SHA}:index.html" > index.html
+          [[ "$(git hash-object index.html)" == "${QF1_PATCHED_INDEX_BLOB}" ]] || exit 1
+          [[ "$(git diff --name-only)" == 'index.html' ]] || { echo 'STOP: unexpected local changes'; exit 1; }
+          git diff --check
+          echo 'PASS exactly reviewed index.html staged in runner; no commit/no push'
+      - name: Run full existing repository regression checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/repo_regression_checks.py
+          python3 scripts/validation/validate_free_agent_valuation_parity.py
+          python3 - <<'PY'
+          import sys
+          sys.path.insert(0, 'scripts/validation')
+          import validate_idp_v1_final_deployment as v
+          result = v.validate_deployment()
+          assert result['actual_changed_entry_count'] == 320
+          print('PASS frozen IDP deployment still matches 320 approved changes')
+          PY
+          python3 scripts/validation/validate_package_adjustment_v2_production.py --selftest
+      - name: Verify final bytes and protected files stayed untouched
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(git hash-object index.html)" == "${QF1_PATCHED_INDEX_BLOB}" ]] || {
+            echo 'STOP: regression modified patched HTML'; exit 1;
+          }
+          [[ "$(git diff --name-only)" == 'index.html' ]] || {
+            echo 'STOP: another tracked file modified by tests'; git status --short; exit 1;
+          }
+          git diff --check
+          echo 'PASS QF1 v3 preflight: model frozen; review index exact; no production write.'
+  qf1-explicit-production-promotion:
+    name: Promote only after separately authorized explicit run
+    needs: qf1-production-preflight
+    if: github.ref == 'refs/heads/main' && inputs.mode == 'promote'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout exactly the validated original main revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Revalidate confirmation, main and immutable candidate
+        shell: bash
+        env:
+          RELEASE_CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set -euo pipefail
+          [[ "${RELEASE_CONFIRMATION}" == 'PROMOTE_QF1_V2_TO_MAIN' ]] || exit 1
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          git fetch --no-tags origin "+refs/heads/${QF1_REVIEW_BRANCH}:refs/remotes/origin/${QF1_REVIEW_BRANCH}"
+          [[ "$(git rev-parse HEAD)" == "${GITHUB_SHA}" ]] || exit 1
+          [[ "$(git rev-parse origin/main)" == "${GITHUB_SHA}" ]] || {
+            echo 'STOP: main advanced during preflight; refuse stale promotion'; exit 1;
+          }
+          [[ "$(git rev-parse origin/${QF1_REVIEW_BRANCH})" == "${QF1_REVIEW_SHA}" ]] || exit 1
+          [[ "$(git hash-object index.html)" == "${QF1_ORIGINAL_INDEX_BLOB}" ]] || exit 1
+          [[ "$(git rev-parse ${QF1_REVIEW_SHA}:index.html)" == "${QF1_PATCHED_INDEX_BLOB}" ]] || exit 1
+          [[ "$(git diff --name-only "${QF1_BASE}" HEAD)" == '.github/workflows/QF1-v3.yml' ]] || exit 1
+          git show "${QF1_REVIEW_SHA}:index.html" > index.html
+          [[ "$(git hash-object index.html)" == "${QF1_PATCHED_INDEX_BLOB}" ]] || exit 1
+          [[ "$(git diff --name-only)" == index.html ]] || exit 1
+          git diff --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- index.html
+          [[ "$(git diff --cached --name-only)" == index.html ]] || exit 1
+          git diff --cached --check
+          git commit -m 'QF1 v2: deploy four reviewed UI-only fixes after preflight'
+          git push origin HEAD:refs/heads/main
+          echo "QF1 PROMOTED TO MAIN: $(git rev-parse HEAD)"
+          echo 'Rollback source: review baseline main index blob 4e42054d5d0c4845dc0b16d3fdf8cf642cbf19c8'
