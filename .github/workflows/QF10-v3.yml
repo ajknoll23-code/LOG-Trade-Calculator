@@ -1,0 +1,198 @@
+# QF10 V3 — preregistered counterfactual decision gate; shadow policy ONLY; no model changes.
+# NO model changes, calibrated alternatives, market recomputation, or production writes.
+# QF9 production+Pages green: runs 38177812395 and 38177862776; 13/20 original tickets closed.
+name: QF10 V3 - PA Tiny-Piece Decision Gate and Live FV Shadow (Read Only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trade-desk-read-only-audit
+  cancel-in-progress: false
+
+jobs:
+  triage:
+    name: Pre-registered 1pct 6pct policy shadows, full FV deltas, and RB live visibility; no writes
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - name: Checkout dispatched main without write credentials
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install repo validation HTTP dependency
+        run: python3 -m pip install --disable-pip-version-check --no-cache-dir requests
+      - name: Verify production QF9 and scientific boundary hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == 'refs/heads/main' ]] || { echo 'STOP non-main dispatch'; exit 1; }
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]] || { echo 'STOP moved dispatch checkout'; exit 1; }
+          [[ -z "$(git status --porcelain)" ]] || { echo 'STOP dirty checkout'; exit 1; }
+          git merge-base --is-ancestor d8a2be0bf1edb8d19e94e2edc5157062f95096f3 HEAD || { echo 'STOP QF9 production ancestry missing'; exit 1; }
+          pin(){ [[ "$(git hash-object "$1")" == "$2" ]] || { echo "STOP inspected source drift $1"; exit 1; }; }
+          pin index.html c83e3f68d11853c072017e6bd83bb1ad085f4a3e
+          pin scripts/artifacts/generated/market_values.json 829445174a77ceb4bb19dfd97a725e371d18efe8
+          pin scripts/artifacts/generated/value_uncertainty.json 24c9f63881cc768a18d412172f04e5a263a4abc2
+          pin scripts/team_utility_projection_runtime.js 1620edf05e56a56b4a874c71b32777a443422de5
+          pin free-agent-board.html 975efe51091a2315475678a9db0842b05c4fc3aa
+          pin model/releases/free-agent-production-v2/release.json 75c9665c0493d8ac4900479b6802c807aaa45633
+          echo 'PASS QF10 exact QF9 production source and protected artifact lineage verified'
+      - name: Evaluate actual-price A1 shadow, A3 alternative scope boundaries, live RB artifact gating
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/qf10-v3-decision.js <<'QF10_JS'
+          'use strict';
+          const assert=require('node:assert/strict');
+          const fs=require('node:fs');
+          const vm=require('node:vm');
+          const html=fs.readFileSync('index.html','utf8');
+          const market=JSON.parse(fs.readFileSync('scripts/artifacts/generated/market_values.json','utf8'));
+          const uncertainty=JSON.parse(fs.readFileSync('scripts/artifacts/generated/value_uncertainty.json','utf8'));
+          function section(start,end){
+            const a=html.indexOf(start);
+            assert(a!==-1,`STOP missing source start: ${start}`);
+            assert(html.indexOf(start,a+start.length)===-1,`STOP duplicate source start: ${start}`);
+            const b=html.indexOf(end,a+start.length);
+            assert(b>a,`STOP missing source end: ${end}`);
+            return html.slice(a,b);
+          }
+          function declaration(name,end='\n};'){
+            const token=`const ${name} =`,a=html.indexOf(token);
+            assert(a!==-1&&html.indexOf(token,a+token.length)===-1,`STOP ambiguous declaration: ${name}`);
+            const b=html.indexOf(end,a+token.length);
+            assert(b>a,`STOP missing end declaration: ${name}`);
+            return html.slice(a,b+end.length);
+          }
+          const ctx=vm.createContext({state:{A:[],B:[]}});
+          const load=(source,label)=>vm.runInContext(source,ctx,{filename:label,timeout:5000});
+          const q=(code)=>vm.runInContext(code,ctx,{timeout:5000});
+          load(declaration('PLAYER_DB'),'PLAYER_DB');
+          load(declaration('PROD_MULT_DATA'),'PROD_MULT_DATA');
+          load(declaration('NO_REAL_PRODUCTION_HISTORY'),'NO_REAL_PRODUCTION_HISTORY');
+          load(declaration('ROLE_MULT',';'),'ROLE_MULT');
+          load(declaration('POSITION_WEIGHT',';'),'POSITION_WEIGHT');
+          load(declaration('AGE_CURVE'),'AGE_CURVE');
+          load(declaration('RB_BIRTH_DATE_DATA'),'RB_BIRTH_DATE_DATA');
+          load(declaration('QB_POST_PEAK_FLOOR',';'),'QB_POST_PEAK_FLOOR');
+          load(declaration('LB_POST_PEAK_DECAY_POWER',';'),'LB_POST_PEAK_DECAY_POWER');
+          load('const PROD_MULT = PROD_MULT_DATA;','PROD_MULT_ALIAS');
+          load(section('function normalizeName(s){','function titleCase(k){'),'normalizeName');
+          load(section('function productionMultiplier(name, role){','function injuryMultiplier('),'productionMultiplier');
+          load(section('function ageMultiplier(pos, age, role, realProduction, rawProduction){','/* RB_CONTINUOUS_AGE_V1'),'ageMultiplier');
+          load(section('function fractionalAgeFromBirthDate(birthDate, fallbackAge, asOfDate=null){','/* QF2_AGE_DISPLAY_ONLY'),'playerValueAndRB');
+          const db=q('PLAYER_DB'), data=q('PROD_MULT_DATA'), mul=q('ROLE_MULT'), curves=q('AGE_CURVE'),posWeight=q('POSITION_WEIGHT');
+          assert(Object.keys(db).length>=500,'STOP unexpected small canonical DB');
+          assert(Object.keys(data).length>=800,'STOP unexpected production source size');
+          // A1: evaluate deployed FULL non-RB point-price expression under one isolated
+          // alternative policy: keep productionMultiplier exactly as deployed, pass null
+          // to the age function only if the player lacks a PROD_MULT_DATA entry.
+          const youth=[];
+          for(const [name,p] of Object.entries(db)){
+            if(!p || Object.hasOwn(data,name) || p.pos==='RB' || p.pos==='K')continue;
+            const age=Number(p.age),c=curves[p.pos];
+            if(!c || !Number.isFinite(age) || age<18 || age>c.peakEnd)continue;
+            const role=String(p.role||''), roleEst=Number(mul[role]??1), pw=posWeight[p.pos];
+            const live=q(`playerValue(${JSON.stringify(p.pos)},${age},${JSON.stringify(role)},${JSON.stringify(name)})`);
+            const shAge=q(`ageMultiplier(${JSON.stringify(p.pos)},${age},${JSON.stringify(role)},null,null)`);
+            const proposed=Math.round(100*pw*shAge*roleEst*55);
+            assert(Number.isFinite(live)&&Number.isFinite(proposed),'STOP A1 invalid FV');
+            youth.push({name,pos:p.pos,role,age,deployedFV:live,shadowFV:proposed,deltaFV:proposed-live,pctChangePct:live?Number((100*(proposed-live)/live).toFixed(3)):null});
+          }
+          const changed=youth.filter(x=>x.deltaFV!==0).sort((a,b)=>Math.abs(b.deltaFV)-Math.abs(a.deltaFV));
+          assert(youth.length>=10&&changed.length>=6,'STOP changed A1 population unexpectedly');
+          console.log('QF10_V3_A1_FULL_FV_SHADOW '+JSON.stringify({policy:'only change missing-production non-RB early-age input to null; role multiplier remains deployed',evaluated:youth.length,changed:changed.length,examples:changed.slice(0,13),maximumAbsPointChange:Math.max(...changed.map(x=>Math.abs(x.deltaFV))),'warning':'Counterfactual only. Not a validated price policy, not an authorization to modify FV.'}));
+          // A3: compare deployed exact-3 policy with two alternative fourth-piece
+          // thresholds. These are SHADOW ROUTERS only; even 1% recreates a cliff at 1%.
+          load(declaration('PACKAGE_ADJUSTMENT_PRODUCTION_V1','\n});'),'PA_POLICY');
+          load(section('function packageAdjustmentSize2Multiplier(targetFv){','function packageAdjustmentSize2CompositionFactor('),'PA_SIZE2');
+          load(section('function packageAdjustmentSize3V6Assessment(values, targetFv){','function packageAdjustmentAssessment(){'),'PA_V6');
+          const original=section('function packageAdjustmentAssessment(){','function packageAdjustmentForTrade(){');
+          const anchor='const exactThreePlayerPackage =\n      packageAssets.length === 3 && packageValues.length === 3;';
+          assert(original.includes(anchor)&&original.split(anchor).length===2,'STOP original exact-three guard drift');
+          load(original,'PA_ROUTER_ORIGINAL');
+          for(const [suffix,pct] of [['001',0.01],['006',0.06]]){
+            const newSource=original.replace('function packageAdjustmentAssessment(){',`function packageAdjustmentAssessmentShadow${suffix}(){`)
+              .replace(anchor,`const exactThreePlayerPackage =\n      (packageAssets.length === 3 && packageValues.length === 3) ||\n      (packageAssets.length === 4 && packageValues.length === 4 && meaningful.length === 3 &&\n       packageValues.filter(v => v < targetFv * ${pct}).length === 1);`);
+            assert(newSource!==original,'STOP shadow patch failed');
+            load(newSource,`PA_ROUTER_COUNTERFACTUAL_${suffix}`);
+          }
+          const cfg=q('PACKAGE_ADJUSTMENT_PRODUCTION_V1');
+          assert(cfg.meaningfulPieceMinTargetShare===0.06&&cfg.size3V6Profiles.length===6&&cfg.size3V6ApexLevels.length===4,'STOP frozen PA policy drift');
+          const T=10000,smallPieces=[1,25,99,100,300,599,600];
+          function asses(vals,func){
+            ctx.state.A=[{type:'player',pos:'RB',name:'SyntheticTarget',value:T}];
+            ctx.state.B=vals.map((v,i)=>({type:'player',pos:'WR',name:`Piece${i}`,value:v}));
+            return q(`${func}()`);
+          }
+          const matrix=[], summary={};
+          for(const prof of cfg.size3V6Profiles)for(const apex of cfg.size3V6ApexLevels){
+            const sum=T*apex/prof.shares[0],vals=prof.shares.map(f=>sum*f);
+            const base=asses(vals,'packageAdjustmentAssessment');
+            assert(base.status==='applied'&&base.packageAdjustment.size3Source==='V6',`STOP V6 published fixture drift ${prof.label}/${apex}`);
+            for(const tiny of smallPieces){
+              const v=[...vals,tiny];
+              const orig=asses(v,'packageAdjustmentAssessment');
+              const low=asses(v,'packageAdjustmentAssessmentShadow001');
+              const high=asses(v,'packageAdjustmentAssessmentShadow006');
+              const route=x=>x.status==='applied'?x.packageAdjustment.size3Source:x.status;
+              const rec={profile:prof.label,apex,tiny,current:route(orig),threshold1Pct:route(low),threshold6Pct:route(high),basePremium:Math.round(base.packageAdjustment.adjustment),currentPremium:orig.status==='applied'?Math.round(orig.packageAdjustment.adjustment):null,shadow1Premium:low.status==='applied'?Math.round(low.packageAdjustment.adjustment):null,shadow6Premium:high.status==='applied'?Math.round(high.packageAdjustment.adjustment):null};
+              if(tiny===600){assert(route(low)!=='V6'&&route(high)!=='V6','STOP 6%-meaningful fourth incorrectly treated tiny');}
+              if(tiny===1){assert(route(low)==='V6'&&route(high)==='V6','STOP shadow did not retain V6 for near-zero fourth');}
+              const z=summary[tiny]||(summary[tiny]={samples:0,current:{},onePercent:{},sixPercent:{}});
+              z.samples++;
+              for(const [k,vv] of [['current',rec.current],['onePercent',rec.threshold1Pct],['sixPercent',rec.threshold6Pct]])z[k][vv]=(z[k][vv]||0)+1;
+              matrix.push(rec);
+            }
+          }
+          assert(matrix.length===168,'STOP policy matrix incomplete');
+          const one=matrix.find(x=>x.profile==='45/33/22'&&x.apex===0.8&&x.tiny===599);
+          console.log('QF10_V3_A3_COUNTERFACTUAL_POLICY_GATE '+JSON.stringify({outcomeBlindFixtures:matrix.length,publishedProfiles:6,publishedApexLevels:4,targetFV:T,tiersTested:smallPieces,byTinyPiece:summary,boundaryExample:one,policyRisks:['Candidate 1% and 6% gates are NOT calibrated by V6 votes for four raw assets','Any positive threshold moves, rather than eliminates, the materiality boundary','V6 models three meaningful players only; do not mistake synthetic coverage for empirical approval','The existing unsupported branch intentionally fails closed; never silently invent a premium'] }));
+          // A6: run deployed playerValue() against the two dated artifact anchors; only
+          // measure visibility suppression and avoid conflating an older center with FV.
+          const gateMarket=section('function marketValueForPlayer(name, fundamentalValue){','function marketValueHTML(');
+          const gateUncertainty=section('function valueUncertaintyForPlayer(name, centerValue){','function valueUncertaintyRangeHTML(');
+          assert(gateMarket.includes('storedFundamental !== Number(fundamentalValue)')&&gateUncertainty.includes('artifactCenter !== Number(centerValue)'),'STOP fail-closed gate changed');
+          assert(market.scale_semantics==='league_rank_quantile_mapped_to_trade_desk_points_v1','STOP market schema');
+          assert(uncertainty.range_semantics==='sensitivity_envelope_v1_not_probability_interval','STOP uncertainty schema');
+          const rb=[];
+          for(const [name,p] of Object.entries(db)){
+            if(p.pos!=='RB')continue;
+            const current=q(`playerValue('RB',${Number(p.age)},${JSON.stringify(p.role)},${JSON.stringify(name)})`);
+            const m=market.players?.[name],u=uncertainty.players?.[name];
+            rb.push({name,currentFV:current,marketDatedFV:m?.fundamental_value??null,uncertaintyDatedFV:u?.center_value??null,marketPasses:!!m&&Number(m.fundamental_value)===current,uncertaintyPasses:!!u&&Number(u.center_value)===current});
+          }
+          const both=rb.filter(x=>x.marketDatedFV!==null&&x.uncertaintyDatedFV!==null);
+          const counts={rbCurrent:rb.length,paired:both.length,bothPass:both.filter(x=>x.marketPasses&&x.uncertaintyPasses).length,marketOnly:both.filter(x=>x.marketPasses&&!x.uncertaintyPasses).length,uncertaintyOnly:both.filter(x=>!x.marketPasses&&x.uncertaintyPasses).length,neither:both.filter(x=>!x.marketPasses&&!x.uncertaintyPasses).length};
+          console.log('QF10_V3_A6_LIVE_GUARD_VISIBILITY '+JSON.stringify({runtimeUtc:new Date().toISOString(),datedMarket:market.generated_at_utc,datedUncertainty:uncertainty.generated_at_utc,counts,examples:both.filter(x=>x.marketPasses!==x.uncertaintyPasses).slice(0,8),warning:'Deployed value computation at run time; no artifact backfill, no relaxed equality comparison, no FV changes.'}));
+          console.log('QF10_V3_READ_ONLY_POLICY_GREEN: actual production code, independent shadow variants, no models/artifacts/deployments mutated');
+          QF10_JS
+          node --check /tmp/qf10-v3-decision.js
+          node /tmp/qf10-v3-decision.js
+      - name: Preserve frozen valuation and package runtime regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/team_utility_projection_runtime.js --selftest
+          python3 scripts/validation/repo_regression_checks.py
+          python3 scripts/validation/validate_free_agent_valuation_parity.py
+          python3 scripts/validation/validate_package_adjustment_v2_production.py --selftest
+          echo 'PASS existing production regressions, unchanged scientific state'
+      - name: Verify exact zero-write read-only outcome
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -z "$(git status --porcelain)" ]] || { echo 'STOP changed sources'; exit 1; }
+          [[ "$(git hash-object index.html)" == 'c83e3f68d11853c072017e6bd83bb1ad085f4a3e' ]] || exit 1
+          echo 'QF10_V3_READ_ONLY_GREEN: decision gate passed; no branch, commit, push, deployment or model updates'
