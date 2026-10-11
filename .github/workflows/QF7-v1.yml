@@ -1,0 +1,204 @@
+# QF7 / A5-F03 — active roster, taxi and reserve/IR source feasibility.
+# Phase 0 is READ ONLY: reproduces the current defect against exact live JS and
+# real saved Sleeper JSON. GREEN authorizes design review, NOT a source patch.
+# Upload to .github/workflows/QF7-v1.yml on main and run manually in Actions.
+name: QF7 Phase 0 - Active Roster Taxi IR Boundary Audit (Read Only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qf7-a5f03-readonly-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  qf7-readonly-source-and-runtime:
+    name: Verify sync lineage and reproduce fallback with real JS
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout exact main dispatch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Prepare Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Stop on source drift or missing canonical inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = 'refs/heads/main'
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git hash-object index.html)" = '0fe2670c67cbea8d057c3c8ec5a6b2dfcce61b8e'
+          test "$(git hash-object scripts/team_utility_projection_runtime.js)" = '1620edf05e56a56b4a874c71b32777a443422de5'
+          test "$(git hash-object free-agent-board.html)" = '975efe51091a2315475678a9db0842b05c4fc3aa'
+          test "$(git hash-object data/free_agent_utility_v1.json)" = '557b8010082a87113ecf9d5574af108f3044a1e7'
+          test "$(git hash-object model/releases/free-agent-production-v2/release.json)" = '75c9665c0493d8ac4900479b6802c807aaa45633'
+          test -f data/my_roster.json
+          test -f data/league_rosters.json
+          test -f scripts/sync/sync_sleeper.py
+          test -z "$(git status --porcelain)"
+          echo 'PASS: QF6 production index and protected runtime/release blobs pinned; checkout is clean'
+
+      - name: Exercise real roster files and extracted production functions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/qf7_phase0.js" <<'JS'
+          'use strict';
+          const assert = require('node:assert/strict');
+          const fs = require('node:fs');
+          const vm = require('node:vm');
+          const index = fs.readFileSync('index.html', 'utf8');
+          const sync = fs.readFileSync('scripts/sync/sync_sleeper.py', 'utf8');
+          const my = JSON.parse(fs.readFileSync('data/my_roster.json', 'utf8'));
+          const league = JSON.parse(fs.readFileSync('data/league_rosters.json', 'utf8'));
+          const limit = 41;
+          const slots = ['starters', 'bench', 'taxi', 'reserve_ir'];
+          const id = p => String(p.player_id);
+          const keys = list => list.map(p => 'sid_' + id(p));
+          const sortedIds = list => list.map(id).sort();
+          const unique = list => new Set(list).size === list.length;
+          function part(begin, end) {
+            const a = index.indexOf(begin);
+            assert(a >= 0, `Missing source anchor: ${begin}`);
+            assert.equal(index.indexOf(begin, a + 1), -1, `Ambiguous source anchor: ${begin}`);
+            const b = index.indexOf(end, a + begin.length);
+            assert(b > a, `Missing ending anchor: ${end}`);
+            return index.slice(a, b);
+          }
+          assert.equal((league.rosters || []).length, 12, 'expected 12 saved league rosters');
+          const team = league.rosters.find(r => String(r.roster_id) === String(my.roster_id));
+          assert(team, 'personal roster ID must be present in league snapshot');
+          assert(Math.abs(my.synced_at - league.synced_at) < 60, 'personal and league snapshots are not coherent');
+          for (const slot of slots) {
+            assert(Array.isArray(my[slot]) && Array.isArray(team[slot]), `missing ${slot}`);
+            assert.deepEqual(sortedIds(my[slot]), sortedIds(team[slot]), `slot ${slot} personal/league mismatch`);
+          }
+          const allIDs = slots.flatMap(slot => my[slot].map(id));
+          assert(unique(allIDs), 'cross-slot Sleeper identity collision');
+          assert(sync.includes('bench = all_players - starters - taxi - reserve'), 'sync no longer excludes taxi/IR from bench');
+          assert(sync.includes('"reserve_ir": resolve_list(sorted(reserve))'), 'sync no longer serializes IR independently');
+          assert(index.includes("for(const slot of ['starters','bench','taxi'])"), 'personal roster ordering has changed');
+          assert(index.includes("for(const slot of ['starters','bench','taxi','reserve_ir'])"), 'league slot mapping has changed');
+          assert(index.includes('MY_ROSTER = keys;'), 'personal sync does not assign expected roster list');
+
+          // Test the actual deployed JS, not an invented transcription of the optimizer.
+          const source = [
+            part('const TU_DEDICATED_SLOTS = [', '/* Legal active-roster constraint.'),
+            part('const TU_ACTIVE_ROSTER_LIMIT = 41;', '/* Greedy lineup fill:'),
+            part('function tuOptimizeLineup(players){', '/* Trade-level wrapper:'),
+          ].join('\n');
+          const context = vm.createContext({ console });
+          vm.runInContext(`
+            let MY_ROSTER = [];
+            let MY_ROSTER_ID = null;
+            let LEAGUE_ROSTERS = {};
+            let PLAYER_DB = {};
+            function playerValueByKey(k) { return PLAYER_DB[k]?.value || 0; }
+          ` + '\n' + source, context, { timeout: 2000 });
+          const run = expression => vm.runInContext(expression, context, { timeout: 2000 });
+          const active = [...my.starters, ...my.bench];
+          const taxi = keys(my.taxi);
+          const ir = keys(my.reserve_ir);
+          const activeKeys = keys(active);
+          const personalOrder = [...activeKeys, ...taxi];
+          assert(activeKeys.length < limit && taxi.length > 0, 'real fixture no longer exercises taxi leakage');
+
+          // Loaded personal data, but league-wide metadata has not arrived (or fails).
+          context.INPUT_KEYS = personalOrder;
+          context.INPUT_ID = my.roster_id;
+          run('MY_ROSTER = INPUT_KEYS; MY_ROSTER_ID = INPUT_ID; LEAGUE_ROSTERS = {};');
+          const leakedFallback = Array.from(run('tuActiveRosterKeys()'));
+          const leakedTaxi = leakedFallback.filter(k => taxi.includes(k));
+          assert.equal(leakedFallback.length, Math.min(limit, personalOrder.length));
+          assert.equal(leakedTaxi.length, Math.min(limit - activeKeys.length, taxi.length), 'expected real taxi leakage absent league metadata');
+          assert.equal(leakedFallback.some(k => ir.includes(k)), false, 'personal fallback unexpectedly contains IR');
+          console.log(`CONFIRMED FALLBACK: active=${activeKeys.length}; taxi=${taxi.length}; IR=${ir.length}; returned=${leakedFallback.length}; leaked_taxi=${leakedTaxi.length}`);
+
+          // Loaded authoritative 12-team slot metadata: taxi and IR excluded.
+          context.AUTHORITY = { [String(my.roster_id)]: {
+            players: slots.flatMap(slot => my[slot].map(p => ({ key: 'sid_' + id(p), slot })))
+          }};
+          run('LEAGUE_ROSTERS = AUTHORITY;');
+          const authoritative = Array.from(run('tuActiveRosterKeys()'));
+          assert.deepEqual(authoritative, activeKeys, 'authoritative active set must equal starters + bench in source order');
+          assert(authoritative.every(k => !taxi.includes(k) && !ir.includes(k)));
+          console.log(`PASS AUTHORITATIVE: ${authoritative.length} active; 0 taxi; 0 IR`);
+
+          // A different team choice must use the chosen team's slot metadata.
+          const other = league.rosters.find(r => String(r.roster_id) !== String(my.roster_id));
+          const otherKeys = slots.flatMap(slot => other[slot].map(p => ({key: 'sid_' + id(p), slot})));
+          context.AUTHORITY[String(other.roster_id)] = { players: otherKeys };
+          context.OTHER_ID = other.roster_id;
+          run('MY_ROSTER_ID = OTHER_ID;');
+          const otherSelected = Array.from(run('tuActiveRosterKeys()'));
+          assert.deepEqual(otherSelected, keys([...other.starters, ...other.bench]));
+          assert(otherSelected.every(k => !keys([...other.taxi, ...other.reserve_ir]).includes(k)));
+          run('MY_ROSTER_ID = INPUT_ID;');
+          console.log(`PASS TEAM SWITCH: selected roster ${other.roster_id} active=${otherSelected.length}; no special-slot leakage`);
+
+          // Incomplete/empty metadata still falls back to taxi-contaminated list.
+          context.EMPTY_AUTHORITY = { [String(my.roster_id)]: { players: [] } };
+          run('LEAGUE_ROSTERS = EMPTY_AUTHORITY;');
+          const emptyMetadata = Array.from(run('tuActiveRosterKeys()'));
+          assert(emptyMetadata.some(k => taxi.includes(k)), 'empty authoritative slots unexpectedly safe');
+          console.log('CONFIRMED EMPTY-METADATA fallback: still admits taxi');
+
+          // Independent, deterministic 41-active roster test. Uses real code
+          // and controlled player values only; does NOT recalibrate any FV.
+          const positionCounts = { QB: 3, RB: 6, WR: 6, TE: 3, K: 2, DL: 8, LB: 7, DB: 6 };
+          const synthetic = {};
+          let cursor = 0;
+          for (const [pos, n] of Object.entries(positionCounts)) {
+            for (let i = 0; i < n; i++) {
+              synthetic[`active_${cursor++}`] = { pos, value: 3000 - cursor * 20 };
+            }
+          }
+          assert.equal(Object.keys(synthetic).length, limit);
+          for (let i = 0; i < 3; i++) synthetic[`taxi_${i}`] = { pos: 'WR', value: 9000 + i };
+          for (let i = 0; i < 2; i++) synthetic[`ir_${i}`] = { pos: 'LB', value: 9000 + i };
+          for (let i = 0; i < 3; i++) synthetic[`arrival_${i}`] = { pos: 'RB', value: 1300 + i };
+          context.SYNTHETIC = synthetic;
+          context.BEFORE = Object.keys(synthetic).filter(k => k.startsWith('active_'));
+          context.AFTER = [...context.BEFORE.slice(1), 'arrival_0', 'arrival_1', 'arrival_2'];
+          run('PLAYER_DB = SYNTHETIC;');
+          const before = run('tuOptimizeLegalRoster(tuPlayersFromKeys(BEFORE))');
+          const after = run('tuOptimizeLegalRoster(tuPlayersFromKeys(AFTER))');
+          assert.equal(before.starters.length, 17, '17 league starter slots must be filled');
+          assert.equal(before.bench.length, 24);
+          assert.equal(before.cuts.length, 0);
+          assert.equal(before.rosterSize, 41);
+          assert.equal(after.starters.length, 17);
+          assert.equal(after.bench.length, 24);
+          assert.equal(after.cuts.length, 2, '41 cap requires two cuts for 1-for-3 from full active roster');
+          assert.equal(after.rosterSize, 41);
+          assert([...before.starters, ...before.bench, ...after.starters, ...after.bench]
+            .every(p => !p.key.startsWith('taxi_') && !p.key.startsWith('ir_')));
+          const impact = run('calculateTeamUtility(BEFORE, AFTER)');
+          assert.equal(impact.postCuts.length, 2);
+          assert.equal(impact.rosterLimit, 41);
+          assert(Number.isFinite(impact.teamUtility));
+          console.log(`PASS 17/41 OPTIMIZER: before=17+24, after=17+24, projected_cuts=2, TU_delta=${impact.teamUtility} (synthetic)`);
+          console.log('QF7_PHASE0_PASS: A5-F03 reproduced and scoped; no production source or model edit authorized');
+          JS
+          node --check "$RUNNER_TEMP/qf7_phase0.js"
+          node "$RUNNER_TEMP/qf7_phase0.js"
+
+      - name: Final read-only cleanliness gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+          echo 'PASS: No tracked or untracked repository changes, commits, branches or deploys'
+          echo 'NEXT: Design minimal QF7 fix on review branch only after considering Phase 0 evidence'
