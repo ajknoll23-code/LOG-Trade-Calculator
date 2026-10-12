@@ -1,0 +1,212 @@
+# QF11 V2: current-sheet per-player provenance research; published Market Value not altered.
+# The archived published vote set is not available, so these evidence fields CANNOT be retroactively grafted onto the old market artifact.
+name: QF11 V2 - Source-Linked Market Direct Vote Provenance Study (Read Only)
+'on':
+  workflow_dispatch: null
+permissions:
+  contents: read
+concurrency:
+  group: trade-desk-read-only-audit
+  cancel-in-progress: false
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+jobs:
+  study:
+    name: Independently derive per-player same-position voting evidence, no market changes
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+    - name: Checkout pinned main without write credentials
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.sha }}
+        fetch-depth: 0
+        persist-credentials: false
+    - name: Set up Python 3.13
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.13'
+    - name: Set up Node 22
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+    - name: Install existing repository regression dependency
+      run: python3 -m pip install --disable-pip-version-check --no-cache-dir requests
+    - name: Verify QF10 V9 production lineage and evidence hashes
+      shell: bash
+      run: |
+        set -euo pipefail
+        [[ "$GITHUB_REF" == 'refs/heads/main' ]] || { echo 'STOP not main'; exit 1; }
+        [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]] || { echo 'STOP dispatch moved'; exit 1; }
+        [[ -z "$(git status --porcelain)" ]] || { echo 'STOP dirty source'; exit 1; }
+        git merge-base --is-ancestor 590afe6046aabe3937a4c360c9c1e93a9cf1e08d HEAD || { echo 'STOP QF10 production ancestor missing'; exit 1; }
+        pin(){ [[ "$(git hash-object "$1")" == "$2" ]] || { echo "STOP source drift: $1"; exit 1; }; }
+        pin index.html c83e3f68d11853c072017e6bd83bb1ad085f4a3e
+        pin scripts/artifacts/generated/market_values.json 829445174a77ceb4bb19dfd97a725e371d18efe8
+        pin scripts/artifacts/generated/value_uncertainty.json 9d007a7f053e15dcdc0f694563ca17bc47568e5f
+        pin scripts/validation/snapshot_values.py 1efca4c35e910a95974c1bec0b06a106196618b3
+        pin research/idp-dl-lb-residual-reconciliation-v1/phase2_evaluation.json 01ae185b325c37727dfea1582da12aa0167df3a4
+        pin scripts/market/build_market_value.py a015d54785ce5fcb3b9f26bae0120b82693a6bd8
+        pin scripts/market/ktc_pipeline.py b9612c73a91223397a4f49b384d8d86719ee8d79
+        pin scripts/validation/evaluate_market_history.py 121fc506d5a5b3c949a1a3951cd92b3bcbb23a58
+        echo 'QF11_V2_SOURCE_GATES_GREEN exact deployed market source, model and identity policies pinned'
+    - name: Derive source-linked per-player same-position provenance in memory only
+      shell: bash
+      run: |
+        set -euo pipefail
+        cat > /tmp/qf11-v2-provenance.py <<'QF11_V2_PY'
+        from __future__ import annotations
+        import json, math, sys
+        from collections import Counter, defaultdict
+        from pathlib import Path
+
+        ROOT = Path.cwd()
+        assert (ROOT/'index.html').is_file(), 'STOP not checked-out calculator repository'
+        for part in ('scripts/market', 'scripts/validation'):
+            sys.path.insert(0, str(ROOT/part))
+        sys.path.insert(0, str(ROOT))
+        import build_market_value as market
+        import ktc_pipeline
+        import snapshot_values
+        from evaluate_market_history import build_alias_index, normalize_name
+
+        cfg = snapshot_values.load_from_html(ROOT/'index.html')
+        model = snapshot_values.compute_all_values(cfg)
+        old = json.loads((ROOT/'scripts/artifacts/generated/market_values.json').read_text())
+        uncertainty = json.loads((ROOT/'scripts/artifacts/generated/value_uncertainty.json').read_text())
+        assert len(model) == 565 and len(old['players']) == 504
+        assert all(uncertainty['players'][name]['center_value'] == value['value'] for name,value in model.items())
+        assert all('same_position_pairwise_observations' not in r.get('evidence',{}) for r in old['players'].values())
+        assert old['method_version'] == 'market-value-v2-balanced-blended-v1'
+
+        # The production builder's exact daily-capped live sheet ingestion and voter-weight policy.
+        rows, source = market.load_vote_rows()
+        assert source['mode'] == 'live_sheet' and len(rows) >= 400, 'STOP unavailable/insufficient fresh vote source'
+        weights = market.build_voter_weights(rows)
+        weighted_pairs = market.build_weighted_pairs(rows, weights)
+        assert len(weighted_pairs) == 3*sum(bool(r.get('keep') and r.get('trade') and r.get('cut')) for r in rows), 'STOP pairwise decomposition drift'
+        assert all(math.isfinite(info['ballot_weight']) and info['ballot_weight'] > 0 for info in weights.values())
+
+        # Independent canonical name resolution: same alias dictionary, and only unique
+        # best-priority matches. No broad fuzzy matching and no name coercion.
+        alias_index = build_alias_index(list(model))
+        resolution_cache = {}
+        identity_counts = Counter()
+        def match(raw):
+            n = normalize_name(str(raw or ''))
+            if n not in resolution_cache:
+                opts = list(set(tuple(opt) for opt in alias_index.get(n,())))
+                if not opts:
+                    resolution_cache[n] = (None,'unmatched')
+                else:
+                    best_priority = min(opt[1] for opt in opts)
+                    best = {opt[0] for opt in opts if opt[1] == best_priority}
+                    if len(best)!=1:
+                        resolution_cache[n] = (None,'ambiguous')
+                    else:
+                        resolution_cache[n] = (next(iter(best)), 'resolved')
+            return resolution_cache[n]
+
+        stats = defaultdict(lambda: {'raw_same_pos_pairs':0, 'effective_same_pos_pairs':0.0, 'voter_mass':defaultdict(float), 'ballots':0, 'direct_voters':set()})
+        counts=Counter()
+        for ballot in rows:
+            voter=str(ballot.get('voter_roster_id') or 'unknown')
+            w=float(weights[voter]['ballot_weight'])
+            names=[ballot.get('keep'),ballot.get('trade'),ballot.get('cut')]
+            resolved=[match(name) for name in names]
+            for key,status in resolved:
+                identity_counts[status]+=1
+                if key in old['players']:
+                    stats[key]['ballots']+=1
+                    stats[key]['direct_voters'].add(voter)
+            # Only distinct, model-resolved same-position real comparisons; no pair
+            # created from an unmatched, ambiguous or cross-position comparison.
+            for a,b in ((0,1),(0,2),(1,2)):
+                ka,sa=resolved[a];kb,sb=resolved[b]
+                if not ka or not kb or ka == kb:
+                    counts['unresolved_or_duplicate_pair']+=1
+                    continue
+                if model[ka]['pos'] != model[kb]['pos']:
+                    counts['cross_position_pair']+=1
+                    continue
+                counts['valid_same_position_pair']+=1
+                for key in (ka,kb):
+                    if key not in old['players']: continue
+                    s=stats[key]
+                    s['raw_same_pos_pairs']+=1
+                    s['effective_same_pos_pairs']+=w
+                    s['voter_mass'][voter]+=w
+
+        # Cross-check that direct data can be attached to a separate live-sheet candidate.
+        ratings=ktc_pipeline.weighted_bradley_terry(weighted_pairs)
+        live_resolved, live_identity=market.resolve_league_ratings(model, ratings)
+        live_candidate=market.quantile_calibrate(model, live_resolved)
+        market.validate_payload({'schema_version':1,'method_version':market.METHOD_VERSION,'scale_semantics':market.SCALE_SEMANTICS,'players':live_candidate})
+        assert len(live_candidate)>=400, 'STOP live candidate too thin for comparable research'
+
+        results={}; hist=Counter(); position=defaultdict(lambda: Counter())
+        for key,r in old['players'].items():
+            s=stats[key];mass=sum(s['voter_mass'].values())
+            maximum=max(s['voter_mass'].values(),default=0.0)
+            dominance=round(100*maximum/mass,3) if mass>0 else None
+            direct_count=len(s['direct_voters'])
+            obs=s['raw_same_pos_pairs']
+            # Expose 'enough data' as UNKNOWN. Selecting a cutoff here would be a
+            # posthoc model-policy decision with no preregistered confirmation.
+            results[key]={'observations':obs,'effectivePairwiseWeight':round(s['effective_same_pos_pairs'],4),'directBallots':s['ballots'],'distinctDirectVoters':direct_count,'topWeightedSharePct':dominance}
+            bucket = 'zero' if obs==0 else ('1-2' if obs<3 else '3-9' if obs<10 else '10+')
+            hist[bucket]+=1
+            position[r['pos']]['players']+=1
+            position[r['pos']][bucket]+=1
+            if dominance is not None and dominance>=50:position[r['pos']]['topVoterShare50plus']+=1
+
+        assert sum(hist.values()) == len(old['players']), 'STOP account coverage mismatch'
+        assert counts['valid_same_position_pair'] + counts['cross_position_pair'] + counts['unresolved_or_duplicate_pair']==3*len(rows), 'STOP pair accounting mismatch'
+        for key in ('will anderson','aaron donald','bijan robinson'):
+            assert key in results,'STOP focus identity missing'
+
+        # Do not output names of individual voters or ballots or log raw candidate fields.
+        summary={
+         'publishedMarketGeneratedAt':old['generated_at_utc'],
+         'sourceMode':'NEW_LIVE_SHEET_NOT_ARCHIVED_PUBLISHED_SNAPSHOT',
+         'liveRowsAfterProductionDailyCap':len(rows),
+         'rawSheetRowCount':source.get('raw_sheet_row_count'),
+         'voters':len(weights),
+         'coveredPublishedPlayers':len(old['players']),
+         'coveredCurrentCandidatePlayers':len(live_candidate),
+         'samePlayerUniverse':set(live_candidate)==set(old['players']),
+         'pairAccounting':dict(counts),
+         'identityResolutionCounts':dict(identity_counts),
+         'directObservationBuckets':dict(hist),
+         'byPosition':{k:dict(v) for k,v in sorted(position.items())},
+         'focusRows':{k:results[k] for k in ('will anderson','aaron donald','bijan robinson')},
+         'candidateSpecificEnoughDataGate':'UNSELECTED_NOT_AUTHORIZED',
+         'directProvenanceAttachToCurrentlyPublishedMarket':'NOT_AUTHORIZED_DATED_SOURCE_MISMATCH',
+         'scientificDecision':'DESCRIPTIVE_SOURCE_LINKED_RESEARCH_ONLY',
+         'privacy':'No voter IDs, ballots, or raw source rows emitted',
+        }
+        print('QF11_V2_CANONICAL_SOURCE_PROVENANCE '+json.dumps(summary,sort_keys=True))
+        print('QF11_V2_READ_ONLY_GREEN: live ballot provenance studied; no published market repricing, no per-player fields committed, no FV changes.')
+        QF11_V2_PY
+        python3 -m py_compile /tmp/qf11-v2-provenance.py
+        python3 /tmp/qf11-v2-provenance.py
+    - name: Run existing 14 repository regressions and frozen model parity
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 scripts/validation/snapshot_values.py --selftest
+        node scripts/team_utility_projection_runtime.js --selftest
+        python3 scripts/validation/repo_regression_checks.py
+        python3 scripts/validation/validate_free_agent_valuation_parity.py
+        python3 scripts/validation/validate_package_adjustment_v2_production.py --selftest
+        echo 'QF11_EXISTING_14_REGRESSIONS_GREEN'
+    - name: Verify zero repository writes and protected production hashes
+      shell: bash
+      run: |
+        set -euo pipefail
+        [[ -z "$(git status --porcelain)" ]] || { echo 'STOP this was not read only'; exit 1; }
+        [[ "$(git hash-object index.html)" == 'c83e3f68d11853c072017e6bd83bb1ad085f4a3e' ]] || exit 1
+        [[ "$(git hash-object scripts/artifacts/generated/market_values.json)" == '829445174a77ceb4bb19dfd97a725e371d18efe8' ]] || exit 1
+        [[ "$(git hash-object scripts/artifacts/generated/value_uncertainty.json)" == '9d007a7f053e15dcdc0f694563ca17bc47568e5f' ]] || exit 1
+        echo 'QF11_ZERO_WRITE_GREEN original seven ticket statuses unchanged; production preserved'
