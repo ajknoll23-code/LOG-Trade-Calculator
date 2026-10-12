@@ -35,10 +35,10 @@ Policy SHA256: `bafc53164f6d98448965c5d0b531b14be31a3d744f0e4a44d6cdac71b6c05247
 | zion young | DL | 1013 | 60 | 1966 | 94.1% | very_high |
 | jack endries | TE | 673 | 50 | 1296 | 92.5% | very_high |
 | dezhaun stribling | WR | 2190 | 192 | 4188 | 91.2% | very_high |
-| dylan sampson | RB | 1540 | 150 | 2930 | 90.3% | very_high |
-| adam randall | RB | 901 | 100 | 1702 | 88.9% | very_high |
+| dylan sampson | RB | 1543 | 150 | 2936 | 90.3% | very_high |
+| adam randall | RB | 903 | 101 | 1705 | 88.9% | very_high |
 | will johnson | DB | 2524 | 305 | 4743 | 87.9% | very_high |
-| jordan james | RB | 781 | 134 | 1428 | 82.9% | very_high |
+| jordan james | RB | 783 | 134 | 1432 | 82.9% | very_high |
 | nick bosa | DL | 4020 | 714 | 7326 | 82.2% | very_high |
 | jake tonges | TE | 1108 | 199 | 2017 | 82.0% | very_high |
 | jayden reed | WR | 3326 | 607 | 6045 | 81.7% | very_high |
