@@ -592,8 +592,17 @@ def corroborate_projection_missing_identities(
         if not hid or hid != cid:
             still_missing.append(issue)
             continue
+        # Sleeper's granular defensive label can be S/CB/DE/DT/OLB
+        # while both model and FantasyPros use DB/DL/LB buckets.
+        raw_pos = str(c.get('sleeper_pos') or '').upper()
+        bucket_pos = {
+            'S': 'DB', 'SS': 'DB', 'FS': 'DB', 'CB': 'DB',
+            'DE': 'DL', 'DT': 'DL', 'NT': 'DL',
+            'OLB': 'LB', 'ILB': 'LB', 'MLB': 'LB',
+        }.get(raw_pos, raw_pos)
+        fantasy_positions = {str(v).upper() for v in (c.get('sleeper_fantasy_positions') or [])}
         if (
-            str(c.get('sleeper_pos') or '') != pos
+            (bucket_pos != pos and pos not in fantasy_positions)
             or c.get('requires_manual_review') is not False
             or c.get('match_confidence') != 'high'
             or c.get('match_method') not in (
@@ -605,11 +614,33 @@ def corroborate_projection_missing_identities(
         ):
             still_missing.append(issue)
             continue
-        # A current indexed identity or a model assignment to the same SID
-        # is a real collision, NOT a missing-projection fallback case.
-        if hid in indexed_sleeper_ids or hid in occupied:
+        # Model assignment to this same ID is always a collision. A fresh
+        # Sleeper record can have a changed name only for the ONE
+        # independently verified Cam Bynum/Camryn Bynum pair.
+        if hid in occupied:
             still_missing.append(issue)
             continue
+        indexed = indexed_sleeper_ids.get(hid)
+        if indexed is not None:
+            indexed_name = norm(indexed.get('player'))
+            alias_ok = name == 'cam bynum' and indexed_name == 'camryn bynum' and hid == '7715'
+            fantasy_pos = {str(v).upper() for v in (indexed.get('fantasy_positions') or [])}
+            raw_pos = str(indexed.get('pos') or '').upper()
+            bucket_pos = {
+                'S': 'DB', 'SS': 'DB', 'FS': 'DB', 'CB': 'DB',
+                'DE': 'DL', 'DT': 'DL', 'NT': 'DL',
+                'OLB': 'LB', 'ILB': 'LB', 'MLB': 'LB',
+            }.get(raw_pos, raw_pos)
+            indexed_team = str(indexed.get('team') or '').upper()
+            crosswalk_team = str(c.get('sleeper_team') or '').upper()
+            if (
+                not indexed_name
+                or (indexed_name != name and not alias_ok)
+                or (pos != bucket_pos and pos not in fantasy_pos)
+                or (indexed_team and crosswalk_team and indexed_team != crosswalk_team)
+            ):
+                still_missing.append(issue)
+                continue
 
         patched[key] = {
             'sleeper_id': hid,

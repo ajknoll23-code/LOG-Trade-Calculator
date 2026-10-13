@@ -475,7 +475,23 @@ def preserve_previous_authoritative(fp, fresh, prior_sid, sleeper_by_sid):
         # Do not preserve an ID that vanished from the current Sleeper universe.
         return fresh
 
-    if not stable_authoritative_name_equivalent(fp["_name"], current["player"]):
+    # Audited *existing* pair only: FantasyPros 22757 calls the player
+    # "Cam Bynum"; Sleeper 7715 now displays "Camryn Bynum".
+    # No other player, ID, team, position or new match gains tolerance.
+    audited_short_name = (
+        fp["_fpid"] == "22757"
+        and prior_sid == "7715"
+        and fp["_name"] == "cam bynum"
+        and current["player"] == "camryn bynum"
+        and fp["_pos"] == "DB"
+        and "DB" in (current.get("positions") or set())
+        and (
+            not fp.get("_team")
+            or not current.get("team")
+            or fp["_team"] == current["team"]
+        )
+    )
+    if not (stable_authoritative_name_equivalent(fp["_name"], current["player"]) or audited_short_name):
         raise RuntimeError(
             f"Stable identity contradiction for FantasyPros {fp['_fpid']} "
             f"({fp['_name']}): prior Sleeper {prior_sid} now resolves to "
