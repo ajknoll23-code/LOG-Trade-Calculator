@@ -85,6 +85,15 @@ function qf11v2Handle_(payload,props,now) {
   if(!Array.isArray(payload.mc) || payload.mc.length!==3 || !payload.mc.every(function(x){return Number.isInteger(x) && x>=0 && x<=2;})) return 'REJECTED_COMPREHENSION_FORMAT';
   var sheet=qf11v2Sheet_(props);
   var rows=sheet.getDataRange().getValues().slice(1);
+  // V39: fail closed if the purge trigger failed or a deadline is corrupt.
+  // Do not accept a fresh response while stale participant data remain.
+  if(!Number.isFinite(now) || rows.some(function(row){
+    var due=Date.parse(String(row[1]));
+    return !Number.isFinite(due) || due<=now;
+  })) {
+    props.setProperty('QF11_V2_HALTED','true');
+    return 'HALTED';
+  }
   if(rows.some(function(row){return String(row[5])===digest || Number(row[3])===assignment.slot;})) return 'DUPLICATE_OR_SLOT_USED';
   if(rows.length>=12) {props.setProperty('QF11_V2_CLOSED','true');return 'CLOSED';}
   var critical=payload.mc.some(function(x,i){return x!==QF11_V2_EXPECTED[i];});
@@ -124,18 +133,24 @@ function doPost(e) {
 function purgeExpiredQF11V2Rows() {
   var props=PropertiesService.getScriptProperties();
   var lock=LockService.getScriptLock();
-  qf11v2Assert_(lock.tryLock(15000),'LOCK_UNAVAILABLE');
+  var acquired=false;
   try {
+    qf11v2Assert_(lock.tryLock(15000),'LOCK_UNAVAILABLE');
+    acquired=true;
     var sheet=qf11v2Sheet_(props),values=sheet.getDataRange().getValues();
-    var count=0, now=Date.now();
+    var now=Date.now(),expired=[];
     for(var i=values.length-1;i>=1;i--){
       var due=Date.parse(String(values[i][1]));
-      if(!Number.isFinite(due) || due<=now){
-        sheet.deleteRow(i+1);count++;
-      }
+      if(!Number.isFinite(due) || due<=now)expired.push(i+1);
     }
-    if(count>0)props.setProperty('QF11_V2_HALTED','true');
+    // V39: halt BEFORE attempting any deletion, including partial failures.
+    if(expired.length>0)props.setProperty('QF11_V2_HALTED','true');
+    expired.forEach(function(row){sheet.deleteRow(row);});
     // Only return a count (no respondent identifiers or raw data).
-    return count;
-  } finally {lock.releaseLock();}
+    return expired.length;
+  } catch(error) {
+    // A failed scheduled purge must not leave intake authorized.
+    props.setProperty('QF11_V2_HALTED','true');
+    throw error;
+  } finally {if(acquired)lock.releaseLock();}
 }
