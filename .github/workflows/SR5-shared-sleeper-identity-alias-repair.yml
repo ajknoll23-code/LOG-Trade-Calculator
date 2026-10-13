@@ -1,0 +1,162 @@
+# SR5 - one-time source-level identity repair. No workflow edits or frozen model changes.
+# Adds only an exact Cam Bynum -> Camryn Bynum outcome alias and tests with fresh Sleeper data.
+name: SR5 - Repair Cam Bynum Shared Identity Source (One Shot)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      SOURCE_FILE: scripts/validation/capture_realized_outcomes.py
+      EXPECTED_SOURCE_BLOB: c83f897a965366fb27233311a8415b64a1a39d3a
+    steps:
+      - name: Check out exact current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Verify clean baseline and exact source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA" || { echo 'STOP: main changed before checkout'; exit 1; }
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          test "$(git hash-object "$SOURCE_FILE")" = "$EXPECTED_SOURCE_BLOB" || { echo 'STOP: identity resolver changed; do not blindly patch'; exit 1; }
+          echo 'PASS: exact shared identity source is unchanged.'
+
+      - name: Apply one exact, audited Sleeper-name alias
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('scripts/validation/capture_realized_outcomes.py')
+          original = path.read_text(encoding='utf-8')
+          before = '''OUTCOME_ALIASES = {
+              "michael penix jr": "michael penix",
+              "bam knight": "zonovan knight",
+              "harold perkins jr": "harold perkins",
+          }
+          '''
+          after = '''OUTCOME_ALIASES = {
+              "michael penix jr": "michael penix",
+              "bam knight": "zonovan knight",
+              "harold perkins jr": "harold perkins",
+              # Audited existing player: FantasyPros/historical display "Cam Bynum"
+              # corresponds to Sleeper's current full given name "Camryn Bynum".
+              # The actual Sleeper ID (7715) and DB eligibility are verified below.
+              "cam bynum": "camryn bynum",
+          }
+          '''
+          assert original.count(before) == 1, 'STOP: changed alias dictionary'
+          revised = original.replace(before, after)
+          compile(revised, str(path), 'exec')
+          path.write_text(revised, encoding='utf-8')
+          print('PASS: exactly one shared identity alias added.')
+          PY
+          git diff --check
+          git diff -- "$SOURCE_FILE"
+
+      - name: Test shared resolver against actual refreshed Sleeper identities
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir 'requests>=2.32,<3'
+          python3 scripts/projections/sleeper_projections_pipeline.py --selftest
+          python3 scripts/validation/capture_realized_outcomes.py --selftest
+          python3 scripts/validation/build_value_uncertainty.py --selftest
+          python3 scripts/projections/sleeper_projections_pipeline.py
+          PYTHONPATH=scripts/validation:scripts/model python3 - <<'PY'
+          import json
+          import capture_realized_outcomes as outcomes
+          import build_value_uncertainty as uncertainty
+          import snapshot_values
+
+          assert outcomes.OUTCOME_ALIASES['cam bynum'] == 'camryn bynum'
+          cfg = snapshot_values.load_from_html(uncertainty.INDEX_PATH)
+          identity_rows = json.loads(uncertainty.SLEEPER_IDENTITY_PATH.read_text(encoding='utf-8'))
+          by_name, by_id = outcomes.build_sleeper_identity_index(identity_rows)
+          # Fail closed if Sleeper changed the verified player/ID/position pairing.
+          candidates = by_name.get('camryn bynum', [])
+          assert len(candidates) == 1, ('STOP: ambiguous/missing Camryn Bynum', candidates)
+          camryn = candidates[0]
+          assert camryn['sleeper_id'] == '7715', ('STOP: stable ID changed', camryn)
+          assert ('DB' in camryn['fantasy_positions'] or camryn['pos'] in ('DB', 'S', 'FS', 'SS', 'CB')), ('STOP: non-DB player', camryn)
+          resolved, unresolved = outcomes.resolve_model_identities(cfg['player_db'], by_name, by_id)
+          assert not unresolved, ('STOP: remaining unresolved model identities', unresolved)
+          assert len(resolved) == len(cfg['player_db']) == 565, ('STOP: population changed', len(resolved))
+          assert resolved['cam bynum']['sleeper_id'] == '7715'
+          assert resolved['cam bynum']['match_method'] == 'outcome_alias'
+          ids = [r['sleeper_id'] for r in resolved.values()]
+          assert len(ids) == len(set(ids)), 'STOP: a Sleeper stable ID maps to multiple model players'
+          payload = uncertainty.build_payload()
+          assert payload['counts']['player_count'] == 565
+          assert payload['players']['cam bynum']['sleeper_id'] == '7715'
+          assert payload['players']['cam bynum']['center_value'] == snapshot_values.compute_all_values(cfg)['cam bynum']['value']
+          print('PASS: all 565 player identities resolved directly from current Sleeper source, and Fundamental Value centers preserved.')
+
+          # Negative tests for the exact audited source identity. The shared resolver
+          # remains position/name-based, but deployment is prohibited unless the
+          # current source has exactly one matching identity with the audited ID.
+          def passes_audited_cam_identity(rows):
+              name, ids_index = outcomes.build_sleeper_identity_index(rows, minimum_ids=1)
+              options = name.get('camryn bynum', [])
+              return (
+                  len(options) == 1
+                  and options[0]['sleeper_id'] == '7715'
+                  and (
+                      'DB' in options[0]['fantasy_positions']
+                      or options[0]['pos'] in ('DB', 'S', 'FS', 'SS', 'CB')
+                  )
+              )
+          valid = {'sleeper_id':'7715','player':'camryn bynum','pos':'S',
+                   'team':'IND','fantasy_positions':['DB']}
+          assert passes_audited_cam_identity([valid])
+          for bad_rows in [
+              [{**valid, 'sleeper_id':'7716'}],
+              [{**valid, 'player':'cameron bynum'}],
+              [{**valid, 'fantasy_positions':['QB'], 'pos':'QB'}],
+              [valid, {**valid, 'sleeper_id':'7716'}],
+          ]:
+              assert not passes_audited_cam_identity(bad_rows), ('STOP: unsafe source accepted', bad_rows)
+          print('PASS: wrong SID, unrelated name, wrong position, and ambiguous name rejected by source gate.')
+          PY
+          git restore -- scripts/sleeper_2026_projections.json \
+            scripts/artifacts/generated/sleeper_2026_raw_categories.json \
+            scripts/artifacts/generated/sleeper_2026_raw_weekly.json
+          git diff --check
+
+      - name: Commit only the reviewed Python identity alias
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add -- "$SOURCE_FILE"
+          ACTUAL="$(git diff --cached --name-only)"
+          test "$ACTUAL" = "$SOURCE_FILE" || { echo "STOP: staged file mismatch: $ACTUAL"; exit 1; }
+          test -z "$(git diff --name-only)" || { git status --short; echo 'STOP: unexpected other source edits'; exit 1; }
+          test -z "$(git ls-files --others --exclude-standard)" || { git status --short; echo 'STOP: untracked files'; exit 1; }
+          git diff --cached --check
+          test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$(git rev-parse HEAD)" || { echo 'STOP: main moved during verification'; exit 1; }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Fix shared Sleeper identity alias for Cam Bynum (7715)'
+          git push origin HEAD:main
+          echo 'GREEN: one verified identity alias committed to main; no workflows or frozen models modified.'
