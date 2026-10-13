@@ -86,6 +86,10 @@ OUTCOME_ALIASES = {
     "michael penix jr": "michael penix",
     "bam knight": "zonovan knight",
     "harold perkins jr": "harold perkins",
+    # Audited existing player: FantasyPros/historical display "Cam Bynum"
+    # corresponds to Sleeper's current full given name "Camryn Bynum".
+    # The actual Sleeper ID (7715) and DB eligibility are verified below.
+    "cam bynum": "camryn bynum",
 }
 
 # Audited same-name collisions where name + fantasy position are insufficient.
