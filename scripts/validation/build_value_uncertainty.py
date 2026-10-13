@@ -533,6 +533,100 @@ def build_records(
     return players, cohorts
 
 
+def corroborate_projection_missing_identities(
+    resolved: dict[str, dict[str, Any]],
+    unresolved: list[dict[str, Any]],
+    indexed_sleeper_ids: dict[str, dict[str, Any]],
+    crosswalk_rows: Any,
+    historical_ppg_rows: Any,
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    """Bridge projection-missing identities with two corroborated stable-ID sources.
+
+    Neither missing projections nor missing history cause guesses. Conflicts fail closed.
+    No model centers, values or historical forecasts are modified.
+    """
+    if not isinstance(crosswalk_rows, list) or not isinstance(historical_ppg_rows, list):
+        raise RuntimeError('Identity corroboration inputs must be lists')
+
+    def norm(value: Any) -> str:
+        x = str(value or '').strip().lower()
+        for ch in ('.', "'", '\u2019', '-'):
+            x = x.replace(ch, '')
+        return ' '.join(x.split())
+
+    def sid(row: dict[str, Any]) -> str:
+        value = str(row.get('sleeper_id') or '').strip()
+        return value if value.isdecimal() and int(value) > 0 else ''
+
+    patched = dict(resolved)
+    still_missing: list[dict[str, Any]] = []
+    occupied = {str(row.get('sleeper_id')) for row in resolved.values()}
+
+    for issue in unresolved:
+        key = str(issue.get('model_key') or '')
+        pos = str(issue.get('model_pos') or '')
+        name = norm(key)
+        if not name or not pos or key in patched:
+            still_missing.append(issue)
+            continue
+
+        # Require exactly one name- and position-matched identity in EACH
+        # independent source. No alias, fuzzy matching, guessed ID or team guess.
+        history = [
+            row for row in historical_ppg_rows
+            if isinstance(row, dict)
+            and norm(row.get('player')) == name
+            and str(row.get('pos') or '') == pos
+        ]
+        crosswalk = [
+            row for row in crosswalk_rows
+            if isinstance(row, dict)
+            and norm(row.get('name')) == name
+            and str(row.get('fp_position') or '') == pos
+        ]
+        if len(history) != 1 or len(crosswalk) != 1:
+            still_missing.append(issue)
+            continue
+        h, c = history[0], crosswalk[0]
+        hid, cid = sid(h), sid(c)
+        if not hid or hid != cid:
+            still_missing.append(issue)
+            continue
+        if (
+            str(c.get('sleeper_pos') or '') != pos
+            or c.get('requires_manual_review') is not False
+            or c.get('match_confidence') != 'high'
+            or c.get('match_method') not in (
+                'name_position_team_confirmed',
+                'name_collision_resolved_by_position_team',
+                'previous_authoritative_stable_id_preserved',
+                'previous_authoritative_stable_id_preserved_position_changed',
+            )
+        ):
+            still_missing.append(issue)
+            continue
+        # A current indexed identity or a model assignment to the same SID
+        # is a real collision, NOT a missing-projection fallback case.
+        if hid in indexed_sleeper_ids or hid in occupied:
+            still_missing.append(issue)
+            continue
+
+        patched[key] = {
+            'sleeper_id': hid,
+            'player': name,
+            'pos': pos,
+            'team': c.get('sleeper_team'),
+            'model_key': key,
+            'model_pos': pos,
+            'model_team': str(issue.get('model_team') or ''),
+            'match_method': 'corroborated_history_plus_authoritative_crosswalk',
+        }
+        occupied.add(hid)
+        print(f'PASS: missing projection identity {key!r} corroborated by PPG and crosswalk (SID {hid})')
+
+    return patched, still_missing
+
+
 def build_payload() -> dict[str, Any]:
     # Imported lazily so --selftest can exercise the pure uncertainty math in
     # isolation; in the repo these sibling validation modules are on sys.path.
@@ -559,6 +653,12 @@ def build_payload() -> dict[str, Any]:
     resolved, unresolved = capture_realized_outcomes.resolve_model_identities(
         cfg["player_db"], by_name, by_id
     )
+    crosswalk_rows = read_json(IDENTITY_CROSSWALK_PATH)
+    historical_ppg_rows = read_json(PPG_PATH)
+    if unresolved:
+        resolved, unresolved = corroborate_projection_missing_identities(
+            resolved, unresolved, by_id, crosswalk_rows, historical_ppg_rows
+        )
     if unresolved:
         raise RuntimeError(
             f"Uncertainty engine requires complete model identity coverage; unresolved={unresolved[:5]}"
@@ -571,9 +671,9 @@ def build_payload() -> dict[str, Any]:
     sleeper_points = build_sleeper_projection_map(read_json(SLEEPER_PROJECTIONS_PATH))
     fp_candidates = build_fp_points_by_sleeper(
         read_json(FANTASYPROS_PATH),
-        read_json(IDENTITY_CROSSWALK_PATH),
+        crosswalk_rows,
     )
-    history = build_history_by_sleeper(read_json(PPG_PATH))
+    history = build_history_by_sleeper(historical_ppg_rows)
     durability = read_json(DURABILITY_PATH)
     if not isinstance(durability, dict):
         raise RuntimeError("durability_results.json must contain a JSON object")
