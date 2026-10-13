@@ -1,0 +1,199 @@
+# SR1 — One-shot uncertainty repair for Scheduled Data Refresh (Cam Bynum projection-source gap).
+# The complete model identity guard remains enforced; values, frozen science and UI are unchanged.
+name: SR1 - Scheduled Refresh Uncertainty Identity Repair (One Shot)
+
+'on':
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install existing outcome-module dependency
+        run: python3 -m pip install --disable-pip-version-check --no-cache-dir 'requests>=2.32,<3'
+      - name: Confirm exact builder source and required artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain --untracked-files=all)"
+          test "$(git branch --show-current)" = main
+          test "$(git hash-object scripts/validation/build_value_uncertainty.py)" = c70db15470704182c8790ebd24cc25c8fca6bd61
+          for f in scripts/ppg_results.json scripts/identity_crosswalk.json scripts/artifacts/generated/sleeper_2026_raw_categories.json scripts/artifacts/generated/value_uncertainty.json scripts/artifacts/reports/value_uncertainty_report.md .github/workflows/SR1-value-uncertainty-corroborated-identity-repair.yml; do
+            test -f "$f" || { echo "STOP: missing $f"; exit 1; }
+          done
+          echo 'PASS: baseline exact and all required inputs present.'
+      - name: Patch only the uncertainty identity resolver
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_PATCH'
+          from pathlib import Path
+          path = Path('scripts/validation/build_value_uncertainty.py')
+          src = path.read_text(encoding='utf-8')
+          anchor = '\ndef build_payload() -> dict[str, Any]:\n'
+          helper = '\ndef corroborate_projection_missing_identities(\n    resolved: dict[str, dict[str, Any]],\n    unresolved: list[dict[str, Any]],\n    indexed_sleeper_ids: dict[str, dict[str, Any]],\n    crosswalk_rows: Any,\n    historical_ppg_rows: Any,\n) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:\n    """Bridge projection-missing identities with two corroborated stable-ID sources.\n\n    Neither missing projections nor missing history cause guesses. Conflicts fail closed.\n    No model centers, values or historical forecasts are modified.\n    """\n    if not isinstance(crosswalk_rows, list) or not isinstance(historical_ppg_rows, list):\n        raise RuntimeError(\'Identity corroboration inputs must be lists\')\n\n    def norm(value: Any) -> str:\n        x = str(value or \'\').strip().lower()\n        for ch in (\'.\', "\'", \'\\u2019\', \'-\'):\n            x = x.replace(ch, \'\')\n        return \' \'.join(x.split())\n\n    def sid(row: dict[str, Any]) -> str:\n        value = str(row.get(\'sleeper_id\') or \'\').strip()\n        return value if value.isdecimal() and int(value) > 0 else \'\'\n\n    patched = dict(resolved)\n    still_missing: list[dict[str, Any]] = []\n    occupied = {str(row.get(\'sleeper_id\')) for row in resolved.values()}\n\n    for issue in unresolved:\n        key = str(issue.get(\'model_key\') or \'\')\n        pos = str(issue.get(\'model_pos\') or \'\')\n        name = norm(key)\n        if not name or not pos or key in patched:\n            still_missing.append(issue)\n            continue\n\n        # Require exactly one name- and position-matched identity in EACH\n        # independent source. No alias, fuzzy matching, guessed ID or team guess.\n        history = [\n            row for row in historical_ppg_rows\n            if isinstance(row, dict)\n            and norm(row.get(\'player\')) == name\n            and str(row.get(\'pos\') or \'\') == pos\n        ]\n        crosswalk = [\n            row for row in crosswalk_rows\n            if isinstance(row, dict)\n            and norm(row.get(\'name\')) == name\n            and str(row.get(\'fp_position\') or \'\') == pos\n        ]\n        if len(history) != 1 or len(crosswalk) != 1:\n            still_missing.append(issue)\n            continue\n        h, c = history[0], crosswalk[0]\n        hid, cid = sid(h), sid(c)\n        if not hid or hid != cid:\n            still_missing.append(issue)\n            continue\n        if (\n            str(c.get(\'sleeper_pos\') or \'\') != pos\n            or c.get(\'requires_manual_review\') is not False\n            or c.get(\'match_confidence\') != \'high\'\n            or c.get(\'match_method\') not in (\n                \'name_position_team_confirmed\',\n                \'name_collision_resolved_by_position_team\',\n                \'previous_authoritative_stable_id_preserved\',\n                \'previous_authoritative_stable_id_preserved_position_changed\',\n            )\n        ):\n            still_missing.append(issue)\n            continue\n        # A current indexed identity or a model assignment to the same SID\n        # is a real collision, NOT a missing-projection fallback case.\n        if hid in indexed_sleeper_ids or hid in occupied:\n            still_missing.append(issue)\n            continue\n\n        patched[key] = {\n            \'sleeper_id\': hid,\n            \'player\': name,\n            \'pos\': pos,\n            \'team\': c.get(\'sleeper_team\'),\n            \'model_key\': key,\n            \'model_pos\': pos,\n            \'model_team\': str(issue.get(\'model_team\') or \'\'),\n            \'match_method\': \'corroborated_history_plus_authoritative_crosswalk\',\n        }\n        occupied.add(hid)\n        print(f\'PASS: missing projection identity {key!r} corroborated by PPG and crosswalk (SID {hid})\')\n\n    return patched, still_missing\n\n'
+          old_guard = '    resolved, unresolved = capture_realized_outcomes.resolve_model_identities(\n        cfg["player_db"], by_name, by_id\n    )\n    if unresolved:\n        raise RuntimeError(\n            f"Uncertainty engine requires complete model identity coverage; unresolved={unresolved[:5]}"\n        )\n'
+          new_guard = '    resolved, unresolved = capture_realized_outcomes.resolve_model_identities(\n        cfg["player_db"], by_name, by_id\n    )\n    crosswalk_rows = read_json(IDENTITY_CROSSWALK_PATH)\n    historical_ppg_rows = read_json(PPG_PATH)\n    if unresolved:\n        resolved, unresolved = corroborate_projection_missing_identities(\n            resolved, unresolved, by_id, crosswalk_rows, historical_ppg_rows\n        )\n    if unresolved:\n        raise RuntimeError(\n            f"Uncertainty engine requires complete model identity coverage; unresolved={unresolved[:5]}"\n        )\n'
+          old_fp = '    fp_candidates = build_fp_points_by_sleeper(\n        read_json(FANTASYPROS_PATH),\n        read_json(IDENTITY_CROSSWALK_PATH),\n    )\n    history = build_history_by_sleeper(read_json(PPG_PATH))\n'
+          new_fp = '    fp_candidates = build_fp_points_by_sleeper(\n        read_json(FANTASYPROS_PATH),\n        crosswalk_rows,\n    )\n    history = build_history_by_sleeper(historical_ppg_rows)\n'
+          assert src.count(anchor) == 1, 'STOP: unknown function structure'
+          assert 'def corroborate_projection_missing_identities(' not in src, 'STOP: SR1 already applied'
+          assert src.count(old_guard) == 1, 'STOP: identity-coverage guard changed'
+          assert src.count(old_fp) == 1, 'STOP: source input wiring changed'
+          src = src.replace(anchor, helper + anchor)
+          src = src.replace(old_guard, new_guard)
+          src = src.replace(old_fp, new_fp)
+          compile(src, str(path), 'exec')
+          path.write_text(src, encoding='utf-8')
+          print('PASS: patched exact current builder; strict unresolved full-coverage guard remains')
+          PY_PATCH
+          python3 -m py_compile scripts/validation/build_value_uncertainty.py
+      - name: Run fail-closed negative tests and actual Cam Bynum corroboration
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_UNIT'
+          import importlib.util
+          import json
+          from pathlib import Path
+
+          path = Path('scripts/validation/build_value_uncertainty.py')
+          spec = importlib.util.spec_from_file_location('sr1_uncertainty', path)
+          mod = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+          resolve = mod.corroborate_projection_missing_identities
+
+          historic = {'player': 'cam bynum', 'pos': 'DB', 'sleeper_id': '7715'}
+          authoritative = {
+              'fantasypros_id': 22757, 'name': 'Cam Bynum', 'fp_position': 'DB',
+              'sleeper_id': '7715', 'sleeper_pos': 'DB', 'sleeper_team': 'IND',
+              'requires_manual_review': False, 'match_confidence': 'high',
+              'match_method': 'name_position_team_confirmed',
+          }
+          issue = {'model_key': 'cam bynum', 'model_pos': 'DB', 'model_team': '',
+                   'reason': 'no Sleeper identity candidate'}
+
+          def run(h=None, c=None, index=None, assigned=None, issues=None):
+              return resolve(assigned if assigned is not None else {},
+                             issues if issues is not None else [issue],
+                             index if index is not None else {},
+                             c if c is not None else [authoritative],
+                             h if h is not None else [historic])
+
+          found, missing = run()
+          assert not missing and found['cam bynum']['sleeper_id'] == '7715'
+          assert found['cam bynum']['match_method'] == 'corroborated_history_plus_authoritative_crosswalk'
+
+          # Failure tests: one-source, disagreement, position conflict, non-authority,
+          # duplicate identity and an already occupied stable ID must all stay unresolved.
+          for historical, crosswalk, index, assigned in [
+              ([], [authoritative], {}, {}),
+              ([historic], [], {}, {}),
+              ([historic], [dict(authoritative, sleeper_id='999')], {}, {}),
+              ([historic], [dict(authoritative, fp_position='LB')], {}, {}),
+              ([historic], [dict(authoritative, sleeper_pos='LB')], {}, {}),
+              ([historic], [dict(authoritative, match_confidence='low')], {}, {}),
+              ([historic], [dict(authoritative, requires_manual_review=True)], {}, {}),
+              ([historic], [dict(authoritative, match_method='unreviewed')], {}, {}),
+              ([historic], [authoritative, dict(authoritative, fantasypros_id=55)], {}, {}),
+              ([historic], [authoritative], {'7715': {'sleeper_id': '7715'}}, {}),
+              ([historic], [authoritative], {}, {'other model': {'sleeper_id': '7715'}}),
+          ]:
+              result, misses = run(historical, crosswalk, index, assigned)
+              assert len(misses) == 1, (historical, crosswalk, index, assigned, result, misses)
+              assert 'cam bynum' not in result
+
+          prior = {'test qb': {'sleeper_id': '1'}}
+          result, missing = run(assigned=prior, issues=[])
+          assert result == prior and not missing
+
+          ppg = json.loads(Path('scripts/ppg_results.json').read_text())
+          cross = json.loads(Path('scripts/identity_crosswalk.json').read_text())
+          actual_p = [r for r in ppg if str(r.get('player')).lower() == 'cam bynum' and r.get('pos') == 'DB']
+          actual_c = [r for r in cross if str(r.get('name')).lower() == 'cam bynum' and r.get('fp_position') == 'DB']
+          assert len(actual_p) == 1 and len(actual_c) == 1, (actual_p, actual_c)
+          assert str(actual_p[0]['sleeper_id']) == str(actual_c[0]['sleeper_id']) == '7715'
+          assert actual_c[0]['match_confidence'] == 'high' and actual_c[0]['requires_manual_review'] is False
+          result, missing = run(h=ppg, c=cross)
+          assert not missing and result['cam bynum']['sleeper_id'] == '7715'
+          print('PASS: 12 synthetic guards and actual independent stable ID 7715 corroboration')
+          PY_UNIT
+          python3 scripts/validation/build_value_uncertainty.py --selftest
+          python3 scripts/validation/capture_realized_outcomes.py --selftest
+      - name: Replay missing-projection identity and all model values
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/build_value_uncertainty.py --write
+          cp scripts/artifacts/generated/value_uncertainty.json scripts/artifacts/generated/value_uncertainty.sr1.original.json
+          python3 - <<'PY_SCENARIO'
+          import json
+          from pathlib import Path
+          raw = Path('scripts/artifacts/generated/sleeper_2026_raw_categories.json')
+          rows = json.loads(raw.read_text())
+          assert isinstance(rows, list) and len(rows) > 5000, 'STOP: invalid raw Sleeper source'
+          filtered = [r for r in rows if str(r.get('player') or '').strip().lower() != 'cam bynum' and str(r.get('sleeper_id') or '') != '7715']
+          assert len(rows) - len(filtered) in (0, 1), 'STOP: unexpected duplicate Bynum ID/name rows'
+          raw.write_text(json.dumps(filtered, indent=2), encoding='utf-8')
+          print(f'PASS: synthetic projection index without Cam Bynum (rows {len(filtered)})')
+          PY_SCENARIO
+          python3 scripts/validation/build_value_uncertainty.py --write
+          python3 - <<'PY_VERIFY'
+          import json
+          from pathlib import Path
+          v = json.loads(Path('scripts/artifacts/generated/value_uncertainty.json').read_text())
+          base = json.loads(Path('scripts/artifacts/generated/value_uncertainty.sr1.original.json').read_text())
+          assert v['method_version'] == 'sensitivity-envelope-v1'
+          assert v['range_semantics'] == 'sensitivity_envelope_v1_not_probability_interval'
+          assert len(v['players']) >= 565 and set(v['players']) == set(base['players'])
+          assert v['players']['cam bynum']['sleeper_id'] == '7715'
+          assert all(v['players'][key]['center_value'] == base['players'][key]['center_value'] for key in base['players'])
+          assert all(r['range_low'] <= r['center_value'] <= r['range_high'] for r in v['players'].values())
+          print('PASS: all 565 model center values and full model coverage preserved')
+          PY_VERIFY
+          git restore -- scripts/artifacts/generated/sleeper_2026_raw_categories.json
+          rm scripts/artifacts/generated/value_uncertainty.sr1.original.json
+          python3 scripts/validation/build_value_uncertainty.py --write
+          git restore -- scripts/artifacts/generated/value_uncertainty.json scripts/artifacts/reports/value_uncertainty_report.md
+          test "$(git diff --name-only)" = scripts/validation/build_value_uncertainty.py
+          echo 'PASS: full builder replay, missing-identity scenario, unmodified player values and sources.'
+      - name: Archive this one-time workflow and commit repair directly to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .github/workflow-archive/completed-research
+          test ! -e .github/workflow-archive/completed-research/SR1-value-uncertainty-corroborated-identity-repair.yml
+          git mv .github/workflows/SR1-value-uncertainty-corroborated-identity-repair.yml .github/workflow-archive/completed-research/SR1-value-uncertainty-corroborated-identity-repair.yml
+          git add scripts/validation/build_value_uncertainty.py
+          python3 - <<'PY_FINAL'
+          import subprocess
+          rows=subprocess.check_output(['git','diff','--cached','--name-status'],text=True).splitlines()
+          assert len(rows)==2, rows
+          assert any(r.startswith('M\t') and r.endswith('scripts/validation/build_value_uncertainty.py') for r in rows), rows
+          assert any(r.startswith('R100\t') and '.github/workflow-archive/completed-research/SR1-value-uncertainty-corroborated-identity-repair.yml' in r for r in rows), rows
+          print('PASS: staged exactly one source change and one workflow self-archive.')
+          PY_FINAL
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Repair uncertainty projection-missing identity using corroborated source IDs (SR1)'
+          git push origin HEAD:main
+          echo 'GREEN: uncertainty builder repaired, self-archived. Rerun Scheduled Data Refresh.'
