@@ -5,9 +5,9 @@ Protocol SHA256: `b6e66793b947e629d8ea238663fc4ab9e94dc7fb6c6b52495ac1207451ba0b
 
 ## Status
 
-- Snapshots seen: **38**
+- Snapshots seen: **39**
 - Prediction states after deduplication: **23**
-- Deduplicated repeated snapshots: **15**
+- Deduplicated repeated snapshots: **16**
 - Outcome identity coverage: **100.0%**
 - Completed realized weeks available: **[1, 2, 3, 4, 5]**
 - Evaluated snapshot/horizon combinations: **11**
