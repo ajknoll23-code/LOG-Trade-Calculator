@@ -1,0 +1,52 @@
+'use strict';
+const assert=require('assert');
+const fs=require('fs');
+const bridge=require('./client-bridge.js');
+const SCHEMA=bridge.SCHEMA;
+const V1='https://script.google.com/macros/s/AKfycbExistingCollectorV1ident0123456789/exec';
+const V2='https://script.google.com/macros/s/AKfycbDedicatedCollectorV2ident0123456789/exec';
+const players=['sample_a','sample_b','sample_c'];
+const token='QF11_V32_SYNTHETIC_INVITATION_TOKEN_0000000000';
+const payload=()=>({schema:SCHEMA,participant_token:token,display_order:0,consent:true,adult:true,sf_idp_experience:true,keep:'sample_a',trade:'sample_b',cut:'sample_c',mc:[1,1,0]});
+const opts=({fetchImpl, ...rest}={})=>Object.assign({independentInstrumentQcApproved:true,ownerRealPilotActivationApproved:true,dedicatedCollectorDeploymentVerified:true,privacyAndDeletionVerified:true,moderatorAndCriticalStopSopVerified:true,independentCollectorIsolationVerified:true,endpoint:V2,legacyV1Endpoint:V1,approvedPlayerKeys:players,fetchImpl:fetchImpl||(()=>Promise.resolve(okAck('PENDING_HUMAN_Q4_REVIEW')))},rest);
+const okAck=status=>({ok:true,type:'cors',headers:{get:k=>k==='content-type'?'application/json; charset=utf-8':''},json:async()=>({schema:SCHEMA,status})});
+let count=0;async function test(name,fn){await fn();count++;console.log('PASS '+name)}
+async function run(){
+  await test('schema and exact client payload pass',()=>assert(bridge.validPayload(payload(),players)));
+  await test('unsolicited identity/free-text fields rejected',()=>assert(!bridge.validPayload({...payload(),q4:'name'},players)));
+  await test('false consent rejected',()=>assert(!bridge.validPayload({...payload(),consent:false},players)));
+  await test('false adult rejected',()=>assert(!bridge.validPayload({...payload(),adult:false},players)));
+  await test('false SF/IDP experience rejected',()=>assert(!bridge.validPayload({...payload(),sf_idp_experience:false},players)));
+  await test('invalid token rejected',()=>assert(!bridge.validPayload({...payload(),participant_token:'roster-123'},players)));
+  await test('duplicate ranking rejected',()=>assert(!bridge.validPayload({...payload(),trade:'sample_a'},players)));
+  await test('unknown player rejected',()=>assert(!bridge.validPayload({...payload(),keep:'some_real_player'},players)));
+  await test('invalid display order rejected',()=>assert(!bridge.validPayload({...payload(),display_order:6},players)));
+  await test('invalid multiple choice rejected',()=>assert(!bridge.validPayload({...payload(),mc:[1,1,4]},players)));
+  await test('endpoint must be Google Script exec without query',()=>{assert(bridge.isGoogleScriptExec(V2));assert(!bridge.isGoogleScriptExec('https://example.com/macros/s/AAAAAAAAAAAAAAAA/exec'));assert(!bridge.isGoogleScriptExec(V2+'?participant_token=xyz'));});
+  let attempted=0;
+  await test('default bridge refuses collection',async()=>assert.deepStrictEqual(await bridge.createBridge({fetchImpl:()=>{attempted++;}}).submit(payload()),{state:'BLOCKED_NOT_AUTHORIZED_OR_CONFIGURED'}));
+  await test('owner authorization false blocks before fetch',async()=>assert.equal((await bridge.createBridge(opts({ownerRealPilotActivationApproved:false,fetchImpl:()=>{attempted++;}})).submit(payload())).state,'BLOCKED_NOT_AUTHORIZED_OR_CONFIGURED'));
+  await test('instrument QC false blocks',async()=>assert.equal((await bridge.createBridge(opts({independentInstrumentQcApproved:false,fetchImpl:()=>{attempted++;}})).submit(payload())).state,'BLOCKED_NOT_AUTHORIZED_OR_CONFIGURED'));
+  await test('privacy deletion false blocks',async()=>assert.equal((await bridge.createBridge(opts({privacyAndDeletionVerified:false,fetchImpl:()=>{attempted++;}})).submit(payload())).state,'BLOCKED_NOT_AUTHORIZED_OR_CONFIGURED'));
+  await test('missing separation proof blocks',async()=>assert.equal((await bridge.createBridge(opts({independentCollectorIsolationVerified:false,fetchImpl:()=>{attempted++;}})).submit(payload())).state,'BLOCKED_NOT_AUTHORIZED_OR_CONFIGURED'));
+  await test('V1 collector URL reuse blocks',async()=>assert.equal((await bridge.createBridge(opts({endpoint:V1,fetchImpl:()=>{attempted++;}})).submit(payload())).state,'BLOCKED_NOT_AUTHORIZED_OR_CONFIGURED'));
+  await test('never sends malformed payload',async()=>assert.equal((await bridge.createBridge(opts({fetchImpl:()=>{attempted++;}})).submit({...payload(),q4:'text'})).state,'REJECTED_CLIENT_VALIDATION'));
+  await test('no unapproved fetch has occurred',()=>assert.equal(attempted,0));
+  await test('valid test ack requires manual Q4 review and privacy fetch config',async()=>{
+    let got;let countCalls=0;const b=bridge.createBridge(opts({fetchImpl:async(url,init)=>{got={url,init};countCalls++;return okAck('PENDING_HUMAN_Q4_REVIEW')}}));
+    assert.equal((await b.submit(payload())).state,'AWAITING_MODERATOR_Q4_REVIEW');
+    assert.equal(countCalls,1);assert.equal(got.url,V2);assert.equal(got.init.mode,'cors');assert.equal(got.init.credentials,'omit');assert.equal(got.init.referrerPolicy,'no-referrer');assert.equal(got.init.cache,'no-store');assert.equal(got.init.method,'POST');assert.deepStrictEqual(JSON.parse(got.init.body),payload());
+    assert.equal((await b.submit(payload())).state,'LOCKED_NO_RETRY');assert.equal(countCalls,1);
+  });
+  await test('critical stop acknowledgment stays a stop',async()=>assert.equal((await bridge.createBridge(opts({fetchImpl:async()=>okAck('CRITICAL_STOP_QUARANTINED')})).submit(payload())).state,'CRITICAL_STOP_QUARANTINED'));
+  await test('collector rejection never shown as accepted',async()=>assert.equal((await bridge.createBridge(opts({fetchImpl:async()=>okAck('DUPLICATE_OR_SLOT_USED')})).submit(payload())).state,'STOPPED_OR_NOT_ACCEPTED'));
+  await test('opaque responses yield uncertain no retry',async()=>{let n=0;const b=bridge.createBridge(opts({fetchImpl:async()=>{n++;return {ok:true,type:'opaque',json:async()=>({schema:SCHEMA,status:'PENDING_HUMAN_Q4_REVIEW'})}}}));assert.equal((await b.submit(payload())).state,'UNCERTAIN_DO_NOT_RETRY');assert.equal((await b.submit(payload())).state,'LOCKED_NO_RETRY');assert.equal(n,1)});
+  await test('CORS rejection yields uncertain no retry',async()=>{let n=0;const b=bridge.createBridge(opts({fetchImpl:async()=>{n++;throw new Error('CORS BLOCKED')}}));assert.equal((await b.submit(payload())).state,'UNCERTAIN_DO_NOT_RETRY');assert.equal((await b.submit(payload())).state,'LOCKED_NO_RETRY');assert.equal(n,1)});
+  await test('missing JSON content type uncertain',async()=>{const b=bridge.createBridge(opts({fetchImpl:async()=>({...okAck('PENDING_HUMAN_Q4_REVIEW'),headers:{get:()=> 'text/html'}})}));assert.equal((await b.submit(payload())).state,'UNCERTAIN_DO_NOT_RETRY')});
+  await test('wrong response schema uncertain',async()=>{const b=bridge.createBridge(opts({fetchImpl:async()=>({...okAck('PENDING_HUMAN_Q4_REVIEW'),json:async()=>({schema:'V1',status:'PENDING_HUMAN_Q4_REVIEW'})})}));assert.equal((await b.submit(payload())).state,'UNCERTAIN_DO_NOT_RETRY')});
+  await test('in-flight duplicate blocked',async()=>{let resolve,n=0;const pending=new Promise(r=>resolve=r);const b=bridge.createBridge(opts({fetchImpl:()=>{n++;return pending}}));const first=b.submit(payload());assert.equal((await b.submit(payload())).state,'LOCKED_NO_RETRY');resolve(okAck('PENDING_HUMAN_Q4_REVIEW'));assert.equal((await first).state,'AWAITING_MODERATOR_Q4_REVIEW');assert.equal(n,1)});
+  await test('no persistent storage/console/auto retry in client source',()=>{const s=fs.readFileSync(__dirname+'/client-bridge.js','utf8');for(const prohibited of [/localStorage\b/,/sessionStorage\b/,/console\.log\b/,/navigator\.sendBeacon\b/,/mode:'no-cors'/,/\.retry\b/])assert(!prohibited.test(s),String(prohibited))});
+  await test('V31 collector contract retained in sibling source',()=>{const s=fs.readFileSync(__dirname+'/collector.gs','utf8');assert(s.includes("var QF11_V2_SCHEMA = 'QF11_KTC_V2_PILOT_RESPONSE_V1'"));assert(s.includes('qf11v2Handle_'));assert(s.includes('QF11_V2_SHEET_ID'));assert(!s.includes('https://script.google.com'))});
+  assert.equal(count,29);console.log('QF11_V32_BROWSER_COLLECTOR_BRIDGE_TESTS_GREEN '+JSON.stringify({tests:count,real_participants:0,live_network_requests:0,real_votes:0}));
+}
+run().catch(e=>{console.error(e.stack);process.exit(1)});
