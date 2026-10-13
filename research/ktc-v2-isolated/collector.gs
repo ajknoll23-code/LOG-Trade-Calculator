@@ -44,9 +44,23 @@ function qf11v2Json_(props,key){
   qf11v2Assert_(x && typeof x==='object','BAD_CONFIG_'+key);
   return x;
 }
+/**
+ * V35: ALL direct intake paths require the same seven authorizations as the
+ * iframe RPC host. Never mistake a single ENABLED switch for full approval.
+ * This helper is intentionally self-contained (collector also has doPost).
+ */
+function qf11v2IntakeAuthorized_(props) {
+  var required=[
+    'QF11_V2_ENABLED','QF11_V2_IFRAME_TRANSPORT_VERIFIED',
+    'QF11_V2_OWNER_PILOT_AUTHORIZED','QF11_V2_INDEPENDENT_WORDING_QC',
+    'QF11_V2_PRIVACY_DELETION_VERIFIED','QF11_V2_MODERATOR_SOP_VERIFIED',
+    'QF11_V2_COLLECTOR_ISOLATION_VERIFIED'
+  ];
+  return required.every(function(k){return props.getProperty(k)==='true';});
+}
 function qf11v2Handle_(payload,props,now) {
   // This routine must only run inside the Apps Script lock.
-  if(props.getProperty('QF11_V2_ENABLED')!=='true') return 'DISABLED';
+  if(!qf11v2IntakeAuthorized_(props)) return 'DISABLED';
   if(props.getProperty('QF11_V2_HALTED')==='true') return 'HALTED';
   if(props.getProperty('QF11_V2_CLOSED')==='true') return 'CLOSED';
   if(!payload || typeof payload!=='object' || Array.isArray(payload)) return 'REJECTED_SCHEMA';
@@ -86,7 +100,7 @@ function qf11v2Handle_(payload,props,now) {
 function doPost(e) {
   // Never log request bodies, invite tokens, or response values.
   var props=PropertiesService.getScriptProperties();
-  if(props.getProperty('QF11_V2_ENABLED')!=='true') return qf11v2Reply_('DISABLED');
+  if(!qf11v2IntakeAuthorized_(props)) return qf11v2Reply_('DISABLED');
   if(props.getProperty('QF11_V2_HALTED')==='true') return qf11v2Reply_('HALTED');
   var lock=LockService.getScriptLock();
   if(!lock.tryLock(15000)) return qf11v2Reply_('BUSY_NO_SUBMISSION');

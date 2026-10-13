@@ -29,8 +29,35 @@ function fresh(){
   const post=p=>JSON.parse(globals.doPost({postData:{contents:JSON.stringify(p)}}).getContent()).status;
   return {conf,rows,props,globals,payload,post};
 }
-const ready=()=>{let e=fresh();e.conf.QF11_V2_ENABLED='true';return e};
+const REQUIRED_GATE_KEYS=[
+ 'QF11_V2_ENABLED','QF11_V2_IFRAME_TRANSPORT_VERIFIED',
+ 'QF11_V2_OWNER_PILOT_AUTHORIZED','QF11_V2_INDEPENDENT_WORDING_QC',
+ 'QF11_V2_PRIVACY_DELETION_VERIFIED','QF11_V2_MODERATOR_SOP_VERIFIED',
+ 'QF11_V2_COLLECTOR_ISOLATION_VERIFIED'
+];
+const ready=()=>{let e=fresh();REQUIRED_GATE_KEYS.forEach(k=>e.conf[k]='true');return e};
+
 test('disabled is default and writes nothing',()=>{let e=fresh();assert.equal(e.post(e.payload()),'DISABLED');assert.equal(e.rows.length,1)});
+test('V35 each of seven missing approvals blocks direct doPost and handler',()=>{
+  for(const key of REQUIRED_GATE_KEYS){
+    let e=ready();e.conf[key]='false';
+    assert.equal(e.post(e.payload()),'DISABLED',key);
+    assert.equal(e.globals.qf11v2Handle_(e.payload(),e.props,Date.now()),'DISABLED',key);
+    assert.equal(e.rows.length,1,key);
+  }
+});
+test('V35 missing and incorrectly typed approval properties fail closed',()=>{
+  for(const value of [undefined,'FALSE','True',true,0,'yes']){
+    let e=ready();e.conf.QF11_V2_PRIVACY_DELETION_VERIFIED=value;
+    assert.equal(e.post(e.payload()),'DISABLED');
+    assert.equal(e.rows.length,1);
+  }
+});
+test('V35 ENABLED alone must not accept even well-formed invite',()=>{
+  let e=fresh();e.conf.QF11_V2_ENABLED='true';
+  assert.equal(e.post(e.payload()),'DISABLED');
+  assert.equal(e.rows.length,1);
+});
 test('happy path stored only in separate sheet and Q4 waits human',()=>{let e=ready();assert.equal(e.post(e.payload()),'PENDING_HUMAN_Q4_REVIEW');assert.equal(e.rows.length,2);assert.equal(e.rows[1][3],1);assert.equal(e.rows[1][5],hmac(token(1)));assert(!JSON.stringify(e.rows).includes(token(1)))});
 test('duplicate same token rejected',()=>{let e=ready();e.post(e.payload());assert.equal(e.post(e.payload()),'DUPLICATE_OR_SLOT_USED');assert.equal(e.rows.length,2)});
 test('reject unassigned',()=>{let e=ready();assert.equal(e.post(e.payload(1,{participant_token:token(15)})),'REJECTED_UNASSIGNED_TOKEN');assert.equal(e.rows.length,1)});
