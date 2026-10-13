@@ -4,16 +4,16 @@
 
 - First eligible future week: **4**
 - Pre-discovery weeks excluded forever: **1, 2, 3**
-- Completed eligible prefix: **[4]**
-- Eligible completed-week count: **1**
+- Completed eligible prefix: **[4, 5]**
+- Eligible completed-week count: **2**
 - Production changed: **No**
 - Deployment authorized: **No**
 
 Collecting future evidence only; do not select or deploy.
 
-## weeks_4_to_4_cumulative
+## weeks_4_to_5_cumulative
 
-- C0 − control Spearman: **-0.00206825675044614**
-- C0 − control pairwise accuracy: **0.0**
-- MAE improvement (control − C0): **0.002430758628597929**
+- C0 − control Spearman: **0.03717088776198452**
+- C0 − control pairwise accuracy: **0.013157894736842035**
+- MAE improvement (control − C0): **0.013527270047860807**
 
