@@ -1,0 +1,329 @@
+# SR3: one-time repair for SR2's discovered live Cam Bynum/Camryn Bynum drift.
+# Explicit FPID 22757 / SID 7715 guard; never enable general fuzzy matching.
+# Also repairs SR1 uncertainty fallback and the one incorrect B51 workflow path.
+# No frozen-model coefficients, output artifacts, live UI, or FV changes.
+name: SR3 - Repair Live Identity Drift and B51 (One Shot)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      SR3_WORKFLOW: .github/workflows/SR3-fix-identity-name-drift-and-B51.yml
+      SR3_ARCHIVE: .github/workflow-archive/completed-research/SR3-fix-identity-name-drift-and-B51.yml
+      SR2_WORKFLOW: .github/workflows/SR2-fix-scheduled-refresh-and-b51.yml
+      SR2_ARCHIVE: .github/workflow-archive/completed-research/SR2-fix-scheduled-refresh-and-b51.yml
+      RESOLVER_SOURCE: scripts/projections/resolve_fantasypros_sleeper_identity.py
+      UNCERTAINTY_SOURCE: scripts/validation/build_value_uncertainty.py
+      B51_SOURCE: .github/workflows/B51-v1r1-schedule-utility-v1-reusable-weekly-prospective-snapshot-freezer.yml
+      EXPECTED_RESOLVER_BLOB: cf77502d864d71cf60507bb0d209c22f12dcc127
+      EXPECTED_UNCERTAINTY_BLOB: 17f13e38b529c2c8d09ca8068edba64186cc9581
+      EXPECTED_B51_BLOB: d328bfb7ca39fc65ed3af49d689f862221295344
+      EXPECTED_SR2_BLOB: 5d9e140c536076b650f18968347a8861df30d94f
+    steps:
+      - name: Checkout current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Install Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Verify exact source identities and clean baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA" || { echo 'STOP: stale main'; exit 1; }
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          test "$(git hash-object "$RESOLVER_SOURCE")" = "$EXPECTED_RESOLVER_BLOB"
+          test "$(git hash-object "$UNCERTAINTY_SOURCE")" = "$EXPECTED_UNCERTAINTY_BLOB"
+          test "$(git hash-object "$B51_SOURCE")" = "$EXPECTED_B51_BLOB"
+          test "$(git hash-object "$SR2_WORKFLOW")" = "$EXPECTED_SR2_BLOB"
+          test -f "$SR3_WORKFLOW"
+          test ! -e "$SR3_ARCHIVE"
+          test ! -e "$SR2_ARCHIVE"
+          echo 'PASS: exact source and baseline validated.'
+
+      - name: Patch exactly three source files in working tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          resolver = Path('scripts/projections/resolve_fantasypros_sleeper_identity.py')
+          before = resolver.read_text(encoding='utf-8')
+          old = '''    if not stable_authoritative_name_equivalent(fp["_name"], current["player"]):
+          '''
+          new = '''    # Audited *existing* pair only: FantasyPros 22757 calls the player
+              # "Cam Bynum"; Sleeper 7715 now displays "Camryn Bynum".
+              # No other player, ID, team, position or new match gains tolerance.
+              audited_short_name = (
+                  fp["_fpid"] == "22757"
+                  and prior_sid == "7715"
+                  and fp["_name"] == "cam bynum"
+                  and current["player"] == "camryn bynum"
+                  and fp["_pos"] == "DB"
+                  and "DB" in (current.get("positions") or set())
+                  and (
+                      not fp.get("_team")
+                      or not current.get("team")
+                      or fp["_team"] == current["team"]
+                  )
+              )
+              if not (stable_authoritative_name_equivalent(fp["_name"], current["player"]) or audited_short_name):
+          '''
+          assert before.count(old) == 1, 'STOP: unreviewed resolver source'
+          patched = before.replace(old, new)
+          compile(patched, str(resolver), 'exec')
+          resolver.write_text(patched, encoding='utf-8')
+
+          uncertainty = Path('scripts/validation/build_value_uncertainty.py')
+          before = uncertainty.read_text(encoding='utf-8')
+          old = '''        if (
+                      str(c.get('sleeper_pos') or '') != pos
+                      or c.get('requires_manual_review') is not False
+          '''
+          new = '''        # Sleeper's granular defensive label can be S/CB/DE/DT/OLB
+                  # while both model and FantasyPros use DB/DL/LB buckets.
+                  raw_pos = str(c.get('sleeper_pos') or '').upper()
+                  bucket_pos = {
+                      'S': 'DB', 'SS': 'DB', 'FS': 'DB', 'CB': 'DB',
+                      'DE': 'DL', 'DT': 'DL', 'NT': 'DL',
+                      'OLB': 'LB', 'ILB': 'LB', 'MLB': 'LB',
+                  }.get(raw_pos, raw_pos)
+                  fantasy_positions = {str(v).upper() for v in (c.get('sleeper_fantasy_positions') or [])}
+                  if (
+                      (bucket_pos != pos and pos not in fantasy_positions)
+                      or c.get('requires_manual_review') is not False
+          '''
+          assert before.count(old) == 1, 'STOP: unreviewed crosswalk position guard'
+          before = before.replace(old, new)
+          old = '''        # A current indexed identity or a model assignment to the same SID
+                  # is a real collision, NOT a missing-projection fallback case.
+                  if hid in indexed_sleeper_ids or hid in occupied:
+                      still_missing.append(issue)
+                      continue
+          '''
+          new = '''        # Model assignment to this same ID is always a collision. A fresh
+                  # Sleeper record can have a changed name only for the ONE
+                  # independently verified Cam Bynum/Camryn Bynum pair.
+                  if hid in occupied:
+                      still_missing.append(issue)
+                      continue
+                  indexed = indexed_sleeper_ids.get(hid)
+                  if indexed is not None:
+                      indexed_name = norm(indexed.get('player'))
+                      alias_ok = name == 'cam bynum' and indexed_name == 'camryn bynum' and hid == '7715'
+                      fantasy_pos = {str(v).upper() for v in (indexed.get('fantasy_positions') or [])}
+                      raw_pos = str(indexed.get('pos') or '').upper()
+                      bucket_pos = {
+                          'S': 'DB', 'SS': 'DB', 'FS': 'DB', 'CB': 'DB',
+                          'DE': 'DL', 'DT': 'DL', 'NT': 'DL',
+                          'OLB': 'LB', 'ILB': 'LB', 'MLB': 'LB',
+                      }.get(raw_pos, raw_pos)
+                      indexed_team = str(indexed.get('team') or '').upper()
+                      crosswalk_team = str(c.get('sleeper_team') or '').upper()
+                      if (
+                          not indexed_name
+                          or (indexed_name != name and not alias_ok)
+                          or (pos != bucket_pos and pos not in fantasy_pos)
+                          or (indexed_team and crosswalk_team and indexed_team != crosswalk_team)
+                      ):
+                          still_missing.append(issue)
+                          continue
+          '''
+          assert before.count(old) == 1, 'STOP: unreviewed projection identity guard'
+          patched = before.replace(old, new)
+          compile(patched, str(uncertainty), 'exec')
+          uncertainty.write_text(patched, encoding='utf-8')
+
+          b51 = Path('.github/workflows/B51-v1r1-schedule-utility-v1-reusable-weekly-prospective-snapshot-freezer.yml')
+          before = b51.read_text(encoding='utf-8')
+          bad = '.github/workflows/B51-v1-schedule-utility-v1-reusable-weekly-prospective-snapshot-freezer.yml'
+          assert before.count(bad) == 1 and b51.is_file(), 'STOP: B51 path not found exactly once'
+          b51.write_text(before.replace(bad, str(b51)), encoding='utf-8')
+          print('PASS: three targeted source edits, no output or frozen data changes.')
+          PY
+          git diff --check
+
+      - name: Test positive and negative identity guards and B51 path
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir 'requests>=2.32,<3' 'PyYAML>=6,<7'
+          PYTHONPATH=scripts/projections:scripts/validation python3 - <<'PY'
+          import json
+          from pathlib import Path
+          import yaml
+          from resolve_fantasypros_sleeper_identity import (
+              stable_authoritative_name_equivalent, build_production_crosswalk,
+          )
+          from build_value_uncertainty import corroborate_projection_missing_identities
+          fp = {'players':[{'fantasypros_id':22757, 'name':'Cam Bynum',
+                            'normalized_name':'cam bynum','source_position':'DB','team':'IND'}]}
+          sleeper = [{'sleeper_id':'7715','player':'camryn bynum','pos':'S',
+                      'team':'IND','fantasy_positions':['DB'],
+                      'raw_category_season_totals':{'idp_tkl_solo':50}}]
+          previous = [{'fantasypros_id':22757,'name':'Cam Bynum','fp_position':'DB',
+                       'sleeper_id':'7715','requires_manual_review':False}]
+          row = build_production_crosswalk(fp, [], sleeper, {}, previous)[0]
+          assert row['sleeper_id'] == '7715'
+          assert row['match_method'] == 'previous_authoritative_stable_id_preserved'
+          assert row['requires_manual_review'] is False
+          assert not stable_authoritative_name_equivalent('Cam Bynum','Camryn Bynum')
+          assert build_production_crosswalk(fp, [], sleeper, {}, [])[0]['sleeper_id'] is None
+          # A different FPID has no authorized prior association and must NOT
+          # manufacture a new match; this is an unresolved result, not an error.
+          other_fp={**fp['players'][0], 'fantasypros_id':22758}
+          assert build_production_crosswalk({'players':[other_fp]},[],sleeper,{},previous)[0]['sleeper_id'] is None
+          for bad in [
+              {'name':'Sam Bynum','normalized_name':'sam bynum'},
+              {'source_position':'QB'}, {'team':'DAL'},
+          ]:
+              alter={**fp['players'][0],**bad}
+              if 'name' in bad: alter['normalized_name']=bad['normalized_name']
+              if 'source_position' in bad: alter['source_position']=bad['source_position']
+              try:
+                  build_production_crosswalk({'players':[alter]},[],sleeper,{},previous)
+              except RuntimeError as exc:
+                  assert 'Stable identity contradiction' in str(exc)
+              else:
+                  raise AssertionError(f'Unsafe stable-ID name tolerance for {bad}')
+          for bad in [{'player':'cameron bynum'},{'team':'DAL'},{'fantasy_positions':['QB'],'pos':'QB'}]:
+              try:
+                  build_production_crosswalk(fp,[],[{**sleeper[0],**bad}],{},previous)
+              except RuntimeError as exc:
+                  assert 'Stable identity contradiction' in str(exc)
+              else:
+                  raise AssertionError(f'Unsafe Sleeper identity tolerance for {bad}')
+          issue={'model_key':'cam bynum','model_pos':'DB','model_team':'','reason':'no Sleeper identity candidate'}
+          cross={'name':'Cam Bynum','fp_position':'DB','sleeper_id':'7715',
+                 'sleeper_pos':'S','sleeper_fantasy_positions':['DB'],
+                 'sleeper_team':'IND','requires_manual_review':False,
+                 'match_confidence':'high','match_method':'previous_authoritative_stable_id_preserved'}
+          ppg={'player':'cam bynum','pos':'DB','sleeper_id':'7715'}
+          current={'sleeper_id':'7715','player':'camryn bynum','pos':'S',
+                   'fantasy_positions':['DB'],'team':'IND'}
+          def chk(ix=None,c=None,h=None,taken=None):
+              ix={'7715':current} if ix is None else ix
+              r,u=corroborate_projection_missing_identities(taken or {},[issue],ix,[c or cross],[h or ppg])
+              return r.get('cam bynum'),u
+          assert chk()[0]['sleeper_id']=='7715' and not chk()[1]
+          assert chk(ix={})[0]['sleeper_id']=='7715' and not chk(ix={})[1]
+          for bad in [{'player':'john bynum'},{'team':'DAL'},
+                      {'fantasy_positions':['QB'],'pos':'QB'}]:
+              r,u=chk(ix={'7715':{**current,**bad}})
+              assert not r and u, bad
+          for bad in [{'sleeper_id':'22222'},{'requires_manual_review':True},
+                      {'match_confidence':'low'},{'sleeper_fantasy_positions':['QB'],'sleeper_pos':'QB'}]:
+              r,u=chk(c={**cross,**bad})
+              assert not r and u, bad
+          assert chk(h={**ppg,'sleeper_id':'22222'})[0] is None
+          assert chk(taken={'other':{'sleeper_id':'7715'}})[0] is None
+          r,u=corroborate_projection_missing_identities({},[issue],{'7715':current},[cross,cross],[ppg])
+          assert not r and u
+          assert not chk(ix={'7715':{**current,'player':'cameron bynum'}})[0]
+          b51=Path('.github/workflows/B51-v1r1-schedule-utility-v1-reusable-weekly-prospective-snapshot-freezer.yml')
+          s=b51.read_text(encoding='utf-8')
+          assert s.count(str(b51))==1
+          assert 'B51-v1-schedule-utility-v1-reusable-weekly-prospective-snapshot-freezer.yml' not in s
+          doc=yaml.safe_load(s)
+          assert doc['name'].startswith('B51 Schedule Utility V1')
+          print('PASS: exact stable-ID alias, strict new match, team/ID/position/name conflict gates, B51 path.')
+          PY
+          python3 scripts/projections/resolve_fantasypros_sleeper_identity.py --selftest
+          python3 scripts/validation/build_value_uncertainty.py --selftest
+          python3 scripts/validation/capture_realized_outcomes.py --selftest
+
+      - name: Verify real refreshed Sleeper and 565-player uncertainty model
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/projections/sleeper_projections_pipeline.py --selftest
+          python3 scripts/projections/sleeper_projections_pipeline.py
+          python3 scripts/projections/resolve_fantasypros_sleeper_identity.py
+          PYTHONPATH=scripts/validation:scripts/model python3 - <<'PY'
+          import json
+          import capture_realized_outcomes as outcome
+          import snapshot_values
+          import build_value_uncertainty as uncertainty
+          cfg=snapshot_values.load_from_html(uncertainty.INDEX_PATH)
+          by_name,by_id=outcome.build_sleeper_identity_index(
+              json.loads(uncertainty.SLEEPER_IDENTITY_PATH.read_text(encoding='utf-8')))
+          resolved,unresolved=outcome.resolve_model_identities(cfg['player_db'],by_name,by_id)
+          print('Fresh-source coverage:',len(resolved),'/',len(cfg['player_db']))
+          print('Unresolved before audited identity bridge:',[x['model_key'] for x in unresolved])
+          assert [x['model_key'] for x in unresolved] in ([],['cam bynum']),unresolved
+          crosswalk=json.loads(uncertainty.IDENTITY_CROSSWALK_PATH.read_text(encoding='utf-8'))
+          cam=[row for row in crosswalk if str(row.get('fantasypros_id'))=='22757']
+          assert len(cam)==1 and str(cam[0]['sleeper_id'])=='7715'
+          assert cam[0]['match_confidence']=='high' and cam[0]['requires_manual_review'] is False
+          patched,remaining=uncertainty.corroborate_projection_missing_identities(
+              resolved,unresolved,by_id,crosswalk,json.loads(uncertainty.PPG_PATH.read_text(encoding='utf-8')))
+          assert not remaining and len(patched)==len(cfg['player_db'])==565,remaining
+          assert patched['cam bynum']['sleeper_id']=='7715'
+          payload=uncertainty.build_payload()
+          assert payload['counts']['player_count']==565
+          assert payload['players']['cam bynum']['sleeper_id']=='7715'
+          assert payload['players']['cam bynum']['center_value']==snapshot_values.compute_all_values(cfg)['cam bynum']['value']
+          print('PASS: fresh current source, authoritative Cam Bynum ID, all 565 model identities and unchanged FV centers.')
+          PY
+          # Live refresh was validation only. Do not commit generated data from this repair.
+          git restore -- \
+            scripts/sleeper_2026_projections.json \
+            scripts/artifacts/generated/sleeper_2026_raw_categories.json \
+            scripts/artifacts/generated/sleeper_2026_raw_weekly.json \
+            scripts/identity_crosswalk.json \
+            scripts/artifacts/reports/identity_collision_report.md
+          git diff --check
+
+      - name: Commit exact fixes and archive completed SR2 and SR3
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .github/workflow-archive/completed-research
+          git mv "$SR2_WORKFLOW" "$SR2_ARCHIVE"
+          git mv "$SR3_WORKFLOW" "$SR3_ARCHIVE"
+          git add -- "$RESOLVER_SOURCE" "$UNCERTAINTY_SOURCE" "$B51_SOURCE" "$SR2_ARCHIVE" "$SR3_ARCHIVE"
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          actual=set(subprocess.check_output(
+              ['git','diff','--cached','--name-status','-M100%'],text=True).splitlines())
+          expected={
+              'M\t'+str(Path('scripts/projections/resolve_fantasypros_sleeper_identity.py')),
+              'M\t'+str(Path('scripts/validation/build_value_uncertainty.py')),
+              'M\t'+str(Path('.github/workflows/B51-v1r1-schedule-utility-v1-reusable-weekly-prospective-snapshot-freezer.yml')),
+              'R100\t.github/workflows/SR2-fix-scheduled-refresh-and-b51.yml\t.github/workflow-archive/completed-research/SR2-fix-scheduled-refresh-and-b51.yml',
+              'R100\t.github/workflows/SR3-fix-identity-name-drift-and-B51.yml\t.github/workflow-archive/completed-research/SR3-fix-identity-name-drift-and-B51.yml',
+          }
+          assert actual==expected,('Unexpected staged paths',sorted(actual),sorted(expected))
+          print('PASS: staged exactly 3 repair edits and 2 unchanged workflow renames.')
+          PY
+          test -z "$(git diff --name-only)" || { echo 'STOP: unexpected unstaged edits'; exit 1; }
+          test -z "$(git ls-files --others --exclude-standard)" || { echo 'STOP: unexpected untracked files'; exit 1; }
+          git diff --cached --check
+          test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$(git rev-parse HEAD)" \
+            || { echo 'STOP: main moved during repair; no push'; exit 1; }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'SR3: corroborated Cam Bynum stable identity and fix B51 path'
+          git push origin HEAD:main
+          echo 'GREEN: SR3 committed three source fixes; SR2/SR3 retired. Rerun B51 then Scheduled Data Refresh.'
