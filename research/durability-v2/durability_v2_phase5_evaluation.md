@@ -10,7 +10,7 @@ Status: **`COLLECTION_ONLY_INTERIM_BYE_UNADJUSTED`**
 - Frozen candidate SHA256: `444d935e7ea108285b0aa6627e1de1404d4c9aaea5f62834e73db76c5452c502`
 - Frozen at: **2026-09-05T10:44:59.483609Z**
 - First eligible future week: **1**
-- Completed consecutive weeks used: **[1, 2, 3, 4]**
+- Completed consecutive weeks used: **[1, 2, 3, 4, 5]**
 - Eligible durability cohort: **425**
 
 ## Primary prospective target
@@ -28,9 +28,9 @@ Authoritative full-season durability metrics are **not available yet**.
 
 | Variant | MAE | RMSE | Spearman | Δ MAE vs control | Δ Spearman | Pos lower MAE |
 |---|---:|---:|---:|---:|---:|---:|
-| `deployed_control` | 0.1874 | 0.2950 | 0.2523 | — | — | — |
-| `bridge_w100` | 0.1852 | 0.2833 | 0.3008 | -0.0023 | +0.0484 | 3/7 |
-| `bridge_w50` | 0.1851 | 0.2856 | 0.2813 | -0.0023 | +0.0289 | 3/7 |
+| `deployed_control` | 0.1955 | 0.3007 | 0.2287 | — | — | — |
+| `bridge_w100` | 0.1944 | 0.2897 | 0.2533 | -0.0011 | +0.0246 | 3/7 |
+| `bridge_w50` | 0.1930 | 0.2916 | 0.2434 | -0.0025 | +0.0147 | 4/7 |
 
 ## Interpretation
 
