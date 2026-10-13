@@ -1,0 +1,236 @@
+# SR2: one-shot exact-source repair of two independent live refresh failures.
+# Fixes identity corroboration when a player changes display name but retains a
+# unique independently corroborated Sleeper ID. Fixes B51's nonexistent V1
+# workflow filename reference. Direct push only after real-feed and negative tests.
+name: SR2 - Repair Scheduled Refresh and B51 (One Shot)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      REPAIR_WORKFLOW: .github/workflows/SR2-fix-scheduled-refresh-and-b51.yml
+      REPAIR_ARCHIVE: .github/workflow-archive/completed-research/SR2-fix-scheduled-refresh-and-b51.yml
+      UNCERTAINTY_SOURCE: scripts/validation/build_value_uncertainty.py
+      B51_SOURCE: .github/workflows/B51-v1r1-schedule-utility-v1-reusable-weekly-prospective-snapshot-freezer.yml
+      EXPECTED_UNCERTAINTY_GIT_BLOB: 17f13e38b529c2c8d09ca8068edba64186cc9581
+      EXPECTED_B51_GIT_BLOB: d328bfb7ca39fc65ed3af49d689f862221295344
+    steps:
+      - name: Check out exact current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Fail closed if workflow or source moved
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          test "$(git hash-object "$UNCERTAINTY_SOURCE")" = "$EXPECTED_UNCERTAINTY_GIT_BLOB"
+          test "$(git hash-object "$B51_SOURCE")" = "$EXPECTED_B51_GIT_BLOB"
+          test -f "$REPAIR_WORKFLOW"
+          test ! -e "$REPAIR_ARCHIVE"
+          echo 'PASS: both exact reviewed sources match the frozen SR2 repair preconditions.'
+
+      - name: Apply exact two-file source repair in memory
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          src=Path('scripts/validation/build_value_uncertainty.py')
+          before=src.read_text(encoding='utf-8')
+          old='''        # A current indexed identity or a model assignment to the same SID
+                  # is a real collision, NOT a missing-projection fallback case.
+                  if hid in indexed_sleeper_ids or hid in occupied:
+                      still_missing.append(issue)
+                      continue
+          '''
+          new='''        # A second model key using this ID is a real collision. However, a
+                  # current Sleeper identity with the same stable ID can legitimately
+                  # have an expanded first name (Cam Bynum vs Camryn Bynum). The two
+                  # independent sources above must still agree on the ID and position.
+                  if hid in occupied:
+                      still_missing.append(issue)
+                      continue
+                  indexed = indexed_sleeper_ids.get(hid)
+                  if indexed is not None:
+                      indexed_name = norm(indexed.get('player'))
+                      fantasy_pos = {str(v).upper() for v in (indexed.get('fantasy_positions') or [])}
+                      indexed_pos = str(indexed.get('pos') or '').upper()
+                      indexed_team = str(indexed.get('team') or '').upper()
+                      crosswalk_team = str(c.get('sleeper_team') or '').upper()
+                      if (
+                          not indexed_name
+                          or indexed_name.split()[-1] != name.split()[-1]
+                          or (pos != indexed_pos and pos not in fantasy_pos)
+                          or (indexed_team and crosswalk_team and indexed_team != crosswalk_team)
+                      ):
+                          still_missing.append(issue)
+                          continue
+          '''
+          assert before.count(old)==1, 'STOP: SR1 corroboration logic no longer matches its reviewed source'
+          updated=before.replace(old,new)
+          assert updated.count('def corroborate_projection_missing_identities(')==1
+          compile(updated,str(src),'exec')
+          src.write_text(updated,encoding='utf-8')
+
+          wf=Path('.github/workflows/B51-v1r1-schedule-utility-v1-reusable-weekly-prospective-snapshot-freezer.yml')
+          existing=wf.read_text(encoding='utf-8')
+          wrong='.github/workflows/B51-v1-schedule-utility-v1-reusable-weekly-prospective-snapshot-freezer.yml'
+          correct=str(wf)
+          assert existing.count(wrong)==1, 'STOP: B51 filename defect does not match reviewed source'
+          assert correct!=wrong and wf.exists()
+          wf.write_text(existing.replace(wrong,correct),encoding='utf-8')
+          print('PASS: SR2 changed exactly one identity guard and one B51 filename literal.')
+          PY
+          git diff --check
+
+      - name: Test successful identity and fail-closed counterexamples
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir 'requests>=2.32,<3' 'PyYAML>=6,<7'
+          PYTHONPATH=scripts/validation python3 - <<'PY'
+          from build_value_uncertainty import corroborate_projection_missing_identities as check
+          issue={'model_key':'cam bynum','model_pos':'DB','model_team':'','reason':'no Sleeper identity candidate'}
+          cross={'name':'Cam Bynum','fp_position':'DB','sleeper_id':'7715',
+                 'sleeper_pos':'DB','sleeper_team':'IND','requires_manual_review':False,
+                 'match_confidence':'high','match_method':'name_position_team_confirmed'}
+          ppg={'player':'cam bynum','pos':'DB','sleeper_id':'7715'}
+          current={'sleeper_id':'7715','player':'camryn bynum','pos':'S',
+                   'fantasy_positions':['DB'],'team':'IND'}
+          def run(index=None, xwalk=None, history=None, taken=None):
+              index={'7715':current} if index is None else index
+              got,missing=check(taken or {},[issue],index,[xwalk or cross],[history or ppg])
+              return got.get('cam bynum'),missing
+          result,missing=run()
+          assert not missing and result['sleeper_id']=='7715', 'same-ID expanded-name case must succeed'
+          result,missing=run(index={})
+          assert not missing and result['sleeper_id']=='7715', 'absent projection source case must succeed'
+          for altered in [
+            {'player':'somebody else'},
+            {'fantasy_positions':['QB'],'pos':'QB'},
+            {'team':'NE'},
+          ]:
+              row={**current,**altered}
+              got,missing=run(index={'7715':row})
+              assert not got and missing, f'incorrectly accepted contradicting indexed player {altered}'
+          for altered in [
+              {'sleeper_id':'123456'},
+              {'requires_manual_review':True},
+              {'match_confidence':'low'},
+              {'sleeper_pos':'QB'},
+          ]:
+              got,missing=run(xwalk={**cross,**altered})
+              assert not got and missing, f'incorrectly accepted contradictory crosswalk {altered}'
+          got,missing=run(history={**ppg,'sleeper_id':'123456'})
+          assert not got and missing
+          got,missing=run(taken={'unrelated DB':{'sleeper_id':'7715'}})
+          assert not got and missing, 'same ID cannot serve two model players'
+          got,missing=check({},[issue],{'7715':current},[cross,cross],[ppg])
+          assert not got and missing, 'ambiguous crosswalk must remain unresolved'
+          print('PASS: corroborated current SID, missing projection, ID mismatch, team/position/name conflicts, review gate, and double-use guards.')
+          PY
+          python3 scripts/validation/build_value_uncertainty.py --selftest
+          python3 scripts/validation/capture_realized_outcomes.py --selftest
+          python3 - <<'PY'
+          import yaml
+          from pathlib import Path
+          p=Path('.github/workflows/B51-v1r1-schedule-utility-v1-reusable-weekly-prospective-snapshot-freezer.yml')
+          s=p.read_text()
+          assert s.count(str(p))==1 and 'B51-v1-schedule-utility-v1-reusable-weekly-prospective-snapshot-freezer.yml' not in s
+          doc=yaml.safe_load(s)
+          assert doc.get('name','').startswith('B51 Schedule Utility V1')
+          print('PASS: real installed B51 workflow path, YAML and freeze-manifest reference.')
+          PY
+
+      - name: Test with refreshed real Sleeper identities and current crosswalk
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/projections/sleeper_projections_pipeline.py --selftest
+          python3 scripts/projections/sleeper_projections_pipeline.py
+          python3 scripts/projections/resolve_fantasypros_sleeper_identity.py --selftest
+          python3 scripts/projections/resolve_fantasypros_sleeper_identity.py
+          PYTHONPATH=scripts/validation:scripts/model python3 - <<'PY'
+          import json
+          from pathlib import Path
+          import capture_realized_outcomes as outcome
+          import snapshot_values
+          import build_value_uncertainty as uncertainty
+          cfg=snapshot_values.load_from_html(uncertainty.INDEX_PATH)
+          name_index,id_index=outcome.build_sleeper_identity_index(json.loads(uncertainty.SLEEPER_IDENTITY_PATH.read_text()))
+          initial,unresolved=outcome.resolve_model_identities(cfg['player_db'],name_index,id_index)
+          print('Fresh source model identity coverage before repair:',len(initial),'/',len(cfg['player_db']))
+          print('Fresh source unresolved model keys:',[row['model_key'] for row in unresolved])
+          if [row['model_key'] for row in unresolved] not in ([],['cam bynum']):
+              raise SystemExit('STOP: different current identity failure requires review')
+          fixed,remaining=uncertainty.corroborate_projection_missing_identities(
+              initial,unresolved,id_index,json.loads(uncertainty.IDENTITY_CROSSWALK_PATH.read_text()),
+              json.loads(uncertainty.PPG_PATH.read_text()))
+          assert not remaining and len(fixed)==len(cfg['player_db']),remaining
+          assert fixed['cam bynum']['sleeper_id']=='7715'
+          payload=uncertainty.build_payload()
+          assert payload['counts']['player_count']==len(cfg['player_db'])==565
+          assert payload['players']['cam bynum']['sleeper_id']=='7715'
+          assert payload['players']['cam bynum']['center_value']==snapshot_values.compute_all_values(cfg)['cam bynum']['value']
+          print('PASS: real current Sleeper-refresh identity and full 565-player uncertainty build, no writes.')
+          PY
+          # These are temporary test inputs. Keep source-code-only maintenance.
+          git restore -- \
+            scripts/sleeper_2026_projections.json \
+            scripts/artifacts/generated/sleeper_2026_raw_categories.json \
+            scripts/artifacts/generated/sleeper_2026_raw_weekly.json \
+            scripts/identity_crosswalk.json \
+            scripts/artifacts/reports/identity_collision_report.md
+          git diff --check
+          git status --short
+
+      - name: Commit the two exact fixes and retire SR2 directly to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .github/workflow-archive/completed-research
+          git mv "$REPAIR_WORKFLOW" "$REPAIR_ARCHIVE"
+          git add -- "$UNCERTAINTY_SOURCE" "$B51_SOURCE" "$REPAIR_ARCHIVE"
+          python3 - <<'PY'
+          import subprocess
+          changes=subprocess.check_output(['git','diff','--cached','--name-status','-M100%'],text=True).splitlines()
+          expected={
+              'M\t'+'.github/workflows/B51-v1r1-schedule-utility-v1-reusable-weekly-prospective-snapshot-freezer.yml',
+              'M\t'+'scripts/validation/build_value_uncertainty.py',
+              'R100\t'+'.github/workflows/SR2-fix-scheduled-refresh-and-b51.yml'+ '\t'+'.github/workflow-archive/completed-research/SR2-fix-scheduled-refresh-and-b51.yml',
+          }
+          assert set(changes)==expected,(changes,sorted(expected))
+          print('PASS: only the exact two source edits and self-archive will be committed.')
+          PY
+          test -z "$(git diff --name-only)"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git diff --cached --check
+          test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$(git rev-parse HEAD)" \
+            || { echo 'STOP: main moved; retry from an updated workflow if needed'; exit 1; }
+          git commit -m 'SR2: resolve same-ID name drift and B51 manifest workflow path'
+          git push origin HEAD:main
+          echo 'GREEN: SR2 repairs committed and workflow archived. Rerun B51 before kickoff, then Scheduled Data Refresh full.'
