@@ -1,0 +1,297 @@
+name: LOG CAL01 - Market Value Full-Pool Evidence Correction
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'preview does not commit; apply publishes the reviewed full-pool model'
+        type: choice
+        required: true
+        default: preview
+        options:
+          - preview
+          - apply
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  calibration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      RUN_MODE: ${{ inputs.mode }}
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Verify main and prevent duplicate installation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git branch --show-current)" = main
+          ! grep -q 'from market_v3_evidence import evidence_adjusted_values' scripts/market/build_market_value.py
+          cp scripts/artifacts/generated/market_values.json /tmp/log_cal01_original_market.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install runtime dependencies
+        run: python3 -m pip install --disable-pip-version-check requests
+      - name: Create cohort-wide ranking helper
+        shell: bash
+        run: |
+          cat > scripts/market/market_v3_evidence.py <<'PYCODE'
+          """LOG CAL01: evidence-regularized display estimate, independent raw MV preserved.
+
+          Uses counted ballots already filtered by the canonical KTC pipeline. The market
+          strength is controlled by both exposure and unique voters, but uncertain
+          comparisons fall back toward *FV ranking* as a weak prior. This hybrid MUST NOT
+          be represented as independently measured league market opinion.
+          """
+          from __future__ import annotations
+          from collections import defaultdict
+
+
+          def evidence_adjusted_values(model_values, calibrated, rows, build_alias_index, normalize_name):
+              """Produce point quotes for every market-covered player without special cases."""
+              if not calibrated:
+                  return {}
+              aliases = build_alias_index(list(model_values))
+              support = defaultdict(list)
+              for ballot in rows:
+                  voter = str(ballot.get("voter_roster_id") or "unknown")
+                  labels = {str(ballot.get(f) or "").strip() for f in ("keep", "trade", "cut")}
+                  for label in labels:
+                      if not label:
+                          continue
+                      options = aliases.get(normalize_name(label), [])
+                      if not options:
+                          continue
+                      highest = min(o[1] for o in options)
+                      targets = {o[0] for o in options if o[1] == highest}
+                      if len(targets) == 1:
+                          target = next(iter(targets))
+                          if target in calibrated:
+                              support[target].append(voter)
+
+              keys = sorted(calibrated)
+              fv_order = sorted(keys, key=lambda k: (-int(calibrated[k]["fundamental_value"]), k))
+              fv_rank = {key: i + 1 for i, key in enumerate(fv_order)}
+              slots = sorted((int(calibrated[k]["fundamental_value"]) for k in keys), reverse=True)
+              estimates = []
+              for key in keys:
+                  votes = support.get(key, [])
+                  n = len(votes)
+                  distinct = len(set(votes))
+                  # Evidence-sensitive *heuristic*, not a probability/confidence interval.
+                  weight = max(0.12, min(0.85, n / (n + 8.0) * min(1.0, distinct / 3.0)))
+                  market_rank = float(calibrated[key]["market_rank"])
+                  rank = weight * market_rank + (1 - weight) * fv_rank[key]
+                  estimates.append((rank, key, n, distinct, weight))
+
+              estimates.sort(key=lambda x: (x[0], x[1]))
+              out = {}
+              for idx, (rank, key, n, distinct, weight) in enumerate(estimates):
+                  price = slots[idx]
+                  out[key] = {
+                      "evidence_adjusted_value": price,
+                      "evidence_adjusted_rank": idx + 1,
+                      "evidence_adjusted_delta_from_raw_mv": price - int(calibrated[key]["market_value"]),
+                      "evidence_adjusted_diagnostics": {
+                          "ballot_appearances": n,
+                          "distinct_voters": distinct,
+                          "market_rank_weight": round(weight, 6),
+                          "fv_rank_weight": round(1.0 - weight, 6),
+                          "source_market_rank": market_rank,
+                          "source_fv_rank": fv_rank[key],
+                          "blended_rank_score": round(rank, 6),
+                          "not_independent_of_fv": True,
+                      },
+                  }
+              assert len(out) == len(calibrated)
+              assert sorted(x["evidence_adjusted_value"] for x in out.values()) == sorted(slots)
+              return out
+          PYCODE
+      - name: Patch canonical MV producer and market-only UI
+        shell: bash
+        run: |
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          root = Path('.')
+          source = root / 'scripts/market/build_market_value.py'
+          s = source.read_text(encoding='utf-8')
+          import_line = 'from market_v3_evidence import evidence_adjusted_values\n'
+          anchor = 'import snapshot_values\n'
+          assert s.count(anchor) == 1, 'Unexpected Market Value producer import layout'
+          assert import_line not in s, 'CAL01 appears already installed: stop rather than double-patch'
+          s=s.replace(anchor,anchor+import_line,1)
+          needle = '    calibrated = quantile_calibrate(model_values, resolved)\n'
+          assert s.count(needle)==1, 'Unexpected Market Value calibration path'
+          replacement = needle + '''    adjustments = evidence_adjusted_values(
+                  model_values, calibrated, rows, build_alias_index, normalize_name
+              )
+              for key, adjustment in adjustments.items():
+                  calibrated[key].update(adjustment)
+          '''
+          s=s.replace(needle,replacement,1)
+          needle = '    validate_payload(payload)\n    return payload\n'
+          assert s.count(needle)==1, 'Unexpected payload validation boundary'
+          replacement = '''    payload["evidence_adjustment"] = {
+                  "version": "LOG-CAL01-evidence-regularized-market-estimate-v1",
+                  "semantics": "FV-anchored, ballot-support-weighted ranking; NOT independent MV",
+                  "raw_market_value_unchanged": True,
+                  "fv_value_formula_unchanged": True,
+                  "ranking_weight_k": 8,
+                  "min_market_rank_weight": 0.12,
+                  "max_market_rank_weight": 0.85,
+              }
+              validate_payload(payload)
+              return payload
+          '''
+          s=s.replace(needle,replacement,1)
+          source.write_text(s,encoding='utf-8')
+
+          html = root / 'index.html'
+          h=html.read_text(encoding='utf-8')
+          # Only replace references inside the existing standalone Market UI region.
+          first=h.index('function marketValueForPlayer(')
+          last=h.index('function syncMarketValueFromGitHub()',first)
+          section=h[first:last]
+          assert section.count('Number(row.market_value)')==2, 'Market UI value lookup drift'
+          assert section.count('Number(x.row.market_value)')==2, 'Market package sum drift'
+          section=section.replace('Number(row.market_value)', 'Number(row.evidence_adjusted_value ?? row.market_value)')
+          section=section.replace('Number(x.row.market_value)', 'Number(x.row.evidence_adjusted_value ?? x.row.market_value)')
+          assert section.count("'Market Value — separate league-opinion lens',")==1
+          section=section.replace("'Market Value — separate league-opinion lens',", "'Market* — evidence-adjusted estimate, FV-anchored (not independent league market price)',")
+          assert section.count("  const tooltip = [\n")==1
+          section=section.replace('  const tooltip = [\n', '''  const adjusted = row.evidence_adjusted_diagnostics || {};
+            const tooltip = [
+              `Raw, vote-only Market Value: ${Number(row.market_value).toLocaleString()}`,
+              `Ballot appearances: ${adjusted.ballot_appearances ?? 'not published'}`,
+              `Distinct voters: ${adjusted.distinct_voters ?? 'not published'}`,
+              `Vote-rank weight: ${adjusted.market_rank_weight ?? 'not published'}`,
+          ''',1)
+          assert section.count('>Market ${market.toLocaleString()}')==1
+          section=section.replace('>Market ${market.toLocaleString()}', '>Market* ${market.toLocaleString()}')
+          assert '— what this league\'s current votes imply' in section
+          section=section.replace('— what this league\'s current votes imply', '— evidence-adjusted FV-anchored estimate; raw MV remains available')
+          h=h[:first]+section+h[last:]
+          html.write_text(h,encoding='utf-8')
+          print('LOG CAL01: built full-pool evidence adjustment producer and clearly labeled display')
+          PYCODE
+      - name: Unit test regularizer and existing Market Value math
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=scripts/market python3 - <<'PYCODE'
+          from market_v3_evidence import evidence_adjusted_values
+          from collections import defaultdict
+
+          # Representative controlled graph; the fixture tests population-wide logic,
+          # not whether any named player is worth a particular number.
+          model={f'p{i}':{'value':(10000-i*100),'pos':'WR'} for i in range(100)}
+          market={f'p{i}':{'fundamental_value':10000-i*100,'market_value':100+i*100,'market_rank':i+1} for i in range(100)}
+          aliases=lambda ks: {k:[(k,0,'exact')] for k in ks}
+          norm=lambda s:s.lower().strip()
+          rows=[{'keep':'p1','trade':'p2','cut':'p3','voter_roster_id':str(j)} for j in range(11)]
+          out=evidence_adjusted_values(model,market,rows,aliases,norm)
+          assert len(out)==100
+          assert out['p1']['evidence_adjusted_diagnostics']['ballot_appearances']==11
+          assert out['p0']['evidence_adjusted_diagnostics']['ballot_appearances']==0
+          assert out['p0']['evidence_adjusted_diagnostics']['market_rank_weight']==0.12
+          assert len({v['evidence_adjusted_rank'] for v in out.values()})==100
+          assert sorted(v['evidence_adjusted_value'] for v in out.values())==sorted(x['fundamental_value'] for x in market.values())
+          assert all(x['evidence_adjusted_diagnostics']['not_independent_of_fv'] for x in out.values())
+          for k in market:
+              assert 'evidence_adjusted_value' not in market[k]
+          print('PASS 100-player fixture: exposure, unique voters, cohort-wide ranking, no raw MV mutation')
+          PYCODE
+          python3 scripts/market/build_market_value.py --selftest
+      - name: Rebuild actual full-pool market artifact from live capped votes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/market/build_market_value.py --write
+      - name: Run repository validation and inline syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/repo_regression_checks.py
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import re, subprocess, tempfile
+          html=Path('index.html').read_text(encoding='utf-8')
+          for i,script in enumerate(re.findall(r'<script(?:\s[^>]*)?>([\s\S]*?)</script>',html,flags=re.IGNORECASE)):
+              with tempfile.NamedTemporaryFile(mode='w',suffix='.js',delete=True) as tmp:
+                  tmp.write(script);tmp.flush()
+                  subprocess.run(['node','--check',tmp.name],check=True)
+          print('PASS inline JS syntax')
+          PYCODE
+      - name: Export full-universe owner review table
+        shell: bash
+        run: |
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import csv, json, os, statistics
+          old=json.loads(Path('/tmp/log_cal01_original_market.json').read_text())
+          new=json.loads(Path('scripts/artifacts/generated/market_values.json').read_text())
+          assert len(set(old['players']).intersection(new['players'])) >= 400, 'Unexpected coverage collapse'
+          rows=[]
+          for name,p in sorted(new['players'].items()):
+              baseline=old['players'][name]
+              assert p['fundamental_value']==baseline['fundamental_value']
+              # Raw MV is recalculated from live capped votes and may legitimately have changed
+              # since the last committed market artifact. Compare same-run raw and adjusted.
+              e=p['evidence_adjusted_diagnostics']
+              rows.append({'player':name,'pos':p['pos'],'FV':p['fundamental_value'], 'raw_MV':p['market_value'],
+                   'adjusted_estimate':p['evidence_adjusted_value'],'delta':p['evidence_adjusted_delta_from_raw_mv'],
+                   'ballots':e['ballot_appearances'],'voters':e['distinct_voters'],'market_weight':e['market_rank_weight']})
+          assert len(rows)>=400
+          changed=sum(x['delta'] != 0 for x in rows)
+          assert changed>=100, 'CAL01 is intended as a broad adjustment, not tiny overrides'
+          Path('cal01-preview').mkdir(exist_ok=True)
+          with Path('cal01-preview/fullpool_market_candidate.csv').open('w',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=list(rows[0]));w.writeheader();w.writerows(rows)
+          by={x['player']:x for x in rows}
+          examples=['fernando mendoza','sonny styles','bijan robinson','brian burns','kc concepcion','malik davis','dorian williams','kenyon sadiq','ty simpson','jihaad campbell','dj giddens','malik willis','xavier worthy','rhamondre stevenson','ashton jeanty','odafe oweh','alex highsmith','christian watson','drake london','chris olave','jahmyr gibbs','nick bolton','kyle hamilton','amonra st brown']
+          summary=[]
+          summary.append('# LOG CAL01 · Evidence-adjusted market candidate')
+          summary.append(f'\n**Mode:** {os.environ.get("RUN_MODE")} · **Universe:** {len(rows)} players · **Adjusted quotes differing from raw:** {changed}')
+          summary.append('\nSame-run raw MV and underlying Fundamental Values are preserved. The checked-in older raw MV snapshot may have different votes. Evidence-adjusted quotes are FV-anchored hybrids, **not independent market observations**. They are candidate estimates requiring owner review.')
+          summary.append('\n| Player | FV | Raw MV | New estimate | Delta | Ballots | Voters |')
+          summary.append('|---|---:|---:|---:|---:|---:|---:|')
+          for name in examples:
+              if name not in by: continue
+              x=by[name]
+              summary.append(f'| {name.title()} | {x["FV"]:,} | {x["raw_MV"]:,} | {x["adjusted_estimate"]:,} | {x["delta"]:+,} | {x["ballots"]} | {x["voters"]} |')
+          summary.append('\n**Scope and safety:** no player-specific pricing changes, no FV or trade-verdict edits. Original vote-only MV remains in artifact for comparison. No additional research phase required; review this preview and choose apply only if the candidate is substantively credible.')
+          Path('cal01-preview/summary.md').write_text('\n'.join(summary)+'\n')
+          with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as f:f.write('\n'.join(summary)+'\n')
+          print('LOG CAL01 population:',len(rows),'changed:',changed,'median absolute adjustment:',statistics.median(abs(x['delta']) for x in rows))
+          PYCODE
+      - name: Upload candidate review table
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-cal01-fullpool-market-preview
+          path: cal01-preview/
+          retention-days: 30
+      - name: Commit only owner-approved apply run
+        if: inputs.mode == 'apply'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'LOG-Cal01-bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add scripts/market/market_v3_evidence.py scripts/market/build_market_value.py index.html scripts/artifacts/generated/market_values.json scripts/artifacts/reports/market_value_report.md
+          test "$(git diff --cached --name-only | wc -l)" -ge 3
+          git commit -m 'CAL01: ship evidence-adjusted fullpool market estimate, preserve raw market and FV'
+          git push origin HEAD:main
