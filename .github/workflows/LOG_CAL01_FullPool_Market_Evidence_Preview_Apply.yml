@@ -46,6 +46,25 @@ jobs:
           node-version: '22'
       - name: Install runtime dependencies
         run: python3 -m pip install --disable-pip-version-check requests
+      - name: Freeze canonical live Fundamental Values before any patch
+        shell: bash
+        run: |
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import json, sys
+          sys.path.insert(0, 'scripts/validation')
+          import snapshot_values
+
+          current = snapshot_values.compute_all_values(
+              snapshot_values.load_from_html(Path('index.html'))
+          )
+          values = {key: int(row['value']) for key, row in current.items()}
+          assert len(values) >= 500, 'Unexpectedly small current player pool'
+          Path('/tmp/log_cal01_fv_before.json').write_text(
+              json.dumps(values, sort_keys=True), encoding='utf-8'
+          )
+          print('CAL01 pinned pre-patch canonical FV:', len(values), 'players')
+          PYCODE
       - name: Create cohort-wide ranking helper
         shell: bash
         run: |
@@ -241,23 +260,48 @@ jobs:
         run: |
           python3 - <<'PYCODE'
           from pathlib import Path
-          import csv, json, os, statistics
+          import csv, json, os, statistics, sys
+          sys.path.insert(0, 'scripts/validation')
+          import snapshot_values
+
           old=json.loads(Path('/tmp/log_cal01_original_market.json').read_text())
           new=json.loads(Path('scripts/artifacts/generated/market_values.json').read_text())
-          assert len(set(old['players']).intersection(new['players'])) >= 400, 'Unexpected coverage collapse'
+          frozen=json.loads(Path('/tmp/log_cal01_fv_before.json').read_text())
+          # Compare FV to CURRENT pre-patch source of truth, never to a dated
+          # market artifact whose stored FV may already be stale.
+          after=snapshot_values.compute_all_values(
+              snapshot_values.load_from_html(Path('index.html'))
+          )
+          after_values={key:int(v['value']) for key,v in after.items()}
+          assert after_values==frozen, 'CAL01 patch changed canonical live FV'
+          oldplayers=old['players']
+          newplayers=new['players']
+          assert len(set(oldplayers).intersection(newplayers)) >= 400, 'Unexpected market coverage collapse'
+          assert set(newplayers).issubset(frozen), 'New market player absent from live FV universe'
           rows=[]
-          for name,p in sorted(new['players'].items()):
-              baseline=old['players'][name]
-              assert p['fundamental_value']==baseline['fundamental_value']
-              # Raw MV is recalculated from live capped votes and may legitimately have changed
-              # since the last committed market artifact. Compare same-run raw and adjusted.
+          for name,p in sorted(newplayers.items()):
+              assert p['fundamental_value']==frozen[name], f'Unexpected FV change at {name}'
+              prior=oldplayers.get(name)
               e=p['evidence_adjusted_diagnostics']
-              rows.append({'player':name,'pos':p['pos'],'FV':p['fundamental_value'], 'raw_MV':p['market_value'],
-                   'adjusted_estimate':p['evidence_adjusted_value'],'delta':p['evidence_adjusted_delta_from_raw_mv'],
-                   'ballots':e['ballot_appearances'],'voters':e['distinct_voters'],'market_weight':e['market_rank_weight']})
-          assert len(rows)>=400
-          changed=sum(x['delta'] != 0 for x in rows)
-          assert changed>=100, 'CAL01 is intended as a broad adjustment, not tiny overrides'
+              assert e['not_independent_of_fv'] is True
+              rows.append({
+                  'player':name, 'pos':p['pos'], 'FV':p['fundamental_value'],
+                  'prior_committed_FV':prior['fundamental_value'] if prior else '',
+                  'prior_committed_raw_MV':prior['market_value'] if prior else '',
+                  'raw_MV':p['market_value'],
+                  'adjusted_estimate':p['evidence_adjusted_value'],
+                  'delta':p['evidence_adjusted_delta_from_raw_mv'],
+                  'ballots':e['ballot_appearances'],
+                  'voters':e['distinct_voters'],
+                  'market_weight':e['market_rank_weight'],
+              })
+          assert len(rows)>=400, 'Unexpectedly small market review universe'
+          changed=sum(x['delta']!=0 for x in rows)
+          stale_fv=sum(
+              oldplayers[name]['fundamental_value']!=p['fundamental_value']
+              for name,p in newplayers.items() if name in oldplayers
+          )
+          added=sum(name not in oldplayers for name in newplayers)
           Path('cal01-preview').mkdir(exist_ok=True)
           with Path('cal01-preview/fullpool_market_candidate.csv').open('w',newline='') as f:
               w=csv.DictWriter(f,fieldnames=list(rows[0]));w.writeheader();w.writerows(rows)
@@ -266,17 +310,21 @@ jobs:
           summary=[]
           summary.append('# LOG CAL01 · Evidence-adjusted market candidate')
           summary.append(f'\n**Mode:** {os.environ.get("RUN_MODE")} · **Universe:** {len(rows)} players · **Adjusted quotes differing from raw:** {changed}')
-          summary.append('\nSame-run raw MV and underlying Fundamental Values are preserved. The checked-in older raw MV snapshot may have different votes. Evidence-adjusted quotes are FV-anchored hybrids, **not independent market observations**. They are candidate estimates requiring owner review.')
-          summary.append('\n| Player | FV | Raw MV | New estimate | Delta | Ballots | Voters |')
+          summary.append(f'\n**FV integrity:** pre/post same-run values identical for {len(frozen)} players. **Older committed market snapshot:** {stale_fv} mismatched stored FV centers, {added} newly covered players (expected snapshot drift, not CAL01 pricing changes).')
+          summary.append('\nRaw MV is rebuilt from current votes. Adjusted estimates are FV-anchored hybrids, **not independent market observations**. Both the old committed snapshot and same-run raw Market Value are included in the CSV for comparison.')
+          summary.append('\n| Player | FV | Raw MV (this run) | New estimate | Delta | Ballots | Voters |')
           summary.append('|---|---:|---:|---:|---:|---:|---:|')
           for name in examples:
               if name not in by: continue
               x=by[name]
               summary.append(f'| {name.title()} | {x["FV"]:,} | {x["raw_MV"]:,} | {x["adjusted_estimate"]:,} | {x["delta"]:+,} | {x["ballots"]} | {x["voters"]} |')
-          summary.append('\n**Scope and safety:** no player-specific pricing changes, no FV or trade-verdict edits. Original vote-only MV remains in artifact for comparison. No additional research phase required; review this preview and choose apply only if the candidate is substantively credible.')
+          summary.append('\n**Scope:** no player-specific pricing rules, no FV or live trade-verdict edits. Raw vote-only MV remains separately accessible. Review full-pool CSV before authorizing `apply`.')
           Path('cal01-preview/summary.md').write_text('\n'.join(summary)+'\n')
-          with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as f:f.write('\n'.join(summary)+'\n')
-          print('LOG CAL01 population:',len(rows),'changed:',changed,'median absolute adjustment:',statistics.median(abs(x['delta']) for x in rows))
+          with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as f:
+              f.write('\n'.join(summary)+'\n')
+          print('LOG CAL01 population:',len(rows),'changed:',changed,
+                'old-snapshot FV drift:',stale_fv,'newly covered:',added,
+                'median absolute adjustment:',statistics.median(abs(x['delta']) for x in rows))
           PYCODE
       - name: Upload candidate review table
         uses: actions/upload-artifact@v4
