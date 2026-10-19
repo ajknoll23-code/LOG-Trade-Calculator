@@ -1,0 +1,186 @@
+name: LOG CAL08 - FV Driver and DL Peer Diagnostic (Read Only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cal08:
+    name: Explain CAL06 discrepancies without changing any valuations
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout production main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install existing snapshot dependency
+        run: python3 -m pip install --disable-pip-version-check requests
+      - name: Produce frozen FV factor decomposition and owner review queue
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p cal08-output
+          cat > /tmp/cal08_audit.py <<'PYCODE'
+          #!/usr/bin/env python3
+          """Explain FV vs FV+Votes vs old MV; absolutely no pricing or UI mutations."""
+          import csv, hashlib, json, math, re, subprocess, sys
+          from pathlib import Path
+
+          root = Path.cwd()
+          index = root / 'index.html'
+          quote_file = root / 'scripts/artifacts/generated/fv_informed_estimate_cal05.json'
+          mv_file = root / 'scripts/artifacts/generated/market_values.json'
+          rel_file = root / 'model/releases/cal06-fv-vote-estimate-v1/release.json'
+          out = root / 'cal08-output'
+          out.mkdir(exist_ok=True)
+          def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
+          rel = json.loads(rel_file.read_text())
+          quotes = json.loads(quote_file.read_text())
+          mv = json.loads(mv_file.read_text())
+          assert rel['release_id'] == 'cal06-fv-vote-estimate-v1'
+          assert sha(index) == rel['deployed_index_sha256'], 'FV index changed since CAL06; stop to rebaseline'
+          assert sha(quote_file) == rel['market_estimate_artifact_sha256'], 'CAL06 data unexpectedly changed'
+          assert sha(mv_file) == rel['existing_market_value_artifact_sha256'], 'Old MV changed since CAL06'
+          assert quotes['display_only'] and quotes['no_trading_math_changes']
+          assert len(quotes['players']) == 565
+          assert mv['scale_semantics'] == 'league_rank_quantile_mapped_to_trade_desk_points_v1'
+
+          sys.path.insert(0, str(root/'scripts/validation'))
+          import snapshot_values
+          cfg = snapshot_values.load_from_html(index)
+          live = snapshot_values.compute_all_values(cfg)
+          assert len(live) == len(quotes['players']) == 565
+          assert all(name in live and row['fundamental_value'] == live[name]['value'] for name,row in quotes['players'].items())
+          page = index.read_text(encoding='utf-8')
+          db_body = snapshot_values.extract_object_body(page,'PLAYER_DB')
+          def stored_pts(name):
+              pattern = re.compile(r"'" + re.escape(name) + r"'\s*:\s*\{([^}\n]*)\}")
+              match = pattern.search(db_body)
+              if not match: return (None,None)
+              s=match.group(1)
+              actual=re.search(r'\bpts2025:\s*([0-9.]+)', s)
+              projected=re.search(r'\bproj2026:\s*([0-9.]+)', s)
+              return (float(actual.group(1)) if actual else None,
+                      float(projected.group(1)) if projected else None)
+
+          targets = [
+            'brian burns','kc concepcion','fernando mendoza','sonny styles','xavier worthy',
+            'malik willis','dorian williams','jihaad campbell','arvell reese','deforest buckner',
+            'greg rousseau','kenyon sadiq','ty simpson','malik davis','dj giddens',
+            'ashton jeanty','odafe oweh','christian watson'
+          ]
+          peers = [
+            'brian burns','aidan hutchinson','will anderson','myles garrett',
+            'micah parsons','maxx crosby','tj watt','abdul carter',
+            'nick bosa','jared verse','greg rousseau','deforest buckner'
+          ]
+          assert len(targets)==18 and len(set(targets))==18
+          assert all(x in live for x in targets+peers)
+          fields = ['player','pos','age','role','pts2025_stored','proj2026_stored',
+                    'projection_vs_prior_pct','position_weight','raw_prod_multiplier',
+                    'effective_prod_multiplier','age_multiplier','fv','existing_mv',
+                    'fv_plus_votes','fv_votes_minus_fv_pct','old_mv_minus_fv_pct',
+                    'ballot_appearances','distinct_voters','evidence_band',
+                    'leave_one_voter_out_max_pct','review_priority','owner_judgment',
+                    'owner_target_value_optional','owner_notes']
+          def row(name):
+              fv = live[name]['value']; info=cfg['player_db'][name]
+              q=quotes['players'][name]; m=mv['players'].get(name)
+              p25,p26 = stored_pts(name)
+              old = m['market_value'] if m and isinstance(m.get('market_value'),(int,float)) else None
+              ballots=q['ballot_appearances']; delta=100*(q['fv_informed_estimate']/fv-1) if fv else None
+              if name=='brian burns': priority='P0_OWNER_CONFIRMED_TOO_HIGH'
+              elif ballots<4: priority='P2_THIN_EVIDENCE'
+              elif abs(delta or 0)>=25 and q['distinct_voters']>=5: priority='P1_MATERIAL_VOTE_FV_GAP'
+              else: priority='P2_REVIEW'
+              return dict(player=name,pos=info['pos'],age=info['age'],role=info['role'],
+                          pts2025_stored=p25,proj2026_stored=p26,
+                          projection_vs_prior_pct=round(100*(p26/p25-1),2) if p25 and p26 is not None else None,
+                          position_weight=cfg['position_weight'].get(info['pos']),
+                          raw_prod_multiplier=cfg['prod_mult'].get(name),
+                          effective_prod_multiplier=live[name]['prod_mult'],
+                          age_multiplier=live[name]['age_mult'],fv=fv,existing_mv=old,
+                          fv_plus_votes=q['fv_informed_estimate'],
+                          fv_votes_minus_fv_pct=round(delta,2) if delta is not None else None,
+                          old_mv_minus_fv_pct=round(100*(old/fv-1),2) if old is not None and fv else None,
+                          ballot_appearances=ballots,distinct_voters=q['distinct_voters'],
+                          evidence_band=q['evidence_band'],
+                          leave_one_voter_out_max_pct=q['loo_max_abs_pct'],
+                          review_priority=priority,owner_judgment='',owner_target_value_optional='',owner_notes='')
+          rows=[row(n) for n in targets]
+          peer_rows=[row(n) for n in peers]
+          for file, data in (('target_factor_breakdown.csv',rows),('dl_peer_comparison.csv',peer_rows)):
+              with (out/file).open('w',newline='',encoding='utf-8') as f:
+                  w=csv.DictWriter(f,fieldnames=fields)
+                  w.writeheader();w.writerows(data)
+
+          burns=rows[0]
+          assert burns['fv']==6007 and burns['fv_plus_votes']==5729
+          assert burns['age']==28 and burns['pos']=='DL' and burns['role']=='Elite'
+          assert burns['raw_prod_multiplier'] is not None
+          assert burns['age_multiplier']==1.0
+          formula=math.floor(100*burns['position_weight']*burns['age_multiplier']*burns['effective_prod_multiplier']*55+0.5)
+          assert formula==burns['fv'], 'FV factor reconstruction failed'
+          # These hypothetical sensitivities modify no actual player value or fitted preference estimate.
+          base=burns['fv']; sens=[]
+          for pct in (0,5,10,15,20,25):
+              alt=math.floor(100*burns['position_weight']*burns['age_multiplier']*burns['effective_prod_multiplier']*(1-pct/100)*55+0.5)
+              sens.append((pct,alt,alt-base))
+          with (out/'brian_burns_sensitivity.csv').open('w',newline='',encoding='utf-8') as f:
+              w=csv.writer(f);w.writerow(['hypothetical_prod_multiplier_reduction_pct','illustrative_fv','difference_from_current_fv']);w.writerows(sens)
+
+          lines=[
+            '# CAL08 — Focused valuation-driver review (read-only)', '',
+            '**Status:** evidence produced, NO price changes authorized or applied.',
+            '', '## What CAL07 did not determine',
+            'CAL07 verified source and rendering invariants; it did not validate the economic correctness of the estimates. CAL08 identifies model components, not a true market price.',
+            '', '## Brian Burns: attributable inputs',
+            f"- Position DL, age {burns['age']}, role {burns['role']}; stored 2025 points {burns['pts2025_stored']}, 2026 projected points {burns['proj2026_stored']}.",
+            f"- Position weight {burns['position_weight']}; raw production multiplier {burns['raw_prod_multiplier']}; effective production multiplier {burns['effective_prod_multiplier']}; age multiplier {burns['age_multiplier']}.",
+            f"- Exact deployed FV: **{burns['fv']:,}** = round(100 × position weight × age multiplier × production multiplier × 55).",
+            f"- Existing old rank-based MV: {burns['existing_mv']:,}. Independent CAL06 display-only FV+Votes: **{burns['fv_plus_votes']:,}**; {burns['ballot_appearances']} ballots from {burns['distinct_voters']} voters.",
+            '- The vote adjustment alone lowered FV by only 278 points. Correcting remaining possible overvaluation would require examining fundamental inputs or obtaining external pricing evidence, not merely replacing the former MV scale.',
+            '- The 2025 total and 2026 projection are saved features in PLAYER_DB; their difference is a reason to investigate the production input, not proof that either feature is incorrect.',
+            '', '### Illustrative FV sensitivity only (NOT model recommendations)',
+            '| Hypothetical production multiplier decrease | Approximate FV | Delta from FV |',
+            '|---:|---:|---:|'
+          ]
+          lines += [f'| {pct}% | {v:,} | {dv:+,} |' for pct,v,dv in sens]
+          lines += ['', '## Deliverables',
+                    '- `target_factor_breakdown.csv`: 18-player factors, market disagreements, sample sizes and blank owner evaluation fields.',
+                    '- `dl_peer_comparison.csv`: 12 comparison DL cases using the same frozen live inputs.',
+                    '- `brian_burns_sensitivity.csv`: mathematical sensitivities, *not* pricing changes.',
+                    '- `repro_manifest.json`: exact frozen input hashes and production commit.',
+                    '', '## Practical next action',
+                    'Use owner judgments and football evidence to decide whether there is a reproducible error in production inputs or assumptions. First narrow fix should address an identified cause and preserve all unrelated prices; no blind overrides or automatic repointing of verdict math.' ]
+          (out/'owner_review.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
+          manifest={'status':'READ_ONLY_DRIVER_DIAGNOSTIC',
+                    'source_commit':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
+                    'source_index_sha256':sha(index),
+                    'cal06_quote_sha256':sha(quote_file),
+                    'existing_market_sha256':sha(mv_file),
+                    'cal06_release_sha256':sha(rel_file),
+                    'player_count':len(live),'review_cases':len(rows),
+                    'dl_peers':len(peer_rows),'no_model_edits':True}
+          (out/'repro_manifest.json').write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n')
+          print('PASS CAL08: 565 unchanged FV; 18 attribution rows; 12 DL peers; Brian Burns exact FV decomposition.')
+          print('Brian Burns FV 6007: raw production multiplier',burns['raw_prod_multiplier'],'age factor',burns['age_multiplier'])
+          PYCODE
+          python3 /tmp/cal08_audit.py
+          python3 scripts/validation/snapshot_values.py --selftest
+          git diff --exit-code -- index.html scripts/artifacts/generated/fv_informed_estimate_cal05.json scripts/artifacts/generated/market_values.json model/releases/cal06-fv-vote-estimate-v1/release.json
+      - name: Upload read-only CAL08 evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-cal08-fv-driver-review
+          path: cal08-output/
+          retention-days: 30
+          if-no-files-found: error
