@@ -1,0 +1,302 @@
+name: LOG CAL12 - Canonical IDP Projection FV Shadow Audit (Read Only)
+on:
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: log-cal12-readonly
+  cancel-in-progress: false
+jobs:
+  idp_shadow:
+    name: Compute exact-model FV shadow without repricing
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout current production
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Use Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build CAL12 canonical IDP V1 forecast shadow
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/log_cal12_shadow.py <<'PYCODE'
+          #!/usr/bin/env python3
+          """CAL12 -- IDP V1 projection-delta FV *shadow*, never write production prices.
+          
+          The fresh official IDP V1 ensemble is consumed from the existing Team Utility
+          artifact. Its 'never FV' consumer contract is respected: all results are
+          sensitivity calculations and require separate pricing-method authorization.
+          """
+          from __future__ import annotations
+          import csv
+          import hashlib
+          import json
+          import math
+          import statistics
+          import sys
+          from collections import Counter, defaultdict
+          from copy import deepcopy
+          from pathlib import Path
+          
+          ROOT = Path.cwd()
+          OUT = ROOT / 'cal12-review'
+          
+          
+          def digest(path):
+              return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+          
+          
+          def clean_number(x):
+              return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+          
+          
+          def projected_raw(current_raw, old_forecast, new_forecast, baseline, weight=0.55):
+              if not all(clean_number(v) for v in (current_raw, old_forecast, new_forecast, baseline, weight)):
+                  raise ValueError('Nonfinite input')
+              if baseline <= 0:
+                  raise ValueError('Nonpositive frozen position baseline')
+              # Change only the forecast contribution to the same calibrated position ratio.
+              return min(1.55, max(0.15, current_raw + weight * (new_forecast - old_forecast) / baseline))
+          
+          
+          def selftest():
+              assert projected_raw(1.0, 100.0, 100.0, 150) == 1.0
+              assert abs(projected_raw(1.0, 100.0, 70.0, 150) - 0.89) < 1e-12
+              assert projected_raw(0.16, 100, 0, 100) == 0.15
+              assert projected_raw(1.5, 100, 1000, 100) == 1.55
+              assert abs(projected_raw(1.1743887154179198, 215.84762086693547, 103.856, 137.00533554579843)-0.7248048270866199) < 1e-9
+              try:
+                  projected_raw(0.5, 100, 200, 0)
+              except ValueError:
+                  pass
+              else:
+                  raise AssertionError('Zero-baseline guard failed')
+              print('CAL12 selftest PASS -- formula, bounds, zero/invalid baseline, Burns fixture')
+          
+          
+          def load(path):
+              return json.loads((ROOT / path).read_text(encoding='utf-8'))
+          
+          
+          def main():
+              sys.path.insert(0, str(ROOT / 'scripts/validation'))
+              import snapshot_values as sv
+          
+              paths = {
+                  'index': 'index.html',
+                  'cal09': 'model/releases/cal09-injury-risk-warning-v1r1/release.json',
+                  'cal06': 'scripts/artifacts/generated/fv_informed_estimate_cal05.json',
+                  'market': 'scripts/artifacts/generated/market_values.json',
+                  'cal02': 'model/releases/cal02-dl-residual-reset-v1/release.json',
+                  'v1': 'model/releases/idp-v1/idp_v1_model_delta_transport_candidate.json',
+                  'fresh': 'scripts/artifacts/generated/team_utility_lineup_projections.json',
+                  'rosters': 'data/league_rosters.json',
+              }
+              h = {k: digest(ROOT / v) for k, v in paths.items()}
+              cfg = sv.load_from_html(ROOT / paths['index'])
+              old_fv = sv.compute_all_values(cfg)
+              assert len(old_fv) == 565, 'Expected exact production player pool'
+              cal09 = load(paths['cal09'])
+              assert h['index'] == cal09['candidate_index_sha256'], 'Production index drifted since CAL09'
+              cal06 = load(paths['cal06'])
+              assert cal06['display_only'] and cal06['no_trading_math_changes']
+              assert len(cal06['players']) == 565
+              for k in old_fv:
+                  assert old_fv[k]['value'] == cal06['players'][k]['fundamental_value'], (k, 'CAL06 FV drift')
+              c02 = load(paths['cal02'])
+              assert c02['scope']['direct_fv_changed'] == 21
+              for k, row in c02['players'].items():
+                  assert old_fv[k]['value'] == row['new_fv'], (k, 'CAL02 FV drift')
+                  assert math.isclose(cfg['prod_mult'][k], row['new_raw_prod_mult'], abs_tol=5e-5), (k, 'CAL02 raw drift')
+              v1 = load(paths['v1'])
+              fresh = load(paths['fresh'])
+              assert fresh['purpose'] == 'Team Utility starter selection only; never Fundamental Value'
+              assert 'IDP V1' in fresh['projection_policy']['DL_LB_DB']
+              assert v1['replacement_rank'] == 32 and v1['projection_weight'] == 0.55
+              for p, wanted in fresh['input_sha256'].items():
+                  assert digest(ROOT / p) == wanted, f'Frozen Team Utility input mismatched {p}'
+              rosters = load(paths['rosters'])
+              roster_by_id = defaultdict(set)
+              for team in rosters['rosters']:
+                  for slot in ('starters', 'bench', 'taxi', 'reserve_ir'):
+                      for p in team.get(slot, []):
+                          if p.get('player_id'):
+                              roster_by_id[str(p['player_id'])].add(str(p.get('injury_status') or ''))
+          
+              # Same V1 projection source policy on both sides; no source substitution.
+              source_map = {
+                  'both': 'idp_v1_both',
+                  'fp_only': 'idp_v1_fp_only',
+                  'sleeper_only': 'idp_v1_sleeper_only',
+                  'no_new_data': 'idp_v1_no_new_data',
+              }
+              candidate_cfg = deepcopy(cfg)
+              considered = []
+              counters = Counter()
+              for key, info in cfg['player_db'].items():
+                  pos = info['pos']
+                  if pos not in ('DL', 'LB', 'DB'):
+                      continue
+                  counters['idp_player_db'] += 1
+                  f = v1['players'].get(key)
+                  raw = cfg['prod_mult'].get(key)
+                  r = dict(player=key, pos=pos, age=info['age'], role=info['role'],
+                           fv_current=old_fv[key]['value'], raw_prod_mult_current=raw,
+                           cal02_migrated_lbdl=key in c02['players'], reason='',
+                           sleeper_id='', injury_status='', old_v1_projection='', fresh_v1_projection='',
+                           delta_projection='', raw_prod_mult_shadow='', fv_shadow='', fv_delta='',
+                           source_old='', source_fresh='', legacy_model_position='',
+                           same_position='', source_consistent='')
+                  if not f or not f.get('sleeper_id') or raw is None:
+                      r['reason'] = 'HOLD_NO_FROZEN_V1_IDENTITY_OR_RAW'; counters[r['reason']] += 1
+                  else:
+                      pid = str(f['sleeper_id'])
+                      p = fresh['players'].get(pid)
+                      injuries = roster_by_id.get(pid, set())
+                      r['sleeper_id'] = pid
+                      r['injury_status'] = 'CONFLICT' if len(injuries)>1 else next(iter(injuries)) if injuries else ''
+                      r['legacy_model_position'] = f.get('legacy_model_position', '')
+                      r['source_old'] = f.get('v1_source_cohort', '')
+                      r['source_fresh'] = p.get('source', '') if p else ''
+                      r['old_v1_projection'] = f.get('v1_projection') if f.get('v1_projection') is not None else ''
+                      r['fresh_v1_projection'] = p.get('projection') if p and p.get('projection') is not None else ''
+                      r['same_position'] = bool(p and p.get('pos') == pos)
+                      r['source_consistent'] = bool(p and source_map.get(f.get('v1_source_cohort')) == p.get('source'))
+                      if not p or not clean_number(p.get('projection')):
+                          r['reason'] = 'HOLD_NO_FRESH_V1_PROJECTION'
+                      elif not r['same_position']:
+                          r['reason'] = 'HOLD_CURRENT_POSITION_DISAGREEMENT'
+                      elif not r['source_consistent']:
+                          r['reason'] = 'HOLD_V1_SOURCE_COHORT_CHANGED'
+                      elif not clean_number(f.get('v1_projection')):
+                          r['reason'] = 'HOLD_NO_FROZEN_PROJECTION'
+                      elif not clean_number(v1['new_model_baseline_by_position'].get(pos)):
+                          r['reason'] = 'HOLD_NO_FROZEN_CURRENT_POSITION_BASELINE'
+                      elif raw <= 0.15 and key in cfg['no_real_history']:
+                          r['reason'] = 'HOLD_PRODUCTION_FLOOR_ROLE_RESCUE'
+                      elif r['injury_status'] == 'CONFLICT':
+                          r['reason'] = 'HOLD_INJURY_IDENTITY_CONFLICT'
+                      else:
+                          baseline = v1['new_model_baseline_by_position'][pos]
+                          new = projected_raw(raw, f['v1_projection'], p['projection'], baseline, v1['projection_weight'])
+                          r['delta_projection'] = round(p['projection']-f['v1_projection'], 4)
+                          r['raw_prod_mult_shadow'] = round(new, 4)
+                          # A candidate *never* updates production files. This is an in-memory sensitivity.
+                          candidate_cfg['prod_mult'][key] = round(new, 4)
+                          r['reason'] = 'SHADOW_COMPUTED_NOT_PRICE_AUTHORIZED'
+                      counters[r['reason']] += 1
+                  considered.append(r)
+          
+              shadow = sv.compute_all_values(candidate_cfg)
+              changed_count=0
+              for r in considered:
+                  key=r['player']
+                  r['fv_shadow'] = shadow[key]['value']
+                  r['fv_delta'] = shadow[key]['value'] - old_fv[key]['value']
+                  if r['reason'] != 'SHADOW_COMPUTED_NOT_PRICE_AUTHORIZED':
+                      assert r['fv_delta'] == 0, (key, 'Held row changed')
+                  if r['fv_delta']:
+                      changed_count += 1
+              for key in old_fv:
+                  if cfg['player_db'][key]['pos'] not in ('DL','LB','DB'):
+                      assert shadow[key]['value'] == old_fv[key]['value'], (key, 'Offense changed')
+              if 'brian burns' in old_fv:
+                  b=next(r for r in considered if r['player']=='brian burns')
+                  assert b['fv_current']==6007 and b['injury_status']=='IR', b
+                  assert abs(b['old_v1_projection']-215.84762086693547)<0.01
+                  assert isinstance(b['fresh_v1_projection'], (int,float)) and b['fresh_v1_projection']>=0
+                  assert b['reason']=='SHADOW_COMPUTED_NOT_PRICE_AUTHORIZED', b
+          
+              OUT.mkdir(exist_ok=True)
+              cols=list(considered[0])
+              with (OUT/'idp_full_shadow.csv').open('w',encoding='utf-8',newline='') as file:
+                  w=csv.DictWriter(file,fieldnames=cols);w.writeheader();w.writerows(considered)
+              queue=sorted(considered,key=lambda r:(r['reason']!='SHADOW_COMPUTED_NOT_PRICE_AUTHORIZED',-abs(r['fv_delta']),r['player']))
+              with (OUT/'top_review_75.csv').open('w',encoding='utf-8',newline='') as file:
+                  w=csv.DictWriter(file,fieldnames=cols);w.writeheader();w.writerows(queue[:75])
+              manifest={
+                  'status':'FV_SHADOW_ONLY_NOT_AUTHORIZED_TO_APPLY',
+                  'git_head': __import__('subprocess').check_output(['git','rev-parse','HEAD'],text=True).strip(),
+                  'base_hashes':h,
+                  'team_utility_inputs_verified':True,
+                  'official_team_utility_purpose_preserved':fresh['purpose'],
+                  'method':'frozen_V1_weighted_forecast_delta_transported_over_CURRENT_PROD_MULT_with_current_position_denominator',
+                  'method_equation':'raw_shadow=clip(raw_live + 0.55*(proj_current_canonical_idp_v1 - proj_frozen_v1)/frozen_v1_position_baseline[valuation_position],0.15,1.55)',
+                  'not_a_validated_full_season_forecast':True,
+                  'cannot_infer_injury_discount':True,
+                  'current_idp_players':counters['idp_player_db'],
+                  'idp_shadow_values_changed':changed_count,
+                  'reason_counts':dict(sorted(counters.items())),
+                  'offense_kicker_fv_changes':0,
+                  'cal02_release_preserved':True,
+                  'cal06_quote_untouched':True,
+                  'cal09_injury_warning_untouched':True,
+                  'production_changed':False,
+              }
+              (OUT/'manifest.json').write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+              examples=['brian burns','micah parsons','harold landry','aidan hutchinson','maxx crosby','will anderson','greg rousseau','odafe oweh']
+              lines=['# CAL12 — Fresh canonical IDP V1 forecast FV sensitivity', '',
+                 '**Read-only shadow, NOT a price recommendation and NOT authorized for production apply.**','',
+                 f'- Exact-live FV pool: **{len(old_fv)}**; current IDPs audited: **{counters["idp_player_db"]}**.',
+                 f'- Shadow-computable IDPs: **{counters["SHADOW_COMPUTED_NOT_PRICE_AUTHORIZED"]}**; changed sensitivity values: **{changed_count}**.',
+                 '- Existing 21 CAL02 lineage correction rows preserve their base values and raw multipliers before any shadow delta.',
+                 '- Formula isolates the *forecast delta* from two releases that use the canonical IDP V1 ensemble; it keeps today\'s live prod_mult and current valuation position.',
+                 '- All identities matched by Sleeper ID. Existing FV, FV+Votes, MV, trade verdicts, Team Utility, and warning code unchanged.',
+                 '', '## Important policy blocker', '',
+                 'The up-to-date Team Utility forecast is **not an approved Fundamental Value forecast input**. A weekly projection feed may revise past-week expectations as the season progresses, and this study has not proved equivalence of the old frozen and new 2026 forecast horizons. Neither the shadow delta nor a player\'s IR status independently establishes their *dynasty* discount. These must be reviewed before an apply workflow is authored.',
+                 '', '## Named-player evidence (not pricing proposals)', '',
+                 '| Player | Status | Frozen V1 projection | Updated V1 projection | FV before | FV shadow | Δ | Reason |',
+                 '|---|---|---:|---:|---:|---:|---:|---|']
+              for name in examples:
+                  try: r=next(r for r in considered if r['player']==name)
+                  except StopIteration: continue
+                  def fmt(x):return str(round(x,1)) if isinstance(x,(int,float)) else '—'
+                  lines.append(f'| {name.title()} | {r["injury_status"] or "—"} | {fmt(r["old_v1_projection"])} | {fmt(r["fresh_v1_projection"])} | {r["fv_current"]} | {r["fv_shadow"]} | {r["fv_delta"]:+} | {r["reason"]} |')
+              lines+=['','## Holds and coverage','','| Reason | Players |','|---|---:|']
+              for k,v in sorted(counters.items()):
+                  if k!='idp_player_db':lines.append(f'| {k} | {v} |')
+              lines+=['', '## One limited next step', '',
+                 'Review the IDP candidate table and source-horizon comparability. If a few large changes have defensible live outlook evidence, version those changes in one exact-hash preview/apply workflow; do not activate the entire sensitivity table automatically.']
+              (OUT/'summary.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
+              print('CAL12 PASS:',len(old_fv),'FV player pool;',counters['idp_player_db'],'IDPs;',counters['SHADOW_COMPUTED_NOT_PRICE_AUTHORIZED'],'shadow-computable;',changed_count,'changed shadow points; zero production writes')
+              print('CAL12 Burns shadow:',b['fv_current'],'->',b['fv_shadow'],'(NOT A PRICE RECOMMENDATION)')
+          
+          
+          if __name__ == '__main__':
+              if '--selftest' in sys.argv:selftest()
+              else:main()
+          PYCODE
+          python3 -m py_compile /tmp/log_cal12_shadow.py
+          python3 /tmp/log_cal12_shadow.py --selftest
+          python3 /tmp/log_cal12_shadow.py
+      - name: Confirm exact existing production parity and read-only scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/snapshot_values.py --selftest
+          python3 - <<'PYCODE'
+          import json
+          from pathlib import Path
+          d=json.loads(Path('cal12-review/manifest.json').read_text())
+          assert d['status']=='FV_SHADOW_ONLY_NOT_AUTHORIZED_TO_APPLY'
+          assert d['production_changed'] is False
+          assert d['offense_kicker_fv_changes']==0
+          assert d['cal02_release_preserved']
+          assert d['team_utility_inputs_verified']
+          assert len(json.loads(Path('scripts/artifacts/generated/fv_informed_estimate_cal05.json').read_text())['players'])==565
+          print('CAL12 release invariant PASS: read-only shadow, no production repricing')
+          PYCODE
+          test -z "$(git status --porcelain --untracked-files=all | grep -vE '^\?\? cal12-review/' || true)"
+      - name: Upload review artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-cal12-canonical-idp-fv-shadow
+          path: cal12-review/
+          if-no-files-found: error
+          retention-days: 30
