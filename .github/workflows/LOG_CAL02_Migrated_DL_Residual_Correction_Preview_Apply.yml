@@ -1,0 +1,352 @@
+name: LOG CAL02 - Migrated DL Residual Correction
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Preview (read-only) or owner-approved apply'
+        type: choice
+        options: [preview, apply]
+        default: preview
+        required: true
+      preview_run_id:
+        description: 'Apply only: ID of reviewed green CAL02 preview run'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  cal02:
+    name: Calibrate frozen DL cohort
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      RUN_MODE: ${{ inputs.mode }}
+      PREVIEW_ID: ${{ inputs.preview_run_id }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Validate release mode and main checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git branch --show-current)" = main
+          test -z "$(git status --porcelain --untracked-files=all)"
+          if [ "$RUN_MODE" = apply ]; then
+            [[ "$PREVIEW_ID" =~ ^[0-9]{8,15}$ ]] || { echo 'Provide reviewed CAL02 preview_run_id'; exit 1; }
+            gh run download "$PREVIEW_ID" --repo "$GITHUB_REPOSITORY" --name log-cal02-reviewed-preview --dir /tmp/cal02-reviewed
+            test -s /tmp/cal02-reviewed/review_contract.json
+            python3 - <<'PYCODE'
+          import json,subprocess
+          j=json.load(open('/tmp/cal02-reviewed/review_contract.json'))
+          sha=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+          assert j['base_git_sha']==sha, 'Main changed after preview: rerun preview instead of applying stale candidate'
+          assert j['release_id']=='cal02-migrated-dl-lineage-residual-reset-v1'
+          print('Reviewed green CAL02 preview matches main:',sha)
+          PYCODE
+          elif [ "$RUN_MODE" = preview ]; then
+            test -z "$PREVIEW_ID" || echo 'Ignoring preview_run_id in preview mode'
+          else
+            echo 'Invalid CAL02 mode'; exit 1
+          fi
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install dependencies
+        run: python3 -m pip install --disable-pip-version-check requests
+      - name: Build exact frozen successor and market rebasing
+        shell: bash
+        run: |
+          cat > /tmp/cal02_build.py <<'PYCODE'
+          #!/usr/bin/env python3
+          """CAL02 deterministic, 21-player migrated DL residual correction.
+          The frozen candidate is an existing immutable artifact; no fitted constants or
+          single-player exceptions are introduced. All dependent MV slots are rebased
+          using the SAME stored voting ratings (no network or new vote evidence).
+          """
+          import csv, hashlib, json, re, sys, copy
+          from pathlib import Path
+          from statistics import median
+          ROOT=Path.cwd()
+          CAND=ROOT/'research/idp-dl-lb-residual-reconciliation-v1/phase2_frozen_candidate.json'
+          MANIFEST=ROOT/'model/releases/cal02-dl-residual-reset-v1/release.json'
+          INDEX=ROOT/'index.html'
+          VAL=ROOT/'scripts/validation/validate_idp_v1_final_deployment.py'
+          MARKET=ROOT/'scripts/artifacts/generated/market_values.json'
+          REPORT=ROOT/'scripts/artifacts/reports/market_value_report.md'
+          OUT=ROOT/'cal02-preview'
+          OUT.mkdir(exist_ok=True)
+          sys.path[:0]=[str(ROOT/'scripts/validation'),str(ROOT/'scripts/market')]
+          import snapshot_values
+          import build_market_value
+          
+          def readj(p): return json.loads(p.read_text())
+          def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
+          def savej(p,doc):
+              p.parent.mkdir(parents=True,exist_ok=True)
+              p.write_text(json.dumps(doc,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+          
+          def prod_hash(values):
+              data=json.dumps({k:float(values[k]) for k in sorted(values)},sort_keys=True,separators=(',',':')).encode()
+              return hashlib.sha256(data).hexdigest()
+          
+          def cfg(): return snapshot_values.load_from_html(INDEX)
+          def current(): return snapshot_values.compute_all_values(cfg())
+          
+          def main():
+              frozen=readj(CAND)
+              rows=frozen['players']
+              assert frozen.get('candidate_id')=='DL_LINEAGE_RESIDUAL_RESET_C0'
+              assert len(rows)==21 and frozen.get('primary_cohort_count')==21
+              assert frozen.get('immutable') is True
+              before_cfg=cfg(); before=current(); before_market=readj(MARKET)
+              assert len(before)==565 and len(before_market['players'])>=500
+              assert not MANIFEST.exists(), 'CAL02 already deployed; fail rather than double apply'
+              assert all(k in before and before[k]['pos']=='DL' for k in rows)
+              initial_raw={k:float(v) for k,v in before_cfg['prod_mult'].items()}
+              # The frozen counterfactual must match the deployed candidate EXACTLY.
+              for key,r in rows.items():
+                  assert abs(initial_raw[key]-float(r['control']['raw_prod_mult']))<1e-9,(key,'raw drift')
+                  assert before[key]['value']==int(r['control']['fv']),(key,'FV drift',before[key]['value'])
+                  assert r['position']=='DL'
+              old_index_sha=sha(INDEX)
+              s=INDEX.read_text(encoding='utf-8')
+              start=s.index('const PROD_MULT_DATA = {');stop=s.index('};',start)+2
+              prefix,part,suffix=s[:start],s[start:stop],s[stop:]
+              for key,r in sorted(rows.items()):
+                  expected=float(r['control']['raw_prod_mult'])
+                  new=float(r['c0_reset']['raw_prod_mult'])
+                  assert 0.15<=new<=1.55,(key,new)
+                  pattern=r"(?m)^(\s*'"+re.escape(key)+r"'\s*:\s*)([0-9]+(?:\.[0-9]+)?)(\s*,)"
+                  hits=list(re.finditer(pattern,part))
+                  assert len(hits)==1,(key,'expected one unambiguous source multiplier')
+                  found=float(hits[0].group(2))
+                  assert abs(found-expected)<1e-9,(key,'unexpected raw multiplier',found,expected)
+                  # Precise enough to preserve expected JS-rounded FV.
+                  newtext=f'{new:.12f}'.rstrip('0').rstrip('.')
+                  part=re.sub(pattern,lambda m:m.group(1)+newtext+m.group(3),part,count=1)
+              INDEX.write_text(prefix+part+suffix,encoding='utf-8')
+              after_cfg=cfg();after=current()
+              diffs=[k for k in before if before[k]['value']!=after[k]['value']]
+              assert set(diffs)==set(rows),(len(diffs),sorted(set(diffs)^set(rows)))
+              assert set(before)==set(after)
+              for key,r in rows.items():
+                  assert after[key]['value']==int(r['c0_reset']['fv']),(key,'candidate value mismatch',after[key]['value'],r['c0_reset']['fv'])
+                  assert abs(after_cfg['prod_mult'][key]-float(r['c0_reset']['raw_prod_mult']))<1e-10
+              assert all(after[k]['value']==before[k]['value'] for k in before if k not in rows)
+              assert before_cfg['position_weight']==after_cfg['position_weight']
+              assert before_cfg['age_curve']==after_cfg['age_curve']
+              assert before_cfg['role_mult']==after_cfg['role_mult']
+              assert before_cfg['no_real_history']==after_cfg['no_real_history']
+              assert before_cfg['player_db']==after_cfg['player_db']
+          
+              doc={
+                'release_id':'cal02-migrated-dl-lineage-residual-reset-v1',
+                'method':'frozen-structural-residual-reset-c0',
+                'base_git_sha': __import__('subprocess').check_output(['git','rev-parse','HEAD'],text=True).strip(),
+                'frozen_candidate_path':str(CAND.relative_to(ROOT)),
+                'frozen_candidate_sha256':sha(CAND),
+                'base_index_sha256':old_index_sha,
+                'deployed_index_sha256':sha(INDEX),
+                'legacy_prod_mult_canonical_sha256':prod_hash(initial_raw),
+                'deployed_prod_mult_canonical_sha256':prod_hash(after_cfg['prod_mult']),
+                'players':{k:{'old_raw_prod_mult':float(v['control']['raw_prod_mult']),
+                              'new_raw_prod_mult':float(v['c0_reset']['raw_prod_mult']),
+                              'old_fv':before[k]['value'],'new_fv':after[k]['value']}
+                           for k,v in sorted(rows.items())},
+                'scope':{'direct_fv_changed':21,'noncohort_fv_changed':0,'market_method_changed':False,
+                         'market_rank_model_retrained':False,'old_releases_rewritten':False},
+              }
+              savej(MANIFEST,doc)
+              # Preserve old frozen hash-chain. The validator reconstructs the historic
+              # table by undoing only this recognized 21-player successor.
+              vs=VAL.read_text(encoding='utf-8')
+              anchor='FOURFORFOUR_CONFIDENCE_C2_RELEASE = REPO_ROOT / "model" / "releases" / "fourforfour-offense-confidence-c2-v1" / "release.json"\n'
+              assert vs.count(anchor)==1
+              vs=vs.replace(anchor,anchor+'CAL02_RELEASE = REPO_ROOT / "model" / "releases" / "cal02-dl-residual-reset-v1" / "release.json"\n',1)
+              needle='        live_hash = canonical_prod_mult_hash(current)\n'
+              assert vs.count(needle)==1
+              replace="""        # CAL02 is an explicitly tracked successor, not a change to the
+                  # immutable previous releases. Undo the 21 deltas only for the
+                  # historical expected-hash check, while verifying live new values.
+                  live_hash = canonical_prod_mult_hash(current)
+                  if CAL02_RELEASE.exists():
+                      cal02 = json.loads(CAL02_RELEASE.read_text(encoding="utf-8"))
+                      assert cal02["release_id"] == "cal02-migrated-dl-lineage-residual-reset-v1"
+                      assert cal02["deployed_prod_mult_canonical_sha256"] == live_hash
+                      frozen = json.loads((REPO_ROOT / cal02["frozen_candidate_path"]).read_text(encoding="utf-8"))
+                      import hashlib
+                      assert hashlib.sha256((REPO_ROOT / cal02["frozen_candidate_path"]).read_bytes()).hexdigest() == cal02["frozen_candidate_sha256"]
+                      assert set(cal02["players"]) == set(frozen["players"])
+                      assert len(cal02["players"]) == 21
+                      pre_cal02 = dict(current)
+                      for k, row in cal02["players"].items():
+                          r = frozen["players"][k]
+                          assert r["position"] == "DL"
+                          assert abs(float(row["new_raw_prod_mult"]) - float(r["c0_reset"]["raw_prod_mult"])) < 1e-10
+                          assert abs(float(row["old_raw_prod_mult"]) - float(r["control"]["raw_prod_mult"])) < 1e-10
+                          assert abs(current[k] - float(row["new_raw_prod_mult"])) < 1e-10
+                          pre_cal02[k] = float(row["old_raw_prod_mult"])
+                      live_hash = canonical_prod_mult_hash(pre_cal02)
+                      assert live_hash == cal02["legacy_prod_mult_canonical_sha256"]
+          """
+              vs=vs.replace(needle,replace,1)
+              VAL.write_text(vs,encoding='utf-8')
+          
+              # Rebase the *existing* published MV ranking on fresh live FV slots.
+              # No vote fetch; no Bradley-Terry re-fit; ranks are held exactly constant.
+              ratings={k:-float(x['market_rank']) for k,x in before_market['players'].items()}
+              assert set(ratings).issubset(after) and len(ratings)>=500
+              rank_values=build_market_value.quantile_calibrate(after,ratings)
+              for k,output in rank_values.items():
+                  output['market_rating']=float(before_market['players'][k]['market_rating'])
+              # The old source had tied ranks; preserve all original per-player evidence.
+              rebased=copy.deepcopy(before_market)
+              for key,row in rank_values.items():
+                  rebased['players'][key].update(row)
+              rebased['cal02_fv_rebase']={
+                 'release_id':doc['release_id'],
+                 'market_votes_refreshed':False,
+                 'market_source_generated_at_utc':before_market['generated_at_utc'],
+                 'market_rank_ratings_preserved':True,
+                 'existing_market_method_unchanged':True,
+                 'frozen_market_artifact_sha256':sha(MARKET),
+                 'base_index_sha256':old_index_sha,
+              }
+              build_market_value.validate_payload(rebased)
+              savej(MARKET,rebased)
+              text=build_market_value.render_report(rebased)
+              REPORT.write_text('> CAL02: FV-point distribution rebased from current canonical FV; original market ratings and voting snapshot preserved, NOT refreshed.\n\n'+text,encoding='utf-8')
+          
+              data=[]
+              for k in sorted(before):
+                  a=before_market['players'].get(k);b=rebased['players'].get(k)
+                  data.append({'player':k,'pos':after[k]['pos'],'old_FV':before[k]['value'],'new_FV':after[k]['value'],
+                              'FV_delta':after[k]['value']-before[k]['value'],
+                              'old_MV':a['market_value'] if a else '',
+                              'new_MV':b['market_value'] if b else '',
+                              'MV_delta':b['market_value']-a['market_value'] if a and b else '',
+                              'MV_rank_unchanged':a['market_rank']==b['market_rank'] if a and b else '',
+                              'direct_fv_cohort':k in rows})
+              with (OUT/'full_pool.csv').open('w',newline='',encoding='utf-8') as f:
+                  w=csv.DictWriter(f,fieldnames=list(data[0]));w.writeheader();w.writerows(data)
+              changed_mv=sum(x['MV_delta'] not in (0,'') for x in data)
+              changed_fv=sum(x['FV_delta']!=0 for x in data)
+              assert changed_fv==21
+              assert len(rebased['players'])==len(before_market['players'])
+              assert all(x['MV_rank_unchanged'] for x in data if x['MV_rank_unchanged']!='')
+              summary=[
+                 '# CAL02 — Migrated DL residual reset, owner review',
+                 f'**Baseline Git SHA:** `{doc["base_git_sha"]}`',
+                 f'**Direct player FV changes:** {changed_fv}/565 (all frozen migrated-DL cohort)',
+                 f'**Market slot prices rebased:** {changed_mv}/{len(ratings)}; **Market rank/rating changes:** 0',
+                 f'**Median DL-cohort FV delta:** {median(after[k]["value"]-before[k]["value"] for k in rows):+,.0f} points',
+                 '',
+                 'The MV layer was requantiled using the existing dated ratings. No fresh voting data was fetched, no market model refit occurred, and the result is NOT an independently validated market correction.',
+                 '',
+                 '| Player | Old FV | New FV | Old MV | Rebases MV |',
+                 '|---|---:|---:|---:|---:|',
+              ]
+              showcase=['brian burns','byron young','will anderson','alex highsmith','odafe oweh','nik bonitto','micah parsons','tj watt']
+              by={x['player']:x for x in data}
+              for k in showcase:
+                  a=by[k]
+                  summary.append(f'| {k.title()} | {a["old_FV"]:,} | {a["new_FV"]:,} | {a["old_MV"]:,} | {a["new_MV"]:,} |')
+              summary+=['','**Production effect if applied:** changes canonical Fundamental Value and downstream trade results for trades containing cohort players; does not change package-adjustment rules, weights, ages, draft-pick constants, or the KTC voting model.',
+                 '**CAUTION:** Cohort correction is based on a frozen model counterfactual with limited prospective outcomes. A green workflow is not proof that pricing is accurate.',
+                 '**Release security:** Owner-approved apply must match the exact preview base commit and deterministic output hashes.']
+              (OUT/'summary.md').write_text('\n'.join(summary)+'\n',encoding='utf-8')
+              print('\n'.join(summary))
+              assert doc['legacy_prod_mult_canonical_sha256'] != doc['deployed_prod_mult_canonical_sha256']
+          
+          if __name__=='__main__':main()
+          PYCODE
+          python3 /tmp/cal02_build.py
+      - name: Regenerate deterministic derived free-agent board
+        run: python3 scripts/maintenance/refresh_repo_derived_state.py --write
+      - name: Reject unrelated derived-artifact updates
+        shell: bash
+        run: |
+          set -euo pipefail
+          unrelated=$(git diff --name-only -- data/free_agents.json scripts/artifacts/generated/player_positions.json)
+          if [ -n "$unrelated" ]; then
+            echo "Unexpected non-valuation derived data changes: $unrelated"; exit 1
+          fi
+      - name: Validate permanent release and repository regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/snapshot_values.py --selftest
+          python3 scripts/market/build_market_value.py --selftest
+          python3 scripts/validation/validate_idp_v1_final_deployment.py
+          python3 scripts/validation/repo_regression_checks.py
+          python3 scripts/maintenance/refresh_repo_derived_state.py --check
+          python3 scripts/sync/sync_free_agent_valuation.py --check
+          python3 scripts/validation/validate_free_agent_valuation_parity.py
+          node scripts/validation/role_band_inline_regression.js
+          python3 - <<'PYCODE'
+          import pathlib,re,subprocess,tempfile
+          for name in ('index.html','free-agent-board.html'):
+              txt=pathlib.Path(name).read_text()
+              js='\n'.join(re.findall(r'<script(?:\s[^>]*)?>(.*?)</script>',txt,re.S|re.I))
+              with tempfile.NamedTemporaryFile(mode='w',suffix='.js') as tmp:
+                  tmp.write(js); tmp.flush()
+                  subprocess.run(['node','--check',tmp.name],check=True)
+          PYCODE
+      - name: Freeze deterministic candidate hashes and preview report
+        shell: bash
+        run: |
+          python3 - <<'PYCODE'
+          import hashlib,json,os,subprocess
+          from pathlib import Path
+          paths=['index.html', 'free-agent-board.html', 'scripts/artifacts/generated/market_values.json', 'scripts/artifacts/reports/market_value_report.md', 'scripts/validation/validate_idp_v1_final_deployment.py', 'model/releases/cal02-dl-residual-reset-v1/release.json']
+          files={p:hashlib.sha256(Path(p).read_bytes()).hexdigest() for p in paths}
+          contract={
+            'release_id':'cal02-migrated-dl-lineage-residual-reset-v1',
+            'base_git_sha':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
+            'files_sha256':files,
+          }
+          Path('cal02-preview/review_contract.json').write_text(json.dumps(contract,indent=2,sort_keys=True)+'\n')
+          if os.environ['RUN_MODE']=='apply':
+              reviewed=json.loads(Path('/tmp/cal02-reviewed/review_contract.json').read_text())
+              assert reviewed==contract, 'Candidate is not byte-identical to reviewed CAL02 preview; must preview again'
+              print('PASS: owner reviewed output hashes all match exactly')
+          with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as f:
+              f.write(Path('cal02-preview/summary.md').read_text())
+          print('Release files SHA256 pinned:',len(files))
+          PYCODE
+      - name: Upload CAL02 owner review
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-cal02-reviewed-preview
+          path: cal02-preview/
+          retention-days: 30
+          if-no-files-found: error
+      - name: Commit only hash-reviewed owner-approved release
+        if: ${{ inputs.mode == 'apply' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add index.html free-agent-board.html scripts/artifacts/generated/market_values.json scripts/artifacts/reports/market_value_report.md scripts/validation/validate_idp_v1_final_deployment.py model/releases/cal02-dl-residual-reset-v1/release.json
+          git diff --cached --check
+          git diff --cached --quiet && { echo 'No changes staged — unexpected'; exit 1; }
+          git commit -m 'CAL02: correct migrated DL residuals with frozen successor proof'
+          git push origin HEAD:main
+          echo 'CAL02 applied and pushed; market ratings unchanged, FV corrected.'
