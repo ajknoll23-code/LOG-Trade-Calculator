@@ -1,0 +1,593 @@
+name: LOG CAL15 V1R2 - Bounded IDP 2026 FV and FV+Votes Production Preview Apply
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Preview exact full-cohort FV/quote candidate; apply only with explicit owner approval"
+        type: choice
+        required: true
+        default: preview
+        options: [preview, apply]
+      preview_run_id:
+        description: "Apply only: approved green preview run number"
+        type: string
+        required: false
+        default: ''
+permissions:
+  contents: write
+  actions: read
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+jobs:
+  cal15:
+    name: V1R2 IDP FV, FV+Votes and Free Agent Board six-file release candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN_MODE: ${{ inputs.mode }}
+      PREVIEW_ID: ${{ inputs.preview_run_id }}
+    steps:
+      - name: Checkout current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install model test dependencies
+        run: python3 -m pip install --disable-pip-version-check requests numpy scipy
+      - name: Check inputs and baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git branch --show-current)" = main
+          test -z "$(git status --porcelain --untracked-files=all)"
+          if [ "$RUN_MODE" = preview ]; then
+            test -z "$PREVIEW_ID" || { echo 'Preview run ID must be blank'; exit 1; }
+          elif [ "$RUN_MODE" = apply ]; then
+            test -n "$PREVIEW_ID"
+          else
+            echo 'Invalid mode'; exit 1
+          fi
+      - name: Generate exact frozen full-pool pricing preview
+        if: ${{ inputs.mode == 'preview' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/cal15-cal14
+          gh run download 39301009907 --repo "$GITHUB_REPOSITORY" --name log-cal14-actual-ros-idp-fv-shadow --dir /tmp/cal15-cal14
+          test -s /tmp/cal15-cal14/manifest.json
+          test -s /tmp/cal15-cal14/full_idp_actual_ros_fv_shadow.csv
+          test -s /tmp/cal15-cal14/actual_2026_w1_w6_raw.json
+          cat >/tmp/cal15_successor_validator.py <<'VALCODE'
+          """Versioned CAL15 successor validator: live FV/quote plus preserved original IDP V1/CAL02 release.
+          The original IDP V1 validator is retained unchanged and run against an exact
+          byte-reconstruction of the pre-CAL15 index from the published CAL15 release.
+          """
+          from __future__ import annotations
+          import hashlib,json,re,tempfile,sys
+          from pathlib import Path
+          import snapshot_values
+          import validate_idp_v1_final_deployment as prior
+
+          ROOT=Path(__file__).resolve().parent.parent.parent
+          INDEX=ROOT/'index.html'
+          RELEASE=ROOT/'model/releases/cal15-idp-2026-horizon-bounded-v1/release.json'
+          QUOTE=ROOT/'scripts/artifacts/generated/fv_informed_estimate_cal15.json'
+          BOARD=ROOT/'free-agent-board.html'
+          sys.path.insert(0,str(ROOT/'scripts/sync'))
+          import sync_free_agent_valuation as sync_fa
+
+          def sha(b):return hashlib.sha256(b).hexdigest()
+
+          def validate_deployment_successor():
+              release=json.loads(RELEASE.read_text())
+              assert release['release_id']=='cal15-idp-2026-horizon-bounded-v1'
+              assert release['base_index_sha256']=='3bdeb2c0f44dfe28b9f5390b53a3512a24a7e6a3ec01d0733928eb13609243c2'
+              assert sha(INDEX.read_bytes())==release['candidate_index_sha256']
+              assert sha(QUOTE.read_bytes())==release['new_quote_sha256']
+              assert sha(BOARD.read_bytes())==release['candidate_free_agent_board_sha256'], 'Free Agent Board bytes not deployed'
+              assert all(sync_fa.parity_regions(INDEX.read_text(),BOARD.read_text()).values()), 'Free Agent Board canonical source drift'
+              assert sync_fa.render_synced(INDEX.read_text(),BOARD.read_text())==BOARD.read_text(), 'Free Agent Board sync not idempotent'
+              assert release['changed_players']==len(release['changed_rows'])>=100
+              current=INDEX.read_text()
+              cfg=snapshot_values.load_from_html(INDEX);now=snapshot_values.compute_all_values(cfg)
+              assert len(now)==565
+              original=current
+              start=original.index('const PROD_MULT_DATA = {')
+              end=original.index('};',start)
+              block=original[start:end]
+              changed=set()
+              for entry in release['changed_rows']:
+                  k=entry['player'];changed.add(k)
+                  assert now[k]['value']==entry['new_fv'],('CAL15 successor FV',k)
+                  assert abs(cfg['prod_mult'][k]-entry['new_raw'])<1e-11,('CAL15 successor raw',k)
+                  pat=re.compile(r"(?m)^([ ]*'"+re.escape(k)+r"':)([-+0-9.eE]+)(,?)$")
+                  block,n=pat.subn(lambda m:m.group(1)+entry['old_literal']+m.group(3),block)
+                  assert n==1,('CAL15 successor missing live raw entry',k,n)
+              original=original[:start]+block+original[end:]
+              assert original.count('fv_informed_estimate_cal15.json')==1
+              original=original.replace('fv_informed_estimate_cal15.json','fv_informed_estimate_cal05.json',1)
+              assert sha(original.encode())==release['base_index_sha256'],'Pre-CAL15 IDP lineage cannot be exactly reproduced'
+              # Run old hard-frozen V1 + CAL02 + 4for4 regression on the exact prior bytes.
+              with tempfile.NamedTemporaryFile('w',suffix='.html',delete=False) as h:
+                  h.write(original);path=Path(h.name)
+              prior_index=prior.INDEX
+              try:
+                  prior.INDEX=path
+                  legacy=prior.validate_deployment()
+              finally:
+                  prior.INDEX=prior_index
+                  path.unlink(missing_ok=True)
+              assert legacy['status']=='PASS'
+              # Independently reconstruct prior FV once more through a temporary file.
+              with tempfile.NamedTemporaryFile('w',suffix='.html',delete=False) as h:
+                  h.write(original);path=Path(h.name)
+              try:
+                  baseline=snapshot_values.compute_all_values(snapshot_values.load_from_html(path))
+              finally:path.unlink(missing_ok=True)
+              assert len(changed)==release['changed_players']
+              assert {k for k in now if now[k]['value']!=baseline[k]['value']}==changed
+              assert all(now[k]['value']-baseline[k]['value']==next(e['new_fv']-e['old_fv'] for e in release['changed_rows'] if e['player']==k) for k in changed)
+              assert all(now[k]['value']==baseline[k]['value'] for k in now if k not in changed)
+              assert all(abs(now[k]['value']-baseline[k]['value'])<=max(1,int(baseline[k]['value']*release['max_relative_FV_shift'])) for k in changed)
+              q=json.loads(QUOTE.read_text())
+              assert q['display_only'] and q['no_trading_math_changes'] and len(q['players'])==565
+              assert all(q['players'][k]['fundamental_value']==now[k]['value'] for k in now)
+              assert 'fv_informed_estimate_cal15.json' in INDEX.read_text()
+              print(f'PASS CAL15 successor: {len(changed)} bounded IDP changes; 565 quote parity; exact historical V1+CAL02 lineage preserved')
+              return {'status':'PASS','changed_players':len(changed),'historical_idp_v1':legacy['status']}
+
+          if __name__=='__main__':validate_deployment_successor()
+          VALCODE
+          python3 -m py_compile /tmp/cal15_successor_validator.py
+          cat >/tmp/cal15_engine.py <<'PYCODE'
+          #!/usr/bin/env python3
+          """CAL15: exact frozen 2026 IDP evidence -> bounded dynasty-FV candidate + FV+Votes refit.
+          Proposed owner policy, not validated dynasty-injury economics:
+          2026 one-season shadow contributes 25% of proposed raw-mult change,
+          with 12% maximum current-FV change per player.
+          No price code or quote may promote without exact preview approval.
+          """
+          from __future__ import annotations
+          import csv, hashlib, json, math, re, subprocess, sys
+          from collections import Counter,defaultdict
+          from copy import deepcopy
+          from pathlib import Path
+          import numpy as np
+          from scipy.optimize import minimize
+          from scipy.special import expit
+
+          ROOT=Path.cwd();OUT=ROOT/'cal15-preview';CAND=OUT/'candidate'
+          CAL14=Path('/tmp/cal15-cal14');RELEASE_ID='cal15-idp-2026-horizon-bounded-v1'
+          COEFFICIENT=0.25;MAX_ABS_FV_PCT=0.12;LAMBDA=8.0
+          INDEX='index.html';BOARD='free-agent-board.html';QUOTE='scripts/artifacts/generated/fv_informed_estimate_cal15.json';REL=f'model/releases/{RELEASE_ID}/release.json'
+          VALIDATOR='scripts/validation/validate_cal15_successor.py';REGRESSION='scripts/validation/repo_regression_checks.py'
+          CAL14_RUN='39301009907';CAL14_ARTIFACT='log-cal14-actual-ros-idp-fv-shadow'
+
+          def sha(p):return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+          def load(p):return json.loads(Path(p).read_text())
+          def fit(mu,ballots,idx,lam=LAMBDA):
+              counts=Counter(b[0] for b in ballots)
+              wins=[];loss=[];weights=[]
+              for voter,k,t,c in ballots:
+                  w=min(1.,30./counts[voter]);w*=1. if market.ktc_pipeline.is_league_voter(voter) else .5
+                  for winner,loser in ((k,t),(k,c),(t,c)):
+                      wins.append(idx[winner]);loss.append(idx[loser]);weights.append(w)
+              wins=np.asarray(wins,np.int64);loss=np.asarray(loss,np.int64);wt=np.asarray(weights,float)
+              if not len(wins):return mu.copy()
+              n=len(mu)
+              def fun(x):
+                  d=x[loss]-x[wins];e=expit(d)*wt;err=x-mu
+                  value=float(np.dot(wt,np.logaddexp(0,d))+.5*lam*np.dot(err,err))
+                  grad=np.bincount(loss,weights=e,minlength=n)-np.bincount(wins,weights=e,minlength=n)+lam*err
+                  return value,grad
+              o=minimize(fun,mu.copy(),method='L-BFGS-B',jac=True,options={'maxiter':300,'ftol':1e-12,'gtol':1e-8})
+              if not o.success and np.max(np.abs(o.jac))>.002:raise RuntimeError(f'vote fit failure: {o.message}')
+              if not np.isfinite(o.x).all():raise ValueError('Nonfinite votes fit')
+              return o.x
+
+          def price(x):return np.floor(np.exp(x)+.5).astype(np.int64)
+          def nkey(name):return re.sub(r'\s+',' ',re.sub(r"[.'’\-]",'',str(name).lower().strip())).strip()
+
+          def resolve_ballots(raw,keys):
+              from evaluate_market_history import build_alias_index,normalize_name
+              aliases=build_alias_index(keys)
+              def resolve(label):
+                  rows=aliases.get(normalize_name(str(label)),[])
+                  if not rows:return None
+                  best=min(row[1] for row in rows)
+                  found={row[0] for row in rows if row[1]==best}
+                  return next(iter(found)) if len(found)==1 else None
+              ballots=[];skipped=Counter()
+              for row in raw:
+                  triple=[resolve(row.get(k,'')) for k in ('keep','trade','cut')]
+                  if any(v is None for v in triple):skipped['unresolved']+=1;continue
+                  if len(set(triple))!=3:skipped['duplicate']+=1;continue
+                  ballots.append((str(row.get('voter_roster_id') or 'unknown'),*triple))
+              return ballots,skipped
+
+          def single_calc(sv,cfg,key,raw):
+              pos=cfg['player_db'][key]['pos'];age=cfg['player_db'][key]['age'];role=cfg['player_db'][key]['role']
+              effective,underlying=sv.production_multiplier(key,role,{key:raw},cfg['no_real_history'],cfg['role_mult'])
+              agef=sv.effective_age_multiplier(pos,age,role,key,effective,underlying,cfg)
+              return math.floor(100*cfg['position_weight'].get(pos,1.)*agef*effective*55+.5)
+
+          # CRITICAL V1R2: model acceptance must evaluate the *serialized* 12-decimal
+          # PROD_MULT literal. CAL15 V1 incorrectly evaluated full-precision floats,
+          # then wrote a rounded float; one threshold-rounding point could fail the
+          # complete 565-FV parity check. Never loosen that check.
+          def serialized_raw(raw):
+              if not math.isfinite(raw):raise ValueError('Nonfinite production multiplier')
+              literal=format(raw,'.12f').rstrip('0').rstrip('.')
+              return float(literal)
+
+          def bound_raw(sv,cfg,key,old,shadow,old_fv):
+              assert math.isfinite(old) and math.isfinite(shadow)
+              direct=serialized_raw(old+COEFFICIENT*(shadow-old))
+              target=single_calc(sv,cfg,key,direct)
+              limit=max(1,math.floor(old_fv*MAX_ABS_FV_PCT))
+              if abs(target-old_fv)<=limit:return direct,target,False
+              lo,hi=0.,1.
+              for _ in range(52):
+                  mid=(lo+hi)/2.
+                  trial=serialized_raw(old+mid*(direct-old))
+                  price_now=single_calc(sv,cfg,key,trial)
+                  if abs(price_now-old_fv)<=limit:lo=mid
+                  else:hi=mid
+              raw=serialized_raw(old+lo*(direct-old))
+              amount=single_calc(sv,cfg,key,raw)
+              assert abs(amount-old_fv)<=limit,('Rounded-cap guard failed',key,old_fv,amount)
+              assert serialized_raw(raw)==raw
+              return raw,amount,True
+
+          def test():
+              assert nkey("D'Andre  Swift")=="dandre swift"
+              assert int(price(np.log(np.array([1234.1,99.9])))[0])==1234
+              idx={'a':0,'b':1,'c':2};mu=np.log(np.array([3500.,2800.,1900.]));votes=[('1','a','b','c'),('2','a','c','b')]
+              assert np.max(np.abs(fit(mu,[],idx)-mu))==0
+              global market
+              class MockMarket:
+                  class ktc_pipeline:
+                      @staticmethod
+                      def is_league_voter(v):return v=="1"
+              market=MockMarket()
+              assert np.isfinite(fit(mu,votes,idx)).all()
+              assert 0<COEFFICIENT<1 and 0<MAX_ABS_FV_PCT<1
+              assert serialized_raw(0.1234567891237)==0.123456789124
+              # Reproduce V1's failure: a raw multiplier just BELOW a half-FV
+              # threshold rounds UP in the 12-decimal HTML representation.
+              threshold_raw=0.27699999999990005
+              naive_fv=math.floor(5500*threshold_raw+.5)
+              html_fv=math.floor(5500*serialized_raw(threshold_raw)+.5)
+              assert (naive_fv,html_fv)==(1523,1524)
+              # Synthetic exact-rounding test: a 12% cap is enforced against the
+              # identical number the HTML parser will read, including a clamp edge.
+              class FakeSV:
+                  @staticmethod
+                  def production_multiplier(key,role,p,history,roles):return p[key],p[key]
+                  @staticmethod
+                  def effective_age_multiplier(pos,age,role,key,effective,raw,cfg):return 1.0
+              fake={'player_db':{'unit':{'pos':'DL','age':25,'role':'Depth'}},
+                    'no_real_history':set(),'role_mult':{'Depth':1.0},
+                    'position_weight':{'DL':1.0}}
+              raw,val,cap=bound_raw(FakeSV,fake,'unit',0.5,1.5,2750)
+              assert cap and serialized_raw(raw)==raw and val==single_calc(FakeSV,fake,'unit',raw)
+              assert abs(val-2750)<=330 and val>=2750
+              print('CAL15 V1R2 unit checks PASS: serialized FV parity, rounded cap, voter fit, identity')
+
+          def main():
+              sys.path.insert(0,str(ROOT/'scripts/validation'));sys.path.insert(0,str(ROOT/'scripts/market'))
+              global market
+              import snapshot_values as sv
+              import build_market_value as market
+              assert not (ROOT/'model/releases/cal03-cross-position-bridge-v1/release.json').exists()
+              assert load('model/releases/cal09-injury-risk-warning-v1r1/release.json')['release_id']=='cal09-injury-risk-warning-v1r1'
+              cfg=sv.load_from_html(INDEX);baseline=sv.compute_all_values(cfg)
+              assert len(baseline)==565
+              old_quote=load('scripts/artifacts/generated/fv_informed_estimate_cal05.json')
+              assert len(old_quote['players'])==565 and old_quote['fit_lambda']==8
+              assert all(int(old_quote['players'][k]['fundamental_value'])==baseline[k]['value'] for k in baseline)
+              assert sha(INDEX)==load('model/releases/cal09-injury-risk-warning-v1r1/release.json')['candidate_index_sha256']
+              artifact_manifest=load(CAL14/'manifest.json')
+              assert artifact_manifest['status']=='ACTUAL_ROS_SHADOW_NOT_DYNASTY_PRICE_AUTHORIZED'
+              assert artifact_manifest['baseline_index_sha256']==sha(INDEX)
+              assert sha(CAL14/'actual_2026_w1_w6_raw.json')==artifact_manifest['actual_raw_sha256']
+              assert artifact_manifest['count']['sensitivity_computable']==176 and artifact_manifest['count']['idp']==230
+              rows=list(csv.DictReader((CAL14/'full_idp_actual_ros_fv_shadow.csv').open()))
+              assert len(rows)==230 and len({r['player'] for r in rows})==230
+              modified=[];holds=[];work=deepcopy(cfg)
+              for row in rows:
+                  key=row['player'];reason=row['reason']
+                  assert key in baseline and row['pos']==baseline[key]['pos'] and int(row['current_fv'])==baseline[key]['value']
+                  if reason!='ACTUAL_PLUS_ROS_SENSITIVITY_ONLY':holds.append({'player':key,'reason':reason});continue
+                  old=cfg['prod_mult'].get(key)
+                  assert old is not None and abs(float(row['current_raw_mult'])-old)<1e-8
+                  scenario=float(row['scenario_raw_mult']);
+                  assert 0.15-1e-12<=scenario<=1.55+1e-12
+                  new,newfv,cap=bound_raw(sv,cfg,key,old,scenario,baseline[key]['value'])
+                  assert new==serialized_raw(new),'Serialized raw is not canonical'
+                  assert newfv==single_calc(sv,cfg,key,new),('Serialized row FV differs',key)
+                  assert (new-old)*(scenario-old)>=0
+                  # Holds whose exact FV does not move are not counted as a repricing.
+                  if newfv==baseline[key]['value']:holds.append({'player':key,'reason':'NO_FV_MOVEMENT_AFTER_BOUNDS'});continue
+                  work['prod_mult'][key]=new
+                  modified.append({'player':key,'pos':row['pos'],'status':row['injury_status'],'before_fv':baseline[key]['value'],
+                      'cal14_raw_2026_nowcast':row['projection_nowcast_2026'],'cal14_unbounded_fv':int(row['fv_scenario']),
+                      'fv_after':newfv,'fv_delta':newfv-baseline[key]['value'],'raw_before':old,'raw_after':new,'cap_active':cap})
+              assert len(modified)+len(holds)==230
+              after=sv.compute_all_values(work)
+              changed={k for k in after if after[k]['value']!=baseline[k]['value']}
+              assert changed=={r['player'] for r in modified}
+              assert len(changed)>=100,'Expected meaningful full-cohort scope, not 27 tiny edits'
+              assert all(baseline[k]['value']==after[k]['value'] for k in baseline if cfg['player_db'][k]['pos'] not in ('DL','LB','DB'))
+              assert all(abs(after[k]['value']-baseline[k]['value'])<=max(1,math.floor(baseline[k]['value']*MAX_ABS_FV_PCT)) for k in changed)
+              # New voter estimate MUST refit on exact FV prior; cannot rename old quote, or rebase it arithmetically.
+              players=sorted(baseline);idx={k:i for i,k in enumerate(players)}
+              vote_rows,source=market.load_vote_rows()
+              ballots,skipped=resolve_ballots(vote_rows,players)
+              voters=sorted({r[0] for r in ballots})
+              assert len(ballots)>=800 and len(voters)>=30, 'Insufficient live votes to refit full 565 pool'
+              digest=hashlib.sha256(json.dumps(ballots,sort_keys=False,separators=(',',':')).encode()).hexdigest()
+              old_mu=np.log(np.array([max(1,baseline[k]['value']) for k in players],float))
+              new_mu=np.log(np.array([max(1,after[k]['value']) for k in players],float))
+              old_fit=price(fit(old_mu,ballots,idx))
+              new_fit=price(fit(new_mu,ballots,idx))
+              if digest==old_quote['cal05_input_vote_sha256']:
+                  worst=max(abs(int(old_fit[i])-int(old_quote['players'][k]['fv_informed_estimate'])) for i,k in enumerate(players))
+                  assert worst<=2,f'Baseline FV+Votes refit does not reproduce CAL05 source, max={worst}'
+              loo=[]
+              for voter in voters:
+                  reduced=[b for b in ballots if b[0]!=voter]
+                  loo.append(price(fit(new_mu,reduced,idx)))
+              loo=np.asarray(loo,dtype=np.int64);loo_max=np.max(np.abs(loo-new_fit[None,:]),axis=0)
+              support=defaultdict(list)
+              for voter,k,t,c in ballots:
+                  for x in (k,t,c):support[x].append(voter)
+              quotes={}
+              for i,key in enumerate(players):
+                  n=len(support[key]);distinct=len(set(support[key]))
+                  band='zero' if n==0 else 'thin_1_3' if n<=3 else 'developing_4_9' if n<=9 else '10_plus'
+                  quotes[key]={'pos':after[key]['pos'],'fundamental_value':after[key]['value'],'fv_informed_estimate':int(new_fit[i]),
+                               'ballot_appearances':n,'distinct_voters':distinct,'evidence_band':band,
+                               'loo_max_abs_pct':round(100*int(loo_max[i])/max(1,int(new_fit[i])),2)}
+                  if n==0:assert quotes[key]['fv_informed_estimate']==after[key]['value']
+              OUT.mkdir(exist_ok=True);(CAND/'scripts/artifacts/generated').mkdir(parents=True,exist_ok=True);(CAND/f'model/releases/{RELEASE_ID}').mkdir(parents=True,exist_ok=True)
+              quote_out={
+                  'schema_version':1,'semantics':'fv_informed_preference_estimate_not_independent_market_price','display_only':True,'no_trading_math_changes':True,
+                  'method':'CAL15_fixed_lambda8_FV_informed_Bradley_Terry_refit_from_CAL05_method', 'fit_lambda':8,
+                  'input_vote_sha256':digest,'source_vote_sha_matches_cal05':digest==old_quote['cal05_input_vote_sha256'],
+                  'counts':{'player_count':565,'voters':len(voters),'usable_ballots':len(ballots),'fv_changed_players':len(changed)},
+                  'pricing_accuracy_validated':False,'model_note':'2026 single-season exposure policy is owner-review proposed, not proven long-term dynasty injury calibration',
+                  'players':quotes}
+              (CAND/QUOTE).write_text(json.dumps(quote_out,sort_keys=True,indent=2)+'\n')
+              # Replace ONLY the intended IDP PROD_MULT lines and old FV+Votes fetch URL.
+              html=Path(INDEX).read_text();anchor='const PROD_MULT_DATA = {';start=html.index(anchor)+len(anchor);end=html.index('};',start)
+              original_block=html[start:end];updated=original_block
+              for row in modified:
+                  orig=re.search(r"(?m)^([ ]*'"+re.escape(row['player'])+r"':)([-+0-9.eE]+)(,?)$",original_block)
+                  assert orig is not None
+                  row['old_literal']=orig.group(2)
+                  key=row['player'];pat=re.compile(r"(?m)^([ ]*'"+re.escape(key)+r"':)([-+0-9.eE]+)(,?)$")
+                  updated,n=pat.subn(lambda m:m.group(1)+format(row['raw_after'],'.12f').rstrip('0').rstrip('.')+m.group(3),updated)
+                  assert n==1,('missing exact PROD_MULT line',key,n)
+              html=html[:start]+updated+html[end:]
+              old_name='fv_informed_estimate_cal05.json';new_name='fv_informed_estimate_cal15.json'
+              assert html.count(old_name)==1
+              html=html.replace(old_name,new_name,1)
+              (CAND/INDEX).write_text(html)
+              # The Free Agent Board shares this exact canonical FV engine.
+              # Sync its mirrored core as an explicit sixth release file; never bypass parity.
+              sys.path.insert(0,str(ROOT/'scripts/sync'))
+              import sync_free_agent_valuation as fa_sync
+              board_before=Path(BOARD).read_text(encoding='utf-8')
+              fa_before=fa_sync._extract_const_object(board_before,'FA_PROD_MULT_DATA')[2]
+              board_after=fa_sync.render_synced(html,board_before)
+              assert fa_sync.render_synced(html,board_after)==board_after, 'Free Agent Board sync not idempotent'
+              assert all(fa_sync.parity_regions(html,board_after).values()), 'Free Agent Board core still stale'
+              assert fa_sync._extract_const_object(board_after,'FA_PROD_MULT_DATA')[2]==fa_before, 'FA-specific production changed'
+              (CAND/BOARD).write_text(board_after,encoding='utf-8')
+              (CAND/'scripts/validation').mkdir(parents=True,exist_ok=True)
+              # Frozen IDP V1 and CAL02 remain separately regression-protected: run them
+              # against reconstructed pre-CAL15 index, never bypass their old checks.
+              src=(ROOT/'scripts/validation/repo_regression_checks.py').read_text()
+              anchor='def check_deployed_idp_v1_invariants():\n    result = validate_idp_v1_final_deployment.validate_deployment()'
+              assert src.count(anchor)==1, 'Historical IDP V1 regression anchor changed'
+              replacement=(
+                  'def check_deployed_idp_v1_invariants():\n'
+                  '    if (REPO_ROOT / "model/releases/cal15-idp-2026-horizon-bounded-v1/release.json").exists():\n'
+                  '        import validate_cal15_successor\n'
+                  '        result = validate_cal15_successor.validate_deployment_successor()\n'
+                  '        assert result["status"] == "PASS"\n'
+                  '        return\n'
+                  '    result = validate_idp_v1_final_deployment.validate_deployment()'
+              )
+              src=src.replace(anchor,replacement,1)
+              (CAND/REGRESSION).write_text(src)
+              (CAND/VALIDATOR).write_text(Path('/tmp/cal15_successor_validator.py').read_text())
+              snap=sv.compute_all_values(sv.load_from_html(CAND/INDEX))
+              differences=[(k,after[k]['value'],snap[k]['value']) for k in after if snap[k]['value']!=after[k]['value']]
+              assert not differences,('Serialized candidate index FV mismatch',differences[:15])
+              assert all(quotes[k]['fundamental_value']==snap[k]['value'] for k in players)
+              assert Path(INDEX).read_text().count('LOG_CAL09_INJURY_RISK_NOTICE_BEGIN')==1
+              assert (CAND/BOARD).read_text()==fa_sync.render_synced((CAND/INDEX).read_text(),Path(BOARD).read_text()), 'FA board candidate artifact drift'
+              # Capture versioned provenance without overwriting CAL02/06/09 release files.
+              full_csv=OUT/'full_pool_before_after.csv'
+              all_rows=[]
+              new_bykey={r['player']:r for r in modified}
+              for k in players:
+                  r=new_bykey.get(k,{})
+                  all_rows.append({'player':k,'pos':baseline[k]['pos'],'age':baseline[k]['age'],'role':baseline[k]['role'],
+                      'fv_before':baseline[k]['value'],'fv_after':after[k]['value'],'fv_delta':after[k]['value']-baseline[k]['value'],
+                      'old_votes':old_quote['players'][k]['fv_informed_estimate'],'new_votes':quotes[k]['fv_informed_estimate'],
+                      'votes_delta':quotes[k]['fv_informed_estimate']-old_quote['players'][k]['fv_informed_estimate'],
+                      'ballots':quotes[k]['ballot_appearances'],'injury_status':r.get('status',''),
+                      'old_raw':cfg['prod_mult'].get(k,''),'new_raw':work['prod_mult'].get(k,''),'cal14_unbounded_fv':r.get('cal14_unbounded_fv',''),
+                      'cap_active':r.get('cap_active','')})
+              with full_csv.open('w',newline='') as h:
+                  w=csv.DictWriter(h,fieldnames=list(all_rows[0]));w.writeheader();w.writerows(all_rows)
+              with (OUT/'held_idps.csv').open('w',newline='') as h:
+                  w=csv.DictWriter(h,fieldnames=['player','reason']);w.writeheader();w.writerows(holds)
+              parent=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+              release={'release_id':RELEASE_ID,'status':'exact_candidate_approved_preview_required_to_apply',
+                  'changed_rows':[{'player':r['player'],'old_raw':r['raw_before'],'new_raw':r['raw_after'],'old_literal':r['old_literal'],'old_fv':r['before_fv'],'new_fv':r['fv_after']} for r in modified],
+                  'base_index_sha256':sha(INDEX),'candidate_index_sha256':sha(CAND/INDEX),'new_quote_sha256':sha(CAND/QUOTE),
+                  'base_free_agent_board_sha256':sha(BOARD),'candidate_free_agent_board_sha256':sha(CAND/BOARD),
+                  'base_commit':parent,'input_cal14_run':CAL14_RUN,'cal14_manifest_sha256':sha(CAL14/'manifest.json'),
+                  'source_2026_stats_sha256':artifact_manifest['actual_raw_sha256'],'shock_weight':COEFFICIENT,
+                  'max_relative_FV_shift':MAX_ABS_FV_PCT,'changed_players':len(changed),'held_idps':len(holds),
+                  'total_players':565,'new_fv_vote_source':'CAL05 fixed lambda8 full Bayesian prior refit, not arithmetic rescale',
+                  'new_vote_digest':digest,'source_vote_sha_matches_cal05':digest==old_quote['cal05_input_vote_sha256'],
+                  'quote_count':565,'market_value_changed':False,'verdict_math_changed':False,
+                  'observational_caveat':'2026 single season evidence not empirically validated as multi-year injury discount; proposed 25% exposure, 12% cap',
+                  'raw_literal_precision':12,'candidate_565_FV_serializer_parity_verified':True}
+              (CAND/REL).write_text(json.dumps(release,indent=2,sort_keys=True)+'\n')
+              files=[INDEX,BOARD,QUOTE,REL,VALIDATOR,REGRESSION]
+              hashes={p:sha(CAND/p) for p in files}
+              contract={'release_id':RELEASE_ID,'base_commit':parent,'files_sha256':hashes,'cal14_run':CAL14_RUN,'changed_players':len(changed),'source_vote_sha256':digest}
+              (OUT/'review_contract.json').write_text(json.dumps(contract,indent=2,sort_keys=True)+'\n')
+              selected=['brian burns','greg rousseau','edgerrin cooper','jacob rodriguez','will anderson','myles garrett','aidan hutchinson','maxx crosby','kerby joseph','jalon walker','bijan robinson']
+              bykey={r['player']:r for r in all_rows}
+              lines=[f'# CAL15 — Bounded 2026 IDP dynasty FV candidate', '',
+                  '**Preview only — cannot change production without owner-approved apply.**',
+                  f'- Source: green CAL14 run {CAL14_RUN}; completed 2026 weeks 1–6 plus existing canonical ROS IDP projection.',
+                  f'- Proposed 2026 evidence exposure: **{int(COEFFICIENT*100)}%** of raw factor correction; max **{int(MAX_ABS_FV_PCT*100)}%** change of player current FV.',
+                  '- These parameters are explicitly conservative proposed policy choices, **not** empirically validated multi-year injury pricing.',
+                  f'- Changed IDPs: **{len(changed)}**. Held IDPs **{len(holds)}**; other positions unchanged.',
+                  '- Fixed lambda=8 Bradley–Terry vote fit recomputed from vote source on new 565-FV prior; FV+Votes is still display-only.',
+                  f'- Vote source matched frozen CAL05: **{str(release["source_vote_sha_matches_cal05"])}**. Usable ballots **{len(ballots)}**, voters **{len(voters)}**.',
+                  '- Existing Market Value, Team Utility, and trade verdict calculation: **unchanged**.',
+                  '- Free Agent Board canonical valuation core synchronized; free-agent-specific model and layout preserved.',
+                  '', '## Named player comparisons', '',
+                  '| Player | FV before | FV after | Change | FV+Votes before | FV+Votes after |',
+                  '|---|---:|---:|---:|---:|---:|']
+              for key in selected:
+                  r=bykey.get(key)
+                  if r:lines.append(f'| {key.title()} | {r["fv_before"]:,} | {r["fv_after"]:,} | {r["fv_delta"]:+,} | {r["old_votes"]:,} | {r["new_votes"]:,} |')
+              lines+=['','## Reproducibility', '',f'- Base commit `{parent}`','- The `candidate/` directory contains six exact production files, including the synced Free Agent Board and successor regression support that reconstructs and re-tests the frozen IDP V1/CAL02 release.',
+                 '- Apply must read only the approved preview artifact and verify all six hashes before committing.',
+                 '- Never substitute direct CAL14 prices or an unbounded IR/PUP injury discount.',
+                 '','## Owner review', '',
+                 'Preview is not an automatic approval. Evaluate the 565-player CSV and whether the 25%/12% horizon policy is appropriate before choosing apply.']
+              (OUT/'summary.md').write_text('\n'.join(lines)+'\n')
+              print('CAL15 PASS: candidate',len(changed),'changed IDPs,',len(holds),'holds; 565 FV and votes refit;',len(ballots),'ballots',len(voters),'voters; votes SHA matches:',release['source_vote_sha_matches_cal05'])
+              for k in selected:
+                  if k in bykey:
+                      r=bykey[k];print('CAL15 case',k,r['fv_before'],'->',r['fv_after'],'FV+Votes',r['old_votes'],'->',r['new_votes'])
+
+          if __name__=='__main__':
+              if '--selftest' in sys.argv:test()
+              else:main()
+          PYCODE
+          python3 -m py_compile /tmp/cal15_engine.py
+          python3 /tmp/cal15_engine.py --selftest
+          python3 /tmp/cal15_engine.py
+      - name: Validate complete preview and repository regressions
+        if: ${{ inputs.mode == 'preview' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import hashlib,json,csv
+          r=Path('cal15-preview')
+          c=json.loads((r/'review_contract.json').read_text())
+          assert c['release_id']=='cal15-idp-2026-horizon-bounded-v1'
+          assert c['changed_players']>=100
+          assert len(list(csv.DictReader((r/'full_pool_before_after.csv').open())))==565
+          assert len(list(csv.DictReader((r/'held_idps.csv').open())))+c['changed_players']==230
+          for name,sha in c['files_sha256'].items():
+              assert hashlib.sha256((r/'candidate'/name).read_bytes()).hexdigest()==sha,name
+          q=json.loads((r/'candidate/scripts/artifacts/generated/fv_informed_estimate_cal15.json').read_text())
+          assert len(q['players'])==565 and q['display_only'] and q['no_trading_math_changes']
+          print('CAL15 frozen exact preview contract verified:',c['changed_players'],'repriced candidates')
+          PYCODE
+          cp cal15-preview/candidate/index.html index.html
+          cp cal15-preview/candidate/free-agent-board.html free-agent-board.html
+          cp cal15-preview/candidate/scripts/artifacts/generated/fv_informed_estimate_cal15.json scripts/artifacts/generated/fv_informed_estimate_cal15.json
+          cp cal15-preview/candidate/scripts/validation/repo_regression_checks.py scripts/validation/repo_regression_checks.py
+          cp cal15-preview/candidate/scripts/validation/validate_cal15_successor.py scripts/validation/validate_cal15_successor.py
+          mkdir -p model/releases/cal15-idp-2026-horizon-bounded-v1
+          cp cal15-preview/candidate/model/releases/cal15-idp-2026-horizon-bounded-v1/release.json model/releases/cal15-idp-2026-horizon-bounded-v1/release.json
+          python3 scripts/validation/snapshot_values.py --selftest
+          python3 scripts/sync/sync_free_agent_valuation.py --check
+          python3 scripts/validation/repo_regression_checks.py
+          python3 scripts/validation/validate_free_agent_valuation_parity.py
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import json,sys
+          sys.path.insert(0,'scripts/validation')
+          import snapshot_values
+          r=snapshot_values.compute_all_values(snapshot_values.load_from_html('index.html'))
+          q=json.loads(Path('scripts/artifacts/generated/fv_informed_estimate_cal15.json').read_text())
+          assert len(r)==565 and len(q['players'])==565
+          assert all(int(q['players'][k]['fundamental_value'])==r[k]['value'] for k in r)
+          assert 'fv_informed_estimate_cal15.json' in Path('index.html').read_text()
+          print('CAL15 preview consistency PASS: 565 FV+Votes matched to current FV')
+          PYCODE
+          cat cal15-preview/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload exact candidate and owner decision table
+        if: ${{ inputs.mode == 'preview' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-cal15-v1r2-exact-preview
+          path: cal15-preview/
+          retention-days: 30
+          if-no-files-found: error
+      - name: Commit only exact explicitly approved production files
+        if: ${{ inputs.mode == 'apply' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$PREVIEW_ID" =~ ^[0-9]{8,15}$ ]] || { echo 'Apply needs green approved CAL15 preview run ID'; exit 1; }
+          test "$(gh run view "$PREVIEW_ID" --repo "$GITHUB_REPOSITORY" --json conclusion --jq .conclusion)" = success
+          mkdir -p /tmp/cal15-approved
+          gh run download "$PREVIEW_ID" --repo "$GITHUB_REPOSITORY" --name log-cal15-v1r2-exact-preview --dir /tmp/cal15-approved
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import hashlib,json,subprocess,shutil
+          r=Path('/tmp/cal15-approved');c=json.loads((r/'review_contract.json').read_text())
+          assert c['release_id']=='cal15-idp-2026-horizon-bounded-v1'
+          head=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+          assert c['base_commit']==head, 'Main has advanced: generate a new CAL15 preview'
+          assert hashlib.sha256(Path('free-agent-board.html').read_bytes()).hexdigest()==json.loads((r/'candidate/model/releases/cal15-idp-2026-horizon-bounded-v1/release.json').read_text())['base_free_agent_board_sha256'], 'Free Agent Board base drift'
+          assert c['cal14_run']=='39301009907' and c['changed_players']>=100
+          assert not Path('scripts/artifacts/generated/fv_informed_estimate_cal15.json').exists(),'Already deployed'
+          for name,wanted in c['files_sha256'].items():
+              src=r/'candidate'/name
+              assert src.is_file() and hashlib.sha256(src.read_bytes()).hexdigest()==wanted,(name,'stale artifact')
+              dest=Path(name);dest.parent.mkdir(parents=True,exist_ok=True)
+              shutil.copyfile(src,dest)
+              assert hashlib.sha256(dest.read_bytes()).hexdigest()==wanted,(name,'copy/hash mismatch')
+          print('CAL15 apply approved exact-hash files:',list(c['files_sha256']))
+          PYCODE
+          python3 scripts/validation/snapshot_values.py --selftest
+          python3 scripts/sync/sync_free_agent_valuation.py --check
+          python3 scripts/validation/repo_regression_checks.py
+          python3 scripts/validation/validate_free_agent_valuation_parity.py
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import json,sys
+          sys.path.insert(0,'scripts/validation')
+          import snapshot_values
+          v=snapshot_values.compute_all_values(snapshot_values.load_from_html('index.html'))
+          q=json.loads(Path('scripts/artifacts/generated/fv_informed_estimate_cal15.json').read_text())
+          r=json.loads(Path('model/releases/cal15-idp-2026-horizon-bounded-v1/release.json').read_text())
+          assert len(v)==565 and len(q['players'])==565
+          assert len([k for k in v if q['players'][k]['fundamental_value'] != v[k]['value']])==0
+          assert r['changed_players']>=100 and r['total_players']==565
+          assert r['market_value_changed'] is False and r['verdict_math_changed'] is False
+          print('CAL15 apply PASS: full 565 player quote parity, unchanged verdict math')
+          PYCODE
+          test -z "$(git diff --name-only | grep -vE '^(index.html|free-agent-board.html|scripts/validation/repo_regression_checks.py)$' || true)"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add index.html free-agent-board.html scripts/artifacts/generated/fv_informed_estimate_cal15.json model/releases/cal15-idp-2026-horizon-bounded-v1/release.json scripts/validation/validate_cal15_successor.py scripts/validation/repo_regression_checks.py
+          git diff --cached --check
+          test "$(git diff --cached --name-only | wc -l)" -eq 6
+          git commit -m 'CAL15: bounded 2026 IDP FV refresh and voter posterior refit'
+          git push origin HEAD:main
