@@ -1,0 +1,279 @@
+name: LOG CAL04 - FV-Informed Market Evidence Full-Pool Preview
+
+'on':
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: log-cal04-readonly
+  cancel-in-progress: false
+
+jobs:
+  market_evidence:
+    name: Evaluate actual vote evidence against Fundamental Value
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out exact main commit
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Verify preview remains read-only and the deployed weights have not moved
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git branch --show-current)" = main
+          test -z "$(git status --porcelain --untracked-files=all)"
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          text=Path('index.html').read_text()
+          assert 'const POSITION_WEIGHT = { QB:1.30, RB:0.89, WR:1.00, TE:0.82, DL:0.93, LB:1.12, DB:0.87, K:0.35 };' in text, 'Post-CAL02 position-weight baseline changed; review before CAL04 preview'
+          print('CAL04 pinned to deployed post-CAL02 baseline')
+          PYCODE
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install modeling dependencies
+        run: python3 -m pip install --disable-pip-version-check requests numpy scipy
+      - name: Build and evaluate read-only full-pool candidate
+        shell: bash
+        run: |
+          cat >/tmp/cal04_market_engine.py <<'PYCODE'
+          #!/usr/bin/env python3
+          """LOG CAL04: read-only, empirical-Bayes market-signal pricing shadow.
+
+          Prices are FV-informed posterior estimates, NOT independent market prices.
+          Never writes to production valuation files or exports identifying voter IDs.
+          """
+          from __future__ import annotations
+          import csv
+          import hashlib
+          import json
+          import math
+          import statistics
+          import sys
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import numpy as np
+          from scipy.optimize import minimize
+          from scipy.special import expit
+
+          ROOT = Path.cwd()
+          sys.path[:0] = [str(ROOT / 'scripts/market'), str(ROOT / 'scripts/validation')]
+          import build_market_value as market
+          import snapshot_values as snap
+          from evaluate_market_history import build_alias_index, normalize_name
+
+          OUT = ROOT / 'cal04-preview'
+          LAMBDAS = (2.0, 8.0, 24.0, 80.0)
+          FOLDS = 5
+          CASE_NAMES = (
+              'brian burns','myles garrett','maxx crosby','aidan hutchinson',
+              'josh allen','patrick mahomes','lamar jackson','bijan robinson',
+              'jahmyr gibbs','jamarr chase','sonny styles','fernando mendoza',
+              'alex highsmith','nick bolton','kc concepcion','malik davis',
+              'dorian williams','kenyon sadiq','ty simpson','jihaad campbell',
+              'dj giddens','malik willis','xavier worthy','rhamondre stevenson',
+              'ashton jeanty','odafe oweh','christian watson','drake london',
+              'chris olave','kyle hamilton','amonra st brown'
+          )
+
+
+          def _canonical_rows(rows, keys):
+              aliases=build_alias_index(list(keys))
+              def resolve(label):
+                  options=aliases.get(normalize_name(str(label)),[])
+                  if not options: return None
+                  best=min(o[1] for o in options)
+                  selected={o[0] for o in options if o[1] == best}
+                  return next(iter(selected)) if len(selected)==1 else None
+              clean=[]
+              skipped=Counter()
+              for r in rows:
+                  names=[resolve(r.get(slot,'')) for slot in ('keep','trade','cut')]
+                  if any(n is None for n in names): skipped['identity_unresolved']+=1;continue
+                  if len(set(names))!=3: skipped['duplicate_player']+=1;continue
+                  clean.append((str(r.get('voter_roster_id') or 'unknown'),*names))
+              return clean,dict(skipped)
+
+
+          def _pairs(ballots, idx, weight_fn=None):
+              # One 3-way ballot becomes three standard Bradley-Terry comparisons.
+              # Weights are capped to equalize extreme repeat-voter concentration.
+              counter=Counter(b[0] for b in ballots)
+              wi=[];li=[];wt=[]
+              for voter,k,t,c in ballots:
+                  w = min(1.0,30.0/counter[voter])
+                  # Preserve the currently deployed league/guest policy exactly.
+                  w *= 1.0 if market.ktc_pipeline.is_league_voter(voter) else 0.50
+                  if weight_fn: w*=weight_fn(voter)
+                  for x,y in ((k,t),(k,c),(t,c)):
+                      wi.append(idx[x]);li.append(idx[y]);wt.append(w)
+              return (np.array(wi,dtype=np.int64),np.array(li,dtype=np.int64),np.array(wt,dtype=float))
+
+
+          def _fit(mu, pairs, lam):
+              wins,loss,wt=pairs
+              n=len(mu)
+              if not len(wins):return mu.copy()
+              def objective(x):
+                  d=x[loss]-x[wins]
+                  z=expit(d)*wt
+                  err=x-mu
+                  f=float(np.dot(wt,np.logaddexp(0.0,d)) + 0.5*lam*np.dot(err,err))
+                  g=np.bincount(loss,weights=z,minlength=n)-np.bincount(wins,weights=z,minlength=n)+lam*err
+                  return f,g
+              opt=minimize(objective,mu.copy(),jac=True,method='L-BFGS-B',options={'maxiter':250,'ftol':1e-11,'gtol':1e-7})
+              if not opt.success and np.max(np.abs(opt.jac))>0.002:
+                  raise RuntimeError(f'CAL04 optimizer failed convergence for lambda={lam}: {opt.message}; max_grad={np.max(np.abs(opt.jac)):.6f}')
+              return opt.x
+
+
+          def _split_folds(ballots):
+              voters=sorted({b[0] for b in ballots},key=lambda v:(hashlib.sha256(v.encode()).hexdigest(),v))
+              if len(voters)<10: raise RuntimeError(f'Insufficient distinct voters to evaluate CAL04: {len(voters)}')
+              assignment={v:i%FOLDS for i,v in enumerate(voters)}
+              return [[b for b in ballots if assignment[b[0]]==k] for k in range(FOLDS)]
+
+
+          def _voter_loss(ballots, x, idx):
+              # Equal average weight to each independent voter, not every ballot.
+              by_voter=defaultdict(list)
+              for v,k,t,c in ballots:
+                  by_voter[v].extend((float(np.logaddexp(0,x[idx[t]]-x[idx[k]])),float(np.logaddexp(0,x[idx[c]]-x[idx[k]])),float(np.logaddexp(0,x[idx[c]]-x[idx[t]]))))
+              return {v:float(np.mean(ls)) for v,ls in by_voter.items()}
+
+
+          def _validate_optimizer():
+              keys=('a','b','c')
+              mu=np.log(np.array([4000.,2500.,1000.]))
+              pairs=_pairs([('v1','a','b','c'),('v2','a','c','b')],{k:i for i,k in enumerate(keys)})
+              x=_fit(mu,pairs,8.)
+              assert x[0]>mu[0] and x[1]!=mu[1]
+              assert np.isfinite(x).all() and np.max(np.abs(x-mu))<0.5
+              assert np.array_equal(_fit(mu,_pairs([],{}),8.),mu)
+              print('PASS CAL04 optimizer, zero-ballot FV hold, and weighted-gradient smoke checks')
+
+
+          def main():
+              _validate_optimizer()
+              OUT.mkdir(parents=True,exist_ok=True)
+              cfg=snap.load_from_html(ROOT/'index.html')
+              current=snap.compute_all_values(cfg)
+              ordered=sorted(current)
+              idx={key:i for i,key in enumerate(ordered)}
+              prior=np.array([max(1,int(current[k]['value'])) for k in ordered],dtype=float)
+              mu=np.log(prior)
+              raw_rows,source=market.load_vote_rows()
+              ballots,skipped=_canonical_rows(raw_rows,current)
+              distinct=len({b[0] for b in ballots})
+              if len(ballots)<300 or distinct<10:
+                  raise RuntimeError(f'CAL04 input too small: {len(ballots)} comparable ballots / {distinct} distinct voters')
+              folds=_split_folds(ballots)
+              cv={f'{v:g}':{} for v in LAMBDAS}
+              control={}
+              for fold in range(FOLDS):
+                  test=folds[fold];train=[b for j,g in enumerate(folds) if j!=fold for b in g]
+                  control.update(_voter_loss(test,mu,idx))
+                  fit_pairs=_pairs(train,idx)
+                  for lam in LAMBDAS:
+                      xf=_fit(mu,fit_pairs,lam)
+                      cv[f'{lam:g}'].update(_voter_loss(test,xf,idx))
+              voter_ids=sorted(control)
+              assert all(set(d)==set(voter_ids) for d in cv.values())
+              control_loss=statistics.mean(control.values())
+              cv_results=[{'lambda':lam,'equal_voter_log_loss':round(statistics.mean(cv[f'{lam:g}'].values()),6),'delta_from_fv_control':round(statistics.mean(cv[f'{lam:g}'].values())-control_loss,6),'voters':len(voter_ids)} for lam in LAMBDAS]
+              cv_results.sort(key=lambda r:(r['equal_voter_log_loss'],-r['lambda']))
+              chosen=cv_results[0]['lambda']
+              # No automatic promotion: candidate is only described, never installed.
+              posterior=_fit(mu,_pairs(ballots,idx),chosen)
+              quotes=np.floor(np.exp(posterior)+0.5).astype(int)
+              support=defaultdict(list)
+              for voter,k,t,c in ballots:
+                  for key in (k,t,c): support[key].append(voter)
+              legacy=market.read_json(market.OUTPUT_JSON)['players']
+              columns=['player','pos','FV','legacy_vote_rank_quote','candidate_fv_informed_quote','delta_from_FV','delta_from_legacy_MV','ballots','distinct_voters','reliability_band','legacy_market_rank']
+              report=[]
+              for i,key in enumerate(ordered):
+                  n=len(support[key]);v=len(set(support[key]));old=legacy.get(key) or {}
+                  band='thin_1_to_3' if 0<n<=3 else ('developing_4_to_9' if n<10 and n>0 else ('10_plus' if n>=10 else 'no_ballots'))
+                  row={'player':key,'pos':current[key]['pos'],'FV':int(prior[i]),'legacy_vote_rank_quote':old.get('market_value'),'candidate_fv_informed_quote':int(quotes[i]),'delta_from_FV':int(quotes[i]-prior[i]),'delta_from_legacy_MV':(int(quotes[i])-int(old['market_value']) if old else ''),'ballots':n,'distinct_voters':v,'reliability_band':band,'legacy_market_rank':old.get('market_rank','')}
+                  report.append(row)
+              assert len(report)==len(current)
+              assert all(r['candidate_fv_informed_quote']==r['FV'] for r in report if r['ballots']==0)
+              # Existing live values remain unchanged.
+              assert all(current[k]['value']==int(prior[i]) for i,k in enumerate(ordered))
+              with (OUT/'full_pool.csv').open('w',newline='',encoding='utf-8') as f:
+                  w=csv.DictWriter(f,fieldnames=columns);w.writeheader();w.writerows(report)
+              vote_sizes=Counter(r['reliability_band'] for r in report)
+              ranked=sorted([r for r in report if r['legacy_vote_rank_quote'] is not None],key=lambda r:abs(r['delta_from_legacy_MV']),reverse=True)
+              case_rows={r['player']:r for r in report}
+              changed=sum(r['candidate_fv_informed_quote']!=r['FV'] for r in report)
+              metadata={
+                  'status':'PREVIEW_ONLY_NOT_PRODUCTION_APPROVAL',
+                  'method':'LOG_CAL04_Bayesian_Bradley_Terry_with_log_FV_prior_v1',
+                  'semantics':'FV-informed posterior quote, NOT independent market price',
+                  'vote_source':source.get('mode'),
+                  'vote_timestamp_utc':datetime.now(timezone.utc).isoformat(),
+                  'input_rows_after_existing_daily_cap':len(raw_rows),
+                  'comparably_resolved_ballots':len(ballots),
+                  'dropped_ballots_by_reason':skipped,
+                  'distinct_comparable_voters':distinct,
+                  'cross_validation':'five nonoverlapping folds by voter; scoring equal-weights each heldout voter',
+                  'fit_vote_policy':'per-voter cap 30, league 1.0, guest 0.50; existing daily cap preserved',
+                  'cv_fv_only_equal_voter_log_loss':round(control_loss,6),
+                  'cv_candidates':cv_results,
+                  'selected_cv_lambda':chosen,
+                  'logistic_likelihood':'P(A above B)=FV_informed_quote(A)/(FV_informed_quote(A)+FV_informed_quote(B))',
+                  'max_adjustment_policy':'no arbitrary per-player caps; Gaussian prior regularizes log prices',
+                  'full_fv_player_count':len(current),
+                  'prior_fv_changed':0,
+                  'posterior_nonzero_changes':changed,
+                  'prior_ballot_bins':dict(vote_sizes),
+                  'raw_market_coverage':len(legacy),
+                  'market_production_changed':False,
+                  'frozen_cal03_weight_bridge_deployed':False,
+              }
+              (OUT/'metrics.json').write_text(json.dumps(metadata,indent=2,sort_keys=True)+'\n')
+              lines=['# LOG CAL04 — Vote-informed price estimation, full-pool shadow','','**PREVIEW ONLY. No live valuation formula, Market Value, Team Utility, or verdict is changed.**','','### Purpose','','Current vote-only MV assigns FV point slots to vote ranks, even with extremely sparse evidence. CAL04 instead fits a regularized Bradley–Terry model with log(FV) as a player-specific prior. This is a **market-informed FV estimate**, **not an independent market price**. No FV ranks/slots are reassigned; no player-specific overrides.','','### Input and independence','','- Data source: existing daily-capped league voting feed; all reserved package votes excluded.','- All voting records remain in the workflow runner; voter identities are **not included in the downloadable report**.',f'- Raw rows after daily cap: **{len(raw_rows)}**. Unambiguously resolved three-way ballots: **{len(ballots)}**. Distinct voters: **{distinct}**.',f'- Dropped identity/duplicate ballots: **{sum(skipped.values())}**.',f'- FV control held-out log loss: **{control_loss:.5f}**.','', '### Five-fold held-out-voter evaluation','', '| Prior strength λ | Held-out voter log loss | Difference vs FV-only |','|---:|---:|---:|']
+              for d in sorted(cv_results,key=lambda a:a['lambda']):lines.append(f"| {d['lambda']:g} | {d['equal_voter_log_loss']:.5f} | {d['delta_from_fv_control']:+.5f} |")
+              lines+=['',f'Lowest held-out log loss λ: **{chosen:g}**. This is an empirical comparison signal, not a trade-price accuracy metric or permission to deploy.', '',f'Full-player rows: **{len(report)}**. FV differences from deployed: **0**. Player posterior estimates differing from FV: **{changed}**. Existing market quote rows: **{len(legacy)}**.', '', '### Vote evidence bands', '', '| Band | Players |','|---|---:|']
+              for key in ('no_ballots','thin_1_to_3','developing_4_to_9','10_plus'):lines.append(f'| {key} | {vote_sizes[key]} |')
+              lines+=['','### Owner diagnostic cases (NOT tuning/acceptance criteria)','','| Player | FV | Existing MV | Candidate estimate | Appearances | Voters |','|---|---:|---:|---:|---:|---:|']
+              for name in CASE_NAMES:
+                  r=case_rows.get(name)
+                  if not r: continue
+                  lines.append(f"| {name} | {r['FV']:,} | {r['legacy_vote_rank_quote'] if r['legacy_vote_rank_quote'] is not None else '—'} | {r['candidate_fv_informed_quote']:,} | {r['ballots']} | {r['distinct_voters']} |")
+              lines+=['','### Largest differences from deployed MV (diagnostic only)','','| Player | FV | Existing MV | FV-informed estimate | Delta | Votes/voters |','|---|---:|---:|---:|---:|---|']
+              for r in ranked[:25]:lines.append(f"| {r['player']} | {r['FV']:,} | {r['legacy_vote_rank_quote']:,} | {r['candidate_fv_informed_quote']:,} | {r['delta_from_legacy_MV']:+,} | {r['ballots']}/{r['distinct_voters']} |")
+              lines+=['','### Decision requested after review','','Compare empirical held-out-voter score, broad player prices, and intended semantics. Retain the deployed raw Market Value as an independently visible baseline. A future production release could offer the **FV-informed quote as a separately labeled lens**, rather than misleadingly calling it independent league opinion. CAL03 remains unapproved and unchanged.']
+              (OUT/'summary.md').write_text('\n'.join(lines)+'\n')
+              print('\n'.join(lines[:32]))
+              print('CAL04 completed, no valuation files changed')
+
+          if __name__=='__main__':main()
+          PYCODE
+          python3 /tmp/cal04_market_engine.py
+      - name: Ensure production files were not modified
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code -- index.html free-agent-board.html scripts/market/build_market_value.py scripts/artifacts/generated/market_values.json scripts/artifacts/reports/market_value_report.md scripts/validation/snapshot_values.py
+          test -z "$(git status --porcelain --untracked-files=all | grep -v '^?? cal04-preview/' || true)"
+          echo 'PASS CAL04: no production changes'
+      - name: Publish CAL04 owner review summary
+        shell: bash
+        run: |
+          cat cal04-preview/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload CAL04 complete player comparison
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-cal04-market-evidence-preview
+          path: cal04-preview/
+          retention-days: 30
+          if-no-files-found: error
