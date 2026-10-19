@@ -1,0 +1,385 @@
+name: LOG CAL05 - Conservative Market Quote Voter Stability Preview
+'on':
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: log-cal05-readonly
+  cancel-in-progress: false
+jobs:
+  market_quote_stability:
+    name: Full-pool fixed-lambda quote and leave-one-voter-out stability
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+    - name: Check out main without write access
+      uses: actions/checkout@v4
+      with:
+        ref: main
+        fetch-depth: 0
+    - name: Validate deployed post-CAL02 baseline
+      shell: bash
+      run: |
+        set -euo pipefail
+        test "$(git branch --show-current)" = main
+        test -z "$(git status --porcelain --untracked-files=all)"
+        test ! -e model/releases/cal03-cross-position-bridge-v1/release.json
+        python3 - <<'PYCODE'
+        import sys
+        sys.path.insert(0,'scripts/validation')
+        import snapshot_values
+        p=snapshot_values.load_from_html('index.html')['position_weight']
+        expected={'QB':1.30,'RB':0.89,'WR':1.00,'TE':0.82,'DL':0.93,'LB':1.12,'DB':0.87,'K':0.35}
+        for k,v in expected.items():
+            assert abs(p[k]-v)<1e-9, f'Position weight drift: {k}, now {p[k]}'
+        print('PASS fixed post-CAL02 FV position weights')
+        PYCODE
+    - name: Install Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Install modeling dependencies
+      run: |-
+        python3 -m pip install --disable-pip-version-check requests numpy scipy
+    - name: Build fixed lambda 8, held-out-voter and LOO preview
+      shell: bash
+      run: |
+        cat >/tmp/log_cal05_engine.py <<'PYCODE'
+        #!/usr/bin/env python3
+        """LOG CAL05: conservative FV-informed market quote, read-only evaluator.
+
+        The lambda=8 model is fixed before inspection. Market quote is not independent of FV;
+        held-out preference prediction is not trade-price validation. Nothing production is written.
+        """
+        from __future__ import annotations
+        import csv
+        import hashlib
+        import json
+        import math
+        import statistics
+        import sys
+        from collections import Counter, defaultdict
+        from datetime import datetime, timezone
+        from pathlib import Path
+        import numpy as np
+        from scipy.optimize import minimize
+        from scipy.special import expit
+
+        ROOT = Path.cwd()
+        sys.path[:0] = [str(ROOT / 'scripts/market'), str(ROOT / 'scripts/validation')]
+        import build_market_value as market
+        import snapshot_values as snap
+        from evaluate_market_history import build_alias_index, normalize_name
+
+        OUT = ROOT / 'cal05-preview'
+        PRIMARY_LAMBDA = 8.0
+        COMPARATORS = (2.0, 24.0)       # strictly descriptive; selection is predeclared
+        FOLDS = 5
+        BOOTSTRAP_REPS = 3000
+        BOOTSTRAP_SEED = 20261018
+        WATCH = ('brian burns','myles garrett','maxx crosby','aidan hutchinson',
+                 'josh allen','patrick mahomes','lamar jackson','bijan robinson',
+                 'jahmyr gibbs','jamarr chase','sonny styles','fernando mendoza',
+                 'alex highsmith','nick bolton','kc concepcion','malik davis',
+                 'dorian williams','kenyon sadiq','ty simpson','jihaad campbell',
+                 'dj giddens','malik willis','xavier worthy','rhamondre stevenson',
+                 'ashton jeanty','odafe oweh','christian watson','drake london',
+                 'chris olave','kyle hamilton','amonra st brown')
+
+
+        def resolve_ballots(rows, player_keys):
+            aliases = build_alias_index(list(player_keys))
+            def resolve(label):
+                matches = aliases.get(normalize_name(str(label)), [])
+                if not matches: return None
+                priority = min(row[1] for row in matches)
+                winners = {row[0] for row in matches if row[1] == priority}
+                return next(iter(winners)) if len(winners)==1 else None
+            output=[]; skipped=Counter()
+            for row in rows:
+                triple = [resolve(row.get(key,'')) for key in ('keep','trade','cut')]
+                if any(key is None for key in triple): skipped['identity_unresolved']+=1;continue
+                if len(set(triple))<3: skipped['duplicate_player']+=1;continue
+                output.append((str(row.get('voter_roster_id') or 'unknown'), *triple))
+            return output, dict(skipped)
+
+
+        def build_pairs(ballots, idx):
+            # Exactly follows CAL04's ballot weighting: a voter contributes <=30
+            # counted effective ballots, then league=1 and guest=.5.
+            counts=Counter(b[0] for b in ballots)
+            wins=[];loss=[];weights=[]
+            for voter,k,t,c in ballots:
+                w=min(1.0,30.0/counts[voter])
+                w*=1.0 if market.ktc_pipeline.is_league_voter(voter) else 0.5
+                for winner,loser in ((k,t),(k,c),(t,c)):
+                    wins.append(idx[winner]);loss.append(idx[loser]);weights.append(w)
+            return (np.asarray(wins,np.int64),np.asarray(loss,np.int64),np.asarray(weights,np.float64))
+
+
+        def fit(mu, pairs, lam):
+            wins,loss,wt = pairs
+            if not len(wins):return mu.copy()
+            n=len(mu)
+            def fun(x):
+                d=x[loss]-x[wins]
+                exp=expit(d)*wt
+                err=x-mu
+                value=float(np.dot(wt,np.logaddexp(0.0,d))+.5*lam*np.dot(err,err))
+                grad=(np.bincount(loss,weights=exp,minlength=n)
+                      -np.bincount(wins,weights=exp,minlength=n)+lam*err)
+                return value,grad
+            result=minimize(fun,mu.copy(),method='L-BFGS-B',jac=True,
+                            options={'maxiter':300,'ftol':1e-12,'gtol':1e-8})
+            if not result.success and np.max(np.abs(result.jac))>0.002:
+                raise RuntimeError(f'CAL05 fit failed lambda={lam}, {result.message}')
+            if not np.isfinite(result.x).all():raise RuntimeError('CAL05 nonfinite posterior')
+            return result.x
+
+
+        def voter_loss(ballots, values, idx):
+            arr=defaultdict(list)
+            for voter,k,t,c in ballots:
+                arr[voter].extend((float(np.logaddexp(0,values[idx[t]]-values[idx[k]])),
+                                   float(np.logaddexp(0,values[idx[c]]-values[idx[k]])),
+                                   float(np.logaddexp(0,values[idx[c]]-values[idx[t]]))))
+            return {v:float(np.mean(ds)) for v,ds in arr.items()}
+
+
+        def fold_split(ballots):
+            voter_ids=sorted({row[0] for row in ballots},key=lambda v:(hashlib.sha256(v.encode()).hexdigest(),v))
+            folds={v:i%FOLDS for i,v in enumerate(voter_ids)}
+            return [[b for b in ballots if folds[b[0]]==i] for i in range(FOLDS)]
+
+
+        def price(x):
+            return np.floor(np.exp(x)+.5).astype('int64')
+
+
+        def test_functions():
+            idx={v:i for i,v in enumerate(('a','b','c'))}
+            mu=np.log(np.array([4000.,2000.,1000.]))
+            assert np.array_equal(fit(mu,build_pairs([],idx),8),mu)
+            ballots=[('1','a','b','c'),('2','a','c','b')]
+            pr=fit(mu,build_pairs(ballots,idx),8)
+            assert pr[0]>mu[0] and np.isfinite(pr).all()
+            assert len(voter_loss(ballots,pr,idx))==2
+            assert np.max(np.abs(pr-mu))<.3
+            # Rebalancing counts should happen using training folds, not full vote counts.
+            q=build_pairs([('1','a','b','c')]*31,idx)[2]
+            assert abs(q.sum()-90)<1e-8  # 31 ballots * 3 edges * cap(30/31)
+            print('PASS CAL05 optimizer, cap, FV hold, loss, and gradient checks')
+
+
+        def percentile(arr,p):
+            return float(np.quantile(np.asarray(arr,dtype=float),p)) if len(arr) else None
+
+
+        def main():
+            test_functions()
+            OUT.mkdir(parents=True,exist_ok=True)
+            source_index=ROOT/'index.html'
+            cfg=snap.load_from_html(source_index)
+            model=snap.compute_all_values(cfg)
+            players=sorted(model)
+            if len(players)<500:raise RuntimeError(f'Unexpectedly small full-pool baseline: {len(players)}')
+            idx={k:i for i,k in enumerate(players)}
+            fv=np.asarray([max(1,int(model[k]['value'])) for k in players],dtype=float)
+            mu=np.log(fv)
+            raw,source=market.load_vote_rows()
+            ballots,skipped=resolve_ballots(raw,model)
+            voters=sorted({b[0] for b in ballots})
+            if len(ballots)<500 or len(voters)<15:
+                raise RuntimeError(f'Insufficient vote source: {len(ballots)} ballots / {len(voters)} voters')
+            # hashes never expose voter ID or raw ballots
+            vote_digest=hashlib.sha256(json.dumps(ballots,sort_keys=False,separators=(',',':')).encode()).hexdigest()
+            comparisons={lam:{} for lam in (PRIMARY_LAMBDA,*COMPARATORS)}
+            baseline={}
+            folds=fold_split(ballots)
+            for i in range(FOLDS):
+                test=folds[i]
+                train=[b for j,f in enumerate(folds) if j!=i for b in f]
+                if not test or not train:raise RuntimeError('Empty voter fold')
+                baseline.update(voter_loss(test,mu,idx))
+                pairs=build_pairs(train,idx)
+                for lam in comparisons:
+                    comparisons[lam].update(voter_loss(test,fit(mu,pairs,lam),idx))
+            if set(baseline)!=set(voters) or any(set(o)!=set(voters) for o in comparisons.values()):
+                raise RuntimeError('Incomplete held-out voter coverage')
+            baseline_loss=statistics.mean(baseline.values())
+            losses={lam:statistics.mean(c.values()) for lam,c in comparisons.items()}
+            difference=np.array([comparisons[PRIMARY_LAMBDA][v]-baseline[v] for v in voters],float)
+            rng=np.random.default_rng(BOOTSTRAP_SEED)
+            draw=rng.integers(0,len(voters),size=(BOOTSTRAP_REPS,len(voters)))
+            means=difference[draw].mean(axis=1)
+            ci=[percentile(means,.025),percentile(means,.975)]
+            # Full-data fit for fixed primary lambda and descriptive CAL04 lambda=2.
+            x8=fit(mu,build_pairs(ballots,idx),PRIMARY_LAMBDA)
+            x2=fit(mu,build_pairs(ballots,idx),2.0)
+            v8=price(x8);v2=price(x2)
+            # Exact leave-one-voter-out: removes ALL votes of one person each time.
+            # Measures estimation sensitivity, not forward/generalization accuracy.
+            loo=[]
+            for v in voters:
+                reduced=[b for b in ballots if b[0]!=v]
+                loo.append(price(fit(mu,build_pairs(reduced,idx),PRIMARY_LAMBDA)))
+            loo=np.stack(loo,axis=0)
+            loo_min=loo.min(axis=0);loo_max=loo.max(axis=0)
+            loo_absmax=np.max(np.abs(loo-v8[None,:]),axis=0)
+            loo_rel=loo_absmax/np.maximum(1,v8)
+            support=defaultdict(list)
+            for voter,k,t,c in ballots:
+                for key in (k,t,c):support[key].append(voter)
+            legacy=market.read_json(market.OUTPUT_JSON)['players']
+            rows=[]
+            for i,key in enumerate(players):
+                n=len(support[key]);d=len(set(support[key]));old=legacy.get(key) or {}
+                band=('zero' if n==0 else 'thin_1_3' if n<=3 else 'developing_4_9' if n<=9 else '10_plus')
+                row={'player':key,'pos':model[key]['pos'],'FV':int(fv[i]),
+                     'existing_MV':old.get('market_value',''),
+                     'CAL04_lambda2_same_votes':int(v2[i]),'CAL05_lambda8':int(v8[i]),
+                     'CAL05_minus_FV':int(v8[i]-fv[i]),
+                     'CAL05_minus_existing_MV':int(v8[i]-old['market_value']) if old else '',
+                     'CAL05_abs_pct_from_FV':round(100*abs(v8[i]-fv[i])/fv[i],2),
+                     'ballot_appearances':n,'unique_voters':d,'evidence_band':band,
+                     'LOO_low':int(loo_min[i]),'LOO_high':int(loo_max[i]),
+                     'LOO_max_abs_delta':int(loo_absmax[i]),
+                     'LOO_max_abs_pct':round(float(100*loo_rel[i]),2),
+                     'legacy_market_rank':old.get('market_rank','')}
+                rows.append(row)
+            cols=list(rows[0])
+            with (OUT/'full_pool.csv').open('w',newline='',encoding='utf-8') as h:
+                w=csv.DictWriter(h,fieldnames=cols);w.writeheader();w.writerows(rows)
+            assert len(rows)==len(players)
+            assert all(r['CAL05_lambda8']==r['FV'] and r['LOO_max_abs_delta']==0 for r in rows if r['ballot_appearances']==0)
+            assert not (ROOT/'model/releases/cal03-cross-position-bridge-v1/release.json').exists(), 'CAL03 deployed; revisit CAL05 base premise'
+            def flagged(predicate):return sum(1 for r in rows if predicate(r))
+            counts={
+                'fv_unchanged_in_production':len(rows),
+                'posterior_differs_from_FV':flagged(lambda r:r['CAL05_lambda8']!=r['FV']),
+                'over_25pct_from_FV':flagged(lambda r:r['CAL05_abs_pct_from_FV']>25),
+                'over_50pct_from_FV':flagged(lambda r:r['CAL05_abs_pct_from_FV']>50),
+                'thin_with_over_25pct_move':flagged(lambda r:r['evidence_band']=='thin_1_3' and r['CAL05_abs_pct_from_FV']>25),
+                'thin_with_over_50pct_move':flagged(lambda r:r['evidence_band']=='thin_1_3' and r['CAL05_abs_pct_from_FV']>50),
+                'one_voter_loses_over_10pct':flagged(lambda r:r['LOO_max_abs_pct']>10),
+                'one_voter_loses_over_20pct':flagged(lambda r:r['LOO_max_abs_pct']>20),
+                'one_voter_loses_over_30pct':flagged(lambda r:r['LOO_max_abs_pct']>30),
+            }
+            bands=dict(Counter(r['evidence_band'] for r in rows))
+            meta={
+                'status':'RESEARCH_PREVIEW_NO_PRODUCTION_CHANGES',
+                'method':'CAL05_fixed_lambda8_FV_informed_Bradley_Terry_v1',
+                'semantics':'FV-informed preference estimate; not independent market price',
+                'base_commit':__import__('subprocess').check_output(['git','rev-parse','HEAD'],text=True).strip() if (ROOT/'.git').exists() else 'local-test-fixture',
+                'input_index_sha256':hashlib.sha256(source_index.read_bytes()).hexdigest(),
+                'input_vote_sha256':vote_digest,
+                'vote_source':source['mode'],
+                'counted_rows_after_daily_cap':len(raw),
+                'usable_ballots':len(ballots),'dropped':skipped,'voters':len(voters),
+                'heldout_evaluation':'five deterministic disjoint voter folds; equal average per voter',
+                'preselected_lambda':PRIMARY_LAMBDA,
+                'baseline_heldout_log_loss':round(baseline_loss,7),
+                'lambda8_heldout_log_loss':round(losses[PRIMARY_LAMBDA],7),
+                'lambda2_heldout_log_loss':round(losses[2.0],7),
+                'lambda24_heldout_log_loss':round(losses[24.0],7),
+                'lambda8_improvement_vs_FV_pct':round(100*(baseline_loss-losses[PRIMARY_LAMBDA])/baseline_loss,3),
+                'lambda8_vs_lambda2_loss_delta':round(losses[PRIMARY_LAMBDA]-losses[2.0],7),
+                'mean_voter_loss_difference_lambda8_minus_FV':round(float(difference.mean()),7),
+                'bootstrap_equal_voter_95pct_ci_difference': [round(y,7) for y in ci],
+                'bootstrap_probability_lambda8_outperforms_FV':round(float(np.mean(means<0)),4),
+                'voters_lambda8_outperforms_FV':int(sum(difference<0)),
+                'LOO_voters_removed_one_at_time':len(voters),
+                'full_pool_players':len(players),'legacy_MV_coverage':len(legacy),
+                'evidence_bands':bands,'distribution':counts,
+                'price_scope':'preview only; no production writes',
+                'last_checked_utc':datetime.now(timezone.utc).isoformat(),
+                'warning':'Held-out voters may share selection effects. Bootstrap reflects voter variation, not pricing-truth uncertainty. LOO is estimation fragility, not accuracy. No holdout guarantees.',
+            }
+            (OUT/'metrics.json').write_text(json.dumps(meta,indent=2,sort_keys=True)+'\n')
+            watch={r['player']:r for r in rows}
+            lines=[
+                '# LOG CAL05 — Fixed λ=8 Market Evidence + Voter Stability', '',
+                '**READ-ONLY PREVIEW. FV, existing MV, free-agent board, trade verdicts, and voting remain unchanged.**','',
+                'This quote is anchored to **Fundamental Value** and adjusted by actual pairwise KTC-style ballots; it is **not** an independent market price.','',
+                f'- Model players: **{len(rows)}**; market price baseline coverage **{len(legacy)}**.',
+                f'- Usable ballots: **{len(ballots)}** from **{len(voters)}** voters; existing daily/voter caps and league/guest weighting preserved.',
+                f'- Dropped ambiguous or duplicate ballot rows: **{sum(skipped.values())}**.',
+                f'- Candidate lambda fixed in advance: **{PRIMARY_LAMBDA:g}** (no post-run selection).', '',
+                '## Five-fold held-out-voter comparison','',
+                '| Model | Equal-voter log loss (lower better) |', '|---|---:|',
+                f'| Current FV-only prior | {baseline_loss:.5f} |',
+                f'| CAL04 aggressive λ=2 (comparison only) | {losses[2.0]:.5f} |',
+                f'| **CAL05 λ=8 fixed candidate** | **{losses[PRIMARY_LAMBDA]:.5f}** |',
+                f'| Conservative comparison λ=24 | {losses[24.0]:.5f} |', '',
+                f'- λ=8 relative reduction vs FV-only: **{100*(baseline_loss-losses[PRIMARY_LAMBDA])/baseline_loss:+.2f}%**.',
+                f'- Equal-voter bootstrap 95% interval for λ=8 minus FV log loss: **[{ci[0]:+.5f}, {ci[1]:+.5f}]**; negative favors λ=8.',
+                f'- Number of voters with lower loss under λ=8: **{int(sum(difference<0))}/{len(voters)}**.',
+                '- Bootstrap reuses the same voter-held-out predictions; it does not create independent future evidence.','',
+                '## Whole-pool risk and robustness','',
+                '| Risk metric | Player count |','|---|---:|',
+                f"| Posterior quote differs from FV | {counts['posterior_differs_from_FV']} |",
+                f"| Move >25% from FV | {counts['over_25pct_from_FV']} |",
+                f"| Move >50% from FV | {counts['over_50pct_from_FV']} |",
+                f"| 1–3-ballot players moving >25% | {counts['thin_with_over_25pct_move']} |",
+                f"| 1–3-ballot players moving >50% | {counts['thin_with_over_50pct_move']} |",
+                f"| Removing one voter moves player's quote >10% | {counts['one_voter_loses_over_10pct']} |",
+                f"| Removing one voter moves player's quote >20% | {counts['one_voter_loses_over_20pct']} |",
+                f"| Removing one voter moves player's quote >30% | {counts['one_voter_loses_over_30pct']} |",
+                '',
+                'LOO = leave one entire voter out (all their ballots), refit λ=8, and compare against the full fit. This captures how strongly one person can move a quote; not a confidence interval.','',
+                '## Owner comparison cases (not used to fit coefficients)','',
+                '| Player | FV | Current MV | CAL05 λ=8 | CAL04 λ=2, same ballots | Ballots / voters | Biggest one-voter shift |',
+                '|---|---:|---:|---:|---:|---|---:|',
+            ]
+            for k in WATCH:
+                r=watch.get(k)
+                if r:lines.append(f"| {k} | {r['FV']:,} | {r['existing_MV'] or '—'} | {r['CAL05_lambda8']:,} | {r['CAL04_lambda2_same_votes']:,} | {r['ballot_appearances']}/{r['unique_voters']} | {r['LOO_max_abs_pct']:.1f}% |")
+            lines+=['','## Largest quote movement from FV (not a tuning list)','',
+                '| Player | FV | CAL05 λ=8 | % from FV | Ballots / voters | LOO max % |',
+                '|---|---:|---:|---:|---|---:|']
+            for r in sorted(rows,key=lambda q:-q['CAL05_abs_pct_from_FV'])[:25]:
+                lines.append(f"| {r['player']} | {r['FV']:,} | {r['CAL05_lambda8']:,} | {r['CAL05_abs_pct_from_FV']:.1f}% | {r['ballot_appearances']}/{r['unique_voters']} | {r['LOO_max_abs_pct']:.1f}% |")
+            lines+=['','## Decision framework','',
+                'This candidate is not automatically approved by a green workflow. Review held-out-voter improvement, voter-bootstrap uncertainty, thin-evidence inflation, and one-voter sensitivity. Importantly, a preference-ranking log loss reduction is *not* a validated trade-price error reduction.',
+                'Recommended eventual production path, if owner approves: publish a separately labeled **FV-Informed Estimate** with source count and an explicit low-evidence indicator; retain the original MV view and leave FV, Team Utility, and trade verdicts unchanged. Freeze the exact vote input and candidate before any apply.']
+            (OUT/'summary.md').write_text('\n'.join(lines)+'\n')
+            print('\n'.join(lines[:36]))
+            print('PASS CAL05 preview only: no production files modified')
+
+        if __name__=='__main__':
+            main()
+        PYCODE
+        python3 /tmp/log_cal05_engine.py
+    - name: Verify no production files changed
+      shell: bash
+      run: |
+        set -euo pipefail
+        git diff --exit-code
+        test -z "$(git status --porcelain --untracked-files=all | grep -v '^?? cal05-preview/' || true)"
+        test -s cal05-preview/full_pool.csv
+        test -s cal05-preview/metrics.json
+        test -s cal05-preview/summary.md
+        python3 - <<'PYCODE'
+        import csv,json
+        with open('cal05-preview/full_pool.csv',newline='') as f:
+            rows=list(csv.DictReader(f))
+        m=json.load(open('cal05-preview/metrics.json'))
+        assert len(rows)==m['full_pool_players']
+        assert m['preselected_lambda']==8
+        assert m['price_scope'].startswith('preview')
+        assert len(set(r['player'] for r in rows))==len(rows)
+        assert all(int(r['FV'])>0 and int(r['CAL05_lambda8'])>0 for r in rows)
+        assert all(int(r['FV'])==int(r['CAL05_lambda8']) for r in rows if r['ballot_appearances']=='0')
+        print('PASS CAL05 artifact integrity and read-only invariants')
+        PYCODE
+    - name: Show CAL05 owner comparison in Actions summary
+      shell: bash
+      run: |-
+        cat cal05-preview/summary.md >> "$GITHUB_STEP_SUMMARY"
+    - name: Upload complete CAL05 owner review
+      uses: actions/upload-artifact@v4
+      with:
+        name: log-cal05-conservative-market-stability-preview
+        path: cal05-preview/
+        retention-days: 30
+        if-no-files-found: error
