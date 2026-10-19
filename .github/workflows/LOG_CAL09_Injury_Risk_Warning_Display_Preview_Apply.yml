@@ -1,0 +1,258 @@
+name: LOG CAL09 - Injury Risk Warning Display Preview Apply
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [preview, apply]
+        required: true
+        default: preview
+        description: "Preview for owner review, or exact-hash apply after approval"
+      preview_run_id:
+        type: string
+        required: false
+        default: ''
+        description: "Apply only: approved green CAL09 preview run ID"
+permissions:
+  contents: write
+  actions: read
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+jobs:
+  cal09:
+    name: CAL09 exact frozen IR/PUP warning preview and apply
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUN_MODE: ${{ inputs.mode }}
+      PREVIEW_ID: ${{ inputs.preview_run_id }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Verify approval and preview base
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git branch --show-current)" = main
+          test -z "$(git status --porcelain --untracked-files=all)"
+          if [ "$RUN_MODE" = apply ]; then
+            [[ "$PREVIEW_ID" =~ ^[0-9]{8,15}$ ]] || { echo 'Provide reviewed green preview run ID'; exit 1; }
+            mkdir -p /tmp/cal09-reviewed
+            gh run download "$PREVIEW_ID" --repo "$GITHUB_REPOSITORY" --name log-cal09-exact-preview --dir /tmp/cal09-reviewed
+            test -s /tmp/cal09-reviewed/review_contract.json
+            python3 - <<'PYCODE'
+          import json,subprocess
+          r=json.load(open('/tmp/cal09-reviewed/review_contract.json'))
+          assert r['release_id']=='cal09-injury-risk-warning-v1'
+          assert r['base_commit']==subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(), 'HEAD moved: preview again'
+          print('Owner-reviewed CAL09 base commit matches')
+          PYCODE
+          elif [ "$RUN_MODE" = preview ]; then
+            test -z "$PREVIEW_ID" || { echo 'preview_run_id must be blank during preview'; exit 1; }
+          else
+            echo 'Choose preview or apply'; exit 1
+          fi
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install existing test dependency
+        run: python3 -m pip install --disable-pip-version-check requests
+      - name: Build exact CAL09 UI-only candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/cal09_builder.py <<'SCRIPT'
+          #!/usr/bin/env python3
+          import hashlib,json,subprocess,sys
+          from pathlib import Path
+          root=Path.cwd()
+          idx=root/'index.html'
+          rel=root/'model/releases/cal06-fv-vote-estimate-v1/release.json'
+          q=root/'scripts/artifacts/generated/fv_informed_estimate_cal05.json'
+          m=root/'scripts/artifacts/generated/market_values.json'
+          def sha(p):return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+          base_release=json.loads(rel.read_text())
+          assert sha(idx)==base_release['deployed_index_sha256'], 'CAL06 base changed; design a new preview instead'
+          assert sha(q)==base_release['market_estimate_artifact_sha256'], 'CAL06 quote changed'
+          assert sha(m)==base_release['existing_market_value_artifact_sha256'], 'Market Value changed'
+          assert 'LOG_CAL09_INJURY_RISK_NOTICE_BEGIN' not in idx.read_text()
+          sys.path.insert(0,str(root/'scripts/validation'))
+          import snapshot_values
+          cfg=snapshot_values.load_from_html(idx)
+          original=snapshot_values.compute_all_values(cfg)
+          assert len(original)==565
+          text=idx.read_text()
+          def exact(s,old,new):
+           count=s.count(old)
+           assert count==1,(old[:100],count)
+           return s.replace(old,new,1)
+          JS_SOURCE='/* LOG_CAL09_INJURY_RISK_NOTICE_BEGIN\n * Status-aware display only. IR/PUP are NOT proof of season-ending injury.\n * Existing uncalibrated INJURY_MULT stays disconnected from playerValue().\n * Never change FV, FV+Votes, old MV, package adjustment or trade verdicts.\n */\nfunction cal09InjuryStatus(asset){\n  if(!asset || asset.type !== \'player\') return null;\n  const key = normalizeName(String(asset.name || \'\'));\n  const info = PLAYER_DB[key];\n  const tag = info && Object.prototype.hasOwnProperty.call(info, \'injury\')\n    ? info.injury : asset.injury;\n  return tag === \'IR\' || tag === \'PUP\' ? tag : null;\n}\nfunction cal09AssetInjuryRiskHTML(asset){\n  const status = cal09InjuryStatus(asset);\n  if(!status) return \'\';\n  return `<div class="asset-market" style="color:var(--amber);" role="note" title="Injury status is informational, not an injury-price adjustment.">⚠ ${status} · FV and FV+Votes exclude injury risk</div>`;\n}\nfunction cal09TradeInjuryRiskHTML(outgoing, incoming){\n  const all = [...outgoing, ...incoming].filter(a => cal09InjuryStatus(a));\n  if(!all.length) return \'\';\n  const detail = all.map(a => escapeHtml(String(a.name || \'\')) + \' (\' + cal09InjuryStatus(a) + \')\').join(\', \');\n  return `<div style="font-family:\'IBM Plex Mono\',monospace;font-size:12px;color:var(--amber);margin-bottom:8px;" role="note">⚠ Injury-risk notice: ${detail}. FV, FV+Votes and the trade verdict do not apply an injury discount. IR/PUP does not itself establish season-ending injury.</div>`;\n}\n/* LOG_CAL09_INJURY_RISK_NOTICE_END */\n\n'
+          text=exact(text,'/* ---------- Separate League Market Value ----------',JS_SOURCE+'/* ---------- Separate League Market Value ----------')
+          text=exact(text,"          ${a.type === 'player' ? fvVoteEstimateHTML(a.name, a.value) : ''}","          ${a.type === 'player' ? fvVoteEstimateHTML(a.name, a.value) : ''}\n          ${a.type === 'player' ? cal09AssetInjuryRiskHTML(a) : ''}")
+          text=exact(text,'  const fvVoteLine = fvVotePackageLineHTML(outgoing, incoming);', '  const fvVoteLine = fvVotePackageLineHTML(outgoing, incoming);\n  const injuryRiskLine = cal09TradeInjuryRiskHTML(outgoing, incoming);')
+          text=exact(text,'      ${fvVoteLine}\n      ${tuLine}','      ${fvVoteLine}\n      ${injuryRiskLine}\n      ${tuLine}')
+          idx.write_text(text)
+          post=snapshot_values.compute_all_values(snapshot_values.load_from_html(idx))
+          assert post==original,'FV changed'
+          assert sha(q)==base_release['market_estimate_artifact_sha256']
+          assert sha(m)==base_release['existing_market_value_artifact_sha256']
+          assert text.count('cal09AssetInjuryRiskHTML(a)')==1
+          assert text.count('cal09TradeInjuryRiskHTML(outgoing, incoming)')==2
+          assert text.count('LOG_CAL09_INJURY_RISK_NOTICE_BEGIN')==1
+          new_rel=root/'model/releases/cal09-injury-risk-warning-v1/release.json'
+          new_rel.parent.mkdir(parents=True,exist_ok=True)
+          head=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+          injured=[]
+          rosters=json.loads((root/'data/league_rosters.json').read_text())
+          for roster in rosters.get('rosters',[]):
+           for slot in ('starters','bench','taxi','reserve_ir'):
+            for p in roster.get(slot,[]):
+             if p.get('injury_status') in ('IR','PUP'):
+              injured.append((p.get('name'),p.get('injury_status')))
+          record={
+           'release_id':'cal09-injury-risk-warning-v1',
+           'candidate_source_commit':head,
+           'candidate_index_sha256':sha(idx),
+           'base_cal06_index_sha256':base_release['deployed_index_sha256'],
+           'cal06_quote_sha256':sha(q),
+           'old_market_sha256':sha(m),
+           'change_scope':'display_only_ir_pup_risk_warning',
+           'source':'current synced PLAYER_DB injury status, with pre-sync asset fallback',
+           'ir_pup_synced_roster_entries_at_preview':len(injured),
+           'brian_burns_ir_in_snapshot':('Brian Burns','IR') in injured,
+           'index_fv_player_count':len(original),
+           'fv_changed_players':0,
+           'fv_votes_changed_players':0,
+           'market_value_changed_players':0,
+           'trade_verdict_math_changed':False,
+           'uncalibrated_injury_multiplier_reenabled':False,
+           'status':'exact_hash_owner_review_candidate_not_deployment_status',
+          }
+          new_rel.write_text(json.dumps(record,indent=2,sort_keys=True)+'\n')
+          output=root/'cal09-preview'
+          output.mkdir(exist_ok=True)
+          lines=['# CAL09 — IR/PUP Injury Risk Warning (display only)', '',
+           '**Preview only.** Owner must separately approve exact-hash apply.', '',
+           f'- Base commit: `{head}`',
+           f'- Existing FV parity: **{len(original)}/{len(original)}**, zero changes.',
+           '- Existing MV, FV+Votes, and trade verdict: **no changes**.',
+           '- IR/PUP source: currently synced player injury status in roster/PLAYER_DB; no automated claim of a season-ending injury.',
+           f'- IR/PUP entries in current league roster snapshot: **{len(injured)}**.',
+           f'- Brian Burns in current synced roster as IR: **{record["brian_burns_ir_in_snapshot"]}**.',
+           '- Existing `INJURY_MULT` remains disconnected from pricing; it has no validated numeric effect.',
+           '- UI changes: player-card warning and trade-impact note only when IR/PUP players are present.',
+           '- If no synced injury status, no new warning. Neither cached season-ending diagnosis nor injury-value estimate is fabricated.',
+           '- Browser-helper smoke is sandboxed JS; run a real device/browser check after apply.',
+           '','## Exact change scope','', '- `index.html`', '- `model/releases/cal09-injury-risk-warning-v1/release.json`']
+          (output/'summary.md').write_text('\n'.join(lines)+'\n')
+          print('CAL09 builder PASS',len(original),'FV values unchanged;',len(injured),'current IR/PUP roster entries')
+          SCRIPT
+          python3 /tmp/cal09_builder.py
+      - name: Run isolated UI smoke checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/cal09_smoke.cjs <<'SCRIPT'
+          const fs=require('node:fs'), vm=require('node:vm'), assert=require('node:assert/strict');
+          const html=fs.readFileSync('index.html','utf8');
+          const start=html.indexOf('/* LOG_CAL09_INJURY_RISK_NOTICE_BEGIN');
+          const end=html.indexOf('/* LOG_CAL09_INJURY_RISK_NOTICE_END */',start);
+          assert(start>=0 && end>start);
+          const code=html.slice(start,end+'/* LOG_CAL09_INJURY_RISK_NOTICE_END */'.length);
+          const db={
+           'brian burns':{pos:'DL',injury:'IR'},
+           'brian branch':{pos:'DB',injury:'PUP'},
+           'normal player':{pos:'WR',injury:null},
+           'out player':{pos:'RB',injury:'Out'},
+           'cleared player':{pos:'QB',injury:null},
+           '<script>':{pos:'WR',injury:'IR'}
+          };
+          const sandbox={PLAYER_DB:db,
+           normalizeName:s=>String(s).trim().toLowerCase().replace(/[.'’-]/g,'').replace(/\s+/g,' '),
+           escapeHtml:s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')
+          };
+          vm.createContext(sandbox);vm.runInContext(code,sandbox,{timeout:2000});
+          const invoke=(fn,args)=>sandbox[fn](...args);
+          let burns={type:'player',name:'Brian Burns',value:6007,injury:'IR'};
+          let branch={type:'player',name:'Brian Branch',value:2300};
+          assert(invoke('cal09AssetInjuryRiskHTML',[burns]).includes('FV and FV+Votes exclude injury risk'));
+          assert(invoke('cal09AssetInjuryRiskHTML',[branch]).includes('PUP'));
+          assert.equal(invoke('cal09AssetInjuryRiskHTML',[{type:'pick',name:'2027 first',injury:'IR'}]),'');
+          assert.equal(invoke('cal09AssetInjuryRiskHTML',[{type:'player',name:'normal player',injury:null}]),'');
+          assert.equal(invoke('cal09AssetInjuryRiskHTML',[{type:'player',name:'out player',injury:'Out'}]),'');
+          assert.equal(invoke('cal09AssetInjuryRiskHTML',[{type:'player',name:'cleared player',injury:'IR'}]),'','newly-cleared injury status must override old asset copy');
+          let trade=invoke('cal09TradeInjuryRiskHTML',[[burns],[branch]]);
+          assert(trade.includes('Brian Burns') && trade.includes('Brian Branch') && trade.includes('do not apply an injury discount'));
+          let none=invoke('cal09TradeInjuryRiskHTML',[[{type:'player',name:'normal player'}],[]]);
+          assert.equal(none,'');
+          let x=invoke('cal09TradeInjuryRiskHTML',[[{type:'player',name:'<script>'}],[]]);
+          assert(!x.includes('<script>') && x.includes('&lt;script&gt;'),'Escaping failed');
+          assert(html.includes("${a.type === 'player' ? cal09AssetInjuryRiskHTML(a) : ''}"));
+          assert(html.includes('const injuryRiskLine = cal09TradeInjuryRiskHTML(outgoing, incoming);'));
+          assert(html.includes('${injuryRiskLine}'));
+          console.log('CAL09 JS smoke PASS: status IR/PUP, non-injury, Out, stale, pick, trade, escaped input, integration');
+          SCRIPT
+          node /tmp/cal09_smoke.cjs
+      - name: Validate unchanged model and complete regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/snapshot_values.py --selftest
+          python3 scripts/validation/repo_regression_checks.py
+          python3 scripts/validation/validate_free_agent_valuation_parity.py
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import re,subprocess,tempfile
+          content=Path('index.html').read_text()
+          scripts=re.findall(r'<script(?:\s[^>]*)?>(.*?)</script>',content,re.S|re.I)
+          with tempfile.NamedTemporaryFile('w',suffix='.js') as f:
+            f.write('\n'.join(scripts));f.flush();subprocess.run(['node','--check',f.name],check=True)
+          print('CAL09 syntax PASS')
+          PYCODE
+          git diff --exit-code -- scripts/artifacts/generated/fv_informed_estimate_cal05.json scripts/artifacts/generated/market_values.json free-agent-board.html scripts/validation/snapshot_values.py
+          extras=$(git status --porcelain --untracked-files=all | sed -E 's/^...//' | grep -v '^index.html$' | grep -v '^model/releases/cal09-injury-risk-warning-v1/release.json$' | grep -v '^cal09-preview/' || true)
+          if [ -n "$extras" ]; then echo "Unexpected CAL09 edits: $extras"; exit 1; fi
+      - name: Freeze exact candidate and verify owner-reviewed hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCODE'
+          import subprocess,hashlib,json,os
+          from pathlib import Path
+          files=['index.html','model/releases/cal09-injury-risk-warning-v1/release.json']
+          hashes={name:hashlib.sha256(Path(name).read_bytes()).hexdigest() for name in files}
+          contract={'release_id':'cal09-injury-risk-warning-v1','base_commit':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),'files_sha256':hashes}
+          Path('cal09-preview/review_contract.json').write_text(json.dumps(contract,indent=2,sort_keys=True)+'\n')
+          if os.environ['RUN_MODE']=='apply':
+             approved=json.loads(Path('/tmp/cal09-reviewed/review_contract.json').read_text())
+             assert contract==approved,'Generated candidate differs from owner-reviewed preview; run preview again'
+             print('CAL09 exact candidate matches approved preview')
+          with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as f:
+             f.write(Path('cal09-preview/summary.md').read_text())
+          print('CAL09 release files frozen:',hashes)
+          PYCODE
+      - name: Upload preview evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-cal09-exact-preview
+          path: cal09-preview/
+          retention-days: 30
+          if-no-files-found: error
+      - name: Commit only approved exact CAL09 preview
+        if: ${{ inputs.mode == 'apply' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add index.html model/releases/cal09-injury-risk-warning-v1/release.json
+          git diff --cached --check
+          git diff --cached --quiet && { echo 'No changes staged'; exit 1; }
+          git commit -m 'CAL09: show live IR/PUP risk warning without repricing'
+          git push origin HEAD:main
