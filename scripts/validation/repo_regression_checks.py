@@ -502,6 +502,11 @@ def check_preferred_bake_preview_invariants():
 
 
 def check_deployed_idp_v1_invariants():
+    if (REPO_ROOT / "model/releases/cal15-idp-2026-horizon-bounded-v1/release.json").exists():
+        import validate_cal15_successor
+        result = validate_cal15_successor.validate_deployment_successor()
+        assert result["status"] == "PASS"
+        return
     result = validate_idp_v1_final_deployment.validate_deployment()
     assert result["status"] == "PASS"
     assert result["actual_changed_entry_count"] == 320, result["actual_changed_entry_count"]
