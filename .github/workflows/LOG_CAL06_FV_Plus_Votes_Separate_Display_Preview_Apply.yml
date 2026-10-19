@@ -1,0 +1,373 @@
+name: LOG CAL06 - FV Plus Votes Separate Display Preview Apply
+'on':
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Owner review preview or owner-approved exact-hash apply
+        type: choice
+        options:
+        - preview
+        - apply
+        default: preview
+        required: true
+      preview_run_id:
+        description: 'Apply only: approved CAL06 green preview run ID'
+        type: string
+        required: false
+        default: ''
+permissions:
+  contents: write
+  actions: read
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+jobs:
+  cal06:
+    name: Freeze CAL05 read-only market estimate and UI
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      RUN_MODE: ${{ inputs.mode }}
+      PREVIEW_ID: ${{ inputs.preview_run_id }}
+      GH_TOKEN: ${{ github.token }}
+      CAL05_SOURCE_RUN: '39189810391'
+    steps:
+    - name: Checkout main
+      uses: actions/checkout@v4
+      with:
+        ref: main
+        fetch-depth: 0
+    - name: Guard branch and apply approval
+      shell: bash
+      run: |-
+        set -euo pipefail
+        test "$(git branch --show-current)" = main
+        test -z "$(git status --porcelain --untracked-files=all)"
+        if [ "$RUN_MODE" = apply ]; then
+          [[ "$PREVIEW_ID" =~ ^[0-9]{8,15}$ ]] || { echo 'Provide the CAL06 green preview run ID'; exit 1; }
+          mkdir -p /tmp/cal06-reviewed
+          gh run download "$PREVIEW_ID" --repo "$GITHUB_REPOSITORY" --name log-cal06-exact-preview --dir /tmp/cal06-reviewed
+          test -s /tmp/cal06-reviewed/review_contract.json
+          python3 - <<'PYCODE'
+        import json,subprocess
+        p=json.load(open('/tmp/cal06-reviewed/review_contract.json'))
+        sha=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+        assert p['release_id']=='cal06-fv-vote-estimate-v1'
+        assert p['base_git_sha']==sha,'HEAD moved since the reviewed preview; repeat preview instead'
+        print('Approved CAL06 preview anchored to exact HEAD',sha)
+        PYCODE
+        elif [ "$RUN_MODE" = preview ]; then
+          test -z "$PREVIEW_ID" || { echo 'preview_run_id must be blank in preview mode'; exit 1; }
+        else
+          echo "Unrecognized CAL06 mode: $RUN_MODE"; exit 1
+        fi
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Install test dependencies
+      run: python3 -m pip install --disable-pip-version-check requests
+    - name: Download and pin reviewed CAL05 source
+      shell: bash
+      run: "set -euo pipefail\n mkdir -p /tmp/cal05-source\n gh run download \"$CAL05_SOURCE_RUN\" --repo \"$GITHUB_REPOSITORY\"\
+        \ --name log-cal05-conservative-market-stability-preview --dir /tmp/cal05-source\n test -s /tmp/cal05-source/full_pool.csv\n\
+        \ test -s /tmp/cal05-source/metrics.json\n echo 'CAL05 source archive files downloaded (SHA256 checked by\
+        \ next step).' "
+    - name: Build exact CAL06 quote and display-only source
+      shell: bash
+      run: |-
+        set -euo pipefail
+        cat > /tmp/cal06_builder.py <<'PYCODE'
+        #!/usr/bin/env python3
+        """Freeze CAL05 shadow as distinct read-only FV+Votes quote; never modify FV or voting model."""
+        from __future__ import annotations
+        import csv
+        import hashlib
+        import json
+        import math
+        import os
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        ROOT=Path.cwd()
+        SRC=Path('/tmp/cal05-source')
+        OUT=ROOT/'cal06-preview'
+        OUT.mkdir(exist_ok=True)
+        MARKET_REL='scripts/artifacts/generated/fv_informed_estimate_cal05.json'
+        RELEASE_REL='model/releases/cal06-fv-vote-estimate-v1/release.json'
+        SOURCE_CSV_SHA='b3774bcd1787a88e06667de04d76ddffbf007725af61f368cf6f4adccdbb03f2'
+        SOURCE_METRICS_SHA='4e1bd26f6e9b6f4169d217ffc087e509e366ed696b462f1ce6dee81dcdd21a0f'
+        SOURCE_CAL05_RUN=39189810391
+
+
+        def sha(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+        def exact(s,old,new):
+            count=s.count(old)
+            assert count==1,(old[:100],count)
+            return s.replace(old,new,1)
+
+        assert sha(SRC/'full_pool.csv')==SOURCE_CSV_SHA, 'CAL05 full pool changed'
+        assert sha(SRC/'metrics.json')==SOURCE_METRICS_SHA, 'CAL05 model metrics changed'
+        metrics=json.loads((SRC/'metrics.json').read_text())
+        assert metrics['status']=='RESEARCH_PREVIEW_NO_PRODUCTION_CHANGES'
+        assert metrics['preselected_lambda']==8.0
+        assert metrics['full_pool_players']==565
+        assert metrics['usable_ballots']==903 and metrics['voters']==35
+        assert metrics['input_index_sha256']==sha(ROOT/'index.html'), 'Live FV engine changed after CAL05: rerun the market study first'
+        assert metrics['base_commit']=='6055de146cfd110af6a9725cc7b9def631cfa2f8'
+        assert metrics['input_vote_sha256']=='b7573cafbafa7d10b70825c342aaaa70a81e66dc62b48c5d54a806d32d700e1e'
+
+        sys.path.insert(0,str(ROOT/'scripts/validation'))
+        import snapshot_values
+        cfg=snapshot_values.load_from_html(ROOT/'index.html')
+        values=snapshot_values.compute_all_values(cfg)
+        assert len(values)==565
+        rows=list(csv.DictReader((SRC/'full_pool.csv').open(newline='',encoding='utf-8')))
+        assert len(rows)==565
+        assert len({r['player'] for r in rows})==565
+        assert set(r['player'] for r in rows)==set(values)
+        required={'zero','thin_1_3','developing_4_9','10_plus'}
+        players={}
+        for r in rows:
+            k=r['player'];v=values[k]
+            f=int(r['FV']);quote=int(r['CAL05_lambda8']);appear=int(r['ballot_appearances']);voters=int(r['unique_voters']);loo=round(float(r['LOO_max_abs_pct']),2)
+            assert f==v['value'] and r['pos']==v['pos'],f'FV mismatch: {k}'
+            assert quote>=0 and appear>=0 and voters>=0 and voters<=appear
+            assert math.isfinite(loo) and 0<=loo<100
+            band=r['evidence_band']
+            assert band in required
+            assert band==('zero' if appear==0 else 'thin_1_3' if appear<=3 else 'developing_4_9' if appear<=9 else '10_plus'),k
+            if appear==0:assert quote==f and voters==0
+            players[k]={
+                'pos':v['pos'],'fundamental_value':f,
+                'fv_informed_estimate':quote,'ballot_appearances':appear,
+                'distinct_voters':voters,'evidence_band':band,'loo_max_abs_pct':loo,
+            }
+        assert sum(x['ballot_appearances']==0 for x in players.values())==63
+        assert sum(x['fv_informed_estimate']!=x['fundamental_value'] for x in players.values())==499
+        assert sum(abs(x['fv_informed_estimate']/x['fundamental_value']-1)>0.25 for x in players.values())==21
+        assert sum(abs(x['fv_informed_estimate']/x['fundamental_value']-1)>0.5 for x in players.values())==1
+
+        payload={
+         'schema_version':1,'method':'CAL05_fixed_lambda8_FV_informed_Bradley_Terry_v1',
+         'semantics':'fv_informed_preference_estimate_not_independent_market_price',
+         'display_only':True,'no_trading_math_changes':True,
+         'cal05_preview_run_id':SOURCE_CAL05_RUN,
+         'cal05_source_csv_sha256':SOURCE_CSV_SHA,
+         'cal05_source_metrics_sha256':SOURCE_METRICS_SHA,
+         'cal05_input_vote_sha256':metrics['input_vote_sha256'],
+         'fv_index_sha256_at_fit':metrics['input_index_sha256'],
+         'fit_lambda':8.0,
+         'evaluation':{
+           'usable_ballots':903,'distinct_voters':35,
+           'fv_only_heldout_log_loss':metrics['baseline_heldout_log_loss'],
+           'candidate_heldout_log_loss':metrics['lambda8_heldout_log_loss'],
+           'voters_improved':metrics['voters_lambda8_outperforms_FV'],
+           'pricing_accuracy_validated':False,
+         },
+         'counts':{'player_count':565,'zero_vote_players':63,'posterior_differs_from_FV':499},
+         'players':dict(sorted(players.items())),
+        }
+        market_path=ROOT/MARKET_REL
+        market_path.parent.mkdir(parents=True,exist_ok=True)
+        market_path.write_text(json.dumps(payload,indent=2,sort_keys=True,ensure_ascii=False)+'\n',encoding='utf-8')
+
+        JS=r'''/* LOG CAL06 — Separate FV + Votes estimate (display only). This is a
+           CAL05 λ=8 FV-anchored preference estimate; NOT independent market price.
+           FV, package adjustment, Team Utility and trade verdicts never read it. */
+        const FV_VOTE_ESTIMATE_URL =
+          'https://raw.githubusercontent.com/ajknoll23-code/LOG-Trade-Calculator/refs/heads/main/scripts/artifacts/generated/fv_informed_estimate_cal05.json';
+        let FV_VOTE_ESTIMATE = null;
+        let FV_VOTE_ESTIMATE_STATUS = 'loading';
+
+        function fvVoteEstimateRow(name, fundamentalValue){
+          const doc = FV_VOTE_ESTIMATE;
+          if(FV_VOTE_ESTIMATE_STATUS !== 'ready' || !doc ||
+              doc.semantics !== 'fv_informed_preference_estimate_not_independent_market_price' ||
+              doc.display_only !== true) return null;
+          const row = doc.players && doc.players[normalizeName(name || '')];
+          if(!row || Number(row.fundamental_value) !== Number(fundamentalValue)) return null;
+          const value = Number(row.fv_informed_estimate);
+          const ballots = Number(row.ballot_appearances);
+          const voters = Number(row.distinct_voters);
+          if(!Number.isSafeInteger(value) || value < 0 ||
+             !Number.isSafeInteger(ballots) || ballots < 0 ||
+             !Number.isSafeInteger(voters) || voters < 0 || voters > ballots) return null;
+          return row;
+        }
+
+        function fvVoteEstimateHTML(name, fundamentalValue){
+          const row = fvVoteEstimateRow(name, fundamentalValue);
+          if(!row) return '';
+          const ballots = Number(row.ballot_appearances);
+          const voters = Number(row.distinct_voters);
+          const value = Number(row.fv_informed_estimate);
+          const risk = Number(row.loo_max_abs_pct);
+          const label = ballots === 0 ? 'no voting evidence — FV only'
+            : ballots <= 3 ? 'thin voting evidence'
+            : ballots <= 9 ? 'developing voting evidence'
+            : '10+ ballots (not a pricing-confidence guarantee)';
+          const tooltip = [
+            'FV + Votes: Fundamental-Value-informed preference estimate (CAL05, lambda 8).',
+            'Not an independent market price or a trade verdict.',
+            `Ballots: ${ballots}; distinct voters: ${voters}.`,
+            label,
+            `Largest leave-one-voter-out movement: ${Number.isFinite(risk) ? risk.toFixed(1)+'%' : 'n/a'}.`,
+            'Frozen 2026-10-19 vote snapshot; not live-updating.',
+          ].join('\n');
+          const confidence = ballots <= 3 || risk > 10 ? 'var(--amber)' : 'var(--text-dim)';
+          return `<div class="asset-market" title="${escapeHtml(tooltip)}">FV+Votes ${value.toLocaleString()} · <span style="color:${confidence}">${ballots === 0 ? 'FV baseline · 0 votes' : `${ballots} votes / ${voters} voters${ballots <= 3 ? ' · thin' : ''}${risk > 10 ? ' · sensitive' : ''}`}</span></div>`;
+        }
+
+        function fvVotePackageLineHTML(outgoing, incoming){
+          const all = [...outgoing,...incoming];
+          if(!all.length) return '';
+          if(FV_VOTE_ESTIMATE_STATUS === 'loading') return `<div style="font-family:'IBM Plex Mono',monospace;font-size:13px;margin-bottom:4px;">FV+Votes estimate: <span style="color:var(--text-dim)">loading…</span></div>`;
+          if(FV_VOTE_ESTIMATE_STATUS !== 'ready') return `<div style="font-family:'IBM Plex Mono',monospace;font-size:13px;margin-bottom:4px;">FV+Votes estimate: unavailable · FV and verdict unchanged</div>`;
+          if(all.some(a => a.type !== 'player')) return `<div style="font-family:'IBM Plex Mono',monospace;font-size:12px;margin-bottom:4px;color:var(--text-dim);">FV+Votes: package estimate not shown with draft picks (player-only quote).</div>`;
+          const outgoingRows=outgoing.map(a=>fvVoteEstimateRow(a.name,a.value));
+          const incomingRows=incoming.map(a=>fvVoteEstimateRow(a.name,a.value));
+          const joined=[...outgoingRows,...incomingRows];
+          if(joined.some(row=>!row)) return `<div style="font-family:'IBM Plex Mono',monospace;font-size:12px;margin-bottom:4px;color:var(--amber);">FV+Votes: incomplete or stale player coverage — no partial total shown</div>`;
+          const net=incomingRows.reduce((t,row)=>t+Number(row.fv_informed_estimate),0)-outgoingRows.reduce((t,row)=>t+Number(row.fv_informed_estimate),0);
+          const thin=joined.filter(row=>Number(row.ballot_appearances)<4).length;
+          const sensitive=joined.filter(row=>Number(row.loo_max_abs_pct)>10).length;
+          const sign=net>=0?'+':'';
+          const color=net>=0?'var(--green)':'var(--red)';
+          const note=thin || sensitive ? ` · ⚠ ${thin} with fewer than 4 votes; ${sensitive} voter-sensitive` : '';
+          return `<div style="font-family:'IBM Plex Mono',monospace;font-size:13px;margin-bottom:4px;">FV+Votes estimate: <span style="color:${color};font-weight:600;">${sign}${net.toLocaleString()}</span> <span style="color:var(--text-dim);">· separate vote-informed FV lens, not verdict</span>${note ? `<div style="font-size:10px;color:var(--amber)">${escapeHtml(note)}</div>` : ''}</div>`;
+        }
+
+        function syncFVVoteEstimateFromGitHub(){
+          FV_VOTE_ESTIMATE_STATUS='loading';
+          fetch(FV_VOTE_ESTIMATE_URL)
+            .then(r => { if(!r.ok)throw new Error('HTTP '+r.status);return r.json(); })
+            .then(doc => {
+              if(doc.schema_version!==1 || doc.semantics!=='fv_informed_preference_estimate_not_independent_market_price' || doc.display_only!==true ||
+                !doc.players || Object.keys(doc.players).length!==565)throw new Error('Unexpected FV+Votes quote artifact');
+              FV_VOTE_ESTIMATE=doc;FV_VOTE_ESTIMATE_STATUS='ready';render();
+            }).catch(()=>{FV_VOTE_ESTIMATE=null;FV_VOTE_ESTIMATE_STATUS='failed';render();});
+        }
+
+        '''
+        index_path=ROOT/'index.html'
+        old_index=index_path.read_text(encoding='utf-8')
+        new_index=exact(old_index,'/* ---------- Separate League Market Value ----------',JS+'/* ---------- Separate League Market Value ----------')
+        new_index=exact(new_index,"          ${a.type === 'player' ? marketValueHTML(a.name, a.value) : ''}","          ${a.type === 'player' ? marketValueHTML(a.name, a.value) : ''}\n          ${a.type === 'player' ? fvVoteEstimateHTML(a.name, a.value) : ''}")
+        new_index=exact(new_index,'  const marketLine = marketPackageLineHTML(marketSummary);','  const marketLine = marketPackageLineHTML(marketSummary);\n  const fvVoteLine = fvVotePackageLineHTML(outgoing, incoming);')
+        new_index=exact(new_index,'      ${marketLine}\n      ${tuLine}', '      ${marketLine}\n      ${fvVoteLine}\n      ${tuLine}')
+        new_index=exact(new_index,'syncMarketValueFromGitHub();','syncMarketValueFromGitHub();\nsyncFVVoteEstimateFromGitHub();')
+        index_path.write_text(new_index,encoding='utf-8')
+
+        # Numeric valuations, ranks, market pipeline and roster utility all unchanged.
+        new_cfg=snapshot_values.load_from_html(index_path)
+        assert snapshot_values.compute_all_values(new_cfg)==values,'CAL06 inadvertently changed FV math'
+        assert cfg['position_weight']==new_cfg['position_weight']
+        assert cfg['prod_mult']==new_cfg['prod_mult']
+        assert new_index.count('fvVoteEstimateHTML(')==2
+        assert new_index.count('fvVotePackageLineHTML(')==2
+        assert new_index.count('syncFVVoteEstimateFromGitHub();')==1
+
+        release={
+         'release_id':'cal06-fv-vote-estimate-v1',
+         'status':'owner_approval_required_to_apply',
+         'feature':'separate_FV_plus_Votes_display_only',
+         'source_cal05_preview_run_id':SOURCE_CAL05_RUN,
+         'source_cal05_csv_sha256':SOURCE_CSV_SHA,
+         'source_cal05_metrics_sha256':SOURCE_METRICS_SHA,
+         'source_fv_index_sha256':metrics['input_index_sha256'],
+         'source_vote_sha256':metrics['input_vote_sha256'],
+         'deployed_index_sha256':sha(index_path),
+         'market_estimate_artifact_sha256':sha(market_path),
+         'existing_market_value_artifact_sha256':sha(ROOT/'scripts/artifacts/generated/market_values.json'),
+         'fv_model_players':len(players),
+         'ballots':903,'distinct_voters':35,'lambda':8.0,
+         'policy':'FV and the old Market Value remain unchanged; player quotes and player-only package comparison are display-only; no draft picks are estimated; no vote refetch; unknown player values are not inferred',
+         'holdouts':'35 existing voters, not an independent future pricing holdout',
+        }
+        rel=ROOT/RELEASE_REL;rel.parent.mkdir(parents=True,exist_ok=True)
+        rel.write_text(json.dumps(release,indent=2,sort_keys=True)+'\n')
+
+        # Exact source output files pinned, and in-repo output reproducible byte for byte.
+        control=[]
+        for name in ('brian burns','fernando mendoza','sonny styles','kc concepcion','malik davis','dorian williams','myles garrett','josh allen','christian watson'):
+         r=players[name];control.append((name,r['fundamental_value'],r['fv_informed_estimate'],r['ballot_appearances'],r['distinct_voters']))
+        lines=['# CAL06 — Separate FV + Votes Quote Release Candidate','','**Preview only until explicit owner apply.**','','- Base HEAD SHA: `' + subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip() + '`',
+          '- Source: CAL05 green run 39189810391; pinned CSV and metrics SHA256; never refetch votes.','- Quoted players: 565; ballot evidence 903 from 35 voters, 63 with zero ballots.','- Full-pool predictions changed in production: **zero**.','- Existing rank-based MV changed: **zero**.','- Trade verdicts, Team Utility, FV constants, role, age, free agent inputs, vote model and draft pick pricing remain untouched.','- New UI: player quotes (FV+Votes), warnings, and player-only package comparison.','- Accuracy: preference log loss improved in CAL05, not independent evidence of true trade-price accuracy.','','## Owner examples','','| Player | FV | New FV+Votes | Ballots | Voters |','|---|---:|---:|---:|---:|']
+        for n,f,q,b,v in control:lines.append(f'| {n.title()} | {f:,} | {q:,} | {b} | {v} |')
+        lines+=['','## Release safety','', '- Uses immutable CAL05 vote/source artifacts; no rebuilt ballots during apply.','- Apply must reproduce exact candidate checksums and match reviewed base HEAD.','- The original Market Value remains visible. This is a **separate** FV-informed quote, not raw league price.']
+        (OUT/'summary.md').write_text('\n'.join(lines)+'\n')
+        (OUT/'source_full_pool.csv').write_bytes((SRC/'full_pool.csv').read_bytes())
+        print('CAL06 builder PASSED; UI+artifact generated; review:',len(players),'players')
+        print('\n'.join(lines[:22]))
+
+        PYCODE
+        python3 /tmp/cal06_builder.py
+    - name: Verify mutation scope and full repository regressions
+      shell: bash
+      run: |-
+        set -euo pipefail
+        python3 scripts/validation/snapshot_values.py --selftest
+        python3 scripts/market/build_market_value.py --selftest
+        python3 scripts/validation/validate_idp_v1_final_deployment.py
+        python3 scripts/validation/repo_regression_checks.py
+        python3 scripts/maintenance/refresh_repo_derived_state.py --check
+        python3 scripts/sync/sync_free_agent_valuation.py --check
+        python3 scripts/validation/validate_free_agent_valuation_parity.py
+        node scripts/validation/role_band_inline_regression.js
+        python3 - <<'PYCODE'
+        from pathlib import Path
+        import re,subprocess,tempfile
+        text=Path('index.html').read_text()
+        scripts=re.findall(r'<script(?:\s[^>]*)?>(.*?)</script>',text,re.S|re.I)
+        with tempfile.NamedTemporaryFile('w',suffix='.js') as f:
+           f.write('\n'.join(scripts));f.flush();subprocess.run(['node','--check',f.name],check=True)
+        print('PASS index inline JS syntax')
+        PYCODE
+        # User-facing read-only quote only: all existing valuation files are unchanged.
+        git diff --exit-code -- free-agent-board.html scripts/artifacts/generated/market_values.json scripts/artifacts/reports/market_value_report.md scripts/market/build_market_value.py scripts/validation/snapshot_values.py
+        allowed='index.html
+        scripts/artifacts/generated/fv_informed_estimate_cal05.json
+        model/releases/cal06-fv-vote-estimate-v1/release.json'
+        found=$(git status --porcelain --untracked-files=all | sed -E 's/^...//' | grep -v '^cal06-preview/' | grep -v '^index.html$' | grep -v '^scripts/artifacts/generated/fv_informed_estimate_cal05.json$' | grep -v '^model/releases/cal06-fv-vote-estimate-v1/release.json$' || true)
+        if [ -n "$found" ]; then echo "Unexpected CAL06 file edits: $found"; exit 1; fi
+    - name: Freeze output SHA256 and verify owner approval
+      shell: bash
+      run: |-
+        set -euo pipefail
+        python3 - <<'PYCODE'
+        from pathlib import Path
+        import json,hashlib,subprocess,os
+        paths=['index.html','scripts/artifacts/generated/fv_informed_estimate_cal05.json','model/releases/cal06-fv-vote-estimate-v1/release.json']
+        contract={
+        'release_id':'cal06-fv-vote-estimate-v1',
+        'base_git_sha':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
+        'source_cal05_run':39189810391,
+        'files_sha256':{p:hashlib.sha256(Path(p).read_bytes()).hexdigest() for p in paths},
+        }
+        Path('cal06-preview/review_contract.json').write_text(json.dumps(contract,indent=2,sort_keys=True)+'\n')
+        if os.environ['RUN_MODE']=='apply':
+         reviewed=json.loads(Path('/tmp/cal06-reviewed/review_contract.json').read_text())
+         assert contract==reviewed,'CAL06 apply output differs from approved preview; rerun preview'
+         print('CAL06 candidate exactly reproduces owner-approved preview')
+        with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as f:
+         f.write(Path('cal06-preview/summary.md').read_text())
+        print('Pinned hash counts:',len(paths))
+        PYCODE
+    - name: Upload owner preview, complete price source, and checksum
+      uses: actions/upload-artifact@v4
+      with:
+        name: log-cal06-exact-preview
+        path: cal06-preview/
+        retention-days: 30
+        if-no-files-found: error
+    - name: Commit only explicitly owner-approved exact preview
+      if: ${{ inputs.mode == 'apply' }}
+      shell: bash
+      run: "set -euo pipefail\ngit config user.name 'github-actions[bot]'\ngit config user.email '41898282+github-actions[bot]@users.noreply.github.com'\n\
+        git add index.html scripts/artifacts/generated/fv_informed_estimate_cal05.json model/releases/cal06-fv-vote-estimate-v1/release.json\n\
+        git diff --cached --check\ngit diff --cached --quiet && { echo 'No approved change staged'; exit 1; }\n\
+        git commit -m 'CAL06: display separate FV-informed vote estimate (CAL05 frozen)'\ngit push origin HEAD:main\n\
+        echo 'CAL06 source and display committed. FV, prior MV, utility and verdict math unchanged.' "
