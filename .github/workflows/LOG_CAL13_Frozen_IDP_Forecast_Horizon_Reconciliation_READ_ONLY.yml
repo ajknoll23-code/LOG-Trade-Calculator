@@ -1,0 +1,247 @@
+name: LOG CAL13 - Frozen IDP Forecast Horizon Reconciliation (Read Only)
+'on':
+  workflow_dispatch: {}
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: log-cal13-readonly
+  cancel-in-progress: false
+jobs:
+  cal13:
+    name: Reconcile weekly forecast horizon with CAL12 sensitivity without changing prices
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Load exact green CAL12 artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/cal12-prior
+          gh run download 39297647024 --repo "$GITHUB_REPOSITORY" --name log-cal12-canonical-idp-fv-shadow --dir /tmp/cal12-prior
+          test -s /tmp/cal12-prior/manifest.json
+          test -s /tmp/cal12-prior/idp_full_shadow.csv
+      - name: Reconcile all 230 IDPs and week coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check requests
+          cat > /tmp/cal13_horizon.py <<'PYCODE'
+          #!/usr/bin/env python3
+          """CAL13: inspect whether weekly Sleeper 2026 projection snapshots are full-season comparable.
+
+          Read-only. The frozen CAL12 price shadow is NOT a recommended price.
+          """
+          import csv
+          import hashlib
+          import json
+          import math
+          import statistics
+          import sys
+          from collections import Counter,defaultdict
+          from pathlib import Path
+
+          ROOT=Path.cwd()
+          OUT=ROOT/'cal13-review'
+          PRIOR=Path('/tmp/cal12-prior')
+          FROZEN_RUN='39297647024'
+          CUTOFF_WEEK=6  # as of 2026-10-19, weeks 1-6 are complete; W7 ongoing
+          WATCH=('brian burns','jalon walker','edgerrin cooper','kerby joseph','will johnson','myles garrett','aidan hutchinson','maxx crosby','greg rousseau','will anderson','jacob rodriguez','jordyn brooks')
+
+          def sha(p):return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+          def num(x):
+              try:
+                  v=float(x)
+                  return v if math.isfinite(v) else None
+              except (ValueError,TypeError):return None
+
+          def weekly_scores(weekly,pid,score_fn,weeks=range(1,19)):
+              rows=[]
+              for w in weeks:
+                  raw=weekly.get(str(w),{})
+                  if not isinstance(raw,dict):raise ValueError(f'invalid week {w} source data')
+                  stats=raw.get(str(pid))
+                  if stats is None:rows.append(None)
+                  elif isinstance(stats,dict):rows.append(float(score_fn(stats)))
+                  else:raise ValueError(f'Invalid stats row: {w}/{pid}')
+              return rows
+
+          def window(rows,cutoff=CUTOFF_WEEK):
+              past=rows[:cutoff];future=rows[cutoff:]
+              a=sum(v for v in past if v is not None);b=sum(v for v in future if v is not None)
+              total=a+b
+              return {'weeks_with_row':sum(v is not None for v in rows),
+                      'early_nonzero_weeks':sum(v is not None and abs(v)>0.001 for v in past),
+                      'late_nonzero_weeks':sum(v is not None and abs(v)>0.001 for v in future),
+                      'past_week_score':round(a,3),'future_week_score':round(b,3),
+                      'past_share_pct':round(100*a/total,2) if total>0 else None,
+                      'season_sum':round(total,3)}
+
+          def horizon_label(record):
+              if record['weeks_with_row']==0:return 'NO_WEEKLY_ROW'
+              if record['season_sum']<=0:return 'ZERO_SEASON_POINTS'
+              if record['early_nonzero_weeks']==0 and record['late_nonzero_weeks']>0:
+                  return 'ZERO_PAST_PROJECTION_POSSIBLE_ROS_FEED'
+              if record['early_nonzero_weeks']>0 and record['late_nonzero_weeks']==0:
+                  return 'ONLY_EARLIER_WEEKS_NONZERO'
+              if record['early_nonzero_weeks']>0 and record['late_nonzero_weeks']>0:
+                  return 'PAST_AND_FUTURE_WEEKLY_PROJECTIONS_PRESENT'
+              return 'OTHER'
+
+          def test():
+              raw={'1':{'11':{'idp_tkl_solo':4}},'7':{'11':{'idp_tkl_solo':6}},'8':{'11':{'idp_tkl_solo':2}}}
+              vals=weekly_scores(raw,'11',lambda s:1.5*s.get('idp_tkl_solo',0))
+              assert len(vals)==18 and vals[0]==6.0 and vals[6]==9.0
+              assert vals[1] is None and vals[7]==3.0
+              v=window(vals)
+              assert v['weeks_with_row']==3 and v['early_nonzero_weeks']==1 and v['late_nonzero_weeks']==2
+              assert horizon_label(v)=='PAST_AND_FUTURE_WEEKLY_PROJECTIONS_PRESENT'
+              vals=weekly_scores({'7':{'11':{'idp_tkl_solo':6}}},'11',lambda s:1.5*s.get('idp_tkl_solo',0))
+              assert horizon_label(window(vals))=='ZERO_PAST_PROJECTION_POSSIBLE_ROS_FEED'
+              print('CAL13 selftest PASS: missing-week detection, exact scoring, past/future window')
+
+          def main():
+              OUT.mkdir(exist_ok=True)
+              from os import environ
+              sys.path.insert(0,str(ROOT/'scripts/model'))
+              from ppg_pipeline import score_week
+
+              target={
+                'index':ROOT/'index.html',
+                'idp_raw_weekly':ROOT/'scripts/artifacts/generated/sleeper_2026_raw_weekly.json',
+                'sleeper_season':ROOT/'scripts/sleeper_2026_projections.json',
+                'tu':ROOT/'scripts/artifacts/generated/team_utility_lineup_projections.json',
+                'frozen_shadow':PRIOR/'idp_full_shadow.csv',
+                'frozen_manifest':PRIOR/'manifest.json'}
+              for k,p in target.items():
+                  if not p.is_file() or p.stat().st_size<10:raise RuntimeError(f'Missing input {k}: {p}')
+              frozen=json.loads(target['frozen_manifest'].read_text())
+              assert frozen['git_head']=='d32b87befe18767c608bf625b35a7a911e040e67'
+              assert frozen['base_hashes']['index']==sha(target['index']), 'Existing live FV file changed after CAL12'
+              assert frozen['base_hashes']['fresh']==sha(target['tu']), 'Fresh V1 forecast changed after CAL12'
+              assert frozen['status']=='FV_SHADOW_ONLY_NOT_AUTHORIZED_TO_APPLY'
+              tu=json.loads(target['tu'].read_text())
+              assert tu['purpose']=='Team Utility starter selection only; never Fundamental Value'
+              assert tu['input_sha256']['scripts/sleeper_2026_projections.json']==sha(target['sleeper_season']), 'Sleeper file no longer matches TU artifact'
+              weekly=json.loads(target['idp_raw_weekly'].read_text())
+              assert isinstance(weekly,dict) and all(str(i) in weekly for i in range(1,19)), 'Expected all 18 source weeks'
+              seasons=json.loads(target['sleeper_season'].read_text())
+              sleeper_by_id={str(s['sleeper_id']):s for s in seasons if s.get('sleeper_id') is not None}
+              with open(target['frozen_shadow'],newline='') as f:rows=list(csv.DictReader(f))
+              assert len(rows)==230, 'CAL12 cohort drift'
+              focus=[];by_label=Counter();by_status=defaultdict(list)
+              for r in rows:
+                  pid=str(r.get('sleeper_id') or '')
+                  pts=weekly_scores(weekly,pid,score_week) if pid else [None]*18
+                  w=window(pts)
+                  labeled=horizon_label(w)
+                  key=r['player'].lower()
+                  source=sleeper_by_id.get(pid,{})
+                  expected=num(source.get('sleeper_2026_proj_total'))
+                  error=abs(w['season_sum']-expected) if expected is not None else None
+                  # The fresh V1 IDP ensemble is NOT equal to the raw Sleeper-only total.
+                  obj={
+                    'player':r['player'],'sleeper_id':pid,'pos':r['pos'],
+                    'injury_status':r.get('injury_status') or '',
+                    'cal12_reason':r['reason'],
+                    'fv_current':r['fv_current'],'fv_cal12_shadow':r.get('fv_shadow') or '',
+                    'cal12_fv_delta':r.get('fv_delta') or '',
+                    'fresh_v1_ensemble':r.get('fresh_v1_projection') or '',
+                    'fresh_sleeper_only':expected if expected is not None else '',
+                    'raw_to_sleeper_total_abs_error':round(error,3) if error is not None else '',
+                    'horizon_indication':labeled,
+                    **w
+                  }
+                  focus.append(obj);by_label[labeled]+=1
+                  by_status['IR/PUP' if r.get('injury_status') in ('IR','PUP') else 'other'].append(obj)
+              # Match season sum to the published Sleeper-only total; permits source-level rounding.
+              matches=[r for r in focus if r['raw_to_sleeper_total_abs_error']!='']
+              large_errors=[r for r in matches if r['raw_to_sleeper_total_abs_error']>1.5]
+              assert len(matches)>=120, f'Too few raw source matches: {len(matches)}'
+              # Large score deltas should be surfaced, not silently treated as correct.
+              with (OUT/'full_idp_weekly_horizon.csv').open('w',newline='') as f:
+                  w=csv.DictWriter(f,fieldnames=list(focus[0]));w.writeheader();w.writerows(focus)
+              with (OUT/'source_mismatches.csv').open('w',newline='') as f:
+                  w=csv.DictWriter(f,fieldnames=list(focus[0]));w.writeheader();w.writerows(large_errors)
+              selected=[r for r in focus if r['player'].lower() in WATCH]
+              with (OUT/'watchlist_week_by_week.json').open('w') as f:
+                  watch={r['player']:{'sleeper_id':r['sleeper_id'],
+                      'projections_by_week':weekly_scores(weekly,r['sleeper_id'],score_week),
+                      'horizon_indication':r['horizon_indication']} for r in selected}
+                  json.dump(watch,f,indent=2,sort_keys=True)
+              prior=focus[:]
+              strong=[r for r in prior if r['cal12_reason']=='SHADOW_COMPUTED_NOT_PRICE_AUTHORIZED' and r['past_share_pct'] is not None]
+              shares=[r['past_share_pct'] for r in strong]
+              ir=[r for r in strong if r['injury_status'] in ('IR','PUP')]
+              healthy=[r for r in strong if r['injury_status'] not in ('IR','PUP')]
+              def median_share(rows):
+                  a=[r['past_share_pct'] for r in rows if r['past_share_pct'] is not None]
+                  return round(statistics.median(a),1) if a else None
+              summary={
+                'state':'HORIZON_AUDIT_ONLY_NO_REPRICING',
+                'cal12_run_id':FROZEN_RUN,'cal12_base_sha':frozen['git_head'],
+                'cal12_index_sha256':sha(target['index']),
+                'current_week_cutoff_complete':CUTOFF_WEEK,
+                'old_idp_v1_is_frozen_2026_season_outlook':True,
+                'fresh_v1_consumer_contract':'Team Utility starter selection only; never Fundamental Value',
+                'idp_players':len(focus),'compared_to_sleeper_raw_sum':len(matches),
+                'large_raw_vs_sleeper_total_errors':len(large_errors),
+                'horizon_indicators':dict(by_label),
+                'eligible_med_past_projection_share_pct':median_share(strong),
+                'ir_pup_med_past_projection_share_pct':median_share(ir),
+                'non_ir_pup_med_past_projection_share_pct':median_share(healthy),
+                'current_prices_changed':False,'candidate_prices_authorized':False,
+                'critical_limit':'A historical weekly projection in a past-week key is not the same as realized points; no 2026 YTD stats are imported here. V1 multi-source ensemble != Sleeper-only week total.'
+              }
+              (OUT/'metrics.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+              lines=['# CAL13 — IDP projection horizon comparability check','','**Read-only. No FV or trade price changes.**','','- Frozen CAL12 run: `'+FROZEN_RUN+'`',
+               f'- CAL12 cohort: **{len(focus)}** current IDP players.',
+               f'- Exact source reconciliations (Sleeper seasonal total vs weekly scoring): **{len(matches)}**.',
+               f'- Source reconciliations with difference >1.5 fantasy points: **{len(large_errors)}**.',
+               '- Week 1–6 is the past-window diagnostic for the 2026-10-19 snapshot. Past weekly projections are **not** realized production.',
+               f'- Median early-week share among CAL12 shadow-eligible players: **{median_share(strong)}%**.',
+               f'- Median early-week share: IR/PUP **{median_share(ir)}%** versus other **{median_share(healthy)}%**.',
+               '','## Horizon indicators','', '| Classification | Players |','|---|---:|']
+              for k,v in by_label.most_common():lines.append(f'| {k} | {v} |')
+              lines+=['','## Named players', '', '| Player | Status | Current FV | CAL12 shadow | FV shadow delta | Past weeks share | Forecast profile |', '|---|---|---:|---:|---:|---:|---|']
+              for r in selected:
+                  oldshadow=r['fv_cal12_shadow'] if r['fv_cal12_shadow']!='' else 'held'
+                  oldv=f'{float(r["cal12_fv_delta"]):+.0f}' if r['cal12_fv_delta']!='' else '—'
+                  past=f'{r["past_share_pct"]:.1f}%' if r['past_share_pct'] is not None else '—'
+                  lines.append(f'| {r["player"].title()} | {r["injury_status"] or "—"} | {r["fv_current"]} | {oldshadow} | {oldv} | {past} | {r["horizon_indication"]} |')
+              lines+=['','## Decision meaning', '',
+                'A source week may still contain preseason projections for completed games. A zero in a past week may instead indicate that the service has moved to remaining-season-only forecasting. Either way, the current source should **not** be treated automatically as a like-for-like dynasty FV reforecast.',
+                'A responsible candidate must reconcile remaining-season forecast versus actual 2026 performance and then define how much a single season changes multi-year dynasty value. CAL12 remains a sensitivity exercise.',
+                '','## Next action','',
+                'If past weeks are largely absent, construct a 2026 actual-to-date plus remaining-season canonical forecast bridge instead of importing CAL12 shadows. If full-year projections persist, investigate injury/cohort-specific changes and quantify prospective bias before an exact-hash apply.']
+              (OUT/'summary.md').write_text('\n'.join(lines)+'\n')
+              print('CAL13 PASS:',len(focus),'IDPs,',len(matches),'week-source matches,',len(large_errors),'source total discrepancies; no value edits')
+              print('CAL13 profile counts:',dict(by_label))
+
+          if __name__=='__main__':
+              if '--selftest' in sys.argv:test()
+              else:main()
+          PYCODE
+          python3 -m py_compile /tmp/cal13_horizon.py
+          python3 /tmp/cal13_horizon.py --selftest
+          python3 /tmp/cal13_horizon.py
+          python3 scripts/validation/snapshot_values.py --selftest
+          test -z "$(git status --porcelain --untracked-files=all | grep -vE '^\?\? cal13-review/' || true)"
+      - name: Upload source-horizon report
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-cal13-idp-horizon-review
+          path: cal13-review/
+          retention-days: 30
+          if-no-files-found: error
