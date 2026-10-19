@@ -1,0 +1,202 @@
+name: LOG CAL07 - Read Only Production Smoke and Target Queue
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cal07:
+    name: Verify CAL06 live-source integration without modifying production
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout production main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install existing snapshot dependency
+        run: python3 -m pip install --disable-pip-version-check requests
+      - name: Validate production source, release freeze, and build owner queue
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p cal07-readonly-output
+          cat > /tmp/cal07_audit.py <<'PYCODE'
+          from __future__ import annotations
+          import csv
+          import hashlib
+          import json
+          import math
+          import sys
+          from collections import Counter
+          from pathlib import Path
+
+          root=Path.cwd()
+          doc_path=root/'scripts/artifacts/generated/fv_informed_estimate_cal05.json'
+          release_path=root/'model/releases/cal06-fv-vote-estimate-v1/release.json'
+          index_path=root/'index.html'
+          old_market_path=root/'scripts/artifacts/generated/market_values.json'
+          assert all(p.is_file() for p in (doc_path,release_path,index_path,old_market_path)), 'CAL06 file missing'
+          def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
+          doc=json.loads(doc_path.read_text(encoding='utf-8'))
+          release=json.loads(release_path.read_text(encoding='utf-8'))
+          assert release['release_id']=='cal06-fv-vote-estimate-v1'
+          assert doc['schema_version']==1
+          assert doc['display_only'] is True and doc['no_trading_math_changes'] is True
+          assert doc['semantics']=='fv_informed_preference_estimate_not_independent_market_price'
+          assert doc['fit_lambda']==8.0
+          assert doc['cal05_preview_run_id']==39189810391
+          assert doc['cal05_source_csv_sha256']==release['source_cal05_csv_sha256']
+          assert doc['cal05_source_metrics_sha256']==release['source_cal05_metrics_sha256']
+          assert doc['cal05_input_vote_sha256']==release['source_vote_sha256']
+          assert sha(doc_path)==release['market_estimate_artifact_sha256'],'CAL06 quote artifact differs from pinned release'
+          assert sha(index_path)==release['deployed_index_sha256'],'Live index changed since CAL06; version new freeze before claiming parity'
+          assert sha(old_market_path)==release['existing_market_value_artifact_sha256'],'Old Market Value changed; stop and review'
+          assert len(doc['players'])==565
+          assert release['fv_model_players']==565 and release['ballots']==903 and release['distinct_voters']==35
+
+          sys.path.insert(0,str(root/'scripts/validation'))
+          import snapshot_values
+          cfg=snapshot_values.load_from_html(index_path)
+          live=snapshot_values.compute_all_values(cfg)
+          assert len(live)==565 and set(live)==set(doc['players'])
+          counters=Counter()
+          for name,row in doc['players'].items():
+              assert name in live
+              assert live[name]['value']==row['fundamental_value'] and live[name]['pos']==row['pos'],name
+              assert type(row['fv_informed_estimate'])==int and row['fv_informed_estimate']>=0
+              b=row['ballot_appearances'];v=row['distinct_voters'];loo=row['loo_max_abs_pct']
+              assert type(b)==int and type(v)==int and 0<=v<=b
+              assert isinstance(loo,(float,int)) and math.isfinite(loo) and 0<=loo<100
+              band=('zero' if b==0 else 'thin_1_3' if b<=3 else 'developing_4_9' if b<=9 else '10_plus')
+              assert band==row['evidence_band'],name
+              if b==0: assert row['fv_informed_estimate']==row['fundamental_value'] and v==0
+              counters[band]+=1
+              if loo>10:counters['sensitive_over_10pct']+=1
+              if row['fv_informed_estimate']!=row['fundamental_value']:counters['differs_from_FV']+=1
+          assert dict((k,counters[k]) for k in ('zero','thin_1_3','developing_4_9','10_plus'))=={
+              'zero':63,'thin_1_3':163,'developing_4_9':281,'10_plus':58}
+          assert counters['sensitive_over_10pct']==83
+          assert counters['differs_from_FV']==499
+
+          page=index_path.read_text(encoding='utf-8')
+          anchors=(
+             'function fvVoteEstimateRow(', 'function fvVoteEstimateHTML(',
+             'function fvVotePackageLineHTML(', 'function syncFVVoteEstimateFromGitHub()',
+             'syncFVVoteEstimateFromGitHub();',
+             "fvVoteEstimateHTML(a.name, a.value)",
+             'fvVotePackageLineHTML(outgoing, incoming)',
+          )
+          for anchor in anchors: assert anchor in page,'UI integration missing: '+anchor
+          assert page.count('syncFVVoteEstimateFromGitHub();')==1
+          # This checks only static hooks. A separate Node sandbox step exercises live JS behavior.
+
+          names=['brian burns','kc concepcion','fernando mendoza','sonny styles','xavier worthy',
+             'malik willis','dorian williams','jihaad campbell','arvell reese','deforest buckner',
+             'greg rousseau','kenyon sadiq','ty simpson','malik davis','dj giddens',
+             'ashton jeanty','odafe oweh','christian watson']
+          assert all(n in doc['players'] for n in names)
+          target_path=root/'cal07-readonly-output/target_queue.csv'
+          with target_path.open('w',newline='',encoding='utf-8') as f:
+              w=csv.writer(f)
+              w.writerow(['player','pos','fundamental_value','fv_plus_votes','ballots','distinct_voters','evidence_band','loo_max_abs_pct','pct_vs_fv'])
+              for name in names:
+                  row=doc['players'][name]
+                  fv=row['fundamental_value'];q=row['fv_informed_estimate']
+                  w.writerow([name,row['pos'],fv,q,row['ballot_appearances'],row['distinct_voters'],row['evidence_band'],row['loo_max_abs_pct'],round(100*(q/fv-1),2) if fv else ''])
+          lines=[
+              '# CAL07 production smoke and targeted review', '',
+              '- Audit type: **read only**; no live model or application files changed.',
+              '- Source: CAL06 deployed, frozen FV-informed preference estimate, not independent market price.',
+              '- Production index/source SHA256: **MATCH** pinned CAL06 release.',
+              '- Existing rank-based market source SHA256: **MATCH** pinned CAL06 release.',
+              '- Current FV equals the stored CAL06 baseline for all **565** players.',
+              '- Voting evidence: **903** usable ballots / **35** voters (frozen).',
+              '- Evidence bands: 63 zero, 163 thin (1–3), 281 developing (4–9), 58 with 10+ ballots.',
+              '- **83** leave-one-voter-out sensitive rows (>10%).',
+              '- Owner target list contains **18** cases; these are review candidates, not approved price edits.',
+              '- CAL06 release manifest status text remains pre-apply by design; deploy verification is GitHub Actions run 39201528873 and Pages run 39201567127.',
+              '- No independent true-market-price accuracy established.',
+              '',
+              '## Next action',
+              '',
+              'Compare owner judgments on high-impact targets; do not blindly promote the old MV or the FV+Votes quote into trade verdict math.',
+          ]
+          (root/'cal07-readonly-output/summary.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
+          print('PASS CAL07 frozen source checks, 565-player FV parity, 18-row target queue')
+          PYCODE
+          python3 /tmp/cal07_audit.py
+      - name: Exercise CAL06 browser helper logic in sandboxed Node
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/cal07_smoke.cjs <<'JSCODE'
+          const fs=require('node:fs');
+          const vm=require('node:vm');
+          const assert=require('node:assert/strict');
+          const html=fs.readFileSync('index.html','utf8');
+          const doc=JSON.parse(fs.readFileSync('scripts/artifacts/generated/fv_informed_estimate_cal05.json','utf8'));
+          const start=html.indexOf('/* LOG CAL06');
+          const end=html.indexOf('/* ---------- Separate League Market Value ----------',start);
+          assert(start>=0 && end>start,'CAL06 isolated JavaScript marker missing');
+          const block=html.slice(start,end);
+          let renders=0;
+          const sandbox={
+              console,
+              render:()=>{renders++;},
+              fetch:async()=>({ok:true,json:async()=>doc}),
+              normalizeName:s=>String(s).trim().toLowerCase().replace(/[.'’-]/g,'').replace(/\s+/g,' '),
+              escapeHtml:s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'),
+          };
+          vm.createContext(sandbox);
+          vm.runInContext(block,sandbox,{timeout:3000});
+          const run=x=>vm.runInContext(x,sandbox,{timeout:3000});
+          async function drain(){for(let i=0;i<12;i++)await Promise.resolve();}
+          (async()=>{
+              assert.equal(run('fvVoteEstimateHTML("brian burns",6007)'),'','Before download: cannot show unverified estimate');
+              run('syncFVVoteEstimateFromGitHub();');await drain();
+              assert.equal(run('FV_VOTE_ESTIMATE_STATUS'),'ready');
+              assert(run('fvVoteEstimateHTML("brian burns",6007)').includes('5,729'));
+              assert.equal(run('fvVoteEstimateRow("brian burns",9999)'),null,'Stale FV mismatch must fail closed');
+              assert(run('fvVoteEstimateHTML("malik davis",848)').includes('thin'));
+              const zero=Object.entries(doc.players).find(([_,p])=>p.ballot_appearances===0);
+              assert(zero,'Missing zero-vote fixture');
+              sandbox._zeroName=zero[0];sandbox._zeroFV=zero[1].fundamental_value;
+              assert(run('fvVoteEstimateHTML(_zeroName,_zeroFV)').includes('0 votes'));
+              const giving=[{type:'player',name:'brian burns',value:6007}];
+              const getting=[{type:'player',name:'kc concepcion',value:2111}];
+              sandbox._giving=giving;sandbox._getting=getting;
+              const text=run('fvVotePackageLineHTML(_giving,_getting)');
+              assert(text.includes('-2,542'),'Player-only package estimate differs from frozen inputs');
+              sandbox._withPick=[{type:'pick',name:'2027 1st',value:3000}];
+              assert(run('fvVotePackageLineHTML(_giving,_withPick)').includes('not shown with draft picks'));
+              sandbox._missing=[{type:'player',name:'imaginary player',value:42}];
+              assert(run('fvVotePackageLineHTML(_giving,_missing)').includes('no partial total shown'));
+              assert(renders>=1,'Quote loaded without re-render');
+              sandbox.fetch=async()=>({ok:false,status:503});
+              run('syncFVVoteEstimateFromGitHub();');await drain();
+              assert.equal(run('FV_VOTE_ESTIMATE_STATUS'),'failed');
+              assert(run('fvVotePackageLineHTML(_giving,_getting)').includes('FV and verdict unchanged'));
+              assert.equal(run('fvVoteEstimateRow("brian burns",6007)'),null);
+              console.log('PASS CAL07 browser-helper smoke: load, 0-vote, thin, stale FV, package, picks, missing, fail closed');
+          })().catch(err=>{console.error(err);process.exitCode=1;});
+          JSCODE
+          node /tmp/cal07_smoke.cjs
+      - name: Recheck production FV invariants
+        run: |
+          python3 scripts/validation/snapshot_values.py --selftest
+          git diff --exit-code -- index.html scripts/artifacts/generated/fv_informed_estimate_cal05.json scripts/artifacts/generated/market_values.json model/releases/cal06-fv-vote-estimate-v1/release.json
+      - name: Upload audit-only report
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-cal07-readonly-smoke-and-target-queue
+          path: cal07-readonly-output/
+          retention-days: 30
+          if-no-files-found: error
