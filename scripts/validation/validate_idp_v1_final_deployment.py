@@ -30,6 +30,7 @@ FOURFORFOUR_PROVISIONAL_RELEASE = REPO_ROOT / "model" / "releases" / "fourforfou
 FOURFORFOUR_OFFENSE_RELEASE = REPO_ROOT / "model" / "releases" / "fourforfour-offense-provisional-10pct-v1" / "release.json"
 FOURFORFOUR_LIVE_ROLE_R1_RELEASE = REPO_ROOT / "model" / "releases" / "fourforfour-offense-live-role-r1-v1" / "release.json"
 FOURFORFOUR_CONFIDENCE_C2_RELEASE = REPO_ROOT / "model" / "releases" / "fourforfour-offense-confidence-c2-v1" / "release.json"
+CAL02_RELEASE = REPO_ROOT / "model" / "releases" / "cal02-dl-residual-reset-v1" / "release.json"
 JSON_OUT = SCRIPT_DIR / "idp_v1_final_deployment_validation.json"
 REPORT = SCRIPT_DIR / "idp_v1_final_deployment_validation.md"
 IDP_POSITIONS = ("LB", "DL", "DB")
@@ -254,7 +255,29 @@ def validate_deployment():
         if int(provisional_release.get("raw_prod_mult_changed_count", 0)) <= 0:
             raise AssertionError("provisional 4for4 release has no recorded production changes")
 
+        # CAL02 is an explicitly tracked successor, not a change to the
+        # immutable previous releases. Undo the 21 deltas only for the
+        # historical expected-hash check, while verifying live new values.
         live_hash = canonical_prod_mult_hash(current)
+        if CAL02_RELEASE.exists():
+            cal02 = json.loads(CAL02_RELEASE.read_text(encoding="utf-8"))
+            assert cal02["release_id"] == "cal02-migrated-dl-lineage-residual-reset-v1"
+            assert cal02["deployed_prod_mult_canonical_sha256"] == live_hash
+            frozen = json.loads((REPO_ROOT / cal02["frozen_candidate_path"]).read_text(encoding="utf-8"))
+            import hashlib
+            assert hashlib.sha256((REPO_ROOT / cal02["frozen_candidate_path"]).read_bytes()).hexdigest() == cal02["frozen_candidate_sha256"]
+            assert set(cal02["players"]) == set(frozen["players"])
+            assert len(cal02["players"]) == 21
+            pre_cal02 = dict(current)
+            for k, row in cal02["players"].items():
+                r = frozen["players"][k]
+                assert r["position"] == "DL"
+                assert abs(float(row["new_raw_prod_mult"]) - float(r["c0_reset"]["raw_prod_mult"])) < 1e-10
+                assert abs(float(row["old_raw_prod_mult"]) - float(r["control"]["raw_prod_mult"])) < 1e-10
+                assert abs(current[k] - float(row["new_raw_prod_mult"])) < 1e-10
+                pre_cal02[k] = float(row["old_raw_prod_mult"])
+            live_hash = canonical_prod_mult_hash(pre_cal02)
+            assert live_hash == cal02["legacy_prod_mult_canonical_sha256"]
         if FOURFORFOUR_OFFENSE_RELEASE.exists():
             offense_release = json.load(
                 open(FOURFORFOUR_OFFENSE_RELEASE, encoding="utf-8")
