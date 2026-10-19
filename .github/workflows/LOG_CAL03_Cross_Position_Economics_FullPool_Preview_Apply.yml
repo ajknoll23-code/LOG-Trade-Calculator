@@ -1,0 +1,301 @@
+name: LOG CAL03 - Full-Pool Position Economics Bridge
+'on':
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Read-only preview or owner-approved apply
+        type: choice
+        options:
+        - preview
+        - apply
+        default: preview
+        required: true
+      preview_run_id:
+        description: 'Apply only: reviewed green preview run ID'
+        type: string
+        required: false
+        default: ''
+permissions:
+  contents: write
+  actions: read
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+jobs:
+  cal03:
+    name: Full-pool position economics candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      RUN_MODE: ${{ inputs.mode }}
+      PREVIEW_ID: ${{ inputs.preview_run_id }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+    - name: Check out main
+      uses: actions/checkout@v4
+      with:
+        ref: main
+        fetch-depth: 0
+    - name: Verify branch and reviewed candidate
+      shell: bash
+      run: |
+        set -euo pipefail
+        test "$(git branch --show-current)" = main
+        test -z "$(git status --porcelain --untracked-files=all)"
+        if [ "$RUN_MODE" = apply ]; then
+          [[ "$PREVIEW_ID" =~ ^[0-9]{8,15}$ ]] || { echo 'Set reviewed CAL03 preview_run_id'; exit 1; }
+          gh run download "$PREVIEW_ID" --repo "$GITHUB_REPOSITORY" --name log-cal03-fullpool-preview --dir /tmp/cal03-reviewed
+          test -s /tmp/cal03-reviewed/review_contract.json
+          python3 - <<'PYCODE'
+        import json,subprocess
+        j=json.load(open('/tmp/cal03-reviewed/review_contract.json'))
+        sha=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+        assert j['base_git_sha']==sha, 'Repo changed: run a new CAL03 preview'
+        assert j['release_id']=='cal03-cross-position-bridge-v1'
+        PYCODE
+        elif [ "$RUN_MODE" = preview ]; then
+          :
+        else echo 'Invalid mode'; exit 1; fi
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+    - name: Install runtime dependencies
+      run: python3 -m pip install --disable-pip-version-check requests
+    - name: Build frozen whole-pool candidate
+      shell: bash
+      run: |
+        set -euo pipefail
+        cat > /tmp/cal03_build.py <<'PYCODE'
+        #!/usr/bin/env python3
+        """CAL03: Current-board, full-pool, frozen bridge_50 position-weight candidate.
+        The only model input changed is POSITION_WEIGHT. No player overrides or live voting fetch.
+        A green preview is not an accuracy claim and never auto-authorizes apply.
+        """
+        import copy,csv,hashlib,json,re,statistics,subprocess,sys
+        from collections import Counter,defaultdict
+        from pathlib import Path
+        root=Path.cwd()
+        sys.path.insert(0,str(root/'scripts/validation'))
+        sys.path.insert(0,str(root/'scripts/market'))
+        import snapshot_values,build_market_value
+        index=root/'index.html'
+        market_file=root/'scripts/artifacts/generated/market_values.json'
+        market_report=root/'scripts/artifacts/reports/market_value_report.md'
+        frozen_file=root/'research/position-weight-v2/position_weight_v2_phase5_frozen_candidates.json'
+        evaluation_file=root/'research/position-weight-v2/position_weight_v2_phase5_evaluation.json'
+        release_file=root/'model/releases/cal03-cross-position-bridge-v1/release.json'
+        out=root/'cal03-preview';out.mkdir(exist_ok=True)
+
+        def json_file(p):return json.loads(p.read_text(encoding='utf-8'))
+        def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
+        def dump(p,o):
+            p.parent.mkdir(parents=True,exist_ok=True)
+            p.write_text(json.dumps(o,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+
+        frozen=json_file(frozen_file)
+        assert frozen['status'] and frozen['research_only'] is True
+        assert frozen['deployment_authorized'] is False
+        variants=frozen['variants']
+        new_weights={k:float(v) for k,v in variants['bridge_50']['position_weights'].items()}
+        base_weights={k:float(v) for k,v in variants['deployed_control']['position_weights'].items()}
+        assert set(new_weights)=={'QB','RB','WR','TE','DL','LB','DB'}
+        assert new_weights['QB']>base_weights['QB'] and new_weights['DL']<base_weights['DL']
+        assert new_weights['WR']==base_weights['WR']==1
+
+        before_config=snapshot_values.load_from_html(index)
+        old_weights=before_config['position_weight']
+        for k,w in base_weights.items():
+            assert abs(old_weights[k]-w)<1e-9,(k,old_weights[k],w)
+        assert old_weights['K']==0.35
+        before=snapshot_values.compute_all_values(before_config)
+        oldmarket=json_file(market_file)
+        assert len(before)>=560 and len(oldmarket['players'])>=500
+        assert not release_file.exists(),'CAL03 already deployed; do not double-apply'
+
+        # Alter only the seven position weights. K remains an exact hold.
+        s=index.read_text(encoding='utf-8')
+        pattern=r'const POSITION_WEIGHT = \{[^\n{}]*\};'
+        assert len(re.findall(pattern,s))==1,'POSITION_WEIGHT layout changed'
+        order=['QB','RB','WR','TE','DL','LB','DB']
+        newobj='const POSITION_WEIGHT = { '+', '.join(f'{p}:{new_weights[p]:.6f}'.rstrip('0').rstrip('.') for p in order)+', K:0.35 };'
+        s,count=re.subn(pattern,lambda _:newobj,s)
+        assert count==1
+        index.write_text(s,encoding='utf-8')
+        after_config=snapshot_values.load_from_html(index)
+        after=snapshot_values.compute_all_values(after_config)
+        assert set(before)==set(after)
+        assert after_config['prod_mult']==before_config['prod_mult']
+        assert after_config['age_curve']==before_config['age_curve']
+        assert after_config['role_mult']==before_config['role_mult']
+        assert after_config['no_real_history']==before_config['no_real_history']
+        assert after_config['player_db']==before_config['player_db']
+        assert after_config['rb_birth_date_data']==before_config['rb_birth_date_data']
+        for k,v in new_weights.items(): assert abs(after_config['position_weight'][k]-v)<1e-9
+        assert after_config['position_weight']['K']==before_config['position_weight']['K']
+        assert all(before[k]['value']==after[k]['value'] for k in before if before[k]['pos'] in ('WR','K'))
+        assert all(after[k]['value']>before[k]['value'] for k in before if before[k]['pos'] in ('QB','RB'))
+        assert all(after[k]['value']<before[k]['value'] for k in before if before[k]['pos'] in ('DL','LB','DB','TE'))
+        changed_fv=sum(after[k]['value']!=before[k]['value'] for k in before)
+        assert changed_fv>=300,changed_fv
+
+        # Preserve all original voter-derived ranks, ratings, ballots, evidence.
+        # Only move the *FV slots* referenced by market quantile mapping.
+        ratings={k:-float(x['market_rank']) for k,x in oldmarket['players'].items()}
+        assert set(ratings)<=set(after)
+        newmarket=copy.deepcopy(oldmarket)
+        recal=build_market_value.quantile_calibrate(after,ratings)
+        assert set(recal)==set(ratings)
+        for k,row in recal.items():
+            assert int(row['market_rank'])==int(oldmarket['players'][k]['market_rank']), ('Market rank drift',k)
+            newmarket['players'][k].update(row)
+            newmarket['players'][k]['market_rating']=oldmarket['players'][k]['market_rating']
+        newmarket['cal03_fv_rebase']={
+            'release_id':'cal03-cross-position-bridge-v1',
+            'market_votes_refreshed':False,
+            'market_ranking_changed':False,
+            'market_method_changed':False,
+            'legacy_market_generated_at_utc':oldmarket.get('generated_at_utc'),
+            'notes':'Exact existing vote ranks, recalibrated to updated current FV slot distribution; NOT independent market price validation.'}
+        build_market_value.validate_payload(newmarket)
+        dump(market_file,newmarket)
+        market_report.write_text('> CAL03: position-weight full-pool FV slot rebase. Vote-derived market ratings and ranks unchanged; no new voting observations.\n\n'+build_market_value.render_report(newmarket),encoding='utf-8')
+
+        # Owner-facing audit covering every live player, all positions and raw ranking guard.
+        rows=[]
+        for k in sorted(before):
+            oldm=oldmarket['players'].get(k);newm=newmarket['players'].get(k)
+            rows.append({
+               'player':k,'pos':before[k]['pos'],
+               'old_FV':before[k]['value'],'candidate_FV':after[k]['value'],
+               'FV_delta':after[k]['value']-before[k]['value'],
+               'FV_pct':round(100*(after[k]['value']/before[k]['value']-1),2) if before[k]['value'] else '',
+               'old_MV':oldm['market_value'] if oldm else '',
+               'candidate_MV':newm['market_value'] if newm else '',
+               'MV_delta':newm['market_value']-oldm['market_value'] if newm else '',
+               'market_rank':oldm['market_rank'] if oldm else '',
+               'market_rating_unchanged':newm['market_rating']==oldm['market_rating'] if newm else ''
+            })
+        with (out/'full_pool.csv').open('w',newline='',encoding='utf-8') as f:
+            w=csv.DictWriter(f,fieldnames=list(rows[0]));w.writeheader();w.writerows(rows)
+        by={r['player']:r for r in rows}
+        posgroups=defaultdict(list)
+        for r in rows:posgroups[r['pos']].append(r)
+        market_changed=sum(r['MV_delta'] not in ('',0) for r in rows)
+        assert all(r['market_rating_unchanged'] is True for r in rows if r['old_MV']!='')
+        evaldoc=json_file(evaluation_file)
+        prior_metrics={x:evaldoc['variant_scores'][x]['cross_position_pairwise']['accuracy'] for x in ('deployed_control','bridge_50')}
+        prior_mae={x:evaldoc['variant_scores'][x]['global_minmax_normalized_error']['mae'] for x in ('deployed_control','bridge_50')}
+        release={
+           'release_id':'cal03-cross-position-bridge-v1',
+           'method':'reuse_frozen_position_weight_v2_bridge_50_with_current_cal02_engine',
+           'base_git_sha':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
+           'frozen_candidate_sha256':sha(frozen_file),
+           'outcome_evaluation_sha256':sha(evaluation_file),
+           'old_position_weights':{k:old_weights[k] for k in sorted(old_weights)},
+           'new_position_weights':{k:after_config['position_weight'][k] for k in sorted(after_config['position_weight'])},
+           'direct_fv_changed':changed_fv,
+           'unchanged_positions':['WR','K'],
+           'market_voter_ranks_unchanged':True,
+           'market_prices_rebased':market_changed,
+           'no_player_specific_overrides':True,
+           'not_independently_calibrated_market_prices':True,
+           'previous_prospective_evidence':{'weeks':evaldoc['completed_consecutive_weeks_used'],
+               'pairwise_accuracy':prior_metrics,'normalized_mae':prior_mae},
+           'owner_review_required':True,
+        }
+        dump(release_file,release)
+        lines=['# CAL03 — Full-pool cross-position economics / frozen bridge_50',
+         f'**Preview base:** `{release["base_git_sha"]}`',
+         f'**FV values changed:** {changed_fv}/{len(rows)}',
+         f'**MV point slots rebased mechanically:** {market_changed}/{len(ratings)}',
+         '**Market voting ranks and ratings changed:** zero',
+         '',
+         '**Important:** This is the existing frozen Position Weight V2 bridge_50, transported onto the LIVE post-CAL02 player pool. It is not fitted to the owner examples.',
+         f'Historical/frozen Week 1–5 cross-position accuracy: control `{prior_metrics["deployed_control"]:.4f}`, bridge `{prior_metrics["bridge_50"]:.4f}` (bridge slightly worse).',
+         f'Normalized MAE: control `{prior_mae["deployed_control"]:.4f}`, bridge `{prior_mae["bridge_50"]:.4f}` (bridge better).',
+         '**Neither establishes market price accuracy. Large QB/RB adjustments require owner review.**',
+         '', '| Position | Count | Old weight | Bridge weight | Median FV delta | Players changed |',
+         '|---|---:|---:|---:|---:|---:|']
+        for pos in ['QB','RB','WR','TE','DL','LB','DB','K']:
+            r=posgroups.get(pos,[])
+            change=[x['FV_pct'] for x in r if isinstance(x['FV_pct'],float)]
+            lines.append(f'| {pos} | {len(r)} | {old_weights[pos]:.6f} | {after_config["position_weight"][pos]:.6f} | {statistics.median(change):+.1f}% | {sum(x["FV_delta"]!=0 for x in r)} |')
+        lines+=['', '| Example | Pos | Current FV | Candidate FV | Current MV | Candidate rebased MV |',
+         '|---|---|---:|---:|---:|---:|']
+        for name in ['brian burns','myles garrett','maxx crosby','aidan hutchinson','josh allen','patrick mahomes','lamar jackson','bijan robinson','jahmyr gibbs','jamarr chase','sonny styles','fernando mendoza','alex highsmith','nick bolton','kc concepcion','malik davis','dorian williams','kenyon sadiq','ty simpson','jihaad campbell','dj giddens','malik willis','xavier worthy','rhamondre stevenson','ashton jeanty','odafe oweh','christian watson','drake london','chris olave','kyle hamilton','amonra st brown']:
+            x=by.get(name)
+            if x:
+                lines.append(f'| {name.title()} | {x["pos"]} | {x["old_FV"]:,} | {x["candidate_FV"]:,} | {x["old_MV"] if x["old_MV"]!="" else "—"} | {x["candidate_MV"] if x["candidate_MV"]!="" else "—"} |')
+        lines+=['','**What changes if applied:** live FV, free-agent valuation and trade outputs for players outside exact-hold positions; MV point mapping is rebased using frozen current market ranks. KTC vote math, age, role, PROD_MULT, draft picks and package rules unchanged.',
+         '**Deployment:** Preview does not push. Apply must match this preview base commit and every output SHA256. No automatic authorization is given by test success.']
+        (out/'summary.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
+        print('\n'.join(lines))
+        PYCODE
+        python3 /tmp/cal03_build.py
+    - name: Synchronize dependent Free Agent Board
+      run: python3 scripts/maintenance/refresh_repo_derived_state.py --write
+    - name: Assert limited file scope
+      shell: bash
+      run: |
+        set -euo pipefail
+        unrelated=$(git diff --name-only -- data/free_agents.json scripts/artifacts/generated/player_positions.json)
+        if [ -n "$unrelated" ]; then echo "Unexpected derived drift: $unrelated"; exit 1; fi
+    - name: Run current repository regression checks
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 scripts/validation/snapshot_values.py --selftest
+        python3 scripts/market/build_market_value.py --selftest
+        python3 scripts/validation/validate_idp_v1_final_deployment.py
+        python3 scripts/validation/repo_regression_checks.py
+        python3 scripts/maintenance/refresh_repo_derived_state.py --check
+        python3 scripts/sync/sync_free_agent_valuation.py --check
+        python3 scripts/validation/validate_free_agent_valuation_parity.py
+        node scripts/validation/role_band_inline_regression.js
+        python3 - <<'PYCODE'
+        import pathlib,re,subprocess,tempfile
+        for name in ('index.html','free-agent-board.html'):
+          text=pathlib.Path(name).read_text()
+          scripts=re.findall(r'<script(?:\s[^>]*)?>(.*?)</script>',text,re.S|re.I)
+          with tempfile.NamedTemporaryFile('w',suffix='.js') as f:
+            f.write('\n'.join(scripts));f.flush();subprocess.run(['node','--check',f.name],check=True)
+        PYCODE
+    - name: Checksum and publish preview
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 - <<'PYCODE'
+        from pathlib import Path
+        import hashlib,json,os,subprocess
+        files=['index.html','free-agent-board.html','scripts/artifacts/generated/market_values.json','scripts/artifacts/reports/market_value_report.md','model/releases/cal03-cross-position-bridge-v1/release.json']
+        contract={'release_id':'cal03-cross-position-bridge-v1','base_git_sha':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
+        'files_sha256':{p:hashlib.sha256(Path(p).read_bytes()).hexdigest() for p in files}}
+        Path('cal03-preview/review_contract.json').write_text(json.dumps(contract,indent=2,sort_keys=True)+'\n')
+        if os.environ['RUN_MODE']=='apply':
+          frozen=json.loads(Path('/tmp/cal03-reviewed/review_contract.json').read_text())
+          assert contract==frozen,'Output differs from reviewed preview; run preview again'
+        with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as f:f.write(Path('cal03-preview/summary.md').read_text())
+        print('CAL03 hash-verified release files:',len(files))
+        PYCODE
+    - name: Upload owner review
+      uses: actions/upload-artifact@v4
+      with:
+        name: log-cal03-fullpool-preview
+        path: cal03-preview/
+        retention-days: 30
+        if-no-files-found: error
+    - name: Commit only approved hash-matched output
+      if: ${{ inputs.mode == 'apply' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        git config user.name 'github-actions[bot]'
+        git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+        git add index.html free-agent-board.html scripts/artifacts/generated/market_values.json scripts/artifacts/reports/market_value_report.md model/releases/cal03-cross-position-bridge-v1/release.json
+        git diff --cached --check
+        git diff --cached --quiet && { echo 'Unexpected empty candidate'; exit 1; }
+        git commit -m 'CAL03: approved cross-position economic weight bridge'
+        git push origin HEAD:main
