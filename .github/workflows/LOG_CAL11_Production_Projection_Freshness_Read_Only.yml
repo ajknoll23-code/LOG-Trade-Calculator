@@ -1,0 +1,248 @@
+name: LOG CAL11 - Production Projection Freshness and Repricing Feasibility
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  cal11:
+    name: Frozen FV versus fresh source input comparison, no value changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout current production
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate model freshness audit code and fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/cal11_bridge.py <<'PYCODE'
+          #!/usr/bin/env python3
+          """CAL11: Identity-safe projection freshness audit (read-only)."""
+          from __future__ import annotations
+          import csv, hashlib, json, math, re, subprocess, sys
+          from collections import Counter, defaultdict
+          from pathlib import Path
+          
+          
+          def sha(path):
+              return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+          
+          
+          def nkey(label):
+              return re.sub(r"\s+", " ", re.sub(r"[.'’\-]", "", str(label or "").strip().lower())).strip()
+          
+          
+          def positive_number(value):
+              return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+          
+          
+          def unique_by(rows, key, label):
+              by = {}; collisions = set()
+              for row in rows:
+                  k = key(row)
+                  if not k: continue
+                  if k in by and by[k] != row: collisions.add(k)
+                  else: by[k] = row
+              for k in collisions: by.pop(k, None)
+              return by, collisions
+          
+          
+          def selftest():
+              assert nkey("  Brian  Burns  ") == "brian burns"
+              assert nkey("D'Andre  Swift") == 'dandre swift'
+              assert positive_number(0) and positive_number(33.6)
+              assert not positive_number(float('nan')) and not positive_number(-1)
+              m,c = unique_by([{"id":"x","team":"A"},{"id":"x","team":"B"},{"id":"y"}],lambda x:x['id'],'test')
+              assert 'x' in c and 'x' not in m and 'y' in m
+              # Replacing a 2026 source is only a hypothetical two-provider blend.
+              assert round((168.8 + 33.6) / 2, 1) == 101.2
+              print('PASS CAL11 selftest: identity collision, numeric validity, name normalization, hypothetical blend')
+          
+          
+          def main():
+              if '--selftest' in sys.argv:
+                  selftest();return
+              base = Path.cwd()
+              output = base/'cal11-output'
+              output.mkdir(exist_ok=True)
+              inputs = {
+                  'index':base/'index.html',
+                  'sleeper':base/'scripts/sleeper_2026_projections.json',
+                  'fantasypros':base/'scripts/fantasypros_2026_projections.json',
+                  'league_rosters':base/'data/league_rosters.json',
+                  'cal06':base/'scripts/artifacts/generated/fv_informed_estimate_cal05.json',
+                  'cal09_release':base/'model/releases/cal09-injury-risk-warning-v1r1/release.json',
+              }
+              for name,path in inputs.items():
+                  if not path.is_file():raise RuntimeError(f'Missing required source: {name}: {path}')
+              sys.path.insert(0,str(base/'scripts/validation'))
+              import snapshot_values
+              cfg=snapshot_values.load_from_html(inputs['index'])
+              live=snapshot_values.compute_all_values(cfg)
+              cal06=json.loads(inputs['cal06'].read_text(encoding='utf-8'))
+              rel=json.loads(inputs['cal09_release'].read_text(encoding='utf-8'))
+              assert len(live)==565 and len(cal06['players'])==565
+              assert all(k in cal06['players'] and live[k]['value']==cal06['players'][k]['fundamental_value'] for k in live)
+              assert rel['release_id']=='cal09-injury-risk-warning-v1r1'
+              assert cal06['display_only'] is True and cal06['no_trading_math_changes'] is True
+              players=set(cfg['player_db'])
+          
+              sleeper=json.loads(inputs['sleeper'].read_text(encoding='utf-8'))
+              fp=json.loads(inputs['fantasypros'].read_text(encoding='utf-8'))
+              rosters=json.loads(inputs['league_rosters'].read_text(encoding='utf-8'))
+              assert isinstance(sleeper,list) and len(sleeper)>200, 'Sleeper source missing bulk data'
+              assert isinstance(fp,list) and len(fp)>100, 'FantasyPros source missing bulk data'
+              assert isinstance(rosters.get('rosters'),list), 'Synced rosters unavailable'
+              by_sl, sl_dup = unique_by(sleeper,lambda p:str(p.get('sleeper_id') or ''),'sleeper')
+              fp_by_name,fp_dup = unique_by(fp,lambda p:nkey(p.get('player')),'fp')
+              league=[]
+              for roster in rosters['rosters']:
+                  for slot in ('starters','bench','taxi','reserve_ir'):
+                      for p in roster.get(slot,[]):
+                          if not p.get('player_id') or not p.get('name'):continue
+                          league.append((slot,p))
+              roster_by_name=defaultdict(list)
+              for slot,p in league:
+                  key=nkey(p['name'])
+                  if key in players:roster_by_name[key].append((slot,p))
+              html=inputs['index'].read_text(encoding='utf-8')
+              body=snapshot_values.extract_object_body(html,'PLAYER_DB')
+          
+              out=[];counts=Counter()
+              for key in sorted(players):
+                  model=live[key]
+                  info=cfg['player_db'][key]
+                  status=roster_by_name.get(key,[])
+                  roster_status='';rid='';slot='';join_state='NO_ROSTER_ID'
+                  # Names here are only an entrypoint. The actual projection match MUST be by immutable Sleeper ID.
+                  id_set={str(p.get('player_id')) for _,p in status if p.get('player_id')}
+                  if len(id_set)==1:
+                      rid=next(iter(id_set));join_state='ID_RESOLVED'
+                      if rid in sl_dup:join_state='SLEEPER_ID_COLLISION'
+                      elif rid not in by_sl:join_state='NO_REFRESHED_SLEEPER_ROW'
+                      else:join_state='JOINED_BY_ID'
+                  elif len(id_set)>1:join_state='ROSTER_ID_COLLISION'
+                  if status:
+                      slot=status[0][0]
+                      statuses={str(p.get('injury_status') or '') for _,p in status}
+                      roster_status=next(iter(statuses)) if len(statuses)==1 else 'CONFLICT'
+                  m=re.search(r"(?m)^\s*'"+re.escape(key)+r"'\s*:\s*\{([^{}\n]*)\}",body)
+                  old=None
+                  if m:
+                      v=re.search(r'\bproj2026:\s*([\d.]+)',m.group(1))
+                      if v:old=float(v.group(1))
+                  fresh=(by_sl.get(rid) or {}).get('sleeper_2026_proj_total') if join_state=='JOINED_BY_ID' else None
+                  if not positive_number(fresh):fresh=None
+                  if rid and rid in by_sl and nkey(by_sl[rid].get('player',''))!=key:
+                      # An exact-ID match with mismatching display name requires explicit alias investigation, not a silent assumption.
+                      join_state='ID_MATCH_NAME_REVIEW'
+                      fresh=None
+                  fprow=fp_by_name.get(key) if key not in fp_dup else None
+                  fp_value=fprow.get('fantasypros_2026_proj') if fprow else None
+                  if not positive_number(fp_value):fp_value=None
+                  # Both stored and refreshed metrics have different methodology. Only a scenario, not an approved projection update.
+                  blended_scenario=round((fresh+fp_value)/2,2) if fresh is not None and fp_value is not None else None
+                  vs_stored=(round(100*(fresh/old-1),2) if old and fresh is not None else None)
+                  blended_vs_stored=(round(blended_scenario-old,2) if blended_scenario is not None and old is not None else None)
+                  category='idp' if info['pos'] in ('DL','LB','DB') else 'offense'
+                  action=('SCENARIO_ONLY_REQUIRES_IDP_CATEGORY_RECOMPUTE' if category=='idp' else 'SCENARIO_ONLY_REQUIRES_PROJECTION_PIPELINE_BRIDGE') if blended_scenario is not None else 'SOURCE_OR_IDENTITY_REVIEW'
+                  row={
+                      'player':key,'pos':info['pos'],'age':info['age'],'role':info['role'],
+                      'injury_status':roster_status,'roster_slot':slot,'join_status':join_state,
+                      'fv_current':model['value'], 'fv_votes_current':cal06['players'][key]['fv_informed_estimate'],
+                      'stored_2026_projection_blended_or_curated':old,
+                      'refreshed_sleeper_2026_total':fresh,
+                      'historical_fantasypros_2026_projection':fp_value,
+                      'two_provider_simple_blend_scenario_ONLY':blended_scenario,
+                      'refreshed_sleeper_vs_stored_pct_NOT_COMPARABLE_METHODS':vs_stored,
+                      'simple_blend_minus_stored_points_SCENARIO_ONLY':blended_vs_stored,
+                      'repricing_status':action
+                  }
+                  out.append(row)
+                  counts[join_state]+=1
+                  if roster_status in ('IR','PUP'):
+                      counts['rostered_IR_PUP_player_db']+=1
+                      if old is not None and fresh is not None:counts['IR_PUP_current_vs_stored_available']+=1
+                  if fresh is not None and old is not None:counts['comparisons']+=1
+                  if blended_scenario is not None and old is not None and abs(blended_vs_stored)>=40:counts['scenario_abs_diff_ge_40']+=1
+              assert len(out)==565
+              burns=next(x for x in out if x['player']=='brian burns')
+              assert burns['fv_current']==6007
+              assert burns['injury_status']=='IR', 'Expected active roster Burns injury status not found; review latest roster before interpreting'
+              assert burns['join_status']=='JOINED_BY_ID',burns
+              assert burns['refreshed_sleeper_2026_total'] is not None,'Missing fresh Burns Sleeper prediction'
+              assert burns['stored_2026_projection_blended_or_curated'] is not None
+          
+              cols=list(out[0])
+              with (output/'full_pool_input_freshness.csv').open('w',newline='',encoding='utf-8') as file:
+                  w=csv.DictWriter(file,fieldnames=cols);w.writeheader();w.writerows(out)
+              focus=sorted((r for r in out if r['stored_2026_projection_blended_or_curated'] is not None and r['refreshed_sleeper_2026_total'] is not None),key=lambda r:(r['injury_status'] not in ('IR','PUP'), -(abs(r['two_provider_simple_blend_scenario_ONLY']-r['stored_2026_projection_blended_or_curated']) if r['two_provider_simple_blend_scenario_ONLY'] is not None else 0),r['player']))
+              with (output/'priority_review_queue.csv').open('w',newline='',encoding='utf-8') as file:
+                  w=csv.DictWriter(file,fieldnames=cols);w.writeheader();w.writerows(focus[:75])
+          
+              manifest={
+                  'status':'READ_ONLY_NOT_PRICE_AUTHORIZED','git_head':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
+                  'input_sha256':{k:sha(v) for k,v in inputs.items()},
+                  'player_count':len(out),'metrics':dict(counts),
+                  'method_guards':[
+                      'Join projection data by Sleeper player ID from current roster; normalized names are used only to locate current PLAYER_DB key.',
+                      'No cross-provider substitution into IDP V1 category ensemble.',
+                      'Historical FantasyPros is stale; two-provider simple blend is a scenario, not production output.',
+                      'No FV, market, vote estimate, package-adjustment, team-utility, or verdict modification.',
+                      'Stored player projection may be curated or blended; raw Sleeper vs stored is not a matched-method measurement.',
+                      'No implied injury discount or automatic model-delta transport.',
+                  ],
+              }
+              (output/'repro_manifest.json').write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+              def val(v):return 'n/a' if v is None else str(v)
+              text='\n'.join([
+                  '# CAL11 — Production-input freshness and recalculation feasibility',
+                  '', '**Decision:** `SOURCE_REFRESH_CONFIRMED_CALIBRATION_BRIDGE_PENDING` — no valuations changed.',
+                  '', '## Scope and checks',
+                  f'- FV baselines preserved exactly: **{len(live)}/565**.',
+                  f'- Unique Sleeper-ID matched comparisons with stored model projections: **{counts["comparisons"]}**.',
+                  f'- Current PLAYER_DB roster entries with IR/PUP: **{counts["rostered_IR_PUP_player_db"]}**.',
+                  f'- Among those, comparable stored/Sleeper projections: **{counts["IR_PUP_current_vs_stored_available"]}**.',
+                  f'- Rows with simple two-source scenario moving ≥40 points: **{counts["scenario_abs_diff_ge_40"]}**.',
+                  '', '## Brian Burns (example, not an approved price change)',
+                  f'- Current FV: **{burns["fv_current"]}**; FV+Votes: **{burns["fv_votes_current"]}**.',
+                  f'- Injury: **{burns["injury_status"]}**; Sleeper ID verified by roster; current projection source row matched by ID.',
+                  f'- Stored model projection: **{val(burns["stored_2026_projection_blended_or_curated"])}**.',
+                  f'- Refreshed Sleeper 2026 total: **{val(burns["refreshed_sleeper_2026_total"])}**.',
+                  f'- Older FantasyPros source: **{val(burns["historical_fantasypros_2026_projection"])}**.',
+                  f'- Simple source-blend sensitivity: **{val(burns["two_provider_simple_blend_scenario_ONLY"])}** (NOT the validated IDP V1 ensemble).',
+                  '', '## Model boundary',
+                  'The exact 2026 provider projection, season horizon, identity, category scoring, and replacement-level lineage must be reconciled to the deployed IDP V1/CAL02 production bridge before any approved production multiplier or FV can change. This workflow intentionally does not try to estimate an ACL discount, assume the newer Sleeper total is interchangeable with the older blended input, or rewrite frozen releases.',
+                  '', '## Next scoped action',
+                  'If the report is green and the major injured-player changes are identified, prepare one directly reviewable CAL12 preview/apply candidate using the canonical 2026 IDP ensemble and deployed model-delta lineage. Constrain its candidate cohort explicitly; provide per-player FV before/after and the unchanged-cohort regression. Production changes require the owner to approve that exact candidate, not a new broad study.',
+              ])
+              (output/'summary.md').write_text(text+'\n',encoding='utf-8')
+              print('PASS CAL11: 565-FV parity, identity-safe source comparison; no production changes')
+              print('matched comparisons:',counts['comparisons'],'rostered IR/PUP:',counts['rostered_IR_PUP_player_db'])
+              print('Burns:',burns['fv_current'],burns['stored_2026_projection_blended_or_curated'],burns['refreshed_sleeper_2026_total'])
+          
+          if __name__=='__main__':main()
+          PYCODE
+          python3 -m py_compile /tmp/cal11_bridge.py
+          python3 /tmp/cal11_bridge.py --selftest
+      - name: Compare source inputs and preserve production invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 /tmp/cal11_bridge.py
+          python3 scripts/validation/snapshot_values.py --selftest
+          git diff --exit-code -- index.html scripts/artifacts/generated/fv_informed_estimate_cal05.json scripts/artifacts/generated/market_values.json model/releases/cal09-injury-risk-warning-v1r1/release.json
+      - name: Upload reviewer-ready evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-cal11-projection-freshness-review
+          path: cal11-output/
+          retention-days: 30
+          if-no-files-found: error
