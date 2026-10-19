@@ -1,0 +1,287 @@
+name: LOG CAL14 - Actual 2026 IDP and ROS FV Candidate Preview (Read Only)
+'on':
+  workflow_dispatch: {}
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: log-cal14-readonly
+  cancel-in-progress: false
+jobs:
+  actual_ros_shadow:
+    name: Frozen full-pool actual plus ROS candidate and production impact
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out production without write access
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install existing scoring dependency
+        run: python3 -m pip install --disable-pip-version-check requests
+      - name: Recover exact CAL12 and CAL13 green evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/cal14-cal12 /tmp/cal14-cal13
+          gh run download 39297647024 --repo "$GITHUB_REPOSITORY" --name log-cal12-canonical-idp-fv-shadow --dir /tmp/cal14-cal12
+          gh run download 39299132784 --repo "$GITHUB_REPOSITORY" --name log-cal13-idp-horizon-review --dir /tmp/cal14-cal13
+          test -s /tmp/cal14-cal12/idp_full_shadow.csv
+          test -s /tmp/cal14-cal12/manifest.json
+          test -s /tmp/cal14-cal13/full_idp_weekly_horizon.csv
+          test -s /tmp/cal14-cal13/metrics.json
+      - name: Verify scores and compute completed-week actual plus ROS shadow
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/cal14_actual_ros.py <<'PYCODE'
+          #!/usr/bin/env python3
+          """CAL14: 2026 completed weeks' realized fantasy points + post-cutoff canonical IDP forecast.
+          No production valuation changes; candidate is forward decision support, not an authorized dynasty calibration.
+          """
+          from __future__ import annotations
+          import csv, hashlib, json, math, os, statistics, sys, time, urllib.request
+          from collections import Counter, defaultdict
+          from copy import deepcopy
+          from pathlib import Path
+
+          ROOT=Path.cwd()
+          OUT=ROOT/'cal14-review'
+          PRIOR12=Path('/tmp/cal14-cal12')
+          PRIOR13=Path('/tmp/cal14-cal13')
+          WEEKS=tuple(range(1,7))
+          WATCH=('brian burns','jalon walker','edgerrin cooper','will johnson','kerby joseph','myles garrett','greg rousseau','jacob rodriguez','aidan hutchinson','maxx crosby','will anderson','jordyn brooks')
+
+          def sha(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+          def num(value):
+              try:
+                  v=float(value)
+                  return v if math.isfinite(v) else None
+              except (ValueError,TypeError):return None
+
+          def jsonload(path):return json.loads(Path(path).read_text(encoding='utf-8'))
+          def csvload(path):return list(csv.DictReader(Path(path).open(newline='',encoding='utf-8')))
+
+          def projected_raw(current,old,new,baseline):
+              assert all(x is not None and math.isfinite(x) for x in (current,old,new,baseline)) and baseline>0
+              return min(1.55,max(0.15,current+0.55*(new-old)/baseline))
+
+          def nowcast(actual,canonical,early,late):
+              """Replace past period's projected share with league-scored actuals; scale current canonical V1 total to future-period Sleeper share.
+              The proportional attribution is an UNVALIDATED scenario approximation when the canonical source blends FP+Sleeper.
+              """
+              assert all(x is not None and x>=0 and math.isfinite(x) for x in (actual,canonical,early,late))
+              total=early+late
+              if total<=0:return None
+              return actual+canonical*late/total
+
+          def selftest():
+              assert nowcast(61,180,60,120)==181
+              assert nowcast(20,100,50,0)==20
+              assert nowcast(0,0,0,0) is None
+              assert abs(projected_raw(1.0,100.0,70.0,150)-.89)<1e-12
+              assert projected_raw(.15,100,0,150)==.15
+              assert projected_raw(1.5,100,1000,100)==1.55
+              import sys
+              sys.path.insert(0,str(ROOT/'scripts/model'))
+              from ppg_pipeline import score_week
+              stats={'idp_tkl_solo':6,'idp_tkl_ast':2,'idp_sack':1,'idp_pass_def':1}
+              assert abs(score_week(stats)-16.5)<1e-6,(score_week(stats),'league 2026 IDP scoring')
+              print('CAL14 selftest PASS: zero-ROS, tracked-week, fallback, clamping, real league IDP scoring')
+
+          def fetch_actual_week(week):
+              url=f'https://api.sleeper.app/v1/stats/nfl/regular/2026/{week}'
+              last=None
+              for attempt in range(3):
+                  try:
+                      req=urllib.request.Request(url,headers={'User-Agent':'LOG-Trade-Calculator-CAL14-2026-Actual-Audit/1.0','Accept':'application/json'})
+                      with urllib.request.urlopen(req,timeout=35) as resp:
+                          raw=resp.read()
+                      if len(raw)<25000:raise ValueError('Unexpectedly short weekly statistics response')
+                      doc=json.loads(raw)
+                      if not isinstance(doc,dict) or len(doc)<300:raise ValueError(f'Insufficient actual stats for week {week}: {len(doc) if isinstance(doc,dict) else type(doc)}')
+                      return doc
+                  except Exception as e:
+                      last=e
+                      if attempt<2:time.sleep(2*(attempt+1))
+              raise RuntimeError(f'Sleeper actual stats unavailable for completed W{week}; fail closed: {last}')
+
+          def main():
+              sys.path.insert(0,str(ROOT/'scripts/validation'))
+              sys.path.insert(0,str(ROOT/'scripts/model'))
+              import snapshot_values as sv
+              from ppg_pipeline import score_week
+              OUT.mkdir(exist_ok=True)
+              c12=jsonload(PRIOR12/'manifest.json')
+              c13=jsonload(PRIOR13/'metrics.json')
+              r12=csvload(PRIOR12/'idp_full_shadow.csv')
+              r13=csvload(PRIOR13/'full_idp_weekly_horizon.csv')
+              assert c12['status']=='FV_SHADOW_ONLY_NOT_AUTHORIZED_TO_APPLY'
+              assert c13['cal12_run_id']=='39297647024'
+              assert c12['base_hashes']['index']==sha(ROOT/'index.html')==c13['cal12_index_sha256']
+              cfg=sv.load_from_html(ROOT/'index.html');before=sv.compute_all_values(cfg)
+              assert len(before)==565 and len(r12)==230 and len(r13)==230
+              m12={r['player']:r for r in r12};m13={r['player']:r for r in r13}
+              assert set(m12)==set(m13)
+              v1=jsonload(ROOT/'model/releases/idp-v1/idp_v1_model_delta_transport_candidate.json')
+              assert v1['projection_weight']==.55 and v1['replacement_rank']==32
+              fresh=jsonload(ROOT/'scripts/artifacts/generated/team_utility_lineup_projections.json')
+              assert sha(ROOT/'scripts/artifacts/generated/team_utility_lineup_projections.json')==c12['base_hashes']['fresh']
+              assert fresh['purpose']=='Team Utility starter selection only; never Fundamental Value'
+              for src,h in fresh['input_sha256'].items():
+                  assert sha(ROOT/src)==h,f'Drifted source: {src}'
+              assert sha(ROOT/'scripts/artifacts/generated/fv_informed_estimate_cal05.json')==c12['base_hashes']['cal06']
+              assert sha(ROOT/'model/releases/cal02-dl-residual-reset-v1/release.json')==c12['base_hashes']['cal02']
+              assert sha(ROOT/'data/league_rosters.json')==c12['base_hashes']['rosters']
+              # Freeze source bytes so future reviewers can reproduce this exact historical decision.
+              source={}
+              for week in WEEKS:
+                  source[str(week)]=fetch_actual_week(week)
+              (OUT/'actual_2026_w1_w6_raw.json').write_text(json.dumps(source,sort_keys=True,separators=(',',':'))+'\n')
+              candidate=deepcopy(cfg);records=[];cohorts=Counter();seen=set()
+              for key,r13 in m13.items():
+                  r12=m12[key];pos=r12['pos'];pid=str(r13['sleeper_id']).strip();old=int(r12['fv_current'])
+                  assert before[key]['value']==old
+                  record={'player':key,'pos':pos,'sleeper_id':pid,'injury_status':r13['injury_status'],
+                          'current_fv':old,'cal12_shadow':r12['fv_shadow'],'cal12_reason':r12['reason'],
+                          'horizon':r13['horizon_indication'],'actual_2026_w1_w6':None,'actual_weeks_present':0,
+                          'sleeper_proj_w1_w6':num(r13['past_week_score']),
+                          'sleeper_proj_w7_w18':num(r13['future_week_score']),
+                          'fresh_idp_v1_full':num(r13['fresh_v1_ensemble']),
+                          'projection_nowcast_2026':None,'frozen_v1_projection':num(r12['old_v1_projection']),
+                          'current_raw_mult':num(r12['raw_prod_mult_current']),
+                          'scenario_raw_mult':None,'fv_scenario':None,'fv_delta':None,'reason':''}
+                  if not pid or not pid.isdigit():record['reason']='HOLD_NO_STABLE_ID'
+                  elif pid in seen:record['reason']='HOLD_DUPLICATE_ID'
+                  else:
+                      seen.add(pid)
+                      pts=[];present=0
+                      for week in WEEKS:
+                          weekly=source[str(week)].get(pid)
+                          if weekly is None:continue
+                          if not isinstance(weekly,dict):raise AssertionError(f'Actual stats row is not dict: {key} W{week}')
+                          val=score_week(weekly)
+                          if not math.isfinite(val):raise AssertionError(f'Nonfinite actual points: {key} W{week}')
+                          pts.append(val);present+=1
+                      record['actual_2026_w1_w6']=round(sum(pts),3)
+                      record['actual_weeks_present']=present
+                      if r12['reason']!='SHADOW_COMPUTED_NOT_PRICE_AUTHORIZED':record['reason']=r12['reason']
+                      elif present==0 and r13['injury_status'] not in ('IR','PUP'):
+                          record['reason']='HOLD_NO_2026_STATS_FOR_ACTIVE_PLAYER'
+                      elif any(record[x] is None for x in ('sleeper_proj_w1_w6','sleeper_proj_w7_w18','fresh_idp_v1_full','frozen_v1_projection','current_raw_mult')):
+                          record['reason']='HOLD_INCOMPLETE_CANONICAL_INPUT'
+                      elif record['sleeper_proj_w1_w6']+record['sleeper_proj_w7_w18']<=0:
+                          record['reason']='HOLD_NO_SLEEPER_WEEKLY_SIGNAL'
+                      elif record['fresh_idp_v1_full']<=0:
+                          record['reason']='HOLD_NO_POSITIVE_CANONICAL_V1'
+                      else:
+                          # Basic source availability, not definitive proof of market or long-term dynasty relevance.
+                          baseline=num(v1['new_model_baseline_by_position'].get(pos))
+                          if baseline is None or baseline<=0:record['reason']='HOLD_FROZEN_BASELINE_MISSING'
+                          else:
+                              val=nowcast(record['actual_2026_w1_w6'],record['fresh_idp_v1_full'],record['sleeper_proj_w1_w6'],record['sleeper_proj_w7_w18'])
+                              newraw=projected_raw(record['current_raw_mult'],record['frozen_v1_projection'],val,baseline)
+                              # Recompute from the canonical live FV, not a linear approximation, preserving age curves and floor rescue.
+                              candidate['prod_mult'][key]=newraw
+                              record['projection_nowcast_2026']=round(val,3)
+                              record['scenario_raw_mult']=newraw
+                              record['reason']='ACTUAL_PLUS_ROS_SENSITIVITY_ONLY'
+                  records.append(record);cohorts[record['reason']]+=1
+              allnew=sv.compute_all_values(candidate)
+              for row in records:
+                  key=row['player']
+                  if row['reason']=='ACTUAL_PLUS_ROS_SENSITIVITY_ONLY':
+                      row['fv_scenario']=allnew[key]['value']
+                      row['fv_delta']=row['fv_scenario']-row['current_fv']
+                  else:
+                      assert allnew[key]['value']==row['current_fv'],(key,'held row repriced')
+              for key in before:
+                  if cfg['player_db'][key]['pos'] not in ('DL','LB','DB'):
+                      assert before[key]['value']==allnew[key]['value'],key
+              assert len(records)==230
+              burns=next(r for r in records if r['player']=='brian burns')
+              assert burns['injury_status']=='IR' and burns['sleeper_id']=='5862'
+              assert burns['sleeper_proj_w7_w18']==0
+              cols=list(records[0]);records.sort(key=lambda z:(z['reason']!='ACTUAL_PLUS_ROS_SENSITIVITY_ONLY',-abs(z['fv_delta'] or 0),z['player']))
+              with (OUT/'full_idp_actual_ros_fv_shadow.csv').open('w',newline='') as h:
+                  wr=csv.DictWriter(h,fieldnames=cols);wr.writeheader();wr.writerows(records)
+              with (OUT/'top_75_review.csv').open('w',newline='') as h:
+                  wr=csv.DictWriter(h,fieldnames=cols);wr.writeheader();wr.writerows(records[:75])
+              changed=[r for r in records if r['fv_delta'] is not None and r['fv_delta']!=0]
+              holds=[r for r in records if r['reason']!='ACTUAL_PLUS_ROS_SENSITIVITY_ONLY']
+              lines=['# CAL14 — 2026 actual-to-date + remaining IDP V1 projection sensitivity','',
+                     '**Owner review only — not a dynasty FV price authorization.**','',
+                     '- League-scored 2026 completed weeks 1–6 actuals pulled directly from Sleeper; weeks 7–18 from frozen October 16 projection snapshot.',
+                     '- Current canonical IDP V1 ensemble prorated to the Sleeper remaining-season weekly forecast share. This proportional attribution is a **modeling assumption** when FP+Sleeper are blended.',
+                     '- 2026 full-season nowcast is actual-to-date plus estimated remaining-season production. This is a **current-year** forecast, not a multi-year market valuation.',
+                     f'- Existing player FV pool: **{len(before)}**, untouched.',
+                     f'- Current IDPs examined: **{len(records)}**.',
+                     f'- Formula-comparable modeled sensitivity rows: **{cohorts["ACTUAL_PLUS_ROS_SENSITIVITY_ONLY"]}**.',
+                     f'- Sensitivity rows with a changed FV: **{len(changed)}**.',
+                     f'- Holds: **{len(holds)}**.',
+                     '- Source actuals snapshot captured in `actual_2026_w1_w6_raw.json`; full player evidence in CSV.',
+                     '- Frozen CAL02, CAL06, CAL09 outputs and core production calculator are unchanged.',
+                     '- **Do not deploy these numbers as dynasty values without adopting and verifying a long-term-injury/year-horizon pricing policy.**',
+                     '', '## Named cases','', '| Player | Status | 2026 actual W1–6 | 2026 nowcast | FV current | Sensitivity FV | Difference | Reason |', '|---|---|---:|---:|---:|---:|---:|---|']
+              for n in WATCH:
+                  r=next(x for x in records if x['player']==n)
+                  def fmt(x):return '—' if x is None or x=='' else f'{x:.1f}' if isinstance(x,(int,float)) else str(x)
+                  lines.append(f'| {n.title()} | {r["injury_status"] or "—"} | {fmt(r["actual_2026_w1_w6"])} | {fmt(r["projection_nowcast_2026"])} | {r["current_fv"]} | {fmt(r["fv_scenario"])} | {fmt(r["fv_delta"])} | {r["reason"]} |')
+              lines+=['','## Cohort holds','', '| Reason | Count |','|---|---:|']
+              for k,v in sorted(cohorts.items()):lines.append(f'| {k} | {v} |')
+              lines+=['','## Deployment considerations','',
+                   'Changing FV would stale the CAL06 frozen FV+Votes player quote for every changed player. A real FV promotion needs an explicit CAL06 quote refresh/rebase and downstream verdict regression in the same versioned release; otherwise the stale quote must be clearly withheld.',
+                   'Do not confuse evidence of an injured 2026 season with a quantified multi-year injury discount. The current 55% V1 projection weight was originally calibrated for historical-to-projected season production, not independently validated against dynasty market transaction values.',
+                   'A realistic release should define how single-season production changes affect long-term values, then preview the complete eligible pool, show coverage/holds and let the owner approve an exact hash candidate. Do not alter production during this workflow.']
+              (OUT/'summary.md').write_text('\n'.join(lines)+'\n')
+              manifest={'schema_version':1,'status':'ACTUAL_ROS_SHADOW_NOT_DYNASTY_PRICE_AUTHORIZED','cal12_run':'39297647024','cal13_run':'39299132784',
+                        'baseline_index_sha256':sha(ROOT/'index.html'),'actual_raw_sha256':sha(OUT/'actual_2026_w1_w6_raw.json'),
+                        'source_actual_endpoint':'api.sleeper.app/v1/stats/nfl/regular/2026/[1-6]',
+                        'cutoff_week':6,'year':2026,'freeze_inputs':{'cal12_manifest':sha(PRIOR12/'manifest.json'),'cal13_metrics':sha(PRIOR13/'metrics.json'),
+                                   'team_utility_projection':sha(ROOT/'scripts/artifacts/generated/team_utility_lineup_projections.json'),
+                                   'league_rosters':sha(ROOT/'data/league_rosters.json')},
+                        'count':{'players_total':565,'idp':230,'sensitivity_computable':cohorts['ACTUAL_PLUS_ROS_SENSITIVITY_ONLY'],'sensitivity_changed':len(changed),'held':len(holds)},
+                        'current_prices_changed':False,'risk':'2026 season outlook sensitivity only; zero scientific evidence from this run for multi-year dynasty injury pricing; prospective attribution by Sleeper weekly share assumed'}
+              (OUT/'manifest.json').write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n')
+              print('CAL14 PASS:',len(records),'IDPs;',cohorts['ACTUAL_PLUS_ROS_SENSITIVITY_ONLY'],'actual+ROS scenarios;',len(changed),'FV sensitivities; production unchanged')
+              print('CAL14 Burns:',burns['actual_2026_w1_w6'],burns['projection_nowcast_2026'],burns['fv_scenario'],burns['reason'])
+
+          if __name__=='__main__':
+              if '--selftest' in sys.argv:selftest()
+              else:main()
+          PYCODE
+          python3 -m py_compile /tmp/cal14_actual_ros.py
+          python3 /tmp/cal14_actual_ros.py --selftest
+          python3 /tmp/cal14_actual_ros.py
+      - name: Validate model and unchanged tracked production
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/snapshot_values.py --selftest
+          python3 scripts/validation/repo_regression_checks.py
+          python3 - <<'PYCODE'
+          import json
+          from pathlib import Path
+          r=json.loads(Path('cal14-review/manifest.json').read_text())
+          assert r['status']=='ACTUAL_ROS_SHADOW_NOT_DYNASTY_PRICE_AUTHORIZED'
+          assert r['count']['players_total']==565
+          assert r['count']['idp']==230
+          assert r['current_prices_changed'] is False
+          assert r['count']['held']+r['count']['sensitivity_computable']==230
+          print('CAL14 invariant PASS: full-pool review, all held rows untouched, no live repricing')
+          PYCODE
+          test -z "$(git status --porcelain --untracked-files=all | grep -vE '^\?\? cal14-review/' || true)"
+      - name: Upload full-pool evidence and reproducible actual snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-cal14-actual-ros-idp-fv-shadow
+          path: cal14-review/
+          retention-days: 30
+          if-no-files-found: error
