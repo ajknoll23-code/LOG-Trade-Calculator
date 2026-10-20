@@ -10,9 +10,9 @@ Status: **`EARLY_DIAGNOSTIC_ONLY`**
 - Frozen candidate SHA256: `56e19f61b9d804a8982a3abbe0b3876b425d0392611f48b4f41595be520a9d1b`
 - Frozen at: **2026-09-03T20:59:35.587961Z**
 - First eligible future week: **1**
-- Completed consecutive weeks used: **[1, 2, 3, 4, 5]**
+- Completed consecutive weeks used: **[1, 2, 3, 4, 5, 6]**
 - Eligible real-history cohort: **441**
-- Players with active game in current window: **404**
+- Players with active game in current window: **408**
 
 ## Prospective metrics
 
@@ -20,10 +20,10 @@ Primary target: **Frozen Fundamental Value vs cumulative future fantasy points**
 
 | Variant | Total Spearman | Total pairwise | Active-PPG Spearman | Δ total Spearman vs control | Mean pos Δ total Spearman |
 |---|---:|---:|---:|---:|---:|
-| `deployed_control` | 0.5885 | 0.7135 | 0.5810 | — | — |
-| `position_k25__w50__all_positions` | 0.5988 | 0.7171 | 0.5977 | +0.0102 | +0.0082 |
-| `position_k25__w50__qb_control` | 0.5945 | 0.7159 | 0.5946 | +0.0059 | +0.0071 |
-| `tier_k50__w25__all_positions` | 0.5911 | 0.7150 | 0.5870 | +0.0025 | +0.0033 |
+| `deployed_control` | 0.5833 | 0.7126 | 0.5747 | — | — |
+| `position_k25__w50__all_positions` | 0.5942 | 0.7162 | 0.5908 | +0.0108 | +0.0074 |
+| `position_k25__w50__qb_control` | 0.5896 | 0.7149 | 0.5878 | +0.0063 | +0.0050 |
+| `tier_k50__w25__all_positions` | 0.5852 | 0.7137 | 0.5797 | +0.0019 | +0.0014 |
 
 ## Readiness ladder
 
