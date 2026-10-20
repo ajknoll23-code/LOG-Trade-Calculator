@@ -1,0 +1,345 @@
+name: CAL16 V2R1 - Offensive FV 565-Player Shadow (READ ONLY)
+
+# V2R1 fix: pin fractional-RB-age FV calculation to CAL15's 2026-10-19 release date.
+# Read-only 565-player exact FV simulation; uses frozen CAL16 V1 Sleeper run.
+# Intentionally no deploy, no modified production files and no automatic owner approval.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: cal16-v2r1-offense-shadow-readonly
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    name: Confirm Sleeper IDs, bound single-provider scenario, audit 565 FV values
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout current CAL15 main in read-only mode
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Retrieve exact successful CAL16 V1 source artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/cal16-v1-evidence
+          gh run download 39371920020 --repo "$GITHUB_REPOSITORY" --name cal16-v1-sleeper-fresh-readonly --dir /tmp/cal16-v1-evidence
+          test -s /tmp/cal16-v1-evidence/cal16-sleeper-readonly-output/summary.json
+          test -s /tmp/cal16-v1-evidence/cal16-sleeper-readonly-output/ros_player_differences.csv
+          test -s /tmp/cal16-v1-evidence/scripts/artifacts/generated/sleeper_2026_raw_weekly.json
+      - name: Execute 565-player read-only shadow and identity checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/cal16_v2_shadow_engine.py <<'PYCODE'
+          #!/usr/bin/env python3
+          """CAL16 V2: scenario-only FV, stable Sleeper identity, no writes to production.
+          
+          Scope: 565-player output. Only eligible QB/RB/WR/TE receive proposed FV shadow.
+          IDP and K retained exactly. Sleeper V1 run provides OLD and NEW ROS values
+          from the same provider and scoring function across weeks 8-18.
+          
+          Method is deliberately labeled a sensitivity scenario rather than calibration.
+          """
+          from __future__ import annotations
+          import csv, hashlib, json, math, re, sys, unicodedata
+          from datetime import date, datetime, timezone
+          from collections import Counter, defaultdict
+          from copy import deepcopy
+          from pathlib import Path
+          
+          ROOT=Path.cwd()
+          OUT=ROOT/'cal16-v2-output'
+          SRC=Path('/tmp/cal16-v1-evidence')
+          FIRST_WEEK=8
+          END_WEEK=18
+          SHOCK_EXPOSURE=0.25
+          FORWARD_WEIGHT=0.55
+          FV_CAP=0.08
+          CAL15_AS_OF=date(2026,10,19)  # Proven by exact 565/565 CAL15 quote parity.
+          OFFENSE={'QB','RB','WR','TE'}
+          MANUAL_ABS=40.0
+          MANUAL_REL=0.50
+          
+          
+          def sha(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+          def load(path):return json.loads(Path(path).read_text(encoding='utf-8'))
+          def nkey(name):
+              s=unicodedata.normalize('NFKD',str(name or '').lower())
+              s=''.join(c for c in s if not unicodedata.combining(c))
+              s=re.sub(r'\b(iii|ii|iv|jr|sr)\b',' ',s)
+              return re.sub(r'[^a-z0-9]+','',s)
+          
+          def serialized_raw(raw):
+              if not math.isfinite(raw):raise ValueError('nonfinite raw multiplier')
+              return float(format(raw,'.12f'))
+          
+          def main():
+              sys.path.insert(0,str(ROOT/'scripts/validation'))
+              import snapshot_values as sv
+              OUT.mkdir(exist_ok=True)
+              summary=load(SRC/'cal16-sleeper-readonly-output/summary.json')
+              assert summary['status']=='READ_ONLY_NOT_AUTHORIZED_FOR_PRICING'
+              assert (summary['season'],summary['ros_first_week'],summary['ros_last_week'])==(2026,8,18)
+              assert summary['hashes']['weekly']['fresh_sha256']==sha(SRC/'scripts/artifacts/generated/sleeper_2026_raw_weekly.json')
+              assert summary['counts']['players_with_ros_deltas']==511
+              diff=list(csv.DictReader((SRC/'cal16-sleeper-readonly-output/ros_player_differences.csv').open(newline='',encoding='utf-8')))
+              assert len(diff)==511 and len({r['sleeper_id'] for r in diff})==len(diff)
+              source={str(r['sleeper_id']):r for r in diff}
+              cfg=sv.load_from_html(ROOT/'index.html')
+              # FIX V2R1: The live RB valuation uses the current UTC date when
+              # calculating fractional ages. CAL15 frozen quotes were built on
+              # 2026-10-19, and recomputing one day later moves some RB values by
+              # more than 3 points (Bijan -7, Gibbs -6). The preview MUST anchor
+              # all original and hypothetical FV calculations to the exact
+              # frozen baseline date. This avoids calendar drift masquerading
+              # as a projection-driven model change. We also retain a separate
+              # current-date drift audit to disclose the live-day discrepancy.
+              unanchored_before=sv.compute_all_values(cfg)
+              baseline_age=sv.fractional_age_from_birth_date
+              def as_of_cal15(birth_date, fallback_age, as_of=None):
+                  return baseline_age(birth_date, fallback_age,
+                                      as_of=CAL15_AS_OF if as_of is None else as_of)
+              sv.fractional_age_from_birth_date=as_of_cal15
+              assert sv.fractional_age_from_birth_date('2002-01-01',23)==baseline_age('2002-01-01',23,as_of=CAL15_AS_OF)
+              before=sv.compute_all_values(cfg)
+              assert len(before)==565 and len([k for k,v in before.items() if v['pos'] in OFFENSE])==319
+              # The canonical snapshot_values loader intentionally parses only pos/age/role.
+              # Read the current, per-player 2026 projection from the SAME production HTML;
+              # calling cfg['player_db'][key].get('proj2026') would silently hold EVERY QB/RB/WR/TE.
+              player_body=sv.extract_object_body((ROOT/'index.html').read_text(encoding='utf-8'),'PLAYER_DB')
+              incumbent_2026={}
+              for name, player_fields in re.findall(r"'([^']+)'\s*:\s*\{([^{}]*)\}",player_body):
+                  projected=re.search(r'\bproj2026:\s*(-?\d+(?:\.\d+)?)',player_fields)
+                  if projected:incumbent_2026[name]=float(projected.group(1))
+              assert len(incumbent_2026)>=500, 'Cannot verify current production 2026 projection input extraction'
+              assert set(incumbent_2026)<=set(cfg['player_db'])
+              release=load(ROOT/'model/releases/cal15-idp-2026-horizon-bounded-v1/release.json')
+              assert release['release_id']=='cal15-idp-2026-horizon-bounded-v1'
+              assert sha(ROOT/'index.html')==release['candidate_index_sha256'], 'Baseline index changed since CAL15; reconsider FV bridge'
+              quotes=load(ROOT/'scripts/artifacts/generated/fv_informed_estimate_cal15.json')
+              assert len(quotes['players'])==565
+              # Exact CAL15 parity is mandatory *after* pinning the valuation
+              # clock to its frozen 2026-10-19 release. This is stricter than
+              # V2's erroneous +/-3 RB allowance, not a relaxed gate.
+              quote_drift=[{'player':k,'position':v['pos'],'computed_fv':v['value'],
+                            'stored_quote_fv':quotes['players'][k]['fundamental_value']}
+                           for k,v in before.items() if quotes['players'][k]['fundamental_value']!=v['value']]
+              # This second cohort is diagnostic only: it reveals the live
+              # runtime-date difference, not a CAL16 source-data difference.
+              current_date_drift=[{'player':k,'position':v['pos'],'current_date_fv':v['value'],
+                                   'cal15_frozen_fv':before[k]['value'],
+                                   'delta':v['value']-before[k]['value']}
+                                  for k,v in unanchored_before.items() if v['value']!=before[k]['value']]
+              assert not quote_drift, ('CAL15 anchored 565-player parity failed',quote_drift[:15])
+              print('CAL15 frozen-date FV parity PASS: 565/565 (2026-10-19 as-of)')
+              print('Diagnostic current-UTC-date RB FV drift:',len(current_date_drift),
+                    'largest:', sorted(current_date_drift,key=lambda r:-abs(r['delta']))[:5])
+          
+              crosswalk=load(ROOT/'scripts/identity_crosswalk.json')
+              idx=defaultdict(list)
+              for r in crosswalk:
+                  pid=str(r.get('sleeper_id') or '')
+                  if not pid or pid.lower() in ('none','null'):continue
+                  idx[nkey(r.get('name'))].append(r)
+              work=deepcopy(cfg)
+              reviews=[];counts=Counter()
+              seen_ids=defaultdict(list)
+          
+              def single_calc(key,raw):
+                  info=cfg['player_db'][key]; pos=info['pos'];age=info['age'];role=info['role']
+                  prod,under=sv.production_multiplier(key,role,{key:raw},cfg['no_real_history'],cfg['role_mult'])
+                  am=sv.effective_age_multiplier(pos,age,role,key,prod,under,cfg)
+                  return math.floor(100*cfg['position_weight'].get(pos,1.)*am*prod*55+.5)
+          
+              def bound_raw(key,old,target,old_fv):
+                  raw=serialized_raw(target)
+                  raw=max(.15,min(1.55,raw))
+                  candidate=single_calc(key,raw)
+                  limit=max(1,math.floor(FV_CAP*old_fv))
+                  if abs(candidate-old_fv)<=limit:return raw,candidate,False
+                  lo,hi=0.,1.
+                  for _ in range(52):
+                      mid=(lo+hi)/2
+                      trial=serialized_raw(old+mid*(raw-old))
+                      if abs(single_calc(key,trial)-old_fv)<=limit:lo=mid
+                      else:hi=mid
+                  b=serialized_raw(old+lo*(raw-old))
+                  v=single_calc(key,b)
+                  if abs(v-old_fv)>limit:raise AssertionError((key,'cap error',v,old_fv,limit))
+                  return b,v,True
+          
+              for key in sorted(before):
+                  record=before[key];pos=record['pos'];old_fv=record['value'];info=cfg['player_db'][key]
+                  entry={'player':key,'pos':pos,'current_fv':old_fv,'shadow_fv':old_fv,
+                      'delta_fv':0,'delta_fv_pct':0.,'status':'','sleeper_id':'',
+                      'baseline_ros_points':'','fresh_ros_points':'','ros_delta_points':'',
+                      'incumbent_2026_projection':incumbent_2026.get(key,''),
+                      'raw_mult_before':cfg['prod_mult'].get(key,''),'raw_mult_shadow':cfg['prod_mult'].get(key,''),
+                      'cap_active':False,'match_confidence':'','review_reason':''}
+                  if pos not in OFFENSE:
+                      entry['status']='FROZEN_CAL15_IDP' if pos in {'DL','LB','DB'} else 'KICKER_UNCHANGED'
+                      reviews.append(entry);counts[entry['status']]+=1;continue
+                  aliases=idx.get(nkey(key),[])
+                  matches=[r for r in aliases if r.get('fp_position')==pos and
+                      not r.get('requires_manual_review') and r.get('match_confidence')=='high' and
+                      str(r.get('sleeper_id') or '') in source]
+                  pairs={(str(r['sleeper_id']),r.get('sleeper_pos')) for r in matches}
+                  if len(pairs)!=1:
+                      entry['status']='HOLD_NO_UNIQUE_CONFIRMED_SLEEPER_ID'
+                  else:
+                      pid,sp=next(iter(pairs)); src=source[pid]
+                      entry['sleeper_id']=pid;entry['match_confidence']='high'
+                      seen_ids[pid].append(key)
+                      old=float(src['old_ros_points']);new=float(src['new_ros_points'])
+                      delta=round(new-old,2)
+                      entry.update(baseline_ros_points=old,fresh_ros_points=new,ros_delta_points=delta)
+                      if src['group']!='OFFENSE' or src['position']!=pos or sp!=pos:
+                          entry['status']='HOLD_CROSS_POSITION_OR_SOURCE_GROUP';entry['review_reason']=f'src={src["position"]},crosswalk={sp},LOG={pos}'
+                      elif old<20 or new<20:
+                          entry['status']='HOLD_LOW_OR_ZERO_ROS_BASELINE'
+                      elif abs(delta)>=MANUAL_ABS or abs(delta)/max(old,0.01)>=MANUAL_REL:
+                          entry['status']='HOLD_LARGE_ROLE_OR_INJURY_SWING'
+                      else:
+                          baseline_proj=incumbent_2026.get(key);raw=cfg['prod_mult'].get(key)
+                          if not isinstance(baseline_proj,(float,int)) or baseline_proj<50 or not isinstance(raw,(float,int)):
+                              entry['status']='HOLD_MODEL_SIGNAL_INSUFFICIENT'
+                          else:
+                              # Sensitivity only: a one-provider ROS revision contributes 25%
+                              # of the model's 55% forward signal, standardized against
+                              # incumbent 2026 full-season projection. NOT trained weights.
+                              trial=max(.15,min(1.55,raw+(SHOCK_EXPOSURE*FORWARD_WEIGHT)*delta/baseline_proj))
+                              new_raw,new_fv,cap=bound_raw(key,raw,trial,old_fv)
+                              entry.update(shadow_fv=new_fv,delta_fv=new_fv-old_fv,
+                                  delta_fv_pct=round(100*(new_fv-old_fv)/old_fv,3),raw_mult_shadow=new_raw,cap_active=cap)
+                              if new_fv!=old_fv:
+                                  work['prod_mult'][key]=new_raw
+                                  entry['status']='SHADOW_FV_CHANGE'
+                              else:entry['status']='NO_ROUNDED_FV_CHANGE'
+                  reviews.append(entry);counts[entry['status']]+=1
+          
+              collisions={id_:keys for id_,keys in seen_ids.items() if len(set(keys))>1}
+              if collisions:raise AssertionError(('Sleeper IDs mapped to multiple player keys',collisions))
+              after=sv.compute_all_values(work)
+              assert set(after)==set(before)
+              assert all(after[k]['value']==r['shadow_fv'] for r in reviews for k in [r['player']]),'Full pool FV shadow parity'
+              assert all(after[k]['value']==v['value'] for k,v in before.items() if v['pos'] not in OFFENSE),'Nonoffense FV changed'
+              assert all(abs(after[k]['value']-v['value'])<=max(1,math.floor(FV_CAP*v['value'])) for k,v in before.items()),'FV 8 percent cap'
+              assert sum(r['status']=='FROZEN_CAL15_IDP' for r in reviews)==230
+              assert sum(r['pos'] in OFFENSE for r in reviews)==319
+              assert len(reviews)==565
+              assert counts['SHADOW_FV_CHANGE']>0, 'No FV sensitivity movements found; projection bridge or identity join likely broken'
+              assert all(before[r['player']]['value']==r['current_fv'] for r in reviews)
+          
+              # Separate issue: do not alter MV in this shadow. Report stale records post CAL15.
+              mv=load(ROOT/'scripts/artifacts/generated/market_values.json')
+              stale=sum(1 for k in before if before[k]['pos'] in {'DL','LB','DB'} and k in mv['players'] and
+                  mv['players'][k]['fundamental_value']!=before[k]['value'])
+              missing=sum(1 for k in before if before[k]['pos'] in {'DL','LB','DB'} and k not in mv['players'])
+              assert stale+missing<=230
+              fields=list(reviews[0])
+              with (OUT/'full_565_offense_fv_shadow.csv').open('w',newline='',encoding='utf-8') as f:
+                  w=csv.DictWriter(f,fieldnames=fields);w.writeheader();w.writerows(reviews)
+              flagged=[r for r in reviews if r['status'].startswith('HOLD_')]
+              with (OUT/'offense_hold_review_queue.csv').open('w',newline='',encoding='utf-8') as f:
+                  w=csv.DictWriter(f,fieldnames=fields);w.writeheader();w.writerows(flagged)
+              leading=sorted((r for r in reviews if r['pos'] in OFFENSE and r['delta_fv']!=0),key=lambda r:-abs(r['delta_fv']))
+              contract={'status':'READ_ONLY_SCENARIO_NOT_PRODUCTION_APPROVED','cal16_v1_run_id':39371920020,
+                  'baseline_commit':__import__('subprocess').check_output(['git','rev-parse','HEAD'],text=True).strip(),
+                  'baseline_cal15_index_sha256':sha(ROOT/'index.html'),
+                  'cal15_fv_evaluation_date_utc':CAL15_AS_OF.isoformat(),
+                  'runtime_current_date_utc':datetime.now(timezone.utc).date().isoformat(),
+                  'input_v1_summary_sha256':sha(SRC/'cal16-sleeper-readonly-output/summary.json'),
+                  'input_v1_fresh_weekly_sha256':summary['hashes']['weekly']['fresh_sha256'],
+                  'parameters':{'ROS_weeks':'8-18','shock_exposure':SHOCK_EXPOSURE,'forward_weight':FORWARD_WEIGHT,
+                                'max_fv_delta_pct':FV_CAP,'hold_if_old_or_new_ros_below':20,
+                                'hold_if_abs_ros_shift_gte':MANUAL_ABS,'hold_if_relative_ros_shift_gte':MANUAL_REL,
+                                'only_high_confidence_same_position_sleeper_ids':True,'projection_source':'canonical current production PLAYER_DB.proj2026'},
+                  'counts':dict(sorted(counts.items())),
+                  'full_pool':565,'offense':319,'IDP_unchanged':230,'K_unchanged':16,'CAL15_anchored_quote_fv_parity_drift':quote_drift,
+                  'current_utc_date_drift_diagnostic':current_date_drift,
+                  'market_value_stale_IDP_records':stale,'market_value_missing_IDP_records':missing,
+                  'meaning':'Read-only model sensitivity scenario. No forward-point-to-dynasty-price calibration, no FV+Votes refit, no MV change.'}
+              (OUT/'manifest.json').write_text(json.dumps(contract,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+              lines=['# CAL16 V2R1 — Offense FV full-pool shadow (read only)','',
+                     '- Status: **READ-ONLY SCENARIO**, not an approved repricing model or deployable release.',
+                     '- Verified baseline: CAL15 exact live `index.html` and quote artifacts, 565 players.',
+                     '- Source: new Sleeper ROS projections for weeks 8–18 compared to its prior committed snapshot (CAL16 V1).',
+                     '- This is a single-provider **sensitivity**, not evidence of dynasty price accuracy.',
+                     '- ID matching: approved FantasyPros/Sleeper crosswalk; unique high-confidence, same-source-position entries only.',
+                     '- Model influence: assumed 25% of incumbent 55% forward-production component, 8% per-player FV cap. This weight is a proposed sensitivity parameter, **not empirically trained**.',
+                     '- Large projected opportunity/injury swings, weak identity matches, and low point totals are review holds, not automatic price updates.',
+                     '- IDP FV and kicker FV remain EXACTLY unchanged; production quote and Market Value artifacts unchanged.',
+                     '', '## Full-pool results','',
+                     f'- Offensive players: **319**, changed FV in scenario: **{counts["SHADOW_FV_CHANGE"]}**.',
+                     f'- Held offensive players: **{len(flagged)}**; rounded-value holds: **{counts["NO_ROUNDED_FV_CHANGE"]}**.',
+                     f'- Frozen CAL15 IDPs: **230**; unchanged kickers: **16**.',
+                     f'- CAL15 exact frozen-date FV+Votes parity: **{len(before)-len(quote_drift)}/565** (as of 2026-10-19).',
+                     f'- Current UTC evaluation date causes **{len(current_date_drift)}** read-only RB FV differences versus frozen CAL15; excluded from scenario deltas.',
+                     f'- Pre-existing IDP Market Value records hidden by stale FV check: **{stale}**; missing MV rows: **{missing}** (separate release required).',
+                     '', '## Cohort breakdown','', '| Status | Players |','|---|---:|',
+                     *[f'| {k} | {v} |' for k,v in sorted(counts.items())],
+                     '', '## Largest scenario FV changes','', '| Player | Position | FV before | FV scenario | Δ FV | ROS delta pts |','|---|---|---:|---:|---:|---:|',
+                     *[f'| {r["player"]} | {r["pos"]} | {r["current_fv"]} | {r["shadow_fv"]} | {r["delta_fv"]:+} | {r["ros_delta_points"]:+.2f} |' for r in leading[:30]],
+                     '', '## Next production-stage decisions','',
+                     '1. Independently corroborate the major injury/role holds using actual NFL stats and current FantasyPros/4for4 where possible.',
+                     '2. Review the **entire 565-player CSV**, not just the biggest movers, and the status of every offense hold.',
+                     '3. Only after owner acceptance, build a separate preview/apply with full FV+Votes Bayesian posterior refit, synchronized free-agent board and all regressions.',
+                     '4. Fix stale IDP Market Values in a distinct guarded candidate; do not mix DLF market ranking evidence with FV.',
+                     '', '**No files in the production repository were written by this workflow.**']
+              (OUT/'summary.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
+              print(f'CAL16 V2R1 READ ONLY PASS: {len(reviews)} full-pool, {counts["SHADOW_FV_CHANGE"]} offense shadows, {len(flagged)} holds, 230 IDP unchanged, 16 kickers unchanged')
+              print('IDP market rows currently stale:',stale,'missing:',missing)
+              print('Top movements:',[(r['player'],r['delta_fv']) for r in leading[:8]])
+          
+          
+          def selftest():
+              assert nkey('Kenneth Walker III')==nkey('kenneth walker')
+              assert nkey("D’Andre Swift") == nkey('dandre swift')
+              assert nkey('J.J. McCarthy') == nkey('jj mccarthy')
+              assert serialized_raw(0.1234567891237)==0.123456789124
+              assert SHOCK_EXPOSURE*FORWARD_WEIGHT==0.1375
+              assert math.floor(100*FV_CAP)>=1
+              print('CAL16 V2 selftest PASS: normalization, serialization and parameters')
+          
+          if __name__=='__main__':
+              if '--selftest' in sys.argv:selftest()
+              else:
+                  selftest();main()
+          PYCODE
+          python3 /tmp/cal16_v2_shadow_engine.py --selftest
+          python3 /tmp/cal16_v2_shadow_engine.py
+      - name: Confirm no production changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s cal16-v2-output/full_565_offense_fv_shadow.csv
+          test -s cal16-v2-output/offense_hold_review_queue.csv
+          test -s cal16-v2-output/manifest.json
+          git diff --exit-code -- index.html free-agent-board.html scripts/artifacts/generated/market_values.json scripts/artifacts/generated/fv_informed_estimate_cal15.json
+          git diff --quiet
+          test -z "$(git ls-files --others --exclude-standard | grep -v '^cal16-v2-output/' || true)"
+      - name: Upload complete CAL16 V2 before-after report
+        uses: actions/upload-artifact@v4
+        with:
+          name: cal16-v2r1-full-pool-offense-fv-shadow-readonly
+          path: |
+            cal16-v2-output/full_565_offense_fv_shadow.csv
+            cal16-v2-output/offense_hold_review_queue.csv
+            cal16-v2-output/summary.md
+            cal16-v2-output/manifest.json
+          retention-days: 30
+          if-no-files-found: error
