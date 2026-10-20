@@ -1,0 +1,570 @@
+name: CAL20 V1R1 - CORE173 Synchronized FV Votes MV Owner-Gated Production Release
+
+# PREVIEW is local to GitHub runner; APPLY needs explicit owner approval and
+# automatically selects latest successful SHA-verified preview. No manual run IDs.
+'on':
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Preview first. Apply only after owner review of the green preview."
+        required: true
+        type: choice
+        options: [preview, apply]
+        default: preview
+      owner_approval:
+        description: "APPLY ONLY: type I_APPROVE_CAL20_CORE173 after reviewing the exact preview"
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  cal20_release:
+    name: CAL20 CORE173 exact candidate preview or owner-gated apply
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_MODE: ${{ inputs.mode }}
+      OWNER_APPROVAL: ${{ inputs.owner_approval }}
+    steps:
+      - name: Checkout current main at full history
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install tested market and validator dependencies
+        run: python3 -m pip install --disable-pip-version-check requests numpy scipy
+      - name: Create syntax-checked release builder and lineage validator
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/cal20_release_engine.py <<'CAL20_ENGINE_PY'
+          #!/usr/bin/env python3
+          """CAL20 CORE173 synchronized owner-gated release orchestrator.
+          Reads exact CAL19/CAL18 green artifacts and repository check-out; never silently
+          rebuilds votes/MV. Preview mutates only GitHub runner checkout, not origin.
+          """
+          from __future__ import annotations
+          import csv
+          import hashlib
+          import io
+          import json
+          import math
+          import re
+          import shutil
+          import subprocess
+          import sys
+          from datetime import date
+          from pathlib import Path
+
+          ROOT=Path.cwd()
+          OUT=ROOT/'cal20-preview'
+          CAND=OUT/'candidate'
+          SOURCE19=Path('/tmp/cal20-cal19')
+          SOURCE18=Path('/tmp/cal20-cal18')
+          RELEASE_ID='cal20-offense-core173-2026-10-20-v1'
+          RELEASE_REL=f'model/releases/{RELEASE_ID}/release.json'
+          QUOTE_REL='scripts/artifacts/generated/fv_informed_estimate_cal18.json'
+          MV_REL='scripts/artifacts/generated/market_values.json'
+          SV_REL='scripts/validation/snapshot_values.py'
+          RG_REL='scripts/validation/repo_regression_checks.py'
+          VALID_REL='scripts/validation/validate_cal20_successor.py'
+          SOURCE19_RUN=39456911324
+          SOURCE18_RUN=39452726097
+          AS_OF='2026-10-20'
+          ORIG_CLOCK='  const now = asOfDate ? new Date(`${asOfDate}T00:00:00Z`) : new Date();'
+          NEW_CLOCK='  const now = new Date(`${asOfDate || CAL20_FV_SNAPSHOT_AS_OF_DATE}T00:00:00Z`);'
+          CLOCK_MARK='const CAL20_FV_SNAPSHOT_AS_OF_DATE = \'2026-10-20\';\n'
+          OLD_TOOLTIP='Frozen 2026-10-19 vote snapshot; not live-updating.'
+          NEW_TOOLTIP='Frozen 2026-10-20 vote snapshot; not live-updating.'
+
+
+          def sha_bytes(b):return hashlib.sha256(b).hexdigest()
+          def sha(p):return sha_bytes(Path(p).read_bytes())
+          def read_json(p):return json.loads(Path(p).read_text(encoding='utf-8'))
+          def assert_same(a,b,label):
+              if a!=b:raise AssertionError(f'{label}: {a!r} != {b!r}')
+          def replace_once(s,before,after,label):
+              assert s.count(before)==1,(label,'expected exactly one occurrence',s.count(before))
+              return s.replace(before,after,1)
+          def write(rel,data):
+              p=CAND/rel;p.parent.mkdir(parents=True,exist_ok=True)
+              if isinstance(data,bytes):p.write_bytes(data)
+              else:p.write_text(data,encoding='utf-8')
+
+          def patch_snapshot(src):
+              src=replace_once(src,
+                '    return {\n        "player_db": player_db,',
+                '''    stamp = re.search(r"const CAL20_FV_SNAPSHOT_AS_OF_DATE\\s*=\\s*'([0-9]{4}-[0-9]{2}-[0-9]{2})'", content)
+              snapshot_as_of = date.fromisoformat(stamp.group(1)) if stamp else None
+
+              return {
+                  "snapshot_as_of": snapshot_as_of,
+                  "player_db": player_db,''',
+                'snapshot date parser')
+              src=replace_once(src,
+                '    fractional_age = fractional_age_from_birth_date(\n        birth_date, age, as_of=as_of\n    )',
+                '''    # Explicit released price-snapshot clock takes precedence over system date.
+              resolved_as_of = as_of if as_of is not None else cfg.get("snapshot_as_of")
+              fractional_age = fractional_age_from_birth_date(
+                  birth_date, age, as_of=resolved_as_of
+              )''',
+                'snapshot clock on fractional RB age')
+              return src
+
+          def patch_regressions(src):
+              needle='def check_deployed_idp_v1_invariants():\n'
+              addition='''def check_deployed_idp_v1_invariants():
+              if (REPO_ROOT / "model/releases/cal20-offense-core173-2026-10-20-v1/release.json").exists():
+                  import validate_cal20_successor
+                  result = validate_cal20_successor.validate_deployment_successor()
+                  assert result["status"] == "PASS"
+                  return
+          '''
+              return replace_once(src,needle,addition,'regression successor dispatcher')
+
+          def core_modifications():
+              with (SOURCE18/'core_173_adjustments.csv').open(newline='',encoding='utf-8') as f:
+                  rows=list(csv.DictReader(f))
+              assert len(rows)==173 and len({r['player'] for r in rows})==173
+              assert all(r['evidence']=='CAL16_SCREENED' for r in rows)
+              return rows
+
+          def replace_prod_raw(original,mods,forward):
+              start=original.index('const PROD_MULT_DATA = {')
+              end=original.index('};',start)
+              block=original[start:end]
+              for row in mods:
+                  old,new=row['from'],row['to']
+                  prior,after=(old,new) if forward else (new,old)
+                  key=row['player']
+                  pattern=re.compile(r"(?m)^([ ]*'"+re.escape(key)+r"':)([-+0-9.eE]+)(,?)$")
+                  m=pattern.search(block)
+                  if not m:raise AssertionError(('missing prod row',key))
+                  assert_same(m.group(2),prior,f'raw literal {key}')
+                  block,n=pattern.subn(lambda match:match.group(1)+after+match.group(3),block)
+                  assert n==1
+              return original[:start]+block+original[end:]
+
+          def build():
+              CAND.mkdir(parents=True,exist_ok=True)
+              manifest=read_json(SOURCE19/'CAL19_Preview_Manifest.json')
+              m18=read_json(SOURCE18/'cal18_run_manifest.json')
+              assert manifest['status']=='PASS_MARKET_COMPANION_PREVIEW_READ_ONLY'
+              assert manifest['source_cal18_green_run']==SOURCE18_RUN
+              assert m18['status']=='PASS_PREPRODUCTION_PREVIEW_READ_ONLY'
+              assert manifest['core_repriced']==173
+              assert m18['cal16_core_changed']==173
+              assert manifest['market_value_stale_after_core_with_companion_as_of']==0
+              assert manifest['market_value_new_covered']==504
+              assert manifest['fv_quote_rows']==565
+              assert manifest['as_of_quote_date']==AS_OF
+              assert manifest['source_index_sha256']==sha(ROOT/'index.html')
+              assert manifest['source_quote_sha256']==sha(ROOT/'scripts/artifacts/generated/fv_informed_estimate_cal15.json')
+              assert manifest['source_market_value_sha256']==sha(ROOT/MV_REL)
+              assert manifest['source_cal18_index_sha256']==m18['baseline_index_sha256']
+              core=SOURCE19/'candidate'
+              for file,wanted in manifest['preview_files_sha256'].items():
+                  assert_same(sha(core/file),wanted,'CAL19 preview hash '+file)
+              for file,wanted in m18['core_files_sha256'].items():
+                  assert_same(sha(core/file),wanted,'CAL18 exact core hash '+file)
+
+              rows=core_modifications()
+              original=(ROOT/'index.html').read_text(encoding='utf-8')
+              core_index=(core/'index.html').read_text(encoding='utf-8')
+              # Validate CAL18 changes originate from exactly this deployed parent.
+              expected=replace_prod_raw(original,rows,True)
+              expected=replace_once(expected,'fv_informed_estimate_cal15.json','fv_informed_estimate_cal18.json','quote URL upgrade')
+              assert_same(expected,core_index,'CAL19 CORE173 exact provenance')
+              # Price freeze makes the four static artifacts mutually consistent for future dates.
+              pinned=replace_once(core_index,'function fractionalAgeFromBirthDate(',CLOCK_MARK+'function fractionalAgeFromBirthDate(','release date marker')
+              pinned=replace_once(pinned,ORIG_CLOCK,NEW_CLOCK,'pricing clock')
+              pinned=replace_once(pinned,OLD_TOOLTIP,NEW_TOOLTIP,'vote date tooltip')
+              write('index.html',pinned)
+              write(QUOTE_REL,(core/QUOTE_REL).read_bytes())
+              write(MV_REL,(core/MV_REL).read_bytes())
+              from importlib import import_module
+              sys.path.insert(0,str(ROOT/'scripts/sync'))
+              fa_sync=import_module('sync_free_agent_valuation')
+              original_board=(ROOT/'free-agent-board.html').read_text(encoding='utf-8')
+              board=fa_sync.render_synced(pinned,original_board)
+              assert all(fa_sync.parity_regions(pinned,board).values())
+              assert fa_sync.render_synced(pinned,board)==board
+              assert fa_sync._extract_const_object(original_board,'FA_PROD_MULT_DATA')[2]==fa_sync._extract_const_object(board,'FA_PROD_MULT_DATA')[2]
+              write('free-agent-board.html',board)
+              write(SV_REL,patch_snapshot((ROOT/SV_REL).read_text(encoding='utf-8')))
+              write(RG_REL,patch_regressions((ROOT/RG_REL).read_text(encoding='utf-8')))
+              validation_source=Path(__file__).with_name('validate_cal20_successor.py')
+              assert validation_source.is_file(),'Missing CAL20 companion validator source'
+              write(VALID_REL,validation_source.read_text(encoding='utf-8'))
+              paths=['index.html','free-agent-board.html',QUOTE_REL,MV_REL,SV_REL,RG_REL,VALID_REL]
+              source_base={key:sha(ROOT/key) for key in paths if (ROOT/key).exists()}
+              base_git=subprocess.check_output(['git','rev-parse','HEAD'],text=True,cwd=ROOT).strip()
+              release={
+                'release_id':RELEASE_ID,'status':'EXACT_HASH_OWNER_APPROVAL_REQUIRED',
+                'source_cal18_green_run':SOURCE18_RUN,'source_cal19_green_run':SOURCE19_RUN,
+                'source_cal19_manifest_sha256':sha(SOURCE19/'CAL19_Preview_Manifest.json'),
+                'base_git_commit':base_git,
+                'base_files_sha256':source_base,
+                'candidate_files_sha256':{file:sha(CAND/file) for file in paths},
+                'source_index_sha256':sha(ROOT/'index.html'),
+                'source_board_sha256':sha(ROOT/'free-agent-board.html'),
+                'source_vote_quote_sha256':sha(ROOT/'scripts/artifacts/generated/fv_informed_estimate_cal15.json'),
+                'source_mv_sha256':sha(ROOT/MV_REL),
+                'as_of_fv_price_date':AS_OF,'date_freeze_reason':'Prevent dynamic RB valuation clock from invalidating static FV+Votes and Market Value snapshots',
+                'changed_player_count':len(rows),'changed_players':rows,
+                'eligible_scope':'173 CAL16-screened offensive players only',
+                'held_cal17_provisional_ids':True,'legacy_quote_artifact_unchanged':True,
+                'vote_model':'CAL15/CAL18 fixed lambda8 FV-anchored Bradley-Terry',
+                'market_value_model':'market-value-v2-balanced-blended-v1 separate layer',
+                'market_coverage':504,'new_market_stale_as_of':0,'quote_coverage':565,
+                'pricing_accuracy_calibrated':False,'input_shock_exposure_assumption':0.25,'fv_cap_pct':0.08,
+                'live_trade_verdict_algorithm_changed':False,
+                'production_apply_authorized':False,
+                'files_to_apply':paths+[RELEASE_REL],
+                'rollback_parent':base_git,
+              }
+              write(RELEASE_REL,json.dumps(release,indent=2,sort_keys=True)+'\n')
+              contract={
+                'release_id':RELEASE_ID,'owner_approval_required':True,
+                'source_run':SOURCE19_RUN,'review_source_manifest_sha256':release['source_cal19_manifest_sha256'],
+                'base_commit':base_git,'base_files_sha256':source_base,
+                'files_sha256':{file:sha(CAND/file) for file in paths+[RELEASE_REL]},
+                'as_of_fv_price_date':AS_OF,'changed_players':173,
+                'sha256_manifest':sha(CAND/RELEASE_REL),
+              }
+              OUT.mkdir(exist_ok=True)
+              (OUT/'review_contract.json').write_text(json.dumps(contract,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+              (OUT/'summary.md').write_text(f'''# CAL20 V1R1 — Owner-gated synchronized release candidate
+
+          **PREVIEW ONLY. No production writes are authorized by this preview.**
+
+          - CAL19 green source run: `{SOURCE19_RUN}`; CAL18 green source run: `{SOURCE18_RUN}`.
+          - Exactly **173** previously screened offensive FV changes; no additional CAL17 identity promotions.
+          - FV+Votes candidate covers **565** players; 35 voters/903 usable ballots in fixed lambda-8 model.
+          - Refreshed independent Market Value covers **504** players with **0 stale FV anchors at 2026-10-20**.
+          - The daily RB fractional age is explicitly pinned to **2026-10-20** in both the site runtime and Python port for **this release snapshot**.
+          - Trade-verdict algorithms and Free Agent Board-specific multipliers are unchanged.
+          - No automated dynasty-pricing calibration: the CAL16 **25% exposure** weight is a bounded scenario assumption, not trained evidence.
+          - All seven source/model/validation files plus versioned release manifest are hash-pinned.
+          - `apply` mode requires owner approval and the exact successful preview run ID; no preview makes commits.
+          - Apply commits only the eight authorized files and records its `rollback_parent`.
+          - Advance the explicit price date only through a future synchronized release of FV, FV+Votes and MV, not by flipping the clock silently.
+          ''',encoding='utf-8')
+              print(json.dumps({'status':'PREVIEW_CREATED','candidate_files':len(contract['files_sha256']),'revised_players':173,'cal19_run':SOURCE19_RUN,'base_commit':base_git,'date_freeze':AS_OF},indent=2))
+
+          def audit_contract(path=OUT):
+              c=read_json(path/'review_contract.json')
+              assert c['release_id']==RELEASE_ID and c['changed_players']==173
+              assert c['source_run']==SOURCE19_RUN
+              for key,want in c['files_sha256'].items():
+                  got=sha(path/'candidate'/key)
+                  assert got==want,(key,got,want)
+              assert c['sha256_manifest']==sha(path/'candidate'/RELEASE_REL)
+              return c
+
+          def selftest():
+              basic='  a\n'+ORIG_CLOCK+'\n'
+              y=replace_once(basic,ORIG_CLOCK,NEW_CLOCK,'clock');assert NEW_CLOCK in y
+              assert replace_once(y,NEW_CLOCK,ORIG_CLOCK,'clock-reverse')==basic
+              # No numerical vote/market fitting here: those were independently run in CAL18/CAL19.
+              print('CAL20 engine static selftest PASS')
+
+          if __name__=='__main__':
+              command=sys.argv[1] if len(sys.argv)>1 else 'build'
+              if command=='selftest':selftest()
+              elif command=='build':build();audit_contract()
+              elif command=='audit':audit_contract();print('CAL20 candidate contract PASS')
+              else:raise SystemExit('Usage: selftest | build | audit')
+          CAL20_ENGINE_PY
+          cat > /tmp/validate_cal20_successor.py <<'CAL20_VALIDATOR_PY'
+          #!/usr/bin/env python3
+          """CAL20 exact-hash successor audit. Restores and audits CAL15 lineage, then
+          verifies deployed CORE173 FV, votes, separate MV and synchronized FA board.
+          No files in the repository are changed by validation.
+          """
+          from __future__ import annotations
+          import hashlib, json, math, re, sys, tempfile
+          from datetime import date
+          from pathlib import Path
+
+          ROOT=Path(__file__).resolve().parent.parent.parent
+          sys.path.insert(0,str(ROOT/'scripts/validation'))
+          sys.path.insert(0,str(ROOT/'scripts/sync'))
+          import snapshot_values as sv
+          import sync_free_agent_valuation as fa_sync
+
+          RELEASE=ROOT/'model/releases/cal20-offense-core173-2026-10-20-v1/release.json'
+          QUOTE=ROOT/'scripts/artifacts/generated/fv_informed_estimate_cal18.json'
+          MV=ROOT/'scripts/artifacts/generated/market_values.json'
+          CAL15_QUOTE=ROOT/'scripts/artifacts/generated/fv_informed_estimate_cal15.json'
+          INDEX=ROOT/'index.html'
+          BOARD=ROOT/'free-agent-board.html'
+          CAL19_DATE=date(2026,10,20)
+          CAL15_DATE=date(2026,10,19)
+          CLOCK_ORIG='  const now = asOfDate ? new Date(`${asOfDate}T00:00:00Z`) : new Date();'
+          CLOCK_NEW='  const now = new Date(`${asOfDate || CAL20_FV_SNAPSHOT_AS_OF_DATE}T00:00:00Z`);'
+          CLOCK_MARK="const CAL20_FV_SNAPSHOT_AS_OF_DATE = '2026-10-20';\n"
+
+          def sha(p):return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+          def sha_data(b):return hashlib.sha256(b).hexdigest()
+          def exact_replace(x,a,b,label):
+              assert x.count(a)==1,(label,x.count(a))
+              return x.replace(a,b,1)
+
+          def reverse_index(index,rows):
+              s=exact_replace(index,CLOCK_NEW,CLOCK_ORIG,'restore live clock')
+              s=exact_replace(s,CLOCK_MARK,'','restore marker')
+              s=exact_replace(s,'Frozen 2026-10-20 vote snapshot; not live-updating.',
+                               'Frozen 2026-10-19 vote snapshot; not live-updating.','restore quote tooltip')
+              s=exact_replace(s,'fv_informed_estimate_cal18.json','fv_informed_estimate_cal15.json','restore quote URL')
+              start=s.index('const PROD_MULT_DATA = {')
+              end=s.index('};',start)
+              part=s[start:end]
+              for r in rows:
+                  k=r['player']
+                  pat=re.compile(r"(?m)^([ ]*'"+re.escape(k)+r"':)([-+0-9.eE]+)(,?)$")
+                  m=pat.search(part)
+                  assert m and m.group(2)==r['to'],('CAL20 raw candidate drift',k)
+                  part,n=pat.subn(lambda a:a.group(1)+r['from']+a.group(3),part)
+                  assert n==1,('CAL20 reverse missing player',k)
+              return s[:start]+part+s[end:]
+
+          def values_as_of(path,when):
+              with tempfile.NamedTemporaryFile('w',suffix='.html',delete=False,encoding='utf-8') as t:
+                  t.write(path);tmp=Path(t.name)
+              try:
+                  cfg=sv.load_from_html(tmp)
+                  prior=sv.fractional_age_from_birth_date
+                  def anchor(dob,age,as_of=None):
+                      return prior(dob,age,as_of=when if as_of is None else as_of)
+                  sv.fractional_age_from_birth_date=anchor
+                  try: return sv.compute_all_values(cfg)
+                  finally:sv.fractional_age_from_birth_date=prior
+              finally:tmp.unlink(missing_ok=True)
+
+          def validate_deployment_successor():
+              r=json.loads(RELEASE.read_text(encoding='utf-8'))
+              assert r['release_id']=='cal20-offense-core173-2026-10-20-v1'
+              assert r['status']=='EXACT_HASH_OWNER_APPROVAL_REQUIRED'
+              assert r['as_of_fv_price_date']=='2026-10-20'
+              assert r['changed_player_count']==173 and len(r['changed_players'])==173
+              assert r['source_cal18_green_run']==39452726097 and r['source_cal19_green_run']==39456911324
+              assert r['legacy_quote_artifact_unchanged'] is True
+              assert r['held_cal17_provisional_ids'] is True
+              for path,wanted in r['candidate_files_sha256'].items():
+                  assert sha(ROOT/path)==wanted,('Candidate exact-hash mismatch',path)
+              assert sha(CAL15_QUOTE)==r['source_vote_quote_sha256'],'Preserved CAL15 quotes changed'
+              current=INDEX.read_text(encoding='utf-8')
+              board=BOARD.read_text(encoding='utf-8')
+              assert current.count(CLOCK_MARK)==1 and current.count(CLOCK_NEW)==1
+              assert all(fa_sync.parity_regions(current,board).values()), 'FA board is not synchronized'
+              assert fa_sync.render_synced(current,board)==board, 'FA sync not idempotent'
+              original=reverse_index(current,r['changed_players'])
+              assert sha_data(original.encode())==r['source_index_sha256'],'CAL15 source index exact reversal failed'
+              original_board=fa_sync.render_synced(original,board)
+              assert sha_data(original_board.encode())==r['source_board_sha256'],'Pre-CAL20 FA board exact reversal failed'
+              # Validate exact pre-CAL20 lineage against the archived CAL15 predecessor,
+              # using its original 2026-10-19 age evaluation date.
+              import validate_cal15_successor as cal15
+              with tempfile.NamedTemporaryFile('w',suffix='.html',delete=False,encoding='utf-8') as f:
+                  f.write(original);old_index=Path(f.name)
+              with tempfile.NamedTemporaryFile('w',suffix='.html',delete=False,encoding='utf-8') as f:
+                  f.write(original_board);old_board=Path(f.name)
+              old_cal15_idx,old_cal15_board=cal15.INDEX,cal15.BOARD
+              old_fractional=sv.fractional_age_from_birth_date
+              try:
+                  cal15.INDEX=old_index;cal15.BOARD=old_board
+                  def cal15_age(dob,age,as_of=None):
+                      return old_fractional(dob,age,as_of=CAL15_DATE if as_of is None else as_of)
+                  sv.fractional_age_from_birth_date=cal15_age
+                  historical=cal15.validate_deployment_successor()
+                  assert historical['status']=='PASS','CAL15 preserved historic check failed'
+              finally:
+                  cal15.INDEX=old_cal15_idx;cal15.BOARD=old_cal15_board
+                  sv.fractional_age_from_birth_date=old_fractional
+                  old_index.unlink(missing_ok=True);old_board.unlink(missing_ok=True)
+
+              baseline=values_as_of(original,CAL19_DATE)
+              after=sv.compute_all_values(sv.load_from_html(INDEX))
+              assert len(baseline)==len(after)==565
+              modified={k for k in baseline if baseline[k]['value']!=after[k]['value']}
+              targets={x['player'] for x in r['changed_players']}
+              assert modified==targets,('173 exact offense scope changed',len(modified),len(targets),sorted(modified^targets)[:12])
+              assert all(after[k]['pos'] in {'QB','RB','WR','TE'} for k in modified)
+              assert all(abs(after[k]['value']-baseline[k]['value'])<=max(1,math.floor(baseline[k]['value']*.08)) for k in targets)
+              assert all(after[k]['value']==baseline[k]['value'] for k in baseline if baseline[k]['pos'] in {'DL','LB','DB','K'})
+              q=json.loads(QUOTE.read_text(encoding='utf-8'))
+              mv=json.loads(MV.read_text(encoding='utf-8'))
+              assert len(q['players'])==565 and q['display_only'] is True
+              assert q['fit_lambda']==8
+              assert all(int(q['players'][k]['fundamental_value'])==after[k]['value'] for k in after)
+              assert mv['scale_semantics']=='league_rank_quantile_mapped_to_trade_desk_points_v1'
+              assert len(mv['players'])==504
+              assert all(int(x['fundamental_value'])==after[k]['value'] for k,x in mv['players'].items())
+              assert mv['policy_sha256']=='f40340a475829d6b0d5b3f63ab25dcf9be976749a307710fd0fc67f602702959'
+              assert r['live_trade_verdict_algorithm_changed'] is False
+              print('CAL20 PASS: 173 exact offense changes, 565 FV+Votes, 504 MV, pinned date, original CAL15+IDP lineage, synced FA board')
+              return {'status':'PASS','repriced_offense':len(modified),'quotes':len(q['players']),'market_covered':len(mv['players'])}
+
+          if __name__=='__main__':validate_deployment_successor()
+          CAL20_VALIDATOR_PY
+          python3 -m py_compile /tmp/cal20_release_engine.py /tmp/validate_cal20_successor.py
+          python3 /tmp/cal20_release_engine.py selftest
+      - name: PREVIEW - restore pinned green CAL18 and CAL19 evidence, build 8-file exact candidate
+        if: ${{ inputs.mode == 'preview' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RELEASE_MODE" = preview
+          test -z "$OWNER_APPROVAL" || { echo 'Approval must be blank in preview mode'; exit 1; }
+          test "$(git branch --show-current)" = main
+          test -z "$(git status --porcelain --untracked-files=all)"
+          mkdir -p /tmp/cal20-cal19 /tmp/cal20-cal18
+          gh run download 39456911324 --repo "$GITHUB_REPOSITORY" --name cal19-v1r1-core173-mv-companion-PREVIEW-READ-ONLY --dir /tmp/cal20-cal19
+          gh run download 39452726097 --repo "$GITHUB_REPOSITORY" --name cal18-v1r1-full-565-fv-votes-candidate-PREVIEW-READ-ONLY --dir /tmp/cal20-cal18
+          test -s /tmp/cal20-cal19/CAL19_Preview_Manifest.json
+          test -s /tmp/cal20-cal18/core_173_adjustments.csv
+          test -s /tmp/cal20-cal19/candidate/index.html
+          python3 /tmp/cal20_release_engine.py build
+          python3 /tmp/cal20_release_engine.py audit
+      - name: PREVIEW - validate full candidate, historical regressions, and frozen price clock
+        if: ${{ inputs.mode == 'preview' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYTEST'
+          import json,hashlib,csv
+          from pathlib import Path
+          r=Path('cal20-preview');c=json.loads((r/'review_contract.json').read_text());manifest=json.loads((r/'candidate/model/releases/cal20-offense-core173-2026-10-20-v1/release.json').read_text())
+          assert c['changed_players']==173 and c['owner_approval_required']
+          assert manifest['held_cal17_provisional_ids'] and not manifest['production_apply_authorized']
+          assert len(c['files_sha256'])==8 and set(c['files_sha256'])==set(manifest['files_to_apply'])
+          for path,digest in c['files_sha256'].items():
+           assert hashlib.sha256((r/'candidate'/path).read_bytes()).hexdigest()==digest,path
+          q=json.loads((r/'candidate/scripts/artifacts/generated/fv_informed_estimate_cal18.json').read_text())
+          mv=json.loads((r/'candidate/scripts/artifacts/generated/market_values.json').read_text())
+          assert len(q['players'])==565 and len(mv['players'])==504
+          assert all(mv['players'][k]['fundamental_value']==q['players'][k]['fundamental_value'] for k in mv['players'])
+          print('CAL20 PREVIEW artifact exact hashes PASS, FV quotes 565, MV 504')
+          PYTEST
+          # Staged candidate testing on disposable runner checkout, NO PUSH in preview.
+          python3 - <<'PYSTAGE'
+          import json,shutil
+          from pathlib import Path
+          r=Path('cal20-preview'); c=json.loads((r/'review_contract.json').read_text())
+          for name in c['files_sha256']:
+           src=r/'candidate'/name;dest=Path(name);dest.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(src,dest)
+          PYSTAGE
+          python3 scripts/validation/snapshot_values.py --selftest
+          python3 scripts/sync/sync_free_agent_valuation.py --check
+          python3 scripts/validation/validate_cal20_successor.py
+          python3 scripts/validation/repo_regression_checks.py
+          python3 scripts/validation/validate_free_agent_valuation_parity.py
+          python3 - <<'PYDATES'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0,'scripts/validation')
+          import snapshot_values as sv
+          from datetime import date
+          from collections import Counter
+          cfg=sv.load_from_html('index.html')
+          assert cfg['snapshot_as_of']==date(2026,10,20)
+          vals=sv.compute_all_values(cfg)
+          assert len(vals)==565
+          print('CAL20 PRICE-CLOCK freeze proven: 2026-10-20, no next-day quote drift')
+          PYDATES
+          cat cal20-preview/summary.md >> "$GITHUB_STEP_SUMMARY"
+          echo 'PREVIEW ONLY: no git push, no production changes.'
+      - name: PREVIEW - publish candidate files and contract for owner approval
+        if: ${{ inputs.mode == 'preview' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cal20-v1r1-core173-exact-OWNER-REVIEW-PREVIEW
+          path: cal20-preview/
+          if-no-files-found: error
+          retention-days: 30
+      - name: APPLY - explicit owner approval, green preview SHA, eight-file exact release
+        if: ${{ inputs.mode == 'apply' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RELEASE_MODE" = apply
+          test "$OWNER_APPROVAL" = I_APPROVE_CAL20_CORE173 || { echo 'STOP: explicit owner approval is required'; exit 1; }
+          test "$(git branch --show-current)" = main
+          test -z "$(git status --porcelain --untracked-files=all)"
+          # Discover newest green preview for this exact workflow. No manual or example run ID.
+          python3 - <<'PYDISCOVER'
+          import json,os,subprocess
+          from pathlib import Path
+          repo=os.environ['GITHUB_REPOSITORY']
+          workflow_path='.github/workflows/CAL20_V1R1_CORE173_Synchronized_FV_Votes_MV_Production_Release.yml'
+          r=json.loads(subprocess.check_output(['gh','api',f'repos/{repo}/actions/runs?per_page=100'],text=True))
+          head=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+          found=[]
+          for x in r.get('workflow_runs',[]):
+           if x.get('path')!=workflow_path or x.get('conclusion')!='success' or x.get('head_sha')!=head:continue
+           found.append(x['id'])
+          for run_id in found:
+           dest=Path('/tmp/cal20-approved');dest.mkdir(exist_ok=True,parents=True)
+           p=subprocess.run(['gh','run','download',str(run_id),'--repo',repo,'--name','cal20-v1r1-core173-exact-OWNER-REVIEW-PREVIEW','--dir',str(dest)],capture_output=True,text=True)
+           if p.returncode!=0:continue
+           try:
+            contract=json.loads((dest/'review_contract.json').read_text())
+            if contract['base_commit']!=head:continue
+            if contract['release_id']!='cal20-offense-core173-2026-10-20-v1':continue
+            Path('/tmp/cal20_approved_preview_run.txt').write_text(str(run_id))
+            print('Owner-approved eligible GREEN preview:',run_id,'base:',head)
+            break
+           except (OSError,KeyError,ValueError):continue
+          else:raise RuntimeError('No matching successful approved CAL20 preview on same HEAD; run preview again')
+          PYDISCOVER
+          python3 - <<'PYAPPLY'
+          import hashlib,json,shutil,subprocess
+          from pathlib import Path
+          r=Path('/tmp/cal20-approved');contract=json.loads((r/'review_contract.json').read_text())
+          assert contract['owner_approval_required'] and contract['changed_players']==173
+          head=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+          assert contract['base_commit']==head,'Base commit advanced after preview'
+          assert len(contract['files_sha256'])==8
+          for rel,want in contract['base_files_sha256'].items():
+           assert hashlib.sha256(Path(rel).read_bytes()).hexdigest()==want,('Production source drift',rel)
+          for rel,want in contract['files_sha256'].items():
+           src=r/'candidate'/rel
+           assert src.is_file() and hashlib.sha256(src.read_bytes()).hexdigest()==want,('Preview content tampered',rel)
+           dest=Path(rel);dest.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(src,dest)
+           assert hashlib.sha256(dest.read_bytes()).hexdigest()==want
+          print('CAL20 owner-gated exact eight-file stage PASS')
+          PYAPPLY
+          python3 scripts/validation/snapshot_values.py --selftest
+          python3 scripts/sync/sync_free_agent_valuation.py --check
+          python3 scripts/validation/validate_cal20_successor.py
+          python3 scripts/validation/repo_regression_checks.py
+          python3 scripts/validation/validate_free_agent_valuation_parity.py
+          python3 - <<'PYFILES'
+          import json,subprocess
+          from pathlib import Path
+          c=json.loads(Path('/tmp/cal20-approved/review_contract.json').read_text())
+          subprocess.run(['git','add','--',*c['files_sha256'].keys()],check=True)
+          changed=set(subprocess.check_output(['git','diff','--cached','--name-only'],text=True).splitlines())
+          assert changed==set(c['files_sha256']),('Only eight expected files can be committed',changed^set(c['files_sha256']))
+          subprocess.run(['git','diff','--cached','--check'],check=True)
+          print('CAL20 exact staged diff PASS',len(changed),'files')
+          PYFILES
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'CAL20: owner-approved CORE173 FV and synced FV+Votes Market Value release'
+          git push origin HEAD:main
+          echo 'CAL20 PRODUCTION APPLY complete. Rollback via git revert of this single release commit.' >> "$GITHUB_STEP_SUMMARY"
