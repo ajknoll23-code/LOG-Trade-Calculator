@@ -9,7 +9,7 @@ Status: **`EARLY_DIAGNOSTIC_ONLY`**
 
 - Frozen at: **2026-09-06T01:51:36.482597Z**
 - Frozen prediction SHA256: `bfe708b0aa991a2cfbafbb008b60944349fc040134e4bcd67f8d3cf79691ca47`
-- Completed consecutive weeks used: **[1, 2, 3, 4, 5]**
+- Completed consecutive weeks used: **[1, 2, 3, 4, 5, 6]**
 - Full structural-allocation universe: **549**
 - Primary real-history cohort: **441**
 
@@ -28,19 +28,19 @@ Same-position pairs are excluded. A common global scale cannot change this metri
 
 | Variant | Players | Pairwise accuracy | Comparable cross-position pairs |
 |---|---:|---:|---:|
-| `deployed_control` | 404 | 0.7311 | 66891 |
-| `bridge_50` | 404 | 0.7308 | 66891 |
+| `deployed_control` | 408 | 0.7273 | 68723 |
+| `bridge_50` | 408 | 0.7290 | 68723 |
 
-Bridge-50 pairwise accuracy delta vs control: **-0.0003**
+Bridge-50 pairwise accuracy delta vs control: **+0.0018**
 
 ## Secondary normalized-error metric
 
 | Variant | Min-max MAE | Min-max RMSE |
 |---|---:|---:|
-| `deployed_control` | 0.1697 | 0.2118 |
-| `bridge_50` | 0.1276 | 0.1664 |
+| `deployed_control` | 0.1669 | 0.2085 |
+| `bridge_50` | 0.1238 | 0.1626 |
 
-Bridge-50 normalized MAE delta vs control: **-0.0421**
+Bridge-50 normalized MAE delta vs control: **-0.0431**
 
 ## Weekly structural allocation audit
 
@@ -51,6 +51,7 @@ Bridge-50 normalized MAE delta vs control: **-0.0421**
 | 3 | Yes | 24 | 30 | 30 | 12 | 26 | 46 | 24 |
 | 4 | Yes | 24 | 32 | 28 | 12 | 33 | 37 | 26 |
 | 5 | Yes | 24 | 28 | 32 | 12 | 27 | 40 | 29 |
+| 6 | Yes | 23 | 29 | 32 | 12 | 28 | 38 | 30 |
 
 ## Readiness ladder
 
