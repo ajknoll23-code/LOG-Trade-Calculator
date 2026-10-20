@@ -1,0 +1,229 @@
+name: CAL16 V1 - Live Sleeper 2026 Projection Pull (READ ONLY)
+
+# Independent source-data retrieval and preview. Does NOT commit or deploy.
+# Baseline: exact Sleeper projection outputs already committed to main.
+# Fresh data: 18 weekly Sleeper projections using the repo's existing pipeline.
+# Analyses weekly row drift and remaining-season player point changes.
+
+on:
+  workflow_dispatch:
+    inputs:
+      first_ros_week:
+        description: 'First projected week to count in ROS comparison (Oct 19: Week 8)'
+        required: true
+        default: '8'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cal16-readonly-sleeper-pull
+  cancel-in-progress: false
+
+jobs:
+  pull-and-compare:
+    name: Re-fetch Sleeper, compare to committed baseline, upload audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout current main (read only)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install existing projection dependencies
+        run: python3 -m pip install requests
+
+      - name: Preserve exact prior committed snapshots
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/cal16-sleeper-baseline
+          cp scripts/artifacts/generated/sleeper_2026_raw_weekly.json /tmp/cal16-sleeper-baseline/weekly.json
+          cp scripts/artifacts/generated/sleeper_2026_raw_categories.json /tmp/cal16-sleeper-baseline/categories.json
+          cp scripts/sleeper_2026_projections.json /tmp/cal16-sleeper-baseline/points.json
+          cp scripts/sleeper_2026_idp_only.json /tmp/cal16-sleeper-baseline/idp.json
+
+      - name: Self-test current scoring and raw-category logic
+        run: python3 scripts/projections/sleeper_projections_pipeline.py --selftest
+
+      - name: Fetch new Sleeper 2026 weekly projections (18 weeks)
+        run: python3 scripts/projections/sleeper_projections_pipeline.py
+
+      - name: Rebuild fresh IDP-only subset
+        run: python3 scripts/projections/filter_sleeper_idp_only.py
+
+      - name: Compare week-level source changes and ROS scored projections
+        shell: bash
+        env:
+          FIRST_ROS_WEEK: ${{ inputs.first_ros_week }}
+        run: |
+          set -euo pipefail
+          python3 - "$FIRST_ROS_WEEK" <<'PY'
+          import csv
+          import hashlib
+          import json
+          import sys
+          from collections import Counter
+          from pathlib import Path
+
+          sys.path.insert(0, str(Path('scripts/projections').resolve()))
+          from sleeper_projections_pipeline import score_week
+
+          OLD = Path('/tmp/cal16-sleeper-baseline')
+          REPORT = Path('cal16-sleeper-readonly-output')
+          REPORT.mkdir(exist_ok=True)
+          SRC = Path('scripts')
+          FILE_MAP = {
+              'weekly': SRC / 'artifacts/generated/sleeper_2026_raw_weekly.json',
+              'categories': SRC / 'artifacts/generated/sleeper_2026_raw_categories.json',
+              'points': SRC / 'sleeper_2026_projections.json',
+              'idp': SRC / 'sleeper_2026_idp_only.json',
+          }
+          FIRST_WEEK = int(sys.argv[1])
+          if not 1 <= FIRST_WEEK <= 18:
+              raise ValueError('first_ros_week must be between 1 and 18')
+
+          def sha(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          def load(path):
+              return json.loads(path.read_text(encoding='utf-8'))
+
+          old_weekly = load(OLD / 'weekly.json')
+          new_weekly = load(FILE_MAP['weekly'])
+          assert isinstance(old_weekly, dict) and isinstance(new_weekly, dict)
+          assert all(str(w) in old_weekly and str(w) in new_weekly for w in range(1, 19))
+          assert all(isinstance(new_weekly[str(w)], dict) for w in range(1, 19))
+
+          new_names = {str(p['sleeper_id']): p for p in load(FILE_MAP['points'])}
+          old_names = {str(p['sleeper_id']): p for p in load(OLD / 'points.json')}
+
+          def aggregate_ros(data):
+              totals, weeks = {}, Counter()
+              for wk in range(FIRST_WEEK, 19):
+                  for pid, stats in data[str(wk)].items():
+                      if not isinstance(stats, dict) or not stats:
+                          continue
+                      value = score_week(stats)
+                      totals[str(pid)] = totals.get(str(pid), 0.0) + value
+                      weeks[str(pid)] += 1
+              return totals, weeks
+
+          prior, prior_weeks = aggregate_ros(old_weekly)
+          current, current_weeks = aggregate_ros(new_weekly)
+          ids = set(prior) | set(current)
+          rows = []
+          for pid in ids:
+              a, b = round(prior.get(pid, 0.0), 2), round(current.get(pid, 0.0), 2)
+              if abs(a - b) < 0.01:
+                  continue
+              meta = new_names.get(pid) or old_names.get(pid) or {}
+              pos = meta.get('pos') or 'UNKNOWN'
+              grp = ('OFFENSE' if pos in {'QB','RB','WR','TE','K'} else
+                     'IDP' if pos in {'DL','DE','DT','NT','EDGE','LB','MLB','ILB','OLB','DB','CB','S','SS','FS'}
+                     else 'OTHER')
+              rows.append({
+                  'sleeper_id': pid,
+                  'player': meta.get('player',''),
+                  'position': pos,
+                  'team': meta.get('team',''),
+                  'group': grp,
+                  'old_ros_points': a,
+                  'new_ros_points': b,
+                  'delta_points': round(b-a,2),
+                  'delta_pct': round(100*(b-a)/a,2) if a else '',
+                  'old_weeks': prior_weeks.get(pid,0),
+                  'new_weeks': current_weeks.get(pid,0),
+              })
+          rows.sort(key=lambda r:(-abs(r['delta_points']), r['player'], r['sleeper_id']))
+          headers = ['sleeper_id','player','position','team','group','old_ros_points','new_ros_points','delta_points','delta_pct','old_weeks','new_weeks']
+          with (REPORT/'ros_player_differences.csv').open('w',newline='',encoding='utf-8') as fp:
+              writer=csv.DictWriter(fp,fieldnames=headers)
+              writer.writeheader()
+              writer.writerows(rows)
+
+          byweek=[]
+          for week in range(1,19):
+              o, n = old_weekly[str(week)],new_weekly[str(week)]
+              changed=sum(o.get(pid)!=n.get(pid) for pid in set(o)|set(n))
+              byweek.append({'week':week,'old_players':len(o),'new_players':len(n),'changed_player_rows':changed,'ros_week':week>=FIRST_WEEK})
+
+          hashes = {key: {'prior_sha256': sha(OLD/f'{key}.json'), 'fresh_sha256': sha(path),
+                           'file_changed':sha(OLD/f'{key}.json') != sha(path)} for key,path in FILE_MAP.items()}
+          summary={
+            'status':'READ_ONLY_NOT_AUTHORIZED_FOR_PRICING',
+            'season':2026,
+            'ros_first_week':FIRST_WEEK,
+            'ros_last_week':18,
+            'source':'Sleeper public weekly projections endpoint; official league scoring script',
+            'baseline':'Committed Sleeper snapshot checked out from main when run started',
+            'note':'Sleeper weekly predictions, NOT real game stats; historical weeks are excluded from the ROS comparison.',
+            'hashes':hashes,
+            'weekly_differences':byweek,
+            'counts':{'players_with_ros_deltas':len(rows),'old_ros_players':len(prior),'new_ros_players':len(current),
+                      'changed_by_position':dict(Counter(r['position'] for r in rows)),
+                      'changed_by_group':dict(Counter(r['group'] for r in rows))},
+          }
+          (REPORT/'summary.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+          lines=[
+            '# CAL16 — New Sleeper Projection Pull (READ ONLY)',
+            '',f'- Projection horizon: Week **{FIRST_WEEK}–18** of 2026 (remaining season).',
+            f'- Players with changed remaining-season projected points: **{len(rows)}**.',
+            f'- Baseline: currently committed GitHub `main` Sleeper files.',
+            '- All valuations, production site files, and market artifacts were left unchanged.',
+            '- These are projections, not actual 2026 results. Old and new projected points use the repository scoring script.',
+            '', '## File fingerprints', '',
+            '| Dataset | Changed? |', '|---|---|',
+            *[f"| {key} | {'YES' if detail['file_changed'] else 'NO'} |" for key,detail in hashes.items()],
+            '', '## Week-by-week raw projection changes', '',
+            '| Week | Previously listed | Newly listed | Player rows changed | ROS? |', '|---:|---:|---:|---:|:---:|',
+            *[f"| {w['week']} | {w['old_players']} | {w['new_players']} | {w['changed_player_rows']} | {'Yes' if w['ros_week'] else 'No'} |" for w in byweek],
+            '', '## Largest remaining-season point changes', '',
+            '| Player | Pos | Old | New | Δ points |', '|---|---|---:|---:|---:|',
+            *[f"| {r['player']} | {r['position']} | {r['old_ros_points']:.1f} | {r['new_ros_points']:.1f} | {r['delta_points']:+.1f} |" for r in rows[:40]],
+            '', 'See `ros_player_differences.csv` for all players; originals are included in the artifact.',
+          ]
+          (REPORT/'summary.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
+          print(f"CAL16 Sleeper READ-ONLY PASS: {len(rows)} ROS player changes; "
+                f"week {FIRST_WEEK}-18; differences CSV, summary markdown and JSON created.")
+          print('Files changed:', {k:v['file_changed'] for k,v in hashes.items()})
+          print('Top ROS deltas:', [(r['player'],r['delta_points']) for r in rows[:8]])
+          PY
+
+      - name: Assert production code and pricing artifacts remain unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code -- index.html free-agent-board.html scripts/artifacts/generated/market_values.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          report=json.loads(Path('cal16-sleeper-readonly-output/summary.json').read_text())
+          assert report['status'] == 'READ_ONLY_NOT_AUTHORIZED_FOR_PRICING'
+          assert report['season'] == 2026
+          assert set(report['hashes']) == {'weekly','categories','points','idp'}
+          print('READ ONLY PASS: no production valuation or market writes')
+          PY
+
+      - name: Upload source provenance and diff artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cal16-v1-sleeper-fresh-readonly
+          retention-days: 30
+          if-no-files-found: error
+          path: |
+            cal16-sleeper-readonly-output/summary.md
+            cal16-sleeper-readonly-output/summary.json
+            cal16-sleeper-readonly-output/ros_player_differences.csv
+            scripts/sleeper_2026_projections.json
+            scripts/sleeper_2026_idp_only.json
+            scripts/artifacts/generated/sleeper_2026_raw_categories.json
+            scripts/artifacts/generated/sleeper_2026_raw_weekly.json
