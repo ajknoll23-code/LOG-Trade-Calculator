@@ -5,13 +5,13 @@ Protocol SHA256: `b6e66793b947e629d8ea238663fc4ab9e94dc7fb6c6b52495ac1207451ba0b
 
 ## Status
 
-- Snapshots seen: **39**
-- Prediction states after deduplication: **23**
+- Snapshots seen: **41**
+- Prediction states after deduplication: **25**
 - Deduplicated repeated snapshots: **16**
 - Outcome identity coverage: **100.0%**
-- Completed realized weeks available: **[1, 2, 3, 4, 5]**
-- Evaluated snapshot/horizon combinations: **11**
-- Pending snapshot/horizon combinations: **58**
+- Completed realized weeks available: **[1, 2, 3, 4, 5, 6]**
+- Evaluated snapshot/horizon combinations: **14**
+- Pending snapshot/horizon combinations: **61**
 
 ## Frozen V1 leakage rules
 
@@ -28,10 +28,13 @@ The scoring period containing a snapshot is excluded. Fixed 4-week and 8-week ho
 | 2026-09-05T19:46:05.101299Z | 1 | future_4w | 0.652 | 0.741 | 0.521 | 492 |
 | 2026-09-07T08:13:19.532310Z | 1 | future_4w | 0.652 | 0.741 | 0.521 | 492 |
 | 2026-09-08T18:25:19.343501Z | 1 | future_4w | 0.652 | 0.741 | 0.521 | 492 |
-| 2026-09-09T04:34:48.848129Z | 2 | future_4w | 0.618 | 0.728 | 0.512 | 487 |
-| 2026-09-11T18:07:00.902784Z | 2 | future_4w | 0.618 | 0.728 | 0.512 | 487 |
+| 2026-09-09T04:34:48.848129Z | 2 | future_4w | 0.618 | 0.729 | 0.512 | 487 |
+| 2026-09-11T18:07:00.902784Z | 2 | future_4w | 0.618 | 0.729 | 0.512 | 487 |
 | 2026-09-13T23:50:54.635067Z | 2 | future_4w | 0.618 | 0.728 | 0.512 | 487 |
 | 2026-09-15T18:48:59.471100Z | 2 | future_4w | 0.618 | 0.728 | 0.512 | 487 |
+| 2026-09-18T18:01:40.209941Z | 3 | future_4w | 0.581 | 0.715 | 0.461 | 480 |
+| 2026-09-18T21:46:15.738077Z | 3 | future_4w | 0.581 | 0.715 | 0.460 | 480 |
+| 2026-09-22T18:39:49.573622Z | 3 | future_4w | 0.581 | 0.715 | 0.460 | 480 |
 
 ## Interpretation guardrails
 
