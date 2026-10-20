@@ -1,0 +1,259 @@
+name: CAL19 V1R1 - CORE173 FV Votes and Market Value Companion Preview (Read Only)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  cal19_read_only:
+    name: CORE173 independent Market Value compatibility and RB clock audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout current canonical sources without writes
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Set up Python environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install existing market modeling dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check requests numpy scipy
+      - name: Download EXACT green CAL18 CORE_173 artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p cal19-source cal19-preview
+          gh run download 39452726097 --repo "$GITHUB_REPOSITORY" --name cal18-v1r1-full-565-fv-votes-candidate-PREVIEW-READ-ONLY --dir cal19-source
+          test -s cal19-source/cal18_run_manifest.json
+          test -s cal19-source/candidate_core_173/index.html
+          test -s cal19-source/candidate_core_173/free-agent-board.html
+          test -s cal19-source/candidate_core_173/scripts/artifacts/generated/fv_informed_estimate_cal18.json
+      - name: Build synchronized FV Votes and MV companion without production changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/cal19_market_companion.py <<'PY_CAL19'
+          #!/usr/bin/env python3
+          """CAL19 V1R1: read-only companion MV refresh against CAL18 CORE_173 (no APPLY)."""
+          from __future__ import annotations
+          import csv,hashlib,json,os,sys,subprocess
+          from datetime import date,datetime,timedelta,timezone
+          from pathlib import Path
+          from collections import Counter
+          
+          ROOT=Path.cwd(); SRC=ROOT/'cal19-source'; OUT=ROOT/'cal19-preview'
+          CAND=SRC/'candidate_core_173'
+          MV_SOURCE=ROOT/'scripts/artifacts/generated/market_values.json'
+          FV_SOURCE=ROOT/'scripts/artifacts/generated/fv_informed_estimate_cal15.json'
+          INDEX_SOURCE=ROOT/'index.html'
+          BOARD_SOURCE=ROOT/'free-agent-board.html'
+          CAL18_RUN=39452726097
+          EXPECTED_INDEX_SHA='59fd86735d0ad90793f6addd296c26267c40ebb959e3985d99871447ff905ff1'
+          EXPECTED_SOURCE_DATE='2026-10-20'
+          
+          def sha(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+          def load(path):return json.loads(Path(path).read_text(encoding='utf-8'))
+          def ensure(test,message):
+              if not test:raise AssertionError(message)
+          
+          def main():
+              sys.path.insert(0,str(ROOT/'scripts/validation'))
+              sys.path.insert(0,str(ROOT/'scripts/market'))
+              sys.path.insert(0,str(ROOT/'scripts/sync'))
+              import snapshot_values as sv
+              import build_market_value as mv
+              import sync_free_agent_valuation as sync
+              OUT.mkdir(exist_ok=True)
+              cm=load(SRC/'cal18_run_manifest.json')
+              core=load(CAND/'candidate_manifest.json')
+              ensure(cm['status']=='PASS_PREPRODUCTION_PREVIEW_READ_ONLY','Unexpected CAL18 preview status')
+              ensure(core['candidate']=='CORE_173' and core['changed_screened']==173,'Not core 173 candidate')
+              ensure(cm['cal16_core_changed']==173 and cm['cal17_provisional_changed']==16,'Unexpected source cohort')
+              ensure(cm['source_green_runs']=={'CAL16_V1':39371920020,'CAL16_V2R1':39427874620,'CAL17_V1R3':39440389555},'Source lineage drift')
+              ensure(sha(INDEX_SOURCE)==EXPECTED_INDEX_SHA, 'Live FV engine moved since CAL18: regenerate CAL18 preview')
+              ensure(cm['baseline_index_sha256']==EXPECTED_INDEX_SHA,'CAL18 baseline drift')
+              ensure(cm['preview_as_of_utc']==EXPECTED_SOURCE_DATE,'CAL18 source-date mismatch')
+              ensure(cm['model_calibrated'] is False and not cm['repo_production_changed'],'Not read-only sensitivity source')
+              for rel,digest in cm['core_files_sha256'].items():
+                  ensure(sha(CAND/rel)==digest,'CAL18 candidate digest mismatch: '+rel)
+                  ensure(core['file_sha256'][rel]==digest,'Nested CAL18 manifest mismatch: '+rel)
+              ensure(sha(CAND/'index.html')==cm['core_files_sha256']['index.html'],'Candidate index hash')
+              quote=load(CAND/'scripts/artifacts/generated/fv_informed_estimate_cal18.json')
+              ensure(quote['schema_version']==1 and quote['display_only'] is True,'Unexpected quote schema')
+              ensure(quote['as_of_date_utc']==EXPECTED_SOURCE_DATE and quote['fit_lambda']==8,'Quote clock/fit drift')
+              ensure(len(quote['players'])==565 and quote['input_vote_sha256']==cm['vote_digest'],'Quote vote provenance mismatch')
+              live_quote=load(FV_SOURCE)
+              ensure(len(live_quote['players'])==565 and live_quote['fit_lambda']==8,'CAL15 quote missing')
+              ensure('fv_informed_estimate_cal18.json' in (CAND/'index.html').read_text(encoding='utf-8'),'CAL18 quote fetch not wired')
+              ensure(sync.render_synced((CAND/'index.html').read_text(),(CAND/'free-agent-board.html').read_text())==(CAND/'free-agent-board.html').read_text(),'Candidate board not canonically synced')
+              ensure(all(sync.parity_regions((CAND/'index.html').read_text(),(CAND/'free-agent-board.html').read_text()).values()), 'Free Agent Board parity failure')
+              ensure(sync._extract_const_object((CAND/'free-agent-board.html').read_text(),'FA_PROD_MULT_DATA')[2]==sync._extract_const_object(BOARD_SOURCE.read_text(),'FA_PROD_MULT_DATA')[2], 'FA-specific factors changed')
+              assert len(load(MV_SOURCE)['players'])>=400
+          
+              # Canonical evaluator has a dynamic RB age; pin it to the CAL18 quote date
+              # for a truthful contemporaneous MV comparison, not an unguarded current-date mix.
+              original_age=sv.fractional_age_from_birth_date
+              def at_clock(asof):
+                  sv.fractional_age_from_birth_date=lambda birth_date,fallback_age,as_of=None: original_age(birth_date,fallback_age,as_of=asof if as_of is None else as_of)
+              candidate_day=date.fromisoformat(EXPECTED_SOURCE_DATE)
+              old_day=date(2026,10,19)
+              try:
+                  at_clock(old_day)
+                  old_fv=sv.compute_all_values(sv.load_from_html(INDEX_SOURCE))
+                  ensure(len(old_fv)==565, 'Baseline player count')
+                  ensure(all(int(live_quote['players'][k]['fundamental_value'])==v['value'] for k,v in old_fv.items()),'CAL15 original quote parity')
+                  at_clock(candidate_day)
+                  new_fv=sv.compute_all_values(sv.load_from_html(CAND/'index.html'))
+                  old_at_candidate_date=sv.compute_all_values(sv.load_from_html(INDEX_SOURCE))
+                  ensure(set(new_fv)==set(quote['players']),'Candidate 565 identity change')
+                  ensure(all(int(quote['players'][k]['fundamental_value'])==v['value'] for k,v in new_fv.items()),'Candidate quote differs from actual FV')
+                  modified=[k for k in new_fv if new_fv[k]['value']!=old_at_candidate_date[k]['value']]
+                  ensure(len(modified)==173,'CAL18 screened count not reproduced against matched date')
+                  ensure(all(new_fv[k]['value']==old_fv[k]['value'] for k in new_fv if new_fv[k]['pos'] in ('DL','LB','DB','K')),'IDP/K changed')
+                  ensure(all(abs(new_fv[k]['value']-old_at_candidate_date[k]['value'])<=max(1,int(.08*old_at_candidate_date[k]['value']))+1 for k in modified),'Scenario FV movement unexpectedly large')
+          
+                  # Use the existing market model unchanged. It remains a wholly separate
+                  # vote-ranked quantile lens and is NOT used to determine intrinsic FV.
+                  mv.INDEX_PATH=CAND/'index.html'
+                  candidate_mv=mv.build_payload()
+                  mv.validate_payload(candidate_mv)
+                  ensure(candidate_mv['method_version']==mv.METHOD_VERSION,'Market method changed')
+                  ensure(candidate_mv['scale_semantics']==mv.SCALE_SEMANTICS,'Market scale changed')
+                  ensure(candidate_mv['policy_sha256']==mv.POLICY_SHA256,'Market policy changed')
+                  ensure(len(candidate_mv['players'])>=400,'Market coverage too low')
+                  ensure(all(int(r['fundamental_value'])==new_fv[k]['value'] for k,r in candidate_mv['players'].items()),'Fresh MV stale vs candidate')
+          
+                  old_mv=load(MV_SOURCE)
+                  before_stale=sum(k in old_mv['players'] and int(r['fundamental_value'])!=new_fv[k]['value'] for k,r in old_mv['players'].items())
+                  live_stale=sum(k in old_mv['players'] and int(r['fundamental_value'])!=old_at_candidate_date[k]['value'] for k,r in old_mv['players'].items())
+                  ensure(before_stale==cm['mv_stale_after_core'],'MV stale count changed from CAL18 preview')
+                  ensure(live_stale==cm['mv_stale_original_run_date'],'Original market stale count mismatch')
+          
+                  # Expose date-horizon risk rather than quietly changing the valuation clock.
+                  age_drift={}
+                  for lag in (1,7,30):
+                      at_clock(candidate_day+timedelta(days=lag))
+                      future=sv.compute_all_values(sv.load_from_html(CAND/'index.html'))
+                      drifted=[k for k in future if future[k]['value']!=new_fv[k]['value']]
+                      age_drift[str(lag)]={'mismatched_quoted_fv':len(drifted),'rb_mismatched':sum(new_fv[k]['pos']=='RB' for k in drifted),'max_abs_diff':max((abs(future[k]['value']-new_fv[k]['value']) for k in drifted),default=0)}
+                  at_clock(candidate_day)
+              finally:
+                  sv.fractional_age_from_birth_date=original_age
+          
+              candidate_dir=OUT/'candidate'
+              for rel in ('index.html','free-agent-board.html','scripts/artifacts/generated/fv_informed_estimate_cal18.json'):
+                  dest=candidate_dir/rel;dest.parent.mkdir(parents=True,exist_ok=True);dest.write_bytes((CAND/rel).read_bytes())
+              mv_dest=candidate_dir/'scripts/artifacts/generated/market_values.json';mv_dest.parent.mkdir(parents=True,exist_ok=True)
+              mv_dest.write_text(json.dumps(candidate_mv,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+          
+              rows=[]
+              for key in sorted(new_fv):
+                  b=old_mv.get('players',{}).get(key)
+                  a=candidate_mv.get('players',{}).get(key)
+                  rows.append({'player':key,'pos':new_fv[key]['pos'],'candidate_fv':new_fv[key]['value'],
+                      'current_mv_value':b['market_value'] if b else '',
+                      'old_mv_fv_anchor':b['fundamental_value'] if b else '',
+                      'new_mv_value':a['market_value'] if a else '',
+                      'new_mv_fv_anchor':a['fundamental_value'] if a else '',
+                      'old_mv_was_stale_against_candidate':str(bool(b and int(b['fundamental_value'])!=new_fv[key]['value'])).upper(),
+                      'new_mv_matches_candidate_fv':str(bool(a and int(a['fundamental_value'])==new_fv[key]['value'])).upper(),
+                      'vote_quote':quote['players'][key]['fv_informed_estimate']})
+              with (OUT/'full_565_FV_Votes_Market_Companion_Comparison.csv').open('w',newline='',encoding='utf-8') as f:
+                  w=csv.DictWriter(f,fieldnames=rows[0].keys());w.writeheader();w.writerows(rows)
+              csha={rel:sha(candidate_dir/rel) for rel in ('index.html','free-agent-board.html','scripts/artifacts/generated/fv_informed_estimate_cal18.json','scripts/artifacts/generated/market_values.json')}
+              manifest={
+                  'status':'PASS_MARKET_COMPANION_PREVIEW_READ_ONLY',
+                  'production_apply_authorized':False,'market_value_model_separate_from_intrinsic_fv':True,
+                  'source_cal18_green_run':CAL18_RUN,'source_cal18_status':cm['status'],
+                  'source_cal18_base_git_sha':cm['base_git_sha'],
+                  'source_cal18_index_sha256':cm['baseline_index_sha256'],
+                  'as_of_quote_date':EXPECTED_SOURCE_DATE,'date_future_mismatch':age_drift,
+                  'core_repriced':173,'provisional_ids_promoted':0,
+                  'fv_quote_rows':565,'vote_digest':quote['input_vote_sha256'],
+                  'market_value_old_covered':len(old_mv['players']),
+                  'market_value_new_covered':len(candidate_mv['players']),
+                  'market_value_stale_before':live_stale,
+                  'market_value_stale_after_core_without_companion':before_stale,
+                  'market_value_stale_after_core_with_companion_as_of':0,
+                  'market_policy_sha256':candidate_mv['policy_sha256'],
+                  'market_source_metadata':candidate_mv.get('source'),
+                  'market_quality':candidate_mv.get('market_quality'),
+                  'preview_files_sha256':csha,
+                  'source_index_sha256':sha(INDEX_SOURCE),
+                  'source_quote_sha256':sha(FV_SOURCE),
+                  'source_market_value_sha256':sha(MV_SOURCE),
+                  'must_refresh_quote_and_MV_on_future_date':True,
+                  'caveat':'CORE_173 uses assumed 25% exposure; this preview does not independently calibrate dynasty prices. Future date drift is disclosed, not corrected by manipulating FV.',
+              }
+              (OUT/'CAL19_Preview_Manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
+              lines=[
+                  '# CAL19 V1R1 — Market Value companion for CAL18 CORE_173',
+                  '', '**PASS PREVIEW, NOT PRODUCTION APPROVAL**',
+                  f'- FV core players repriced: **173**, no CAL17 provisional identity auto-promotions.',
+                  f'- Full FV+Votes quote parity: **565/565** anchored to **{EXPECTED_SOURCE_DATE}**.',
+                  f'- Market Value old covered: **{len(old_mv["players"])}**; refreshed market covered: **{len(candidate_mv["players"])}**.',
+                  f'- Old MV stale before (2026-10-20): **{live_stale}**; stale after CORE_173 without companion **{before_stale}**.',
+                  f'- Market Value stale after independent refresh (as-of {EXPECTED_SOURCE_DATE}): **0 / {len(candidate_mv["players"])} covered**.',
+                  f'- Rebuilt market method **{candidate_mv["method_version"]}**; fresh raw counted ballots: **{candidate_mv["market_quality"]["raw_votes"]}**.',
+                  '- Market ordering remains a separate league-opinion layer; the 173-player FV candidate remains an uncalibrated 25%-exposure sensitivity.',
+                  f'- Next-day static quote mismatches from RB age: **{age_drift["1"]["mismatched_quoted_fv"]}**, 7-day: **{age_drift["7"]["mismatched_quoted_fv"]}**, 30-day: **{age_drift["30"]["mismatched_quoted_fv"]}**.',
+                  '- Market Values may also become date-stale until refreshed. Do not silently bypass strict quote/MV display-staleness checks.',
+                  '', '## Release-ready follow-up',
+                  'Construct ONE guarded owner-approved synchronized FV + vote quote + separate Market Value candidate release from this exact four-file preview; require exact base hashes and rollback capability. Update quote/MV date prior to APPLY if the live date has advanced.',
+                  'Keep CAL17 provisional identity rows held. Do not change trade-verdict algorithms or free-agent-specific factors.',
+              ]
+              (OUT/'CAL19_Review.md').write_text('\n'.join(lines)+'\n')
+              print(json.dumps({k:manifest[k] for k in ('status','core_repriced','market_value_old_covered','market_value_new_covered','market_value_stale_before','market_value_stale_after_core_without_companion','market_value_stale_after_core_with_companion_as_of','date_future_mismatch')},indent=2))
+          
+          if __name__=='__main__':main()
+          PY_CAL19
+          python -m py_compile /tmp/cal19_market_companion.py
+          python /tmp/cal19_market_companion.py
+      - name: Verify preview outputs and unchanged tracked production artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY_CHECK'
+          from pathlib import Path
+          import hashlib,json,csv
+          root=Path('cal19-preview')
+          m=json.loads((root/'CAL19_Preview_Manifest.json').read_text())
+          assert m['status']=='PASS_MARKET_COMPANION_PREVIEW_READ_ONLY'
+          assert m['production_apply_authorized'] is False
+          assert m['core_repriced']==173 and m['provisional_ids_promoted']==0
+          assert m['fv_quote_rows']==565
+          assert m['market_value_stale_after_core_with_companion_as_of']==0
+          assert m['market_value_stale_after_core_without_companion']==345
+          for name,expected in m['preview_files_sha256'].items():
+              assert hashlib.sha256((root/'candidate'/name).read_bytes()).hexdigest()==expected,name
+          q=json.loads((root/'candidate/scripts/artifacts/generated/fv_informed_estimate_cal18.json').read_text())
+          mv=json.loads((root/'candidate/scripts/artifacts/generated/market_values.json').read_text())
+          assert len(q['players'])==565 and len(mv['players'])>=400
+          assert all(int(row['fundamental_value'])==int(q['players'][k]['fundamental_value']) for k,row in mv['players'].items())
+          rows=list(csv.DictReader((root/'full_565_FV_Votes_Market_Companion_Comparison.csv').open()))
+          assert len(rows)==565
+          print('CAL19 independent MV companion PASS:',len(mv['players']),'market-covered rows')
+          PY_CHECK
+          git diff --exit-code -- index.html free-agent-board.html scripts/artifacts/generated/market_values.json scripts/artifacts/generated/fv_informed_estimate_cal15.json
+          git diff --cached --quiet
+          test -z "$(git status --porcelain --untracked-files=all | grep -v '^?? cal19-preview/' | grep -v '^?? cal19-source/' || true)"
+          cat cal19-preview/CAL19_Review.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload candidate companion and full review
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cal19-v1r1-core173-mv-companion-PREVIEW-READ-ONLY
+          path: cal19-preview/
+          if-no-files-found: warn
+          retention-days: 30
