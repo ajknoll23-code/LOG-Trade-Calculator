@@ -1,0 +1,259 @@
+name: CAL17 V1R1 - Offense Identity Rescue and Preproduction Review (Read Only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      cal16_v2r1_run_id:
+        description: "Run ID of the GREEN CAL16 V2R1 workflow (NOT CAL16 V1)"
+        required: true
+        type: string
+      fetch_sleeper_directory_once:
+        description: "Check current Sleeper player directory once for identity hints (never auto-apply)"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  cal17_read_only:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CAL17_FETCH_SLEEPER: ${{ inputs.fetch_sleeper_directory_once }}
+    steps:
+      - name: Check out for GitHub CLI context (no writes)
+        uses: actions/checkout@v4
+
+      - name: Download pinned CAL16 V2R1 run artifacts
+        shell: bash
+        env:
+          SOURCE_RUN: ${{ inputs.cal16_v2r1_run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p cal17_inputs
+          [[ "$SOURCE_RUN" =~ ^[0-9]+$ ]] || { echo "Run ID must be numeric"; exit 2; }
+          gh run download "$SOURCE_RUN" --dir cal17_inputs
+
+      - name: Build read-only 565-row review and Sleeper ID proposals
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCAL17
+          #!/usr/bin/env python3
+          """CAL17 V1R1: read-only review of CAL16 V2R1 artifacts; no model or repository mutation."""
+          import csv
+          import hashlib
+          import json
+          import os
+          import re
+          import unicodedata
+          import urllib.request
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          SOURCE = Path(os.environ.get("CAL17_INPUT_DIR", "cal17_inputs"))
+          OUT = Path(os.environ.get("CAL17_OUTPUT_DIR", "cal17_outputs"))
+          OUT.mkdir(parents=True, exist_ok=True)
+          REQUIRED = {
+              "manifest": "CAL16_V2R1_Green_Run_Manifest.json",
+              "shadow": "CAL16_V2R1_Full_565_Offense_FV_Shadow_READ_ONLY.csv",
+              "holds": "CAL16_V2R1_Offense_Hold_Review_Queue.csv",
+          }
+          POSITIONS = ("QB", "RB", "WR", "TE")
+          FROZEN = {"DL": "FROZEN_CAL15_IDP", "LB": "FROZEN_CAL15_IDP",
+                    "DB": "FROZEN_CAL15_IDP", "K": "KICKER_UNCHANGED"}
+          errors = []
+          def find_unique(filename):
+              matches = list(SOURCE.rglob(filename))
+              if len(matches) != 1:
+                  raise RuntimeError(f"Expected exactly one {filename} under {SOURCE}, found {len(matches)}")
+              return matches[0]
+
+          paths = {key: find_unique(name) for key, name in REQUIRED.items()}
+          manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+          with paths["shadow"].open(newline="", encoding="utf-8-sig") as f:
+              pool = list(csv.DictReader(f))
+          with paths["holds"].open(newline="", encoding="utf-8-sig") as f:
+              holds = list(csv.DictReader(f))
+
+          def integer(row, field): return int(row[field])
+          def number(row, field): return float(row[field])
+          def k(row): return (row["player"], row["pos"])
+          def check(ok, message):
+              if not ok: errors.append(message)
+
+          statuses = Counter(r["status"] for r in pool)
+          changed = [r for r in pool if r["status"] == "SHADOW_FV_CHANGE"]
+          held = [r for r in pool if r["status"].startswith("HOLD_")]
+          held_keys = {k(r) for r in held}
+          keys = [k(r) for r in pool]
+          check(len(pool) == 565, f"Expected 565 full-pool rows, got {len(pool)}")
+          check(len(keys) == len(set(keys)), "Duplicate player-position keys in full pool")
+          check(len(holds) == len(held) == 139, "Hold queue is not identical in size to held full-pool rows")
+          check({k(r) for r in holds} == held_keys, "Hold queue/player keys do not match full pool")
+          check(len(changed) == 173, f"Expected 173 changes, got {len(changed)}")
+          check(manifest.get("full_pool") == len(pool), "Manifest pool count mismatch")
+          check(manifest.get("offense") == sum(r["pos"] in POSITIONS for r in pool),
+                "Manifest offense count mismatch")
+          check(manifest.get("counts") == dict(statuses), "Manifest status counts mismatch")
+          check(manifest.get("CAL15_anchored_quote_fv_parity_drift") == [],
+                "CAL15 quote parity drift not empty")
+          check(manifest.get("cal15_fv_evaluation_date_utc") == "2026-10-19",
+                "Frozen CAL15 evaluation date unexpected")
+          check(manifest.get("status") == "READ_ONLY_SCENARIO_NOT_PRODUCTION_APPROVED",
+                "Manifest unexpectedly claims production approval")
+          check(manifest.get("parameters", {}).get("shock_exposure") == 0.25,
+                "Shock exposure changed from documented scenario")
+          check(manifest.get("parameters", {}).get("max_fv_delta_pct") == 0.08,
+                "FV cap changed from documented scenario")
+
+          for r in pool:
+              pos, status = r["pos"], r["status"]
+              old, new, delta = (integer(r, f) for f in ("current_fv", "shadow_fv", "delta_fv"))
+              check(old + delta == new, f"Arithmetic mismatch: {k(r)}")
+              check(old >= 0 and new >= 0, f"Negative FV: {k(r)}")
+              if pos in FROZEN:
+                  check(status == FROZEN[pos] and delta == 0, f"Frozen IDP/K changed: {k(r)}")
+              if status.startswith("HOLD_") or status == "NO_ROUNDED_FV_CHANGE":
+                  check(delta == 0, f"Held/no-change player repriced: {k(r)}")
+              if status == "SHADOW_FV_CHANGE":
+                  check(pos in POSITIONS and delta != 0, f"Invalid scenario move: {k(r)}")
+                  check(abs(delta) / max(old, 1) <= 0.0801,
+                        f"8% FV move cap exceeded (rounding tolerance): {k(r)}")
+
+          def normalize(s):
+              s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode()
+              return re.sub(r"[^a-z0-9]+", "", s.casefold())
+          def directory_candidates():
+              if os.environ.get("CAL17_FETCH_SLEEPER", "false").lower() != "true":
+                  return None, "directory lookup disabled"
+              url = "https://api.sleeper.app/v1/players/nfl"
+              req = urllib.request.Request(url, headers={"User-Agent": "LOG-CAL17-ReadOnly/1.0"})
+              try:
+                  with urllib.request.urlopen(req, timeout=40) as resp:
+                      data = resp.read(15_000_000)
+                  (OUT / "CAL17_Sleeper_Directory_SHA256.txt").write_text(
+                      hashlib.sha256(data).hexdigest() + "\n", encoding="utf-8")
+                  directory = json.loads(data)
+                  if not isinstance(directory, dict): raise ValueError("not a player-id dictionary")
+                  index = defaultdict(list)
+                  for ident, value in directory.items():
+                      if not isinstance(value, dict): continue
+                      name = value.get("full_name") or " ".join(
+                          x for x in (value.get("first_name"), value.get("last_name")) if x)
+                      fantasy_pos = value.get("fantasy_positions") or []
+                      if isinstance(fantasy_pos, str): fantasy_pos = [fantasy_pos]
+                      for pos in POSITIONS:
+                          if pos in fantasy_pos or value.get("position") == pos:
+                              index[(normalize(str(name)), pos)].append(
+                                  (str(ident), str(name), str(value.get("team") or "")))
+                  return index, "directory fetched once for name/position hints only; no ids applied"
+              except Exception as exc:
+                  return None, f"directory fetch unavailable: {type(exc).__name__}: {exc}"
+
+          directory, directory_note = directory_candidates()
+          proposals = []
+          for r in held:
+              if r["status"] != "HOLD_NO_UNIQUE_CONFIRMED_SLEEPER_ID": continue
+              raw = directory.get((normalize(r["player"]), r["pos"]), []) if directory else []
+              # Proposals NEVER constitute a canonical crosswalk or a joined projection.
+              classification = ("NOT_CHECKED" if directory is None else
+                                "DIRECTORY_UNIQUE_UNVERIFIED" if len(raw) == 1 else
+                                "DIRECTORY_MULTIPLE" if len(raw) > 1 else "NO_DIRECTORY_MATCH")
+              proposals.append({
+                  "player": r["player"], "pos": r["pos"], "current_fv": r["current_fv"],
+                  "status": classification, "suggested_sleeper_id": raw[0][0] if len(raw) == 1 else "",
+                  "sleeper_directory_name": raw[0][1] if len(raw) == 1 else "",
+                  "sleeper_team": raw[0][2] if len(raw) == 1 else "",
+                  "candidate_count": len(raw),
+                  "next_step": "independently verify identity, position AND old/new ROS coverage before any refit"
+              })
+          def write_csv(name, data, header):
+              with (OUT / name).open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
+                  w.writeheader(); w.writerows(data)
+
+          write_csv("CAL17_V1R1_Identity_Rescue_Proposals_READ_ONLY.csv", proposals,
+                    ["player", "pos", "current_fv", "status", "suggested_sleeper_id",
+                     "sleeper_directory_name", "sleeper_team", "candidate_count", "next_step"])
+          review = []
+          for r in pool:
+              delta = integer(r, "delta_fv")
+              status = r["status"]
+              high = abs(delta) > 40 or r["cap_active"].lower() == "true"
+              tier = ("REVIEW_CONTEXT_FIRST" if high else "REFIT_INPUT_PENDING_CALIBRATION") if delta else (
+                  "PRIORITY_IDENTITY_RESCUE" if status == "HOLD_NO_UNIQUE_CONFIRMED_SLEEPER_ID"
+                  and integer(r, "current_fv") >= 3000 else "HOLD_FOR_SEPARATE_REVIEW"
+                  if status.startswith("HOLD_") else "UNCHANGED")
+              review.append({"player": r["player"], "pos": r["pos"],
+                             "current_fv": r["current_fv"], "shadow_fv": r["shadow_fv"],
+                             "delta_fv": r["delta_fv"], "status": status,
+                             "review_tier": tier, "cap_active": r["cap_active"],
+                             "ros_delta_points": r["ros_delta_points"],
+                             "production_apply_authorized": "FALSE"})
+          write_csv("CAL17_V1R1_Full_565_Candidate_Decision_Ledger_READ_ONLY.csv", review,
+                    ["player", "pos", "current_fv", "shadow_fv", "delta_fv", "status",
+                     "review_tier", "cap_active", "ros_delta_points",
+                     "production_apply_authorized"])
+          summary = {
+              "status": "PASS_READ_ONLY_REVIEW" if not errors else "FAIL_INPUT_INTEGRITY",
+              "production_change_authorized": False,
+              "all_565_rows_checked": len(pool),
+              "offense": sum(r["pos"] in POSITIONS for r in pool),
+              "changed": len(changed), "held": len(held),
+              "status_counts": dict(statuses),
+              "capped_changed": sum(r["cap_active"].lower() == "true" for r in changed),
+              "large_changes_abs_gt_40": sum(abs(integer(r, "delta_fv")) > 40 for r in changed),
+              "unmatched_identity_rows": len(proposals),
+              "unique_directory_hints": sum(r["status"] == "DIRECTORY_UNIQUE_UNVERIFIED" for r in proposals),
+              "identity_lookup": directory_note,
+              "source_sha256": {key: hashlib.sha256(path.read_bytes()).hexdigest()
+                                for key, path in paths.items()},
+              "baseline_commit": manifest.get("baseline_commit"),
+              "evaluation_date": manifest.get("cal15_fv_evaluation_date_utc"),
+              "integrity_errors": errors,
+              "review_required": True,
+              "next": "source-verified identity joins + independent FV-weight calibration + full FV+Votes refit PREVIEW",
+          }
+          (OUT / "CAL17_V1R1_Run_Manifest.json").write_text(json.dumps(summary, indent=2) + "\n")
+          lines = [
+              "# CAL17 V1R1 — Offense Candidate & Identity Rescue",
+              f"**Status:** {summary['status']} — READ ONLY, NO PRODUCTION APPLY",
+              "",
+              f"Verified: {len(pool)} total; {len(changed)} scenario changes; {len(held)} holds.",
+              f"Changed with 8% cap: {summary['capped_changed']}; changes >40 FV: "
+              f"{summary['large_changes_abs_gt_40']}.",
+              f"Unmatched identity review: {len(proposals)}; directory hints: "
+              f"{summary['unique_directory_hints']}.",
+              f"Directory: {directory_note}.",
+              "",
+              "No change was applied to FV, votes, Market Value, IDP, kickers, free-agent board, or index.html.",
+              "Even a unique directory match does NOT establish a validated ROS projection join.",
+              "Shock-exposure weight (25%) remains an UNTRAINED sensitivity assumption.",
+              "Owner acceptance and calibrated Bayesian FV+Votes refit preview required before any deployment.",
+              "",
+              "## Input integrity issues",
+              *(["- " + x for x in errors] if errors else ["- None"]),
+          ]
+          (OUT / "CAL17_V1R1_Review.md").write_text("\n".join(lines) + "\n")
+          print(json.dumps({k: summary[k] for k in (
+              "status", "all_565_rows_checked", "changed", "held",
+              "capped_changed", "unmatched_identity_rows", "unique_directory_hints",
+              "integrity_errors")}, indent=2))
+          if errors:
+              raise SystemExit(2)
+          PYCAL17
+
+      - name: Publish read-only results, including on validation failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CAL17_V1R1_Read_Only_Review
+          path: cal17_outputs/
+          if-no-files-found: warn
+          retention-days: 30
