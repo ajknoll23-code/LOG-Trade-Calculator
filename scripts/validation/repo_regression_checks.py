@@ -177,6 +177,7 @@ def live_js_values():
         _extract_const_object(text, "PROD_MULT_DATA"),
         "const PROD_MULT = PROD_MULT_DATA;",
         _extract_const_object(text, "NO_REAL_PRODUCTION_HISTORY"),
+        _extract_const_object(text, "CAL22_LEGACY_MONOTONE_KEYS"),
         _extract_const_object(text, "PLAYER_DB"),
         _extract_const_object(text, "RB_BIRTH_DATE_DATA"),
         re.search(r"function normalizeName\(s\)\{.*?\n\}", text, re.S).group(0),
@@ -207,7 +208,9 @@ process.stdout.write(JSON.stringify(__rows));
         f.write(js)
         path = f.name
     try:
-        proc = subprocess.run(["node", path], capture_output=True, text=True, check=True)
+        proc = subprocess.run(["node", path], capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise AssertionError(f"live valuation JS failed (exit={proc.returncode}): STDERR={proc.stderr[-4000:]} STDOUT={proc.stdout[-1000:]}")
         return json.loads(proc.stdout)
     finally:
         os.unlink(path)
@@ -502,6 +505,11 @@ def check_preferred_bake_preview_invariants():
 
 
 def check_deployed_idp_v1_invariants():
+    if (REPO_ROOT / "model/releases/cal22-legacy-048-raw-floor-continuity-v1/release.json").exists():
+        import validate_cal22_monotone_guard
+        result = validate_cal22_monotone_guard.validate_deployment_successor()
+        assert result["status"] == "PASS"
+        return
     if (REPO_ROOT / "model/releases/cal15-idp-2026-horizon-bounded-v1/release.json").exists():
         import validate_cal15_successor
         result = validate_cal15_successor.validate_deployment_successor()

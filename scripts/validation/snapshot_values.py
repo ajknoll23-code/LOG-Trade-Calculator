@@ -108,6 +108,8 @@ def load_from_html(html_path):
     no_history = set(re.findall(r"'([^']+)'\s*:\s*1\b", extract_object_body(content, "NO_REAL_PRODUCTION_HISTORY")))
     position_weight = parse_simple_numeric_object(extract_object_body(content, "POSITION_WEIGHT"))
     role_mult = parse_simple_numeric_object(extract_object_body(content, "ROLE_MULT"))
+    cal22_keys = set(re.findall(r"'([^']+)'\s*:\s*1\b",
+        extract_object_body(content, "CAL22_LEGACY_MONOTONE_KEYS"))) if "const CAL22_LEGACY_MONOTONE_KEYS = {" in content else set()
     rb_birth_date_data = parse_simple_string_object(
         extract_object_body(content, "RB_BIRTH_DATE_DATA")
     )
@@ -129,6 +131,7 @@ def load_from_html(html_path):
         "no_real_history": no_history,
         "position_weight": position_weight,
         "role_mult": role_mult,
+        "cal22_keys": cal22_keys,
         "rb_birth_date_data": rb_birth_date_data,
         "age_curve": age_curve,
         "qb_post_peak_floor": extract_scalar(content, "QB_POST_PEAK_FLOOR"),
@@ -136,12 +139,15 @@ def load_from_html(html_path):
     }
 
 
-def production_multiplier(key, role, prod_mult_data, no_real_history, role_mult):
+def production_multiplier(key, role, prod_mult_data, no_real_history, role_mult, cal22_keys=None):
     role_estimate = role_mult.get(role, 1.0)
     if key in prod_mult_data:
         real = prod_mult_data[key]
         if role == "Elite" and real < 0.65:
             return 0.65, real
+        if (role == "Speculative" and key in (cal22_keys or ()) and real >= 0.15
+                and real < role_estimate and key in no_real_history):
+            return role_estimate, real
         if real <= 0.15 and role_estimate > real and key in no_real_history:
             return role_estimate, real
         return real, real
@@ -318,6 +324,7 @@ def compute_all_values(cfg):
             cfg["prod_mult"],
             cfg["no_real_history"],
             cfg["role_mult"],
+            cfg.get("cal22_keys", set()),
         )
         am = effective_age_multiplier(
             pos, age, role, key, rm, raw_rm, cfg
