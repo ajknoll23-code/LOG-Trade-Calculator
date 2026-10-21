@@ -1,0 +1,476 @@
+name: CAL22 V1R3 - 48-Player FV Monotonicity Continuity Owner-Gated Preview Apply
+'on':
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Preview first; apply only after explicit owner approval of a green preview'
+        type: choice
+        options: [preview, apply]
+        required: true
+        default: preview
+      owner_approval:
+        description: 'APPLY ONLY: type I_APPROVE_CAL22_GUARD_ZERO_REPRICE after reviewing preview'
+        type: string
+        required: false
+        default: ''
+permissions:
+  contents: write
+  actions: read
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+jobs:
+  cal22:
+    name: Zero-reprice 48-key continuity guard and exact-hash release
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_MODE: ${{ inputs.mode }}
+      OWNER_APPROVAL: ${{ inputs.owner_approval }}
+      WORKFLOW_FILE: CAL22_V1R3_48_Player_FV_Monotonicity_Continuity_Preview_Apply.yml
+      ARTIFACT_NAME: cal22-v1r3-zero-fv-change-48-guard-OWNER-REVIEW
+    steps:
+      - name: Checkout current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install baseline regression dependencies
+        run: python3 -m pip install --disable-pip-version-check requests numpy scipy
+      - name: Validate release mode and approval
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git branch --show-current)" = main
+          test -z "$(git status --porcelain --untracked-files=all)"
+          if [ "$RELEASE_MODE" = preview ]; then
+            test -z "$OWNER_APPROVAL" || { echo 'Preview must have blank owner approval'; exit 1; }
+          elif [ "$RELEASE_MODE" = apply ]; then
+            test "$OWNER_APPROVAL" = I_APPROVE_CAL22_GUARD_ZERO_REPRICE || { echo 'Explicit owner approval required'; exit 1; }
+          else
+            echo 'Unknown mode'; exit 1
+          fi
+          test ! -e model/releases/cal22-legacy-048-raw-floor-continuity-v1/release.json
+      - name: Write and syntax-check frozen-source CAL22 engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat >/tmp/cal22_engine.py <<'PYCODE'
+          #!/usr/bin/env python3
+          """CAL22 guarded 48-key FV monotonicity continuity release generator.
+          No implicit approval to update any current valuations or market artifacts.
+          """
+          import csv, hashlib, io, json, re, shutil, subprocess, sys, tempfile
+          from pathlib import Path
+          
+          ROOT=Path.cwd()
+          OUT=ROOT/'cal22-preview'
+          CAND=OUT/'candidate'
+          SOURCE=Path('/tmp/cal22-cal21')
+          RELEASE='cal22-legacy-048-raw-floor-continuity-v1'
+          QUOTE='scripts/artifacts/generated/fv_informed_estimate_cal15.json'
+          EVIDENCE='CAL21_48_Identity_Frozen_0p15_Monotonic_Guard_Proposal.csv'
+          EVIDENCE_SHA='f113ff87f4543708f3f188e7d18818c8be354adb3f6570cf9ae41a6440901d30'
+          ORIGINAL_BRANCH="    if(real <= 0.15 && roleEstimate > real && NO_REAL_PRODUCTION_HISTORY.hasOwnProperty(key)) return roleEstimate;"
+          ADDITIONAL_BRANCH=("    if(role === 'Speculative' && CAL22_LEGACY_MONOTONE_KEYS.hasOwnProperty(key) && "
+                             "real >= 0.15 && real < roleEstimate && NO_REAL_PRODUCTION_HISTORY.hasOwnProperty(key)) return roleEstimate;\n")
+          MARK_BEGIN='/* CAL22_LEGACY_MONOTONE_GUARD_BEGIN — frozen 48-key identity cohort; never change current FV */\n'
+          MARK_END='/* CAL22_LEGACY_MONOTONE_GUARD_END */\n'
+          FILES=['index.html','free-agent-board.html','scripts/validation/snapshot_values.py',
+                 'scripts/validation/repo_regression_checks.py','scripts/validation/validate_cal22_monotone_guard.py',
+                 f'model/releases/{RELEASE}/release.json']
+          
+          def sha(b):return hashlib.sha256(b if isinstance(b,bytes) else Path(b).read_bytes()).hexdigest()
+          def read(p):return Path(p).read_text(encoding='utf-8')
+          def write(p,s):
+           p=Path(p);p.parent.mkdir(parents=True,exist_ok=True);p.write_text(s,encoding='utf-8')
+          def exact(s,a,b,count=1):
+           n=s.count(a)
+           if n!=count:raise RuntimeError(f'Anchor drift: expected {count} got {n} for {a[:100]!r}')
+           return s.replace(a,b,count)
+          
+          def load_evidence():
+           p=SOURCE/EVIDENCE
+           assert p.exists() and sha(p)==EVIDENCE_SHA, 'CAL21 evidence changed'
+           entries=list(csv.DictReader(p.open(encoding='utf-8',newline='')))
+           assert len(entries)==48 and len(set(r['player'] for r in entries))==48
+           assert all(r['role']=='Speculative' and float(r['frozen_raw_at_release'])==0.15 and float(r['frozen_effective_role_floor'])==0.22 for r in entries)
+           assert all(r['existing_production_fv_changed'].lower()=='false' and r['not_deployed'].lower()=='true' for r in entries)
+           return sorted(r['player'] for r in entries)
+          
+          def guard_object(keys):
+           return MARK_BEGIN+'const CAL22_LEGACY_MONOTONE_KEYS = {\n'+''.join(f"  '{k}':1,\n" for k in keys)+'};\n'+MARK_END+'\n'
+          
+          def patch_snapshot(s):
+           a='    role_mult = parse_simple_numeric_object(extract_object_body(content, "ROLE_MULT"))\n'
+           b=a+('    cal22_keys = set(re.findall(r"\'([^\']+)\'\\s*:\\s*1\\b",\n'
+                '        extract_object_body(content, "CAL22_LEGACY_MONOTONE_KEYS"))) if "const CAL22_LEGACY_MONOTONE_KEYS = {" in content else set()\n')
+           s=exact(s,a,b)
+           s=exact(s,'        "role_mult": role_mult,\n','        "role_mult": role_mult,\n        "cal22_keys": cal22_keys,\n')
+           s=exact(s,'def production_multiplier(key, role, prod_mult_data, no_real_history, role_mult):',
+                   'def production_multiplier(key, role, prod_mult_data, no_real_history, role_mult, cal22_keys=None):')
+           a='        if real <= 0.15 and role_estimate > real and key in no_real_history:\n'
+           b=('        if (role == "Speculative" and key in (cal22_keys or ()) and real >= 0.15\n'
+              '                and real < role_estimate and key in no_real_history):\n'
+              '            return role_estimate, real\n'+a)
+           s=exact(s,a,b)
+           a='            cfg["role_mult"],\n'
+           # On `compute_all_values`, rather than extra elsewhere: expected once.
+           s=exact(s,a,a+'            cfg.get("cal22_keys", set()),\n',1)
+           return s
+          
+          def patch_regression(s):
+           a='def check_deployed_idp_v1_invariants():\n'
+           b=(a+f'    if (REPO_ROOT / "model/releases/{RELEASE}/release.json").exists():\n'
+               '        import validate_cal22_monotone_guard\n'
+               '        result = validate_cal22_monotone_guard.validate_deployment_successor()\n'
+               '        assert result["status"] == "PASS"\n'
+               '        return\n')
+           return exact(s,a,b)
+          
+          def render_validator():
+           # This file is deployed with the fixed candidate. Revert exactly and run prior release validator.
+           return r'''#!/usr/bin/env python3
+          """CAL22 frozen-source continuity guard: deployed-price parity and prior lineage.
+          This validator proves the 48-key repair without masking old IDP/CAL15 safeguards.
+          """
+          from __future__ import annotations
+          import csv,hashlib,json,re,sys,tempfile
+          from pathlib import Path
+          HERE=Path(__file__).resolve()
+          ROOT=HERE.parents[2]
+          sys.path.insert(0,str(ROOT/'scripts/validation'))
+          sys.path.insert(0,str(ROOT/'scripts/sync'))
+          import snapshot_values as sv
+          import sync_free_agent_valuation as sync_fa
+          REL='model/releases/cal22-legacy-048-raw-floor-continuity-v1/release.json'
+          BEGIN='/* CAL22_LEGACY_MONOTONE_GUARD_BEGIN — frozen 48-key identity cohort; never change current FV */\n'
+          END='/* CAL22_LEGACY_MONOTONE_GUARD_END */\n'
+          ADDITIONAL=("    if(role === 'Speculative' && CAL22_LEGACY_MONOTONE_KEYS.hasOwnProperty(key) && "
+                      "real >= 0.15 && real < roleEstimate && NO_REAL_PRODUCTION_HISTORY.hasOwnProperty(key)) return roleEstimate;\n")
+          
+          def sha(b):return hashlib.sha256(b).hexdigest()
+          def original_html(s):
+           assert s.count(BEGIN)==1 and s.count(END)==1 and s.count(ADDITIONAL)==1
+           begin=s.index(BEGIN);end=s.index(END,begin)+len(END)
+           # Extra newline inserted after block.
+           assert s[end:end+1]=='\n'
+           return (s[:begin]+s[end+1:]).replace(ADDITIONAL,'',1)
+          
+          def validate_deployment_successor():
+           release=json.loads((ROOT/REL).read_text())
+           assert release['release_id']=='cal22-legacy-048-raw-floor-continuity-v1'
+           assert release['no_current_price_changes'] and release['market_value_untouched']
+           assert release['guard_key_count']==48
+           index=(ROOT/'index.html').read_text();board=(ROOT/'free-agent-board.html').read_text()
+           assert sha(index.encode())==release['candidate_index_sha256']
+           assert sha(board.encode())==release['candidate_board_sha256']
+           assert sync_fa.render_synced(index,board)==board
+           assert all(sync_fa.parity_regions(index,board).values())
+           original=original_html(index)
+           original_board=sync_fa.render_synced(original,board)
+           assert sha(original.encode())==release['base_index_sha256']
+           assert sha(original_board.encode())==release['base_board_sha256']
+           cfg=sv.load_from_html(ROOT/'index.html');after=sv.compute_all_values(cfg)
+           assert len(after)==565 and len(cfg['cal22_keys'])==48
+           assert sorted(cfg['cal22_keys'])==release['frozen_keys']
+           with tempfile.TemporaryDirectory() as td:
+            p=Path(td)/'old.html';p.write_text(original)
+            q=Path(td)/'oldboard.html';q.write_text(original_board)
+            old=sv.compute_all_values(sv.load_from_html(p))
+            assert {k:r['value'] for k,r in old.items()}=={k:r['value'] for k,r in after.items()}
+            cal20_deployed=(ROOT/'model/releases/cal20-offense-core173-2026-10-20-v1/release.json').exists()
+            if cal20_deployed:
+             import validate_cal20_successor as prior
+             # CAL20 validation operates on the reconstructed directly preceding
+             # exact release. If later background jobs changed the CAL20 file,
+             # the predecessor's release hash appropriately FAILS CLOSED.
+             predecessor_index=p
+             predecessor_board=q
+            else:
+             import validate_cal15_successor as prior
+             # Current index.html contains unrelated scheduled-refresh metadata
+             # changes since CAL15. The CAL15 validator intentionally requires
+             # EXACT released HTML SHA256 bytes, so replay its immutable release
+             # instead of mistakenly claiming the current (pre-CAL22) index is CAL15.
+             # This commit is a GREEN CAL16 run that contains the deployed CAL15
+             # index/board exactly, not a regenerated approximation.
+             import subprocess
+             frozen_commit='2789271e94e80674d2f183ab726ec7407041b111'
+             manifest15=json.loads((ROOT/'model/releases/cal15-idp-2026-horizon-bounded-v1/release.json').read_text())
+             frozen_index=subprocess.check_output(['git','show',f'{frozen_commit}:index.html'],cwd=ROOT)
+             frozen_board=subprocess.check_output(['git','show',f'{frozen_commit}:free-agent-board.html'],cwd=ROOT)
+             assert sha(frozen_index)==manifest15['candidate_index_sha256'], 'Immutable CAL15 source index drift'
+             assert sha(frozen_board)==manifest15['candidate_free_agent_board_sha256'], 'Immutable CAL15 source board drift'
+             predecessor_index=Path(td)/'immutable-cal15-index.html'
+             predecessor_board=Path(td)/'immutable-cal15-board.html'
+             predecessor_index.write_bytes(frozen_index)
+             predecessor_board.write_bytes(frozen_board)
+             # Independently retain the current predecessor reconstruction check
+             # above: sha(original)==release['base_index_sha256'] remains mandatory.
+            from datetime import date
+            pi,pb=prior.INDEX,prior.BOARD
+            live_birth_age=sv.fractional_age_from_birth_date
+            def cal15_historical_birth_age(birth_date,fallback_age,as_of=None):
+             return live_birth_age(birth_date,fallback_age,
+                as_of=date(2026,10,19) if as_of is None else as_of)
+            try:
+             prior.INDEX=predecessor_index;prior.BOARD=predecessor_board
+             if not cal20_deployed:
+              sv.fractional_age_from_birth_date=cal15_historical_birth_age
+             previous=prior.validate_deployment_successor()
+            finally:
+             sv.fractional_age_from_birth_date=live_birth_age
+             prior.INDEX=pi;prior.BOARD=pb
+            assert sv.fractional_age_from_birth_date is live_birth_age
+            assert previous['status']=='PASS'
+            print('CAL22 historical validator PASS:', 'CAL20 frozen price date' if cal20_deployed else 'CAL15 2026-10-19 release date pinned; live clock restored')
+           role_floor=cfg['role_mult']['Speculative'];assert role_floor==0.22
+           oldprod=dict(cfg['prod_mult']);suspects=[]
+           for k in sorted(cfg['cal22_keys']):
+            assert k in cfg['no_real_history'] and cfg['player_db'][k]['role']=='Speculative'
+            assert oldprod[k]==0.15,(k,oldprod[k])
+            last=0
+            for raw in (.15,.150001,.151,.1575,.165,.18,.219999,.22,.220001,.24,.3):
+             eff,_=sv.production_multiplier(k,'Speculative',{k:raw},cfg['no_real_history'],cfg['role_mult'],cfg['cal22_keys'])
+             assert eff>=last,(k,raw,eff,last)
+             last=eff
+             probe=dict(cfg);probe['prod_mult']=dict(oldprod);probe['prod_mult'][k]=raw
+             val=sv.compute_all_values(probe)[k]['value']
+             suspects.append((k,raw,val))
+            per=[v for name,r,v in suspects if name==k]
+            assert per==sorted(per),(k,per)
+           assert len(suspects)==48*11
+           print('PASS CAL22: 48 guard keys, no current FV change 565/565, prior IDP/CAL15 lineage, 528 raw monotonicity probes')
+           return {'status':'PASS','guard_keys':48,'current_fv_changes':0,'prior':previous['status']}
+          
+          if __name__=='__main__':validate_deployment_successor()
+          '''
+          
+          def construct():
+           keys=load_evidence()
+           sys.path.insert(0,str(ROOT/'scripts/validation'))
+           sys.path.insert(0,str(ROOT/'scripts/sync'))
+           import snapshot_values as sv
+           import sync_free_agent_valuation as fa
+           index=read(ROOT/'index.html'); board=read(ROOT/'free-agent-board.html')
+           snap=read(ROOT/'scripts/validation/snapshot_values.py')
+           rg=read(ROOT/'scripts/validation/repo_regression_checks.py')
+           assert 'CAL22_LEGACY_MONOTONE_KEYS' not in index
+           assert index.count(ORIGINAL_BRANCH)==1
+           assert fa.render_synced(index,board)==board, 'Original FA core not synchronized'
+           baseline=sv.compute_all_values(sv.load_from_html(ROOT/'index.html'))
+           assert len(baseline)==565 and set(keys).issubset(baseline)
+           original_cfg=sv.load_from_html(ROOT/'index.html')
+           assert all(original_cfg['prod_mult'].get(k)==.15 and original_cfg['player_db'][k]['role']=='Speculative' and k in original_cfg['no_real_history'] for k in keys)
+           index=exact(index,'function productionMultiplier(name, role){', guard_object(keys)+'function productionMultiplier(name, role){')
+           index=exact(index,ORIGINAL_BRANCH,ADDITIONAL_BRANCH+ORIGINAL_BRANCH)
+           snap2=patch_snapshot(snap)
+           reg2=patch_regression(rg)
+           CAND.mkdir(parents=True,exist_ok=True)
+           write(CAND/'index.html',index)
+           write(CAND/'free-agent-board.html',fa.render_synced(index,board))
+           write(CAND/'scripts/validation/snapshot_values.py',snap2)
+           write(CAND/'scripts/validation/repo_regression_checks.py',reg2)
+           write(CAND/'scripts/validation/validate_cal22_monotone_guard.py',render_validator())
+           # Reparse directly with patched snapshot module to validate all 565 current FVs.
+           import importlib.util
+           spec=importlib.util.spec_from_file_location('cal22_candidate_snapshot',CAND/'scripts/validation/snapshot_values.py')
+           new_sv=importlib.util.module_from_spec(spec);spec.loader.exec_module(new_sv)
+           cfg=new_sv.load_from_html(CAND/'index.html');new=new_sv.compute_all_values(cfg)
+           diff=[(k,baseline[k]['value'],new[k]['value']) for k in baseline if baseline[k]['value']!=new[k]['value']]
+           assert not diff,('Current value drift',diff[:5]);assert cfg['cal22_keys']==set(keys)
+           cases=[.15,.150001,.151,.1575,.165,.18,.219999,.22,.220001,.24,.3]
+           for k in keys:
+            vals=[]
+            for raw in cases:
+             test=dict(cfg);test['prod_mult']=dict(cfg['prod_mult']);test['prod_mult'][k]=raw
+             vals.append(new_sv.compute_all_values(test)[k]['value'])
+            assert vals==sorted(vals),(k,vals)
+           # Prove JS runtime current price parity and monotone guard on 48 identities against all scenarios.
+           core=fa._extract_core(index)[2]
+           playerdb=fa._extract_const_object(index,'PLAYER_DB')[2]
+           dates=fa._extract_const_object(index,'RB_BIRTH_DATE_DATA')[2]
+           norm=fa._extract_function(index,'normalizeName')[2]
+           js='\n'.join((core,playerdb,dates,norm,
+              'const keys='+json.dumps(keys)+';',
+              'const trials='+json.dumps(cases)+';',
+              'let results={};for(const key of keys){const v=PLAYER_DB[key];const prior=PROD_MULT[key];results[key]=trials.map(raw=>{PROD_MULT[key]=raw;return playerValue(v.pos,v.age,v.role,key)});PROD_MULT[key]=prior;}process.stdout.write(JSON.stringify(results));'))
+           with tempfile.TemporaryDirectory() as td:
+            path=Path(td)/'cal22.js';path.write_text(js)
+            jsresult=subprocess.run(['node',str(path)],capture_output=True,text=True)
+            assert jsresult.returncode==0,('JS kernel',jsresult.stderr[-1200:])
+            jsvals=json.loads(jsresult.stdout)
+            for k,vals in jsvals.items():assert vals==sorted(vals),(k,vals)
+            assert len(jsvals)==48
+           # Proven baseline immutable: no edits to quote or market (not part of candidates).
+           release={
+             'release_id':RELEASE,'status':'PREVIEW_REQUIRES_EXPLICIT_OWNER_APPROVAL',
+             'source_run':39474617051,'source_artifact':'cal21-v1r2-owner-and-elite-lb-full-pool-READ-ONLY',
+             'source_evidence_sha256':EVIDENCE_SHA,'base_commit':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
+             'base_index_sha256':sha(ROOT/'index.html'),'candidate_index_sha256':sha(CAND/'index.html'),
+             'base_board_sha256':sha(ROOT/'free-agent-board.html'),'candidate_board_sha256':sha(CAND/'free-agent-board.html'),
+             'base_snapshot_sha256':sha(ROOT/'scripts/validation/snapshot_values.py'),
+             'base_regression_sha256':sha(ROOT/'scripts/validation/repo_regression_checks.py'),
+             'frozen_keys':keys,'guard_key_count':48,'no_current_price_changes':True,'market_value_untouched':True,
+             'votes_untouched':True,'package_trade_verdict_untouched':True,'global_role_floor_unchanged':True,
+             'sonny_styles_reprice_approved':False,'cal20_release_approved':False,
+             'conditions':{'only_no_history_role':'Speculative','frozen_raw':0.15,'role_floor':0.22}
+           }
+           write(CAND/f'model/releases/{RELEASE}/release.json',json.dumps(release,indent=2,sort_keys=True)+'\n')
+           contract={'release_id':RELEASE,'base_commit':release['base_commit'],'source_run':39474617051,
+                     'owner_approval_required':True,'changes_to_live_FV':0,'files_sha256':{f:sha(CAND/f) for f in FILES},
+                     'base_files_sha256':{f:sha(ROOT/f) for f in FILES[:4]}}
+           write(OUT/'review_contract.json',json.dumps(contract,indent=2,sort_keys=True)+'\n')
+           report=['# CAL22 V1R3 — Narrow monotonicity continuity guard','',
+            '**Owner decision: preview only. Not a market repricing or CAL20 approval.**','',
+            f'- Input: CAL21 V1R2 green run 39474617051, SHA-256 {EVIDENCE_SHA}.',
+            '- Exact legacy 0.15 Speculative/no-history cohort: **48 players**.',
+            '- Current FV changed: **0/565**. No current quote or MV JSON files changed.',
+            '- JS runtime and Python port: **528/528** positive-raw perturbation probes monotonic (11 probes × 48 players).',
+            '- Free Agent Board canonical valuation code synchronized.',
+            '- Historical CAL15 release validator must still pass against byte-exact reconstructed prior release.',
+            '- Sonny Styles, Mendoza, Concepcion and the wider role-floor cohort are NOT repriced.',
+            '- Any future CAL20 release would need a new base after a CAL22 deployment.','',
+            '## Next','',
+            'Review preview; apply only after explicit owner approval. No auto-approval for market prices.']
+           write(OUT/'summary.md','\n'.join(report)+'\n')
+           print(json.dumps({'status':'PREVIEW_BUILT','changed_FV':0,'guarded':len(keys),'files':len(FILES),'js_py_probes':len(keys)*len(cases),'base_commit':release['base_commit']},indent=2))
+          
+          def audit():
+           contract=json.loads(read(OUT/'review_contract.json'))
+           assert len(contract['files_sha256'])==len(FILES)
+           assert contract['changes_to_live_FV']==0
+           for f,h in contract['files_sha256'].items():assert sha(CAND/f)==h,f
+           print('CAL22 candidate exact hashes PASS')
+          
+          if __name__=='__main__':
+           mode=sys.argv[1] if len(sys.argv)>1 else 'build'
+           if mode=='build':construct()
+           elif mode=='audit':audit()
+           else:raise ValueError(mode)
+          PYCODE
+          python3 -m py_compile /tmp/cal22_engine.py
+      - name: PREVIEW - fetch exact green CAL21 48-key source artifact
+        if: ${{ inputs.mode == 'preview' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/cal22-cal21
+          gh run download 39474617051 --repo "$GITHUB_REPOSITORY" --name cal21-v1r2-owner-and-elite-lb-full-pool-READ-ONLY --dir /tmp/cal22-cal21
+          test -s /tmp/cal22-cal21/CAL21_48_Identity_Frozen_0p15_Monotonic_Guard_Proposal.csv
+          python3 - <<'PYVERIFY'
+          import hashlib
+          from pathlib import Path
+          p=Path('/tmp/cal22-cal21/CAL21_48_Identity_Frozen_0p15_Monotonic_Guard_Proposal.csv')
+          assert hashlib.sha256(p.read_bytes()).hexdigest()=='f113ff87f4543708f3f188e7d18818c8be354adb3f6570cf9ae41a6440901d30'
+          print('CAL21 48-key evidence SHA-256 pinned PASS')
+          PYVERIFY
+      - name: PREVIEW - generate exact six-file release candidate
+        if: ${{ inputs.mode == 'preview' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 /tmp/cal22_engine.py build
+          python3 /tmp/cal22_engine.py audit
+          python3 - <<'PYCHECK'
+          import json,hashlib
+          from pathlib import Path
+          p=Path('cal22-preview'); c=json.loads((p/'review_contract.json').read_text())
+          assert c['owner_approval_required'] and c['changes_to_live_FV']==0
+          assert len(c['files_sha256'])==6
+          for f,h in c['files_sha256'].items():
+            assert hashlib.sha256((p/'candidate'/f).read_bytes()).hexdigest()==h,f
+          print('CAL22 six exact candidate file hashes PASS')
+          PYCHECK
+      - name: PREVIEW - stage on disposable runner and run all historical regressions
+        if: ${{ inputs.mode == 'preview' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYSTAGE'
+          from pathlib import Path
+          import json,shutil
+          p=Path('cal22-preview');c=json.loads((p/'review_contract.json').read_text())
+          for f,h in c['base_files_sha256'].items():
+            import hashlib
+            assert hashlib.sha256(Path(f).read_bytes()).hexdigest()==h,(f,'baseline drift')
+          for name in c['files_sha256']:
+            source=p/'candidate'/name
+            destination=Path(name)
+            destination.parent.mkdir(parents=True,exist_ok=True)
+            shutil.copyfile(source,destination)
+          PYSTAGE
+          python3 scripts/validation/snapshot_values.py --selftest
+          python3 scripts/sync/sync_free_agent_valuation.py --check
+          python3 scripts/validation/validate_cal22_monotone_guard.py
+          python3 scripts/validation/repo_regression_checks.py
+          python3 scripts/validation/validate_free_agent_valuation_parity.py
+          git diff --check
+          cat cal22-preview/summary.md >> "$GITHUB_STEP_SUMMARY"
+          echo 'CAL22 PREVIEW PASS: no production push or player repricing'
+      - name: PREVIEW - publish owner review candidate even on test failure
+        if: ${{ always() && inputs.mode == 'preview' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cal22-v1r3-zero-fv-change-48-guard-OWNER-REVIEW
+          path: cal22-preview/
+          retention-days: 30
+          if-no-files-found: warn
+      - name: APPLY - explicit approval and exact preview SHA
+        if: ${{ inputs.mode == 'apply' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$OWNER_APPROVAL" = I_APPROVE_CAL22_GUARD_ZERO_REPRICE
+          HEAD_SHA="$(git rev-parse HEAD)"
+          test "$HEAD_SHA" = "$GITHUB_SHA"
+          mkdir -p /tmp/cal22-approved
+          RUNS="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow "$WORKFLOW_FILE" --limit 40 --json databaseId,headSha,conclusion --jq '.[] | select(.conclusion=="success") | [.databaseId,.headSha] | @tsv')"
+          PREVIEW_ID=''
+          while IFS=$'\t' read -r rid sha; do
+            test -n "$rid" || continue
+            test "$sha" = "$HEAD_SHA" || continue
+            if gh run download "$rid" --repo "$GITHUB_REPOSITORY" --name "$ARTIFACT_NAME" --dir /tmp/cal22-approved; then
+              PREVIEW_ID="$rid";break
+            fi
+          done <<< "$RUNS"
+          test -n "$PREVIEW_ID" || { echo 'No successful exact-HEAD green CAL22 preview artifact found'; exit 1; }
+          export PREVIEW_ID
+          python3 - <<'PYAPPLY'
+          from pathlib import Path
+          import json,hashlib,shutil,os,subprocess
+          root=Path('.');p=Path('/tmp/cal22-approved');c=json.loads((p/'review_contract.json').read_text())
+          sha=lambda f:hashlib.sha256(Path(f).read_bytes()).hexdigest()
+          head=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+          assert c['base_commit']==head,'HEAD drift since owner's green preview'
+          assert c['release_id']=='cal22-legacy-048-raw-floor-continuity-v1'
+          assert c['changes_to_live_FV']==0 and c['owner_approval_required']
+          assert c['source_run']==39474617051 and len(c['files_sha256'])==6
+          for name,digest in c['base_files_sha256'].items():assert sha(name)==digest,(name,'baseline drift')
+          for name,digest in c['files_sha256'].items():assert sha(p/'candidate'/name)==digest,(name,'artifact drift')
+          for name in c['files_sha256']:
+            dst=Path(name);dst.parent.mkdir(parents=True,exist_ok=True)
+            shutil.copyfile(p/'candidate'/name,dst)
+            assert sha(dst)==c['files_sha256'][name]
+          print('Verified green preview',os.environ['PREVIEW_ID'],'exact owner-approved 6-file release')
+          PYAPPLY
+          python3 scripts/validation/snapshot_values.py --selftest
+          python3 scripts/sync/sync_free_agent_valuation.py --check
+          python3 scripts/validation/validate_cal22_monotone_guard.py
+          python3 scripts/validation/repo_regression_checks.py
+          python3 scripts/validation/validate_free_agent_valuation_parity.py
+          git diff --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add index.html free-agent-board.html scripts/validation/snapshot_values.py scripts/validation/repo_regression_checks.py scripts/validation/validate_cal22_monotone_guard.py model/releases/cal22-legacy-048-raw-floor-continuity-v1/release.json
+          test "$(git diff --cached --name-only | wc -l)" -eq 6
+          git diff --cached --check
+          git commit -m 'CAL22: fix 48-player no-history FV monotonicity without current repricing'
+          git push origin HEAD:main
+          echo 'Owner-approved CAL22 guard deployed; CAL20 market pricing remains unapproved.'
