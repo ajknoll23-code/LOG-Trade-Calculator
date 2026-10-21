@@ -1,0 +1,199 @@
+name: CAL22 V1R5 - Pinned Green V1R4 Artifact Owner-Gated Apply
+
+'on':
+  workflow_dispatch:
+    inputs:
+      owner_approval:
+        description: 'Required: type I_APPROVE_CAL22_GUARD_ZERO_REPRICE to deploy the exact green V1R4 candidate'
+        type: string
+        required: true
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Verify owner-approved six-file CAL22 release and apply
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OWNER_APPROVAL: ${{ inputs.owner_approval }}
+      PINNED_BASE: c87856ca2c7a73f2f2cc96aad158df6a7f5559c6
+      PINNED_GREEN_RUN: '39524424897'
+      PINNED_ARTIFACT: cal22-v1r4-zero-fv-change-48-guard-OWNER-REVIEW
+      PINNED_CONTRACT_SHA: 613d15d24852cf25444244bc1b97fd50bb33c441807a0ac74238a6123d3bab42
+      V1R5_WORKFLOW: .github/workflows/CAL22_V1R5_Pinned_Green_Apply.yml
+    steps:
+      - name: Checkout main with complete provenance history
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Install Python and pinned-regression dependencies
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python3 -m pip install --disable-pip-version-check requests numpy scipy
+
+      - name: Enforce explicit approval and exact green-preview lineage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$OWNER_APPROVAL" = 'I_APPROVE_CAL22_GUARD_ZERO_REPRICE' || { echo 'Explicit owner approval is missing'; exit 1; }
+          test "$(git branch --show-current)" = main
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          test ! -e model/releases/cal22-legacy-048-raw-floor-continuity-v1/release.json
+          git cat-file -e "${PINNED_BASE}^{commit}"
+          git merge-base --is-ancestor "$PINNED_BASE" HEAD
+          # This V1R5 is a packaging/deployment repair. No production code or data
+          # may have changed after the green V1R4 preview. Only this new YAML is allowed.
+          mapfile -t delta < <(git diff --name-only "$PINNED_BASE" HEAD)
+          printf 'Changes since green preview: %s\n' "${delta[*]}"
+          test "${#delta[@]}" -eq 1
+          test "${delta[0]}" = "$V1R5_WORKFLOW"
+          test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "$GITHUB_SHA"
+
+      - name: Retrieve existing immutable green V1R4 review artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(gh run view "$PINNED_GREEN_RUN" --repo "$GITHUB_REPOSITORY" --json conclusion --jq '.conclusion')" = success
+          test "$(gh run view "$PINNED_GREEN_RUN" --repo "$GITHUB_REPOSITORY" --json headSha --jq '.headSha')" = "$PINNED_BASE"
+          mkdir -p "$RUNNER_TEMP/cal22-v1r4-green"
+          gh run download "$PINNED_GREEN_RUN" --repo "$GITHUB_REPOSITORY" --name "$PINNED_ARTIFACT" --dir "$RUNNER_TEMP/cal22-v1r4-green"
+          test -s "$RUNNER_TEMP/cal22-v1r4-green/review_contract.json"
+
+      - name: Verify exact approved candidate and stage six files
+        shell: bash
+        env:
+          CAL22_APPROVED_DIR: ${{ runner.temp }}/cal22-v1r4-green
+        run: |
+          set -euo pipefail
+          cat >"$RUNNER_TEMP/cal22_v1r5_apply.py" <<'PYCODE'
+          #!/usr/bin/env python3
+          """Promote exact V1R4 green bytes without generating a new valuation candidate."""
+          import hashlib
+          import json
+          import os
+          import shutil
+          from pathlib import Path
+
+          ROOT = Path.cwd()
+          BUNDLE = Path(os.environ['CAL22_APPROVED_DIR'])
+          PINNED_BASE = os.environ['PINNED_BASE']
+          PINNED_CONTRACT_SHA = os.environ['PINNED_CONTRACT_SHA']
+          EXPECTED_FILES = {
+              'index.html',
+              'free-agent-board.html',
+              'scripts/validation/snapshot_values.py',
+              'scripts/validation/repo_regression_checks.py',
+              'scripts/validation/validate_cal22_monotone_guard.py',
+              'model/releases/cal22-legacy-048-raw-floor-continuity-v1/release.json',
+          }
+          EXPECTED_BASE = EXPECTED_FILES - {
+              'scripts/validation/validate_cal22_monotone_guard.py',
+              'model/releases/cal22-legacy-048-raw-floor-continuity-v1/release.json',
+          }
+
+          def sha256(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          contract_path = BUNDLE / 'review_contract.json'
+          assert sha256(contract_path) == PINNED_CONTRACT_SHA, 'Pinned review contract drift'
+          contract = json.loads(contract_path.read_text(encoding='utf-8'))
+          assert contract['base_commit'] == PINNED_BASE, 'Pinned preview base commit drift'
+          assert contract['release_id'] == 'cal22-legacy-048-raw-floor-continuity-v1'
+          assert contract['source_run'] == 39474617051
+          assert contract['changes_to_live_FV'] == 0
+          assert contract['owner_approval_required'] is True
+          assert set(contract['files_sha256']) == EXPECTED_FILES
+          assert set(contract['base_files_sha256']) == EXPECTED_BASE
+
+          release_path = BUNDLE / 'candidate/model/releases/cal22-legacy-048-raw-floor-continuity-v1/release.json'
+          release = json.loads(release_path.read_text(encoding='utf-8'))
+          assert release['base_commit'] == PINNED_BASE
+          assert release['guard_key_count'] == 48
+          assert len(set(release['frozen_keys'])) == 48
+          for flag in ('no_current_price_changes', 'market_value_untouched',
+                       'votes_untouched', 'package_trade_verdict_untouched',
+                       'global_role_floor_unchanged'):
+              assert release[flag] is True, flag
+          assert release['cal20_release_approved'] is False
+
+          for filename, original_digest in contract['base_files_sha256'].items():
+              current_path = ROOT / filename
+              assert current_path.is_file(), 'Missing baseline file: ' + filename
+              assert sha256(current_path) == original_digest, 'Source drift: ' + filename
+          for filename, approved_digest in contract['files_sha256'].items():
+              candidate_path = BUNDLE / 'candidate' / filename
+              assert candidate_path.is_file(), 'Missing green file: ' + filename
+              assert sha256(candidate_path) == approved_digest, 'Green candidate drift: ' + filename
+
+          # Only after every source and candidate check passes do we touch the checkout.
+          for filename in sorted(EXPECTED_FILES):
+              current_path = ROOT / filename
+              current_path.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copyfile(BUNDLE / 'candidate' / filename, current_path)
+              assert sha256(current_path) == contract['files_sha256'][filename]
+          print('PASS: pinned V1R4 review contract, all 6 files, 48 frozen keys, baseline hashes, zero-reprice controls')
+          PYCODE
+          python3 -m py_compile "$RUNNER_TEMP/cal22_v1r5_apply.py"
+          python3 "$RUNNER_TEMP/cal22_v1r5_apply.py"
+
+      - name: Repeat all green preview regression gates before release
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/snapshot_values.py --selftest
+          python3 scripts/sync/sync_free_agent_valuation.py --check
+          python3 scripts/validation/validate_cal22_monotone_guard.py
+          python3 scripts/validation/repo_regression_checks.py
+          python3 scripts/validation/validate_free_agent_valuation_parity.py
+          git diff --check
+          echo 'PASS: CAL22 exact green V1R4 candidate revalidated on V1R5 owner-gated apply' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit exactly six previously approved files and push
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add -- \
+            index.html \
+            free-agent-board.html \
+            scripts/validation/snapshot_values.py \
+            scripts/validation/repo_regression_checks.py \
+            scripts/validation/validate_cal22_monotone_guard.py \
+            model/releases/cal22-legacy-048-raw-floor-continuity-v1/release.json
+          mapfile -t staged < <(git diff --cached --name-only)
+          test "${#staged[@]}" -eq 6
+          python3 - <<'PYSTAGED'
+          import subprocess
+          expected = {
+              'index.html', 'free-agent-board.html',
+              'scripts/validation/snapshot_values.py',
+              'scripts/validation/repo_regression_checks.py',
+              'scripts/validation/validate_cal22_monotone_guard.py',
+              'model/releases/cal22-legacy-048-raw-floor-continuity-v1/release.json',
+          }
+          actual = set(subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines())
+          assert actual == expected, 'Staged-file allowlist mismatch: ' + str(actual ^ expected)
+          other = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          assert not other, 'Unexpected unstaged modifications: ' + str(other)
+          print('PASS: exactly 6 approved changed files and no other production mutations')
+          PYSTAGED
+          git diff --cached --check
+          test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "$GITHUB_SHA"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'CAL22: 48-player no-history FV monotonicity repair (no repricing)'
+          git push origin HEAD:main
+          echo 'CAL22 released: 48 monotonicity guards and zero current player repricing.' >> "$GITHUB_STEP_SUMMARY"
