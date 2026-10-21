@@ -1,0 +1,612 @@
+name: CAL26 WR01 - Weekly Frozen Role V2 Refresh and Safe FV Neutral Auto Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_mode:
+        description: 'Manual runs default to report only; choose safe automatic FV-neutral promotion mode to publish.'
+        required: true
+        type: choice
+        default: REPORT_ONLY
+        options:
+          - REPORT_ONLY
+          - AUTO_SAFE_FV_NEUTRAL
+  schedule:
+    # Wednesday 20:00 UTC = Wednesday 13:00 in Arizona (no DST).
+    # Deliberately after Monday games and weekly source ingestion.
+    - cron: '0 20 * 1,9-12 3'
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  weekly_frozen_roles:
+    name: Weekly frozen B42 Role V2 replay, stable FV-neutral promotions, provenance and 565-player parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out main with push permission only for guarded release
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Identify completed 2026 NFL week and avoid duplicate/offseason runs
+        id: gate
+        env:
+          CAL26_MODE: ${{ github.event_name == 'schedule' && 'AUTO_SAFE_FV_NEUTRAL' || inputs.release_mode || 'REPORT_ONLY' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" = 'refs/heads/main' ]] || { echo '::error::Run only on main'; exit 1; }
+          python3 - <<'PY_GATE'
+          import json,os,urllib.request
+          from pathlib import Path
+          with urllib.request.urlopen('https://api.sleeper.app/v1/state/nfl',timeout=40) as res:
+              state=json.load(res)
+          season=str(state.get('season') or '')
+          kind=str(state.get('season_type') or '').lower()
+          try: progress=max(int(state.get('week') or 0),int(state.get('leg') or 0))
+          except Exception: progress=0
+          completed=progress-1
+          ready=season=='2026' and (not kind or kind=='regular') and 7<=completed<=18
+          prior=Path('model/role-weekly-v1/latest_observation.json')
+          if prior.exists():
+              x=json.loads(prior.read_text())
+              priorweek=int(x['completed_week'])
+          else: priorweek=6
+          if ready and completed<=priorweek: ready=False
+          mode=os.environ.get('CAL26_MODE','REPORT_ONLY')
+          assert mode in ('AUTO_SAFE_FV_NEUTRAL','REPORT_ONLY'),mode
+          p=Path(os.environ['GITHUB_OUTPUT'])
+          with p.open('a') as f:
+              f.write('ready='+('true' if ready else 'false')+'\n')
+              f.write('completed_week='+str(completed)+'\n')
+              f.write('mode='+mode+'\n')
+          print(json.dumps({'sleeper_season':season,'season_type':kind,'completed_week':completed,
+                            'last_recorded_week':priorweek,'ready':ready,'release_mode':mode}))
+          PY_GATE
+      - name: Set up frozen B41J and B42 runtime
+        if: steps.gate.outputs.ready == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install immutable B41J and B42 numerical dependencies
+        if: steps.gate.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --no-cache-dir \
+            'requests>=2.32,<3' 'numpy==2.5.3' 'pandas==2.3.3' 'scipy==1.18.1'
+          python - <<'PY_PINS'
+          import importlib.metadata as md
+          for pkg,version in [('numpy','2.5.3'),('pandas','2.3.3'),('scipy','1.18.1')]:
+              assert md.version(pkg)==version,(pkg,md.version(pkg))
+          print('PASS immutable frozen Role V2 runtime pins')
+          PY_PINS
+      - name: Bootstrap immutable Week 6 observation only if no weekly state exists
+        if: steps.gate.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/cal26-weekly-bootstrap"
+          if [[ ! -f model/role-weekly-v1/latest_observation.json ]]; then
+            gh run download 39643851866 --repo "$GITHUB_REPOSITORY" \
+              --name CAL26-V1R5-Frozen-Role-V2-Through-Week6-READ-ONLY \
+              --dir "$RUNNER_TEMP/cal26-weekly-bootstrap"
+            python - <<'PY_BASE'
+          from pathlib import Path
+          import hashlib,os
+          p=Path(os.environ['RUNNER_TEMP'])/'cal26-weekly-bootstrap'/'cal26-v1r5-output'/'CAL26_V1R5_565_Week6_Role_Comparison.csv'
+          assert p.exists(),p
+          assert hashlib.sha256(p.read_bytes()).hexdigest()=='7eafb0410c02625d3b0daff89182b391df6483e9d766901ec0a3f916f99810fe'
+          print('PASS pinned Week 6 (565-player, 18 protected) bootstrap')
+          PY_BASE
+          else
+            echo 'Reusing durable previous completed week from model/role-weekly-v1/latest_observation.json'
+          fi
+      - name: Recompute frozen Role V2 with all 2026 completed regular-season weeks
+        if: steps.gate.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY_WITNESS'
+          import hashlib,json
+          from pathlib import Path
+          root=Path('research/player-role-v2')
+          p=root/'player_role_v2_b42_v4_owner_blind_parity_evaluator.py'
+          protocol=json.loads((root/'player_role_v2_b42_v4_protocol_freeze.json').read_text())
+          parity=json.loads((root/'player_role_v2_b42_v4_implementation_parity.json').read_text())
+          assert hashlib.sha256(p.read_bytes()).hexdigest()==protocol['evaluator_sha256'], 'Frozen evaluator drift'
+          assert parity['exact_parity']['pass'] is True, 'Frozen B41J parity failed'
+          print('Using original frozen B42 evaluator; no adaptation, no model retuning')
+          PY_WITNESS
+          python research/player-role-v2/player_role_v2_b42_v4_owner_blind_parity_evaluator.py \
+            --mode shadow --repo . \
+            --out "$RUNNER_TEMP/cal26-weekly-role-snapshot" \
+            --protocol-commit "$(python - <<'PY_PROTOCOL'
+          import json
+          with open('research/player-role-v2/player_role_v2_b42_v4_shadow_refresh_witness.json') as f:d=json.load(f)
+          print(d['protocol_freeze_commit'])
+          PY_PROTOCOL
+          )" \
+            --parity-commit "$(python - <<'PY_PARITY'
+          import json
+          with open('research/player-role-v2/player_role_v2_b42_v4_shadow_refresh_witness.json') as f:d=json.load(f)
+          print(d['implementation_parity_commit'])
+          PY_PARITY
+          )"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - name: Materialize isolated weekly release engine and run fast negative selftests
+        if: steps.gate.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/cal26_weekly_role_engine.py" <<'PY_CAL26_WR01'
+          #!/usr/bin/env python3
+          """CAL26 WR01 — weekly frozen B41F/B42 role observations and safe FV-neutral promotion release.
+
+          Runtime on GitHub: invoked on checkout, with repo's own canonical pricing and FA synchronization.
+          All state is generated outside repo until guarded commit. No downgrades, large tier moves,
+          unstable predictions or price-moving changes automatically enter production.
+          """
+          from __future__ import annotations
+          import argparse
+          import csv
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+          import unicodedata
+          from collections import Counter, defaultdict
+
+          ROLES = ('Speculative','Depth','Understudy','Rotational','Starter','Every-Down','Elite')
+          POSITIONS = {'QB','RB','WR','TE','K','DL','LB','DB'}
+          STATE_REL = 'model/role-weekly-v1/latest_observation.json'
+          RECEIPT_FOLDER = 'model/role-weekly-v1/receipts'
+          RELEASE_REL = 'model/releases/cal26-v1r8-role-v2-98-week6-fv-neutral-2026-10-21-v1/release.json'
+          BASE_SHA = '7eafb0410c02625d3b0daff89182b391df6483e9d766901ec0a3f916f99810fe'
+          BASE_NAME = 'CAL26_V1R5_565_Week6_Role_Comparison.csv'
+          PARENT_RUN = 39643851866
+
+
+          def require(ok, detail):
+              if not ok:
+                  raise RuntimeError('CAL26_WEEKLY_ROLE_' + detail)
+
+
+          def sha(path):
+              return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+          def readcsv(path):
+              with Path(path).open(encoding='utf-8', newline='') as f:
+                  return list(csv.DictReader(f))
+
+
+          def writecsv(path, rows, columns):
+              with Path(path).open('w', newline='', encoding='utf-8') as f:
+                  w = csv.DictWriter(f, fieldnames=columns, extrasaction='ignore')
+                  w.writeheader();w.writerows(rows)
+
+
+          def truth(v):
+              return str(v).strip().lower() in ('true','1','yes')
+
+
+          def namekey(value):
+              t=''.join(c for c in unicodedata.normalize('NFKD', str(value or '')) if not unicodedata.combining(c)).casefold()
+              tokens=re.findall(r'[a-z0-9]+',t)
+              while tokens and tokens[-1] in ('jr','sr','ii','iii','iv','v'):
+                  tokens.pop()
+              out=[];i=0
+              while i<len(tokens):
+                  j=i
+                  while j<len(tokens) and len(tokens[j])==1 and tokens[j].isalpha(): j+=1
+                  if j-i>=2:
+                      out.append(''.join(tokens[i:j]));i=j
+                  else:
+                      out.append(tokens[i]);i+=1
+              return ' '.join(out)
+
+
+          def prior_from_bootstrap(path):
+              require(sha(path)==BASE_SHA, 'BOOTSTRAP_WEEK6_SHA_DRIFT')
+              source=readcsv(path)
+              require(len(source)==565 and len({r['player'] for r in source})==565,'BOOTSTRAP_NOT_565_UNIQUE')
+              require(sum(truth(r['protect_accepted_fv']) for r in source)==18,'BOOTSTRAP_18_CONTROLS_DRIFT')
+              result={}
+              for r in source:
+                  tier=r['week6_model_tier']
+                  if tier: require(tier in ROLES,'BOOTSTRAP_BAD_MODEL_TIER')
+                  result[r['player']]={'position':r['position'], 'tier':tier,
+                      'gsis_id':r['week6_gsis_id'],'sleeper_id':r['week6_sleeper_id'],
+                      'active_games':int(r['week6_prior_active_games']) if r['week6_prior_active_games'] else 0}
+              return {'schema_version':1,'season':2026,'completed_week':6,'players':result,
+                      'origin':'PINNED_CAL26_V1R5_GREEN_WEEK6','source_run':PARENT_RUN}
+
+
+          def validate_prior(state, week):
+              require(state['schema_version']==1 and state['season']==2026,'PRIOR_STATE_SCHEMA')
+              require(6<=state['completed_week']<week<=18,'WEEK_OUT_OF_SEQUENCE')
+              require(len(state['players'])==565, 'PRIOR_STATE_NOT_565')
+              require(len(set(state['players']))==565,'PRIOR_STATE_NAME_COLLISION')
+              for player,r in state['players'].items():
+                  require(player and r['position'] in POSITIONS and (not r['tier'] or r['tier'] in ROLES),
+                          'BAD_PRIOR_PLAYER')
+              return state
+
+
+          def weekly_model_rows(source, expected_week):
+              root=Path(source)
+              shadow=root/'player_role_v2_b42_v4_shadow_refresh.csv'
+              cross=root/'player_role_v2_b42_v4_role_eligibility.csv'
+              witpath=root/'player_role_v2_b42_v4_shadow_refresh_witness.json'
+              for p in (shadow,cross,witpath): require(p.exists(), 'MISSING_'+p.name)
+              witness=json.loads(witpath.read_text(encoding='utf-8'))
+              require(witness['latest_completed_week']==expected_week,'WITNESS_WRONG_WEEK')
+              require(witness['shadow_refresh_sha256']==sha(shadow),'SHADOW_SHA_DRIFT')
+              require(witness['role_eligibility_sha256']==sha(cross),'CROSSWALK_SHA_DRIFT')
+              require(witness['implementation_parity_exact_pass'] is True,'B41J_PARITY_NOT_PASS')
+              require(witness['model_or_tier_retuning_performed'] is False and witness['future_target_used'] is False,
+                      'UNFROZEN_MODEL_OR_FUTURE_DATA')
+              require(all(witness.get(x) is False for x in (
+                  'role_inference_used_owner_identity','role_inference_used_dynasty_team',
+                  'role_inference_used_fantasy_roster_slot')), 'ROSTER_CONTEXT_IN_MODEL')
+              for n in ('weekly_stats','snap_counts'):
+                  require(witness['current_sources'][n]['latest_completed_week_included']==expected_week,
+                          'INPUT_CUTOFF_'+n)
+              stats=witness['current_sources']['sleeper_completed_week_stats_sha256']
+              require(str(expected_week) in stats,'NO_CURRENT_WEEK_SLEEPER_STATS')
+              model=readcsv(shadow);identity=readcsv(cross)
+              bygsis={};bysid={}
+              for s in model:
+                  gsis,sid,pos=s['gsis_id'],s['sleeper_id'],s['position']
+                  require(gsis and sid and pos in POSITIONS,'EMPTY_MODEL_ID')
+                  require(s['role_tier'] in ROLES and int(s['tier_index'])==ROLES.index(s['role_tier']),
+                          'BAD_FROZEN_ROLE_TIER')
+                  require(int(s['origin_week'])==expected_week, 'OLD_MODEL_WEEK')
+                  require(gsis not in bygsis and sid not in bysid,'MODEL_ID_COLLISION')
+                  bygsis[gsis]=s;bysid[sid]=s
+              byname=defaultdict(list)
+              for x in identity:
+                  if not truth(x['identity_mapped']):continue
+                  s=bygsis.get(x['gsis_id'])
+                  if s is None or s['sleeper_id']!=x['sleeper_id'] or s['position']!=x['position']:continue
+                  k=(namekey(x['player_name']),x['position'])
+                  if k[0]:byname[k].append(s)
+              return byname,witness,model
+
+
+          def role_patch(index, changes, sync):
+              begin,end,region=sync._extract_const_object(index,'PLAYER_DB')
+              patched=region
+              for r in changes:
+                  name,pos,old,new=(r[k] for k in ('player','position','old_role','new_role'))
+                  require(old in ROLES and new in ROLES and ROLES.index(new)>ROLES.index(old),
+                          'NOT_AN_UPGRADE_'+name)
+                  pattern=(r"(?P<front>'"+re.escape(name)+r"'\s*:\s*\{\s*pos:'"+re.escape(pos)+
+                           r"'\s*,\s*age:\d+\s*,\s*role:')"+re.escape(old)+r"(?P<back>')")
+                  patched,occ=re.subn(pattern,lambda m:m['front']+new+m['back'],patched)
+                  require(occ==1,'LIVE_ROLE_NOT_EXACT_ONCE_'+name)
+              return index[:begin]+patched+index[end:]
+
+
+          def analyze(repo,shadow_dir,out,prev,week,mode,synthetic=False):
+              repo=Path(repo);out=Path(out);out.mkdir(parents=True,exist_ok=True)
+              require(mode in ('AUTO_SAFE_FV_NEUTRAL','REPORT_ONLY'),'BAD_RELEASE_MODE')
+              validate_prior(prev,week)
+              if not synthetic:
+                  release=json.loads((repo/RELEASE_REL).read_text())
+                  require(release['affected_role_count']==98 and release['live_fv_change_count']==0,
+                          'INITIAL_98_ROLE_RELEASE_MISSING')
+                  # Frozen B42 V4 lineage is validated independently by its evaluator.
+                  witness=json.loads((Path(shadow_dir)/'player_role_v2_b42_v4_shadow_refresh_witness.json').read_text())
+                  protocol=json.loads((repo/'research/player-role-v2/player_role_v2_b42_v4_protocol_freeze.json').read_text())
+                  require(witness['evaluator_sha256']==protocol['evaluator_sha256'],
+                          'FROZEN_EVALUATOR_PROTOCOL_DRIFT')
+              byname,witness,model=weekly_model_rows(shadow_dir,week)
+              sys.path.insert(0,str(repo/'scripts'/'validation'))
+              sys.path.insert(0,str(repo/'scripts'/'sync'))
+              import snapshot_values as sv
+              import sync_free_agent_valuation as sync
+              indexfile=repo/'index.html';boardfile=repo/'free-agent-board.html'
+              index=indexfile.read_text(encoding='utf-8');board=boardfile.read_text(encoding='utf-8')
+              config=sv.load_from_html(indexfile);before=sv.compute_all_values(config)
+              require(len(before)==565 and len(config['player_db'])==565,'LIVE_UNIVERSE_NOT_565')
+              require(set(prev['players'])==set(before), 'PREVIOUS_STATE_NOT_CURRENT_UNIVERSE')
+              require(sync.render_synced(index,board)==board,'LIVE_BOARD_NOT_SYNCED')
+              require(all(sync.parity_regions(index,board).values()),'LIVE_BOARD_PARITY')
+              decision_rows=[];newplayers={};proposed=[];counts=Counter()
+              consecutive=(week==prev['completed_week']+1)
+              for player in sorted(before):
+                  now=before[player];pos=now['pos'];old=now['role'];prior=prev['players'][player]
+                  require(pos==prior['position'] and old in ROLES,'LIVE_ID_OR_ROLE_DRIFT_'+player)
+                  candidates=byname.get((namekey(player),pos),[])
+                  item=candidates[0] if len(candidates)==1 else None
+                  if item is not None and prior['tier']:
+                      if item['gsis_id']!=prior['gsis_id'] or item['sleeper_id']!=prior['sleeper_id']:
+                          item=None
+                          status='IDENTITY_CHANGED_HOLD'
+                      else:status=''
+                  else:status=''
+                  tier=item['role_tier'] if item else ''
+                  active=int(item['prior_active_games']) if item else 0
+                  state_entry={'position':pos,'tier':tier,'gsis_id':item['gsis_id'] if item else '',
+                               'sleeper_id':item['sleeper_id'] if item else '', 'active_games':active}
+                  newplayers[player]=state_entry
+                  shift=ROLES.index(tier)-ROLES.index(old) if tier else None
+                  if item is None:
+                      status=status or ('AMBIGUOUS_MATCH_HOLD' if len(candidates)>1 else 'UNMATCHED_HOLD')
+                  elif shift==0:
+                      status='ALREADY_CORRECT'
+                  elif shift<0:
+                      status='DOWNGRADE_REVIEW_HOLD'
+                  elif shift>=3:
+                      status='LARGE_UPGRADE_REVIEW_HOLD'
+                  elif not consecutive:
+                      status='MISSING_PREVIOUS_WEEK_REVIEW_HOLD'
+                  elif not prior['tier'] or tier!=prior['tier']:
+                      status='UNSTABLE_OR_NEW_MATCH_REVIEW_HOLD'
+                  elif active<3:
+                      status='INSUFFICIENT_ACTIVE_GAMES_HOLD'
+                  else:
+                      status='FV_NEUTRALITY_TO_BE_TESTED'
+                      proposed.append({'player':player,'position':pos,'old_role':old,'new_role':tier,
+                                       'active_games':active,'prior_tier':prior['tier'],
+                                       'sleeper_id':item['sleeper_id'],'gsis_id':item['gsis_id']})
+                  counts[status]+=1
+                  decision_rows.append({'player':player,'position':pos,'current_role':old,
+                                        'last_week_tier':prior['tier'],'new_week_tier':tier,
+                                        'role_shift_from_live':shift if shift is not None else '',
+                                        'prior_active_games':active,'old_fv':before[player]['value'],
+                                        'outcome':status,'new_fv':'','sleeper_id':state_entry['sleeper_id'],
+                                        'gsis_id':state_entry['gsis_id']})
+              # Apply candidates independently, then compute exact all-player FV with repository canonical code.
+              # FV-moving candidates are skipped without causing unrelated FV-neutral candidates to be lost.
+              accepted=[];fvheld=[];temporary_index=index
+              for change in proposed:
+                  p=change['player']
+                  tested=role_patch(index,[change],sync)
+                  testpath=out/'_one_player_candidate.html'
+                  testpath.write_text(tested,encoding='utf-8')
+                  afterone=sv.compute_all_values(sv.load_from_html(testpath))
+                  require(set(afterone)==set(before),'SINGLE_PLAYER_UNIVERSE_CHANGED_'+p)
+                  n=sum(1 for k in before if before[k]['value']!=afterone[k]['value'])
+                  if n==0:
+                      accepted.append(change)
+                  else:
+                      fvheld.append(change)
+              if accepted: temporary_index=role_patch(index,accepted,sync)
+              tempindex=out/'index.html';tempboard=out/'free-agent-board.html'
+              tempindex.write_text(temporary_index,encoding='utf-8')
+              temporary_board=sync.render_synced(temporary_index,board) if accepted else board
+              tempboard.write_text(temporary_board,encoding='utf-8')
+              after=sv.compute_all_values(sv.load_from_html(tempindex))
+              require(set(before)==set(after),'AFTER_PLAYER_SET_DRIFT')
+              require(all(before[p]['value']==after[p]['value'] for p in before), 'ALL_FV_PARITY_FAILED')
+              require(all(after[p]['pos']==before[p]['pos'] for p in before),'POSITION_CHANGED')
+              allowed={x['player']:x['new_role'] for x in accepted}
+              require(all(after[p]['role']==allowed.get(p,before[p]['role']) for p in before),
+                      'NONCANDIDATE_ROLE_CHANGED')
+              require(sum(before[p]['role']!=after[p]['role'] for p in before)==len(accepted),
+                      'EDIT_COUNT_MISMATCH')
+              require(all(sync.parity_regions(temporary_index,temporary_board).values()),
+                      'SYNC_PARITY_FAILED')
+              require(sync.render_synced(temporary_index,temporary_board)==temporary_board,
+                      'BOARD_NOT_IDEMPOTENT')
+              require(sync._extract_const_object(board,'FA_PROD_MULT_DATA')[2]==
+                      sync._extract_const_object(temporary_board,'FA_PROD_MULT_DATA')[2],
+                      'FREE_AGENT_PRODUCTION_CHANGED')
+              require(sync._extract_const_object(index,'PROD_MULT_DATA')[2]==
+                      sync._extract_const_object(temporary_index,'PROD_MULT_DATA')[2],
+                      'CANONICAL_PRODUCTION_CHANGED')
+              require(sync._extract_const_object(index,'NO_REAL_PRODUCTION_HISTORY')[2]==
+                      sync._extract_const_object(temporary_index,'NO_REAL_PRODUCTION_HISTORY')[2],
+                      'PRODUCTION_HISTORY_GUARD_CHANGED')
+              namesaccepted={c['player'] for c in accepted};namesfvheld={c['player'] for c in fvheld}
+              for r in decision_rows:
+                  p=r['player'];r['new_fv']=after[p]['value']
+                  if p in namesaccepted:r['outcome']='FV_NEUTRAL_UPGRADE_CANDIDATE'
+                  elif p in namesfvheld:r['outcome']='PRICE_MOVING_UPGRADE_HELD'
+              counts=Counter(r['outcome'] for r in decision_rows)
+              fields=list(decision_rows[0]);writecsv(out/'CAL26_Weekly_All_565_Role_Decisions.csv',decision_rows,fields)
+              writecsv(out/'CAL26_Weekly_Auto_Upgrades.csv',[r for r in decision_rows if r['outcome']=='FV_NEUTRAL_UPGRADE_CANDIDATE'],fields)
+              writecsv(out/'CAL26_Weekly_Manual_Review.csv',[r for r in decision_rows if r['outcome'] not in ('FV_NEUTRAL_UPGRADE_CANDIDATE','ALREADY_CORRECT')],fields)
+              modelstate={'schema_version':1,'season':2026,'completed_week':week,'players':newplayers,
+                          'origin':'FROZEN_B41F_B42_V4_WEEKLY_SHADOW','witness_sha256':sha(Path(shadow_dir)/'player_role_v2_b42_v4_shadow_refresh_witness.json')}
+              (out/'latest_observation.json').write_text(json.dumps(modelstate,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+              receipt={'status':'PASS_CAL26_WEEKLY_ROLE_RELEASE_CANDIDATE','season':2026,
+                       'completed_week':week,'previous_observation_week':prev['completed_week'],
+                       'consecutive_week':consecutive,'release_mode':mode,'model_retrained':False,
+                       'candidate_role_updates':len(accepted),'fv_moving_candidates_held':len(fvheld),
+                       'player_count':565,'live_fv_change_count':0,'live_price_protection_count':565,
+                       'reviewed_owner_price_controls_preserved':18,
+                       'decisions_by_outcome':dict(counts),'before_index_sha256':sha(indexfile),
+                       'after_index_sha256':sha(tempindex),'before_board_sha256':sha(boardfile),
+                       'after_board_sha256':sha(tempboard),'model_shadow_sha256':witness['shadow_refresh_sha256'],
+                       'model_witness_sha256':sha(Path(shadow_dir)/'player_role_v2_b42_v4_shadow_refresh_witness.json'),
+                       'auto_downward_revisions':0,'auto_large_upgrades':0,'production_price_write':False}
+              (out/'release_receipt.json').write_text(json.dumps(receipt,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+              review=['# CAL26 Weekly Role V2 — Week '+str(week),'',
+                      f"- Production eligibility: **{len(accepted)}** stable (+1/+2) FV-neutral upgrades.",
+                      f"- Price-moving candidates held: **{len(fvheld)}**.",
+                      f"- Previous observed week: **{prev['completed_week']}**. Consecutive: **{consecutive}**.",
+                      '- No downgrades, large jumps, new/unmatched identities, or live FV changes are permitted automatically.',
+                      '- The frozen usage model scores current role, not permanent dynasty talent quality.',
+                      '', '## Decision groups','']
+              for k,n in sorted(counts.items()):review.append(f'- {k}: {n}')
+              review+=['','Source Week and per-player decisions are saved with the Actions artifact.','']
+              (out/'CAL26_Weekly_Review.md').write_text('\n'.join(review),encoding='utf-8')
+              (out/'_one_player_candidate.html').unlink(missing_ok=True)
+              print(json.dumps({'completed_week':week,'release_mode':mode,'candidate_role_updates':len(accepted),
+                                'price_moving_held':len(fvheld),'counts':dict(counts),'fv_changed':0},indent=2))
+              return receipt
+
+
+          def selftest():
+              require(namekey('C.J. Stroud')==namekey('cj stroud'), 'NAME_CJ_MISMATCH')
+              require(namekey('Marvin Harrison Jr.')==namekey('marvin harrison'), 'NAME_JR_MISMATCH')
+              class S:
+                  @staticmethod
+                  def _extract_const_object(text,name):
+                      require(name=='PLAYER_DB','TEST_BAD_CONST')
+                      return (0,len(text),text)
+              original="const PLAYER_DB = {'foo':{pos:'QB',age:24,role:'Depth'},'bar':{pos:'WR',age:23,role:'Elite'}};"
+              row={'player':'foo','position':'QB','old_role':'Depth','new_role':'Rotational'}
+              patched=role_patch(original,[row],S())
+              require("'foo':{pos:'QB',age:24,role:'Rotational'}" in patched,'ROLE_PATCH_SELFTEST')
+              try:
+                  role_patch(original,[{'player':'absent','position':'QB','old_role':'Depth','new_role':'Starter'}],S())
+                  raise AssertionError('missing key silently accepted')
+              except RuntimeError as e:
+                  require('LIVE_ROLE_NOT_EXACT_ONCE' in str(e),'MISSING_KEY_BAD_ERROR')
+              print('CAL26 weekly selftest PASS: identity normalization, role patch and negative test')
+
+
+          if __name__=='__main__':
+              ap=argparse.ArgumentParser()
+              ap.add_argument('--repo',default='.')
+              ap.add_argument('--shadow')
+              ap.add_argument('--bootstrap')
+              ap.add_argument('--out')
+              ap.add_argument('--week',type=int)
+              ap.add_argument('--mode',default='AUTO_SAFE_FV_NEUTRAL')
+              ap.add_argument('--selftest',action='store_true')
+              a=ap.parse_args()
+              if a.selftest:selftest()
+              else:
+                  if not all((a.shadow,a.out,a.week)): ap.error('shadow/out/week required')
+                  priorfile=Path(a.repo)/STATE_REL
+                  if priorfile.exists(): prior=json.loads(priorfile.read_text())
+                  else:
+                      require(a.bootstrap and Path(a.bootstrap).exists(),'WEEK6_BOOTSTRAP_REQUIRED')
+                      prior=prior_from_bootstrap(a.bootstrap)
+                  analyze(a.repo,a.shadow,a.out,prior,a.week,a.mode)
+          PY_CAL26_WR01
+          python "$RUNNER_TEMP/cal26_weekly_role_engine.py" --selftest
+          python - <<'PY_SYNTAX'
+          import ast,os
+          from pathlib import Path
+          p=Path(os.environ['RUNNER_TEMP'])/'cal26_weekly_role_engine.py'
+          ast.parse(p.read_text())
+          print('PASS self-contained weekly Role V2 engine parses')
+          PY_SYNTAX
+      - name: Build exact 565-player role-only weekly release candidate and manual review report
+        if: steps.gate.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python "$RUNNER_TEMP/cal26_weekly_role_engine.py" \
+            --repo . \
+            --shadow "$RUNNER_TEMP/cal26-weekly-role-snapshot" \
+            --bootstrap "$RUNNER_TEMP/cal26-weekly-bootstrap/cal26-v1r5-output/CAL26_V1R5_565_Week6_Role_Comparison.csv" \
+            --out "$RUNNER_TEMP/cal26-weekly-review" \
+            --week "${{ steps.gate.outputs.completed_week }}" \
+            --mode "${{ steps.gate.outputs.mode }}"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - name: Independently check 565-FV parity, candidate CSV, snapshot and receipt
+        if: steps.gate.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY_CHECK'
+          import csv,hashlib,json,os
+          from pathlib import Path
+          out=Path(os.environ['RUNNER_TEMP'])/'cal26-weekly-review'
+          receipt=json.loads((out/'release_receipt.json').read_text())
+          state=json.loads((out/'latest_observation.json').read_text())
+          with (out/'CAL26_Weekly_All_565_Role_Decisions.csv').open(newline='') as f:
+              rows=list(csv.DictReader(f))
+          with (out/'CAL26_Weekly_Auto_Upgrades.csv').open(newline='') as f:
+              upgrades=list(csv.DictReader(f))
+          assert receipt['status']=='PASS_CAL26_WEEKLY_ROLE_RELEASE_CANDIDATE'
+          assert receipt['model_retrained'] is False
+          assert receipt['player_count']==565 and len(rows)==565 and len(state['players'])==565
+          assert len(upgrades)==receipt['candidate_role_updates']
+          assert len({r['player'] for r in rows})==565
+          assert all(int(r['old_fv'])==int(r['new_fv']) for r in rows)
+          assert receipt['live_fv_change_count']==0 and receipt['auto_downward_revisions']==0
+          assert receipt['auto_large_upgrades']==0 and receipt['production_price_write'] is False
+          assert receipt['completed_week']==state['completed_week']
+          sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+          assert sha(out/'index.html')==receipt['after_index_sha256']
+          assert sha(out/'free-agent-board.html')==receipt['after_board_sha256']
+          print('PASS independent weekly source and all 565 live FV parity checks')
+          PY_CHECK
+          cat "$RUNNER_TEMP/cal26-weekly-review/CAL26_Weekly_Review.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Automatically deploy only weekly FV-neutral stable +1/+2 upgrades and checkpoint previous week
+        if: steps.gate.outputs.ready == 'true' && steps.gate.outputs.mode == 'AUTO_SAFE_FV_NEUTRAL'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ steps.gate.outputs.mode }}" = 'AUTO_SAFE_FV_NEUTRAL'
+          test "$GITHUB_REF" = 'refs/heads/main'
+          python - <<'PY_STAGE'
+          import hashlib,json,os,shutil,subprocess
+          from pathlib import Path
+          out=Path(os.environ['RUNNER_TEMP'])/'cal26-weekly-review'
+          receipt=json.loads((out/'release_receipt.json').read_text())
+          week=receipt['completed_week']
+          assert receipt['release_mode']=='AUTO_SAFE_FV_NEUTRAL'
+          assert receipt['player_count']==565 and receipt['live_fv_change_count']==0
+          assert receipt['auto_downward_revisions']==receipt['auto_large_upgrades']==0
+          assert receipt['production_price_write'] is False
+          rel=Path(f'model/role-weekly-v1/receipts/2026-week-{week:02d}.json')
+          assert not rel.exists(),f'Week {week} was already committed'
+          state=Path('model/role-weekly-v1/latest_observation.json')
+          snapshot=Path(f'model/role-weekly-v1/snapshots/2026-week-{week:02d}.json')
+          assert not snapshot.exists(), 'Week snapshot already exists'
+          for src,dest in [('release_receipt.json',rel),('latest_observation.json',state),('latest_observation.json',snapshot)]:
+              dest.parent.mkdir(parents=True,exist_ok=True)
+              shutil.copyfile(out/src,dest)
+          changes=receipt['candidate_role_updates']
+          if changes:
+              for p in ('index.html','free-agent-board.html'):
+                  shutil.copyfile(out/p,Path(p))
+          expected={rel.as_posix(),state.as_posix(),snapshot.as_posix()}
+          if changes: expected|={'index.html','free-agent-board.html'}
+          subprocess.run(['git','add','--',*sorted(expected)],check=True)
+          actual=set(subprocess.check_output(['git','diff','--cached','--name-only'],text=True).splitlines())
+          assert actual==expected,('EXPECTED_CHANGED_PATHS_MISMATCH',actual,expected)
+          print(f'PASS staging Week {week}: {changes} FV-neutral role upgrades; 565 exact FV prices')
+          PY_STAGE
+          git diff --cached --check
+          git -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -m "CAL26 WR01: week ${{ steps.gate.outputs.completed_week }} frozen roles, FV-neutral updates + observation ledger"
+          # Explicitly no rebase or force-push; stale main rejects the write.
+          git push origin HEAD:main
+          echo "PRODUCTION: Week ${{ steps.gate.outputs.completed_week }} FV-neutral role updates and new weekly model observation committed." >> "$GITHUB_STEP_SUMMARY"
+      - name: Explain report-only or no-new-week outcome
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.gate.outputs.ready }}" != 'true' ]]; then
+            echo 'No eligible new completed 2026 regular-season week. No source or production change made.' >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "${{ steps.gate.outputs.mode }}" = 'REPORT_ONLY' ]]; then
+            echo 'Manual REPORT_ONLY mode: no repository files changed, next scheduled run can auto update.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload weekly immutable input audit, all 565 decisions and price review
+        if: always() && steps.gate.outputs.ready == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: CAL26-WR01-Weekly-Role-V2-Refresh-${{ steps.gate.outputs.completed_week }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/cal26-weekly-review/
+            ${{ runner.temp }}/cal26-weekly-role-snapshot/player_role_v2_b42_v4_shadow_refresh.csv
+            ${{ runner.temp }}/cal26-weekly-role-snapshot/player_role_v2_b42_v4_shadow_refresh_witness.json
+            ${{ runner.temp }}/cal26-weekly-role-snapshot/player_role_v2_b42_v4_role_eligibility.csv
+          if-no-files-found: warn
+          retention-days: 45
