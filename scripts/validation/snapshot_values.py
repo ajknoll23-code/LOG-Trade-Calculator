@@ -125,7 +125,12 @@ def load_from_html(html_path):
     if not age_curve:
         raise RuntimeError("AGE_CURVE parsed as empty")
 
+    cal26_overrides = (
+        parse_simple_numeric_object(extract_object_body(content, "CAL26_FV_OWNER_ANCHORS"))
+        if "const CAL26_FV_OWNER_ANCHORS = {" in content else {}
+    )
     return {
+        "cal26_fv_owner_anchors": cal26_overrides,
         "player_db": player_db,
         "prod_mult": prod_mult,
         "no_real_history": no_history,
@@ -334,6 +339,11 @@ def compute_all_values(cfg):
         # built-in round() uses bankers rounding. Trade Desk values are
         # positive, so floor(x + 0.5) reproduces the live JS exactly.
         value = math.floor(100 * pw * am * rm * 55 + 0.5)
+        anchor = cfg.get("cal26_fv_owner_anchors", {}).get(key)
+        if anchor is not None:
+            if int(anchor) != anchor or anchor <= 0:
+                raise AssertionError("INVALID_OWNER_FV_ANCHOR_" + key)
+            value = int(anchor)
         results[key] = {
             "pos": pos,
             "age": age,
