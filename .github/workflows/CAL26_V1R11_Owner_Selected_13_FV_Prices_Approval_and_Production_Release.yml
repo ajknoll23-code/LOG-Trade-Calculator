@@ -1,0 +1,368 @@
+name: CAL26 V1R11 - Owner Selected FV Pricing Preview or Production Release
+
+'on':
+  workflow_dispatch:
+    inputs:
+      release_mode:
+        description: 'Default preview does NOT deploy. Production requires explicit approval and player names.'
+        type: choice
+        required: true
+        default: PREVIEW_ONLY
+        options:
+          - PREVIEW_ONLY
+          - I_APPROVE_EXACT_LISTED_FV_PRICES_IN_PRODUCTION
+      approved_players:
+        description: 'Exact comma-separated canonical player names to release. Blank in preview = view all 13. Production cannot be blank.'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  PYTHONDONTWRITEBYTECODE: '1'
+  RELEASE_MODE: ${{ inputs.release_mode }}
+  APPROVED_PLAYERS: ${{ inputs.approved_players }}
+  ARTIFACT_RUN: '39662495564'
+  RELEASE_PATH: model/releases/cal26-v1r11-owner-selected-fv-2026-10-21-v1/release.json
+
+jobs:
+  exact-fv-selected-release:
+    name: Reconcile 565 prices and 18 anchors; commit only explicitly owner-approved selection
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Validate branch and manual approval form
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = 'refs/heads/main'
+          case "$RELEASE_MODE" in
+            PREVIEW_ONLY) ;;
+            I_APPROVE_EXACT_LISTED_FV_PRICES_IN_PRODUCTION) test -n "$APPROVED_PLAYERS" ;;
+            *) echo '::error::Unsupported approval mode'; exit 1 ;;
+          esac
+      - name: Checkout current production main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Configure Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Download exact green V1R10 13-player pricing integration source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/cal26-v1r11-source"
+          gh run download "$ARTIFACT_RUN" --repo "$GITHUB_REPOSITORY" \
+            --name CAL26-V1R10-13-Exact-FV-Integration-Candidate-READ-ONLY \
+            --dir "$RUNNER_TEMP/cal26-v1r11-source"
+          for f in CAL26_V1R10_Manifest.json CAL26_V1R10_13_Candidate_Exact_FV_Deltas.csv \
+                   CAL26_V1R10_565_Exact_FV_Shadow.csv index.html free-agent-board.html snapshot_values.py; do
+            test -s "$RUNNER_TEMP/cal26-v1r11-source/$f"
+          done
+      - name: Materialize frozen exact-price candidate selection engine outside repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/cal26_v1r11_owner_selected_release.py" <<'PY_CAL26_V1R11_ENGINE'
+          #!/usr/bin/env python3
+          """CAL26 V1R11 candidate 13 anchored FV prices: explicit selected-owner release.
+
+          Input is pinned live Green V1R10 artifact. Preview generates candidate output only.
+          Approved mode requires an explicitly named player whitelist on dispatch and
+          commits via GitHub Action after complete 565-player/18-control parity checks.
+          """
+          from __future__ import annotations
+          import argparse,csv,hashlib,json,re,sys,importlib.util
+          from pathlib import Path
+
+          RUN_ID=39662495564
+          ARTIFACT='CAL26-V1R10-13-Exact-FV-Integration-Candidate-READ-ONLY'
+          RELEASE='model/releases/cal26-v1r11-owner-selected-fv-2026-10-21-v1/release.json'
+          MARKER='/* CAL26_V1R10_EXPLICIT_OWNER_PRICE_ANCHOR_SHADOW_NOT_PRODUCTION */'
+          MODE_PREVIEW='PREVIEW_ONLY'
+          MODE_APPROVED='I_APPROVE_EXACT_LISTED_FV_PRICES_IN_PRODUCTION'
+
+
+          def fail_if(not_ok,code):
+              if not not_ok:raise AssertionError('CAL26_V1R11_'+code)
+          def sha(p):return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+          def load_csv(p):
+              with open(p,newline='',encoding='utf-8') as f:return list(csv.DictReader(f))
+          def save_csv(p,rows,fieldnames):
+              with open(p,'w',newline='',encoding='utf-8') as f:
+                  w=csv.DictWriter(f,fieldnames=fieldnames,extrasaction='ignore');w.writeheader();w.writerows(rows)
+
+          def selected_names(text,targets,mode):
+              raw=(text or '').strip()
+              if mode==MODE_PREVIEW and not raw:return set(targets) # preview the complete first pricing wave
+              fail_if(raw!='','MISSING_EXPLICIT_APPROVED_PLAYER_LIST')
+              names=[x.strip().casefold() for x in raw.split(',')]
+              fail_if(all(names) and all(re.fullmatch(r'[a-z0-9 ]+',x) for x in names),'NONCANONICAL_NAME')
+              fail_if(len(names)==len(set(names)),'DUPLICATE_APPROVAL_NAMES')
+              fail_if(set(names).issubset(targets),'UNKNOWN_OR_UNAUTHORIZED_PLAYER')
+              fail_if(len(names)>0,'EMPTY_APPROVAL')
+              return set(names)
+
+          def build(repo,source,out,mode,approved_text,fixture=False):
+              repo,source,out=map(Path,(repo,source,out));out.mkdir(parents=True,exist_ok=True)
+              fail_if(mode in (MODE_PREVIEW,MODE_APPROVED),'INVALID_RELEASE_MODE')
+              p_manifest=source/'CAL26_V1R10_Manifest.json'
+              m=json.loads(p_manifest.read_text(encoding='utf-8'))
+              fail_if(m['status']=='PASS_CAL26_V1R10_13_EXACT_PRICE_INTEGRATION_CANDIDATE_READ_ONLY','BAD_PINNED_SOURCE_STATUS')
+              fail_if(m['source_green_v1r9_run']==39660339898 and m['proposed_price_changes']==13 and m['live_player_count']==565 and m['accepted_owner_controls']==18,'GREEN_SOURCE_LINEAGE_CHANGED')
+              fail_if(m['proposed_price_delta_total']==6772 and m['production_price_release_authorized'] is False,'SOURCE_ALREADY_AUTHORIZED')
+              fail_if(m['existing_prod_multiplier_values_unchanged'] is True and m['prior_98_role_labels_preserved'] is True,'SOURCE_ROLE_OR_PRODUCTION_UNSAFE')
+              pins={'index.html':'candidate_index_sha256','free-agent-board.html':'candidate_board_sha256','snapshot_values.py':'candidate_snapshot_values_sha256'}
+              for n,k in pins.items():fail_if(sha(source/n)==m[k],'STAGED_SOURCE_SHA_DRIFT_'+n)
+              for n in ['CAL26_V1R10_13_Candidate_Exact_FV_Deltas.csv','CAL26_V1R10_565_Exact_FV_Shadow.csv']:
+                  fail_if((source/n).exists(),'MISSING_STAGED_SOURCE_'+n)
+              prices=load_csv(source/'CAL26_V1R10_13_Candidate_Exact_FV_Deltas.csv')
+              rows=load_csv(source/'CAL26_V1R10_565_Exact_FV_Shadow.csv')
+              targets={r['player']:int(r['shadow_fv']) for r in prices}
+              baseline={r['player']:r for r in rows}
+              fail_if(len(targets)==13 and len(rows)==565 and len(baseline)==565,'BAD_565_OR_13_UNIQUE_COUNTS')
+              for r in prices:
+                  name=r['player'];b=baseline[name]
+                  fail_if(int(r['before_fv'])==int(b['before_fv']) and int(r['shadow_fv'])==int(b['shadow_fv']),'GREEN_ROW_MISMATCH_'+name)
+                  fail_if(r['source']=='OWNER_RATED_CORRECT_COMPANION' and r['release_eligible_approved']=='NO','GREEN_ROW_APPROVAL_FLAG_CHANGED_'+name)
+                  fail_if(int(r['delta'])==targets[name]-int(r['before_fv']) and int(r['delta'])>0,'GREEN_DELTA_BAD_'+name)
+              fail_if(sum(int(r['delta']) for r in prices)==6772,'GREEN_PRICE_TOTAL_BAD')
+              approved=selected_names(approved_text,targets,mode)
+              # Current live production must still equal the exact release used in V1R10.
+              live_index=repo/'index.html';live_board=repo/'free-agent-board.html'
+              if not fixture:
+                  fail_if(sha(live_index)==m['source_release_index_sha256'] and sha(live_board)==m['source_release_board_sha256'],
+                          'SOURCE_PRODUCTION_HTML_CHANGED_SINCE_GREEN_V1R10')
+              original_index=live_index.read_text(encoding='utf-8')
+              original_board=live_board.read_text(encoding='utf-8')
+              artifact_index=(source/'index.html').read_text(encoding='utf-8')
+              anchor_pattern=r'(const CAL26_FV_OWNER_ANCHORS = \{\n)(.*?)(\};)'
+              match=re.search(anchor_pattern,artifact_index,re.S)
+              fail_if(match is not None and artifact_index.count(MARKER)==1,'MISSING_UNIQUE_ANCHOR_TABLE')
+              parsed={k:int(v) for k,v in re.findall(r"^  '([^']+)':(\d+),$",match.group(2),re.M)}
+              fail_if(parsed==targets,'PINNED_JS_PRICE_ENTRIES_CHANGED')
+              new_entries=''.join("  '"+k+"':"+str(targets[k])+",\n" for k in sorted(approved))
+              index=artifact_index[:match.start(2)]+new_entries+artifact_index[match.end(2):]
+              fail_if(index.count('const CAL26_FV_OWNER_ANCHORS')==1,'DOUBLE_ANCHOR_LAYER')
+              fail_if('PROD_MULT_DATA' in index and 'PLAYER_DB' in index,'CALCULATOR_CORE_MISSING')
+              # Invariant: candidate baseline has exactly one small, reversible JS modification.
+              def reverse(s):
+                  prefix,rest=s.split(MARKER,1)
+                  original_marker='  const pw = POSITION_WEIGHT[pos] ?? 1.0;'
+                  fail_if(rest.count(original_marker)==1,'LOSS_OF_ORIGINAL_PRICING_FORMULA')
+                  return prefix+ 'function playerValue(pos, age, role, name){\n'+original_marker+rest.split(original_marker,1)[1]
+              fail_if(reverse(index)==original_index,'JS_INJECTION_CHANGED_UNRELATED_FIELDS')
+              sys.path.insert(0,str(repo/'scripts/sync'))
+              sys.path.insert(0,str(repo/'scripts/validation'))
+              import sync_free_agent_valuation as sync
+              import snapshot_values as sv
+              fail_if(sync.render_synced(original_index,original_board)==original_board,'LIVE_BOARD_NOT_SYNCHRONIZED')
+              board=sync.render_synced(index,original_board)
+              fail_if(sync.render_synced(index,board)==board and all(sync.parity_regions(index,board).values()),'NEW_BOARD_PARITY_ERROR')
+              fail_if(sync._extract_const_object(original_board,'FA_PROD_MULT_DATA')[2]==sync._extract_const_object(board,'FA_PROD_MULT_DATA')[2], 'FREE_AGENT_SPECIFIC_PROD_CHANGED')
+              candidate_script=(source/'snapshot_values.py').read_text(encoding='utf-8')
+              original_script=(repo/'scripts/validation/snapshot_values.py').read_text(encoding='utf-8')
+              # Exact reverse of the V1R10 shadow Python evaluator patch to guard unintended edits.
+              altered_return='''    cal26_overrides = (
+                  parse_simple_numeric_object(extract_object_body(content, "CAL26_FV_OWNER_ANCHORS"))
+                  if "const CAL26_FV_OWNER_ANCHORS = {" in content else {}
+              )
+              return {
+                  "cal26_fv_owner_anchors": cal26_overrides,
+                  "player_db": player_db,'''
+              original_return='''    return {
+                  "player_db": player_db,'''
+              altered_result='''        anchor = cfg.get("cal26_fv_owner_anchors", {}).get(key)
+                  if anchor is not None:
+                      if int(anchor) != anchor or anchor <= 0:
+                          raise AssertionError("INVALID_OWNER_FV_ANCHOR_" + key)
+                      value = int(anchor)
+                  results[key] = {
+                      "pos": pos,'''
+              original_result='''        results[key] = {
+                      "pos": pos,'''
+              fail_if(candidate_script.count(altered_return)==1 and candidate_script.count(altered_result)==1,'PY_SNAPSHOT_MISMATCH')
+              reconstructed=candidate_script.replace(altered_return,original_return,1).replace(altered_result,original_result,1)
+              fail_if(reconstructed==original_script,'CANDIDATE_PY_SNAPSHOT_NOT_EXACT_BASELINE_PLUS_OVERRIDES')
+              fail_if(MARKER not in original_index,'LIVE_ALREADY_ANCHORED')
+              (out/'index.html').write_text(index,encoding='utf-8')
+              (out/'free-agent-board.html').write_text(board,encoding='utf-8')
+              (out/'snapshot_values.py').write_text(candidate_script,encoding='utf-8')
+              # Compute original prices with canonical Python and after prices with exact staged candidate port.
+              live=sv.compute_all_values(sv.load_from_html(live_index))
+              scope={'__name__':'cal26_v1r11_shadow','__file__':str(out/'snapshot_values.py')}
+              exec(compile(candidate_script,str(out/'snapshot_values.py'),'exec'),scope)
+              candcfg=scope['load_from_html'](out/'index.html')
+              current=scope['compute_all_values'](candcfg)
+              fail_if(candcfg['cal26_fv_owner_anchors']=={k:targets[k] for k in approved},'PY_PRICES_DIFFER_FROM_APPROVED_SET')
+              fail_if(len(live)==len(current)==565 and len(rows)==565,'PRICE_UNIVERSE_DRIFT')
+              changed=[];audits=[]
+              for name,old in live.items():
+                  after=current[name];b=baseline[name]
+                  fail_if(old['pos']==after['pos']==b['position'] and old['role']==after['role']==b['live_role'] and old['age']==after['age'],'POSITION_ROLE_AGE_CHANGED_'+name)
+                  fail_if(old['value']==int(b['before_fv']),'LIVE_FV_DIFFERENT_FROM_PINNED_GREEN_'+name)
+                  expected=targets[name] if name in approved else old['value']
+                  fail_if(after['value']==expected,'WRONG_PRICE_'+name)
+                  if old['value']!=after['value']:changed.append(name)
+                  audits.append({'player':name,'position':old['pos'],'before_fv':old['value'],'after_fv':after['value'],'delta':after['value']-old['value'],'release_authorized_for_player':name in approved})
+              fail_if(set(changed)==approved,'PRICE_CHANGES_NOT_EXACTLY_APPROVED')
+              # Previous green V1R10 verified 18 accepted controls untouched under all 13 candidates;
+              # a chosen subset cannot create extra changes. Every other player remains unchanged.
+              fail_if(sum(x['delta'] for x in audits)==sum(targets[k]-int(baseline[k]['before_fv']) for k in approved),'APPROVED_SUM_DRIFT')
+              fail_if([name for name in changed if name not in targets]==[],'NON_TARGET_PRICE_CHANGED')
+              fail_if(all(live[k]['role']==current[k]['role'] and live[k]['prod_mult']==current[k]['prod_mult'] for k in live),'ROLE_OR_PRODUCTION_CHANGED')
+              manifest={'status':'PASS_CAL26_V1R11_OWNER_SELECTED_EXACT_FV_RELEASE_CANDIDATE',
+                   'release_mode':mode,'owner_selected_player_count':len(approved),'owner_selected_players':sorted(approved),
+                   'owner_selected_exact_fv':{k:targets[k] for k in sorted(approved)},
+                   'price_changes_count':len(changed),'price_delta_total':sum(x['delta'] for x in audits),
+                   'total_live_players':565,'untouched_players':565-len(approved),
+                   'accepted_price_controls_protected':18,'frozen_role_labels_unchanged':True,
+                   'production_multipliers_unchanged':True,'other_player_prices_unchanged':True,
+                   'historical_13_release_approval':False,'new_explicit_owner_approval_required':True,
+                   'owner_approval_selected_in_run':mode==MODE_APPROVED,
+                   'pinned_green_v1r10_run':RUN_ID,'pinned_green_artifact':ARTIFACT,'pinned_manifest_sha256':sha(p_manifest),
+                   'base_index_sha256':sha(live_index),'base_board_sha256':sha(live_board),
+                   'staged_index_sha256':sha(out/'index.html'), 'staged_board_sha256':sha(out/'free-agent-board.html'),
+                   'staged_snapshot_sha256':sha(out/'snapshot_values.py'),
+                   'production_files_mutated_by_builder':False,
+                   'release_path':RELEASE}
+              (out/'CAL26_V1R11_Manifest.json').write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n')
+              save_csv(out/'CAL26_V1R11_565_Exact_Release_Preview.csv',audits,['player','position','before_fv','after_fv','delta','release_authorized_for_player'])
+              save_csv(out/'CAL26_V1R11_Explicit_Selected_Prices.csv',[a for a in audits if a['player'] in approved],['player','position','before_fv','after_fv','delta','release_authorized_for_player'])
+              (out/'CAL26_V1R11_Review.md').write_text(
+                  '# CAL26 V1R11 - Owner-selected exact FV pricing release\n\n'
+                  +('**PRODUCTION RELEASE SELECTED — pending guarded commit step.**\n\n' if mode==MODE_APPROVED else '**PREVIEW ONLY. NO PRODUCTION CHANGES.**\n\n')
+                  +f"Selected prices: {len(approved)} of 13; combined price delta: +{manifest['price_delta_total']:,}. All other players' prices unchanged; 18 prior accepted controls preserved.\n\n"
+                  + '| Player | Before FV | Owner-selected FV | Delta |\n|---|---:|---:|---:|\n'
+                  + ''.join(f"| {r['player'].title()} | {r['before_fv']:,} | {r['after_fv']:,} | +{r['delta']:,} |\n" for r in audits if r['player'] in approved)
+              )
+              print(json.dumps(manifest,indent=2,sort_keys=True))
+
+          if __name__=='__main__':
+              p=argparse.ArgumentParser()
+              p.add_argument('--repo',default='.')
+              p.add_argument('--source',required=True)
+              p.add_argument('--out',required=True)
+              p.add_argument('--release-mode',required=True)
+              p.add_argument('--approved-players',default='')
+              a=p.parse_args()
+              build(a.repo,a.source,a.out,a.release_mode,a.approved_players)
+          PY_CAL26_V1R11_ENGINE
+          python - <<'PY_SYNTAX'
+          import ast,os
+          from pathlib import Path
+          p=Path(os.environ['RUNNER_TEMP'])/'cal26_v1r11_owner_selected_release.py'
+          ast.parse(p.read_text())
+          print('PASS V1R11 pinned selection engine syntax')
+          PY_SYNTAX
+      - name: Approval whitelist failure-mode regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY_APPROVAL_TESTS'
+          import importlib.util,os
+          from pathlib import Path
+          p=Path(os.environ['RUNNER_TEMP'])/'cal26_v1r11_owner_selected_release.py'
+          spec=importlib.util.spec_from_file_location('cal26_v1r11_tests',p)
+          mod=importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+          names={'patrick mahomes':5756,'brian branch':3436,'trey mcbride':5823}
+          assert mod.selected_names('',names,mod.MODE_PREVIEW)==set(names)
+          assert mod.selected_names('patrick mahomes, brian branch',names,mod.MODE_APPROVED)=={'patrick mahomes','brian branch'}
+          for text in ('','patrick mahomes,patrick mahomes','unknown player','patrick mahomes,unknown player'):
+            try: mod.selected_names(text,names,mod.MODE_APPROVED)
+            except AssertionError:pass
+            else:raise AssertionError('Approval whitelist did not reject '+repr(text))
+          print('PASS V1R11 exact owner approval whitelist and missing/unknown/duplicate name guards')
+          PY_APPROVAL_TESTS
+      - name: Generate exact owner-selected shadow and verify all 565 player prices
+        shell: bash
+        run: |
+          set -euo pipefail
+          python "$RUNNER_TEMP/cal26_v1r11_owner_selected_release.py" \
+            --repo . --source "$RUNNER_TEMP/cal26-v1r11-source" \
+            --out "$RUNNER_TEMP/cal26-v1r11-stage" \
+            --release-mode "$RELEASE_MODE" \
+            --approved-players "$APPROVED_PLAYERS"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - name: Independently reconcile release scope and staged SHA evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY_VERIFY'
+          import os,hashlib,json,csv
+          from pathlib import Path
+          path=Path(os.environ['RUNNER_TEMP'])/'cal26-v1r11-stage'
+          m=json.loads((path/'CAL26_V1R11_Manifest.json').read_text())
+          with (path/'CAL26_V1R11_565_Exact_Release_Preview.csv').open(newline='') as f:r=list(csv.DictReader(f))
+          approved=set(m['owner_selected_players'])
+          assert m['status']=='PASS_CAL26_V1R11_OWNER_SELECTED_EXACT_FV_RELEASE_CANDIDATE'
+          assert len(r)==565 and m['total_live_players']==565 and m['accepted_price_controls_protected']==18
+          assert m['production_multipliers_unchanged'] and m['frozen_role_labels_unchanged']
+          assert m['production_files_mutated_by_builder'] is False
+          assert {x['player'] for x in r if int(x['delta'])!=0}==approved
+          assert sum(int(x['delta']) for x in r)==m['price_delta_total']
+          assert m['price_changes_count']==len(approved)
+          for name,field in [('index.html','staged_index_sha256'),('free-agent-board.html','staged_board_sha256'),('snapshot_values.py','staged_snapshot_sha256')]:
+            assert hashlib.sha256((path/name).read_bytes()).hexdigest()==m[field],name
+          print('PASS V1R11 exact FV evidence, 565 scope, 18 protected, and current live SHA')
+          PY_VERIFY
+          cat "$RUNNER_TEMP/cal26-v1r11-stage/CAL26_V1R11_Review.md" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$RELEASE_MODE" == 'PREVIEW_ONLY' ]]; then
+            echo '**PREVIEW: No production changes authorized or made.**' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '**OWNER-SELECTED PRODUCTION RELEASE REQUESTED: guarded commit follows.**' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Commit exact approved FV prices and synced board - only when explicitly selected
+        if: ${{ inputs.release_mode == 'I_APPROVE_EXACT_LISTED_FV_PRICES_IN_PRODUCTION' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RELEASE_MODE" = 'I_APPROVE_EXACT_LISTED_FV_PRICES_IN_PRODUCTION'
+          test -n "$APPROVED_PLAYERS"
+          test "$GITHUB_REF" = 'refs/heads/main'
+          test ! -e "$RELEASE_PATH" || { echo '::error::Release receipt already exists'; exit 1; }
+          cp "$RUNNER_TEMP/cal26-v1r11-stage/index.html" index.html
+          cp "$RUNNER_TEMP/cal26-v1r11-stage/free-agent-board.html" free-agent-board.html
+          cp "$RUNNER_TEMP/cal26-v1r11-stage/snapshot_values.py" scripts/validation/snapshot_values.py
+          mkdir -p "$(dirname "$RELEASE_PATH")"
+          cp "$RUNNER_TEMP/cal26-v1r11-stage/CAL26_V1R11_Manifest.json" "$RELEASE_PATH"
+          # Canonical FV and free-agent sync must still work in the real release files.
+          python scripts/validation/snapshot_values.py --selftest
+          python scripts/sync/sync_free_agent_valuation.py --check
+          git diff --check
+          git add -- index.html free-agent-board.html scripts/validation/snapshot_values.py "$RELEASE_PATH"
+          git diff --cached --check
+          python - <<'PY_FILES'
+          import os,subprocess
+          actual=set(subprocess.check_output(['git','diff','--cached','--name-only'],text=True).splitlines())
+          expected={'index.html','free-agent-board.html','scripts/validation/snapshot_values.py',os.environ['RELEASE_PATH']}
+          assert actual==expected,(actual,expected)
+          print('PASS: exactly three core files + one immutable FV release receipt')
+          PY_FILES
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m 'CAL26 V1R11: owner-selected exact FV prices (565-player parity checked)'
+          # Never force-push or rebase a concurrent production edit.
+          git push origin HEAD:main
+          echo 'PRODUCTION DEPLOYED: exact owner-selected FV price changes only.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve source evidence and independent candidate receipts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: CAL26-V1R11-Owner-Selected-Exact-FV-Review-or-Release
+          path: ${{ runner.temp }}/cal26-v1r11-stage/
+          if-no-files-found: warn
+          retention-days: 30
