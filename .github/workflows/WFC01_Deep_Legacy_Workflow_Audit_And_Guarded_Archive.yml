@@ -1,4 +1,4 @@
-# WFC01 V1R3 | Safe audit first. Never archive without explicit owner approval + pinned audit evidence.
+# WFC01 V1R4 | Safe audit first. Never archive without explicit owner approval + pinned audit evidence.
 name: WFC01 - Deep Legacy Workflow Audit and Explicit Archive
 run-name: WFC01 ${{ inputs.mode }} - ${{ github.sha }}
 'on':
@@ -65,14 +65,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat > "$RUNNER_TEMP/wfc01_v1r3_engine.py" <<'PY_WFC01_V1R3'
+          cat > "$RUNNER_TEMP/wfc01_v1r4_engine.py" <<'PY_WFC01_V1R4'
           #!/usr/bin/env python3
-          """WFC01 V1R3 safe workflow inventory and owner-approved exact archive.
+          """WFC01 V1R4 safe workflow inventory and owner-approved exact archive.
           
           An audit candidate is never an authorization to archive. Never deletes files.
           """
           from __future__ import annotations
-          import argparse,csv,datetime as dt,hashlib,io,json,os,re,subprocess,sys,urllib.parse,urllib.request,zipfile
+          import argparse,csv,datetime as dt,hashlib,io,json,os,re,subprocess,sys,time,urllib.parse,urllib.request,zipfile
           from pathlib import Path
           import yaml
           
@@ -128,9 +128,48 @@ jobs:
               except Exception as e:
                   return {'events':['UNKNOWN'],'write':True,'valid':False,'error':str(e)[:200],'sha256':sha_bytes(b)}
           
+          def _day_history_rows(label):
+              # GitHub can transiently return an empty or truncated page even when the
+              # same date query has a nonzero result count. Retry complete date slices;
+              # NEVER use a partial slice to authorize a workflow archive.
+              base=urllib.parse.urlencode({'created':label,'per_page':100})
+              last_error='NOT_STARTED'
+              for attempt in range(5):
+                  try:
+                      first=api_json('actions/runs?'+base+'&page=1')
+                      total=first.get('total_count')
+                      check(isinstance(total,int) and 0<=total<=1000,
+                            'HISTORY_UTC_DAY_EXCEEDS_API_LIMIT_'+label)
+                      rows=first.get('workflow_runs')
+                      check(isinstance(rows,list),'INVALID_HISTORY_PAGE1_'+label)
+                      # A zero-day must also agree with an independently formatted
+                      # timestamp-range query, preventing transient false empty pages.
+                      if total==0:
+                          time_range=label+'T00:00:00Z..'+label+'T23:59:59Z'
+                          verify=api_json('actions/runs?'+urllib.parse.urlencode({'created':time_range,'per_page':1,'page':1}))
+                          check(verify.get('total_count')==0,'ZERO_HISTORY_UNVERIFIED_'+label)
+                      else:
+                          check(len(rows)==min(100,total),'TRUNCATED_HISTORY_PAGE1_'+label)
+                      for page in range(2,(total+99)//100+1):
+                          x=api_json('actions/runs?'+base+'&page='+str(page))
+                          check(x.get('total_count')==total,'HISTORY_TOTAL_CHANGED_'+label)
+                          segment=x.get('workflow_runs')
+                          check(isinstance(segment,list) and len(segment)==min(100,total-100*(page-1)),
+                                'TRUNCATED_HISTORY_PAGE_'+label+'_'+str(page))
+                          rows.extend(segment)
+                      check(len(rows)==total,'INCOMPLETE_ACTION_HISTORY_UTC_DAY_'+label)
+                      ids=[item.get('id') for item in rows]
+                      check(None not in ids and len(ids)==len(set(ids)),'DUPLICATE_OR_MISSING_RUN_ID_'+label)
+                      check(all(str(item.get('created_at',''))[:10]==label for item in rows),
+                            'HISTORY_DAY_MISMATCH_'+label)
+                      return rows
+                  except (Exception,) as exc:
+                      last_error=type(exc).__name__+': '+str(exc)
+                      if attempt<4:time.sleep(min(2**attempt,4))
+              raise RuntimeError('INCOMPLETE_ACTION_HISTORY_UTC_DAY_'+label+' AFTER_5_RETRIES: '+last_error)
+          
           def recent_history(since):
-              # GitHub's Actions run listing has a 1000-result search limit. Query one
-              # UTC day at a time, including the partial first day, and validate each page.
+              # Exact UTC day pagination avoids GitHub's 1000-result cap.
               day=since.date()
               end_day=dt.datetime.now(dt.timezone.utc).date()
               check(day<=end_day,'INVALID_HISTORY_WINDOW')
@@ -138,22 +177,12 @@ jobs:
               seen_ids=set()
               while day<=end_day:
                   label=day.isoformat()
-                  base=urllib.parse.urlencode({'created':label,'per_page':100})
-                  first=api_json('actions/runs?'+base+'&page=1')
-                  total=first.get('total_count')
-                  check(isinstance(total,int) and 0<=total<=1000,'HISTORY_UTC_DAY_EXCEEDS_API_LIMIT_'+label)
-                  rows=list(first.get('workflow_runs',[]))
-                  for page in range(2,(total+99)//100+1):
-                      x=api_json('actions/runs?'+base+'&page='+str(page))
-                      rows.extend(x.get('workflow_runs',[]))
-                  check(len(rows)==total,'INCOMPLETE_ACTION_HISTORY_UTC_DAY_'+label)
+                  rows=_day_history_rows(label)
                   for item in rows:
-                      created=str(item.get('created_at',''))
-                      check(created[:10]==label,'HISTORY_DAY_MISMATCH_'+label)
-                      rid=item.get('id')
-                      check(rid not in seen_ids and rid is not None,'DUPLICATE_OR_MISSING_RUN_ID_'+label)
+                      rid=item['id']
+                      check(rid not in seen_ids,'DUPLICATE_RUN_ACROSS_DAYS_'+str(rid))
                       seen_ids.add(rid)
-                      if created>=since.strftime(TS):result.append(item)
+                      if str(item['created_at'])>=since.strftime(TS):result.append(item)
                   day+=dt.timedelta(days=1)
               mapping={};page=1
               while True:
@@ -230,7 +259,7 @@ jobs:
                   for x in inventory if not x['recent_run'] and
                   set(filter(None,x['hold_reasons'].split(';'))).issubset(soft)]
               # Stable across subsequent runs when HEAD and pinned lookback are unchanged.
-              manifest={'schema':2,'tool':'WFC01_V1R3','audit_main_sha':commit,'since_utc':since_s,
+              manifest={'schema':2,'tool':'WFC01_V1R4','audit_main_sha':commit,'since_utc':since_s,
                         'lookback_days':LOOKBACK_DAYS,'candidate_count':len(candidates),'candidates':candidates}
               out.mkdir(parents=True,exist_ok=True)
               (out/'WFC01_Approved_Candidate_Manifest.json').write_bytes(jbytes(manifest))
@@ -241,7 +270,7 @@ jobs:
               with (out/'WFC01_Manual_Review_Queue_PRELIMINARY.csv').open('w',newline='',encoding='utf-8') as f:
                   cols=['path','source_edit_utc','recent_run','hold_reasons','queue_status']
                   writer=csv.DictWriter(f,fieldnames=cols);writer.writeheader();writer.writerows(manual_queue)
-              report=['# WFC01 V1R3 Legacy Workflow Deep Audit','','**No workflow has been moved or deleted.**','',
+              report=['# WFC01 V1R4 Legacy Workflow Deep Audit','','**No workflow has been moved or deleted.**','',
                   f'- Commit: `{commit}`',f'- Lookback start: `{since_s}`',f'- Workflow YAMLs scanned: **{len(workflows)}**',
                   f'- GitHub Actions history runs in window: **{run_count}**',f'- History complete: **{not bool(history_problem)}**',
                   f'- Text source paths scanned (no size cap): **{len(texts)}**',f'- Reference links discovered: **{len(refs)}**',
@@ -343,14 +372,14 @@ jobs:
               else:archive(out)
           
           if __name__=='__main__':main()
-          PY_WFC01_V1R3
-          python3 -m py_compile "$RUNNER_TEMP/wfc01_v1r3_engine.py"
-          python3 "$RUNNER_TEMP/wfc01_v1r3_engine.py" --selftest
+          PY_WFC01_V1R4
+          python3 -m py_compile "$RUNNER_TEMP/wfc01_v1r4_engine.py"
+          python3 "$RUNNER_TEMP/wfc01_v1r4_engine.py" --selftest
       - name: Run exhaustive read-only workflow audit
         shell: bash
         run: |
           set -euo pipefail
-          python3 "$RUNNER_TEMP/wfc01_v1r3_engine.py" --mode AUDIT_ONLY --out "$WFC01_OUT"
+          python3 "$RUNNER_TEMP/wfc01_v1r4_engine.py" --mode AUDIT_ONLY --out "$WFC01_OUT"
       - name: Upload reviewed audit inventory, references, gaps, and signed manifest
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
@@ -395,14 +424,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat > "$RUNNER_TEMP/wfc01_v1r3_engine.py" <<'PY_WFC01_V1R3'
+          cat > "$RUNNER_TEMP/wfc01_v1r4_engine.py" <<'PY_WFC01_V1R4'
           #!/usr/bin/env python3
-          """WFC01 V1R3 safe workflow inventory and owner-approved exact archive.
+          """WFC01 V1R4 safe workflow inventory and owner-approved exact archive.
           
           An audit candidate is never an authorization to archive. Never deletes files.
           """
           from __future__ import annotations
-          import argparse,csv,datetime as dt,hashlib,io,json,os,re,subprocess,sys,urllib.parse,urllib.request,zipfile
+          import argparse,csv,datetime as dt,hashlib,io,json,os,re,subprocess,sys,time,urllib.parse,urllib.request,zipfile
           from pathlib import Path
           import yaml
           
@@ -458,9 +487,48 @@ jobs:
               except Exception as e:
                   return {'events':['UNKNOWN'],'write':True,'valid':False,'error':str(e)[:200],'sha256':sha_bytes(b)}
           
+          def _day_history_rows(label):
+              # GitHub can transiently return an empty or truncated page even when the
+              # same date query has a nonzero result count. Retry complete date slices;
+              # NEVER use a partial slice to authorize a workflow archive.
+              base=urllib.parse.urlencode({'created':label,'per_page':100})
+              last_error='NOT_STARTED'
+              for attempt in range(5):
+                  try:
+                      first=api_json('actions/runs?'+base+'&page=1')
+                      total=first.get('total_count')
+                      check(isinstance(total,int) and 0<=total<=1000,
+                            'HISTORY_UTC_DAY_EXCEEDS_API_LIMIT_'+label)
+                      rows=first.get('workflow_runs')
+                      check(isinstance(rows,list),'INVALID_HISTORY_PAGE1_'+label)
+                      # A zero-day must also agree with an independently formatted
+                      # timestamp-range query, preventing transient false empty pages.
+                      if total==0:
+                          time_range=label+'T00:00:00Z..'+label+'T23:59:59Z'
+                          verify=api_json('actions/runs?'+urllib.parse.urlencode({'created':time_range,'per_page':1,'page':1}))
+                          check(verify.get('total_count')==0,'ZERO_HISTORY_UNVERIFIED_'+label)
+                      else:
+                          check(len(rows)==min(100,total),'TRUNCATED_HISTORY_PAGE1_'+label)
+                      for page in range(2,(total+99)//100+1):
+                          x=api_json('actions/runs?'+base+'&page='+str(page))
+                          check(x.get('total_count')==total,'HISTORY_TOTAL_CHANGED_'+label)
+                          segment=x.get('workflow_runs')
+                          check(isinstance(segment,list) and len(segment)==min(100,total-100*(page-1)),
+                                'TRUNCATED_HISTORY_PAGE_'+label+'_'+str(page))
+                          rows.extend(segment)
+                      check(len(rows)==total,'INCOMPLETE_ACTION_HISTORY_UTC_DAY_'+label)
+                      ids=[item.get('id') for item in rows]
+                      check(None not in ids and len(ids)==len(set(ids)),'DUPLICATE_OR_MISSING_RUN_ID_'+label)
+                      check(all(str(item.get('created_at',''))[:10]==label for item in rows),
+                            'HISTORY_DAY_MISMATCH_'+label)
+                      return rows
+                  except (Exception,) as exc:
+                      last_error=type(exc).__name__+': '+str(exc)
+                      if attempt<4:time.sleep(min(2**attempt,4))
+              raise RuntimeError('INCOMPLETE_ACTION_HISTORY_UTC_DAY_'+label+' AFTER_5_RETRIES: '+last_error)
+          
           def recent_history(since):
-              # GitHub's Actions run listing has a 1000-result search limit. Query one
-              # UTC day at a time, including the partial first day, and validate each page.
+              # Exact UTC day pagination avoids GitHub's 1000-result cap.
               day=since.date()
               end_day=dt.datetime.now(dt.timezone.utc).date()
               check(day<=end_day,'INVALID_HISTORY_WINDOW')
@@ -468,22 +536,12 @@ jobs:
               seen_ids=set()
               while day<=end_day:
                   label=day.isoformat()
-                  base=urllib.parse.urlencode({'created':label,'per_page':100})
-                  first=api_json('actions/runs?'+base+'&page=1')
-                  total=first.get('total_count')
-                  check(isinstance(total,int) and 0<=total<=1000,'HISTORY_UTC_DAY_EXCEEDS_API_LIMIT_'+label)
-                  rows=list(first.get('workflow_runs',[]))
-                  for page in range(2,(total+99)//100+1):
-                      x=api_json('actions/runs?'+base+'&page='+str(page))
-                      rows.extend(x.get('workflow_runs',[]))
-                  check(len(rows)==total,'INCOMPLETE_ACTION_HISTORY_UTC_DAY_'+label)
+                  rows=_day_history_rows(label)
                   for item in rows:
-                      created=str(item.get('created_at',''))
-                      check(created[:10]==label,'HISTORY_DAY_MISMATCH_'+label)
-                      rid=item.get('id')
-                      check(rid not in seen_ids and rid is not None,'DUPLICATE_OR_MISSING_RUN_ID_'+label)
+                      rid=item['id']
+                      check(rid not in seen_ids,'DUPLICATE_RUN_ACROSS_DAYS_'+str(rid))
                       seen_ids.add(rid)
-                      if created>=since.strftime(TS):result.append(item)
+                      if str(item['created_at'])>=since.strftime(TS):result.append(item)
                   day+=dt.timedelta(days=1)
               mapping={};page=1
               while True:
@@ -560,7 +618,7 @@ jobs:
                   for x in inventory if not x['recent_run'] and
                   set(filter(None,x['hold_reasons'].split(';'))).issubset(soft)]
               # Stable across subsequent runs when HEAD and pinned lookback are unchanged.
-              manifest={'schema':2,'tool':'WFC01_V1R3','audit_main_sha':commit,'since_utc':since_s,
+              manifest={'schema':2,'tool':'WFC01_V1R4','audit_main_sha':commit,'since_utc':since_s,
                         'lookback_days':LOOKBACK_DAYS,'candidate_count':len(candidates),'candidates':candidates}
               out.mkdir(parents=True,exist_ok=True)
               (out/'WFC01_Approved_Candidate_Manifest.json').write_bytes(jbytes(manifest))
@@ -571,7 +629,7 @@ jobs:
               with (out/'WFC01_Manual_Review_Queue_PRELIMINARY.csv').open('w',newline='',encoding='utf-8') as f:
                   cols=['path','source_edit_utc','recent_run','hold_reasons','queue_status']
                   writer=csv.DictWriter(f,fieldnames=cols);writer.writeheader();writer.writerows(manual_queue)
-              report=['# WFC01 V1R3 Legacy Workflow Deep Audit','','**No workflow has been moved or deleted.**','',
+              report=['# WFC01 V1R4 Legacy Workflow Deep Audit','','**No workflow has been moved or deleted.**','',
                   f'- Commit: `{commit}`',f'- Lookback start: `{since_s}`',f'- Workflow YAMLs scanned: **{len(workflows)}**',
                   f'- GitHub Actions history runs in window: **{run_count}**',f'- History complete: **{not bool(history_problem)}**',
                   f'- Text source paths scanned (no size cap): **{len(texts)}**',f'- Reference links discovered: **{len(refs)}**',
@@ -673,11 +731,11 @@ jobs:
               else:archive(out)
           
           if __name__=='__main__':main()
-          PY_WFC01_V1R3
-          python3 -m py_compile "$RUNNER_TEMP/wfc01_v1r3_engine.py"
-          python3 "$RUNNER_TEMP/wfc01_v1r3_engine.py" --selftest
+          PY_WFC01_V1R4
+          python3 -m py_compile "$RUNNER_TEMP/wfc01_v1r4_engine.py"
+          python3 "$RUNNER_TEMP/wfc01_v1r4_engine.py" --selftest
       - name: Archive only exact owner-approved audited paths
         shell: bash
         run: |
           set -euo pipefail
-          python3 "$RUNNER_TEMP/wfc01_v1r3_engine.py" --mode ARCHIVE_APPROVED --out "$WFC01_OUT"
+          python3 "$RUNNER_TEMP/wfc01_v1r4_engine.py" --mode ARCHIVE_APPROVED --out "$WFC01_OUT"
