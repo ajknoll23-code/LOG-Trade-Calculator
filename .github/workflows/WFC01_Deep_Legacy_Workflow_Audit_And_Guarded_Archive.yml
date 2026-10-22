@@ -1,0 +1,642 @@
+# WFC01 | Default AUDIT_ONLY | NEVER use ARCHIVE_APPROVED before full owner review.
+name: WFC01 - Deep Legacy Workflow Audit and Explicit Archive
+run-name: WFC01 ${{ inputs.mode }} • ${{ github.sha }}
+'on':
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Default read-only audit. ARCHIVE_APPROVED requires exact reviewed inputs.
+        type: choice
+        default: AUDIT_ONLY
+        required: true
+        options:
+        - AUDIT_ONLY
+        - ARCHIVE_APPROVED
+      approved_paths:
+        description: 'Archive only: comma-separated exact approved .github/workflows/*.yml paths, lexicographically sorted'
+        required: false
+        type: string
+        default: ''
+      audit_run_id:
+        description: 'Archive only: green WFC01 AUDIT_ONLY GitHub run number (numeric ID)'
+        required: false
+        type: string
+        default: ''
+      audit_commit:
+        description: 'Archive only: exact full 40-char main SHA from reviewed audit'
+        required: false
+        type: string
+        default: ''
+      manifest_sha256:
+        description: 'Archive only: 64-char SHA256 of reviewed candidate manifest'
+        required: false
+        type: string
+        default: ''
+concurrency:
+  group: wfc01-workflow-cleanup-main
+  cancel-in-progress: false
+jobs:
+  read_only_audit:
+    if: ${{ inputs.mode == 'AUDIT_ONLY' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      WFC01_MODE: ${{ inputs.mode }}
+      WFC01_OUT: ${{ runner.temp }}/wfc01-results
+      WFC01_APPROVED_PATHS: ${{ inputs.approved_paths }}
+      WFC01_AUDIT_RUN_ID: ${{ inputs.audit_run_id }}
+      WFC01_AUDIT_COMMIT: ${{ inputs.audit_commit }}
+      WFC01_MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
+    steps:
+    - name: Checkout current main with explicit read-only credentials
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+    - name: Install pinned YAML parser
+      run: python3 -m pip install --quiet PyYAML==6.0.2
+    - name: Run WFC01 isolated Python full-depth audit
+      shell: bash
+      run: |
+        cat > "$RUNNER_TEMP/wfc01_engine.py" <<'PY'
+        #!/usr/bin/env python3
+        """WFC01: conservative GitHub Actions archival audit, run inside actions."""
+        import csv
+        import datetime as dt
+        import hashlib
+        import io
+        import json
+        import os
+        import re
+        import shutil
+        import subprocess
+        import sys
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+        import zipfile
+        from pathlib import Path
+
+        import yaml
+
+        REPO = Path.cwd()
+        ROOT = '.github/workflows/'
+        ARCHIVE = '.github/workflow-archive/'
+        SELF = 'WFC01_Deep_Legacy_Workflow_Audit_And_Guarded_Archive.yml'
+        LOOKBACK_DAYS = 35
+        TEXT_LIMIT = 524288
+        SCAN_EXT = {'.yml','.yaml','.md','.txt','.py','.js','.mjs','.cjs','.ts','.tsx','.html','.css','.json','.jsonl','.toml','.ini','.cfg','.sh','.bash','.sql','.csv','.xml','.rst'}
+        PROTECT_STEMS = ('CAL26_', 'WFC01_', 'scheduled-data-refresh', 'sync-sleeper', 'repo-regression-checks', 'fantasypros-api-pipeline', 'free-agent-utility-v1-refresh', 'ktc-vote-aggregation')
+        WRITE_PATTERNS = [r'git\s+push\b',r'gh\s+api[^\n]*\s+-X\s+(POST|PUT|PATCH|DELETE)\b',r'gh\s+(workflow\s+run|release\s+create)\b',r'actions\/github-script@',r'peter-evans\/create-pull-request@',r'peaceiris\/actions-gh-pages@',r'git\s+commit\b',r'git\s+mv\b',r'gh\s+pr\s+create\b',r'GITHUB_TOKEN[^\n]*\bwrite\b']
+
+        def run(*a, check=True):
+            p = subprocess.run(a, capture_output=True, text=True, check=False)
+            if check and p.returncode:
+                raise RuntimeError(f'Command failed {a}: {p.stderr[:500]}')
+            return p.stdout.strip()
+
+        def api(path):
+            token=os.environ.get('GH_TOKEN','')
+            if not token: raise RuntimeError('GitHub token unavailable: archive candidates disabled')
+            url=f'https://api.github.com/repos/{os.environ["GITHUB_REPOSITORY"]}/{path}'
+            req=urllib.request.Request(url,headers={'Authorization':'Bearer '+token,'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28','User-Agent':'WFC01-safe-audit'})
+            with urllib.request.urlopen(req,timeout=30) as r:
+                return r.read()
+
+        def sha(b): return hashlib.sha256(b).hexdigest()
+        def jbytes(obj): return (json.dumps(obj,sort_keys=True,ensure_ascii=False,separators=(',',':'))+'\n').encode()
+        def utc(): return dt.datetime.now(dt.timezone.utc)
+        def parse_events(obj):
+            on = obj.get('on', None)
+            if isinstance(on,dict): return sorted(str(x) for x in on)
+            if isinstance(on,list): return sorted(str(x) for x in on)
+            if isinstance(on,str): return [on]
+            return ['UNKNOWN']
+
+        def source_data(path):
+            b=(REPO/path).read_bytes()
+            try:
+                text=b.decode('utf-8')
+                obj=yaml.load(text,Loader=yaml.BaseLoader)
+                if not isinstance(obj,dict): raise ValueError('not a YAML mapping')
+                events=parse_events(obj)
+                if 'UNKNOWN' in events or not events: raise ValueError('unknown event')
+                def check_perms(o):
+                    if not isinstance(o,dict):return False
+                    pm=o.get('permissions')
+                    if isinstance(pm,str):return pm not in ('read-all','none')
+                    if isinstance(pm,dict):return any(str(v).lower()=='write' for v in pm.values())
+                    return False
+                write = check_perms(obj)
+                jobs=obj.get('jobs',{})
+                if isinstance(jobs,dict): write=write or any(check_perms(v) for v in jobs.values())
+                write=write or any(re.search(p,text,re.I) for p in WRITE_PATTERNS)
+                return {'sha256':sha(b),'events':events,'may_write':bool(write),'valid_yaml':True,'error':''}
+            except (ValueError,UnicodeError,yaml.YAMLError,KeyError,TypeError) as e:
+                return {'sha256':sha(b),'events':['UNKNOWN'],'may_write':True,'valid_yaml':False,'error':str(e)[:200]}
+
+        def history(since):
+            # Fail-closed if API pagination is incomplete or an unknown run cannot be mapped.
+            stamp=since.strftime('%Y-%m-%dT%H:%M:%SZ')
+            qs=urllib.parse.urlencode({'created':f'>={stamp}','per_page':100,'page':1})
+            first=json.loads(api('actions/runs?'+qs))
+            count=first.get('total_count')
+            if not isinstance(count,int):raise RuntimeError('run count missing')
+            if count>2500:raise RuntimeError(f'run count {count} exceeds 2500-item completeness budget')
+            runs=first.get('workflow_runs',[])
+            for page in range(2,(count+99)//100+1):
+                qs=urllib.parse.urlencode({'created':f'>={stamp}','per_page':100,'page':page})
+                runs+=json.loads(api('actions/runs?'+qs)).get('workflow_runs',[])
+            if len(runs)!=count:raise RuntimeError(f'run listing incomplete: received {len(runs)} vs {count}')
+            mapping={}
+            page=1
+            while True:
+                x=json.loads(api('actions/workflows?'+urllib.parse.urlencode({'per_page':100,'page':page})))
+                ws=x.get('workflows',[])
+                for w in ws:mapping[w['id']]=w.get('path','')
+                if not ws or len(ws)<100:break
+                page+=1
+                if page>20:raise RuntimeError('workflow registry pagination too large')
+            recent=set(); unresolved=[]
+            for item in runs:
+                path=item.get('path') or mapping.get(item.get('workflow_id'))
+                if not path:
+                    unresolved.append(item.get('id'))
+                    continue
+                path=path.lstrip('/')
+                if path.startswith('.github/workflows/'):
+                    recent.add(path)
+            if unresolved:raise RuntimeError(f'{len(unresolved)} recent runs cannot be mapped to workflow source; fail closed')
+            return {'complete':True,'run_count':len(runs),'recent_paths':recent,'problem':''}
+
+        def audit(out):
+            head=run('git','rev-parse','HEAD')
+            if os.environ.get('GITHUB_REF','')!='refs/heads/main':raise RuntimeError('WFC01 must run on main ref')
+            tracked=run('git','ls-files','-z').split('\0')
+            workflows=sorted(p for p in tracked if p.startswith(ROOT) and p.endswith(('.yml','.yaml')))
+            names={p:Path(p).name for p in workflows}
+            since=utc()-dt.timedelta(days=LOOKBACK_DAYS)
+            problem=''; recent=set(); count=0
+            try:
+                hist=history(since)
+                recent=hist['recent_paths'];count=hist['run_count']
+            except Exception as e:
+                problem=f'{type(e).__name__}: {e}'
+            texts=[]; skipped=[]; skipped_ref_capable=False
+            for f in tracked:
+                if f.startswith(ROOT) or f.startswith(ARCHIVE) or f not in names and Path(f).suffix.lower() not in SCAN_EXT:
+                    continue
+                fp=REPO/f
+                try:
+                    size=fp.stat().st_size
+                    if size>TEXT_LIMIT:
+                        skipped.append({'path':f,'size':size,'reason':'size limit'})
+                        if fp.suffix.lower() in {'.py','.js','.mjs','.cjs','.ts','.tsx','.yml','.yaml','.sh','.bash','.md','.txt','.html','.toml','.cfg','.ini'}:
+                            skipped_ref_capable=True
+                        continue
+                    text=fp.read_text(encoding='utf-8')
+                    texts.append((f,text))
+                except (UnicodeError,OSError) as e:
+                    skipped.append({'path':f,'size':None,'reason':str(e)[:130]})
+                    if fp.suffix.lower() not in {'.json','.jsonl','.csv'}:skipped_ref_capable=True
+            refs=[]; candidates=[]; inventory=[]
+            for f in workflows:
+                x=source_data(f)
+                hits=[]
+                for other,content in texts:
+                    if other==f:continue
+                    if f in content or names[f] in content:
+                        hits.append(other)
+                        refs.append({'workflow':f,'referenced_by':other})
+                t=run('git','log','-1','--format=%ct','--',f)
+                edited=dt.datetime.fromtimestamp(int(t),tz=dt.timezone.utc) if t else None
+                recently_edited=bool(edited and edited>=since)
+                holds=[]
+                if names[f]==SELF or names[f].startswith(PROTECT_STEMS):holds.append('core_or_active_family')
+                if x['events']!=['workflow_dispatch']:holds.append('nonmanual_or_unknown_trigger')
+                if x['may_write']:holds.append('potential_production_write')
+                if not x['valid_yaml']:holds.append('invalid_or_unparseable_yaml')
+                if hits:holds.append('referenced_in_repo')
+                if f in recent:holds.append('recent_action_run')
+                if recently_edited:holds.append('recently_modified')
+                if problem:holds.append('incomplete_action_history')
+                if skipped_ref_capable:holds.append('unscanned_large_or_nonutf8_source')
+                status='REVIEW_ONLY_CANDIDATE' if not holds else 'PROTECTED'
+                rec={'path':f,'sha256':x['sha256'],'events':','.join(x['events']),'may_write':x['may_write'],'last_source_edit_utc':edited.isoformat() if edited else '', 'recent_run':f in recent,'refs_count':len(hits),'referenced_by':';'.join(hits[:40]),'status':status,'hold_reasons':';'.join(holds),'yaml_error':x['error']}
+                inventory.append(rec)
+                if not holds:candidates.append({'path':f,'sha256':x['sha256']})
+            manifest={'schema':1,'tool':'WFC01','audit_main_sha':head,'candidate_count':len(candidates),'candidates':candidates,'lookback_days':LOOKBACK_DAYS}
+            out.mkdir(parents=True,exist_ok=True)
+            (out/'WFC01_Approved_Candidate_Manifest.json').write_bytes(jbytes(manifest))
+            with (out/'WFC01_Workflow_Inventory.csv').open('w',encoding='utf-8',newline='') as fd:
+                writer=csv.DictWriter(fd,fieldnames=list(inventory[0]) if inventory else ['path']);writer.writeheader();writer.writerows(inventory)
+            with (out/'WFC01_References.csv').open('w',encoding='utf-8',newline='') as fd:
+                writer=csv.DictWriter(fd,fieldnames=['workflow','referenced_by']);writer.writeheader();writer.writerows(refs)
+            with (out/'WFC01_Scan_Gaps.csv').open('w',encoding='utf-8',newline='') as fd:
+                writer=csv.DictWriter(fd,fieldnames=['path','size','reason']);writer.writeheader();writer.writerows(skipped)
+            cat={};[cat.__setitem__(v['status'],cat.get(v['status'],0)+1) for v in inventory]
+            report=['# WFC01 Deep Workflow Audit','','**Read-only report. No file moved or deleted.**','',f'- Commit: `{head}`',f'- Workflow files: **{len(workflows)}**',f'- Recent Actions history: {count} runs in {LOOKBACK_DAYS} days',f'- History complete: **{not bool(problem)}**',f'- References found: **{len(refs)}**',f'- Readable source files scanned: **{len(texts)}**',f'- Skipped text-like files: **{len(skipped)}**',f'- Skipped potentially reference-capable files (archive hold): **{skipped_ref_capable}**',f'- REVIEW_ONLY candidates: **{len(candidates)}**',f'- Protected: **{len(workflows)-len(candidates)}**','']
+            if problem:report+=['## Safety stop: incomplete run history',f'`{problem}`','']
+            if skipped_ref_capable:report+=['## Safety stop: incomplete reference scan','One or more reference-capable files exceed scan limits or are unreadable. No workflow is eligible for archival.','']
+            report+=['## Candidates (require manual review, NOT automatic archive)','']
+            report += ['- `'+x['path']+'`' for x in candidates] if candidates else ['None: all held. Review inventory hold reasons.']
+            report+=['','## Interpretation','A candidate is not proof of dispensability. External or dynamically constructed references can be missed. All approved sources remain in Git history even after archive.','']
+            (out/'WFC01_Deep_Audit_Report.md').write_text('\n'.join(report),encoding='utf-8')
+            info={'head_sha':head,'inventory_count':len(workflows),'candidates':len(candidates),'history_complete':not bool(problem),'skipped_ref_capable':skipped_ref_capable,'manifest_sha256':sha(jbytes(manifest)),'output_dir':str(out)}
+            print(json.dumps(info,sort_keys=True))
+            return manifest
+
+        def archive(out):
+            # Also rebuild report freshly at exact pinned commit and compare previous manifest.
+            mode=os.environ.get('WFC01_MODE','')
+            if mode!='ARCHIVE_APPROVED':raise RuntimeError('archive mode not selected')
+            approval=os.environ.get('WFC01_APPROVED_PATHS','')
+            runid=os.environ.get('WFC01_AUDIT_RUN_ID','')
+            pinned=os.environ.get('WFC01_AUDIT_COMMIT','')
+            expected=os.environ.get('WFC01_MANIFEST_SHA256','')
+            if not re.fullmatch(r'[0-9]+',runid):raise RuntimeError('exact successful audit run ID required')
+            if not re.fullmatch(r'[0-9a-f]{40}',pinned):raise RuntimeError('exact audit commit SHA required')
+            if not re.fullmatch(r'[0-9a-f]{64}',expected):raise RuntimeError('manifest SHA256 required')
+            paths=approval.split(',')
+            if not paths or any(not x or x.strip()!=x or not x.startswith(ROOT) or not x.endswith('.yml') for x in paths):
+                raise RuntimeError('provide exact comma-separated original .github/workflows/*.yml paths, no whitespace')
+            if paths!=sorted(set(paths)):raise RuntimeError('approved paths must be sorted and unique')
+            head=run('git','rev-parse','HEAD')
+            if head!=pinned:raise RuntimeError('HEAD moved after approved audit; rerun AUDIT_ONLY')
+            if run('git','status','--porcelain','--untracked-files=all'):
+                raise RuntimeError('dirty checkout before archive')
+            md=json.loads(api('actions/runs/'+runid))
+            if not (md.get('conclusion')=='success' and md.get('status')=='completed' and md.get('head_sha')==head and md.get('event')=='workflow_dispatch' and md.get('name')=='WFC01 - Deep Legacy Workflow Audit and Explicit Archive'):
+                raise RuntimeError('audit run metadata does not match green WFC01 audit on pinned commit')
+            artifacts=json.loads(api('actions/runs/'+runid+'/artifacts?per_page=100'))['artifacts']
+            picked=[x for x in artifacts if x.get('name')=='WFC01-Deep-Workflow-Audit-Read-Only' and not x.get('expired')]
+            if len(picked)!=1:raise RuntimeError('expected exactly one unexpired WFC01 audit artifact')
+            raw=api('actions/artifacts/'+str(picked[0]['id'])+'/zip')
+            with zipfile.ZipFile(io.BytesIO(raw)) as z:
+                manifests=[p for p in z.namelist() if p.endswith('WFC01_Approved_Candidate_Manifest.json')]
+                if len(manifests)!=1:raise RuntimeError('audit artifact has missing or ambiguous manifest')
+                previous=z.read(manifests[0])
+            if sha(previous)!=expected:raise RuntimeError('original audit manifest sha256 mismatch')
+            live=audit(out)
+            current=jbytes(live)
+            if current!=previous:raise RuntimeError('fresh complete audit differs from approved green audit; no changes made')
+            eligible={x['path']:x['sha256'] for x in live['candidates']}
+            if not eligible:raise RuntimeError('no eligible archive candidates')
+            for p in paths:
+                if p not in eligible:raise RuntimeError('not an approved candidate: '+p)
+                if sha((REPO/p).read_bytes())!=eligible[p]:raise RuntimeError('source bytes differ: '+p)
+                target=ARCHIVE+Path(p).name
+                if (REPO/target).exists():raise RuntimeError('archive collision: '+target)
+            receipt={'schema':1,'tool':'WFC01','source_audit_run_id':runid,'source_main_sha':head,'source_manifest_sha256':expected,'action':'byte_identical_move_not_delete','moved':[]}
+            for p in paths:
+                dest=ARCHIVE+Path(p).name
+                (REPO/dest).parent.mkdir(parents=True,exist_ok=True)
+                before=(REPO/p).read_bytes()
+                run('git','mv','--',p,dest)
+                if not (REPO/dest).exists() or (REPO/p).exists() or (REPO/dest).read_bytes()!=before:
+                    raise RuntimeError('byte-identical move verification failed')
+                receipt['moved'].append({'from':p,'to':dest,'sha256':sha(before)})
+            receipt_path=ARCHIVE+'receipts/WFC01_'+runid+'_'+head[:12]+'.json'
+            (REPO/receipt_path).parent.mkdir(parents=True,exist_ok=True)
+            (REPO/receipt_path).write_bytes(json.dumps(receipt,sort_keys=True,indent=2).encode()+b'\n')
+            run('git','add','--',receipt_path)
+            staged=run('git','diff','--cached','--name-status','-M100%').splitlines()
+            renames=set();added=set()
+            for line in staged:
+                cols=line.split('\t')
+                if len(cols)==3 and cols[0]=='R100':renames.add((cols[1],cols[2]))
+                elif len(cols)==2 and cols[0]=='A':added.add(cols[1])
+                else:raise RuntimeError('unexpected staged change (must be R100 rename or receipt only): '+line)
+            expect={(p,ARCHIVE+Path(p).name) for p in paths}
+            if renames!=expect or added!={receipt_path}:raise RuntimeError('staged changes do not equal approved moves + receipt')
+            run('git','config','user.name','github-actions[bot]')
+            run('git','config','user.email','41898282+github-actions[bot]@users.noreply.github.com')
+            run('git','commit','-m','WFC01: archive explicitly approved legacy workflows (byte-identical renames)')
+            run('git','push','origin','HEAD:refs/heads/main')
+            print(json.dumps({'status':'ARCHIVED_EXACT_APPROVED_PATHS','paths':paths,'receipt':receipt_path,'commit':run('git','rev-parse','HEAD')},sort_keys=True))
+
+        def main():
+            out=Path(os.environ.get('WFC01_OUT','/tmp/wfc01-results'))
+            if os.environ.get('WFC01_MODE','AUDIT_ONLY')=='AUDIT_ONLY':
+                audit(out)
+                if run('git','status','--porcelain','--untracked-files=all'):
+                    raise RuntimeError('audit unexpectedly dirtied repository')
+            else:archive(out)
+
+        if __name__=='__main__':main()
+        PY
+        python3 "$RUNNER_TEMP/wfc01_engine.py"
+    - name: Upload full audit inventory and manifest
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: WFC01-Deep-Workflow-Audit-Read-Only
+        path: ${{ runner.temp }}/wfc01-results
+        if-no-files-found: warn
+        retention-days: 60
+  approved_archive:
+    if: ${{ inputs.mode == 'ARCHIVE_APPROVED' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      WFC01_MODE: ${{ inputs.mode }}
+      WFC01_OUT: ${{ runner.temp }}/wfc01-results
+      WFC01_APPROVED_PATHS: ${{ inputs.approved_paths }}
+      WFC01_AUDIT_RUN_ID: ${{ inputs.audit_run_id }}
+      WFC01_AUDIT_COMMIT: ${{ inputs.audit_commit }}
+      WFC01_MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
+    steps:
+    - name: Checkout current main with explicit archive authorization
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        persist-credentials: true
+    - name: Install pinned YAML parser
+      run: python3 -m pip install --quiet PyYAML==6.0.2
+    - name: Run WFC01 isolated Python approved guarded archive
+      shell: bash
+      run: |
+        cat > "$RUNNER_TEMP/wfc01_engine.py" <<'PY'
+        #!/usr/bin/env python3
+        """WFC01: conservative GitHub Actions archival audit, run inside actions."""
+        import csv
+        import datetime as dt
+        import hashlib
+        import io
+        import json
+        import os
+        import re
+        import shutil
+        import subprocess
+        import sys
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+        import zipfile
+        from pathlib import Path
+
+        import yaml
+
+        REPO = Path.cwd()
+        ROOT = '.github/workflows/'
+        ARCHIVE = '.github/workflow-archive/'
+        SELF = 'WFC01_Deep_Legacy_Workflow_Audit_And_Guarded_Archive.yml'
+        LOOKBACK_DAYS = 35
+        TEXT_LIMIT = 524288
+        SCAN_EXT = {'.yml','.yaml','.md','.txt','.py','.js','.mjs','.cjs','.ts','.tsx','.html','.css','.json','.jsonl','.toml','.ini','.cfg','.sh','.bash','.sql','.csv','.xml','.rst'}
+        PROTECT_STEMS = ('CAL26_', 'WFC01_', 'scheduled-data-refresh', 'sync-sleeper', 'repo-regression-checks', 'fantasypros-api-pipeline', 'free-agent-utility-v1-refresh', 'ktc-vote-aggregation')
+        WRITE_PATTERNS = [r'git\s+push\b',r'gh\s+api[^\n]*\s+-X\s+(POST|PUT|PATCH|DELETE)\b',r'gh\s+(workflow\s+run|release\s+create)\b',r'actions\/github-script@',r'peter-evans\/create-pull-request@',r'peaceiris\/actions-gh-pages@',r'git\s+commit\b',r'git\s+mv\b',r'gh\s+pr\s+create\b',r'GITHUB_TOKEN[^\n]*\bwrite\b']
+
+        def run(*a, check=True):
+            p = subprocess.run(a, capture_output=True, text=True, check=False)
+            if check and p.returncode:
+                raise RuntimeError(f'Command failed {a}: {p.stderr[:500]}')
+            return p.stdout.strip()
+
+        def api(path):
+            token=os.environ.get('GH_TOKEN','')
+            if not token: raise RuntimeError('GitHub token unavailable: archive candidates disabled')
+            url=f'https://api.github.com/repos/{os.environ["GITHUB_REPOSITORY"]}/{path}'
+            req=urllib.request.Request(url,headers={'Authorization':'Bearer '+token,'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28','User-Agent':'WFC01-safe-audit'})
+            with urllib.request.urlopen(req,timeout=30) as r:
+                return r.read()
+
+        def sha(b): return hashlib.sha256(b).hexdigest()
+        def jbytes(obj): return (json.dumps(obj,sort_keys=True,ensure_ascii=False,separators=(',',':'))+'\n').encode()
+        def utc(): return dt.datetime.now(dt.timezone.utc)
+        def parse_events(obj):
+            on = obj.get('on', None)
+            if isinstance(on,dict): return sorted(str(x) for x in on)
+            if isinstance(on,list): return sorted(str(x) for x in on)
+            if isinstance(on,str): return [on]
+            return ['UNKNOWN']
+
+        def source_data(path):
+            b=(REPO/path).read_bytes()
+            try:
+                text=b.decode('utf-8')
+                obj=yaml.load(text,Loader=yaml.BaseLoader)
+                if not isinstance(obj,dict): raise ValueError('not a YAML mapping')
+                events=parse_events(obj)
+                if 'UNKNOWN' in events or not events: raise ValueError('unknown event')
+                def check_perms(o):
+                    if not isinstance(o,dict):return False
+                    pm=o.get('permissions')
+                    if isinstance(pm,str):return pm not in ('read-all','none')
+                    if isinstance(pm,dict):return any(str(v).lower()=='write' for v in pm.values())
+                    return False
+                write = check_perms(obj)
+                jobs=obj.get('jobs',{})
+                if isinstance(jobs,dict): write=write or any(check_perms(v) for v in jobs.values())
+                write=write or any(re.search(p,text,re.I) for p in WRITE_PATTERNS)
+                return {'sha256':sha(b),'events':events,'may_write':bool(write),'valid_yaml':True,'error':''}
+            except (ValueError,UnicodeError,yaml.YAMLError,KeyError,TypeError) as e:
+                return {'sha256':sha(b),'events':['UNKNOWN'],'may_write':True,'valid_yaml':False,'error':str(e)[:200]}
+
+        def history(since):
+            # Fail-closed if API pagination is incomplete or an unknown run cannot be mapped.
+            stamp=since.strftime('%Y-%m-%dT%H:%M:%SZ')
+            qs=urllib.parse.urlencode({'created':f'>={stamp}','per_page':100,'page':1})
+            first=json.loads(api('actions/runs?'+qs))
+            count=first.get('total_count')
+            if not isinstance(count,int):raise RuntimeError('run count missing')
+            if count>2500:raise RuntimeError(f'run count {count} exceeds 2500-item completeness budget')
+            runs=first.get('workflow_runs',[])
+            for page in range(2,(count+99)//100+1):
+                qs=urllib.parse.urlencode({'created':f'>={stamp}','per_page':100,'page':page})
+                runs+=json.loads(api('actions/runs?'+qs)).get('workflow_runs',[])
+            if len(runs)!=count:raise RuntimeError(f'run listing incomplete: received {len(runs)} vs {count}')
+            mapping={}
+            page=1
+            while True:
+                x=json.loads(api('actions/workflows?'+urllib.parse.urlencode({'per_page':100,'page':page})))
+                ws=x.get('workflows',[])
+                for w in ws:mapping[w['id']]=w.get('path','')
+                if not ws or len(ws)<100:break
+                page+=1
+                if page>20:raise RuntimeError('workflow registry pagination too large')
+            recent=set(); unresolved=[]
+            for item in runs:
+                path=item.get('path') or mapping.get(item.get('workflow_id'))
+                if not path:
+                    unresolved.append(item.get('id'))
+                    continue
+                path=path.lstrip('/')
+                if path.startswith('.github/workflows/'):
+                    recent.add(path)
+            if unresolved:raise RuntimeError(f'{len(unresolved)} recent runs cannot be mapped to workflow source; fail closed')
+            return {'complete':True,'run_count':len(runs),'recent_paths':recent,'problem':''}
+
+        def audit(out):
+            head=run('git','rev-parse','HEAD')
+            if os.environ.get('GITHUB_REF','')!='refs/heads/main':raise RuntimeError('WFC01 must run on main ref')
+            tracked=run('git','ls-files','-z').split('\0')
+            workflows=sorted(p for p in tracked if p.startswith(ROOT) and p.endswith(('.yml','.yaml')))
+            names={p:Path(p).name for p in workflows}
+            since=utc()-dt.timedelta(days=LOOKBACK_DAYS)
+            problem=''; recent=set(); count=0
+            try:
+                hist=history(since)
+                recent=hist['recent_paths'];count=hist['run_count']
+            except Exception as e:
+                problem=f'{type(e).__name__}: {e}'
+            texts=[]; skipped=[]; skipped_ref_capable=False
+            for f in tracked:
+                if f.startswith(ROOT) or f.startswith(ARCHIVE) or f not in names and Path(f).suffix.lower() not in SCAN_EXT:
+                    continue
+                fp=REPO/f
+                try:
+                    size=fp.stat().st_size
+                    if size>TEXT_LIMIT:
+                        skipped.append({'path':f,'size':size,'reason':'size limit'})
+                        if fp.suffix.lower() in {'.py','.js','.mjs','.cjs','.ts','.tsx','.yml','.yaml','.sh','.bash','.md','.txt','.html','.toml','.cfg','.ini'}:
+                            skipped_ref_capable=True
+                        continue
+                    text=fp.read_text(encoding='utf-8')
+                    texts.append((f,text))
+                except (UnicodeError,OSError) as e:
+                    skipped.append({'path':f,'size':None,'reason':str(e)[:130]})
+                    if fp.suffix.lower() not in {'.json','.jsonl','.csv'}:skipped_ref_capable=True
+            refs=[]; candidates=[]; inventory=[]
+            for f in workflows:
+                x=source_data(f)
+                hits=[]
+                for other,content in texts:
+                    if other==f:continue
+                    if f in content or names[f] in content:
+                        hits.append(other)
+                        refs.append({'workflow':f,'referenced_by':other})
+                t=run('git','log','-1','--format=%ct','--',f)
+                edited=dt.datetime.fromtimestamp(int(t),tz=dt.timezone.utc) if t else None
+                recently_edited=bool(edited and edited>=since)
+                holds=[]
+                if names[f]==SELF or names[f].startswith(PROTECT_STEMS):holds.append('core_or_active_family')
+                if x['events']!=['workflow_dispatch']:holds.append('nonmanual_or_unknown_trigger')
+                if x['may_write']:holds.append('potential_production_write')
+                if not x['valid_yaml']:holds.append('invalid_or_unparseable_yaml')
+                if hits:holds.append('referenced_in_repo')
+                if f in recent:holds.append('recent_action_run')
+                if recently_edited:holds.append('recently_modified')
+                if problem:holds.append('incomplete_action_history')
+                if skipped_ref_capable:holds.append('unscanned_large_or_nonutf8_source')
+                status='REVIEW_ONLY_CANDIDATE' if not holds else 'PROTECTED'
+                rec={'path':f,'sha256':x['sha256'],'events':','.join(x['events']),'may_write':x['may_write'],'last_source_edit_utc':edited.isoformat() if edited else '', 'recent_run':f in recent,'refs_count':len(hits),'referenced_by':';'.join(hits[:40]),'status':status,'hold_reasons':';'.join(holds),'yaml_error':x['error']}
+                inventory.append(rec)
+                if not holds:candidates.append({'path':f,'sha256':x['sha256']})
+            manifest={'schema':1,'tool':'WFC01','audit_main_sha':head,'candidate_count':len(candidates),'candidates':candidates,'lookback_days':LOOKBACK_DAYS}
+            out.mkdir(parents=True,exist_ok=True)
+            (out/'WFC01_Approved_Candidate_Manifest.json').write_bytes(jbytes(manifest))
+            with (out/'WFC01_Workflow_Inventory.csv').open('w',encoding='utf-8',newline='') as fd:
+                writer=csv.DictWriter(fd,fieldnames=list(inventory[0]) if inventory else ['path']);writer.writeheader();writer.writerows(inventory)
+            with (out/'WFC01_References.csv').open('w',encoding='utf-8',newline='') as fd:
+                writer=csv.DictWriter(fd,fieldnames=['workflow','referenced_by']);writer.writeheader();writer.writerows(refs)
+            with (out/'WFC01_Scan_Gaps.csv').open('w',encoding='utf-8',newline='') as fd:
+                writer=csv.DictWriter(fd,fieldnames=['path','size','reason']);writer.writeheader();writer.writerows(skipped)
+            cat={};[cat.__setitem__(v['status'],cat.get(v['status'],0)+1) for v in inventory]
+            report=['# WFC01 Deep Workflow Audit','','**Read-only report. No file moved or deleted.**','',f'- Commit: `{head}`',f'- Workflow files: **{len(workflows)}**',f'- Recent Actions history: {count} runs in {LOOKBACK_DAYS} days',f'- History complete: **{not bool(problem)}**',f'- References found: **{len(refs)}**',f'- Readable source files scanned: **{len(texts)}**',f'- Skipped text-like files: **{len(skipped)}**',f'- Skipped potentially reference-capable files (archive hold): **{skipped_ref_capable}**',f'- REVIEW_ONLY candidates: **{len(candidates)}**',f'- Protected: **{len(workflows)-len(candidates)}**','']
+            if problem:report+=['## Safety stop: incomplete run history',f'`{problem}`','']
+            if skipped_ref_capable:report+=['## Safety stop: incomplete reference scan','One or more reference-capable files exceed scan limits or are unreadable. No workflow is eligible for archival.','']
+            report+=['## Candidates (require manual review, NOT automatic archive)','']
+            report += ['- `'+x['path']+'`' for x in candidates] if candidates else ['None: all held. Review inventory hold reasons.']
+            report+=['','## Interpretation','A candidate is not proof of dispensability. External or dynamically constructed references can be missed. All approved sources remain in Git history even after archive.','']
+            (out/'WFC01_Deep_Audit_Report.md').write_text('\n'.join(report),encoding='utf-8')
+            info={'head_sha':head,'inventory_count':len(workflows),'candidates':len(candidates),'history_complete':not bool(problem),'skipped_ref_capable':skipped_ref_capable,'manifest_sha256':sha(jbytes(manifest)),'output_dir':str(out)}
+            print(json.dumps(info,sort_keys=True))
+            return manifest
+
+        def archive(out):
+            # Also rebuild report freshly at exact pinned commit and compare previous manifest.
+            mode=os.environ.get('WFC01_MODE','')
+            if mode!='ARCHIVE_APPROVED':raise RuntimeError('archive mode not selected')
+            approval=os.environ.get('WFC01_APPROVED_PATHS','')
+            runid=os.environ.get('WFC01_AUDIT_RUN_ID','')
+            pinned=os.environ.get('WFC01_AUDIT_COMMIT','')
+            expected=os.environ.get('WFC01_MANIFEST_SHA256','')
+            if not re.fullmatch(r'[0-9]+',runid):raise RuntimeError('exact successful audit run ID required')
+            if not re.fullmatch(r'[0-9a-f]{40}',pinned):raise RuntimeError('exact audit commit SHA required')
+            if not re.fullmatch(r'[0-9a-f]{64}',expected):raise RuntimeError('manifest SHA256 required')
+            paths=approval.split(',')
+            if not paths or any(not x or x.strip()!=x or not x.startswith(ROOT) or not x.endswith('.yml') for x in paths):
+                raise RuntimeError('provide exact comma-separated original .github/workflows/*.yml paths, no whitespace')
+            if paths!=sorted(set(paths)):raise RuntimeError('approved paths must be sorted and unique')
+            head=run('git','rev-parse','HEAD')
+            if head!=pinned:raise RuntimeError('HEAD moved after approved audit; rerun AUDIT_ONLY')
+            if run('git','status','--porcelain','--untracked-files=all'):
+                raise RuntimeError('dirty checkout before archive')
+            md=json.loads(api('actions/runs/'+runid))
+            if not (md.get('conclusion')=='success' and md.get('status')=='completed' and md.get('head_sha')==head and md.get('event')=='workflow_dispatch' and md.get('name')=='WFC01 - Deep Legacy Workflow Audit and Explicit Archive'):
+                raise RuntimeError('audit run metadata does not match green WFC01 audit on pinned commit')
+            artifacts=json.loads(api('actions/runs/'+runid+'/artifacts?per_page=100'))['artifacts']
+            picked=[x for x in artifacts if x.get('name')=='WFC01-Deep-Workflow-Audit-Read-Only' and not x.get('expired')]
+            if len(picked)!=1:raise RuntimeError('expected exactly one unexpired WFC01 audit artifact')
+            raw=api('actions/artifacts/'+str(picked[0]['id'])+'/zip')
+            with zipfile.ZipFile(io.BytesIO(raw)) as z:
+                manifests=[p for p in z.namelist() if p.endswith('WFC01_Approved_Candidate_Manifest.json')]
+                if len(manifests)!=1:raise RuntimeError('audit artifact has missing or ambiguous manifest')
+                previous=z.read(manifests[0])
+            if sha(previous)!=expected:raise RuntimeError('original audit manifest sha256 mismatch')
+            live=audit(out)
+            current=jbytes(live)
+            if current!=previous:raise RuntimeError('fresh complete audit differs from approved green audit; no changes made')
+            eligible={x['path']:x['sha256'] for x in live['candidates']}
+            if not eligible:raise RuntimeError('no eligible archive candidates')
+            for p in paths:
+                if p not in eligible:raise RuntimeError('not an approved candidate: '+p)
+                if sha((REPO/p).read_bytes())!=eligible[p]:raise RuntimeError('source bytes differ: '+p)
+                target=ARCHIVE+Path(p).name
+                if (REPO/target).exists():raise RuntimeError('archive collision: '+target)
+            receipt={'schema':1,'tool':'WFC01','source_audit_run_id':runid,'source_main_sha':head,'source_manifest_sha256':expected,'action':'byte_identical_move_not_delete','moved':[]}
+            for p in paths:
+                dest=ARCHIVE+Path(p).name
+                (REPO/dest).parent.mkdir(parents=True,exist_ok=True)
+                before=(REPO/p).read_bytes()
+                run('git','mv','--',p,dest)
+                if not (REPO/dest).exists() or (REPO/p).exists() or (REPO/dest).read_bytes()!=before:
+                    raise RuntimeError('byte-identical move verification failed')
+                receipt['moved'].append({'from':p,'to':dest,'sha256':sha(before)})
+            receipt_path=ARCHIVE+'receipts/WFC01_'+runid+'_'+head[:12]+'.json'
+            (REPO/receipt_path).parent.mkdir(parents=True,exist_ok=True)
+            (REPO/receipt_path).write_bytes(json.dumps(receipt,sort_keys=True,indent=2).encode()+b'\n')
+            run('git','add','--',receipt_path)
+            staged=run('git','diff','--cached','--name-status','-M100%').splitlines()
+            renames=set();added=set()
+            for line in staged:
+                cols=line.split('\t')
+                if len(cols)==3 and cols[0]=='R100':renames.add((cols[1],cols[2]))
+                elif len(cols)==2 and cols[0]=='A':added.add(cols[1])
+                else:raise RuntimeError('unexpected staged change (must be R100 rename or receipt only): '+line)
+            expect={(p,ARCHIVE+Path(p).name) for p in paths}
+            if renames!=expect or added!={receipt_path}:raise RuntimeError('staged changes do not equal approved moves + receipt')
+            run('git','config','user.name','github-actions[bot]')
+            run('git','config','user.email','41898282+github-actions[bot]@users.noreply.github.com')
+            run('git','commit','-m','WFC01: archive explicitly approved legacy workflows (byte-identical renames)')
+            run('git','push','origin','HEAD:refs/heads/main')
+            print(json.dumps({'status':'ARCHIVED_EXACT_APPROVED_PATHS','paths':paths,'receipt':receipt_path,'commit':run('git','rev-parse','HEAD')},sort_keys=True))
+
+        def main():
+            out=Path(os.environ.get('WFC01_OUT','/tmp/wfc01-results'))
+            if os.environ.get('WFC01_MODE','AUDIT_ONLY')=='AUDIT_ONLY':
+                audit(out)
+                if run('git','status','--porcelain','--untracked-files=all'):
+                    raise RuntimeError('audit unexpectedly dirtied repository')
+            else:archive(out)
+
+        if __name__=='__main__':main()
+        PY
+        python3 "$RUNNER_TEMP/wfc01_engine.py"
+    - name: Upload full audit inventory and manifest
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: WFC01-Approved-Archive-Receipt
+        path: ${{ runner.temp }}/wfc01-results
+        if-no-files-found: warn
+        retention-days: 60
