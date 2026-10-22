@@ -1,4 +1,4 @@
-# WFC01 V1R2 | Safe audit first. Never archive without explicit owner approval + pinned audit evidence.
+# WFC01 V1R3 | Safe audit first. Never archive without explicit owner approval + pinned audit evidence.
 name: WFC01 - Deep Legacy Workflow Audit and Explicit Archive
 run-name: WFC01 ${{ inputs.mode }} - ${{ github.sha }}
 'on':
@@ -65,9 +65,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat > "$RUNNER_TEMP/wfc01_v1r2_engine.py" <<'PY_WFC01_V1R2'
+          cat > "$RUNNER_TEMP/wfc01_v1r3_engine.py" <<'PY_WFC01_V1R3'
           #!/usr/bin/env python3
-          """WFC01 V1R2 safe workflow inventory and owner-approved exact archive.
+          """WFC01 V1R3 safe workflow inventory and owner-approved exact archive.
           
           An audit candidate is never an authorization to archive. Never deletes files.
           """
@@ -80,8 +80,8 @@ jobs:
           ARCHIVE='.github/workflow-archive/'
           SELF='WFC01_Deep_Legacy_Workflow_Audit_And_Guarded_Archive.yml'
           LOOKBACK_DAYS=35
-          MAX_HISTORY=10000
-          MAX_SCAN_BYTES=524288
+          MAX_HISTORY=10000  # retained for backward source metadata, daily pagination guards history
+          MAX_SCAN_BYTES=524288  # legacy constant, no longer used; complete scan is mandatory
           TEXT_EXT={'.yml','.yaml','.py','.js','.mjs','.cjs','.ts','.tsx','.html','.css','.json','.jsonl','.toml','.ini','.cfg','.sh','.bash','.md','.txt','.sql','.csv','.xml','.rst'}
           REF_CAPABLE={'.yml','.yaml','.py','.js','.mjs','.cjs','.ts','.tsx','.html','.toml','.ini','.cfg','.sh','.bash','.md','.txt'}
           CORE_PREFIX=('CAL26','WFC01','scheduled-data-refresh','sync-sleeper','repo-regression-checks','fantasypros-api-pipeline','free-agent-utility-v1-refresh','ktc-vote-aggregation')
@@ -129,16 +129,32 @@ jobs:
                   return {'events':['UNKNOWN'],'write':True,'valid':False,'error':str(e)[:200],'sha256':sha_bytes(b)}
           
           def recent_history(since):
-              created='>='+since.strftime(TS)
-              q=urllib.parse.urlencode({'created':created,'per_page':100,'page':1})
-              first=api_json('actions/runs?'+q)
-              total=first.get('total_count',None)
-              check(isinstance(total,int) and 0<=total<=MAX_HISTORY,'RECENT_HISTORY_COUNT_UNSUPPORTED')
-              runs=first.get('workflow_runs',[])
-              for page in range(2,(total+99)//100+1):
-                  q=urllib.parse.urlencode({'created':created,'per_page':100,'page':page})
-                  runs.extend(api_json('actions/runs?'+q).get('workflow_runs',[]))
-              check(len(runs)==total,'INCOMPLETE_ACTION_HISTORY')
+              # GitHub's Actions run listing has a 1000-result search limit. Query one
+              # UTC day at a time, including the partial first day, and validate each page.
+              day=since.date()
+              end_day=dt.datetime.now(dt.timezone.utc).date()
+              check(day<=end_day,'INVALID_HISTORY_WINDOW')
+              result=[]
+              seen_ids=set()
+              while day<=end_day:
+                  label=day.isoformat()
+                  base=urllib.parse.urlencode({'created':label,'per_page':100})
+                  first=api_json('actions/runs?'+base+'&page=1')
+                  total=first.get('total_count')
+                  check(isinstance(total,int) and 0<=total<=1000,'HISTORY_UTC_DAY_EXCEEDS_API_LIMIT_'+label)
+                  rows=list(first.get('workflow_runs',[]))
+                  for page in range(2,(total+99)//100+1):
+                      x=api_json('actions/runs?'+base+'&page='+str(page))
+                      rows.extend(x.get('workflow_runs',[]))
+                  check(len(rows)==total,'INCOMPLETE_ACTION_HISTORY_UTC_DAY_'+label)
+                  for item in rows:
+                      created=str(item.get('created_at',''))
+                      check(created[:10]==label,'HISTORY_DAY_MISMATCH_'+label)
+                      rid=item.get('id')
+                      check(rid not in seen_ids and rid is not None,'DUPLICATE_OR_MISSING_RUN_ID_'+label)
+                      seen_ids.add(rid)
+                      if created>=since.strftime(TS):result.append(item)
+                  day+=dt.timedelta(days=1)
               mapping={};page=1
               while True:
                   entries=api_json('actions/workflows?per_page=100&page='+str(page)).get('workflows',[])
@@ -146,15 +162,14 @@ jobs:
                   if len(entries)<100:break
                   page+=1;check(page<=30,'INCOMPLETE_WORKFLOW_DIRECTORY')
               recent=set();unresolved=[]
-              for item in runs:
-                  p=item.get('path') or mapping.get(item.get('workflow_id'))
-                  if not p:
+              for item in result:
+                  path=item.get('path') or mapping.get(item.get('workflow_id'))
+                  if not path:
                       unresolved.append(item.get('id'));continue
-                  p=str(p).lstrip('/')
-                  if p.startswith(ROOT):recent.add(p)
+                  path=str(path).lstrip('/')
+                  if path.startswith(ROOT):recent.add(path)
               check(not unresolved,'UNRESOLVED_RECENT_RUNS_'+str(len(unresolved)))
-              return recent,total
-          
+              return recent,len(result)
           def audit(out, since_override=None):
               check(os.environ.get('GITHUB_REF')=='refs/heads/main','MAIN_ONLY_AUDIT')
               commit=run('git','rev-parse','HEAD')
@@ -174,19 +189,16 @@ jobs:
                   if p.startswith(ARCHIVE) or Path(p).suffix.lower() not in TEXT_EXT:continue
                   path=REPO/p
                   try:
-                      size=path.stat().st_size
-                      if size>MAX_SCAN_BYTES:
-                          gaps.append({'file':p,'reason':'OVER_512KB','bytes':size})
-                          incomplete=incomplete or path.suffix.lower() in REF_CAPABLE
-                          continue
-                      texts.append((p,path.read_text(encoding='utf-8')))
-                  except (OSError,UnicodeError) as exc:
+                      # No arbitrary 512 KB exclusion. Binary-safe literal byte search
+                      # still finds ASCII workflow references in large JSON/HTML sources.
+                      texts.append((p,path.read_bytes()))
+                  except OSError as exc:
                       gaps.append({'file':p,'reason':str(exc)[:160],'bytes':''})
-                      incomplete=incomplete or path.suffix.lower() in REF_CAPABLE
+                      incomplete=True
               inventory=[];refs=[];candidates=[]
               for p in workflows:
                   info=source_info(p)
-                  linked=[f for f,text in texts if f!=p and (p in text or Path(p).name in text)]
+                  linked=[f for f,blob in texts if f!=p and (p.encode('utf-8') in blob or Path(p).name.encode('utf-8') in blob)]
                   for f in linked:refs.append({'workflow':p,'referenced_by':f})
                   stamp=run('git','log','-1','--format=%ct','--',p)
                   edited=dt.datetime.fromtimestamp(int(stamp),tz=dt.timezone.utc) if stamp else None
@@ -209,8 +221,16 @@ jobs:
                         'hold_reasons':';'.join(holds),'yaml_error':info['error']}
                   inventory.append(item)
                   if not holds:candidates.append({'path':p,'sha256':info['sha256']})
+              # Separate manual-review leads from actual archival eligibility.
+              # This is explicitly advisory, even when history or scan is incomplete.
+              soft={'RECENTLY_EDITED','HISTORY_INCOMPLETE','REFERENCE_SCAN_INCOMPLETE'}
+              manual_queue=[{'path':x['path'],'source_edit_utc':x['source_edit_utc'],
+                  'recent_run':x['recent_run'],'hold_reasons':x['hold_reasons'],
+                  'queue_status':'PRELIMINARY_OWNER_REVIEW_ONLY_NOT_ARCHIVE_AUTHORIZATION'}
+                  for x in inventory if not x['recent_run'] and
+                  set(filter(None,x['hold_reasons'].split(';'))).issubset(soft)]
               # Stable across subsequent runs when HEAD and pinned lookback are unchanged.
-              manifest={'schema':2,'tool':'WFC01_V1R2','audit_main_sha':commit,'since_utc':since_s,
+              manifest={'schema':2,'tool':'WFC01_V1R3','audit_main_sha':commit,'since_utc':since_s,
                         'lookback_days':LOOKBACK_DAYS,'candidate_count':len(candidates),'candidates':candidates}
               out.mkdir(parents=True,exist_ok=True)
               (out/'WFC01_Approved_Candidate_Manifest.json').write_bytes(jbytes(manifest))
@@ -218,14 +238,18 @@ jobs:
                   with (out/file).open('w',newline='',encoding='utf-8') as f:
                       writer=csv.DictWriter(f,fieldnames=list(records[0]) if records else header,extrasaction='ignore')
                       writer.writeheader();writer.writerows(records)
-              report=['# WFC01 V1R2 Legacy Workflow Deep Audit','','**No workflow has been moved or deleted.**','',
+              with (out/'WFC01_Manual_Review_Queue_PRELIMINARY.csv').open('w',newline='',encoding='utf-8') as f:
+                  cols=['path','source_edit_utc','recent_run','hold_reasons','queue_status']
+                  writer=csv.DictWriter(f,fieldnames=cols);writer.writeheader();writer.writerows(manual_queue)
+              report=['# WFC01 V1R3 Legacy Workflow Deep Audit','','**No workflow has been moved or deleted.**','',
                   f'- Commit: `{commit}`',f'- Lookback start: `{since_s}`',f'- Workflow YAMLs scanned: **{len(workflows)}**',
                   f'- GitHub Actions history runs in window: **{run_count}**',f'- History complete: **{not bool(history_problem)}**',
-                  f'- Text source paths scanned: **{len(texts)}**',f'- Reference links discovered: **{len(refs)}**',
-                  f'- Potentially reference-bearing unscanned file exists: **{incomplete}**',
-                  f'- Review-only candidates: **{len(candidates)}**',f'- Protected: **{len(workflows)-len(candidates)}**','']
+                  f'- Text source paths scanned (no size cap): **{len(texts)}**',f'- Reference links discovered: **{len(refs)}**',
+                  f'- Potentially reference-bearing unreadable file exists: **{incomplete}**',
+                  f'- Review-only candidates: **{len(candidates)}**',f'- Protected: **{len(workflows)-len(candidates)}**',
+                  f'- Provisional manually reviewable leads (not archive eligible): **{len(manual_queue)}**','']
               if history_problem:report.extend(['## Action history safety hold',history_problem,''])
-              if incomplete:report.extend(['## Source scan safety hold','Some sources were too large or unreadable; all workflows protected.',''])
+              if incomplete:report.extend(['## Source scan safety hold','A source file could not be read; all workflows protected.',''])
               report+=['## Review-only candidates','']+[('- `'+p['path']+'`') for p in candidates] if candidates else ['## Review-only candidates','','None.']
               report+=['','## Important','Candidates require individual owner review. Dynamic/external references may not be discoverable. Archive mode is separately permissioned and verifies a previous green audit, pinned commit and manifest SHA256.']
               (out/'WFC01_Deep_Audit_Report.md').write_text('\n'.join(report)+'\n',encoding='utf8')
@@ -319,14 +343,14 @@ jobs:
               else:archive(out)
           
           if __name__=='__main__':main()
-          PY_WFC01_V1R2
-          python3 -m py_compile "$RUNNER_TEMP/wfc01_v1r2_engine.py"
-          python3 "$RUNNER_TEMP/wfc01_v1r2_engine.py" --selftest
+          PY_WFC01_V1R3
+          python3 -m py_compile "$RUNNER_TEMP/wfc01_v1r3_engine.py"
+          python3 "$RUNNER_TEMP/wfc01_v1r3_engine.py" --selftest
       - name: Run exhaustive read-only workflow audit
         shell: bash
         run: |
           set -euo pipefail
-          python3 "$RUNNER_TEMP/wfc01_v1r2_engine.py" --mode AUDIT_ONLY --out "$WFC01_OUT"
+          python3 "$RUNNER_TEMP/wfc01_v1r3_engine.py" --mode AUDIT_ONLY --out "$WFC01_OUT"
       - name: Upload reviewed audit inventory, references, gaps, and signed manifest
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
@@ -371,9 +395,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat > "$RUNNER_TEMP/wfc01_v1r2_engine.py" <<'PY_WFC01_V1R2'
+          cat > "$RUNNER_TEMP/wfc01_v1r3_engine.py" <<'PY_WFC01_V1R3'
           #!/usr/bin/env python3
-          """WFC01 V1R2 safe workflow inventory and owner-approved exact archive.
+          """WFC01 V1R3 safe workflow inventory and owner-approved exact archive.
           
           An audit candidate is never an authorization to archive. Never deletes files.
           """
@@ -386,8 +410,8 @@ jobs:
           ARCHIVE='.github/workflow-archive/'
           SELF='WFC01_Deep_Legacy_Workflow_Audit_And_Guarded_Archive.yml'
           LOOKBACK_DAYS=35
-          MAX_HISTORY=10000
-          MAX_SCAN_BYTES=524288
+          MAX_HISTORY=10000  # retained for backward source metadata, daily pagination guards history
+          MAX_SCAN_BYTES=524288  # legacy constant, no longer used; complete scan is mandatory
           TEXT_EXT={'.yml','.yaml','.py','.js','.mjs','.cjs','.ts','.tsx','.html','.css','.json','.jsonl','.toml','.ini','.cfg','.sh','.bash','.md','.txt','.sql','.csv','.xml','.rst'}
           REF_CAPABLE={'.yml','.yaml','.py','.js','.mjs','.cjs','.ts','.tsx','.html','.toml','.ini','.cfg','.sh','.bash','.md','.txt'}
           CORE_PREFIX=('CAL26','WFC01','scheduled-data-refresh','sync-sleeper','repo-regression-checks','fantasypros-api-pipeline','free-agent-utility-v1-refresh','ktc-vote-aggregation')
@@ -435,16 +459,32 @@ jobs:
                   return {'events':['UNKNOWN'],'write':True,'valid':False,'error':str(e)[:200],'sha256':sha_bytes(b)}
           
           def recent_history(since):
-              created='>='+since.strftime(TS)
-              q=urllib.parse.urlencode({'created':created,'per_page':100,'page':1})
-              first=api_json('actions/runs?'+q)
-              total=first.get('total_count',None)
-              check(isinstance(total,int) and 0<=total<=MAX_HISTORY,'RECENT_HISTORY_COUNT_UNSUPPORTED')
-              runs=first.get('workflow_runs',[])
-              for page in range(2,(total+99)//100+1):
-                  q=urllib.parse.urlencode({'created':created,'per_page':100,'page':page})
-                  runs.extend(api_json('actions/runs?'+q).get('workflow_runs',[]))
-              check(len(runs)==total,'INCOMPLETE_ACTION_HISTORY')
+              # GitHub's Actions run listing has a 1000-result search limit. Query one
+              # UTC day at a time, including the partial first day, and validate each page.
+              day=since.date()
+              end_day=dt.datetime.now(dt.timezone.utc).date()
+              check(day<=end_day,'INVALID_HISTORY_WINDOW')
+              result=[]
+              seen_ids=set()
+              while day<=end_day:
+                  label=day.isoformat()
+                  base=urllib.parse.urlencode({'created':label,'per_page':100})
+                  first=api_json('actions/runs?'+base+'&page=1')
+                  total=first.get('total_count')
+                  check(isinstance(total,int) and 0<=total<=1000,'HISTORY_UTC_DAY_EXCEEDS_API_LIMIT_'+label)
+                  rows=list(first.get('workflow_runs',[]))
+                  for page in range(2,(total+99)//100+1):
+                      x=api_json('actions/runs?'+base+'&page='+str(page))
+                      rows.extend(x.get('workflow_runs',[]))
+                  check(len(rows)==total,'INCOMPLETE_ACTION_HISTORY_UTC_DAY_'+label)
+                  for item in rows:
+                      created=str(item.get('created_at',''))
+                      check(created[:10]==label,'HISTORY_DAY_MISMATCH_'+label)
+                      rid=item.get('id')
+                      check(rid not in seen_ids and rid is not None,'DUPLICATE_OR_MISSING_RUN_ID_'+label)
+                      seen_ids.add(rid)
+                      if created>=since.strftime(TS):result.append(item)
+                  day+=dt.timedelta(days=1)
               mapping={};page=1
               while True:
                   entries=api_json('actions/workflows?per_page=100&page='+str(page)).get('workflows',[])
@@ -452,15 +492,14 @@ jobs:
                   if len(entries)<100:break
                   page+=1;check(page<=30,'INCOMPLETE_WORKFLOW_DIRECTORY')
               recent=set();unresolved=[]
-              for item in runs:
-                  p=item.get('path') or mapping.get(item.get('workflow_id'))
-                  if not p:
+              for item in result:
+                  path=item.get('path') or mapping.get(item.get('workflow_id'))
+                  if not path:
                       unresolved.append(item.get('id'));continue
-                  p=str(p).lstrip('/')
-                  if p.startswith(ROOT):recent.add(p)
+                  path=str(path).lstrip('/')
+                  if path.startswith(ROOT):recent.add(path)
               check(not unresolved,'UNRESOLVED_RECENT_RUNS_'+str(len(unresolved)))
-              return recent,total
-          
+              return recent,len(result)
           def audit(out, since_override=None):
               check(os.environ.get('GITHUB_REF')=='refs/heads/main','MAIN_ONLY_AUDIT')
               commit=run('git','rev-parse','HEAD')
@@ -480,19 +519,16 @@ jobs:
                   if p.startswith(ARCHIVE) or Path(p).suffix.lower() not in TEXT_EXT:continue
                   path=REPO/p
                   try:
-                      size=path.stat().st_size
-                      if size>MAX_SCAN_BYTES:
-                          gaps.append({'file':p,'reason':'OVER_512KB','bytes':size})
-                          incomplete=incomplete or path.suffix.lower() in REF_CAPABLE
-                          continue
-                      texts.append((p,path.read_text(encoding='utf-8')))
-                  except (OSError,UnicodeError) as exc:
+                      # No arbitrary 512 KB exclusion. Binary-safe literal byte search
+                      # still finds ASCII workflow references in large JSON/HTML sources.
+                      texts.append((p,path.read_bytes()))
+                  except OSError as exc:
                       gaps.append({'file':p,'reason':str(exc)[:160],'bytes':''})
-                      incomplete=incomplete or path.suffix.lower() in REF_CAPABLE
+                      incomplete=True
               inventory=[];refs=[];candidates=[]
               for p in workflows:
                   info=source_info(p)
-                  linked=[f for f,text in texts if f!=p and (p in text or Path(p).name in text)]
+                  linked=[f for f,blob in texts if f!=p and (p.encode('utf-8') in blob or Path(p).name.encode('utf-8') in blob)]
                   for f in linked:refs.append({'workflow':p,'referenced_by':f})
                   stamp=run('git','log','-1','--format=%ct','--',p)
                   edited=dt.datetime.fromtimestamp(int(stamp),tz=dt.timezone.utc) if stamp else None
@@ -515,8 +551,16 @@ jobs:
                         'hold_reasons':';'.join(holds),'yaml_error':info['error']}
                   inventory.append(item)
                   if not holds:candidates.append({'path':p,'sha256':info['sha256']})
+              # Separate manual-review leads from actual archival eligibility.
+              # This is explicitly advisory, even when history or scan is incomplete.
+              soft={'RECENTLY_EDITED','HISTORY_INCOMPLETE','REFERENCE_SCAN_INCOMPLETE'}
+              manual_queue=[{'path':x['path'],'source_edit_utc':x['source_edit_utc'],
+                  'recent_run':x['recent_run'],'hold_reasons':x['hold_reasons'],
+                  'queue_status':'PRELIMINARY_OWNER_REVIEW_ONLY_NOT_ARCHIVE_AUTHORIZATION'}
+                  for x in inventory if not x['recent_run'] and
+                  set(filter(None,x['hold_reasons'].split(';'))).issubset(soft)]
               # Stable across subsequent runs when HEAD and pinned lookback are unchanged.
-              manifest={'schema':2,'tool':'WFC01_V1R2','audit_main_sha':commit,'since_utc':since_s,
+              manifest={'schema':2,'tool':'WFC01_V1R3','audit_main_sha':commit,'since_utc':since_s,
                         'lookback_days':LOOKBACK_DAYS,'candidate_count':len(candidates),'candidates':candidates}
               out.mkdir(parents=True,exist_ok=True)
               (out/'WFC01_Approved_Candidate_Manifest.json').write_bytes(jbytes(manifest))
@@ -524,14 +568,18 @@ jobs:
                   with (out/file).open('w',newline='',encoding='utf-8') as f:
                       writer=csv.DictWriter(f,fieldnames=list(records[0]) if records else header,extrasaction='ignore')
                       writer.writeheader();writer.writerows(records)
-              report=['# WFC01 V1R2 Legacy Workflow Deep Audit','','**No workflow has been moved or deleted.**','',
+              with (out/'WFC01_Manual_Review_Queue_PRELIMINARY.csv').open('w',newline='',encoding='utf-8') as f:
+                  cols=['path','source_edit_utc','recent_run','hold_reasons','queue_status']
+                  writer=csv.DictWriter(f,fieldnames=cols);writer.writeheader();writer.writerows(manual_queue)
+              report=['# WFC01 V1R3 Legacy Workflow Deep Audit','','**No workflow has been moved or deleted.**','',
                   f'- Commit: `{commit}`',f'- Lookback start: `{since_s}`',f'- Workflow YAMLs scanned: **{len(workflows)}**',
                   f'- GitHub Actions history runs in window: **{run_count}**',f'- History complete: **{not bool(history_problem)}**',
-                  f'- Text source paths scanned: **{len(texts)}**',f'- Reference links discovered: **{len(refs)}**',
-                  f'- Potentially reference-bearing unscanned file exists: **{incomplete}**',
-                  f'- Review-only candidates: **{len(candidates)}**',f'- Protected: **{len(workflows)-len(candidates)}**','']
+                  f'- Text source paths scanned (no size cap): **{len(texts)}**',f'- Reference links discovered: **{len(refs)}**',
+                  f'- Potentially reference-bearing unreadable file exists: **{incomplete}**',
+                  f'- Review-only candidates: **{len(candidates)}**',f'- Protected: **{len(workflows)-len(candidates)}**',
+                  f'- Provisional manually reviewable leads (not archive eligible): **{len(manual_queue)}**','']
               if history_problem:report.extend(['## Action history safety hold',history_problem,''])
-              if incomplete:report.extend(['## Source scan safety hold','Some sources were too large or unreadable; all workflows protected.',''])
+              if incomplete:report.extend(['## Source scan safety hold','A source file could not be read; all workflows protected.',''])
               report+=['## Review-only candidates','']+[('- `'+p['path']+'`') for p in candidates] if candidates else ['## Review-only candidates','','None.']
               report+=['','## Important','Candidates require individual owner review. Dynamic/external references may not be discoverable. Archive mode is separately permissioned and verifies a previous green audit, pinned commit and manifest SHA256.']
               (out/'WFC01_Deep_Audit_Report.md').write_text('\n'.join(report)+'\n',encoding='utf8')
@@ -625,11 +673,11 @@ jobs:
               else:archive(out)
           
           if __name__=='__main__':main()
-          PY_WFC01_V1R2
-          python3 -m py_compile "$RUNNER_TEMP/wfc01_v1r2_engine.py"
-          python3 "$RUNNER_TEMP/wfc01_v1r2_engine.py" --selftest
+          PY_WFC01_V1R3
+          python3 -m py_compile "$RUNNER_TEMP/wfc01_v1r3_engine.py"
+          python3 "$RUNNER_TEMP/wfc01_v1r3_engine.py" --selftest
       - name: Archive only exact owner-approved audited paths
         shell: bash
         run: |
           set -euo pipefail
-          python3 "$RUNNER_TEMP/wfc01_v1r2_engine.py" --mode ARCHIVE_APPROVED --out "$WFC01_OUT"
+          python3 "$RUNNER_TEMP/wfc01_v1r3_engine.py" --mode ARCHIVE_APPROVED --out "$WFC01_OUT"
