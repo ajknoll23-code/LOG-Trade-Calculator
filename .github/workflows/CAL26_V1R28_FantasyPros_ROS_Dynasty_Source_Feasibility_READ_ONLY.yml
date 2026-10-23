@@ -1,0 +1,274 @@
+# CAL26 V1R28 — Read-only external provider feasibility. No rankings or projections stored.
+name: CAL26 V1R28 - FantasyPros ROS and Dynasty Source Feasibility READ ONLY
+'on':
+  workflow_dispatch: {}
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: cal26-v1r28-private-provider-source-probe
+  cancel-in-progress: false
+jobs:
+  fantasypros_source_feasibility:
+    name: Validate dated FantasyPros ROS and dynasty endpoint availability without retaining private rows
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout main without write credentials
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify expected source checkout and clean state
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/main
+          test -s index.html
+          test -s scripts/validation/snapshot_values.py
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Pin successful V1R27 grid without using future outcomes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/cal26-v1r27-frozen"
+          gh run download 39963472646 --repo "$GITHUB_REPOSITORY" \
+            --name CAL26-V1R27-Frozen-QB-Prospective-20-Model-Grid-Read-Only \
+            --dir "$RUNNER_TEMP/cal26-v1r27-frozen"
+          test -s "$RUNNER_TEMP/cal26-v1r27-frozen/CAL26_V1R27_Manifest.json"
+      - name: Install and selftest metadata-only FantasyPros source checker
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/cal26_v1r28_source_probe.py" <<'PY_CAL26_V1R28_PROBE'
+          #!/usr/bin/env python3
+          """CAL26 V1R28. Metadata-only, no proprietary player payload persisted."""
+          from __future__ import annotations
+          import argparse
+          import csv
+          import hashlib
+          import importlib.util
+          import io
+          import json
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          ENDPOINTS = {
+              'qb_ros': ('nfl/2026/projections', {'position':'QB','ros':'true'}),
+              'dynasty_all': ('nfl/2026/consensus-rankings', {'position':'ALL','type':'DYNASTY'}),
+          }
+
+
+          def normalize(name):
+              s = str(name or '').strip().lower()
+              s = re.sub(r'[.\'’\-]', '', s)
+              return re.sub(r'\s+', ' ', s).strip()
+
+
+          def count_coverage(doc, roster):
+              players = doc.get('players', [])
+              if not isinstance(players, list):
+                  return {'schema_valid':False,'players':0,'qbs':0,'qb_roster_name_matched':0,
+                          'identity_collisions':0,'has_numeric_forecast_categories':False}
+              qbs=[r for r in players if isinstance(r,dict) and str(r.get('position_id') or r.get('position') or '').upper()=='QB']
+              names=[normalize(r.get('name') or r.get('player_name')) for r in qbs]
+              names=[x for x in names if x]
+              dup=len(names)-len(set(names))
+              nested=[r.get('stats',{}) for r in qbs]
+              stats=any(isinstance(q,dict) and any(isinstance(v,(int,float)) and not isinstance(v,bool) for v in q.values()) for q in nested)
+              return {'schema_valid':True,'players':len(players),'qbs':len(qbs),
+                      'qb_roster_name_matched':len(set(names)&roster),'identity_collisions':dup,
+                      'has_numeric_forecast_categories':stats}
+
+
+          def endpoint_meta(kind, data, roster, response_bytes):
+              base=count_coverage(data,roster)
+              keep=('week','year','season','count','positions','position_id','scoring','ranking_type_name',
+                    'last_updated','last_updated_ts','total_experts')
+              doc_fields={k:str(data[k])[:100] for k in keep if k in data and not isinstance(data[k],(list,dict))}
+              expert=data.get('experts')
+              result={'result':'RESPONSE_JSON_RECEIVED','response_sha256':hashlib.sha256(response_bytes).hexdigest(),
+                      'coverage':base,'response_fields':doc_fields,'expert_count':len(expert) if isinstance(expert,list) else None}
+              if kind=='dynasty_all':
+                  result['superflex_verified']=False
+                  result['superflex_note']='ALL/DYNASTY does not prove superflex; requires explicit source-format verification'
+              else:
+                  result['ros_requested']=True
+                  result['ros_confirmed_in_response']=str(data.get('ros') or data.get('type') or '').lower() in ('true','ros')
+                  result['ros_confirmation_note']='Requested ros=true, but absence of explicit response flag is not independent confirmation of ROS period'
+              return result
+
+
+          def load_roster(repo):
+              path=repo/'scripts/validation/snapshot_values.py'
+              spec=importlib.util.spec_from_file_location('cal26_v1r28_snapshot',path)
+              mod=importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(mod)
+              vals=mod.compute_all_values(mod.load_from_html(repo/'index.html'))
+              assert len(vals)==565 and sum(z['pos']=='QB' for z in vals.values())==64, 'LIVE_ROSTER_SCOPE_DRIFT'
+              qb={normalize(k) for k,v in vals.items() if v['pos']=='QB'}
+              assert len(qb)==64
+              return vals,qb
+
+
+          def fetch(endpoint,query,key):
+              url='https://api.fantasypros.com/public/v2/json/'+endpoint+'?'+urllib.parse.urlencode(query)
+              req=urllib.request.Request(url,headers={
+                  'x-api-key':key,'Accept':'application/json',
+                  'User-Agent':'LOG-Trade-Calculator/1.0 V1R28 private source-feasibility (no raw persistence)'})
+              try:
+                  with urllib.request.urlopen(req,timeout=20) as response:
+                      b=response.read(12_000_001)
+                      if len(b)>12_000_000: return {'result':'HOLD_RESPONSE_TOO_LARGE'}
+                      doc=json.loads(b)
+                      if not isinstance(doc,dict): return {'result':'HOLD_NOT_JSON_OBJECT'}
+                      return (doc,b)
+              except urllib.error.HTTPError as e:
+                  return {'result':'HOLD_HTTP_ERROR','http_status':e.code} # no provider error body
+              except (OSError,TimeoutError,ValueError,json.JSONDecodeError):
+                  return {'result':'HOLD_TRANSPORT_OR_JSON_ERROR'}
+
+
+          def safe_run(repo,out,key,freeze):
+              _,roster=load_roster(repo)
+              assert len(roster)==64
+              f=json.loads((freeze/'CAL26_V1R27_Manifest.json').read_text())
+              assert f['status']=='PASS_CAL26_V1R27_FROZEN_FUTURE_ONLY_31_QB_20_CANDIDATES'
+              assert (f['same_cohort_qbs'],f['candidate_models'],f['candidate_rows'])==(31,20,620)
+              assert f['production_change_authorized'] is False
+              assert f['holdout_weeks']==[8,9,10,11,12]
+              out.mkdir(parents=True,exist_ok=True)
+              result={}
+              for name,(endpoint,params) in ENDPOINTS.items():
+                  if not key:
+                      result[name]={'result':'HOLD_API_KEY_NOT_CONFIGURED'}
+                      continue
+                  obj=fetch(endpoint,params,key)
+                  if isinstance(obj,dict): result[name]=obj
+                  else: result[name]=endpoint_meta(name,obj[0],roster,obj[1])
+              good_ros=result['qb_ros']['result']=='RESPONSE_JSON_RECEIVED' and result['qb_ros']['coverage']['qb_roster_name_matched']>=30 and result['qb_ros']['coverage']['has_numeric_forecast_categories']
+              good_rank=result['dynasty_all']['result']=='RESPONSE_JSON_RECEIVED' and result['dynasty_all']['coverage']['qbs']>=15
+              ros_verified=result['qb_ros'].get('ros_confirmed_in_response') is True
+              status='SOURCES_AVAILABLE_ROS_METADATA_REVIEW_REQUIRED' if good_ros and good_rank else 'HOLD_SOURCE_ACCESS_OR_COVERAGE_UNVERIFIED'
+              if not ros_verified:
+                  status='HOLD_SOURCE_VINTAGE_OR_PERIOD_UNVERIFIED' if good_ros and good_rank else status
+              captured=datetime.now(timezone.utc).isoformat()
+              summary={
+                  'schema_version':1,'status':status,'captured_at_utc':captured,
+                  'workflow':'CAL26_V1R28_FANTASYPROS_ROS_DYNASTY_API_METADATA_PROBE',
+                  'frozen_v1r27_run':39963472646,'freeze_sha256':hashlib.sha256((freeze/'CAL26_V1R27_Manifest.json').read_bytes()).hexdigest(),
+                  'frozen_candidate_count':20,'frozen_qbs':31,'current_board_players':565,'current_board_qbs':64,
+                  'api_key_present':bool(key),'source_check':result,
+                  'dynasty_superflex_verified':False,'licensed_player_rows_saved':False,'licensed_player_rows_printed':False,
+                  'production_change_authorized':False,'production_files_mutated':0,
+                  'model_coefficients_calibrated':False,'future_outcomes_used':False,
+                  'pricing_or_calibration_ready':False,
+              }
+              if 'files' in summary: raise AssertionError('unexpected files attribute')
+              report=[
+                  '# CAL26 V1R28 — FantasyPros ROS and Dynasty API Feasibility',
+                  '',f'- Status: `{status}`',f'- Checked UTC: `{captured}`','',
+                  '## Source probes',
+                  '',
+                  '| Probe | Request | Result | Returned QBs | Matched current QBs |',
+                  '|---|---|---|---:|---:|',
+              ]
+              for name in ENDPOINTS:
+                  v=result[name]; cv=v.get('coverage',{})
+                  report.append(f"| {name} | {('QB ros=true' if name=='qb_ros' else 'ALL type=DYNASTY')} | {v['result']} | {cv.get('qbs', '—')} | {cv.get('qb_roster_name_matched','—')} |")
+              report += ['',
+                '## Interpretation and requirements','',
+                '- The documented `ros=true` request is tested for transport, schema, and coverage; ROS date/period is not assumed merely because an HTTP response succeeds.',
+                '- `type=DYNASTY&position=ALL` is an exploratory ranking query, **not** proven superflex or two-QB ranking data; do not treat it as superflex.',
+                '- No proprietary player-level FantasyPros rankings or projections are printed, saved, uploaded, or committed.',
+                '- Existing DLF rankings remain private; 4for4 syndicated DLF dynasty rankings are not counted separately.',
+                '- To build a point-in-time dynasty model, obtain explicit superflex rankings and verified ROS forecast vintage with authorized private storage.',
+                '- None of these source probes selects a forecasting model or creates a player value; Week 8-12 predictions remain frozen.',
+                '- Green means the diagnostic ran; it does not authorize model calibration or deployment.',
+                '',
+              ]
+              report_name='CAL26_V1R28_Source_Feasibility_Report.md'
+              (out/report_name).write_text('\n'.join(report),encoding='utf-8')
+              summary['files']={report_name:hashlib.sha256((out/report_name).read_bytes()).hexdigest()}
+              (out/'CAL26_V1R28_Manifest.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+              print(f"SOURCE_PROBE status={status}; ROS={result['qb_ros']['result']}; dynasty={result['dynasty_all']['result']}; no source row data saved")
+
+
+          def selftest():
+              assert normalize('Michael Penix Jr.')==normalize('michael penix jr')
+              qbs={normalize('Michael Penix Jr.'),normalize('Josh Allen')}
+              data={'players':[{'name':'Michael Penix Jr.','position_id':'QB','stats':{'pass_yds':2400}}, {'name':'Josh Allen','position_id':'QB','stats':{'pass_yds':3100}}], 'count':2,'week':7}
+              m=endpoint_meta('qb_ros',data,qbs,json.dumps(data).encode())
+              assert m['coverage']['qb_roster_name_matched']==2
+              assert m['ros_requested'] and not m['ros_confirmed_in_response']
+              assert 'players' not in m and 'name' not in m
+              d=endpoint_meta('dynasty_all',{'players':[{'name':'Josh Allen','position_id':'QB','rank_ecr':1}]},qbs,b'sample')
+              assert d['superflex_verified'] is False
+              assert count_coverage({'players':'wrong'},qbs)['schema_valid'] is False
+              print('PASS source probe selftest: identity, fail-closed ROS, fail-closed superflex, no raw-player metadata')
+
+          if __name__=='__main__':
+              parser=argparse.ArgumentParser()
+              parser.add_argument('--repo',type=Path)
+              parser.add_argument('--freeze',type=Path)
+              parser.add_argument('--out',type=Path)
+              parser.add_argument('--selftest',action='store_true')
+              args=parser.parse_args()
+              if args.selftest:selftest()
+              else:
+                  assert args.repo and args.freeze and args.out
+                  safe_run(args.repo,args.out,os.environ.get('FANTASYPROS_API_KEY',''),args.freeze)
+          PY_CAL26_V1R28_PROBE
+          python3 -m py_compile "$RUNNER_TEMP/cal26_v1r28_source_probe.py"
+          python3 "$RUNNER_TEMP/cal26_v1r28_source_probe.py" --selftest
+      - name: Test authenticated 2026 ROS and dynasty source coverage without saving provider rows
+        shell: bash
+        env:
+          FANTASYPROS_API_KEY: ${{ secrets.FANTASYPROS_API_KEY }}
+        run: |
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/cal26_v1r28_source_probe.py" \
+            --repo "$GITHUB_WORKSPACE" \
+            --freeze "$RUNNER_TEMP/cal26-v1r27-frozen" \
+            --out "$RUNNER_TEMP/CAL26_V1R28_Safe_Report"
+      - name: Independently validate no pricing and no private row-level artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_CAL26_V1R28_VERIFY'
+          import hashlib,json,os
+          from pathlib import Path
+          out=Path(os.environ['RUNNER_TEMP'])/'CAL26_V1R28_Safe_Report'
+          actual=sorted(p.name for p in out.iterdir())
+          assert actual==['CAL26_V1R28_Manifest.json','CAL26_V1R28_Source_Feasibility_Report.md'], actual
+          m=json.loads((out/'CAL26_V1R28_Manifest.json').read_text())
+          assert (m['frozen_candidate_count'],m['frozen_qbs'],m['current_board_qbs'],m['current_board_players'])==(20,31,64,565)
+          assert m['frozen_v1r27_run']==39963472646
+          assert m['dynasty_superflex_verified'] is False
+          assert m['licensed_player_rows_saved'] is False and m['licensed_player_rows_printed'] is False
+          assert m['future_outcomes_used'] is False and m['model_coefficients_calibrated'] is False
+          assert m['pricing_or_calibration_ready'] is False
+          assert m['production_change_authorized'] is False and m['production_files_mutated']==0
+          assert set(m['source_check'])=={'qb_ros','dynasty_all'}
+          for f,d in m['files'].items():
+            assert hashlib.sha256((out/f).read_bytes()).hexdigest()==d
+          print('PASS V1R28: 31/20 freeze intact; diagnostics only; no licensed player rows, no pricing')
+          PY_CAL26_V1R28_VERIFY
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Upload metadata-only audit (no provider rankings or projections)
+        uses: actions/upload-artifact@v4
+        with:
+          name: CAL26-V1R28-FantasyPros-ROS-Dynasty-Source-Feasibility-Read-Only
+          path: ${{ runner.temp }}/CAL26_V1R28_Safe_Report
+          if-no-files-found: error
+          retention-days: 45
