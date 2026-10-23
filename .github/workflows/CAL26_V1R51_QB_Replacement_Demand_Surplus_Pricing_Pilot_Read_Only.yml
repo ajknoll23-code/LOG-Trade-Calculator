@@ -1,0 +1,295 @@
+name: CAL26 V1R51 - QB Replacement Demand and Surplus Pricing Pilot (Read Only)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: cal26-v1r51-qb-replacement-demand-surplus-pilot-readonly
+  cancel-in-progress: false
+
+jobs:
+  qb-surplus-evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout read-only evidence
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Download completed R42 historical surplus artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: CAL26_V1R42_HISTORICAL_QB_RESEARCH_ONLY
+          run-id: 40021246762
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/cal26_r51/r42
+      - name: Download completed R47R1 recency bridge artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: CAL26_V1R47R1_QB_RECENCY_TWO_TRACK_EVIDENCE_READ_ONLY
+          run-id: 40030717495
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/cal26_r51/r47
+      - name: Download completed R50R1 next-season outcomes artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: CAL26_V1R50R1_QB_NEXTSEASON_RECENCY_RESEARCH_ONLY
+          run-id: 40035367958
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/cal26_r51/r50
+      - name: Assemble pinned 54-QB prospective surplus and roster-demand sensitivity
+        shell: bash
+        run: |
+          
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/cal26_v1r51_engine.py" <<'PY_CAL26_R51_ENGINE'
+          #!/usr/bin/env python3
+          """CAL26 V1R51. QB replacement-demand and four-season surplus bridge; research only.
+          
+          Inputs are actual R42, R47R1, R50R1 published artifacts and pinned roster-economics.
+          Outputs are *dimensionless research indices*, explicitly not calibrated FV.
+          No player changes, no future 2026 data, no scoring unit mixing.
+          """
+          import argparse,csv,hashlib,io,json,math,pathlib,statistics,subprocess,sys
+          
+          ROOT='CAL26_V1R51'
+          BLOB_ROSTER='61c0b5079ee7efef644e94c3ddadf66d8a32e5a'
+          BLOB_P2='ed5025134ca5992b460fa8b850033f82d7ea450f'
+          ARTIFACTS={
+           'r42':('CAL26_V1R42_manifest.json','CAL26_V1R42_54_QB_empirical_shadow.csv'),
+           'r47':('CAL26_V1R47_manifest.json','CAL26_V1R47_54_QB_two_track_evidence.csv'),
+           'r50':('CAL26_V1R50_manifest.json','CAL26_V1R50_six_decisions.csv'),
+          }
+          
+          
+          def check(x,msg):
+           if not x:raise AssertionError(msg)
+          
+          def sha(x):return hashlib.sha256(x).hexdigest()
+          def clean(n):return str(n).strip().lower()
+          def num(x):
+           v=float(x);check(math.isfinite(v),'NONFINITE_FLOAT');return v
+          
+          def read_artifact(root,key):
+           folder=root/key;manifest_file,data_file=ARTIFACTS[key]
+           m=json.loads((folder/manifest_file).read_text())
+           files=m['output_sha256'];check(data_file in files,'INPUT_MISSING_'+key)
+           for name,expected in files.items():
+            path=folder/name
+            check(path.exists(),f'MISSING_ARTIFACT_FILE_{key}_{name}')
+            check(sha(path.read_bytes())==expected,f'ARTIFACT_HASH_MISMATCH_{key}_{name}')
+           rows=list(csv.DictReader((folder/data_file).open(newline='',encoding='utf-8')))
+           return m,rows
+          
+          def load_roster(repo,fixture):
+           if fixture:
+            # Real source excerpt copied for synthetic/offline test, never permits production release.
+            v={'positions':{'QB':{'effective_demand':27.65,'coverage_ranks':{'80':24,'90':29,'95':34},
+               'bootstrap_50pct_crossing':{'median':22,'p10':22,'p90':34},
+               'documented_baseline':18,'empirical_baseline':18}}}
+            provenance={'mode':'OFFLINE_FIXTURE_VERIFIED_FIELDS_ONLY','sha':None}
+           else:
+            path=repo/'research/roster-economics/roster_economics_robustness.json'
+            check(path.exists(),'ROSTER_ECONOMICS_NOT_FOUND')
+            s=subprocess.run(['git','hash-object',str(path)],cwd=repo,capture_output=True,text=True,check=True).stdout.strip()
+            check(s==BLOB_ROSTER,'FROZEN_ROSTER_ECONOMICS_BLOB_MISMATCH')
+            v=json.loads(path.read_text());provenance={'mode':'REPOSITORY_PINNED','sha':s}
+            p2=repo/'research/production-v2/production_v2_phase2_preseason_baseline.json'
+            check(p2.exists(),'FROZEN_P2_MISSING')
+            p2sha=subprocess.run(['git','hash-object',str(p2)],cwd=repo,capture_output=True,text=True,check=True).stdout.strip()
+            check(p2sha==BLOB_P2,'FROZEN_P2_BLOB_MISMATCH')
+            provenance['frozen_P2_git_blob']=p2sha
+           q=v['positions']['QB']; check(15<float(q['effective_demand'])<45,'QB_EFFECTIVE_DEMAND_OUT_OF_BOUNDS')
+           check(all(k in q for k in ['coverage_ranks','bootstrap_50pct_crossing','documented_baseline','empirical_baseline']), 'QB_DEMAND_SOURCE_CONTRACT')
+           return q,provenance
+          
+          def csv_str(data,fields):
+           stream=io.StringIO(newline='');w=csv.DictWriter(stream,fieldnames=fields,extrasaction='ignore',lineterminator='\n');w.writeheader()
+           for x in data:w.writerow({k:x.get(k,'') for k in fields})
+           return stream.getvalue()
+          
+          def validate_sources(m42,m47,m50,x42,x47,x50):
+           check(len(x42)==len(x47)==54,'EXPECTED_54_QBS')
+           check(len({clean(r['name']) for r in x42})==54,'DUPLICATE_R42_QB')
+           check(len({clean(r['name']) for r in x47})==54,'DUPLICATE_R47_QB')
+           check(m42.get('n_2026_frozen_forward_QBs')==54,'R42_EXPECTED_54')
+           check(m42.get('source_historical_max_year')==2025 and m42.get('future_2026_holdout_read') is False,'R42_LEAK_OR_EVIDENCE_DRIFT')
+           check(m42.get('production_change_authorized') is False and m42.get('scoring_semantics','').find('mismatch')>=0,'R42_PRICING_GUARD')
+           check(m47.get('QB_54_frozen_rows')==54 and m47.get('QB_week6_eligible_matched')==31,'R47_MATCHED_CONTRACT')
+           check(m47.get('weeks7_or_later_QB_stats_parsed') is False and m47.get('production_change_authorized') is False,'R47_LEAK_OR_PRICING_GUARD')
+           check(m50.get('n_holdout_decisions')==6 and len(x50)==6,'R50_SIX_DECISIONS')
+           check(m50.get('outer_test_origins')==[2023,2024] and m50.get('test_outcome_last_season')==2025,'R50_CHRONOLOGY')
+           check(m50.get('protected_2026_holdout_read') is False and m50.get('production_change_authorized') is False,'R50_HOLDOUT_OR_RELEASE_GUARD')
+           check(all(r['production_price_change_authorized']=='False' for r in x50),'R50_OUTPUT_APPROVAL_GUARD')
+           q={clean(r['name']):r for r in x42};w={clean(r['name']):r for r in x47}
+           check(q.keys()==w.keys(),'R42_R47_QB_IDENTITY_MISMATCH')
+           for name in q:
+            a,b=q[name],w[name]
+            check(abs(num(a['frozen_2026_forward'])-num(b['2026_frozen_preseason_points']))<.0001,'FROZEN_PRESEASON_DRIFT_'+name)
+            check(int(a['frozen_FV_reference_only'])==int(b['frozen_september_FV']),'FROZEN_FV_DRIFT_'+name)
+            check(b['production_change_authorized']=='False' and b['future_holdout_read']=='False','R47_ROW_GOVERNANCE_'+name)
+           return q,w
+          
+          def run(data,output,repo,fixture):
+           m42,x42=read_artifact(data,'r42'); m47,x47=read_artifact(data,'r47');m50,x50=read_artifact(data,'r50')
+           q,w=validate_sources(m42,m47,m50,x42,x47,x50)
+           demand,roster_meta=load_roster(repo,fixture)
+           qb_sorted=sorted(q.values(),key=lambda a:(-num(a['frozen_2026_forward']),clean(a['name'])))
+           rankproj={r:num(qb_sorted[r-1]['frozen_2026_forward']) for r in (18,22,24,28,29,34)}
+           check(abs(num(qb_sorted[23]['frozen_2026_forward'])-num(qb_sorted[0]['QB24_2026_frozen']))<1e-4,'R42_QB24_REFERENCE_DRIFT')
+           check(rankproj[22]>=rankproj[24]>=rankproj[28]>=rankproj[34]>0,'QB_RANK_MONOTONICITY')
+           def projected_index(a,discount):
+            # Each R42 future ratio is an *already unconditional* expected surplus above QB24.
+            # NEVER multiply these ratios by p_150_pass_attempts or p_above_QB24 again.
+            h=[num(a[f'h{i}_expected_ratio_surplus']) for i in (1,2,3)]
+            base=max(0,num(a['frozen_2026_forward'])/rankproj[24]-1)
+            return base+sum((discount**i)*h[i-1] for i in (1,2,3))
+           dataset=[]
+           for name,a in q.items():
+            b=w[name]
+            proj=num(a['frozen_2026_forward']);frozen=int(a['frozen_FV_reference_only'])
+            row={'name':name,'age':int(a['age_2026_frozen']),'frozen_FV_UNCHANGED':frozen,'R45_reference_only_FV_NOT_CALIBRATED':int(b['R45R1_reference_only_FV']),
+             '2026_preseason_projected_points_SCORING_NOT_VERIFIED':round(proj,3),'R42_baseline_tier':a['baseline_tier'],
+             'week6_recency_eligible':b['R46_2026_week6_qualifies']=='True','weeks1_6_LOG_active_ppg_OBSERVATION_ONLY':b['weeks1_6_LOG_active_ppg_OBSERVATION_ONLY'],
+             'R46_std_ROS_ppg_NOT_COMBINED':b['week6_R46_heldout_selected_std_ROS_ppg'],
+             'R50_next_year_equal3_std_signal_NOT_FORECAST':'',
+             'h1_R42_unconditional_QB24_ratio_surplus':a['h1_expected_ratio_surplus'],
+             'h2_R42_unconditional_QB24_ratio_surplus':a['h2_expected_ratio_surplus'],
+             'h3_R42_unconditional_QB24_ratio_surplus':a['h3_expected_ratio_surplus'],
+             'h1_R42_local_n':int(a['h1_local_sample_n']),'h2_R42_local_n':int(a['h2_local_sample_n']),'h3_R42_local_n':int(a['h3_local_sample_n']),
+             'year0_surplus_QB24_projected_points':round(max(0,proj-rankproj[24]),3),
+             'year0_surplus_rank22_projected_points':round(max(0,proj-rankproj[22]),3),
+             'year0_surplus_rank28_projected_points':round(max(0,proj-rankproj[28]),3),
+             'year0_surplus_rank34_projected_points':round(max(0,proj-rankproj[34]),3),
+             'four_year_QB24_proxy_index_discount_0pct':round(projected_index(a,1.0),6),
+             'four_year_QB24_proxy_index_discount_10pct':round(projected_index(a,.9),6),
+             'four_year_QB24_proxy_index_discount_20pct':round(projected_index(a,.8),6),
+             'rank28_year0_shows_demand_sensitivity_only':True,
+             'LOG_QB_scoring_confirmed':False,'cross_position_FV_calibrated':False,'numerical_FV_reprice_authorized':False}
+            if b['R46_2026_week6_qualifies']=='True' and b['has_usable_2025_prior']=='True':
+             row['R50_next_year_equal3_std_signal_NOT_FORECAST']=round(sum(num(b[k]) for k in ['recent3_std_ppg','ytd_std_ppg','prior2025_std_ppg'])/3,4)
+            dataset.append(row)
+           dataset.sort(key=lambda r:(-r['four_year_QB24_proxy_index_discount_10pct'],r['name']))
+           top=dataset[0]['four_year_QB24_proxy_index_discount_10pct'];check(top>0,'NO_POSITIVE_INDEX')
+           for i,r in enumerate(dataset,1):
+            r['QB24_proxy_rank']=i
+            r['illustrative_QB_ONLY_10000_INDEX_NOT_FV']=int(round(10000*r['four_year_QB24_proxy_index_discount_10pct']/top))
+            r['frozen_FV_minus_illustrative_index_NOT_MEANINGFUL']='NOT_COMPARABLE'
+           check(len(dataset)==54,'DATASET_ROW_COUNT')
+           check(all(r['illustrative_QB_ONLY_10000_INDEX_NOT_FV']<=10000 for r in dataset),'NORMALIZATION_OVERFLOW')
+           check(all(r['numerical_FV_reprice_authorized'] is False for r in dataset),'REPRICE_LEAK')
+           # Leading gap diagnostics: near-zero QB34 is not a safe default replacement estimate.
+           ratio34=rankproj[34]/rankproj[28]
+           warnings=['QB34_PROJECTED_POINTS_COLLAPSE__SENSITIVITY_NOT_A_TRUSTED_REPLACEMENT' ] if ratio34<.4 else []
+           decisions={f'{r["cohort"]}__{r["outcome"]}':r for r in x50}
+           check(decisions['has_prior__future_ratio_surplus']['selected_on_inner_2020_2021']=='equal_all_three','R50_ESTABLISHED_PRODUCTION_MODEL_DRIFT')
+           check(decisions['has_prior__future_ratio_surplus']['beat_YTD']=='True','R50_ESTABLISHED_TEST_DRIFT')
+           summary={
+            'semantic_status':'QB_REPLACEMENT_SURPLUS_PILOT_CREATED__FV_SCORING_AND_SCALE_HOLD',
+            'production_change_authorized':False,'index_html_modified':False,'no_2026_week7_or_later_data_read':True,'holdout_2026_weeks8_12_sealed':True,
+            'frozen_QB_count':54,'week6_recency_eligible':sum(r['week6_recency_eligible'] for r in dataset),
+            'R50_actual_next_year_decisions':{k:{'selected':v['selected_on_inner_2020_2021'],'n':int(v['n_2023_2024_origin_holdout']),'gain_pct':num(v['improvement_pct']),'beat_ytd':v['beat_YTD']=='True'} for k,v in decisions.items()},
+            'effective_qb_demand':num(demand['effective_demand']),'coverage_ranks':demand['coverage_ranks'],'bootstrap_demand':demand['bootstrap_50pct_crossing'],
+            'documented_baseline':demand['documented_baseline'],'empirical_baseline':demand['empirical_baseline'],
+            'qb_rank_projection_sensitivity':rankproj,'replacement_warning_flags':warnings,
+            'ratio_surplus_h1_h3_is_already_unconditional':True,'no_second_survival_multiplier':True,
+            'future_h1_h3_QB24_only':True,'rank28_year0_only':True,'no_cross_scenario_year1_3_replacement_recenter':True,
+            'normalization_is_QB_only_not_market_or_absolute_FV':True,'calibration_is_not_production_ready':True,
+            'scoring_warning':'NFLVERSE standard historical ratios vs 2026 FP+Sleeper preseason points; exact LOG QB scoring reconciliation incomplete',
+            'frozen_P2_ref':BLOB_P2,'roster_source':roster_meta,'artifact_source_runs':{'R42':40021246762,'R47R1':40030717495,'R50R1':40035367958},
+            'artifact_semantic_source':{k:m['semantic_status'] for k,m in [('R42',m42),('R47R1',m47),('R50R1',m50)]},
+           }
+           report=['# CAL26 V1R51 — QB surplus and league-demand pricing pilot (read-only)',
+           f"**Status:** {summary['semantic_status']}. R50R1 actual results validated; all 54 players joined; no production prices changed.",
+           '', '## Evidence from R50R1 (2023–2024 origins predicting next season)',
+           '| Cohort | Next season outcome | Inner-selected signal | Test observations | Loss improvement vs YTD |',
+           '|---|---|---|---:|---:|']
+           for k,v in sorted(decisions.items()):report.append(f"| {k.split('__')[0]} | {k.split('__')[1]} | {v['selected_on_inner_2020_2021']} | {v['n_2023_2024_origin_holdout']} | {num(v['improvement_pct']):+.2f}% |")
+           report.extend(['','## Replacement demand — actual repo evidence',
+           f"Historical effective QB demand {num(demand['effective_demand']):.2f}; 80/90/95% coverage ranks {demand['coverage_ranks']}. Bootstrap 50% rosterability crossing median={demand['bootstrap_50pct_crossing']['median']}, P10={demand['bootstrap_50pct_crossing']['p10']}, P90={demand['bootstrap_50pct_crossing']['p90']}.",
+           'These are different concepts; demand is not a validated 2026 roster-availability replacement definition.',
+           '| Frozen 54-QB projected pool rank | 2026 projection |', '|---|---:|'] )
+           for k in [18,22,24,28,29,34]:report.append(f'| QB{k} | {rankproj[k]:.2f} |')
+           report.extend(['',f"**WARNING:** QB34/QB28 projected-points ratio = {ratio34:.1%}. Some unprojected QBs and rookies create a cliff; QB34 is *not* credible as an automatic replacement baseline.",
+           '', '## Four-year demonstrator — transparent, not a new price',
+           'Year 0 uses non-negative (preseason projected points / QB24 projected points − 1). Years 1–3 use R42 age/tier pooled *unconditional* expected ratio surplus above historical QB24, each discounted at 0/10/20%.',
+           'The historical horizon components already include opportunity and are **not multiplied by starting probability again**.',
+           'Sensitivity against QB22, QB28, QB34 applies to 2026 year 0 **only**. Do not claim those alternate ranks were calibrated for future seasons.',
+           'The illustrative 0–10,000 number is normalized solely to the top QB in this 54-player pool. It is **NOT** production FV, is not cross-position cardinal, and is deliberately NOT compared numerically to frozen FV.',
+           'R50 equal-all-three signal (where usable) is shown separately in historical-standard PPG units; it is NOT inserted into year-zero LOG-projection numbers because the scoring scale and calibration coefficients are unresolved.',
+           '', '## Top ten QB24-relative index examples',
+           '| Name | Frozen FV | Current-year QB24 surplus pts | Four-year relative index | Normalized illustrative QB index (NOT FV) |',
+           '|---|---:|---:|---:|---:|'])
+           for row in dataset[:10]: report.append(f"| {row['name']} | {row['frozen_FV_UNCHANGED']} | {row['year0_surplus_QB24_projected_points']:.2f} | {row['four_year_QB24_proxy_index_discount_10pct']:.4f} | {row['illustrative_QB_ONLY_10000_INDEX_NOT_FV']} |")
+           report.extend(['','## Required for a defensible calibrated FV release',
+           '1. Verify exact LOG scoring, including passing TD and negative plays, half-PPR, and 0.2 rushing-attempt bonus. Current FP+Sleeper 2026 projections may not use LOG scoring.',
+           '2. Estimate true league replacement under 12-team Superflex lineup usage and roster/waiver availability; effective QB demand ~27.65 is informative but not identical.',
+           '3. Reconcile 2026 season projections to a compatible historical prediction/output unit; avoid the standard-scoring + LOG-projection mixture.',
+           '4. Validate multi-season surplus transfer on chronological historical outcomes before promotion. R50 only predicts one season.',
+           '5. Choose one explicit cross-position cardinal FV scale convention; a relative QB-only 0–10,000 normalization is NOT that scale.',
+           '', '**Production: HOLD.** Do not replace the live FV field or the 15 owner overlays with this pilot.'])
+           out={ROOT+'_54_QB_surplus_evidence.csv':csv_str(dataset,list(dataset[0])),
+                ROOT+'_findings.md':'\n'.join(report)+'\n'}
+           summary['output_sha256']={n:sha(v.encode('utf-8')) for n,v in out.items()}
+           output.mkdir(parents=True,exist_ok=True)
+           for n,v in out.items():(output/n).write_text(v)
+           (output/(ROOT+'_manifest.json')).write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+           print(json.dumps({'status':summary['semantic_status'],'qbs':len(dataset),'top3':[x['name'] for x in dataset[:3]],'rank28_points':rankproj[28],'rank34_points':rankproj[34],'real_artifact_hashes_verified':True,'research_only':True}))
+           return summary
+          
+          def selftest():
+           check(sha(b'123')=='a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3','SHA_SELFTEST')
+           check(BLOB_ROSTER=='61c0b5079ee7efef644e94c3ddadf66d8a32e5a','PIN_DRIFT')
+           # If selftest fails before downloads, script cannot silently publish an unsafe shadow.
+           check(abs((1+.9*.2+.9**2*.1)-1.261)<1e-9,'DISCOUNT_ARITHMETIC')
+           print('R51_SELFTEST_GREEN')
+          
+          if __name__=='__main__':
+           p=argparse.ArgumentParser();p.add_argument('--data',type=pathlib.Path);p.add_argument('--repo',type=pathlib.Path,default=pathlib.Path('.'));p.add_argument('--out',type=pathlib.Path);p.add_argument('--fixture',action='store_true');p.add_argument('--selftest',action='store_true')
+           a=p.parse_args()
+           if a.selftest:selftest();sys.exit(0)
+           check(a.data is not None and a.out is not None,'DATA_AND_OUT_REQUIRED')
+           run(a.data,a.out,a.repo,a.fixture)
+          PY_CAL26_R51_ENGINE
+          python -m py_compile "$RUNNER_TEMP/cal26_v1r51_engine.py"
+          python "$RUNNER_TEMP/cal26_v1r51_engine.py" --selftest
+          python "$RUNNER_TEMP/cal26_v1r51_engine.py" --data "$RUNNER_TEMP/cal26_r51" --repo "$GITHUB_WORKSPACE" --out "$RUNNER_TEMP/cal26_r51_output"
+          python - "$RUNNER_TEMP/cal26_r51_output" <<'PY_R51_VALIDATE'
+          import hashlib,json,csv,pathlib,sys
+          p=pathlib.Path(sys.argv[1]);m=json.loads((p/'CAL26_V1R51_manifest.json').read_text())
+          assert m['semantic_status']=='QB_REPLACEMENT_SURPLUS_PILOT_CREATED__FV_SCORING_AND_SCALE_HOLD'
+          assert m['frozen_QB_count']==54 and m['week6_recency_eligible']==31
+          assert not m['production_change_authorized'] and not m['index_html_modified']
+          assert m['no_2026_week7_or_later_data_read'] and m['holdout_2026_weeks8_12_sealed']
+          assert m['roster_source']['mode']=='REPOSITORY_PINNED'
+          assert m['roster_source']['sha']=='61c0b5079ee7efef644e94c3ddadf66d8a32e5a'
+          assert m['roster_source']['frozen_P2_git_blob']=='ed5025134ca5992b460fa8b850033f82d7ea450f'
+          assert m['ratio_surplus_h1_h3_is_already_unconditional'] and m['no_second_survival_multiplier']
+          assert m['normalization_is_QB_only_not_market_or_absolute_FV']
+          for n,h in m['output_sha256'].items():
+              assert hashlib.sha256((p/n).read_bytes()).hexdigest()==h,n
+          with (p/'CAL26_V1R51_54_QB_surplus_evidence.csv').open() as f:
+              q=list(csv.DictReader(f))
+          assert len(q)==54 and len({r['name'] for r in q})==54
+          assert all(r['numerical_FV_reprice_authorized']=='False' for r in q)
+          assert all(r['frozen_FV_minus_illustrative_index_NOT_MEANINGFUL']=='NOT_COMPARABLE' for r in q)
+          print('R51_SOURCE_PIN_AND_QB_SURPLUS_PILOT_GREEN - RESEARCH ONLY')
+          PY_R51_VALIDATE
+          test -z "$(git status --porcelain)"
+          echo '## CAL26 V1R51 - R50R1 Next-Season Evidence + QB Surplus Pilot' >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/cal26_r51_output/CAL26_V1R51_findings.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload protected QB surplus research only
+        uses: actions/upload-artifact@v4
+        with:
+          name: CAL26_V1R51_QB_SURPLUS_REPLACEMENT_DEMAND_RESEARCH_ONLY
+          path: ${{ runner.temp }}/cal26_r51_output/CAL26_V1R51_*
+          if-no-files-found: error
+          retention-days: 30
