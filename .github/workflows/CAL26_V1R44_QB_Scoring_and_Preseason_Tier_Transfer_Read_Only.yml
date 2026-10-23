@@ -1,0 +1,428 @@
+name: CAL26 V1R44 - QB Scoring and Preseason Tier Transfer Audit (Read Only)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: cal26-v1r44-qb-scoring-domain-transfer-readonly
+  cancel-in-progress: false
+
+jobs:
+  reproduce-scoring-and-tier-transfer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout frozen reference (no persistent credentials)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Reclaim pinned R42 and R43 real research artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/cal26-r44-r42" "$RUNNER_TEMP/cal26-r44-r43"
+          gh run download 40021246762 --name CAL26_V1R42_HISTORICAL_QB_RESEARCH_ONLY --dir "$RUNNER_TEMP/cal26-r44-r42" --repo "$GITHUB_REPOSITORY"
+          gh run download 40023582418 --name CAL26_V1R43_HISTORICAL_QB_VALIDATION_ADJUDICATION_READ_ONLY --dir "$RUNNER_TEMP/cal26-r44-r43" --repo "$GITHUB_REPOSITORY"
+          test -s "$RUNNER_TEMP/cal26-r44-r42/CAL26_V1R42_manifest.json"
+          test -s "$RUNNER_TEMP/cal26-r44-r43/CAL26_V1R43_decision_manifest.json"
+
+      - name: Recompute NFLverse scoring scenarios and validate historical model parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/cal26_v1r44_engine.py" <<'PY_CAL26_V1R44_ENGINE'
+          #!/usr/bin/env python3
+          """CAL26 V1R44: historical QB scoring sensitivity and preseason-tier transfer QA.
+          Reads only pinned R42/R43 outputs, frozen 2026 preseason and 2013-2025 nflverse stats.
+          Does NOT calculate new FV prices or read 2026 realized outcomes.
+          """
+          from __future__ import annotations
+          import argparse, collections, csv, datetime as dt, hashlib, io, json, math, pathlib, statistics, subprocess, sys, time, urllib.request
+          
+          R42_ID=40021246762
+          R43_ID=40023582418
+          P2_FILE='research/production-v2/production_v2_phase2_preseason_baseline.json'
+          P2_GIT_SHA='ed5025134ca5992b460fa8b850033f82d7ea450f'
+          LIVE_GIT_SHA='5630bb681dd8710f8e45bc5363488f358ce9ebe2'
+          YEARS=range(2013,2026)
+          HORIZONS=(1,2,3)
+          FIELDS=('future_above_QB24','future_pass_150','future_surplus')
+          SCENARIOS={
+            'standard_4pt_pass_td':(0,0,0),
+            'standard_6pt_pass_td':(2,0,0),
+            '4pt_half_ppr_plus_0p2_carry':(0,.5,.2),
+            '6pt_half_ppr_plus_0p2_carry':(2,.5,.2),
+          }
+          TIER_NAMES=('below_090','near_090_110','above_110')
+          LABEL={'future_above_QB24':'Brier','future_pass_150':'Brier','future_surplus':'MSE'}
+          OUT_PREFIX='CAL26_V1R44'
+          
+          
+          def check(test,msg):
+            if not test: raise AssertionError(msg)
+          
+          def sha(b): return hashlib.sha256(b).hexdigest()
+          
+          def read_json(path):return json.loads(path.read_text(encoding='utf-8'))
+          
+          def check_output_hashes(directory,manifest):
+            for name, digest in manifest['output_sha256'].items():
+              p=directory/name
+              check(p.is_file(),f'PINNED_ARTIFACT_FILE_MISSING_{name}')
+              check(sha(p.read_bytes())==digest,f'PINNED_ARTIFACT_SHA256_MISMATCH_{name}')
+          
+          def load_inputs(r42,r43,repo):
+            a=read_json(r42/'CAL26_V1R42_manifest.json');b=read_json(r43/'CAL26_V1R43_decision_manifest.json')
+            check(a['semantic_status']=='HISTORICAL_EMPIRICAL_RESEARCH_ONLY_PRICE_CALIBRATION_HOLD','R42_SEMANTIC_DRIFT')
+            check(b['semantic_status']=='HISTORICAL_HOLDOUT_REVIEW_COMPLETE_FV_PRICE_CALIBRATION_HOLD','R43_SEMANTIC_DRIFT')
+            check(b['R42_workflow_run_id']==R42_ID,'R42_RUN_ID_DRIFT')
+            check(b['R42_research_artifact_id']==12529839028,'R42_ARTIFACT_ID_DRIFT')
+            check(b['n_validation_rows']==9 and b['n_historical_QB_seasons']==988,'R43_SAMPLE_DRIFT')
+            check(b['numeric_FV_prices_calibrated'] is False,'R43_PRICE_DRIFT')
+            check(a['source_historical_min_year']==2013 and a['source_historical_max_year']==2025,'R42_YEAR_DRIFT')
+            check(a['n_historical_QB_seasons']==988,'R42_SEASON_COUNT_DRIFT')
+            check(a['n_2026_frozen_forward_QBs']==54,'R42_QB_BOARD_DRIFT')
+            check(a['production_change_authorized'] is False and b['production_change_authorized'] is False,'SOURCE_PRODUCTION_GUARD')
+            check(a['used_2026_realized_outcomes'] is False and b['future_2026_holdout_read'] is False,'HOLDOUT_GUARD')
+            check_output_hashes(r42,a);check_output_hashes(r43,b)
+            m42={row['asset']:row for row in csv.DictReader((r42/'CAL26_V1R42_source_sha256.csv').open(newline=''))}
+            check(len(m42)==14,'SOURCE_COUNT_DRIFT')
+            for k,v in m42.items():check(a['source_sha256'].get(k)==v['sha256'],'SOURCE_DIGEST_MANIFEST_PARITY_'+k)
+            annual={int(r['season']):r for r in csv.DictReader((r42/'CAL26_V1R42_year_qb24_proxy.csv').open(newline=''))}
+            check(set(annual)==set(YEARS),'R42_ANNUAL_YEARS_DRIFT')
+            tested={(int(r['horizon']),r['outcome']):r for r in csv.DictReader((r43/'CAL26_V1R43_validation_comparisons.csv').open(newline=''))}
+            check(len(tested)==9,'R43_VALIDATION_COUNT_DRIFT')
+            # Frozen P2 snapshot must be identical to the pre-2026 source; index.html is read only.
+            result=subprocess.check_output(['git','hash-object','--',P2_FILE],cwd=repo,text=True).strip()
+            check(result==P2_GIT_SHA,'P2_GIT_BLOB_DRIFT')
+            live=subprocess.check_output(['git','hash-object','--','index.html'],cwd=repo,text=True).strip()
+            check(live==LIVE_GIT_SHA,'LIVE_INDEX_SHA_DRIFT')
+            p2=read_json(repo/P2_FILE)
+            check(p2['status']=='FROZEN_PRESEASON_BASELINE_RESEARCH_ONLY' and p2['production_mutation_authorized'] is False,'P2_STATUS_OR_AUTH_DRIFT')
+            return a,b,m42,annual,tested,p2,live
+          
+          
+          def fetch_csv(cache,source):
+            dest=cache/source['asset']
+            if dest.is_file():blob=dest.read_bytes()
+            else:
+              err=None
+              for t in range(3):
+                try:
+                  req=urllib.request.Request(source['url'],headers={'User-Agent':'CAL26-V1R44-Research-Only/1.0'})
+                  with urllib.request.urlopen(req,timeout=40) as resp:
+                    check(resp.status==200,'SOURCE_HTTP_STATUS')
+                    blob=resp.read(40_000_001)
+                  check(300<len(blob)<40_000_000,'SOURCE_LENGTH_INVALID')
+                  dest.parent.mkdir(parents=True,exist_ok=True);dest.write_bytes(blob)
+                  break
+                except Exception as exc:
+                  err=exc
+                  if t<2:time.sleep(2*(t+1))
+              else: raise RuntimeError(f'SOURCE_DOWNLOAD_FAILED_{source["asset"]}: {err}')
+            check(sha(blob)==source['sha256'],'PINNED_HISTORICAL_SOURCE_SHA_DRIFT_'+source['asset'])
+            return blob
+          
+          
+          def rows_csv(blob):
+            rdr=csv.DictReader(io.StringIO(blob.decode('utf-8-sig')))
+            check(rdr.fieldnames is not None,'MISSING_CSV_HEADERS')
+            return rdr
+          
+          def real_num(s,label):
+            try: v=float(s if s not in ('',None) else 0)
+            except (ValueError,TypeError):raise AssertionError('INVALID_NUM_'+label)
+            check(math.isfinite(v),'NONFINITE_'+label)
+            return v
+          
+          def band(r):
+            if r<.9:return 'below_090'
+            if r<1.1:return 'near_090_110'
+            return 'above_110'
+          
+          
+          def load_years(blobs,annual_reference):
+            play=rows_csv(blobs['players.csv'])
+            check({'gsis_id','birth_date'}.issubset(play.fieldnames),'PLAYERS_FIELDS_MISSING')
+            birth={}
+            for r in play:
+              pid=(r.get('gsis_id') or '').strip();d=(r.get('birth_date') or '').strip()
+              if not pid or not d:continue
+              try: date=dt.date.fromisoformat(d[:10])
+              except ValueError: continue
+              if pid in birth:check(birth[pid]==date,'DUPLICATE_BIRTH_DATE_CONFLICT')
+              else: birth[pid]=date
+            hist={};annual=[]
+            for year in YEARS:
+              reader=rows_csv(blobs[f'stats_player_reg_{year}.csv'])
+              require={'player_id','position','season','attempts','fantasy_points','passing_tds','carries','receptions'}
+              check(require.issubset(reader.fieldnames),f'HISTORICAL_FIELDS_MISSING_{year}_{sorted(require-set(reader.fieldnames))}')
+              current={};row_count=0
+              for r in reader:
+                if (r.get('position') or '').strip()!='QB':continue
+                pid=(r.get('player_id') or '').strip()
+                if not pid or pid not in birth:continue
+                d=birth[pid];ref=dt.date(year,9,1)
+                age=year-d.year-((ref.month,ref.day)<(d.month,d.day))
+                if not 19<=age<=46:continue
+                check(int(r['season'])==year,'SEASON_MISMATCH')
+                attempts=real_num(r.get('attempts'),'attempts');fp=real_num(r.get('fantasy_points'),'fantasy_points')
+                td=real_num(r.get('passing_tds'),'passing_tds');car=real_num(r.get('carries'),'carries');catch=real_num(r.get('receptions'),'receptions')
+                check(attempts>=0 and td>=0 and car>=0 and catch>=0 and fp>-100,'INVALID_HISTORICAL_QB_INPUT')
+                row_count+=1
+                if pid not in current:current[pid]={'age':age,'att':0.0,'fp':0.0,'pass_td':0.0,'carries':0.0,'receptions':0.0}
+                v=current[pid];check(v['age']==age,'AGE_CONFLICT');v['att']+=attempts;v['fp']+=fp;v['pass_td']+=td;v['carries']+=car;v['receptions']+=catch
+              ref=annual_reference[year]
+              check(len(current)==int(ref['qb_n']),f'R42_QB_UNIVERSE_PARITY_YEAR_{year}')
+              check(row_count==int(ref['raw_qb_rows']),f'R42_QB_ROW_PARITY_YEAR_{year}')
+              check(len([1 for x in current.values() if x['fp']>0])==int(ref['qb_ranking_pool_n']),f'R42_POSITIVE_QBS_PARITY_YEAR_{year}')
+              hist[year]=current
+            return hist
+          
+          
+          def reprice_hist(hist,ref):
+            matrices={s:{} for s in SCENARIOS};annual=[]
+            for season in YEARS:
+              old=hist[season]
+              for name,(pass_delta,ppr,carry) in SCENARIOS.items():
+                points={k:row['fp']+pass_delta*row['pass_td']+ppr*row['receptions']+carry*row['carries'] for k,row in old.items()}
+                ranking=sorted((x for x in points.values() if x>0),reverse=True)
+                check(len(ranking)>=30,'INSUFFICIENT_POSITIVE_QB')
+                qb24=ranking[23]
+                if name=='standard_4pt_pass_td':
+                  check(abs(qb24-float(ref[season]['qb24_points']))<=1e-6, f'R42_QB24_PARITY_YEAR_{season}')
+                matrix={k:{**row,'pts':points[k], 'ratio':max(0,points[k]/qb24), 'tier':band(max(0,points[k]/qb24))} for k,row in old.items()}
+                matrices[name][season]=matrix
+                annual.append({'season':season,'scenario':name,'QB24_points':round(qb24,4),'qb_n':len(old),'scoring_status':'sensitivity_scenario_not_verified_LOG_scoring'})
+            return matrices,annual
+          
+          
+          def build_examples(historical,hh):
+            ex=[]
+            for season in YEARS:
+              target=season+hh
+              if target not in historical: continue
+              for pid,p in historical[season].items():
+                if p['att']<150:continue
+                after=historical[target].get(pid)
+                next_rat=min(3,after['ratio']) if after is not None else 0
+                ex.append({'anchor_year':season,'target_year':target,'tier':p['tier'],'above':int(next_rat>=1), 'pass':int(after is not None and after['att']>=150), 'surplus':max(0,next_rat-1)})
+            return ex
+          
+          def model_global_tier_loss(ex, metric):
+            train=[r for r in ex if r['target_year']<=2022]
+            test=[r for r in ex if r['anchor_year']>=2022 and r['target_year']<=2025]
+            check(len(train)>=80,'INSUFFICIENT_TRAIN')
+            check(len(test)>=12,'INSUFFICIENT_TEST')
+            label={'future_above_QB24':'above','future_pass_150':'pass','future_surplus':'surplus'}[metric]
+            av=sum(x[label] for x in train)/len(train)
+            groups={t:[x for x in train if x['tier']==t] for t in TIER_NAMES}
+            estimate={t:(sum(x[label] for x in group)+12*av)/(len(group)+12) for t,group in groups.items()}
+            tloss=sum((estimate[x['tier']]-x[label])**2 for x in test)/len(test)
+            gloss=sum((av-x[label])**2 for x in test)/len(test)
+            return {'n_train':len(train),'n_test':len(test),'tier_loss':tloss,'global_loss':gloss,'relative_tier_gain_pct':100*(gloss-tloss)/gloss}
+          
+          def migration(hist_scenarios):
+            std=hist_scenarios['standard_4pt_pass_td'];out=[]
+            for other in SCENARIOS:
+              n=0;n_move=0;n_up=0;n_down=0;ratios=[]
+              for season in YEARS:
+                for pid,r in std[season].items():
+                  if r['att']<150:continue
+                  f=hist_scenarios[other][season][pid]
+                  n+=1
+                  ratios.append(abs(r['ratio']-f['ratio']))
+                  if r['tier']!=f['tier']:
+                    n_move+=1
+                    if TIER_NAMES.index(f['tier'])>TIER_NAMES.index(r['tier']):n_up+=1
+                    else:n_down+=1
+              out.append({'scenario':other,'eligible_player_seasons':n,'tier_changed_n':n_move,'tier_changed_pct':round(100*n_move/n,2),'moved_up':n_up,'moved_down':n_down,'median_abs_ratio_delta':round(statistics.median(ratios),5)})
+            return out
+          
+          def domain_shift(p2):
+            q=p2['frozen_players'];pool={n:p for n,p in q.items() if p.get('pos')=='QB'}
+            check(len(pool)==64,'P2_QB_BOARD_DRIFT')
+            hist=sorted([(n,p['history_component_2025']) for n,p in pool.items() if p.get('history_note')=='real' and isinstance(p.get('history_component_2025'),(int,float)) and p['history_component_2025']>0],key=lambda x:-x[1])
+            proj=sorted([(n,p['canonical_forward_2026_points']) for n,p in pool.items() if isinstance(p.get('canonical_forward_2026_points'),(int,float)) and p['canonical_forward_2026_points']>0],key=lambda x:-x[1])
+            check(len(hist)==49 and len(proj)==54,'2025_HISTORY_OR_2026_FORECAST_COUNT_DRIFT')
+            h24=hist[23][1];p24=proj[23][1];check(abs(p24-270.855)<.001,'QB24_2026_DRIFT')
+            cohort=[]
+            for n,p in sorted(pool.items()):
+              if not(p.get('history_note')=='real' and isinstance(p.get('history_component_2025'),(int,float)) and isinstance(p.get('fantasypros_2026_points'),(int,float)) and isinstance(p.get('sleeper_2026_points'),(int,float))): continue
+              hr=p['history_component_2025']/h24;pr=p['canonical_forward_2026_points']/p24
+              cohort.append({'name':n,'age':p['age'],'history_component_2025':round(p['history_component_2025'],4),'preseason_forward_2026':round(p['canonical_forward_2026_points'],4),'history_relative_to_QB24':round(hr,5),'preseason_relative_to_QB24':round(pr,5),'history_tier':band(hr),'preseason_tier':band(pr),'tier_changed':int(band(hr)!=band(pr))})
+            check(len(cohort)==31,'DOMAIN_SHIFT_COHORT_DRIFT')
+            return cohort,{'n':len(cohort),'2025_real_history_component_qb24':h24,'2026_preseason_qb24':p24,'tier_changes':sum(r['tier_changed'] for r in cohort),'tier_change_pct':round(100*sum(r['tier_changed'] for r in cohort)/len(cohort),2),'interpretation':'2025 shrunk/durability-adjusted history component vs 2026 preseason projection; NOT true historical preseason forecast backtest'}
+          
+          def csvout(rows,keys):
+            b=io.StringIO(newline='');w=csv.DictWriter(b,fieldnames=keys,extrasaction='ignore',lineterminator='\n');w.writeheader();w.writerows(rows);return b.getvalue()
+          
+          def analyze(r42,r43,repo,cache,out,download=True):
+            m42,m43,sources,r42years,r43eval,p2,live=load_inputs(r42,r43,repo)
+            raw={name:fetch_csv(cache,item) for name,item in sorted(sources.items())}
+            original=load_years(raw,r42years)
+            scen,annual=reprice_hist(original,r42years)
+            migration_rows=migration(scen)
+            tests=[]
+            for name,rows in scen.items():
+              for h in HORIZONS:
+                examples=build_examples(rows,h)
+                for target in FIELDS:
+                  r=model_global_tier_loss(examples,target)
+                  if name=='standard_4pt_pass_td':
+                    old=r43eval[(h,target)]
+                    check(r['n_test']==int(old['n_test']),f'R43_TEST_N_PARITY_H{h}_{target}')
+                    check(abs(r['tier_loss']-float(old['tier_loss']))<2e-6,f'R43_TIER_LOSS_PARITY_H{h}_{target}')
+                    check(abs(r['global_loss']-float(old['global_loss']))<2e-6,f'R43_GLOBAL_LOSS_PARITY_H{h}_{target}')
+                  tests.append({'scenario':name,'horizon':h,'outcome':target, 'n_test':r['n_test'], 'tier_loss':round(r['tier_loss'],6), 'global_loss':round(r['global_loss'],6),'tier_better_than_global':r['tier_loss']<r['global_loss'], 'tier_gain_pct':round(r['relative_tier_gain_pct'],2)})
+            cohort,domain=domain_shift(p2)
+            check(len(annual)==52 and len(tests)==36 and len(migration_rows)==4,'OUTPUT_COHORT_INVARIANT')
+            n_wins=collections.Counter()
+            for row in tests:
+              if row['tier_better_than_global']:n_wins[row['scenario']]+=1
+            status='SCORING_SENSITIVITY_RESEARCH_ONLY_TRANSFER_AND_FV_PRICE_HOLD'
+            summary={
+              'workflow':'CAL26 V1R44 - QB Historical Scoring and Preseason Tier Transfer Audit (Read Only)',
+              'semantic_status':status,'source_run_ids':{'R42':R42_ID,'R43':R43_ID},'historical_seasons':[2013,2025],
+              'R42_historical_qb_seasons':988,'R43_holdout_validation_horizons':[1,2,3], 'R42_H4_out_of_sample_validation':False,
+              'scoring_source':'nflverse fantasy_points 4pt passing TD standard; scenario variants +2/pass TD, +0.5/reception, +0.2/carry',
+              'LOG_half_ppr_and_carry_bonus_documented_in_index':True,'LOG_complete_QB_scoring_config_verified':False,
+              'hypothetical_scoring_not_exact_league_scoring':True,
+              'R42_4pt_qb24_reproduction_pass':True,'R43_tier_only_test_loss_reproduction_pass':True,
+              'scenario_tier_wins_vs_unconditional':dict(n_wins),
+              'tier_transfer_sample':domain,'2025_history_component_vs_2026_preseason_is_not_historical_preseason_backtest':True,
+              'independent_dated_historical_preseason_projection_series_verified':False,
+              'R42_only_anchor_QBs_with_150_pass_attempts':True,
+              'production_change_authorized':False,'numeric_FV_price_authorized':False,'index_html_modified':False,
+              'owner_QB_price_targets_used_as_fit_labels':False,'DLF_or_MV_used_as_FV_fit_targets':False,
+              '2026_realized_weeks_read':False,'2026_weeks_8_to_12_holdout_read':False,'2026_weeks_13_to_18_holdout_read':False,
+              'frozen_P2_git_blob_sha':P2_GIT_SHA,'read_only_index_sha':live,'pinned_R42_source_sha256':m42['source_sha256'],
+              'outputs_sha256':{}
+            }
+            report=['# CAL26 V1R44 — Historical QB scoring / preseason transfer audit','',
+                    '**Status: RESEARCH ONLY — numerical dynasty FV pricing HOLD.**',
+                    f'Pinned real source artifacts: R42 run {R42_ID}, R43 run {R43_ID}; all source-output SHA256 values verified. 2013–2025 nflverse stats fetched and each asset SHA256 matched the original R42 source manifest.',
+                    'R42 standard 4-point passing-TD historical QB24 levels and all nine R43 tier-only holdout losses reproduced before any scoring variants were evaluated. No synthetic evaluation scores are reported.',
+                    '', '## Historical scoring scenarios',
+                    'The reference nflverse `fantasy_points` score is a *standard 4-point passing-TD* baseline; the variants add 2 passing-TD points and/or 0.5 per catch plus 0.2 per rushing attempt. They are **sensitivity scenarios**, NOT independently proven to equal this league\'s full QB scoring rules.',
+                    '| Scenario | Tier changes among >=150-pass QB-seasons | Median relative QB24 ratio difference | Tier beats global in holdout tests |',
+                    '|---|---:|---:|---:|']
+            for t in migration_rows:
+              report.append(f"| {t['scenario']} | {t['tier_changed_n']}/{t['eligible_player_seasons']} ({t['tier_changed_pct']:.2f}%) | {t['median_abs_ratio_delta']:.4f} | {n_wins[t['scenario']]}/9 |")
+            report+=['','## Dated historical validation scores (tier-only versus unconditional)','| Scenario | Horizon | Outcome | n | Tier error | Global error | Tier gain |','|---|---:|---|---:|---:|---:|---:|']
+            for row in tests: report.append(f"| {row['scenario']} | {row['horizon']} | {row['outcome']} | {row['n_test']} | {row['tier_loss']:.4f} | {row['global_loss']:.4f} | {row['tier_gain_pct']:+.2f}% |")
+            report+=['','## Historical input versus 2026 preseason covariate transport',
+              f"2025 shrunk/durability-adjusted real-history component QB24 (within eligible historic-history board) = {domain['2025_real_history_component_qb24']:.3f}; 2026 frozen preseason projection QB24 = {domain['2026_preseason_qb24']:.3f}.",
+              f"On the **same 31 dual-source, real-history QBs**, {domain['tier_changes']}/{domain['n']} ({domain['tier_change_pct']:.1f}%) changed relative production tier between the 2025 history component and 2026 projected scoring.",
+              'This comparison is **NOT** a dated historical preseason-projection backtest: history was shrinkage/durability-adjusted and vintages differ. Tier transfer has not been validated for the full future 2026 QB board, including players lacking 2025 data.',
+              '', '## Unresolved limitations',
+              '1. The live calculator documents half-PPR and 0.2 point per rushing attempt, but complete QB scoring coefficients were not independently verified. Do not promote any simulated scenario as exact league scoring.',
+              '2. Historical forecasts condition on actual completed-season tier and >=150 pass attempts. The 2026 QB cohort is selected by availability of preseason forecasts; selection/covariate shifts remain.',
+              '3. Full independent, dated historical **preseason** QB projection vintages are not in the pinned R42/R43 archives. No model predicting from preseason projections has been independently validated here.',
+              '4. H4 remains unvalidated; H1–H3 historical tests use overlapping players/years and no paired row-level confidence intervals. These limitations cannot be solved by green workflow assertions.',
+              '5. Neither market benchmarks nor owner target prices provide independent FV truth; the conversion from multi-year QB surplus to numeric cross-position dynasty FV is still uncalibrated.',
+              '', '**R45 recommendation:** Only after exact scoring rules and appropriately dated projection inputs are available, quantify prospective forecast-to-future production calibration and propose a numeric FV bridge. If absent, stop treating the R42/R43 historical rate as production-ready and use a bounded shadow scenario only.',
+              '', '**Safety:** Does not read any 2026 realized outcome weeks, does not write repository files, and does not modify `index.html` or production FV.']
+            out.mkdir(parents=True,exist_ok=True)
+            files={
+              OUT_PREFIX+'_scoring_annual.csv':csvout(annual,list(annual[0])),
+              OUT_PREFIX+'_tier_migration_summary.csv':csvout(migration_rows,list(migration_rows[0])),
+              OUT_PREFIX+'_historical_validation_scoring_scenarios.csv':csvout(tests,list(tests[0])),
+              OUT_PREFIX+'_2025_history_2026_preseason_tier_diagnostic.csv':csvout(cohort,list(cohort[0])),
+              OUT_PREFIX+'_findings.md':'\n'.join(report)+'\n'
+            }
+            for name, content in files.items():
+              (out/name).write_text(content,encoding='utf8')
+              summary['outputs_sha256'][name]=sha(content.encode())
+            (out/(OUT_PREFIX+'_manifest.json')).write_text(json.dumps(summary,sort_keys=True,indent=2)+'\n',encoding='utf8')
+            print(json.dumps({'status':status,'h1_h3_validation_rows':len(tests),'reproduced_R43_rows':9,'tier_transfer_changes':domain['tier_changes'],'n':domain['n'],'scenarios':dict(n_wins)},sort_keys=True))
+            return summary
+          
+          def selftest():
+            check(band(.89999)=='below_090' and band(.9)=='near_090_110' and band(1.1)=='above_110','TIER_BOUNDARY')
+            a={2013:{'a':{'att':160,'ratio':1.2,'tier':'above_110'},'b':{'att':152,'ratio':.8,'tier':'below_090'}},2014:{'a':{'att':160,'ratio':1.1,'tier':'above_110'}}}
+            ex=build_examples(a,1)
+            check(len(ex)==2 and ex[0]['above']==1 and ex[1]['above']==0,'MISSING_TARGET_ZERO')
+            check(abs((10+2*3+0.5*4+0.2*5)-19)<1e-10,'SCENARIO_ARITH')
+            # H1-H3 training labels use outcomes ending <=2022; validation starts at >=2022.
+            examples=[{'anchor_year':2019,'target_year':2022,'tier':'above_110','above':1}]
+            check(all(x['target_year']<=2022 for x in examples),'TEMPORAL_CUTOFF')
+            print('CAL26_V1R44_SELFTEST_GREEN tier boundary, future missing zero, scenario scoring, temporal semantics')
+          
+          def main():
+            ap=argparse.ArgumentParser()
+            ap.add_argument('--selftest',action='store_true')
+            ap.add_argument('--repo',type=pathlib.Path,default=pathlib.Path('.'))
+            ap.add_argument('--r42',type=pathlib.Path,default=pathlib.Path('r42'))
+            ap.add_argument('--r43',type=pathlib.Path,default=pathlib.Path('r43'))
+            ap.add_argument('--cache',type=pathlib.Path,default=pathlib.Path('historical-cache'))
+            ap.add_argument('--out',type=pathlib.Path,default=pathlib.Path('out'))
+            a=ap.parse_args()
+            if a.selftest:selftest();return
+            analyze(a.r42,a.r43,a.repo,a.cache,a.out)
+          if __name__=='__main__':main()
+          PY_CAL26_V1R44_ENGINE
+          python -m py_compile "$RUNNER_TEMP/cal26_v1r44_engine.py"
+          python "$RUNNER_TEMP/cal26_v1r44_engine.py" --selftest
+          python "$RUNNER_TEMP/cal26_v1r44_engine.py" \
+            --repo "$GITHUB_WORKSPACE" \
+            --r42 "$RUNNER_TEMP/cal26-r44-r42" \
+            --r43 "$RUNNER_TEMP/cal26-r44-r43" \
+            --cache "$RUNNER_TEMP/cal26-r44-historical-source" \
+            --out "$RUNNER_TEMP/cal26-r44-output"
+          python - "$RUNNER_TEMP/cal26-r44-output" <<'PY_CAL26_V1R44_ASSERT'
+          import csv,hashlib,json,pathlib,sys
+          root=pathlib.Path(sys.argv[1]);m=json.loads((root/'CAL26_V1R44_manifest.json').read_text())
+          assert m['semantic_status']=='SCORING_SENSITIVITY_RESEARCH_ONLY_TRANSFER_AND_FV_PRICE_HOLD'
+          assert m['source_run_ids']=={'R42':40021246762,'R43':40023582418}
+          assert m['R42_historical_qb_seasons']==988
+          assert m['R42_4pt_qb24_reproduction_pass'] is True
+          assert m['R43_tier_only_test_loss_reproduction_pass'] is True
+          assert m['historical_seasons']==[2013,2025]
+          assert m['R43_holdout_validation_horizons']==[1,2,3]
+          assert m['R42_H4_out_of_sample_validation'] is False
+          assert m['LOG_complete_QB_scoring_config_verified'] is False
+          assert m['independent_dated_historical_preseason_projection_series_verified'] is False
+          assert m['numeric_FV_price_authorized'] is False and m['production_change_authorized'] is False
+          assert m['index_html_modified'] is False
+          assert m['2026_realized_weeks_read'] is False
+          assert m['2026_weeks_8_to_12_holdout_read'] is False
+          assert m['2026_weeks_13_to_18_holdout_read'] is False
+          assert m['owner_QB_price_targets_used_as_fit_labels'] is False
+          assert m['DLF_or_MV_used_as_FV_fit_targets'] is False
+          assert m['tier_transfer_sample']['n']==31
+          assert len(m['outputs_sha256'])==5
+          for file,digest in m['outputs_sha256'].items():
+              f=root/file; assert f.exists() and f.stat().st_size>50
+              assert hashlib.sha256(f.read_bytes()).hexdigest()==digest
+          with (root/'CAL26_V1R44_historical_validation_scoring_scenarios.csv').open() as f:
+              assert len(list(csv.DictReader(f)))==36
+          with (root/'CAL26_V1R44_scoring_annual.csv').open() as f:
+              assert len(list(csv.DictReader(f)))==52
+          with (root/'CAL26_V1R44_2025_history_2026_preseason_tier_diagnostic.csv').open() as f:
+              assert len(list(csv.DictReader(f)))==31
+          print('GREEN: REAL R42 4pt QB24 and R43 nine tier holdout losses reproduced, 4 scoring scenarios, 31 QB cross-vintage diagnostics; no pricing authorization')
+          PY_CAL26_V1R44_ASSERT
+          test -z "$(git status --porcelain)"
+          echo '## CAL26 V1R44 — historical QB scoring / preseason tier shift (read-only)' >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/cal26-r44-output/CAL26_V1R44_findings.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload research summaries only (no historical source rows or production files)
+        uses: actions/upload-artifact@v4
+        with:
+          name: CAL26_V1R44_QB_SCORING_TIER_TRANSFER_RESEARCH_ONLY
+          path: ${{ runner.temp }}/cal26-r44-output/
+          if-no-files-found: error
+          retention-days: 90
