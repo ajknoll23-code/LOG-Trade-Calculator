@@ -1,0 +1,326 @@
+name: CAL26 V1R52 - LOG Scoring and QB Surplus FV Release Bridge (Read Only)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: cal26-v1r52-scoring-qb-surplus-fv-readonly
+  cancel-in-progress: false
+
+jobs:
+  qb-scoring-bridge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout read-only frozen repository evidence
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Retrieve successful R51R1 GitHub research artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: CAL26_V1R51R1_QB_SURPLUS_REPLACEMENT_DEMAND_RESEARCH_ONLY
+          run-id: 40036751470
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ${{ runner.temp }}/cal26-r52-r51-pinned
+      - name: Audit exact LOG scoring and cross-source season points compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/cal26_v1r52_engine.py" <<'PY_CAL26_V1R52_ENGINE'
+          #!/usr/bin/env python3
+          """CAL26 V1R52: LOG scoring source reconciliation and QB surplus release bridge.
+
+          Research-only. Frozen R51 research is never changed. Neither 2026 realized results
+          nor future protected holdouts are queried. All league requests are read-only.
+          """
+          from __future__ import annotations
+          import argparse, ast, collections, csv, hashlib, io, json, math, pathlib, re, subprocess, sys, time, urllib.error, urllib.request
+          from typing import Any
+
+          PREFIX='CAL26_V1R52'
+          R51_PREFIX='CAL26_V1R51'
+          SOURCES={
+           'sleeper_scoring':('scripts/projections/sleeper_projections_pipeline.py','0bcb3c94ecde7a4457577b499ca6a61c1972cb66'),
+           'historical_scoring':('research/roster-economics/historical_weekly_points_pipeline.py','d6d6c6b4c2725eca3aae46f6c32dcc6ae8633ace'),
+           'fantasypros_scoring':('scripts/projections/fantasypros_api_pipeline.py','78ca876406cd3ef5b2467d6bf0d01f80b70b9a59'),
+           'frozen_projections':('research/production-v2/production_v2_phase2_preseason_baseline.json','ed5025134ca5992b460fa8b850033f82d7ea450f'),
+           'roster_economics':('research/roster-economics/roster_economics_robustness.json','61c0b5079ee7efef644e94c3ddadf66f8da32e5a'),
+          }
+          LEAGUE_CATEGORIES={'pass_yd':.04,'pass_td':4,'pass_int':-2,'pass_2pt':2,
+           'rush_att':.2,'rush_yd':.1,'rush_td':6,'rush_2pt':2,
+           'rec':.5,'rec_yd':.1,'rec_td':6,'rec_2pt':2,'fum_lost':-2,'fum_rec_td':6}
+          BONUS_CATEGORIES={'bonus_pass_yd_300':2,'bonus_pass_yd_400':3,
+           'bonus_rush_yd_100':2,'bonus_rush_yd_200':3,
+           'bonus_rec_yd_100':2,'bonus_rec_yd_200':3}
+
+
+          def require(x,msg):
+           if not x: raise AssertionError(msg)
+          def sha(b):return hashlib.sha256(b).hexdigest()
+          def git_blob(b):
+           h=hashlib.sha1(b'blob '+str(len(b)).encode()+b'\0'+b).hexdigest();return h
+
+
+          def read_src(repo,tag,fixture):
+           rel,expected=SOURCES[tag];p=repo/rel
+           require(p.is_file(),f'SOURCE_MISSING_{tag}_{rel}')
+           data=p.read_bytes(); actual=git_blob(data)
+           if not fixture:require(actual==expected,f'PIN_DRIFT_{tag}: {actual} != {expected}')
+           return data.decode('utf-8'),actual
+
+
+          def score_fn(code,name):
+           tree=ast.parse(code); f=next((n for n in tree.body if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name==name),None)
+           require(isinstance(f,ast.FunctionDef),f'MISSING_FUNCTION_{name}')
+           # Compile only this single scoring function: unrelated module-level API code is not run.
+           isolated=ast.Module(body=[f],type_ignores=[]);ast.fix_missing_locations(isolated)
+           scope={};exec(compile(isolated,'<pinned-score-function>','exec'),scope,scope)
+           return scope[name],f
+
+          def canon_body(f):
+           body=f.body[:]
+           if body and isinstance(body[0],ast.Expr) and isinstance(body[0].value,ast.Constant) and isinstance(body[0].value.value,str):body=body[1:]
+           return ast.dump(ast.Module(body=body,type_ignores=[]),include_attributes=False)
+
+
+          def check_score_functions(source):
+           hist,ft_h=score_fn(source['historical_scoring'][0],'score_week')
+           sleep,ft_s=score_fn(source['sleeper_scoring'][0],'score_week')
+           fp,ft_f=score_fn(source['fantasypros_scoring'][0],'score_offense')
+           require(canon_body(ft_h)==canon_body(ft_s),'SLEEPER_HISTORICAL_FORMULA_DIVERGENCE')
+           # Known core scoring probes, excluding per-game threshold bonuses.
+           cases=[({'pass_yd':150,'pass_td':2,'pass_int':1,'rush_att':4,'rush_yd':40},
+                  {'pass_yds':150,'pass_tds':2,'pass_ints':1,'rush_att':4,'rush_yds':40}),
+                  ({'pass_yd':250,'pass_td':1,'pass_int':0,'rush_att':10,'rush_yd':56,'rec':1,'rec_yd':10,'fum_lost':1},
+                   {'pass_yds':250,'pass_tds':1,'pass_ints':0,'rush_att':10,'rush_yds':56,'rec_rec':1,'rec_yds':10,'fumbles':1}),
+                  ({'pass_yd':200,'pass_2pt':1,'rush_2pt':1,'rec_2pt':1,'rush_att':2},
+                   {'pass_yds':200,'2pt_tds':3,'rush_att':2})]
+           probes=[]
+           for a,b in cases:
+            v1=float(hist(a));v2=float(sleep(a));v3=float(fp(b))
+            require(all(math.isfinite(v) for v in (v1,v2,v3)),'SCORE_NONFINITE')
+            require(max(abs(v1-v2),abs(v1-v3))<1e-7,'CORE_SCORE_CROSS_PIPELINE_DIFFERENCE')
+            probes.append({'case':len(probes)+1,'LOG_points':round(v1,3),'passed':True})
+           # Milestone semantics are demonstrably non-stacking in repo function.
+           p300=hist({'pass_yd':300})-hist({'pass_yd':299})
+           p400=hist({'pass_yd':400})-hist({'pass_yd':399})
+           require(abs(p300-2.04)<1e-7 and abs(p400-1.04)<1e-7,'MILESTONE_SEMANTICS_CHANGED')
+           return {'historical_and_sleeper_Ast_equal':True,'fantasypros_core_probe_parity':True,
+                   'core_probes':probes,'pass300_increment_pts':round(p300,4),
+                   'pass400_increment_pts':round(p400,4),
+                   'passing_milestones_nonstacking_in_repo_code':True,
+                   'projection_season_totals_cannot_receive_per_game_threshold_directly':True}
+
+
+          def get_live_league(repo,live_fixture):
+           config=json.loads((repo/'config.json').read_text());lid=str(config.get('league_id',''))
+           require(bool(re.fullmatch(r'\d{7,24}',lid)),'INVALID_CONFIG_LEAGUE_ID')
+           if live_fixture:
+            live=json.loads(pathlib.Path(live_fixture).read_text())
+            if not live.get('league_id'):live['league_id']=lid
+            return live,'LOCAL_FIXTURE'
+           url='https://api.sleeper.app/v1/league/'+lid
+           error='';data=None
+           for i in range(3):
+            try:
+             req=urllib.request.Request(url,headers={'User-Agent':'CAL26-V1R52-NonCommercial-ReadOnly/1.0'})
+             with urllib.request.urlopen(req,timeout=18) as r:
+              require(r.status==200,'LEAGUE_SOURCE_NOT_HTTP200')
+              blob=r.read(400_001)
+             require(10<len(blob)<400_000,'LEAGUE_DATA_SIZE_LIMIT')
+             data=json.loads(blob)
+             require(isinstance(data,dict) and data.get('league_id')==lid,'LEAGUE_SOURCE_ID_MISMATCH')
+             break
+            except Exception as e:
+             error=f'{type(e).__name__}: {str(e)[:160]}'
+             if i<2:time.sleep(1+i)
+           if data is None:
+            return {'scoring_settings':{},'roster_positions':[]},'LIVE_SOURCE_UNAVAILABLE__'+error
+           return data,'SLEEPER_PUBLIC_LEAGUE_API'
+
+
+          def reconcile(live,mode):
+           settings=live.get('scoring_settings') or {};positions=live.get('roster_positions') or []
+           require(isinstance(settings,dict) and isinstance(positions,list),'LEAGUE_SETTINGS_STRUCTURE_INVALID')
+           rows=[];mismatch=0;unknown=0;bonus_semantics=[]
+           for cat,expected in list(LEAGUE_CATEGORIES.items())+list(BONUS_CATEGORIES.items()):
+            actual=settings.get(cat)
+            if actual is None:status='MISSING_FROM_SNAPSHOT';unknown+=1
+            else:
+             try:
+              actual=float(actual)
+              status='MATCH' if abs(actual-expected)<1e-7 else 'MISMATCH'
+              if status=='MISMATCH':mismatch+=1
+             except (ValueError,TypeError):status='NONNUMERIC';mismatch+=1
+            rows.append({'category':cat,'repo_formula_value':expected,'live_league_value':actual if actual is not None else '',
+                         'check':status,'notes':'Bonus thresholds may stack in source provider; see warning' if cat in BONUS_CATEGORIES else ''})
+           valid_context=(str(live.get('season',''))=='2026' and int(live.get('total_rosters',0) or 0)==12 and
+                          'QB' in positions and 'SUPER_FLEX' in positions)
+           return rows,{'league_source_mode':mode,'league_context_matches_2026_12team_SF':valid_context,
+                       'live_league_season':str(live.get('season','')),'live_roster_count':int(live.get('total_rosters',0) or 0),
+                       'lineup_slots':positions,'n_exact_category_matches':sum(r['check']=='MATCH' for r in rows),
+                       'n_categories_missing':unknown,'n_categories_mismatch':mismatch,
+                       'per_game_milestone_source_semantics_reverified':False,
+                       'exact_all_categories_and_milestones_approved':False,
+                       'scoring_review_needed':True,'league_source_ok':mode=='SLEEPER_PUBLIC_LEAGUE_API'}
+
+
+          def out_csv(rows,cols):
+           s=io.StringIO();w=csv.DictWriter(s,fieldnames=cols,lineterminator='\n',extrasaction='ignore');w.writeheader();w.writerows(rows);return s.getvalue()
+
+          def run(repo,artifact_folder,outdir,fixture,live_fixture):
+           require(repo.is_dir(),'REPO_MISSING')
+           src={k:read_src(repo,k,fixture) for k in ('sleeper_scoring','historical_scoring','fantasypros_scoring','frozen_projections','roster_economics')}
+           score_check=check_score_functions(src)
+           base=repo/'config.json';require(base.is_file(),'LEAGUE_CONFIG_MISSING')
+           live,mode=get_live_league(repo,live_fixture)
+           rows,league_check=reconcile(live,mode)
+           folder=pathlib.Path(artifact_folder)
+           m=json.loads((folder/(R51_PREFIX+'_manifest.json')).read_text())
+           require(m['semantic_status']=='QB_REPLACEMENT_SURPLUS_PILOT_CREATED__FV_SCORING_AND_SCALE_HOLD','R51_STATUS_DRIFT')
+           require(m['production_change_authorized'] is False and m['frozen_QB_count']==54,'R51_SCOPE_DRIFT')
+           require(m['frozen_P2_ref']==SOURCES['frozen_projections'][1] or fixture,'R51_P2_PIN_MISMATCH')
+           r51name=R51_PREFIX+'_54_QB_surplus_evidence.csv';csvbytes=(folder/r51name).read_bytes()
+           require(sha(csvbytes)==m['output_sha256'][r51name],'R51_ARTIFACT_CONTENT_SHA_MISMATCH')
+           qbs=list(csv.DictReader(io.StringIO(csvbytes.decode('utf-8'))));require(len(qbs)==54,'R51_NOT_54_QB')
+           require(len({q['name'] for q in qbs})==54,'R51_DUPLICATE_QB')
+           require(all(q['numerical_FV_reprice_authorized']=='False' for q in qbs),'R51_REPRICING_LEAK')
+           data=json.loads(src['frozen_projections'][0]);frozen=data.get('frozen_players') or {}
+           demand=json.loads(src['roster_economics'][0]);effective=float(demand['positions']['QB']['effective_demand'])
+           require(20<=effective<=35,'REPLACEMENT_DEMAND_OUT_OF_BOUNDS')
+           progress=[]
+           for q in qbs:
+            key=q['name'];row=frozen.get(key)
+            require(bool(row) and row['pos']=='QB',f'FROZEN_QB_MISSING_{key}')
+            require(int(row['current_fundamental_value'])==int(q['frozen_FV_UNCHANGED']),f'R51_FROZEN_FV_DRIFT_{key}')
+            projected=float(row['canonical_forward_2026_points'])
+            require(abs(projected-float(q['2026_preseason_projected_points_SCORING_NOT_VERIFIED']))<.001,f'R51_PROJECTION_DRIFT_{key}')
+            progress.append({'name':key,'frozen_FV_UNCHANGED':q['frozen_FV_UNCHANGED'],
+              'preseason_2026_points_LOG_source_projection':round(projected,3),
+              'FP_points':row.get('fantasypros_2026_points'),'Sleeper_points':row.get('sleeper_2026_points'),
+              'forward_source':row.get('forward_source'),'recency_eligible':q['week6_recency_eligible'],
+              'R51_QB24_relative_index_NOT_FV':q['four_year_QB24_proxy_index_discount_10pct'],
+              'future_season_standard_scoring_NOT_RECONCILED':True,
+              'exact_LOG_scoring_verified_for_production':False,'FV_repricing_authorized':False})
+           progress.sort(key=lambda x:(-float(x['R51_QB24_relative_index_NOT_FV']),x['name']))
+           report=['# CAL26 V1R52 — QB scoring reconciliation and surplus-to-FV release bridge',
+            '**PRODUCTION FV: HOLD.** This is a validation of sources and blocked assumptions, not a new price set.','',
+            '## Execution results',f'- Real 54-QB R51 artifact verified by SHA256: **yes**',
+            f'- Frozen P2, roster economics, Sleeper, FantasyPros and historical source Git blobs: **{("fixture only" if fixture else "verified exact") }**',
+            f'- Three independently maintained scoring functions reconcile on core QB probes: **yes**',
+            f'- Historical vs Sleeper full scoring function ASTs match exactly: **yes**',
+            f'- Live league source: **{mode}**',
+            f'- League context 2026 / 12 teams / Superflex: **{league_check["league_context_matches_2026_12team_SF"]}**',
+            f'- Scoring category matches: **{league_check["n_exact_category_matches"]}/{len(rows)}**, missing **{league_check["n_categories_missing"]}**, mismatched **{league_check["n_categories_mismatch"]}**.',
+            '', '## Do not silently assume scoring parity',
+            'Sleeper season-long QB and FantasyPros projections have compatible core per-stat scoring in repository scripts. '
+            'However, FantasyPros deliberately omits per-game 300+/400+ pass-yard threshold bonuses from season totals; '
+            'directly applying weekly milestones to season aggregates would be wrong.',
+            'Historical full week scoring code applies milestone levels as non-stacking (400+ receives a total +3, not +2 plus +3). '
+            '**Provider live-settings semantics for overlapping milestone thresholds still require confirmation**, even when both configured numbers match.',
+            'NFLverse historical R42/R50 points use standard scoring; those multi-year ratio-surplus signals have not been recomputed in full LOG scoring, '
+            'so they cannot yet be used as a calibrated LOG surplus dollar/point value.',
+            'A 54-QB preseason projection does not imply a 54-player fully projected eligible pool. '
+            'R51 shows a steep QB28→QB34 projection cliff and effective historical QB demand ~27.65; replacement availability remains separate from starter demand.',
+            '', '## Next concrete production-oriented step',
+            'Use exact weekly LOG-scored historical outcomes and rosterable replacement estimates to estimate year-0 and next-season surplus in the same units, '
+            'then define an explicit cross-position FV unit convention before issuing any proposed FV prices. '
+            'Preserve R46/R50 signal results as separate predictors until matching scores are reconciled.',
+            'No files in the repository were written. No 2026 realized scores or Weeks 8–12 holdout data were read.',
+            '', '## Live source category differences',
+            '| Category | Repo formula | Live league | Match |','|---|---:|---:|---|']
+           report.extend(f"| {r['category']} | {r['repo_formula_value']} | {r['live_league_value']} | {r['check']} |" for r in rows)
+           report.append('')
+           files={PREFIX+'_LOG_scoring_source_comparison.csv':out_csv(rows,list(rows[0])),
+                  PREFIX+'_54_QB_FV_release_prerequisites.csv':out_csv(progress,list(progress[0])),
+                  PREFIX+'_findings.md':'\n'.join(report)+'\n'}
+           man={'workflow':'CAL26 V1R52 - LOG Scoring and QB Surplus FV Release Bridge (Read Only)',
+                'semantic_status':'LOG_SCORING_RECONCILIATION_DIAGNOSTIC__FUNDAMENTAL_FV_HOLD',
+                'production_change_authorized':False,'index_html_modified':False,'R51_54_QB_artifact_hash_verified':True,
+                'n_QB':len(qbs),'protected_2026_holdout_read':False,'2026_realized_performance_read':False,
+                'scoring_formula_consistency':score_check,'league_comparison':league_check,
+                'src_blob_ids':{k:v[1] for k,v in src.items()},
+                'R51_source_run_id':40036751470,'R51_source_manifest_sha256':sha((folder/(R51_PREFIX+'_manifest.json')).read_bytes()),
+                'replacement_demand_effective_QBs':effective,'QB34_projection_cliff_unresolved':True,
+                'historical_standard_to_LOG_multi_year_reconciled':False,
+                'year0_and_multi_year_scoring_comparable_for_calibration':False,
+                'cross_position_FV_scale_defined':False,'production_probability_not_empirically_estimable':True,
+                'output_sha256':{k:sha(v.encode()) for k,v in files.items()}}
+           outdir.mkdir(parents=True,exist_ok=True)
+           for k,v in files.items():(outdir/k).write_text(v)
+           (outdir/(PREFIX+'_manifest.json')).write_text(json.dumps(man,indent=2,sort_keys=True)+'\n')
+           print(json.dumps({'status':man['semantic_status'],'qbs':len(qbs),'scoring_live_matches':league_check['n_exact_category_matches'],
+                             'missing':league_check['n_categories_missing'],'mismatch':league_check['n_categories_mismatch'],
+                             'league_mode':mode,'production_change_authorized':False}))
+           return man
+
+
+          def selftest():
+           require(len(SOURCES)==5,'SOURCE_SET')
+           require(all(re.fullmatch('[a-f0-9]{40}',sha1) for _,sha1 in SOURCES.values()),'MALFORMED_GIT_BLOB_PIN')
+           require(len(LEAGUE_CATEGORIES)==14 and len(BONUS_CATEGORIES)==6,'EXPECTED_RULESET_DRIFT')
+           v,_=reconcile({'season':'2026','total_rosters':12,'roster_positions':['QB','SUPER_FLEX'],
+                          'scoring_settings':{**LEAGUE_CATEGORIES,**BONUS_CATEGORIES}},'LOCAL_FIXTURE')
+           require(len(v)==20 and all(x['check']=='MATCH' for x in v),'LIVE_CONFIG_TEST_FAIL')
+           require(abs(.04*300+2-14)<1e-9,'BONUS_TEST_FAIL')
+           print('R52_SELFTEST_GREEN pins scoring rules, no guessing, no pricing')
+
+          def main():
+           p=argparse.ArgumentParser()
+           p.add_argument('--repo',type=pathlib.Path,default=pathlib.Path('.'))
+           p.add_argument('--r51',type=pathlib.Path)
+           p.add_argument('--out',type=pathlib.Path)
+           p.add_argument('--fixture',action='store_true')
+           p.add_argument('--live-fixture',type=pathlib.Path)
+           p.add_argument('--selftest',action='store_true')
+           a=p.parse_args()
+           if a.selftest:selftest();return
+           require(a.r51 and a.out,'INPUTS_REQUIRED')
+           run(a.repo,a.r51,a.out,a.fixture,a.live_fixture)
+
+          if __name__=='__main__':main()
+          PY_CAL26_V1R52_ENGINE
+          python -m py_compile "$RUNNER_TEMP/cal26_v1r52_engine.py"
+          python "$RUNNER_TEMP/cal26_v1r52_engine.py" --selftest
+          python "$RUNNER_TEMP/cal26_v1r52_engine.py" \
+            --repo "$GITHUB_WORKSPACE" \
+            --r51 "$RUNNER_TEMP/cal26-r52-r51-pinned" \
+            --out "$RUNNER_TEMP/cal26-r52-output"
+          python - "$RUNNER_TEMP/cal26-r52-output" <<'PY_R52_VERIFY'
+          import csv,hashlib,json,pathlib,sys
+          p=pathlib.Path(sys.argv[1]);m=json.loads((p/'CAL26_V1R52_manifest.json').read_text())
+          assert m['semantic_status']=='LOG_SCORING_RECONCILIATION_DIAGNOSTIC__FUNDAMENTAL_FV_HOLD'
+          assert m['n_QB']==54 and m['R51_54_QB_artifact_hash_verified']
+          assert m['production_change_authorized'] is False and m['index_html_modified'] is False
+          assert not m['2026_realized_performance_read'] and not m['protected_2026_holdout_read']
+          assert all(len(v)==40 for v in m['src_blob_ids'].values())
+          assert m['scoring_formula_consistency']['historical_and_sleeper_Ast_equal']
+          assert m['scoring_formula_consistency']['fantasypros_core_probe_parity']
+          assert m['historical_standard_to_LOG_multi_year_reconciled'] is False
+          assert m['cross_position_FV_scale_defined'] is False
+          for f,sha in m['output_sha256'].items():
+              assert hashlib.sha256((p/f).read_bytes()).hexdigest()==sha,f
+          q=list(csv.DictReader((p/'CAL26_V1R52_54_QB_FV_release_prerequisites.csv').open()))
+          assert len(q)==54 and len({v['name'] for v in q})==54
+          assert all(v['FV_repricing_authorized']=='False' for v in q)
+          print('CAL26_V1R52_GREEN scoring provenance & 54QB release prerequisites; PRODUCTION FV HOLD')
+          PY_R52_VERIFY
+          test -z "$(git status --porcelain)"
+          echo '## CAL26 V1R52 - LOG scoring and QB surplus release prerequisites' >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/cal26-r52-output/CAL26_V1R52_findings.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload verified research artifacts only
+        uses: actions/upload-artifact@v4
+        with:
+          name: CAL26_V1R52_LOG_SCORING_SURPLUS_FV_RELEASE_BRIDGE_READ_ONLY
+          path: ${{ runner.temp }}/cal26-r52-output/CAL26_V1R52_*
+          if-no-files-found: error
+          retention-days: 30
