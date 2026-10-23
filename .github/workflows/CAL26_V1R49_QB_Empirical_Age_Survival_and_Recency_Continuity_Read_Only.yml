@@ -1,0 +1,729 @@
+name: CAL26 V1R49 - QB Empirical Age Survival and Recency Continuity (Read Only)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: cal26-v1r49-age-survival-recency-readonly
+  cancel-in-progress: false
+
+jobs:
+  empirical-qb-age-risk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout pinned historical research files
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Use Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Verify source lineage and evaluate age-risk nested holdouts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/cal26_v1r49_engine.py" <<'PY_CAL26_V1R49_ENGINE'
+
+          #!/usr/bin/env python3
+          """CAL26 V1R42. Historical QB opportunity/surplus evidence. RESEARCH ONLY.
+
+          External inputs: nflverse regular-season stats 2013-2025 and nflverse players.csv.
+          Historical labels NEVER include 2026. Future 2026 R41 holdout NEVER read.
+          Only frozen 2026 preseason P2 is used to make illustrative shadow descriptors.
+          """
+          from __future__ import annotations
+          import argparse, collections, csv, datetime as dt, hashlib, io, json, math
+          from pathlib import Path
+          import statistics, subprocess, time, urllib.request
+
+          YEARS=tuple(range(2013,2026))
+          CUTOFF=2022  # strictly all training outcomes end <=2022; test origins >=2022
+          HORIZONS=(1,2,3,4)
+          MIN_ATTEMPTS=150
+          SOURCE='https://github.com/nflverse/nflverse-data/releases/download/'
+          PLAYERS_URL=SOURCE+'players/players.csv'
+          STAT_URL=lambda year: SOURCE+f'stats_player/stats_player_reg_{year}.csv'
+          P2='research/production-v2/production_v2_phase2_preseason_baseline.json'
+          P2_SHA='ed5025134ca5992b460fa8b850033f82d7ea450f'
+          OUT_PREFIX='CAL26_V1R42'
+          QB_FOCUS=('bryce young','jayden daniels','cj stroud','caleb williams','drake maye')
+
+
+          def check(v,s):
+              if not v: raise AssertionError(s)
+
+
+          def fnum(s,what):
+              try: f=float(s)
+              except (ValueError,TypeError): raise AssertionError('BAD_NUMERIC_'+what)
+              check(math.isfinite(f),'NONFINITE_'+what)
+              return f
+
+
+          def shas(data):return hashlib.sha256(data).hexdigest()
+
+
+          def git_sha(repo,path):
+              return subprocess.check_output(['git','hash-object','--',path],cwd=repo,text=True).strip()
+
+
+          def age_at_sep1(season,birth):
+              dob=dt.date.fromisoformat(birth[:10]);at=dt.date(season,9,1)
+              age=at.year-dob.year-((at.month,at.day)<(dob.month,dob.day))
+              return age
+
+
+          def age_band(age):
+              if age<=24:return '<=24'
+              if age<=28:return '25-28'
+              if age<=32:return '29-32'
+              if age<=36:return '33-36'
+              return '37+'
+
+
+          def tier(ratio):
+              if ratio<.90:return 'below_090'
+              if ratio<1.10:return 'near_090_110'
+              return 'above_110'
+
+
+          def csvout(rows,columns):
+              buf=io.StringIO(newline='');w=csv.DictWriter(buf,fieldnames=columns,extrasaction='ignore',lineterminator='\n')
+              w.writeheader(); w.writerows([{k:'' if r.get(k) is None else r.get(k) for k in columns} for r in rows]);return buf.getvalue()
+
+
+          def retrieve(url,path):
+              if path.exists() and path.stat().st_size>40:return path.read_bytes()
+              last=None
+              for attempt in range(3):
+                  try:
+                      req=urllib.request.Request(url,headers={'User-Agent':'CAL26-Research-Only/1.0 (+https://github.com/nflverse/nflverse-data)'})
+                      with urllib.request.urlopen(req,timeout=35) as resp:
+                          check(resp.status==200,'HTTP_STATUS_'+str(resp.status))
+                          data=resp.read(40_000_001)
+                      check(300<len(data)<40_000_000,'HISTORICAL_ASSET_SIZE_INVALID')
+                      check(b'player_id' in data[:1600] or b'gsis_id' in data[:1600],'HISTORICAL_ASSET_NOT_CSV')
+                      path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(data)
+                      return data
+                  except Exception as exc:
+                      last=exc
+                      if attempt<2:time.sleep(2*(attempt+1))
+              raise RuntimeError(f'SOURCE_DOWNLOAD_FAILED {url}: {last}')
+
+
+          def load_assets(cache,download):
+              raw={};sources=[]
+              for year in YEARS:
+                  fn=f'stats_player_reg_{year}.csv';url=STAT_URL(year);path=cache/fn
+                  if download: blob=retrieve(url,path)
+                  else:check(path.is_file(),'HISTORICAL_FILE_MISSING_'+fn);blob=path.read_bytes()
+                  raw[year]=blob
+                  sources.append({'asset':fn,'url':url,'sha256':shas(blob),'bytes':len(blob)})
+              p=cache/'players.csv'
+              if download:players=retrieve(PLAYERS_URL,p)
+              else:check(p.is_file(),'HISTORICAL_FILE_MISSING_players.csv');players=p.read_bytes()
+              sources.append({'asset':'players.csv','url':PLAYERS_URL,'sha256':shas(players),'bytes':len(players)})
+              return raw,players,sources
+
+
+          def readcsv(blob):
+              s=blob.decode('utf-8-sig')
+              rdr=csv.DictReader(io.StringIO(s));check(rdr.fieldnames is not None,'CSV_NO_FIELDS');
+              return rdr
+
+
+          def normalize(raw,players_blob):
+              ids={}; player_issues=collections.Counter()
+              x=readcsv(players_blob)
+              check({'gsis_id','birth_date'}.issubset(x.fieldnames),'PLAYERS_REQUIRED_COLUMNS_MISSING')
+              for row in x:
+                  pid=(row.get('gsis_id') or '').strip();birth=(row.get('birth_date') or '').strip()
+                  if not pid or not birth:continue
+                  try: dt.date.fromisoformat(birth[:10])
+                  except ValueError:player_issues['unparseable_dob']+=1;continue
+                  if pid in ids:
+                      if ids[pid]!=birth:raise AssertionError('CONFLICTING_PLAYER_BIRTHDATE_'+pid)
+                      player_issues['identical_id_duplicate']+=1
+                  else:ids[pid]=birth
+              allrows={};annual={};issues=collections.Counter()
+              for year,blob in sorted(raw.items()):
+                  rdr=readcsv(blob)
+                  req={'player_id','position','season','attempts','fantasy_points'}
+                  check(req.issubset(rdr.fieldnames),f'STATS_REQUIRED_COLUMNS_MISSING_{year}_'+str(req-set(rdr.fieldnames)))
+                  yr={};nqb=0
+                  for row in rdr:
+                      if (row.get('position') or '').strip()!='QB':continue
+                      pid=(row.get('player_id') or '').strip()
+                      if not pid:issues['QB_empty_id']+=1;continue
+                      val=row.get('season')
+                      check(val and int(val)==year,f'SEASON_ROW_MISMATCH_{year}')
+                      attempts=fnum(row.get('attempts') or 0,'attempts');pts=fnum(row.get('fantasy_points') or 0,'fantasy_points')
+                      check(attempts>=0 and pts>-100,'HISTORICAL_STAT_INVALID_'+pid)
+                      if pid not in ids: issues['DOB_unmatched']+=1;continue
+                      try:age=age_at_sep1(year,ids[pid])
+                      except ValueError: issues['invalid_birthdate']+=1;continue
+                      if not 19<=age<=46:issues['age_outside_19_46']+=1;continue
+                      nqb+=1
+                      if pid in yr:
+                          # Multi-team split is possible in historical data: aggregate season totals
+                          yr[pid]['attempts']+=attempts;yr[pid]['pts']+=pts
+                          issues['multiteam_duplicate_aggregated']+=1
+                      else:yr[pid]={'pid':pid,'season':year,'age':age,'attempts':attempts,'pts':pts}
+                  check(len(yr)>=20,f'YEAR_QB_COVERAGE_TOO_LOW_{year}_{len(yr)}')
+                  # QB24 replacement based on actual NFL scoring proxy. Do not include 2026!
+                  board=sorted([r for r in yr.values() if r['pts']>0],key=lambda a:-a['pts'])
+                  check(len(board)>=30,f'YEAR_QB24_POPULATION_LOW_{year}')
+                  qb24=board[23]['pts'];check(qb24>20,f'QB24_INVALID_{year}')
+                  annual[year]={'qb24_points':qb24,'qb_n':len(yr),'qb_ranking_pool_n':len(board),'raw_qb_rows':nqb}
+                  for pid,v in yr.items():
+                      v['ratio']=max(0,v['pts']/qb24) # negative points become zero
+                      v['ratio_capped']=min(v['ratio'],3)
+                  allrows[year]=yr
+              check(set(allrows)==set(YEARS),'HISTORICAL_YEAR_GAP')
+              return allrows,annual,issues,player_issues
+
+
+          def build_examples(allrows,annual):
+              examples={h:[] for h in HORIZONS}
+              for season in YEARS:
+                  for r in allrows[season].values():
+                      if r['attempts']<MIN_ATTEMPTS:continue
+                      baseline_age=r['age'];baseline_ratio=r['ratio'];base_tier=tier(baseline_ratio)
+                      for h in HORIZONS:
+                          target=season+h
+                          if target not in allrows:continue # right-censored, NEVER treated as zero
+                          nxt=allrows[target].get(r['pid'])
+                          nxt_att=0 if nxt is None else nxt['attempts']
+                          nxt_ratio=0 if nxt is None else nxt['ratio']
+                          examples[h].append({'anchor_year':season,'age_band':age_band(baseline_age),'tier':base_tier,
+                              'age':baseline_age,'baseline_ratio':baseline_ratio,'target_year':target,
+                              'next_ratio':min(nxt_ratio,3),'future_pass_150':int(nxt_att>=MIN_ATTEMPTS),
+                              'future_above_QB24':int(nxt_ratio>=1),'future_surplus':max(0,min(nxt_ratio,3)-1)})
+              return examples
+
+
+          def mean(rows,key):return sum(x[key] for x in rows)/len(rows) if rows else 0
+
+
+          def estimate(rows,key,age,tier_name,partial=12):
+              # Tier pool -> global pool. Equal pseudocounts are declared ex ante.
+              global_mean=mean(rows,key)
+              tier_rows=[x for x in rows if x['tier']==tier_name]
+              n_t=len(tier_rows)
+              tier_avg=(sum(x[key] for x in tier_rows)+partial*global_mean)/(n_t+partial)
+              local=[x for x in tier_rows if x['age_band']==age]
+              n=len(local)
+              est=(sum(x[key] for x in local)+partial*tier_avg)/(n+partial)
+              return {'estimate':est,'n_cell':n,'n_tier':n_t,'tier_rate':tier_avg,'global_rate':global_mean}
+
+
+          def backtest(examples):
+              allm={};evalrows=[];status={}
+              for h in HORIZONS:
+                  train=[x for x in examples[h] if x['target_year']<=CUTOFF]
+                  val=[x for x in examples[h] if x['anchor_year']>=CUTOFF and x['target_year']<=2025]
+                  check(all(x['target_year']<=CUTOFF for x in train),'TEMPORAL_TRAIN_LABEL_LEAK')
+                  check(all(x['anchor_year']>=CUTOFF and x['target_year']<=2025 for x in val),'TEMPORAL_VALIDATION_LEAK')
+                  check(len(train)>=80,f'TOO_FEW_HISTORICAL_TRAINING_ROWS_H{h}_{len(train)}')
+                  # independent validation only possible for h<=3 given 2025 latest and cut 2022
+                  if h<=3:check(len(val)>=12,f'TOO_FEW_VALIDATION_ROWS_H{h}_{len(val)}')
+                  status[h]={'n_train':len(train),'n_validation':len(val),'independent_validation_possible':bool(val)}
+                  allm[h]={'train':train,'validation':val}
+                  for target in ('future_above_QB24','future_pass_150','future_surplus'):
+                      rows=[]
+                      for x in val:
+                          fit=estimate(train,target,x['age_band'],x['tier']);y=x[target]
+                          simple=fit['global_rate'];tierfit=fit['tier_rate']
+                          # Surplus is continuous. Brier/MAE assigned appropriately.
+                          rows.append({'target':target,'actual':y,'pred':fit['estimate'],'tierpred':tierfit,'globalpred':simple})
+                      if rows:
+                          loss=(lambda pred:sum((v[pred]-v['actual'])**2 for v in rows)/len(rows))
+                          err=(lambda pred:sum(abs(v[pred]-v['actual']) for v in rows)/len(rows))
+                          evalrows.append({'horizon':h,'outcome':target,'n':len(rows),'score_type':'brier' if target!='future_surplus' else 'mse',
+                              'age_tier_loss':round(loss('pred'),6),'tier_loss':round(loss('tierpred'),6),
+                              'global_loss':round(loss('globalpred'),6),
+                              'age_tier_mae':round(err('pred'),6),'global_mae':round(err('globalpred'),6),
+                              'delta_loss_vs_global':round(loss('pred')-loss('globalpred'),6)})
+              return allm,status,evalrows
+
+
+          def load_frozen_qbs(repo):
+              p=repo/P2;check(p.is_file(),'FROZEN_P2_MISSING')
+              check(git_sha(repo,P2)==P2_SHA,'FROZEN_P2_SHA_DRIFT')
+              obj=json.loads(p.read_text(encoding='utf8'))
+              check(obj['status']=='FROZEN_PRESEASON_BASELINE_RESEARCH_ONLY','P2_STATUS_DRIFT')
+              check(obj['production_mutation_authorized'] is False,'P2_PROD_GUARD')
+              q={name:x for name,x in obj['frozen_players'].items() if x.get('pos')=='QB'}
+              check(len(q)==64,'QB_BOARD_COUNT_DRIFT')
+              have=sorted([(n,x) for n,x in q.items() if isinstance(x.get('canonical_forward_2026_points'),(int,float)) and x['canonical_forward_2026_points']>0],
+                          key=lambda p:(-p[1]['canonical_forward_2026_points'],p[0]))
+              check(len(have)==54,'QB_FORWARD_BOARD_COUNT_DRIFT')
+              repl=have[23][1]['canonical_forward_2026_points'];check(abs(repl-270.855)<.001,'FROZEN_2026_QB24_DRIFT')
+              check(all(name in q for name in QB_FOCUS),'FOCUS_MISSING')
+              return q,have,repl
+
+
+          def build_shadow(models,have,repl):
+              res=[]
+              for name,v in have:
+                  r=v['canonical_forward_2026_points']/repl;age=v['age'];t=tier(r);ab=age_band(age)
+                  row={'name':name,'age_2026_frozen':age,'frozen_2026_forward':round(v['canonical_forward_2026_points'],3),
+                       'QB24_2026_frozen':repl,'ratio_2026_forward_to_QB24':round(r,5),
+                       'age_band':ab,'baseline_tier':t,'frozen_FV_reference_only':v['current_fundamental_value'],
+                       'year0_ratio_surplus':round(max(0,r-1),5)}
+                  for h in HORIZONS:
+                      train=models[h]['train']
+                      row[f'h{h}_p_above_QB24']=round(estimate(train,'future_above_QB24',ab,t)['estimate'],5)
+                      row[f'h{h}_p_150_pass_attempts']=round(estimate(train,'future_pass_150',ab,t)['estimate'],5)
+                      row[f'h{h}_expected_ratio_surplus']=round(estimate(train,'future_surplus',ab,t)['estimate'],5)
+                      row[f'h{h}_local_sample_n']=estimate(train,'future_surplus',ab,t)['n_cell']
+                  # 2026 y0 vs 2027-2030 h1..4; discount chosen in R41, still assumption.
+                  row['five_season_relative_surplus_research_only']=round(row['year0_ratio_surplus']+sum((.85**h)*row[f'h{h}_expected_ratio_surplus'] for h in HORIZONS),5)
+                  row['shadow_is_numeric_FV_price']=False
+                  res.append(row)
+              return sorted(res,key=lambda x:(-x['five_season_relative_surplus_research_only'],x['name']))
+
+
+          def output(cache,repo,out,download):
+              raw,players,src=load_assets(cache,download)
+              allrows,annual,issues,pissues=normalize(raw,players)
+              ex=build_examples(allrows,annual)
+              models,counts,valid=backtest(ex)
+              q,board,repl=load_frozen_qbs(repo)
+              shadow=build_shadow(models,board,repl)
+              assert len(shadow)==54
+              raw_total=sum(d['qb_n'] for d in annual.values())
+              check(raw_total>500,'HISTORICAL_QB_COHORT_TOO_SMALL')
+              check(sum(len(t['train']) for t in models.values())>300,'HISTORICAL_TRAIN_SAMPLE_TOO_SMALL')
+              out.mkdir(parents=True,exist_ok=True)
+              data={}
+              data[f'{OUT_PREFIX}_source_sha256.csv']=csvout(src,['asset','url','sha256','bytes'])
+              yeard=[{'season':y,**x} for y,x in sorted(annual.items())]
+              data[f'{OUT_PREFIX}_year_qb24_proxy.csv']=csvout(yeard,['season','qb24_points','qb_n','qb_ranking_pool_n','raw_qb_rows'])
+              data[f'{OUT_PREFIX}_temporal_validation.csv']=csvout(valid,['horizon','outcome','n','score_type','age_tier_loss','tier_loss','global_loss','age_tier_mae','global_mae','delta_loss_vs_global'])
+              data[f'{OUT_PREFIX}_54_QB_empirical_shadow.csv']=csvout(shadow,list(shadow[0]))
+              cells=[]
+              for h in HORIZONS:
+                  train=models[h]['train']
+                  for a in ('<=24','25-28','29-32','33-36','37+'):
+                      for t in ('below_090','near_090_110','above_110'):
+                          row={'horizon':h,'age_band':a,'baseline_tier':t}
+                          for label,field in [('p_QB24','future_above_QB24'),('p_150_attempts','future_pass_150'),('future_ratio_surplus','future_surplus')]:
+                              fit=estimate(train,field,a,t);row[label]=round(fit['estimate'],6)
+                              row['local_n']=fit['n_cell'];row['tier_n']=fit['n_tier']
+                          cells.append(row)
+              data[f'{OUT_PREFIX}_60_conditional_horizon_cells.csv']=csvout(cells,list(cells[0]))
+              report=['# CAL26 V1R42 — Historical QB multi-year opportunity and replacement-surplus study','',
+                  '**Semantic status:** HISTORICAL_EMPIRICAL_RESEARCH_ONLY_PRICE_CALIBRATION_HOLD','',
+                  f'Loaded NFLverse **2013–2025** regular-season QB performance, joined on stable GSIS ID to birth dates. {raw_total} player-seasons with DOB coverage, no 2026 realized outcomes.',
+                  f'Historical fantasy points are nflverse **4-point passing-TD standard-scoring proxy**, NOT independently verified as the L.O.G. league-scored 2026 projection unit. Annual QB24 thresholds are recalculated from each historical season; no fixed cross-era raw point scale is assumed.',
+                  'Source citations: https://github.com/nflverse/nflverse-data/releases/tag/stats_player ; https://github.com/nflverse/nflverse-data/releases/tag/players ; https://nflreadr.nflverse.com/reference/load_player_stats.html (nflverse CC BY 4.0 attribution).',
+                  '', '## Temporal holdout design',
+                  'Training: only historical outcomes ending 2022 or earlier. Validation: anchor seasons from 2022 forward, with targets no later than 2025. Horizons without independently observable validation are explicitly marked unvalidated.',
+                  'Missing player row in a **complete** target season is recorded as zero NFL statistical output, not as proof of retirement. Right-censored unobserved future seasons are never zero-filled.',
+                  'Eligibility: historical anchor QBs with >=150 seasonal passing attempts; outcome is probability of >=150 attempts, probability of scoring >=that season QB24, and replacement-relative surplus.',
+                  'QB24 values are based on available QB rows with positive fantasy points, not a full 12-team SF lineup simulation.',
+                  'Partial pooling: each age-by-projection-tier cohort shrinks toward its same-tier mean with 12 pseudo-observations; that tier estimate shrinks toward the unconditional population mean with 12 pseudo-observations. These are declared smoothing constants, not tuned to validation.',
+                  '', '## Historical source QA',
+                  '| Season | QB24 proxy | QB rows |','|---|---:|---:|']
+              for row in yeard:report.append(f"| {row['season']} | {row['qb24_points']:.2f} | {row['qb_n']} |")
+              report+=['','## Chronological validation (lower loss better)',
+                       '| Horizon | Label | Test n | Age+tier loss | Global loss | Delta |','|---|---|---:|---:|---:|---:|']
+              for x in valid:report.append(f"| {x['horizon']} | {x['outcome']} | {x['n']} | {x['age_tier_loss']:.4f} | {x['global_loss']:.4f} | {x['delta_loss_vs_global']:+.4f} |")
+              for h in HORIZONS:
+                  if not counts[h]['independent_validation_possible']:
+                      report.append(f'**Horizon {h}:** No 2022+ origin has an observed complete {h}-year result by 2025. This horizon is **UNVALIDATED**, regardless of training size.')
+              report+=['','## Frozen 2026 QB examples: shadow evidence, NOT numeric dynasty FV','',
+                       '| QB | Frozen FV reference | Forward / QB24 | H1 improve above QB24 | H1 >=150 pass att | Five-season normalized research surplus |',
+                       '|---|---:|---:|---:|---:|---:|']
+              lookup={x['name']:x for x in shadow}
+              for name in QB_FOCUS:
+                  x=lookup[name]; report.append(f"| {name} | {x['frozen_FV_reference_only']:,} | {x['ratio_2026_forward_to_QB24']:.3f} | {x['h1_p_above_QB24']:.3f} | {x['h1_p_150_pass_attempts']:.3f} | {x['five_season_relative_surplus_research_only']:.3f} |")
+              report+=['','## Interpretation and holds',
+                  'These probabilities are **historical conditional cohort estimates**, not personalized guarantees; no injury/status or real-time role predictor is included. The historical baseline ratio is based on realized full-season NFL stats while 2026 grouping uses preseason projections, introducing measurement/domain shift. This requires reconciliation before deploy.',
+                  'Age-group and baseline-tier effects need to beat the unconditional baseline on genuinely later data. No 2026 Week 8–12 or 13–18 outcomes have been inspected.',
+                  'Future QB scoring and future opportunity are dependent; report records empirical distributions directly instead of multiplying assumed probabilities blindly. Five-season shadow is unit-normalized research surplus and **NOT** an FV quote. It does not establish independent currency conversion, roster scarcity, or cross-position trade price.',
+                  'R41 scenarios stay frozen; V1R42 neither rewrites them nor back-fits them to owner target QB values or DLF prices.',
+                  'Raw player level historical data is fetched into runner temporary storage, not placed in public repo or uploaded as an artifact. Only aggregates, sources SHA and 54 2026 frozen QB descriptors are uploaded.',
+                  '', '## Next decision',
+                  'Review chronological validation: if age/tier model fails to improve over global rate, do not promote those covariates. Separately reconcile historical proxy scoring to the L.O.G. league scoring and projected-vs-realized covariate mismatch, then connect to cross-position FV point scale. Production remains HOLD.', '']
+              data[f'{OUT_PREFIX}_historical_findings.md']='\n'.join(report)
+              for name,txt in data.items():(out/name).write_text(txt,encoding='utf8')
+              manifest={'workflow':'CAL26 V1R42 - Historical QB Career Continuation and Multi-Year Surplus (Read Only)',
+                'semantic_status':'HISTORICAL_EMPIRICAL_RESEARCH_ONLY_PRICE_CALIBRATION_HOLD',
+                'production_change_authorized':False,'index_html_modified':False,
+                'future_2026_holdout_read':False,'used_2026_realized_outcomes':False,'owner_target_ranges_used_for_fit':False,
+                'DLF_or_MV_used_for_fit':False,'source_historical_min_year':min(YEARS),'source_historical_max_year':max(YEARS),
+                'scoring_semantics':'nflverse 4pt-pass-TD standard proxy; mismatch vs league-scored projections unresolved',
+                'validated_horizons':[h for h in HORIZONS if counts[h]['independent_validation_possible']],
+                'unvalidated_horizons':[h for h in HORIZONS if not counts[h]['independent_validation_possible']],
+                'temporal_holdout_cutoff':CUTOFF,'n_historical_QB_seasons':raw_total,
+                'n_2026_frozen_forward_QBs':len(board),'n_example_models':len(cells),
+                'summary_by_horizon':counts,'source_qa':dict(issues),'player_qa':dict(pissues),
+                'source_sha256':{x['asset']:x['sha256'] for x in src},'frozen_preseason_git_blob_pin':P2_SHA,
+                'output_sha256':{n:shas(txt.encode()) for n,txt in data.items()},
+                'n_raw_external_source_rows_in_artifact':0,'n_2026_outcomes_in_model':0}
+              (out/(OUT_PREFIX+'_manifest.json')).write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n',encoding='utf8')
+              print(json.dumps({'status':manifest['semantic_status'],'historical_QB_seasons':raw_total,'training':counts,'sources':len(src)},sort_keys=True))
+              return manifest
+
+
+          def selftest():
+              check(age_at_sep1(2020,'1995-09-01')==25,'AGE_BIRTHDAY_BOUNDARY')
+              check(age_at_sep1(2020,'1995-09-02')==24,'AGE_PRE_BIRTHDAY')
+              check([tier(x) for x in (.89,1.,1.12)]==['below_090','near_090_110','above_110'],'TIER_BOUNDARY')
+              a=[{'age_band':'25-28','tier':'near_090_110','future_above_QB24':1}]
+              z=estimate(a,'future_above_QB24','25-28','near_090_110')
+              check(0<z['estimate']<=1,'SHRINK_INVALID')
+              check(shas(b'test')==hashlib.sha256(b'test').hexdigest(),'SHA')
+              print('SELFTEST_GREEN age, scoring-group tiers, smooth pooling, hashes')
+
+
+          def main():
+              ap=argparse.ArgumentParser()
+              ap.add_argument('--selftest',action='store_true')
+              ap.add_argument('--download',action='store_true')
+              ap.add_argument('--assets',type=Path,default=Path('assets'))
+              ap.add_argument('--repo',type=Path,default=Path('.'))
+              ap.add_argument('--out',type=Path,default=Path('cal26-v1r42'))
+              a=ap.parse_args()
+              if a.selftest:selftest();return
+              output(a.assets,a.repo,a.out,a.download)
+
+
+
+          # ===========================================================================
+          # CAL26 V1R49: OUT-OF-TIME VALIDATION OF AGE-CONDITIONAL OPPORTUNITY GUARDS
+          # ===========================================================================
+          import os,re,urllib.error,urllib.parse,zipfile
+          from collections import defaultdict
+
+          R49='CAL26_V1R49'
+          HORIZONS=(1,2,3) # only horizons independently validated by R43
+          # GitHub original archives SHA256, immutable runs. R42 historical data re-fetched with source hashes.
+          SOURCES = {
+            42:dict(artifact=12529839028, run=40021246762, zipsha='614efa8b5624c8014aed546d3030c54357b69319bcb1e03d9284ae0b98e8a948', manifest='CAL26_V1R42_manifest.json'),
+            45:dict(artifact=12534025370, run=40027833230, zipsha='02b023e4ec2c8e4e5ab6de8232c20bb24d996a5e5cc3d43acb128b88c9e20724', manifest='CAL26_V1R45_manifest.json'),
+            47:dict(artifact=12534682338, run=40030717495, zipsha='9cb4fbfaab456f2c1517e1e128159afe6068ee54b38e0b647e2de2b37b168d78', manifest='CAL26_V1R47_manifest.json'),
+            48:dict(artifact=12535381220, run=40031781056, zipsha='826a20c0ba1e6a93a490a1a5ad41c69c90957e0a435591fa163fbf148420e7e2', manifest='CAL26_V1R48_manifest.json'),
+          }
+          OPTIONS=('tier_only','old_age_guard_k24','old_age_guard_k72','old_age_guard_k144')
+          FOCUS_NAMES=('bryce young','jayden daniels','cj stroud','caleb williams','drake maye','aaron rodgers','matthew stafford')
+
+          class SafeRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self,req,fp,code,msg,headers,newurl):
+                  nxt=super().redirect_request(req,fp,code,msg,headers,newurl)
+                  if nxt:
+                      check(urllib.parse.urlparse(newurl).scheme=='https','NON_HTTPS_REDIRECT')
+                      if urllib.parse.urlparse(req.full_url).netloc!=urllib.parse.urlparse(newurl).netloc:
+                          nxt.remove_header('Authorization')
+                  return nxt
+
+
+          def get_archive(which,repo,token,archive_cache=None):
+              source=SOURCES[which]
+              if archive_cache:
+                  data=(Path(archive_cache)/f'r{which}.zip').read_bytes()
+              else:
+                  check(re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+',str(repo)) is not None,'GH_REPO_INVALID')
+                  check(bool(token),'GH_TOKEN_EMPTY')
+                  url=f'https://api.github.com/repos/{repo}/actions/artifacts/{source["artifact"]}/zip'
+                  headers={'Authorization':'Bearer '+token,'Accept':'application/vnd.github+json','User-Agent':'CAL26-V1R49-Research','X-GitHub-Api-Version':'2022-11-28'}
+                  with urllib.request.build_opener(SafeRedirect()).open(urllib.request.Request(url,headers=headers),timeout=75) as res:
+                      data=res.read(500_001)
+              check(len(data)<500_000 and data[:4]==b'PK\x03\x04','ARTIFACT_ZIP_INVALID')
+              check(shas(data)==source['zipsha'],f'R{which}_ARTIFACT_SHA_MISMATCH')
+              with zipfile.ZipFile(io.BytesIO(data)) as zp:
+                  check(len(zp.infolist())<20,'ZIP_TOO_MANY')
+                  content={}
+                  for entry in zp.infolist():
+                      name=entry.filename
+                      check(name and not name.startswith('/') and '/' not in name and '\\' not in name and '..' not in name, 'ZIP_UNSAFE')
+                      check(name not in content,'ZIP_DUPLICATE')
+                      if not entry.is_dir():
+                          check(entry.file_size<400_000,'ZIP_OVERSIZE')
+                          content[name]=zp.read(entry)
+              check(source['manifest'] in content,f'R{which}_NO_MANIFEST')
+              man=json.loads(content[source['manifest']]);digests=man.get('output_sha256')
+              check(isinstance(digests,dict) and set(content)==set(digests)|{source['manifest']},f'R{which}_ZIP_CONTENT_DRIFT')
+              for n,h in digests.items():check(shas(content[n])==h,f'R{which}_FILE_SHA_{n}')
+              return content,man
+
+
+          def csvrecords(blob):
+              return list(csv.DictReader(io.StringIO(blob.decode('utf-8-sig'))))
+
+
+          def tier_pool(rows,field,t):
+              global_mean=mean(rows,field)
+              group=[r for r in rows if r['tier']==t]
+              return (sum(r[field] for r in group)+12*global_mean)/(len(group)+12)
+
+
+          def value_model(train,field,h,age,production_tier,variant):
+              # Train data contains only labels available by declared time cutoff.
+              tval=tier_pool(train,field,production_tier)
+              if variant=='tier_only' or age<=32:return tval
+              k=int(variant.rsplit('k',1)[1])
+              local=[r for r in train if r['tier']==production_tier and r['age_band']==age_band(age)]
+              local_val=(sum(r[field] for r in local)+k*tval)/(len(local)+k)
+              if field=='future_surplus':
+                  # The surplus expectation already includes a chance of no playing opportunity.
+                  # Only project a research risk cap from its own future-pass-attempt chance.
+                  tp=tier_pool(train,'future_pass_150',production_tier)
+                  ap=value_model(train,'future_pass_150',h,age,production_tier,variant)
+                  ratio=ap/tp if tp>1e-6 else 1
+                  return tval*min(1,max(0,ratio))
+              if field=='future_pass_150':return min(tval,local_val)
+              return tval
+
+
+          def err(results,pred_key):
+              return sum((r[pred_key]-r['target'])**2 for r in results)/len(results) if results else None
+
+
+          def choose_by_inner(examples):
+              combos=[];winners={};passes=[]
+              for h in HORIZONS:
+                  allx=examples[h]
+                  inner_train=[r for r in allx if r['target_year']<=2019]
+                  inner_val=[r for r in allx if 2020<=r['target_year']<=2022 and r['anchor_year']>=2019]
+                  outer_train=[r for r in allx if r['target_year']<=2022]
+                  outer_test=[r for r in allx if r['anchor_year']>=2022 and r['target_year']<=2025]
+                  check(len(inner_train)>=60 and len(inner_val)>=12 and len(outer_train)>=80 and len(outer_test)>=12,f'R49_TEMPORAL_SAMPLE_H{h}')
+                  check(all(x['target_year']<=2019 for x in inner_train),'INNER_LEAK')
+                  check(all(2020<=x['target_year']<=2022 for x in inner_val),'INNER_VAL_LEAK')
+                  check(all(x['target_year']<=2022 for x in outer_train),'OUTER_TRAIN_LEAK')
+                  check(all(x['anchor_year']>=2022 and x['target_year']<=2025 for x in outer_test),'OUTER_TEST_LEAK')
+                  for target in ('future_surplus','future_pass_150','future_above_QB24'):
+                      # Predeclare inner selection for each horizon/target. Even if the age-guard wins inner,
+                      # it is not promoted unless it independently beats tier-only in later data.
+                      scores={}
+                      for option in OPTIONS:
+                          pred=[{'target':r[target], 'prediction':value_model(inner_train,target,h,r['age'],r['tier'],option)} for r in inner_val]
+                          loss=err(pred,'prediction');scores[option]=loss
+                      best=min(OPTIONS,key=lambda x:(scores[x],OPTIONS.index(x)))
+                      winners[(h,target)]=best
+                      val=[{'target':r[target], 'baseline':value_model(outer_train,target,h,r['age'],r['tier'],'tier_only'),
+                            'selected':value_model(outer_train,target,h,r['age'],r['tier'],best)} for r in outer_test]
+                      old=[{'target':r[target], 'baseline':value_model(outer_train,target,h,r['age'],r['tier'],'tier_only'),
+                            'selected':value_model(outer_train,target,h,r['age'],r['tier'],best)} for r in outer_test if r['age']>=33]
+                      full_b=err(val,'baseline');full_m=err(val,'selected');older_b=err(old,'baseline');older_m=err(old,'selected')
+                      candidate_better=(best!='tier_only' and full_m<full_b and len(old)>=10 and older_m<older_b)
+                      combo={'horizon':h,'outcome':target,'selected_from_pre2023_inner_test':best,
+                             'n_fit_pre2020':len(inner_train),'n_inner_2020_22':len(inner_val),'n_fit_pre2023':len(outer_train),'n_future_2023_25_test':len(val),
+                             'n_older_33plus_outer_test':len(old),'inner_selected_loss':round(scores[best],8),
+                             'inner_tier_only_loss':round(scores['tier_only'],8),
+                             'future_tier_only_loss':round(full_b,8),'future_selected_loss':round(full_m,8),
+                             'future_loss_change_pct':round(100*(full_b-full_m)/full_b,4) if full_b else 0,
+                             'older_tier_only_loss':round(older_b,8) if older_b is not None else '',
+                             'older_selected_loss':round(older_m,8) if older_m is not None else '',
+                             'age_guard_passed_validation':candidate_better,
+                             'tier_only_retained_by_default':not candidate_better,
+                             'training_and_2023_25_temporal_separation':True}
+                      combos.append(combo)
+                      if target=='future_surplus':passes.append(combo)
+              return combos,winners,passes
+
+
+          def produce_shadow(history,actual,repo_path,asset_mode):
+              r42,m42=actual[42];r45,m45=actual[45];r47,m47=actual[47];r48,m48=actual[48]
+              check(m42['n_historical_QB_seasons']==988,'R42_BASE_COHORT_DRIFT')
+              check(m45['production_mutation_authorized'] is False,'R45_PRODUCTION_STATUS_DRIFT')
+              check(m47['QB_week6_eligible_matched']==31,'R47_COHORT_DRIFT')
+              check(m48['R48_wins_vs_R46']==2 and m48['R46_chronological_holdout_parity_verified'] is True,'R48_OUTCOME_DRIFT')
+              oldsha=m42['source_sha256']
+              if asset_mode=='real':
+                  check(len(history['sources'])==14 and all(oldsha[s['asset']]==s['sha256'] for s in history['sources']),'R42_SOURCE_HASH_DRIFT')
+                  check(len(history['annual'])==13 and sum(x['qb_n'] for x in history['annual'].values())==988,'HISTORICAL_988_DRIFT')
+              examples=history['examples'];comparison,winners,passes=choose_by_inner(examples)
+              pres=csvrecords(r45['CAL26_V1R45_54_QB_reference_reallocation.csv'])
+              bas=[r for r in pres if r['scenario']=='base_equal_year_weights']
+              rec=csvrecords(r47['CAL26_V1R47_54_QB_two_track_evidence.csv'])
+              check(len(bas)==54 and len(rec)==54,'QB_54_DRIFT')
+              byrec={r['name']:r for r in rec}; check(len(byrec)==54,'QB_RECENCY_DUPLICATE')
+              # keep 2026 frozen reference and near-term recency distinct from long-term age scenarios.
+              rows=[]
+              for r in bas:
+                  name=r['name'];r47=byrec[name];age=int(r['age']);check(age==int(r47['age']),'AGE_SOURCE_DRIFT')
+                  future_impacts=[]
+                  t=r['tier']
+                  for h in HORIZONS:
+                      full_train=[x for x in examples[h] if x['target_year']<=2022]
+                      selected=winners[(h,'future_surplus')]
+                      # IMPORTANT: Do not use outer validation labels to choose the selected option.
+                      est=value_model(full_train,'future_surplus',h,age,t,selected)
+                      base=value_model(full_train,'future_surplus',h,age,t,'tier_only')
+                      future_impacts.append((selected,base,est))
+                  delta=sum(a-b for _,b,a in future_impacts)
+                  row={'name':name,'age':age,'frozen_FV':r['frozen_FV'],
+                       'R45R1_reference_FV_not_approved':r['quantile_reallocated_FV_reference_points'],
+                       'R45R1_surplus_index_reference':r['surplus_2026_to_2029_index'],
+                       'R46_week6_qualified':r47['R46_2026_week6_qualifies'],
+                       'R46_week6_standard_ROS_ppg_DIAGNOSTIC_ONLY':r47['week6_R46_heldout_selected_std_ROS_ppg'],
+                       'age_horizon_chosen_from_inner':';'.join(s for s,_,_ in future_impacts),
+                       'age_guard_surplus_change_preapproval':round(delta,5),
+                       'age_guard_status':'HOLD_UNLESS_H1_H3_SURPLUS_PASS' if age>=33 else 'TIER_ONLY_FOR_UNDER33',
+                       'age_survival_evidence_is_not_numerical_FV_price':True,'production_change_authorized':False}
+                  rows.append(row)
+              check(len(rows)==54,'54_SHADOW_BAD')
+              return rows,comparison,passes
+
+
+          def generate_data(asset_folder,repo_path,download,fixture=False):
+              raw,players,source=load_assets(asset_folder,download)
+              if not fixture:
+                  known=json.loads((Path(repo_path)/P2).read_text())
+                  check(known['status']=='FROZEN_PRESEASON_BASELINE_RESEARCH_ONLY' and known['production_mutation_authorized'] is False,'P2_STATUS_DRIFT')
+                  check(git_sha(Path(repo_path),P2)==P2_SHA,'P2_HASH_DRIFT')
+              allrows,annual,issues,people=normalize(raw,players)
+              examples=build_examples(allrows,annual)
+              return {'sources':source,'annual':annual,'examples':examples,'qa':dict(issues)}
+
+
+          def fixture_sample():
+              # Tests pipeline logic on realistic cohort shapes; never called in actual GitHub historical run.
+              # not designed to imitate real calibrated NFL results.
+              ex={h:[] for h in HORIZONS}
+              for yr in range(2013,2025):
+                  for i in range(65):
+                      age=21+i%22
+                      r=0.65+((i*17+yr*3)%41)/50
+                      t=tier(r)
+                      for h in HORIZONS:
+                          target=yr+h
+                          if target>2025:continue
+                          # fixed deterministic target, age-dependent only as synthetic coverage.
+                          future=((i*31+yr*17+h*23)%17)/17
+                          opportunity=int(future>.32 and not (age+h>37 and future<.9))
+                          val=0 if not opportunity else max(0,r*(.9**h)+future*.4-1)
+                          ex[h].append({'anchor_year':yr,'target_year':target,'age':age,'age_band':age_band(age),'tier':t,
+                                        'future_pass_150':opportunity,'future_surplus':val,'future_above_QB24':int(val>0)})
+              return {'sources':[],'annual':{},'examples':ex,'qa':{}}
+
+
+          def output_r49(repo,cache,out,fixture_path='',asset_mode='real'):
+              if asset_mode=='fixture':hist=fixture_sample()
+              else:hist=generate_data(cache,repo,download=True,fixture=False)
+              artifact={};metadata={}
+              for which in SOURCES:
+                  artifact[which]=get_archive(which,os.environ.get('GITHUB_REPOSITORY',''),os.environ.get('GH_TOKEN',''),fixture_path or None)
+                  metadata[str(which)]={'run':SOURCES[which]['run'],'sha256':SOURCES[which]['zipsha']}
+              shadow,comparison,passes=produce_shadow(hist,artifact,repo,asset_mode)
+              out.mkdir(parents=True,exist_ok=True)
+              output={f'{R49}_nine_temporal_evaluations.csv':csvout(comparison,list(comparison[0])),
+                      f'{R49}_54_QB_age_survival_shadow_diagnostic.csv':csvout(shadow,list(shadow[0]))}
+              report=['# CAL26 V1R49 — Historical QB remaining-career age-risk test','',
+                '**Status: AGE_GUARD_BACKTEST_REVIEW_REQUIRED__NO_FV_PRICE_PROMOTION**','',
+                'R48 actual result: opportunity × conditional skill lost 4/6 holdouts to R46, including BOTH Week6 cohorts. R46 retained as recency predictor.',
+                'R49 trains candidate old-age participation risk caps using nflverse 2013–2025 historical QBs, same anchored thresholds and R42 identified seasons.',
+                'Nested chronology: model choice by label outcomes 2020–22 only, with fitting outcomes ending by 2019. Out-of-time evaluation 2023–25 with refitting through 2022.',
+                'No age uplift for any player; only age>=33 opportunity downside cap candidates, and only if historical inner test chose them.',
+                'Important: future_surplus already includes zero-output risk. Opportunity cap ratio is a research stress-test, NOT an independently identified career survival probability.',
+                '', '## Chronological test (lower squared loss better)','',
+                '| H | Target | Selected using 2020–22 | 2023–25 n | Tier-only loss | Selected loss | Change | Age guard beat tier + older cohort? |',
+                '|---:|---|---|---:|---:|---:|---:|---|']
+              for a in comparison:
+                  report.append(f"| {a['horizon']} | {a['outcome']} | {a['selected_from_pre2023_inner_test']} | {a['n_future_2023_25_test']} | {a['future_tier_only_loss']:.6f} | {a['future_selected_loss']:.6f} | {a['future_loss_change_pct']:+.2f}% | {a['age_guard_passed_validation']} |")
+              report+=['','## Selected reference QBs','',
+                '| QB | Age | Frozen FV | Existing R45R1 reference | Empirical old-age guard diagnostic delta in normalized surplus units |',
+                '|---|---:|---:|---:|---:|']
+              by={x['name']:x for x in shadow}
+              for name in FOCUS_NAMES:
+                  if name in by:
+                      x=by[name];report.append(f"| {name} | {x['age']} | {x['frozen_FV']} | {x['R45R1_reference_FV_not_approved']} | {x['age_guard_surplus_change_preapproval']:+.5f} |")
+              report+=['','## Guardrails','',
+                'No exact LOG scoring conversion, no validated lifetime FV currency, and no numeric recency FV repricing. All R45 references retained for comparison, not promoted.',
+                'Do not promote on workflow green. If age-risk guards fail future holdouts or do not help in an older sample, tier-only remains recommended.',
+                'Historical outcome absence means no >=150 attempts in the source, not necessarily retirement. 2026 realized outcomes, Week8–12 protected holdouts and market owner price targets untouched.',
+                'No source or production files changed.','']
+              output[f'{R49}_findings.md']='\n'.join(report)
+              for fname,s in output.items():(out/fname).write_text(s)
+              m={'workflow':'CAL26 V1R49 - QB Empirical Age Survival and Recency Continuity Read Only',
+                 'semantic_status':'AGE_GUARD_BACKTEST_REVIEW_REQUIRED_NO_FV_PRICE_PROMOTION',
+                 'real_historical_data_used':asset_mode=='real','historical_QB_2013_25_n':sum(x['qb_n'] for x in hist['annual'].values()) if asset_mode=='real' else None,
+                 'R48_week6_opportunity_product_not_promoted':True,'R46_Week6_recency_retained':True,
+                 'evaluation_count':len(comparison),'n_QB_reference_rows':len(shadow),
+                 'n_surplus_horizons_age_guard_passed':sum(x['age_guard_passed_validation'] for x in passes),
+                 'protected_2026_holdout_read':False,'2026_realized_outcomes_read':False,
+                 'owner_target_FV_fitted':False,'DLF_MV_used_for_fit':False,'production_change_authorized':False,
+                 'R45R1_FV_repriced':False,'index_html_modified':False,'artifacts_verified':metadata,
+                 'source_sha256':{x['asset']:x['sha256'] for x in hist['sources']} if asset_mode=='real' else {},
+                 'output_sha256':{k:shas(v.encode()) for k,v in output.items()}}
+              (out/f'{R49}_manifest.json').write_text(json.dumps(m,sort_keys=True,indent=2)+'\n')
+              print(json.dumps({k:m[k] for k in ['semantic_status','real_historical_data_used','evaluation_count','n_QB_reference_rows','n_surplus_horizons_age_guard_passed']}))
+              return m
+
+
+          def selftest_r49():
+              assert age_band(33)=='33-36'
+              a=fixture_sample()
+              rows,winners,p=choose_by_inner(a['examples'])
+              assert len(rows)==9 and len(p)==3 and len(winners)==9
+              for h in HORIZONS:
+                  t=[x for x in a['examples'][h] if x['target_year']<=2022]
+                  for age in (24,31,34,38,42):
+                      for v in OPTIONS:
+                          base=value_model(t,'future_surplus',h,age,'above_110','tier_only')
+                          guarded=value_model(t,'future_surplus',h,age,'above_110',v)
+                          assert 0<=guarded<=base+1e-9
+                          if age<=32:assert abs(guarded-base)<1e-12
+              print('R49_SELFTEST_GREEN nested chronology, no pre33 age penalty, value model monotonicity')
+
+
+          def main_r49():
+              ap=argparse.ArgumentParser()
+              ap.add_argument('--selftest',action='store_true')
+              ap.add_argument('--repo',type=Path,default=Path('.'))
+              ap.add_argument('--cache',type=Path,default=Path('historical'))
+              ap.add_argument('--out',type=Path,default=Path('cal26-r49-output'))
+              ap.add_argument('--fixture-path',default='')
+              ap.add_argument('--fixture',action='store_true')
+              a=ap.parse_args()
+              if a.selftest:selftest_r49();return
+              output_r49(a.repo,a.cache,a.out,a.fixture_path,'fixture' if a.fixture else 'real')
+
+          if __name__=='__main__':main_r49()
+          PY_CAL26_V1R49_ENGINE
+          python -m py_compile "$RUNNER_TEMP/cal26_v1r49_engine.py"
+          python "$RUNNER_TEMP/cal26_v1r49_engine.py" --selftest
+          python "$RUNNER_TEMP/cal26_v1r49_engine.py" --repo "$GITHUB_WORKSPACE" --cache "$RUNNER_TEMP/cal26-v1r49-nflverse-cache" --out "$RUNNER_TEMP/cal26-v1r49-artifacts"
+          python - "$RUNNER_TEMP/cal26-v1r49-artifacts" <<'PY_CAL26_V1R49_ASSERT'
+          import sys,json,pathlib,hashlib,csv
+          p=pathlib.Path(sys.argv[1]);m=json.loads((p/'CAL26_V1R49_manifest.json').read_text())
+          assert m['semantic_status']=='AGE_GUARD_BACKTEST_REVIEW_REQUIRED_NO_FV_PRICE_PROMOTION'
+          assert m['real_historical_data_used'] is True and m['historical_QB_2013_25_n']==988
+          assert m['evaluation_count']==9 and m['n_QB_reference_rows']==54
+          assert m['R48_week6_opportunity_product_not_promoted'] is True and m['R46_Week6_recency_retained'] is True
+          assert m['protected_2026_holdout_read'] is False and m['2026_realized_outcomes_read'] is False
+          assert m['owner_target_FV_fitted'] is False and m['DLF_MV_used_for_fit'] is False
+          assert m['production_change_authorized'] is False and m['index_html_modified'] is False and m['R45R1_FV_repriced'] is False
+          assert len(m['source_sha256'])==14 and len(m['artifacts_verified'])==4
+          for n,h in m['output_sha256'].items():
+              assert (p/n).is_file() and hashlib.sha256((p/n).read_bytes()).hexdigest()==h
+          with (p/'CAL26_V1R49_nine_temporal_evaluations.csv').open() as h:
+              rows=list(csv.DictReader(h));assert len(rows)==9 and all(r['training_and_2023_25_temporal_separation']=='True' for r in rows)
+          with (p/'CAL26_V1R49_54_QB_age_survival_shadow_diagnostic.csv').open() as h:
+              rows=list(csv.DictReader(h));assert len(rows)==54 and len({r['name'] for r in rows})==54
+              assert all(r['production_change_authorized']=='False' for r in rows)
+          print('R49_GREEN: 2013-25 pinned longitudinal data; R42/R45R1/R47R1/R48 SHA-verified; nested future validation; production HOLD')
+          PY_CAL26_V1R49_ASSERT
+          test -z "$(git status --porcelain)"
+          echo '## CAL26 V1R49 - age-risk, forecast transfer and remaining-career audit; NO production changes' >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/cal26-v1r49-artifacts/CAL26_V1R49_findings.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload research only (no raw NFLverse player rows)
+        uses: actions/upload-artifact@v4
+        with:
+          name: CAL26_V1R49_QB_AGE_RISK_AND_RECENCY_CONTINUITY_READ_ONLY
+          path: ${{ runner.temp }}/cal26-v1r49-artifacts/
+          if-no-files-found: error
+          retention-days: 90
