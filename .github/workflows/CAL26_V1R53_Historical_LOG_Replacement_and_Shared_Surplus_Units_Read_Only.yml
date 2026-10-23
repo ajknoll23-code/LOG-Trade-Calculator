@@ -1,0 +1,281 @@
+name: CAL26 V1R53 - Historical LOG Replacement and Shared Surplus Units (Read Only)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: cal26-v1r53-log-scoring-shared-surplus-read-only
+  cancel-in-progress: false
+
+jobs:
+  historical-log-shared-surplus:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Read-only checkout of frozen LOG evidence
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Use Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Download verified R51R1 QB 54 research artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: CAL26_V1R51R1_QB_SURPLUS_REPLACEMENT_DEMAND_RESEARCH_ONLY
+          run-id: 40036751470
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ${{ runner.temp }}/cal26-v1r53-art/R51
+      - name: Download verified R52 LOG live scoring reconciliation artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: CAL26_V1R52_LOG_SCORING_SURPLUS_FV_RELEASE_BRIDGE_READ_ONLY
+          run-id: 40037826752
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ${{ runner.temp }}/cal26-v1r53-art/R52
+      - name: Run pinned historical LOG points and shared-units study
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/cal26_v1r53.py" <<'PY_CAL26_V1R53_ENGINE'
+          #!/usr/bin/env python3
+          """CAL26 V1R53: historical LOG-scored replacement and same-unit 2026 surplus.
+          Read-only. No 2026 actuals, protected outcomes, production edits, or owner-price fitting.
+          The 2026 year-zero surplus is a projection-based diagnostic, NOT dynasty FV.
+          """
+          from __future__ import annotations
+          import argparse, csv, hashlib, io, json, math, pathlib, statistics, sys
+          from collections import Counter,defaultdict
+          
+          P='CAL26_V1R53'
+          PINS={
+           'historical_log':('research/roster-economics/weekly_points_by_season.json','ad8c2275042fba93cbbae20d6a0b8c27b4bcaf84'),
+           'preseason_p2':('research/production-v2/production_v2_phase2_preseason_baseline.json','ed5025134ca5992b460fa8b850033f82d7ea450f'),
+           'roster_econ':('research/roster-economics/roster_economics_robustness.json','61c0b5079ee7efef644e94c3ddadf66f8da32e5a'),
+           'history_scorer':('research/roster-economics/historical_weekly_points_pipeline.py','d6d6c6b4c2725eca3aae46f6c32dcc6ae8633ace'),
+          }
+          ART={
+           'R51':('CAL26_V1R51_manifest.json','2c3b3fef3f10187f17f48e9afbb6ab86255080242eee88e9b9668e9da01f28d5'),
+           'R52':('CAL26_V1R52_manifest.json','520e6aae06bb59508964f2b025a00a58c695371fc58ea2c0a71057d23c618fbe'),
+          }
+          POSITIONS=('QB','RB','WR','TE','DL','LB','DB')
+          SENS=(18,22,24,28,29,34)
+          def require(v,msg):
+           if not v:raise AssertionError(msg)
+          def sha(b):return hashlib.sha256(b).hexdigest()
+          def git_blob(b):return hashlib.sha1(b'blob '+str(len(b)).encode()+b'\0'+b).hexdigest()
+          def clean_float(v):
+           x=float(v);require(math.isfinite(x),'NONFINITE_POINTS');return x
+          def csv_file(rows,fields):
+           out=io.StringIO(newline='');w=csv.DictWriter(out,fieldnames=fields,extrasaction='ignore',lineterminator='\n');w.writeheader();w.writerows(rows);return out.getvalue()
+          def read_source(repo,key,fixture):
+           path,expect=PINS[key];b=(repo/path).read_bytes();observed=git_blob(b)
+           if not fixture:require(observed==expect,f'FROZEN_{key}_DRIFT_EXPECT_{expect}_GOT_{observed}')
+           return b,observed
+          
+          def read_artifacts(folder,fixture):
+           result={};prov={}
+           for key,(filename,expect) in ART.items():
+            b=(folder/key/filename).read_bytes();observed=sha(b)
+            if not fixture:require(observed==expect,f'{key}_MANIFEST_SHA_DRIFT')
+            m=json.loads(b);files=m.get('output_sha256',{})
+            require(len(files)>=2,f'{key}_OUTPUT_HASHES_MISSING')
+            for fn,h in files.items():
+             data=(folder/key/fn).read_bytes()
+             require(sha(data)==h,f'{key}_{fn}_TAMPERED')
+            result[key]=m;prov[key]={'manifest_sha256':observed,'output_count':len(files)}
+           return result,prov
+          
+          def load_historical(source):
+           raw=json.loads(source)
+           require(isinstance(raw,dict) and {'2024','2025'}<=set(raw),'HISTORY_SEASON_KEYS')
+           hist={};meta={}
+           for year in ('2024','2025'):
+            yr=raw[year]
+            require(isinstance(yr,dict),'HISTORY_YEAR_NOT_DICT')
+            bypos=defaultdict(list)
+            n=0
+            for pid,p in yr.items():
+             if not isinstance(p,dict):continue
+             pos=p.get('pos_bucket')
+             if pos not in POSITIONS:continue
+             ww=p.get('weekly_points')
+             if not isinstance(ww,dict) or not ww:continue
+             require(all(str(i).isdigit() and 1<=int(i)<=18 for i in ww),'BAD_WEEK_LABEL')
+             pts=[clean_float(x) for x in ww.values()]
+             n+=1;bypos[pos].append({'pid':str(pid),'name':str(p.get('name') or pid),'pos':pos,
+                                 'season':year,'total':sum(pts),'games_recorded':len(ww)})
+            for pos in POSITIONS:bypos[pos].sort(key=lambda x:(-x['total'],x['name']))
+            require(len(bypos['QB'])>=34,f'HISTORICAL_QB_POOL_SHORT_{year}_{len(bypos["QB"])}')
+            hist[year]=bypos;meta[year]={'players_with_games':n,'QB_count':len(bypos['QB']),'positions':{pos:len(bypos[pos]) for pos in POSITIONS}}
+           return hist,meta
+          
+          def make_report(repo,folder,out,fixture):
+           sources={};blobs={}
+           for key in PINS:
+            data,observed=read_source(repo,key,fixture);sources[key]=data;blobs[key]=observed
+           arts,aprov=read_artifacts(folder,fixture)
+           r51,r52=arts['R51'],arts['R52']
+           require(r51['frozen_QB_count']==54,'R51_QB_COUNT_DRIFT')
+           require(r52['n_QB']==54 and r52['league_comparison']['n_exact_category_matches']==20 and not r52['league_comparison']['n_categories_mismatch'],'R52_SCORE_NOT_RECONCILED')
+           require(not r52['production_change_authorized'] and not r52['historical_standard_to_LOG_multi_year_reconciled'],'R52_UNEXPECTED_PROMOTION')
+           qq=list(csv.DictReader((folder/'R51'/'CAL26_V1R51_54_QB_surplus_evidence.csv').open()))
+           require(len(qq)==54 and len({r['name'] for r in qq})==54,'R51_QB_UNIVERSE')
+           p2=json.loads(sources['preseason_p2']);players=p2['frozen_players'];require(len(players)>=500,'PRESEASON_SMALL')
+           roster=json.loads(sources['roster_econ'])['positions'];hist,meta=load_historical(sources['historical_log'])
+           require(all(p in roster for p in POSITIONS),'ROSTER_MISSING_POSITIONS')
+           projection=defaultdict(list)
+           for name,p in players.items():
+            pos=p.get('pos')
+            if pos not in POSITIONS:continue
+            pt=p.get('canonical_forward_2026_points')
+            if pt is None:continue
+            val=clean_float(pt)
+            require(val>=0,f'NEGATIVE_PROJECTION_{name}')
+            projection[pos].append((val,name))
+           for pos in POSITIONS:projection[pos].sort(reverse=True)
+           # Empirical lineup demand and projection universe may differ: keep signal as sensitivity only.
+           refs={};info=[]
+           for pos in POSITIONS:
+            count=len(projection[pos]);effective=clean_float(roster[pos]['effective_demand'])
+            rank=max(1,math.ceil(effective));available=count>=rank
+            baseline=projection[pos][rank-1][0] if available else None
+            refs[pos]={'effective_demand':effective,'replacement_rank_ceil':rank,'candidate_projection_points':baseline,'projected_pool_count':count,'status':'SENSITIVITY_NOT_VALIDATED_WAIVER_REPLACEMENT' if available else 'INSUFFICIENT_PROJECTED_POOL'}
+            info.append({'position':pos,'effective_lineup_demand':round(effective,2),'rank_ceil':rank,'available_projected_players':count,'projection_at_rank':round(baseline,3) if baseline is not None else '',
+                         'status':refs[pos]['status']})
+           check54=[]
+           for r in qq:
+            name=r['name'];p=players.get(name)
+            require(p is not None and p.get('pos')=='QB',f'MISSING_R51_QB_IN_P2_{name}')
+            cand=clean_float(p['canonical_forward_2026_points']);require(abs(cand-clean_float(r['2026_preseason_projected_points_SCORING_NOT_VERIFIED']))<.00001,f'R51_P2_QB_DRIFT_{name}')
+            rank_all=next(i for i,(_,nm) in enumerate(projection['QB'],1) if nm==name)
+            ref=refs['QB']['candidate_projection_points']
+            check54.append({'name':name,'frozen_FV_UNCHANGED':r['frozen_FV_UNCHANGED'],'2026_projected_LOG_core_points':round(cand,4),'rank_in_P2_full_QB_pool':rank_all,
+             'rank_in_R51_54_subset':r['QB24_proxy_rank'],'QB28_all_pool_reference_pts':round(ref,4) if ref is not None else '',
+             '2026_surplus_all_pool_QB_demand_ceil_pts':round(max(cand-ref,0),4) if ref is not None else '',
+             'R51_four_year_QB24_relative_index_NOT_FV':r['four_year_QB24_proxy_index_discount_10pct'],
+             'R51_week6_recency_eligible':r['week6_recency_eligible'],
+             'same_scoring_unit_but_no_dynasty_FV':True,'production_change_authorized':False})
+           check54.sort(key=lambda x:(-float(x['2026_surplus_all_pool_QB_demand_ceil_pts'] or 0),x['name']))
+           # One-season cardinal point surplus: shared units, different position baseline hypotheses.
+           allpos=[]
+           for nm,p in players.items():
+            pos=p.get('pos');val=p.get('canonical_forward_2026_points')
+            if pos not in POSITIONS or val is None:continue
+            val=clean_float(val);base=refs[pos]['candidate_projection_points']
+            allpos.append({'name':nm,'position':pos,'frozen_FV_UNCHANGED':p['current_fundamental_value'],'2026_projected_points':round(val,4),
+                           'effective_demand_rank_ceil':refs[pos]['replacement_rank_ceil'],
+                           'position_ref_projected_points':round(base,4) if base is not None else '',
+                           'one_season_same_unit_surplus_points':round(max(0,val-base),4) if base is not None else '',
+                           'status':'YEAR_ZERO_SHARED_POINTS_NOT_DYNASTY_FV' if base is not None else 'INSUFFICIENT_POSITION_COVERAGE',
+                           'production_change_authorized':False})
+           allpos.sort(key=lambda x:(-float(x['one_season_same_unit_surplus_points'] or 0),x['name']))
+           histrows=[]
+           for year in ('2024','2025'):
+            for pos in POSITIONS:
+             seq=hist[year][pos];effective=refs[pos]['effective_demand'];rank=math.ceil(effective)
+             ranks=sorted(set([18,22,24,28,29,34,rank])) if pos=='QB' else [rank]
+             for k in ranks:
+              rec=seq[k-1] if len(seq)>=k else None
+              histrows.append({'season':year,'position':pos,'rank':k,'points_exact_LOG_weekly_scored':round(rec['total'],4) if rec else '',
+                               'name':rec['name'] if rec else '','games_recorded':rec['games_recorded'] if rec else '',
+                               'qualified_by_stat_line':'observed_weekly_stats_not_waiver_replacement'})
+           # Vital distinction: 2024/25 full-season points are not 2026 preseason expected season points.
+           txt=['# CAL26 V1R53 — Historical LOG-scored replacement and shared 2026 surplus units',
+            '**Status:** Research-only. No production FV or 2026 holdout outcomes changed.','',
+            '## Important evidence','- R52 authentic GitHub scoring source verifies 20/20 core/bonus categories and 12-team Superflex. Provider overlap milestone interpretation still flagged for review.',
+            '- 2024 and 2025 weekly LOG-scored NFL-wide position points are read from the existing repository, not newly scraped.',
+            '- The historical ranks use cumulative fantasy points from recorded player weeks. They are not proof a player was available on waivers.',
+            '- 2026 same-unit one-season surplus is projected points minus projected position replacement candidate; it is **not** four-year dynasty FV.',
+            '- R42 future-year QB24 ratio surplus is still standard-scoring; R53 does **not** silently mix it into LOG point totals or assign 0–10000 dynasty prices.',
+            '- Position replacement ranks are ceilings of empirical lineup demand, only sensitivity assumptions. 54 QB subset vs full 64 QB P2 pool may have rank drift.',
+            '', '## 2026 candidate one-year baseline by position',
+            '|Position|Effective lineup demand|Rank ceil|Full P2 projected pool|Reference projected points|Status|','|---|---:|---:|---:|---:|---|']
+           for r in info:txt.append(f"|{r['position']}|{r['effective_lineup_demand']}|{r['rank_ceil']}|{r['available_projected_players']}|{r['projection_at_rank']}|{r['status']}|")
+           txt.extend(['','## 2024–2025 historical LOG QB ranks', '|Year|QB24 actual LOG points|QB28 actual LOG points|QB34 actual LOG points|','|---|---:|---:|---:|'])
+           for year in ('2024','2025'):
+            look={r['rank']:r['points_exact_LOG_weekly_scored'] for r in histrows if r['season']==year and r['position']=='QB'}
+            txt.append(f"|{year}|{look.get(24,'')}|{look.get(28,'')}|{look.get(34,'')}|")
+           txt+=['','## Top QB one-year projected surpluses (not dynasty FV)','|Player|Frozen FV (untouched)|Projected LOG core points|2026 one-year surplus|','|---|---:|---:|---:|']
+           for r in check54[:10]:txt.append(f"|{r['name']}|{r['frozen_FV_UNCHANGED']}|{r['2026_projected_LOG_core_points']}|{r['2026_surplus_all_pool_QB_demand_ceil_pts']}|")
+           txt+=['','## What R54 must complete before proposed dynasty FV prices',
+            '1. Compare actual LOG-scored next-season surplus to historical standard-scored R42 ratios on the same QB ID cohorts, across years with comparable weekly data.',
+            '2. Estimate replacement availability rather than equating lineup demand with waiver replacement. Handle projected-but-not-active players and 2026 source missingness.',
+            '3. Specify an explicit shared dynasty FV unit convention from multi-year surplus, with sensitivity, and demonstrate ranking effects for all 54 QBs and several cross-position players.',
+            '4. Review, then require explicit owner approval before any production price change. No rigid unattainable gates.',
+            '', '**Production FV: HOLD. Do not apply provisional points as live FV.**']
+           outs={P+'_2024_2025_historical_LOG_replacement_ranks.csv':csv_file(histrows,list(histrows[0])),
+                 P+'_2026_position_reference_sensitivity.csv':csv_file(info,list(info[0])),
+                 P+'_54_QB_same_unit_surplus_bridge.csv':csv_file(check54,list(check54[0])),
+                 P+'_full_pool_year0_shared_surplus_units.csv':csv_file(allpos,list(allpos[0])),
+                 P+'_findings.md':'\n'.join(txt)+'\n'}
+           manifest={'workflow':'CAL26 V1R53 - Historical LOG Replacement and Shared Surplus Units (Read Only)',
+            'semantic_status':'HISTORICAL_LOG_SCORING_BRIDGE_AND_YEAR0_SHARED_SURPLUS__FV_HOLD',
+            'production_change_authorized':False,'index_html_modified':False,'2026_actuals_read':False,'protected_2026_holdout_read':False,
+            'n_frozen_players':len(players),'n_projected_rows':len(allpos),'n_R51_54_qbs':len(check54),
+            'n_all_projected_qbs':len(projection['QB']),'historical_source_QA':meta,'pos_replacement_sensitivity':refs,
+            'r51_r52_artifact_source_manifests':aprov,'frozen_git_blob_observed':blobs,
+            'historical_2024_2025_points_use_LOG_scorer':True,'2026_projection_contains_unmodeled_weekly_threshold_bonuses':True,
+            'future_year_h1_h3_standard_scoring_not_convertible_with_current_data':True,
+            'cross_position_year0_points_shared_unit_not_dynasty_FV':True,
+            'output_sha256':{n:sha(x.encode()) for n,x in outs.items()}}
+           out.mkdir(parents=True,exist_ok=True)
+           for name,content in outs.items():(out/name).write_text(content)
+           (out/(P+'_manifest.json')).write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n')
+           print(json.dumps({'semantic_status':manifest['semantic_status'],'players':len(allpos),'qbs':len(check54),'hist_QBs':{k:meta[k]['QB_count'] for k in meta},'production_change':False},sort_keys=True))
+           return manifest
+          
+          def selftest():
+           for k,(name,checksum) in PINS.items():require(len(checksum)==40 and len(name)>5 and all(c in '0123456789abcdef' for c in checksum),f'BAD_PIN_{k}')
+           for k,(name,checksum) in ART.items():require(len(checksum)==64 and len(name)>5 and all(c in '0123456789abcdef' for c in checksum),f'BAD_ARTIFACT_PIN_{k}')
+           require(git_blob(b'abc')=='f2ba8f84ab5c1bce84a7b441cb1959cfc7093b7f','GIT_BLOB_TEST')
+           require(abs(clean_float(2.5)-2.5)<1e-9,'FLOAT_TEST')
+           print('R53_SELFTEST_GREEN pins scoring sources historical 2024-25 and artifact integrity')
+          
+          def main():
+           a=argparse.ArgumentParser();a.add_argument('--repo',type=pathlib.Path,default=pathlib.Path('.'))
+           a.add_argument('--artifacts',type=pathlib.Path);a.add_argument('--out',type=pathlib.Path)
+           a.add_argument('--fixture',action='store_true');a.add_argument('--selftest',action='store_true');v=a.parse_args()
+           if v.selftest:selftest();return
+           require(v.artifacts and v.out,'ARTIFACTS_AND_OUTPUT_REQUIRED')
+           make_report(v.repo,v.artifacts,v.out,v.fixture)
+          if __name__=='__main__':main()
+          PY_CAL26_V1R53_ENGINE
+          python -m py_compile "$RUNNER_TEMP/cal26_v1r53.py"
+          python "$RUNNER_TEMP/cal26_v1r53.py" --selftest
+          python "$RUNNER_TEMP/cal26_v1r53.py" \
+            --repo "$GITHUB_WORKSPACE" \
+            --artifacts "$RUNNER_TEMP/cal26-v1r53-art" \
+            --out "$RUNNER_TEMP/cal26-v1r53-out"
+          python - "$RUNNER_TEMP/cal26-v1r53-out" <<'PY_CAL26_V1R53_VERIFY'
+          import pathlib, hashlib, json, csv, sys
+          folder=pathlib.Path(sys.argv[1])
+          m=json.loads((folder/'CAL26_V1R53_manifest.json').read_text())
+          assert m['semantic_status']=='HISTORICAL_LOG_SCORING_BRIDGE_AND_YEAR0_SHARED_SURPLUS__FV_HOLD'
+          assert not m['production_change_authorized'] and not m['protected_2026_holdout_read'] and not m['2026_actuals_read']
+          assert m['n_R51_54_qbs']==54 and m['n_frozen_players']>=500 and m['n_projected_rows']>=500
+          assert m['n_all_projected_qbs']>=54
+          assert all(m['historical_source_QA'][str(y)]['QB_count']>=34 for y in (2024,2025))
+          assert m['cross_position_year0_points_shared_unit_not_dynasty_FV']
+          for name,expected in m['output_sha256'].items():
+           assert hashlib.sha256((folder/name).read_bytes()).hexdigest()==expected,name
+          with (folder/'CAL26_V1R53_54_QB_same_unit_surplus_bridge.csv').open() as f:
+           players=list(csv.DictReader(f))
+          assert len(players)==54 and all(x['production_change_authorized']=='False' for x in players)
+          print('R53_RUNTIME_INTEGRITY_GREEN real historical LOG, R51/R52, QB54 and projected broader pool; FV HOLD')
+          PY_CAL26_V1R53_VERIFY
+          test -z "$(git status --porcelain)"
+          echo '## CAL26 V1R53 — Historical LOG Replacement & Shared Unit Bridge (Read Only)' >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/cal26-v1r53-out/CAL26_V1R53_findings.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload read-only LOG replacement research
+        uses: actions/upload-artifact@v4
+        with:
+          name: CAL26_V1R53_HISTORICAL_LOG_REPLACEMENT_SHARED_SURPLUS_READ_ONLY
+          path: ${{ runner.temp }}/cal26-v1r53-out/CAL26_V1R53_*
+          if-no-files-found: error
+          retention-days: 90
