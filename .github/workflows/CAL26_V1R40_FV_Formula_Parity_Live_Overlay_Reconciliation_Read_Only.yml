@@ -1,0 +1,383 @@
+name: CAL26 V1R40 - FV Formula Parity and Live Overlay Reconciliation (Read Only)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cal26-v1r40-fv-formula-parity-readonly
+  cancel-in-progress: false
+
+jobs:
+  verify-fv-structure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout pinned repository sources
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run formula parity and live overlay audit (read only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/cal26_v1r40.py" <<'PY_CAL26_V1R40_EOF'
+          #!/usr/bin/env python3
+          """CAL26 V1R40: Formula parity and independent-factor audit, read-only.
+          
+          No observed 2026 games, no future holdout, no private provider data, no pricing writes.
+          """
+          from __future__ import annotations
+          import argparse
+          import csv
+          from collections import Counter, defaultdict
+          import hashlib
+          import io
+          import json
+          import math
+          from pathlib import Path
+          import re
+          import subprocess
+          
+          P1='research/production-v2/production_v2_phase1_audit.json'
+          P2='research/production-v2/production_v2_phase2_preseason_baseline.json'
+          LIVE='index.html'
+          PINNED={P1:'bdd4657ff45e0c64f1406f27c1ffe6ad2e597d31',
+                  P2:'ed5025134ca5992b460fa8b850033f82d7ea450f',
+                  LIVE:'5630bb681dd8710f8e45bc5363488f358ce9ebe2'}
+          POSITION_WEIGHT={'QB':1.30,'RB':0.89,'WR':1.00,'TE':0.82,'DL':0.93,'LB':1.12,'DB':0.87}
+          FIVE_QBS={
+              'bryce young': (5300,5800), 'jayden daniels': (5900,6300),
+              'cj stroud': (5300,5800), 'caleb williams': (7000,7600),
+              'drake maye': (6800,7400),
+          }
+          COUNTS={'QB':64,'RB':97,'WR':114,'TE':44,'DL':86,'LB':79,'DB':65}
+          
+          
+          def check(c,m):
+              if not c: raise AssertionError(m)
+          
+          
+          def numeric(x):
+              return isinstance(x,(int,float)) and not isinstance(x,bool) and math.isfinite(x)
+          
+          
+          def js_round_nonnegative(x):
+              check(numeric(x) and x>=0,'nonfinite/negative input for FV rounding')
+              return math.floor(x+0.5)
+          
+          
+          def load_json(path):
+              def unique_pairs(items):
+                  o={}
+                  for k,v in items:
+                      check(k not in o,'duplicate source JSON key: '+k)
+                      o[k]=v
+                  return o
+              return json.loads(Path(path).read_text(encoding='utf8'),object_pairs_hook=unique_pairs)
+          
+          
+          def repo_blob_sha(repo,path):
+              return subprocess.check_output(['git','hash-object','--',path],cwd=repo,text=True).strip()
+          
+          
+          def locate_const_object(src,name):
+              m=re.search(r'\bconst\s+'+re.escape(name)+r'\s*=\s*\{',src)
+              check(m is not None,'cannot locate index.html constant '+name)
+              start=m.end();end=src.find('};',start)
+              check(end>start,'cannot locate end of '+name)
+              return src[start:end]
+          
+          
+          def parse_live_index(src):
+              weights=locate_const_object(src,'POSITION_WEIGHT')
+              live_weights={k:float(v) for k,v in re.findall(r'\b(QB|RB|WR|TE|DL|LB|DB)\s*:\s*(\d+(?:\.\d+)?)',weights)}
+              check(live_weights==POSITION_WEIGHT,'LIVE_POSITION_WEIGHTS_DRIFT')
+              m=re.search(r'return\s+Math\.round\(100\s*\*\s*pw\s*\*\s*am\s*\*\s*rm\s*\*\s*55\)',src)
+              check(m is not None,'LIVE_FV_FORMULA_DRIFT')
+              check("const CAL26_FV_OWNER_ANCHORS" in src and 'CAL26_FV_OWNER_ANCHORS[cal26AnchorKey]' in src,
+                    'LIVE_NAMED_OVERLAY_PATH_DRIFT')
+              anchor_block=locate_const_object(src,'CAL26_FV_OWNER_ANCHORS')
+              anchors={}
+              for name,v in re.findall(r"'([^']+)'\s*:\s*(\d+)\s*,?",anchor_block):
+                  check(name not in anchors,'duplicate live override '+name)
+                  anchors[name]=int(v)
+              check(len(anchors)==15,'LIVE_OVERLAY_COUNT_CHANGED')
+              check('canonical.pos === pos && canonical.age === age && canonical.role === role' in src,
+                    'LIVE_OVERLAY_CANONICAL_GUARD_DRIFT')
+              check('const AGE_CURVE = {' in src and 'QB:{peakStart:26, peakEnd:33, floor:35}' in src,
+                    'LIVE_QB_CURVE_ANCHOR_DRIFT')
+              check('const ratio = Math.max(0, Math.min(1, (realProduction - lo) / (hi - lo)))' in src,
+                    'LIVE_PRODUCTION_DEPENDENT_YOUTH_CURVE_DRIFT')
+              check('preFloor = 0.55 + ratio * (0.98 - 0.55)' in src,
+                    'LIVE_PRODUCTION_DEPENDENT_AGE_COEFFICIENT_DRIFT')
+              check('const t = Math.max(0, (age - 21) / (c.peakStart - 21))' in src,
+                    'LIVE_PREPEAK_RAMP_DRIFT')
+              return anchors
+          
+          
+          def qb_prepeak_age(age,production_mult):
+              # Mirrors LIVE ageMultiplier QB prepeak branch when valid real production exists.
+              check(numeric(age) and 21<=age<=26 and numeric(production_mult),
+                    'QB prepeak formula input out of range')
+              ratio=max(0,min(1,(production_mult-0.15)/(1.55-0.15)))
+              pre_floor=0.55+ratio*(0.98-0.55)
+              t=max(0,(age-21)/(26-21))
+              return pre_floor+t*(1-pre_floor)
+          
+          
+          def qb_required_pm(age,desired_fv):
+              # DIAGNOSTIC INVERSION ONLY. User-provided ranges are NOT observed FV labels.
+              check(numeric(desired_fv) and desired_fv>0,'bad target')
+              lo,hi=0.15,1.55
+              fn=lambda pm: 7150*pm*qb_prepeak_age(age,pm)
+              # Model rounds final points; invert a point range using the lower edge
+              # of the rounded-value interval, allowing a 0.5-point end-cap margin.
+              if desired_fv<fn(lo)-0.5 or desired_fv>fn(hi)+0.5:return None
+              boundary=max(fn(lo),min(fn(hi),desired_fv-0.499999))
+              for _ in range(85):
+                  mid=(lo+hi)/2
+                  if fn(mid)<boundary:lo=mid
+                  else:hi=mid
+              return hi
+          
+          
+          def write_csv(rows,columns):
+              dst=io.StringIO(newline='')
+              w=csv.DictWriter(dst,fieldnames=columns,extrasaction='ignore',lineterminator='\n')
+              w.writeheader()
+              for row in rows:
+                  w.writerow({k: ('' if row.get(k) is None else row[k]) for k in columns})
+              return dst.getvalue()
+          
+          
+          def audit(p1,p2,src):
+              check(p1.get('status')=='RESEARCH_ONLY_NO_PRODUCTION_CHANGE_AUTHORIZED','SOURCE_P1_STATUS_HOLD')
+              check(p2.get('status')=='FROZEN_PRESEASON_BASELINE_RESEARCH_ONLY','SOURCE_P2_STATUS_HOLD')
+              check(p1.get('production_mutation_authorized') is False,'SOURCE_P1_MUTATION_HOLD')
+              check(p2.get('production_mutation_authorized') is False,'SOURCE_P2_MUTATION_HOLD')
+              check(len(p1['players'])==549 and len(p2['frozen_players'])==549,'FROZEN_UNIVERSE_DRIFT')
+              anchors=parse_live_index(src)
+              counts=Counter()
+              reconstruction=[]
+              raw_by_pos=defaultdict(list)
+              candidate_count=0
+              current_mismatch_over1=[]
+              candidate_mismatch_over1=[]
+              cross_source_fv_mismatches=[]
+              for name,player in sorted(p1['players'].items()):
+                  pos=player['pos'];counts[pos]+=1
+                  check(pos in POSITION_WEIGHT,'UNSUPPORTED_POSITION '+str(pos))
+                  frozen=p2['frozen_players'].get(name)
+                  check(frozen is not None and frozen['pos']==pos,'FROZEN_IDENTITY_OR_POSITION_DRIFT '+name)
+                  current=player['current'];candidate=player.get('candidate') or {}
+                  age=current.get('age_mult');prod=current.get('effective_prod_mult')
+                  value=current.get('fundamental_value')
+                  check(all(numeric(x) and x>0 for x in (age,prod,value)),'BAD_SOURCE_FACTOR '+name)
+                  check(frozen['current_fundamental_value']==value,'FROZEN_FV_MISMATCH '+name)
+                  structural=55*100*POSITION_WEIGHT[pos]*age*prod
+                  modeled=js_round_nonnegative(structural)
+                  delta=modeled-value
+                  raw_by_pos[pos].append(delta)
+                  if abs(delta)>1:current_mismatch_over1.append(name)
+                  candidate_val=None
+                  if numeric(candidate.get('value')):
+                      candidate_count+=1
+                      cam=candidate.get('age_mult');cpm=candidate.get('effective_prod_mult')
+                      check(numeric(cam) and numeric(cpm),'BAD_P1_CANDIDATE_FACTOR '+name)
+                      candidate_val=js_round_nonnegative(55*100*POSITION_WEIGHT[pos]*cam*cpm)
+                      if abs(candidate_val-candidate['value'])>1:candidate_mismatch_over1.append(name)
+                  row={'name':name,'position':pos,'age':player.get('age'),'role':player.get('role'),
+                       'frozen_fv':value,'reproduced_fv':modeled,'rounding_delta':delta,
+                       'position_scale':int(round(5500*POSITION_WEIGHT[pos])),
+                       'age_multiplier':age,'production_multiplier':prod,
+                       'age_neutral_fixed_pm_fv':js_round_nonnegative(5500*POSITION_WEIGHT[pos]*prod),
+                       'production_neutral_fixed_age_fv':js_round_nonnegative(5500*POSITION_WEIGHT[pos]*age),
+                       'phase1_candidate_fv':candidate.get('value'),
+                       'phase1_candidate_reproduced_fv':candidate_val,
+                       'named_live_overlay_declared':name in anchors,
+                       'declared_live_overlay_points':anchors.get(name),
+                       'live_override_delta_vs_frozen_reference':anchors[name]-value if name in anchors else None}
+                  reconstruction.append(row)
+              check(dict(counts)==COUNTS,'FROZEN_POSITION_COUNTS_DRIFT '+str(dict(counts)))
+              check(not current_mismatch_over1,'FROZEN_FORMULA_NOT_REPRODUCED '+str(current_mismatch_over1[:5]))
+              check(not candidate_mismatch_over1,'PHASE1_CANDIDATE_FORMULA_NOT_REPRODUCED '+str(candidate_mismatch_over1[:5]))
+              check(candidate_count==518,'PHASE1_CANDIDATE_COUNT_DRIFT')
+              check(set(anchors).issubset(p1['players']),'UNKNOWN_LIVE_OVERLAY_IDENTITY')
+              overlays=[{'name':name,'position':p1['players'][name]['pos'],'declared_override_fv':price,
+                         'frozen_reference_fv':p1['players'][name]['current']['fundamental_value'],
+                         'difference_across_nonidentical_vintages':price-p1['players'][name]['current']['fundamental_value'],
+                         'canonical_guard_present_in_live_code':True}
+                        for name,price in sorted(anchors.items())]
+              five=[]
+              for name,(lowest,highest) in FIVE_QBS.items():
+                  pl=p1['players'][name];cur=pl['current'];
+                  check(pl['pos']=='QB' and 21<=pl['age']<=26,'QB_AGE_OR_IDENTITY_DRIFT '+name)
+                  pm=cur['effective_prod_mult']; age=cur['age_mult']
+                  from_formula=qb_prepeak_age(pl['age'],pm)
+                  check(abs(age-from_formula)<1e-5,'QB_COUPLED_PREPEAK_AGE_FORMULA_PARITY '+name)
+                  lo=qb_required_pm(pl['age'],lowest)
+                  hi=qb_required_pm(pl['age'],highest)
+                  # Calculations express the multiplier required by existing formula, not recommendation.
+                  five.append({'name':name,'age':pl['age'],'role':pl['role'],
+                               'frozen_reference_fv':cur['fundamental_value'],
+                               'current_age_mult':age,'current_production_mult':pm,
+                               'production_weight_used_in_age_multiplier':True,
+                               'phase1_candidate_fv':pl.get('candidate',{}).get('value'),
+                               'projection_freeze_forward_2026_points':p2['frozen_players'][name]['canonical_forward_2026_points'],
+                               'illustrative_owner_target_low_not_a_label':lowest,
+                               'illustrative_owner_target_high_not_a_label':highest,
+                               'required_pm_for_low_under_current_formula':round(lo,6) if lo is not None else None,
+                               'required_pm_for_high_under_current_formula':round(hi,6) if hi is not None else None,
+                               'required_low_vs_current_pm_ratio':round(lo/pm,6) if lo is not None else None,
+                               'required_high_vs_current_pm_ratio':round(hi/pm,6) if hi is not None else None,
+                               'low_range_achievable_inside_current_pm_cap':lo is not None,
+                               'high_range_achievable_inside_current_pm_cap':hi is not None})
+              checks={'player_counts':dict(counts),'frozen_player_count':len(reconstruction),
+                      'phase1_candidate_count':candidate_count,
+                      'per_position_max_abs_rounding_difference':{k:max(abs(v) for v in values) for k,values in raw_by_pos.items()},
+                      'frozen_formula_rounding_differences_nonzero':sum(bool(x['rounding_delta']) for x in reconstruction),
+                      'live_named_override_declarations':len(overlays),
+                      'prepeak_age_is_production_coupled':True,
+                      'future_outcomes_read':False,
+                      'no_fv_labels_created':True}
+              return reconstruction,overlays,five,checks
+          
+          
+          def output(data,out):
+              p1,p2,src=data
+              ledger,overlays,qbs,checks=audit(p1,p2,src)
+              out.mkdir(parents=True,exist_ok=True)
+              ledger_columns=('name','position','age','role','frozen_fv','reproduced_fv','rounding_delta',
+                              'position_scale','age_multiplier','production_multiplier',
+                              'age_neutral_fixed_pm_fv','production_neutral_fixed_age_fv',
+                              'phase1_candidate_fv','phase1_candidate_reproduced_fv',
+                              'named_live_overlay_declared','declared_live_overlay_points','live_override_delta_vs_frozen_reference')
+              files={
+                'CAL26_V1R40_frozen_549_formula_attribution.csv':write_csv(ledger,ledger_columns),
+                'CAL26_V1R40_live_overlay_15_declarations.csv':write_csv(overlays,list(overlays[0])),
+                'CAL26_V1R40_five_QB_inverse_diagnostic.csv':write_csv(qbs,list(qbs[0]))
+              }
+              report=['# CAL26 V1R40 — FV Formula Parity and Live Overlay Reconciliation','',
+                '**Status:** `RESEARCH_ONLY_FV_STRUCTURE_VERIFIED_PRODUCTION_HOLD`','',
+                '## Reconstructed frozen FV equation','',
+                '`FV = Math.round(55 × 100 × POSITION_WEIGHT × AGE_MULT × PRODUCTION_MULT)`','',
+                'The seven position weights are read from the live repository but were checked for the September frozen cohort.',
+                'This is a **descriptive parity audit**, not a fitted dynasty pricing model. Exact half-point rounding can differ by 1 point due to source float precision.',
+                '', '| Position | Frozen players | Full FV point scale |', '|---|---:|---:|']
+              for pos in ('QB','RB','WR','TE','DL','LB','DB'):
+                  report.append(f"| {pos} | {checks['player_counts'][pos]} | {round(5500*POSITION_WEIGHT[pos]):,} |")
+              report+=['',f"**Phase 1 candidate reconstructions:** {checks['phase1_candidate_count']}.",
+                  f"**Declared live named-player overrides:** {checks['live_named_override_declarations']}.",
+                  '**Important:** The overrides conditionally bypass the normal formula when position, age and role match the live canonical player. These declarations do not establish that a particular rendered screen currently uses each override.',
+                  '',
+                  '## Production-dependent pre-peak QB age multiplier','',
+                  'The formula in live `index.html` uses the *production multiplier* inside the youth age calculation for QBs aged 21–26. Consequently, a fixed-age factor counterfactual is not a causal age intervention. Do not blindly divide FV by AGE_MULT and call the result a new price.',
+                  '',
+                  'For QB under age 26: `preFloor = 0.55 + clamp((PM-0.15)/1.4,0,1)*0.43`; `t=clamp((age-21)/5,0,1)`; `AgeMult=preFloor+t*(1-preFloor)`.',
+                  '',
+                  '## Five owner-questioned QB cases — inverse diagnostic, **NOT targets to fit**','',
+                  '| Name | Frozen FV | Historical PM | PM required for illustrative low range | PM required for high |','|---|---:|---:|---:|---:|']
+              for v in qbs:
+                  lo=v['required_pm_for_low_under_current_formula'];hi=v['required_pm_for_high_under_current_formula']
+                  report.append(f"| {v['name']} | {v['frozen_reference_fv']:,} | {v['current_production_mult']:.3f} | {lo if lo is not None else 'not reachable'} | {hi if hi is not None else 'not reachable'} |")
+              report+=['',
+                'Owner-provided illustrative ranges are **diagnostic questions** only. They are not independent dynasty FV labels, calibration targets, constraints, or proof that an alternative multiplier is correct.',
+                'Forward 2026 points in the ledger are frozen preseason—not independently measured FV points. DLF numeric market data is also not independent FV truth.',
+                '',
+                '## Model direction','',
+                'The present price equation exactly describes the frozen data; uncertainty lies in whether its age/production/position parameters imply sensible **dynasty** values. Before any deployment, define a forward multi-year production/survival utility and validate it against independently dated evidence, holding scarcity and market interpretation separate.',
+                'Do not turn this sensitivity decomposition into an arbitrary additive boost. Do not edit `index.html` or delete the 15 live overrides automatically.',
+                '',
+                '## Provenance and guardrails','',
+                *[f'- `{p}` pinned Git blob `{sha}`' for p,sha in PINNED.items()],
+                '- No 2026 weeks, no V1R27 or V1R38 holdout, no DLF/4for4 private rows, no production modification.',
+                '- Source drift is a hard stop: regenerate an explicitly versioned read-only study if the live file changes.',
+                '' ]
+              files['CAL26_V1R40_report.md']='\n'.join(report)
+              for name,content in files.items():
+                  (out/name).write_text(content,encoding='utf8')
+              manifest={'workflow':'CAL26 V1R40 - FV Formula Parity and Live Overlay Reconciliation (Read Only)',
+                        'semantic_status':'RESEARCH_ONLY_FV_STRUCTURE_VERIFIED_PRODUCTION_HOLD',
+                        'mutates_production':False,'pricing_change_authorized':False,
+                        'fitted_a_new_fv_model':False,'owner_ranges_are_training_labels':False,
+                        'future_holdout_accessed':False,'v1r27_qb_holdout_untouched':True,
+                        'v1r38_offense_preholdout_untouched':True,
+                        'private_provider_rows_read':False,'index_html_modified':False,
+                        'input_git_blobs':PINNED,'checks':checks,
+                        'artifacts_sha256':{name:hashlib.sha256(v.encode('utf8')).hexdigest() for name,v in files.items()}}
+              (out/'CAL26_V1R40_manifest.json').write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n',encoding='utf8')
+              return manifest
+          
+          
+          def selftest():
+              check(js_round_nonnegative(1072.5)==1073,'JS half-point rounding')
+              check(abs(qb_prepeak_age(23,0.809)-0.851446428571)<0.00002,'QB prepeak age math')
+              for age in (21,22,23,24,25,26):
+                  for pm in (.15,.65,.80,1.35,1.55):
+                      value=js_round_nonnegative(7150*qb_prepeak_age(age,pm)*pm)
+                      inferred=qb_required_pm(age,value)
+                      check(inferred is not None and abs(js_round_nonnegative(7150*qb_prepeak_age(age,inferred)*inferred)-value)<1e-6,'inverse QB roundtrip')
+              check(qb_required_pm(23,20000) is None,'unreachable hypothetical')
+              print('SELFTEST_GREEN: JS rounding; production-coupled QB age; inverse-monotone solution')
+          
+          
+          def main():
+              pa=argparse.ArgumentParser()
+              pa.add_argument('--selftest',action='store_true')
+              pa.add_argument('--repo',type=Path,default=Path('.'))
+              pa.add_argument('--out',type=Path,default=Path('cal26-v1r40-out'))
+              args=pa.parse_args()
+              if args.selftest:selftest();return
+              for path,sha in PINNED.items():
+                  check((args.repo/path).is_file(),'PINNED_SOURCE_MISSING '+path)
+                  got=repo_blob_sha(args.repo,path)
+                  check(got==sha,f'PINNED_SOURCE_GIT_SHA_MISMATCH {path}: {got}')
+              data=(load_json(args.repo/P1),load_json(args.repo/P2),(args.repo/LIVE).read_text(encoding='utf8'))
+              m=output(data,args.out)
+              print(m['semantic_status']);print(m['checks'])
+          
+          
+          if __name__=='__main__':main()
+          PY_CAL26_V1R40_EOF
+          python -m py_compile "$RUNNER_TEMP/cal26_v1r40.py"
+          python "$RUNNER_TEMP/cal26_v1r40.py" --selftest
+          python "$RUNNER_TEMP/cal26_v1r40.py" --repo "$GITHUB_WORKSPACE" --out "$RUNNER_TEMP/cal26-v1r40"
+          python - "$RUNNER_TEMP/cal26-v1r40/CAL26_V1R40_manifest.json" <<'PY_CAL26_V1R40_ASSERT'
+          import json,sys
+          m=json.load(open(sys.argv[1],encoding='utf8'))
+          assert m['semantic_status']=='RESEARCH_ONLY_FV_STRUCTURE_VERIFIED_PRODUCTION_HOLD'
+          assert m['checks']['frozen_player_count']==549
+          assert m['checks']['phase1_candidate_count']==518
+          assert m['checks']['live_named_override_declarations']==15
+          assert max(m['checks']['per_position_max_abs_rounding_difference'].values())<=1
+          assert not m['pricing_change_authorized'] and not m['mutates_production']
+          assert not m['future_holdout_accessed'] and not m['private_provider_rows_read']
+          assert not m['owner_ranges_are_training_labels']
+          assert m['v1r27_qb_holdout_untouched'] and m['v1r38_offense_preholdout_untouched']
+          print('GREEN: 549-player formula parity; 518 phase1 candidates; 15 live override declarations')
+          PY_CAL26_V1R40_ASSERT
+          test -s "$RUNNER_TEMP/cal26-v1r40/CAL26_V1R40_report.md"
+          test -s "$RUNNER_TEMP/cal26-v1r40/CAL26_V1R40_frozen_549_formula_attribution.csv"
+          test -s "$RUNNER_TEMP/cal26-v1r40/CAL26_V1R40_live_overlay_15_declarations.csv"
+          test -s "$RUNNER_TEMP/cal26-v1r40/CAL26_V1R40_five_QB_inverse_diagnostic.csv"
+          test -s "$RUNNER_TEMP/cal26-v1r40/CAL26_V1R40_manifest.json"
+          test -z "$(git status --porcelain)"
+          echo '## CAL26 V1R40 — read-only formula and overlay audit' >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/cal26-v1r40/CAL26_V1R40_report.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload reproducible research-only artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: CAL26_V1R40_FV_STRUCTURE_RESEARCH_ONLY
+          path: ${{ runner.temp }}/cal26-v1r40/
+          if-no-files-found: error
+          retention-days: 90
