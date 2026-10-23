@@ -1,0 +1,463 @@
+name: CAL26 V1R37 - Four Position Preseason Outcome Benchmark (Read Only)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cal26-v1r37-read-only-outcome-benchmark
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out frozen repository evidence
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python stdlib environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Materialize and run self-tests of V1R37 research-only analyzer
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/cal26_v1r37_engine.py" <<'PYSCRIPT'
+          #!/usr/bin/env python3
+          """CAL26 V1R37: immutable preseason forecasts versus Weeks 1-6 outcomes.
+          Pure Python stdlib; standalone research only. No FV writes or future holdout reads.
+          """
+          from __future__ import annotations
+          import argparse
+          import hashlib
+          import json
+          import math
+          import random
+          import statistics
+          import subprocess
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+          
+          PATH_PRE = 'research/production-v2/production_v2_phase2_preseason_baseline.json'
+          PATH_OUT = 'research/opportunity-v2/opportunity_v2_phase5_evaluation.json'
+          SHA_PRE = 'ed5025134ca5992b460fa8b850033f82d7ea450f'
+          SHA_OUT = '7055b9d0e01befcba9fbe05cc72db86846c91f7b'
+          POSITIONS = ('QB', 'RB', 'WR', 'TE')
+          MODELS = (
+              'history', 'fantasypros', 'sleeper', 'preseason_blend',
+              'frozen_reference_45_55', 'illustrative_history_forward_50_50',
+          )
+          MODEL_LABELS = {
+              'history': '2025 historical component',
+              'fantasypros': 'FantasyPros 2026 preseason',
+              'sleeper': 'Sleeper 2026 preseason',
+              'preseason_blend': '50/50 preseason providers',
+              'frozen_reference_45_55': 'Sept. 3 frozen reference (45% history / 55% forward)',
+              'illustrative_history_forward_50_50': 'Illustrative 50% history / 50% forward',
+          }
+          PRIMARY_EXPECTED = {'QB': 28, 'RB': 52, 'WR': 65, 'TE': 28}
+          
+          
+          def require(condition, text):
+              if not condition:
+                  raise AssertionError(text)
+          
+          
+          def isfinite(x):
+              return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+          
+          
+          def read_json_strict(path):
+              # This hook fails on duplicate JSON keys rather than silently replacing player identities.
+              def reject_dupes(pairs):
+                  obj = {}
+                  for key, value in pairs:
+                      require(key not in obj, f'Duplicate JSON key {key!r} in {path}')
+                      obj[key] = value
+                  return obj
+              return json.loads(Path(path).read_text(encoding='utf-8'), object_pairs_hook=reject_dupes)
+          
+          
+          def git_sha(repo, relpath):
+              return subprocess.check_output(
+                  ['git', 'hash-object', '--', relpath], cwd=repo, text=True,
+              ).strip()
+          
+          
+          def rank_average(values):
+              ordered = sorted(enumerate(values), key=lambda pair: pair[1])
+              ranks = [0.0] * len(values)
+              i = 0
+              while i < len(ordered):
+                  j = i + 1
+                  while j < len(ordered) and ordered[j][1] == ordered[i][1]:
+                      j += 1
+                  rank = (i + 1 + j) / 2.0
+                  for k in range(i, j):
+                      ranks[ordered[k][0]] = rank
+                  i = j
+              return ranks
+          
+          
+          def correlation(x, y):
+              if len(x) < 3 or len(x) != len(y):
+                  return None
+              mx = statistics.fmean(x)
+              my = statistics.fmean(y)
+              xx = sum((v - mx) ** 2 for v in x)
+              yy = sum((v - my) ** 2 for v in y)
+              if xx <= 0 or yy <= 0:
+                  return None
+              xy = sum((a - mx) * (b - my) for a, b in zip(x, y))
+              return xy / math.sqrt(xx * yy)
+          
+          
+          def spearman(rows, model):
+              return correlation(rank_average([r[model] for r in rows]),
+                                 rank_average([r['ppg'] for r in rows]))
+          
+          
+          def quantile(vs, q):
+              xs = sorted(vs)
+              if not xs:
+                  return None
+              index = (len(xs) - 1) * q
+              lo = int(index)
+              fraction = index - lo
+              return xs[lo] + (xs[min(lo + 1, len(xs) - 1)] - xs[lo]) * fraction
+          
+          
+          def bootstrap_deltas(rows, trials, seed):
+              """Resample *players*, preserving outcome/forecast pairing and position."""
+              rng = random.Random(seed)
+              result = {name: [] for name in MODELS if name != 'history'}
+              n = len(rows)
+              for _ in range(trials):
+                  sample = [rows[rng.randrange(n)] for _ in range(n)]
+                  base = spearman(sample, 'history')
+                  if base is None:
+                      continue
+                  for model, dist in result.items():
+                      rho = spearman(sample, model)
+                      if rho is not None:
+                          dist.append(rho - base)
+              observed_history = spearman(rows, 'history')
+              return {
+                  model: {
+                      'observed_delta': round(spearman(rows, model) - observed_history, 6),
+                      'paired_player_bootstrap_ci95': [round(quantile(values, .025), 6),
+                                                        round(quantile(values, .975), 6)]
+                                                       if values else None,
+                      'valid_draws': len(values),
+                  }
+                  for model, values in result.items()
+              }
+          
+          
+          def prepare(pre, outcome):
+              frozen = pre['frozen_players']
+              realized = outcome['realized_player_outcomes']
+              require(len(frozen) == 549, 'Unexpected frozen-player count')
+              require(len(realized) == 426, 'Unexpected actual-outcome count')
+              require(pre.get('status') == 'FROZEN_PRESEASON_BASELINE_RESEARCH_ONLY',
+                      'Preseason source no longer frozen research-only')
+              require(pre.get('production_mutation_authorized') is False,
+                      'Unexpected production-authorization flag in baseline')
+              require(outcome.get('status') == 'EARLY_DIAGNOSTIC_ONLY',
+                      'Unexpected opportunity status; review before comparisons')
+              require(outcome.get('deployment_authorized') is False,
+                      'Opportunity file appears production-authorized')
+              require(outcome.get('production_files_mutated') == 0,
+                      'Source reports production mutation')
+              require(outcome.get('completed_outcome_weeks') == [1, 2, 3, 4, 5, 6],
+                      'Outcomes no longer restricted to Weeks 1-6')
+              ref = pre.get('reference_scenario', {})
+              for name, expected in [('history_weight', .45), ('forward_weight', .55),
+                                     ('fantasypros_weight', .5), ('sleeper_weight_when_both', .5)]:
+                  require(ref.get(name) == expected, f'Preseason ref mismatch: {name}')
+              require(set(realized).issubset(set(frozen)),
+                      'Outcome identities missing from frozen player keys')
+              ids = defaultdict(list)
+              for name, player in frozen.items():
+                  if player.get('pos') in POSITIONS and player.get('sleeper_id') is not None:
+                      ids[str(player['sleeper_id'])].append(name)
+              duplicate_ids = {key: names for key, names in ids.items() if len(names) > 1}
+              require(not duplicate_ids, f'Duplicate offense Sleeper IDs: {duplicate_ids}')
+              rows = {pos: [] for pos in POSITIONS}
+              counts = {pos: Counter() for pos in POSITIONS}
+              projection_drift = []
+              outcome_drift = []
+              for name, player in frozen.items():
+                  pos = player.get('pos')
+                  if pos not in POSITIONS:
+                      continue
+                  c = counts[pos]
+                  c['universe'] += 1
+                  fp = player.get('fantasypros_2026_points')
+                  sleeper = player.get('sleeper_2026_points')
+                  history = player.get('history_component_2025')
+                  if player.get('history_note') == 'real':
+                      c['real_history'] += 1
+                  if isfinite(fp) and isfinite(sleeper):
+                      c['both_preseason'] += 1
+                      canon = player.get('canonical_forward_2026_points')
+                      if not isfinite(canon) or abs((fp + sleeper) / 2.0 - canon) > .0001:
+                          projection_drift.append(name)
+                  actual = realized.get(name)
+                  if not actual:
+                      c['excluded_no_outcome'] += 1
+                      continue
+                  c['matched_outcome'] += 1
+                  games = actual.get('active_games')
+                  ppg = actual.get('active_ppg')
+                  total = actual.get('total_points')
+                  if isfinite(games) and isfinite(ppg) and isfinite(total):
+                      if abs(total - games * ppg) > .0001:
+                          outcome_drift.append(name)
+                  if not isfinite(games) or games < 3:
+                      c['excluded_games_lt3'] += 1
+                      continue
+                  if not isfinite(ppg) or ppg <= 0:
+                      c['excluded_ppg_nonpositive'] += 1
+                      continue
+                  if not isfinite(fp):
+                      c['excluded_missing_fp'] += 1
+                      continue
+                  if not isfinite(sleeper):
+                      c['excluded_missing_sleeper'] += 1
+                      continue
+                  if player.get('history_note') != 'real' or not isfinite(history):
+                      c['excluded_history_nonreal'] += 1
+                      continue
+                  fwd = .5 * fp + .5 * sleeper
+                  rows[pos].append({
+                      'name': name, 'games': games, 'ppg': ppg,
+                      'history': history, 'fantasypros': fp, 'sleeper': sleeper,
+                      'preseason_blend': fwd,
+                      'frozen_reference_45_55': .45 * history + .55 * fwd,
+                      'illustrative_history_forward_50_50': .5 * history + .5 * fwd,
+                  })
+                  c['eligible_primary'] += 1
+              require(not projection_drift, f'Canonical preseason blend drift: {projection_drift[:10]}')
+              require(not outcome_drift, f'Actual PPG arithmetic drift: {outcome_drift[:10]}')
+              require({k: len(v) for k, v in rows.items()} == PRIMARY_EXPECTED,
+                      '173-player preregistered same-person comparison cohort changed')
+              return rows, counts, duplicate_ids
+          
+          
+          def make_results(repo, output, bootstrap_trials=1500):
+              pre_path = Path(repo) / PATH_PRE
+              out_path = Path(repo) / PATH_OUT
+              sha_pre = git_sha(repo, PATH_PRE)
+              sha_out = git_sha(repo, PATH_OUT)
+              require(sha_pre == SHA_PRE, f'Preseason Git blob SHA changed: {sha_pre}')
+              require(sha_out == SHA_OUT, f'Actuals Git blob SHA changed: {sha_out}')
+              pre = read_json_strict(pre_path)
+              actual = read_json_strict(out_path)
+              rows, counts, duplicate_ids = prepare(pre, actual)
+              primary = {}
+              sensitivity = {}
+              for index, pos in enumerate(POSITIONS):
+                  cohort = rows[pos]
+                  primary[pos] = {
+                      'n': len(cohort),
+                      'spearman_vs_weeks1_6_active_ppg': {
+                          k: round(spearman(cohort, k), 6) for k in MODELS
+                      },
+                      'delta_vs_history_paired_bootstrap': bootstrap_deltas(
+                          cohort, bootstrap_trials, seed=1372026 + 9973 * index),
+                  }
+                  # Sensitivity uses the same source-complete cohort, but games >=2 is added
+                  # after the >=3 source eligibility stage. Thus recompute rows for >=2 below.
+                  sensitivity[pos] = {}
+              # Complete-case source cohort for sensitivity, independent of outcome min-games.
+              bypos = {pos: [] for pos in POSITIONS}
+              for name, x in pre['frozen_players'].items():
+                  pos = x.get('pos')
+                  o = actual['realized_player_outcomes'].get(name)
+                  if pos not in bypos or o is None:
+                      continue
+                  fp, sl, hi = (x.get('fantasypros_2026_points'),
+                                x.get('sleeper_2026_points'), x.get('history_component_2025'))
+                  if x.get('history_note') != 'real' or not all(isfinite(t) for t in (fp, sl, hi)):
+                      continue
+                  if not isfinite(o.get('active_games')) or not isfinite(o.get('active_ppg')) or o['active_ppg'] <= 0:
+                      continue
+                  fwd = (fp + sl) / 2.0
+                  bypos[pos].append({
+                      'name': name, 'games': o['active_games'], 'ppg': o['active_ppg'],
+                      'history': hi, 'fantasypros': fp, 'sleeper': sl,
+                      'preseason_blend': fwd,
+                      'frozen_reference_45_55': .45 * hi + .55 * fwd,
+                      'illustrative_history_forward_50_50': .5 * hi + .5 * fwd,
+                  })
+              for pos in POSITIONS:
+                  for threshold in [2, 3, 4, 5]:
+                      cohort = [x for x in bypos[pos] if x['games'] >= threshold]
+                      sensitivity[pos][str(threshold)] = {
+                          'n': len(cohort),
+                          'spearman': {k: round(spearman(cohort, k), 6) for k in MODELS},
+                      }
+              result = {
+                  'name': 'CAL26 V1R37 Read-Only Prospective Outcome Benchmark',
+                  'status': 'RESEARCH_COMPLETE_PRODUCTION_HOLD',
+                  'production_change_authorized': False,
+                  'source_provenance': {
+                      'frozen_preseason_file': PATH_PRE, 'preseason_git_blob_sha': sha_pre,
+                      'actuals_file': PATH_OUT, 'actuals_git_blob_sha': sha_out,
+                      'baseline_input_sha256': pre.get('input_sha256'),
+                      'actuals_source_frozen_at_utc': actual.get('frozen_at_utc'),
+                      'actuals_generated_at_utc': actual.get('generated_at_utc'),
+                      'completed_outcome_weeks': actual['completed_outcome_weeks'],
+                      'source_truth_note': 'Read-only Git commit-local files; not a new ROS snapshot.',
+                  },
+                  'cohort_qa': {
+                      'frozen_universe': len(pre['frozen_players']),
+                      'offensive_universe': sum(counts[p]['universe'] for p in POSITIONS),
+                      'realized_outcome_count': len(actual['realized_player_outcomes']),
+                      'identity_join': 'Exact canonical name key only; no fuzzy matches.',
+                      'all_realized_identities_in_frozen_universe': True,
+                      'duplicate_offensive_sleeper_ids': duplicate_ids,
+                      'within_provider_preseason_blend_parity': 'PASS',
+                      'outcome_active_ppg_arithmetic': 'PASS',
+                      'by_position': {p: dict(counts[p]) for p in POSITIONS},
+                      'primary_complete_case_n': sum(len(rows[p]) for p in POSITIONS),
+                  },
+                  'models': MODEL_LABELS,
+                  'outcome_metric': 'league-scored 2026 weeks 1-6 points per active game',
+                  'ranking_metric': 'Spearman rank correlation, average-rank tie handling',
+                  'bootstrap': {
+                      'unit': 'paired players sampled with replacement within each position',
+                      'draws_per_position': bootstrap_trials,
+                      'interval': 'empirical percentile 95% interval; exploratory, no multiple-testing correction',
+                      'seed': 1372026,
+                  },
+                  'primary': primary,
+                  'sensitivity_min_active_games': sensitivity,
+                  'interpretation': {
+                      'no_lookahead': 'Frozen September 2026 preseason file vs completed Weeks 1-6 only.',
+                      'holdout_protection': 'V1R27 Weeks 8-12 / 13-18 prediction holdout never read, tested, or altered.',
+                      'weights': '45/55 is source-frozen September 3 reference; illustrative 50/50 history-forward was not pre-registered.',
+                      'not_measuring': ['numerical FV accuracy', 'DLF market price accuracy',
+                                        'season-average calibrated fantasy points error',
+                                        'ROS projection accuracy', 'future Weeks 8-12 generalization'],
+                      'license_note': 'No DLF or 4for4 licensed rows used or emitted.',
+                      'action': 'No index.html edits, FV writes, model selection, or deployment authorization.',
+                  },
+              }
+              outdir = Path(output)
+              outdir.mkdir(parents=True, exist_ok=True)
+              (outdir / 'CAL26_V1R37_results.json').write_text(
+                  json.dumps(result, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+              lines = [
+                  '# CAL26 V1R37 — Offensive Forecast Evidence (Read Only)',
+                  '', '**Status:** RESEARCH COMPLETE / PRODUCTION HOLD', '',
+                  'Source: September 3 frozen preseason evidence and 2026 Weeks 1–6 outcomes.',
+                  'The files are checked against hard-pinned Git blob SHAs; V1R27 future holdouts were not read.', '',
+                  '## Primary same-player ranking benchmark', '',
+                  '| Position | n | History | FantasyPros | Sleeper | FP/Sleeper 50/50 | Frozen 45/55 history/forward | Illustrative 50/50 history/forward |',
+                  '|---|---:|---:|---:|---:|---:|---:|---:|',
+              ]
+              for pos in POSITIONS:
+                  s = primary[pos]['spearman_vs_weeks1_6_active_ppg']
+                  lines.append(f'| {pos} | {primary[pos]["n"]} | {s["history"]:.3f} | '
+                               f'{s["fantasypros"]:.3f} | {s["sleeper"]:.3f} | '
+                               f'{s["preseason_blend"]:.3f} | {s["frozen_reference_45_55"]:.3f} | '
+                               f'{s["illustrative_history_forward_50_50"]:.3f} |')
+              lines += ['', '## Paired player bootstrap, gain versus history', '',
+                        '95% percentile bootstrap intervals (exploratory; correlated sources and many comparisons).', '',
+                        '| Position | Preseason 50/50 gain (CI) | Frozen 45/55 gain (CI) |',
+                        '|---|---|---|']
+              for pos in POSITIONS:
+                  d = primary[pos]['delta_vs_history_paired_bootstrap']
+                  def fmt(k):
+                      e = d[k]
+                      ci = e['paired_player_bootstrap_ci95']
+                      return f'{e["observed_delta"]:+.3f} ({ci[0]:+.3f}, {ci[1]:+.3f})'
+                  lines.append(f'| {pos} | {fmt("preseason_blend")} | {fmt("frozen_reference_45_55")} |')
+              lines += ['', '## Source, identity, and exclusion QA', '',
+                        f'- Frozen players: {len(pre["frozen_players"])} total; {result["cohort_qa"]["offensive_universe"]} offensive.',
+                        f'- Actual outcomes: {len(actual["realized_player_outcomes"])}; Weeks {actual["completed_outcome_weeks"]}.',
+                        '- Exact-name realized-player join: all outcomes map into frozen source; no fuzzy identities.',
+                        '- Zero duplicate offensive Sleeper IDs; projection 50/50 arithmetic and outcome PPG arithmetic pass.',
+                        '- Exclusions are sequential: no outcome, under three games, nonpositive PPG, missing FP, missing Sleeper, invalid/non-real history.',
+                        '- Primary cohort: QB 28 / RB 52 / WR 65 / TE 28 = **173 players**.', '',
+                        '## Sensitivity: eligibility by minimum active games', '',
+                        '| Position | Min games | n | History | Preseason blend | Frozen history+forward |',
+                        '|---|---:|---:|---:|---:|---:|']
+              for pos in POSITIONS:
+                  for min_games in ['2', '3', '4', '5']:
+                      ss = sensitivity[pos][min_games]
+                      score = ss['spearman']
+                      lines.append(f'| {pos} | {min_games} | {ss["n"]} | {score["history"]:.3f} | '
+                                   f'{score["preseason_blend"]:.3f} | {score["frozen_reference_45_55"]:.3f} |')
+              lines += ['', '## Interpretation and restrictions', '',
+                        '- Year-scale points cannot be compared to weekly PPG as an MAE/RMSE without a justified active-game denominator. Only within-position ordering is tested.',
+                        '- Six early outcome weeks are noisy; player-bootstrap intervals do not establish future calibration or definitive winning weights.',
+                        '- 45% history / 55% forward is a source-frozen September 3 reference. A 50/50 history-forward comparison is descriptive and not pre-registered.',
+                        '- Position Spearman correlations do not translate directly into dynasty FV points or cross-position value tiers.',
+                        '- DLF, 4for4, private calibration inputs, later ROS vintages, and Weeks 8–12/13–18 holdouts are not read.',
+                        '- **NO PRODUCTION AUTHORIZATION:** `index.html` and FV/MV prices remain unchanged.', '',
+                        '### Source Git blob SHAs', '',
+                        f'- Preseason: `{sha_pre}`', f'- Outcomes: `{sha_out}`', '',
+                        'Run-generated detailed machine-readable stats: `CAL26_V1R37_results.json`.', '']
+              (outdir / 'CAL26_V1R37_report.md').write_text('\n'.join(lines), encoding='utf-8')
+              print('GREEN: V1R37 read-only evidence analysis completed (NOT production authorization)')
+              print('Primary cohorts:', {p: len(rows[p]) for p in POSITIONS})
+              for pos in POSITIONS:
+                  print(pos, primary[pos]['spearman_vs_weeks1_6_active_ppg'])
+              return result
+          
+          
+          def selftest():
+              require(rank_average([1, 3, 3, 7]) == [1, 2.5, 2.5, 4], 'Average tie-rank error')
+              require(abs(spearman([{'history': x, 'ppg': x} for x in [1, 2, 3, 4]], 'history') - 1) < 1e-12,
+                      'Perfect-correlation test failure')
+              require(abs(spearman([{'history': x, 'ppg': -x} for x in [1, 2, 3, 4]], 'history') + 1) < 1e-12,
+                      'Reverse-correlation test failure')
+              require(spearman([{'history': 1, 'ppg': x} for x in [1, 2, 3]], 'history') is None,
+                      'Constant ranks must be undefined')
+              sample = [dict(history=float(x), fantasypros=float(x), sleeper=float(x),
+                             preseason_blend=float(x), frozen_reference_45_55=float(x),
+                             illustrative_history_forward_50_50=float(x), ppg=float(x))
+                        for x in range(1, 9)]
+              require(bootstrap_deltas(sample, 25, 42)['fantasypros']['observed_delta'] == 0.0,
+                      'Bootstrap pairing test failed')
+              print('GREEN: rank ties, correlation, guards, and bootstrap self-tests')
+          
+          
+          if __name__ == '__main__':
+              parser = argparse.ArgumentParser()
+              parser.add_argument('--repo-root', default='.')
+              parser.add_argument('--output', default='cal26_v1r37_outputs')
+              parser.add_argument('--bootstrap-trials', type=int, default=1500)
+              parser.add_argument('--self-test', action='store_true')
+              args = parser.parse_args()
+              if args.self_test:
+                  selftest()
+              else:
+                  make_results(args.repo_root, args.output, args.bootstrap_trials)
+          PYSCRIPT
+          python "$RUNNER_TEMP/cal26_v1r37_engine.py" --self-test
+          python "$RUNNER_TEMP/cal26_v1r37_engine.py" --repo-root "$GITHUB_WORKSPACE" --output "$RUNNER_TEMP/cal26_v1r37_outputs"
+          test -s "$RUNNER_TEMP/cal26_v1r37_outputs/CAL26_V1R37_results.json"
+          test -s "$RUNNER_TEMP/cal26_v1r37_outputs/CAL26_V1R37_report.md"
+          grep -q 'RESEARCH COMPLETE / PRODUCTION HOLD' "$RUNNER_TEMP/cal26_v1r37_outputs/CAL26_V1R37_report.md"
+          cp -R "$RUNNER_TEMP/cal26_v1r37_outputs" ./cal26_v1r37_outputs
+
+      - name: Upload reproducible read-only evidence artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CAL26_V1R37_Four_Position_Outcome_Review
+          path: cal26_v1r37_outputs/
+          if-no-files-found: warn
+          retention-days: 30
