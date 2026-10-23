@@ -1,0 +1,370 @@
+name: CAL26 V1R41 - QB Multi-Year Surplus and Shadow Bridge (Read Only)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cal26-v1r41-qb-multiyear-readonly
+  cancel-in-progress: false
+
+jobs:
+  verify-qb-surplus-shadow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout frozen source references
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build 54 QB replacement board and 31 QB shadow diagnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/cal26_v1r41.py" <<'PY_CAL26_V1R41_ENGINE'
+          #!/usr/bin/env python3
+          """CAL26 V1R41 QB multi-year surplus and fixed-distribution diagnostic.
+          
+          Research only. Inputs: frozen 2026 preseason / phase1 structural data, live overlay guard.
+          No outcomes, no private providers, no writing to production. Future paths are assumptions.
+          """
+          from __future__ import annotations
+          import argparse
+          from collections import Counter
+          import csv
+          import hashlib
+          import io
+          import json
+          import math
+          from pathlib import Path
+          import re
+          import subprocess
+          
+          P1='research/production-v2/production_v2_phase1_audit.json'
+          P2='research/production-v2/production_v2_phase2_preseason_baseline.json'
+          LIVE='index.html'
+          PINNED={P1:'bdd4657ff45e0c64f1406f27c1ffe6ad2e597d31',
+                  P2:'ed5025134ca5992b460fa8b850033f82d7ea450f',
+                  LIVE:'5630bb681dd8710f8e45bc5363488f358ce9ebe2'}
+          REPLACEMENT=(18,24,30)
+          PERSISTENCE=(0.8,0.9,1.0)
+          TERMINAL_AGES=(35,38,41)
+          DISCOUNT=.85
+          HORIZON=5
+          PRIMARY=(24,.9,38)
+          FOCUS=('bryce young','jayden daniels','cj stroud','caleb williams','drake maye')
+          
+          
+          def check(cond,msg):
+              if not cond: raise AssertionError(msg)
+          
+          
+          def numeric(x):
+              return type(x) in (int,float) and math.isfinite(x)
+          
+          
+          def csv_text(rows,fields):
+              f=io.StringIO(newline='')
+              w=csv.DictWriter(f,fieldnames=fields,extrasaction='ignore',lineterminator='\n')
+              w.writeheader()
+              for r in rows:w.writerow({k:'' if r.get(k) is None else r[k] for k in fields})
+              return f.getvalue()
+          
+          
+          def load_json(path):
+              def unique(items):
+                  d={}
+                  for k,v in items:
+                      check(k not in d,'SOURCE_DUPLICATE_JSON_KEY '+k)
+                      d[k]=v
+                  return d
+              return json.loads(Path(path).read_text(encoding='utf8'),object_pairs_hook=unique)
+          
+          
+          def blob_sha(repo,path):
+              return subprocess.check_output(['git','hash-object','--',path],cwd=repo,text=True).strip()
+          
+          
+          def extract_overrides(src):
+              m=re.search(r'\bconst\s+CAL26_FV_OWNER_ANCHORS\s*=\s*\{([^}]*)\}',src)
+              check(m is not None,'LIVE_OVERLAY_BLOCK_MISSING')
+              entries=re.findall(r"'([^']+)'\s*:\s*(\d+)",m.group(1))
+              d={}
+              for n,p in entries:
+                  check(n not in d,'LIVE_OVERLAY_DUPLICATE '+n)
+                  d[n]=int(p)
+              check(len(d)==15,'LIVE_OVERLAY_COUNT_DRIFT')
+              check('canonical.pos === pos && canonical.age === age && canonical.role === role' in src,
+                    'LIVE_OVERLAY_GUARD_DRIFT')
+              return d
+          
+          
+          def score(forward,age,repl,retention,terminal_age,discount=DISCOUNT,horizon=HORIZON):
+              """Illustrative continuation, not measured survival probability or FV truth.
+          
+              Replacement supply decays at the same assumed rate as player scoring to
+              avoid penalizing every future year simply because of an inconsistent unit.
+              Current season is always included. Terminal age cuts ONLY future seasons.
+              """
+              assert numeric(forward) and numeric(repl) and forward>=0 and repl>=0
+              assert numeric(age) and 0<retention<=1 and 0<discount<=1
+              per_year=[]
+              for y in range(horizon):
+                  eligible=(y==0 or age+y<=terminal_age)
+                  amount=max(0,(forward-repl)*(retention**y))*(discount**y) if eligible else 0.
+                  per_year.append(amount)
+              return sum(per_year),per_year
+          
+          
+          def evaluate(p1,p2,live):
+              check(p1.get('status')=='RESEARCH_ONLY_NO_PRODUCTION_CHANGE_AUTHORIZED','P1_STATUS_DRIFT')
+              check(p2.get('status')=='FROZEN_PRESEASON_BASELINE_RESEARCH_ONLY','P2_STATUS_DRIFT')
+              check(p1.get('production_mutation_authorized') is False,'P1_MUTATION_DRIFT')
+              check(p2.get('production_mutation_authorized') is False,'P2_MUTATION_DRIFT')
+              check(len(p1['players'])==549 and len(p2['frozen_players'])==549,'FROZEN_PLAYER_COUNT_DRIFT')
+              check(p1['players'].keys()==p2['frozen_players'].keys(),'FROZEN_IDENTITY_UNIVERSE_DRIFT')
+              overlay=extract_overrides(live)
+              p1q={k:v for k,v in p1['players'].items() if v.get('pos')=='QB'}
+              p2q={k:v for k,v in p2['frozen_players'].items() if v.get('pos')=='QB'}
+              check(len(p1q)==len(p2q)==64,'QB_UNIVERSE_DRIFT')
+              available=[]; paired=[]; qa=Counter()
+              for name,src in sorted(p2q.items()):
+                  p=p1q[name]
+                  check(src.get('pos')==p.get('pos')=='QB','QB_POSITION_DRIFT '+name)
+                  check(src.get('age')==p.get('age'),'QB_AGE_DRIFT '+name)
+                  check(src.get('current_fundamental_value')==p['current']['fundamental_value'],
+                        'FROZEN_FV_PARITY_DRIFT '+name)
+                  forward=src.get('canonical_forward_2026_points')
+                  if not numeric(forward) or forward<=0:
+                      qa['no_forward']+=1
+                      continue
+                  fp,sl=src.get('fantasypros_2026_points'),src.get('sleeper_2026_points')
+                  if numeric(fp) and numeric(sl):
+                      check(abs((fp+sl)/2-forward)<1e-4,'FORWARD_SOURCE_PARITY '+name)
+                      qa['has_both_providers']+=1
+                  else:qa['single_provider_or_no_pair']+=1
+                  r={'name':name,'age':src['age'],'role':src['role'],'forward':forward,
+                     'history':src.get('history_component_2025'),
+                     'source':src.get('forward_source'),
+                     'frozen_fv':src['current_fundamental_value'],
+                     'named_live_override_declared':name in overlay,
+                     'live_override_declaration':overlay.get(name)}
+                  available.append(r)
+                  if numeric(fp) and numeric(sl) and src.get('history_note')=='real' and numeric(src.get('history_component_2025')):
+                      r['source_2026_fp']=fp;r['source_2026_sleeper']=sl
+                      paired.append(r)
+              check(len(available)==54 and len(paired)==31,'PROSPECTIVE_COHORT_DRIFT: '+str((len(available),len(paired))))
+              for name in FOCUS:
+                  check(name in {r['name'] for r in paired},'FOCUS_QB_MISSING '+name)
+              replacement={}
+              full=sorted(available,key=lambda a:(-a['forward'],a['name']))
+              for rank in REPLACEMENT:
+                  x=full[rank-1]
+                  replacement[rank]={'name':x['name'],'preseason_points':x['forward']}
+              check(all(replacement[a]['preseason_points']>replacement[b]['preseason_points'] for a,b in [(18,24),(24,30)]),
+                    'REPLACEMENT_MONOTONIC_DRIFT')
+              # Price comparison uses precisely the 31 frozen points, never owner targets,
+              # fitted prices, DLF, MV, or the 15 live named overlays.
+              original_prices=sorted((x['frozen_fv'] for x in paired),reverse=True)
+              check(len(original_prices)==31,'PRICE_SET_DRIFT')
+              scenario_rows=[]; grouped={}
+              for rank in REPLACEMENT:
+                  repl=replacement[rank]['preseason_points']
+                  for persistence in PERSISTENCE:
+                      for terminal_age in TERMINAL_AGES:
+                          scenario=f'QB{rank}_R{int(persistence*100)}_A{terminal_age}'
+                          scored=[]
+                          for x in paired:
+                              utility,annual=score(x['forward'],x['age'],repl,persistence,terminal_age)
+                              scored.append({**x,'utility':utility,'annual':annual})
+                          scored.sort(key=lambda x:(-x['utility'],-x['forward'],x['name']))
+                          for k,x in enumerate(scored):
+                              assigned=original_prices[k]
+                              scenario_rows.append({'scenario':scenario,'replacement_rank':rank,
+                                     'replacement_player':replacement[rank]['name'],
+                                     'replacement_2026_points':repl,'retention_per_year_assumed':persistence,
+                                     'hypothetical_terminal_age':terminal_age,'discount':DISCOUNT,
+                                     'name':x['name'],'age':x['age'],'preseason_2026_points':x['forward'],
+                                     'history_2025_component':x['history'],'current_frozen_fv':x['frozen_fv'],
+                                     'utility_index_discounted_surplus_points':round(x['utility'],6),
+                                     'scenario_rank':k+1,
+                                     'rank_only_reassignment_DIAGNOSTIC_NOT_FV':assigned,
+                                     'diagnostic_delta_vs_frozen_fv':assigned-x['frozen_fv'],
+                                     'live_name_overlay_declared':x['named_live_override_declared']})
+                          grouped[scenario]=scored
+              check(len(scenario_rows)==31*27,'SCENARIO_CATALOG_COUNT_DRIFT')
+              primary_name=f'QB{PRIMARY[0]}_R{int(PRIMARY[1]*100)}_A{PRIMARY[2]}'
+              main=[r for r in scenario_rows if r['scenario']==primary_name]
+              check(len(main)==31,'PRIMARY_SCENARIO_COUNT_DRIFT')
+              check(sum(x['diagnostic_delta_vs_frozen_fv'] for x in main)==0,'PRICE_DISTRIBUTION_NOT_CONSERVED')
+              # As every scenario reassigns the same 31 existing frozen prices, each is zero sum.
+              for sc in grouped:
+                  rows=[r for r in scenario_rows if r['scenario']==sc]
+                  check(len(rows)==31 and sum(r['diagnostic_delta_vs_frozen_fv'] for r in rows)==0,
+                        'SCENARIO_PRICE_CONSERVATION '+sc)
+              byname={x['name']:[] for x in paired}
+              for row in scenario_rows:byname[row['name']].append(row)
+              rank_robust=[]
+              basebyname={r['name']:r for r in main}
+              for n,rows in sorted(byname.items()):
+                  ranks=[r['scenario_rank'] for r in rows]
+                  shadows=[r['rank_only_reassignment_DIAGNOSTIC_NOT_FV'] for r in rows]
+                  rank_robust.append({'name':n,'position':'QB','age':p1q[n]['age'],
+                      'frozen_FV':p2q[n]['current_fundamental_value'],
+                      'primary_rank':basebyname[n]['scenario_rank'],
+                      'primary_shadow_rank_only_fv':basebyname[n]['rank_only_reassignment_DIAGNOSTIC_NOT_FV'],
+                      'primary_shadow_rank_only_delta':basebyname[n]['diagnostic_delta_vs_frozen_fv'],
+                      'primary_2026_surplus_vs_QB24':round(max(0,p2q[n]['canonical_forward_2026_points']-replacement[24]['preseason_points']),4),
+                      'min_rank_over_27_scenarios':min(ranks),'max_rank_over_27_scenarios':max(ranks),
+                      'min_remapped_price_over_27_scenarios':min(shadows),
+                      'max_remapped_price_over_27_scenarios':max(shadows),
+                      'top_12_scenario_fraction':round(sum(r<=12 for r in ranks)/27,5),
+                      'named_live_override_declared':n in overlay})
+              check(len(rank_robust)==31,'ROBUSTNESS_COUNT_DRIFT')
+              # Spot check: Bryce Young has no instantaneous QB24 surplus in the frozen forecast.
+              bryce=next(x for x in rank_robust if x['name']=='bryce young')
+              check(bryce['primary_2026_surplus_vs_QB24']==0,'BRYCE_OPTIONALITY_DIAGNOSTIC_DRIFT')
+              qa=dict(qa)
+              qa.update({'frozen_QBs':64,'forward_qbs':54,'dual_source_real_history_qbs':31,
+                         'replacement_scenarios':len(REPLACEMENT),
+                         'terminal_age_scenarios':len(TERMINAL_AGES),
+                         'retention_scenarios':len(PERSISTENCE),
+                         'all_scenario_rows':len(scenario_rows),
+                         'named_live_overrides_declared':len(overlay),
+                         'main_zero_sum_shadow_delta':sum(r['diagnostic_delta_vs_frozen_fv'] for r in main),
+                         'bryce_QB24_forward_surplus_zero':True})
+              return replacement,full,main,scenario_rows,rank_robust,dict(qa)
+          
+          
+          def output(data,out):
+              repl,full,main,scenarios,robust,qa=evaluate(*data)
+              out.mkdir(parents=True,exist_ok=True)
+              csvs={
+                'CAL26_V1R41_54_QB_forward_replacement_board.csv':csv_text(full,['name','age','role','forward','history','source','frozen_fv','named_live_override_declared','live_override_declaration']),
+                'CAL26_V1R41_31_QB_primary_surplus_shadow.csv':csv_text(main,list(main[0])),
+                'CAL26_V1R41_837_QB_scenario_sensitivity.csv':csv_text(scenarios,list(scenarios[0])),
+                'CAL26_V1R41_31_QB_rank_robustness.csv':csv_text(robust,list(robust[0])),
+              }
+              mapp={row['name']:row for row in robust}
+              lines=['# CAL26 V1R41 — QB Multi-Year Surplus & Fixed-Distribution Shadow (Read Only)','',
+                '**Decision:** `RESEARCH_SHADOW_ONLY_NOT_AN_FV_CALIBRATION`; production remains HOLD.','',
+                '## Measured 2026 preseason evidence','',
+                '54/64 QBs have a usable frozen preseason forward projection. On a strictly comparable subset of 31 QBs, both FantasyPros and Sleeper 2026 forward data and REAL 2025 history exist.',
+                'The 2026 projection is real frozen source input, **not a calibrated five-year dynasty forecast**.',
+                '', '| Replacement rank (out of 54) | QB | League-scored season projections |','|---|---|---:|']
+              for k in REPLACEMENT:
+                  v=repl[k];lines.append(f"| QB{k} | {v['name']} | {v['preseason_points']:.3f} |")
+              lines+=['','## Scenario mechanics (assumptions NOT validated as probabilities)','',
+                'For each future year 0..4, `surplus_y = max(0, F2026 - replacement_F2026) × retention^y × 0.85^y`, with 0 for future years above the scenario terminal age. The current year always counts.',
+                'The QB and replacement projection share the **same** retention factor to avoid asymmetric future-year scaling. This is a continuation thought experiment, not an estimated career survival model.',
+                'All 27 scenarios cross replacement rank QB18 / QB24 / QB30, annual persistence 0.80 / 0.90 / 1.00, and assumed terminal age 35 / 38 / 41. Primary is QB24, 0.90, age38.',
+                'The optional rank-only shadow **reassigns the 31 already-existing frozen FV values** to scenario utility ranks. It is *zero-sum by construction* and **not an independent FV calibration, MV, a recommended new price, or an estimate of future market prices**.',
+                '', '## Five illustrative quarterbacks — primary scenario','',
+                '| QB | Frozen FV | Frozen forward Pts | QB24 year-0 surplus | Rank-only shadow diagnostic | Rank range across 27 scenarios |',
+                '|---|---:|---:|---:|---:|---:|']
+              for n in FOCUS:
+                  r=mapp[n];f=next(x for x in full if x['name']==n)
+                  lines.append(f"| {n} | {r['frozen_FV']:,} | {f['forward']:.3f} | {r['primary_2026_surplus_vs_QB24']:.3f} | {r['primary_shadow_rank_only_fv']:,} | {r['min_rank_over_27_scenarios']}–{r['max_rank_over_27_scenarios']} |")
+              lines+=['',
+                '### Why this is not a complete FV model',
+                'Bryce Young has **zero QB24 year-0 surplus** despite nonzero dynasty value. This exposes a missing component: future starter opportunity, breakout probability, and long-term option value need independent *historical longitudinal evidence* before turning surplus into a standalone dynasty price.',
+                'The proxy has no fit to multi-season dynasty outcomes and does not estimate age-specific availability or quarterback future breakout rates. Terminal ages and persistence values are explicit stress assumptions, not learned NFL probabilities.',
+                'The fixed-distribution rank remapping is an accounting diagnostic only. It cannot change total QB value or establish an independent point scale, and ties among zero-surplus players may depend on their forward projection tie-break.',
+                'The 15 preexisting live named overlays, including applicable QBs, are not copied into the shadow training targets. Snapshot dates are not interchangeable with current live quotes.',
+                '', '## Production-directed next step',
+                'Collect *pre-2026* season-to-season QB historical retention and next-year positional production by stable player ID and league scoring; fit and freeze age-conditional future survival / continuation outside the 2026 holdout. Only then convert utility to a proposed pricing bridge, with cross-position replacement economics separately vetted.',
+                '', '## Provenance',
+                *[f'- `{k}` — pinned Git blob `{v}`' for k,v in PINNED.items()],
+                '- No 2026 realized outcomes, private DLF/4for4 rows, owner targets, roster trades, or V1R27/V1R38 holdout opened.',
+                '- No `index.html`, frozen input, or deployed player FV is written.', '']
+              csvs['CAL26_V1R41_research_report.md']='\n'.join(lines)
+              for name,txt in csvs.items(): (out/name).write_text(txt,encoding='utf8')
+              manifest={'workflow':'CAL26 V1R41 - QB Multi-Year Surplus and Shadow Bridge (Read Only)',
+                  'semantic_status':'RESEARCH_SHADOW_ONLY_NOT_AN_FV_CALIBRATION',
+                  'production_change_authorized':False,'index_modified':False,
+                  'future_holdout_read':False,'v1r27_holdout_untouched':True,
+                  'v1r38_holdout_untouched':True,'private_provider_rows_read':False,
+                  'owner_target_ranges_used_as_labels':False,
+                  'scenario_knobs_empirically_fitted':False,'multi_year_survival_model_calibrated':False,
+                  'rank_only_shadow_quotes_are_independent_FV':False,
+                  'inputs_git_blob_pins':PINNED,'qa':qa,
+                  'files_sha256':{n:hashlib.sha256(s.encode()).hexdigest() for n,s in csvs.items()}}
+              (out/'CAL26_V1R41_manifest.json').write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n',encoding='utf8')
+              return manifest
+          
+          
+          def selftest():
+              s,a=score(300,25,250,.9,38)
+              expected=50*sum((.9*.85)**y for y in range(5))
+              check(abs(s-expected)<1e-10,'selftest compound discounted surplus')
+              s,_=score(300,38,250,.9,38)
+              check(s==50,'selftest terminal age clamps future, not first year')
+              s,_=score(220,25,250,.9,38)
+              check(s==0,'selftest replacement nonnegative surplus')
+              s,_=score(300,25,250,.9,38,discount=1,horizon=1)
+              check(s==50,'selftest one-year path')
+              print('SELFTEST_GREEN: discount, shared retention, terminal cutoff, zero surplus, year0 inclusion')
+          
+          
+          def main():
+              ap=argparse.ArgumentParser()
+              ap.add_argument('--selftest',action='store_true')
+              ap.add_argument('--repo',type=Path,default=Path('.'))
+              ap.add_argument('--out',type=Path,default=Path('cal26-v1r41-out'))
+              args=ap.parse_args()
+              if args.selftest:selftest();return
+              for path,sha in PINNED.items():
+                  check((args.repo/path).is_file(),'SOURCE_MISSING '+path)
+                  check(blob_sha(args.repo,path)==sha,'PINNED_BLOB_DRIFT '+path)
+              d=(load_json(args.repo/P1),load_json(args.repo/P2),(args.repo/LIVE).read_text(encoding='utf8'))
+              m=output(d,args.out)
+              print(m['semantic_status']);print(m['qa'])
+          
+          if __name__=='__main__':main()
+          PY_CAL26_V1R41_ENGINE
+          python -m py_compile "$RUNNER_TEMP/cal26_v1r41.py"
+          python "$RUNNER_TEMP/cal26_v1r41.py" --selftest
+          python "$RUNNER_TEMP/cal26_v1r41.py" --repo "$GITHUB_WORKSPACE" --out "$RUNNER_TEMP/cal26-v1r41"
+          python - "$RUNNER_TEMP/cal26-v1r41/CAL26_V1R41_manifest.json" <<'PY_CAL26_V1R41_ASSERT'
+          import json,sys
+          m=json.load(open(sys.argv[1],encoding='utf8'))
+          assert m['semantic_status']=='RESEARCH_SHADOW_ONLY_NOT_AN_FV_CALIBRATION'
+          assert m['qa']['frozen_QBs']==64
+          assert m['qa']['forward_qbs']==54
+          assert m['qa']['dual_source_real_history_qbs']==31
+          assert m['qa']['all_scenario_rows']==837
+          assert m['qa']['named_live_overrides_declared']==15
+          assert m['qa']['main_zero_sum_shadow_delta']==0
+          assert m['qa']['bryce_QB24_forward_surplus_zero'] is True
+          assert not m['production_change_authorized']
+          assert not m['future_holdout_read']
+          assert not m['owner_target_ranges_used_as_labels']
+          assert not m['scenario_knobs_empirically_fitted']
+          assert not m['rank_only_shadow_quotes_are_independent_FV']
+          assert m['v1r27_holdout_untouched'] and m['v1r38_holdout_untouched']
+          print('GREEN: 54 QB projection board; 31 paired QBs; 837 scenarios; research only')
+          PY_CAL26_V1R41_ASSERT
+          test -s "$RUNNER_TEMP/cal26-v1r41/CAL26_V1R41_research_report.md"
+          test -s "$RUNNER_TEMP/cal26-v1r41/CAL26_V1R41_54_QB_forward_replacement_board.csv"
+          test -s "$RUNNER_TEMP/cal26-v1r41/CAL26_V1R41_31_QB_primary_surplus_shadow.csv"
+          test -s "$RUNNER_TEMP/cal26-v1r41/CAL26_V1R41_837_QB_scenario_sensitivity.csv"
+          test -s "$RUNNER_TEMP/cal26-v1r41/CAL26_V1R41_31_QB_rank_robustness.csv"
+          test -z "$(git status --porcelain)"
+          echo '## CAL26 V1R41 — research-only QB surplus shadow' >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/cal26-v1r41/CAL26_V1R41_research_report.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload reproducible research-only artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: CAL26_V1R41_QB_SURPLUS_RESEARCH_ONLY
+          path: ${{ runner.temp }}/cal26-v1r41/
+          if-no-files-found: error
+          retention-days: 90
