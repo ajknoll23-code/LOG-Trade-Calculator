@@ -1,0 +1,386 @@
+name: CAL26 V1R39 - Structural Production to FV Attribution (Read Only)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cal26-v1r39-fv-structural-audit-readonly
+  cancel-in-progress: false
+
+jobs:
+  inspect-structural-fv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout frozen research inputs only
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Verify fixed source lineage and run V1R39 diagnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/cal26_v1r39_engine.py" <<'PY_CAL26_V1R39_SOURCE_EOF'
+          #!/usr/bin/env python3
+          """CAL26 V1R39: source-pinned read-only production -> FV structural audit.
+          
+          Frozen 2026 Weeks 1–6 are used for retrospective descriptive checks only.
+          No fitting, parameter search, or future holdout access.
+          """
+          from __future__ import annotations
+          import argparse
+          from collections import Counter
+          import csv
+          import hashlib
+          import io
+          import json
+          import math
+          from pathlib import Path
+          import random
+          import subprocess
+          
+          P1='research/production-v2/production_v2_phase1_audit.json'
+          P2='research/production-v2/production_v2_phase2_preseason_baseline.json'
+          P5='research/opportunity-v2/opportunity_v2_phase5_evaluation.json'
+          PINNED={P1:'bdd4657ff45e0c64f1406f27c1ffe6ad2e597d31',
+                  P2:'ed5025134ca5992b460fa8b850033f82d7ea450f',
+                  P5:'7055b9d0e01befcba9fbe05cc72db86846c91f7b'}
+          POSITIONS=('QB','RB','WR','TE')
+          PRE_REG_COUNTS={'QB':31,'RB':62,'WR':72,'TE':30}
+          REALIZED_COUNTS={'QB':28,'RB':52,'WR':65,'TE':28}
+          MODELS=('history','forward','frozen_45_55','current_fv','phase1_fv',
+                  'current_fv_age_neutral','phase1_fv_age_neutral')
+          OWNERS_QB=('bryce young','jayden daniels','cj stroud','caleb williams','drake maye')
+          
+          
+          def require(expr,msg):
+              if not expr: raise AssertionError(msg)
+          
+          
+          def numeric(x):
+              return isinstance(x,(float,int)) and not isinstance(x,bool) and math.isfinite(x)
+          
+          
+          def load_json(path):
+              def pairs(items):
+                  out={}
+                  for k,v in items:
+                      require(k not in out,f'duplicate key in {path}: {k}')
+                      out[k]=v
+                  return out
+              return json.loads(Path(path).read_text(encoding='utf-8'),object_pairs_hook=pairs)
+          
+          
+          def descending_rank(values):
+              inds=sorted(range(len(values)),key=lambda i:(-values[i],i))
+              out=[0.0]*len(values)
+              i=0
+              while i<len(inds):
+                  j=i+1
+                  while j<len(inds) and values[inds[j]]==values[inds[i]]: j+=1
+                  rank=(i+1+j)/2
+                  for k in range(i,j):out[inds[k]]=rank
+                  i=j
+              return out
+          
+          
+          def spearman(rows,model):
+              if len(rows)<3:return None
+              xs=descending_rank([r[model] for r in rows]);ys=descending_rank([r['actual_active_ppg'] for r in rows]);n=len(xs)
+              xm=sum(xs)/n;ym=sum(ys)/n
+              a=sum((x-xm)*(y-ym) for x,y in zip(xs,ys))
+              b=sum((x-xm)**2 for x in xs);c=sum((y-ym)**2 for y in ys)
+              if b<=0 or c<=0:return None
+              return a/math.sqrt(b*c)
+          
+          
+          def quantile(xs,p):
+              ys=sorted(xs); z=(len(ys)-1)*p; i=math.floor(z)
+              return ys[i]+(ys[min(i+1,len(ys)-1)]-ys[i])*(z-i)
+          
+          
+          def paired_ci(rows,variant,base='current_fv',seed=1392026,draws=2000):
+              rng=random.Random(seed)
+              deltas=[]
+              for _ in range(draws):
+                  sample=[rows[rng.randrange(len(rows))] for _ in rows]
+                  x=spearman(sample,variant);y=spearman(sample,base)
+                  if x is not None and y is not None:deltas.append(x-y)
+              require(len(deltas)>=int(draws*.95),'too many degenerate paired resamples')
+              return [round(quantile(deltas,.025),4),round(quantile(deltas,.975),4)]
+          
+          
+          def csv_text(rows,cols):
+              dst=io.StringIO(newline='')
+              writer=csv.DictWriter(dst,cols,extrasaction='ignore',lineterminator='\n')
+              writer.writeheader();writer.writerows(rows)
+              return dst.getvalue()
+          
+          
+          def inspect(p1,p2,p5,strict=True):
+              require(p1.get('status')=='RESEARCH_ONLY_NO_PRODUCTION_CHANGE_AUTHORIZED','phase1 source status')
+              require(p2.get('status')=='FROZEN_PRESEASON_BASELINE_RESEARCH_ONLY','phase2 source status')
+              require(p5.get('status')=='EARLY_DIAGNOSTIC_ONLY','phase5 source status')
+              require(p1.get('production_mutation_authorized') is False,'phase1 mutating')
+              require(p2.get('production_mutation_authorized') is False,'phase2 mutating')
+              require(p5.get('deployment_authorized') is False,'phase5 deployment')
+              require(p5.get('completed_outcome_weeks')==[1,2,3,4,5,6],'must use exactly Weeks 1–6')
+              require(p5.get('frozen_at_utc','').startswith('2026-09-03T'),'unexpected phase5 freeze vintage')
+              ref=p2.get('reference_scenario',{})
+              for k,v in [('history_weight',.45),('forward_weight',.55),('fantasypros_weight',.5),('sleeper_weight_when_both',.5)]:
+                  require(ref.get(k)==v,f'preseason reference weight {k} drifted')
+              baseline=p1['phase1_baselines']; universe=p2['frozen_players']; earlier=p1['players']; observed=p5['realized_player_outcomes']
+              if strict:
+                  require(len(universe)==549,'frozen 549 player universe changed')
+                  require(len(observed)==426,'Week 1–6 outcome universe changed')
+              cohorts={p:[] for p in POSITIONS}
+              excluded={p:Counter() for p in POSITIONS}
+              all_rows=[]
+              parity_errors=[]
+              used_ids=set()
+              for name,src in sorted(universe.items()):
+                  pos=src.get('pos')
+                  if pos not in POSITIONS:continue
+                  excluded[pos]['total_frozen']+=1
+                  if src.get('history_note')!='real' or not numeric(src.get('history_component_2025')):
+                      excluded[pos]['no_real_2025_history']+=1;continue
+                  fp=src.get('fantasypros_2026_points'); sl=src.get('sleeper_2026_points')
+                  if not numeric(fp) or not numeric(sl):
+                      excluded[pos]['missing_one_or_more_providers']+=1;continue
+                  require(name in earlier,f'missing Phase 1 identity: {name}')
+                  a=earlier[name]; q=a.get('candidate');cur=a.get('current')
+                  require(q is not None and cur is not None,f'missing phase1 components: {name}')
+                  ident=str(src.get('sleeper_id') or '')
+                  require(ident and ident not in used_ids,f'colliding/missing Sleeper ID: {name}')
+                  used_ids.add(ident)
+                  h=src['history_component_2025'];f=(fp+sl)/2;frozen=.45*h+.55*f
+                  if abs(src.get('canonical_forward_2026_points',float('nan'))-f)>1e-4:
+                      parity_errors.append(f'{name} preseason forecast drift')
+                  if abs(a.get('phase1_combined_points',float('nan'))-frozen)>1e-3:
+                      parity_errors.append(f'{name} combined production drift')
+                  base=baseline[pos]['combined_points']
+                  require(numeric(base) and base>0,'invalid position baseline')
+                  raw=max(.15,min(1.55,-.1+.75*frozen/base))
+                  if abs(q['raw_prod_mult']-raw)>1e-5:
+                      parity_errors.append(f'{name} Phase1 production conversion drift')
+                  if q.get('elite_floor_applied') or q.get('no_history_role_rescue_applied'):
+                      parity_errors.append(f'{name} non-linear Phase 1 floor/rescue not supported')
+                  if abs(q['raw_prod_mult']-q['effective_prod_mult'])>1e-6:
+                      parity_errors.append(f'{name} Phase1 multiplier nonlinearity')
+                  if cur['fundamental_value']!=src['current_fundamental_value']:
+                      parity_errors.append(f'{name} original FV parity drift')
+                  for key in ('age_mult','effective_prod_mult'):
+                      require(numeric(cur.get(key)) and cur[key]>0,f'bad current {key}: {name}')
+                      require(numeric(q.get(key)) and q[key]>0,f'bad candidate {key}: {name}')
+                  row={'name':name,'position':pos,'sleeper_id':ident,'age':src['age'],
+                       'role':src['role'],'history':h,'forward':f,'frozen_45_55':frozen,
+                       'current_fv':src['current_fundamental_value'],
+                       'phase1_fv':q['value'],'current_age_mult':cur['age_mult'],
+                       'phase1_age_mult':q['age_mult'],'current_production_mult':cur['effective_prod_mult'],
+                       'phase1_production_mult':q['effective_prod_mult'],
+                       'position_baseline':base,
+                       'current_fv_age_neutral':cur['fundamental_value']/cur['age_mult'],
+                       'phase1_fv_age_neutral':q['value']/q['age_mult'],
+                       'phase1_diagnostic_conversion_fv_per_pm':q['value']/q['effective_prod_mult'],
+                       'phase1_delta_pct':(q['value']/cur['fundamental_value']-1) if cur['fundamental_value']>0 else None,
+                       'has_observed_3_active_games':False,'actual_active_ppg':None,'active_games':None}
+                  o=observed.get(name)
+                  if o is not None:
+                      require(numeric(o.get('active_games')) and o['active_games']>=0,'bad active game count: '+name)
+                      require(numeric(o.get('active_ppg')),'bad PPG: '+name)
+                      require(numeric(o.get('total_points')),'bad total points: '+name)
+                      require(abs(o['active_ppg']*o['active_games']-o['total_points'])<=1e-4,'scoring parity: '+name)
+                      row['active_games']=o['active_games']
+                      if o['active_games']>=3 and o['active_ppg']>0:
+                          row['actual_active_ppg']=o['active_ppg'];row['has_observed_3_active_games']=True
+                          cohorts[pos].append(row)
+                  all_rows.append(row)
+                  excluded[pos]['eligible_preseason']+=1
+              require(not parity_errors,'SOURCE_PARITY_HOLD '+str(parity_errors[:8]))
+              eligible=Counter(r['position'] for r in all_rows)
+              count_observed={pos:len(cohorts[pos]) for pos in POSITIONS}
+              if strict:
+                  require(dict(eligible)==PRE_REG_COUNTS,'R38 cohort drift from 195/164 frozen reference')
+                  require(count_observed==REALIZED_COUNTS,'unexpected realized 173 cohort; halt before comparisons')
+              diag={}
+              for i,pos in enumerate(POSITIONS):
+                  rows=cohorts[pos]
+                  vals={m:round(spearman(rows,m),4) for m in MODELS}
+                  changes={
+                      'phase1_vs_current_fv':round(vals['phase1_fv']-vals['current_fv'],4),
+                      'age_neutral_current_vs_current_fv':round(vals['current_fv_age_neutral']-vals['current_fv'],4),
+                      'age_neutral_phase1_vs_phase1_fv':round(vals['phase1_fv_age_neutral']-vals['phase1_fv'],4),
+                      'forward_vs_current_fv':round(vals['forward']-vals['current_fv'],4),
+                  }
+                  diag[pos]={'n':len(rows),'spearman_with_weeks1_6_active_ppg':vals,
+                             'differences_descriptive_not_dynasty_fv_truth':changes,
+                             'bootstrap_95pct_paired_player_difference_vs_current_fv':{
+                                 'phase1_fv':paired_ci(rows,'phase1_fv',seed=1392026+i),
+                                 'current_fv_age_neutral':paired_ci(rows,'current_fv_age_neutral',seed=1392126+i),
+                                 'forward':paired_ci(rows,'forward',seed=1392226+i)
+                             }}
+              qbrows=[]
+              for name in OWNERS_QB:
+                  hits=[r for r in all_rows if r['name']==name]
+                  require(len(hits)==1,f'missing QB diagnostic player: {name}')
+                  x=hits[0]
+                  qbrows.append({k:x[k] for k in ('name','position','age','role','current_fv','phase1_fv',
+                                 'current_age_mult','current_production_mult','phase1_production_mult',
+                                 'current_fv_age_neutral','forward','history','frozen_45_55',
+                                 'phase1_delta_pct')})
+              return all_rows,diag,qbrows,excluded
+          
+          
+          def write_outputs(data,out):
+              p1,p2,p5=data
+              all_rows,diag,qbrows,excluded=inspect(p1,p2,p5,strict=True)
+              out.mkdir(parents=True,exist_ok=True)
+              def fmt(x):
+                  if x is None:return ''
+                  if isinstance(x,float):return f'{x:.6f}'
+                  return str(x)
+              fields=('name','position','sleeper_id','age','role','current_fv','phase1_fv',
+                      'current_age_mult','phase1_age_mult','current_production_mult','phase1_production_mult',
+                      'history','forward','frozen_45_55','current_fv_age_neutral','phase1_fv_age_neutral',
+                      'position_baseline','phase1_diagnostic_conversion_fv_per_pm','phase1_delta_pct',
+                      'has_observed_3_active_games','active_games','actual_active_ppg')
+              ledger=csv_text([{k:fmt(r[k]) for k in fields} for r in all_rows],fields)
+              (out/'CAL26_V1R39_195_player_decomposition.csv').write_text(ledger,encoding='utf-8')
+              benchmark={'methodology':'FIXED_RETROSPECTIVE_DIAGNOSTIC_NOT_PRICE_OR_FORECAST_CALIBRATION',
+                         'position_metrics':diag,'frozen_cohort_total':len(all_rows),
+                         'source_week_window':[1,2,3,4,5,6],
+                         'source_eligible_by_position':dict(Counter(r['position'] for r in all_rows)),
+                         'scored_active_games_by_position':{p:diag[p]['n'] for p in POSITIONS},
+                         'source_exclusions_by_position':{p:dict(excluded[p]) for p in POSITIONS},
+                         'retrospective_result_is_not_independent_dynasty_FV_truth':True}
+              (out/'CAL26_V1R39_fixed_retrospective_benchmark.json').write_text(json.dumps(benchmark,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+              (out/'CAL26_V1R39_QB_five_player_decomposition.csv').write_text(csv_text(qbrows,list(qbrows[0])),encoding='utf-8')
+              payload={
+                  'workflow':'CAL26 V1R39 - Structural Production to FV Attribution (Read Only)',
+                  'semantic_status':'RESEARCH_ONLY_STRUCTURAL_DIAGNOSIS_PRODUCTION_HOLD',
+                  'mutates_production':False,'deployment_authorized':False,
+                  'pricing_change_authorized':False,'new_FV_calibration_completed':False,
+                  'weeks_used':[1,2,3,4,5,6],
+                  'weeks_8_12_holdout_untouched':True,
+                  'V1R27_QB_forecast_weights_untouched':True,
+                  'V1R38_prospective_forecast_candidates_untouched':True,
+                  'owner_provided_target_values_are_not_training_labels':True,
+                  'licensed_DLF_4for4_rows_not_read':True,
+                  'inputs':{p:{'git_blob_sha1':PINNED[p]} for p in PINNED},
+                  'artifact_sha256':{'195_player_decomposition_csv':hashlib.sha256(ledger.encode()).hexdigest()},
+                  'population_summary':{'frozen_offensive_source_eligible':len(all_rows),'early_observed_common':sum(d['n'] for d in diag.values())},
+                  'separates_short_term_scoring_from_dynasty_fv':True,
+                  'next_step':'Evaluate non-production price-scale options using independent temporally aligned pricing/consistency evidence, and revisit future outcome validation when Weeks 8–12 are actually complete.',
+              }
+              (out/'CAL26_V1R39_manifest.json').write_text(json.dumps(payload,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+              md=['# CAL26 V1R39 — Structural Production-to-FV Attribution','',
+                 '**Status:** `RESEARCH_ONLY_STRUCTURAL_DIAGNOSIS_PRODUCTION_HOLD`  ',
+                 '**Scope:** fixed retrospective Weeks 1–6 analysis; source-eligible 195 offensive players; 173 with >=3 scored games.','',
+                 '## Same-player early-scoring diagnostic','',
+                 'Spearman with 2026 Weeks 1–6 league-scored PPG per active game; higher means better association with short-term scoring, not truer dynasty FV.','',
+                 '| Metric | QB | RB | WR | TE |','|---|---:|---:|---:|---:|']
+              names=[('Current FV','current_fv'),('Phase 1 candidate FV','phase1_fv'),
+                     ('Current FV / frozen age multiplier','current_fv_age_neutral'),
+                     ('Phase 1 FV / frozen age multiplier','phase1_fv_age_neutral'),
+                     ('History component','history'),('Preseason forward 50/50','forward'),
+                     ('Frozen reference 45% history + 55% forward','frozen_45_55')]
+              for label,key in names:
+                  md.append('| '+label+' | '+' | '.join(f"{diag[p]['spearman_with_weeks1_6_active_ppg'][key]:.3f}" for p in POSITIONS)+' |')
+              md+=['',
+                   'Age-neutral ratios *divide out* the frozen age component for diagnostic purposes; they are **not** dynasty prices and are not a proposed age curve deletion.',
+                   'Phase 1 candidate controls retain the same age, role and position structure. The low QB scoring alignment is not itself evidence of underpricing.',
+                   '',
+                   '## Owners five QB cases — frozen structural values','',
+                   '| Player | Current FV | Phase 1 FV | Age multiplier | FV / age multiplier | 2026 preseason forward pts |',
+                   '|---|---:|---:|---:|---:|---:|']
+              for r in qbrows:
+                  md.append(f"| {r['name']} | {r['current_fv']:.0f} | {r['phase1_fv']:.0f} | {r['current_age_mult']:.3f} | {r['current_fv_age_neutral']:.0f} | {r['forward']:.1f} |")
+              md+=['',
+                   '## Interpretation',
+                   '',
+                   '1. Original Phase 1 is a benchmark, not a validated optimal FV. Its production change barely moves these five players; model structure and price scale need investigation.',
+                   '2. Short-term scoring does not determine dynasty FV: young asset value, role, position and longevity are expected to break that relationship.',
+                   '3. No owner-provided numerical target, provider rank, or DLF value was used as ground truth. Independent numeric FV labels are still unavailable.',
+                   '4. Normalization anchors and production multiplier are inherited and were not optimized. Do not fit on weeks 1–6 while describing Weeks 8–12 as untouched.',
+                   '5. Bootstrap intervals are paired-player descriptive uncertainty, not validation of a revised dynasty price.',
+                   '',
+                   '## Fixed-source provenance','',
+              ]
+              for p,sha in PINNED.items():md.append(f'- `{p}` Git blob SHA `{sha}`')
+              md+=['','## Recommendation','',
+                   'Next model step: make a **non-deployed structural FV scale and replacement anchor sensitivity** protocol that discloses constraints and validates against independent, dated external evidence. This step produces no price recommendations or automatic promotion.',
+                   '',
+                   'No `index.html` read/write, no 2026 Week 7+, and no private DLF/4for4 rows accessed.']
+              (out/'CAL26_V1R39_report.md').write_text('\n'.join(md)+'\n',encoding='utf-8')
+              return payload
+          
+          
+          def synthetic_test():
+              require(descending_rank([1,3,3,0])==[3,1.5,1.5,4],'tie ranks broken')
+              toy=[{'v':v,'actual_active_ppg':u} for v,u in [(2,3),(1,1),(3,2),(4,4)]]
+              # correct ordering y ranks x positions 2->3,1->1,3->2,4->4
+              require(abs(spearman(toy,'v')-.8)<1e-9,'rank correlation self-test')
+              require(quantile([1,3,5],.5)==3,'quantile test')
+              require(csv_text([{'a':1,'b':2}],('a','b'))=='a,b\n1,2\n','CSV parity')
+              print('SELFTEST_GREEN: rank ties, numeric correlation, bootstrap quantile, CSV')
+          
+          
+          def main():
+              parser=argparse.ArgumentParser();parser.add_argument('--selftest',action='store_true');parser.add_argument('--repo',type=Path,default=Path('.'));parser.add_argument('--out',type=Path,default=Path('cal26-v1r39-out'))
+              arg=parser.parse_args()
+              if arg.selftest: synthetic_test(); return
+              data=[]
+              for path,expected in PINNED.items():
+                  require((arg.repo/path).is_file(),f'cannot locate pinned repo file {path}')
+                  got=subprocess.check_output(['git','hash-object','--',path],cwd=arg.repo,text=True).strip()
+                  require(got==expected,f'input Git hash changed: {path} {got}; STOP')
+                  data.append(load_json(arg.repo/path))
+              manifest=write_outputs(data,arg.out)
+              print(manifest['semantic_status']);print(manifest['population_summary']);print(manifest['artifact_sha256'])
+          
+          if __name__=='__main__':main()
+          PY_CAL26_V1R39_SOURCE_EOF
+          python -m py_compile "$RUNNER_TEMP/cal26_v1r39_engine.py"
+          python "$RUNNER_TEMP/cal26_v1r39_engine.py" --selftest
+          python "$RUNNER_TEMP/cal26_v1r39_engine.py" \
+            --repo "$GITHUB_WORKSPACE" \
+            --out "$RUNNER_TEMP/cal26-v1r39"
+          python - "$RUNNER_TEMP/cal26-v1r39/CAL26_V1R39_manifest.json" <<'PY_CAL26_V1R39_AUDIT_ASSERT'
+          import json,sys
+          m=json.load(open(sys.argv[1],encoding='utf-8'))
+          assert m['semantic_status']=='RESEARCH_ONLY_STRUCTURAL_DIAGNOSIS_PRODUCTION_HOLD'
+          assert m['population_summary']=={'frozen_offensive_source_eligible':195,'early_observed_common':173}
+          assert m['weeks_used']==[1,2,3,4,5,6]
+          assert m['mutates_production'] is False
+          assert m['pricing_change_authorized'] is False
+          assert m['weeks_8_12_holdout_untouched'] is True
+          assert m['V1R27_QB_forecast_weights_untouched'] is True
+          assert m['V1R38_prospective_forecast_candidates_untouched'] is True
+          assert m['licensed_DLF_4for4_rows_not_read'] is True
+          print('GREEN: 195-player decomposition, 173 outcome comparison, frozen future holdouts protected')
+          PY_CAL26_V1R39_AUDIT_ASSERT
+          test -s "$RUNNER_TEMP/cal26-v1r39/CAL26_V1R39_manifest.json"
+          test -s "$RUNNER_TEMP/cal26-v1r39/CAL26_V1R39_report.md"
+          test -s "$RUNNER_TEMP/cal26-v1r39/CAL26_V1R39_195_player_decomposition.csv"
+          test -s "$RUNNER_TEMP/cal26-v1r39/CAL26_V1R39_QB_five_player_decomposition.csv"
+          test -s "$RUNNER_TEMP/cal26-v1r39/CAL26_V1R39_fixed_retrospective_benchmark.json"
+          test -z "$(git status --porcelain)"
+          echo '## CAL26 V1R39 - structural FV attribution, read only' >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/cal26-v1r39/CAL26_V1R39_report.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload research-only artifacts (not production)
+        uses: actions/upload-artifact@v4
+        with:
+          name: CAL26_V1R39_STRUCTURAL_FV_AUDIT_RESEARCH_ONLY
+          path: ${{ runner.temp }}/cal26-v1r39/
+          if-no-files-found: error
+          retention-days: 90
