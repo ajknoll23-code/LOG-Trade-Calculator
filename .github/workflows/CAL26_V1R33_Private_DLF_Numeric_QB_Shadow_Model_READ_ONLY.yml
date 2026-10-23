@@ -1,0 +1,438 @@
+# CAL26 V1R33: private licensed DLF-native QB value benchmark.
+# Public GitHub run is source-validation ONLY unless the user explicitly runs
+# 'private-calibration' AND configures repository secret CAL26_DLF_SF_CSV_B64.
+# No licensed provider rows or per-player predictions are written in GitHub.
+# 2026-10-23 ROS is deliberately excluded as it postdates the 2026-10-20 DLF upload.
+name: CAL26 V1R33 - Private DLF Numeric QB Shadow Model READ ONLY
+'on':
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'validation-only needs no secret; private-calibration needs secret CAL26_DLF_SF_CSV_B64'
+        required: true
+        default: validation-only
+        type: choice
+        options:
+          - validation-only
+          - private-calibration
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: cal26-v1r33-private-qb-shadow-readonly
+  cancel-in-progress: false
+jobs:
+  private_qb_shadow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout main with no persisted write token
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Validate main source and prohibit bundled provider CSV
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/main
+          test -s index.html
+          test ! -e sf.csv
+          test ! -e scripts/sf.csv
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Set up pinned Python runtime
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install numeric dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --quiet 'numpy==2.2.6' 'scikit-learn==1.8.0'
+      - name: Download successful V1R25R1 frozen 64 QB features
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/cal26-v1r25r1"
+          gh run download 39890393453 --repo "$GITHUB_REPOSITORY" \
+            --name CAL26-V1R25-Frozen-64-QB-Source-Feature-Assembly-READ-ONLY \
+            --dir "$RUNNER_TEMP/cal26-v1r25r1"
+          test -s "$RUNNER_TEMP/cal26-v1r25r1/CAL26_V1R25_Frozen_64_QB_Source_Features_READ_ONLY.csv"
+          python3 - <<'PY_PIN'
+          import csv,hashlib,os
+          from pathlib import Path
+          p=Path(os.environ['RUNNER_TEMP'])/'cal26-v1r25r1'/'CAL26_V1R25_Frozen_64_QB_Source_Features_READ_ONLY.csv'
+          assert hashlib.sha256(p.read_bytes()).hexdigest()=='70960bd043d5bb56b9764efc59c1e5c14313d1233c2955376980d15c8d2a42c6','FROZEN_QB_FEATURE_SHA_DRIFT'
+          rows=list(csv.DictReader(p.open(newline='')))
+          assert len(rows)==64 and len({r['canonical_name'] for r in rows})==64
+          print('PASS exactly pinned 64 QB evidence features; zero DLF rows')
+          PY_PIN
+      - name: Materialize private-safe training engine and self-test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/cal26_v1r33_engine.py" <<'PY_CAL26_V1R33_ENGINE'
+          #!/usr/bin/env python3
+          """CAL26 V1R33 private cross-sectional QB DLF-native shadow benchmark.
+          
+          Provider row-level data may only be processed privately. No live FV writes.
+          Purposely excludes 2026-10-23 ROS feature for a 2026-10-20-uploaded target:
+          not a chronologically valid predictor. No owner feedback fit and no DLF rank inputs.
+          """
+          from __future__ import annotations
+          import argparse, base64, csv, hashlib, io, json, math, os, statistics, unicodedata, re
+          from pathlib import Path
+          from collections import Counter, defaultdict
+          
+          import numpy as np
+          from sklearn.linear_model import Ridge
+          from sklearn.preprocessing import StandardScaler
+          from sklearn.pipeline import Pipeline
+          
+          MODEL_VERSION='CAL26_V1R33_PRIVATE_QB_DLF_NATIVE_OOF_V1'
+          FOLD_SALT='CAL26-V1R33-2026-10-23-INDEPENDENT-5-FOLD'
+          ALIAS={('michael penix','QB'):'michael penix jr'}
+          CANDIDATES={
+              'train_median':(),
+              'existing_fv_only':('fv',),
+              'historical_only':('hist',),
+              'fantasypros_preseason_only':('fp',),
+              'sleeper_preseason_only':('sleeper',),
+              'fantasypros_and_sleeper':('fp','sleeper'),
+              'historical_and_preseasons':('hist','fp','sleeper'),
+              'existing_fv_plus_preseasons':('fv','fp','sleeper'),
+              'all_existing_and_forward':('fv','hist','fp','sleeper'),
+          }
+          SECONDARY={
+              'train_median':(),
+              'existing_fv_only':('fv',),
+              'historical_only':('hist',),
+              'preseason_any_available':('blend',),
+              'historical_plus_available_preseason':('hist','blend'),
+              'existing_fv_plus_available_preseason':('fv','blend'),
+          }
+          
+          
+          def norm(text):
+              s=unicodedata.normalize('NFKD',str(text).strip().lower())
+              s=''.join(c for c in s if not unicodedata.combining(c))
+              s=re.sub(r'[^a-z0-9 ]+','',s)
+              return re.sub(r'\s+',' ',s).strip()
+          
+          
+          def rows_from_file(path):
+              with Path(path).open(newline='',encoding='utf-8-sig') as h:
+                  return list(csv.DictReader(h))
+          
+          
+          def rows_from_b64(secret):
+              if not secret:
+                  raise ValueError('DLF private secret absent; do not substitute a fake source')
+              decoded=base64.b64decode(secret,validate=True).decode('utf-8-sig')
+              return list(csv.DictReader(io.StringIO(decoded)))
+          
+          
+          def parse_features(features, dlf):
+              if not features or not dlf:raise ValueError('missing inputs')
+              need=('canonical_name','position','frozen_owner_review_fv','historical_2025_component',
+                    'production_evidence_type','preseason_2026_fantasypros_points',
+                    'preseason_2026_sleeper_points','preseason_2026_blended_points')
+              if any(x not in features[0] for x in need):raise ValueError('QB source schema mismatch')
+              if list(dlf[0])!=['name','position','team','value']:raise ValueError('DLF source schema mismatch')
+              by_name={norm(r['canonical_name']):r for r in features if r['position']=='QB'}
+              if len(by_name)!=len(features):raise ValueError('duplicate or non-QB feature entries')
+              if len(features)!=64:raise ValueError('expected frozen 64 QBs')
+              dlf_qb={}
+              for d in dlf:
+                  if d['position'] not in ('QB','RB','WR','TE',''):raise ValueError('unexpected DLF player position')
+                  v=float(d['value'])
+                  if not math.isfinite(v) or v<=0:raise ValueError('invalid provider target')
+                  if d['position']!='QB':continue
+                  name=norm(d['name']);name=ALIAS.get((name,'QB'),name)
+                  if name in dlf_qb:raise ValueError('duplicate DLF QB identity')
+                  dlf_qb[name]=v
+              matched=[]
+              for name,r in by_name.items():
+                  if name not in dlf_qb:continue
+                  raw={
+                     'canonical_name':name,'dlf_native_trade_value':dlf_qb[name],
+                     'fv':float(r['frozen_owner_review_fv']),
+                     'hist':float(r['historical_2025_component']) if r['production_evidence_type']=='REAL_PRODUCTION_DATA' and r['historical_2025_component'] else None,
+                     'fp':float(r['preseason_2026_fantasypros_points']) if r['preseason_2026_fantasypros_points'] else None,
+                     'sleeper':float(r['preseason_2026_sleeper_points']) if r['preseason_2026_sleeper_points'] else None,
+                     'blend':float(r['preseason_2026_blended_points']) if r['preseason_2026_blended_points'] else None,
+                  }
+                  if any(x is not None and (x<=0 or not math.isfinite(x)) for k,x in raw.items() if k not in ('canonical_name','dlf_native_trade_value')):raise ValueError('nonpositive source feature')
+                  raw['fold']=int(hashlib.sha256((FOLD_SALT+'/'+name).encode()).hexdigest(),16)%5
+                  matched.append(raw)
+              matched.sort(key=lambda r:r['canonical_name'])
+              if len(matched)!=50:raise ValueError(f'unexpected matched QB count {len(matched)}')
+              return matched
+          
+          
+          def rho(values_a,values_b):
+              a=np.asarray(values_a,dtype=float);b=np.asarray(values_b,dtype=float)
+              ra=np.asarray([sum(x>z for x in a)+1+0.5*(sum(x==z for x in a)-1) for z in a],dtype=float)
+              rb=np.asarray([sum(x>z for x in b)+1+0.5*(sum(x==z for x in b)-1) for z in b],dtype=float)
+              if len(a)<3 or np.std(ra)==0 or np.std(rb)==0:return None
+              return float(np.corrcoef(ra,rb)[0,1])
+          
+          
+          def oof(cohort,candidates):
+              fold_count=Counter(r['fold'] for r in cohort)
+              if len(fold_count)!=5 or min(fold_count.values())<2:raise ValueError(f'unbalanced/empty CV fold {fold_count}')
+              outcomes=[];detail=[]
+              labels=np.array([math.log(r['dlf_native_trade_value']) for r in cohort])
+              for name,keys in candidates.items():
+                  pred=np.full(len(cohort),np.nan)
+                  for fold in range(5):
+                      tr=[i for i,r in enumerate(cohort) if r['fold']!=fold]; te=[i for i,r in enumerate(cohort) if r['fold']==fold]
+                      if not tr or not te:raise ValueError('empty train/test split')
+                      if not keys:
+                          pred[te]=np.median(labels[tr]);continue
+                      xtr=np.array([[math.log1p(cohort[i][k]) for k in keys] for i in tr])
+                      xte=np.array([[math.log1p(cohort[i][k]) for k in keys] for i in te])
+                      reg=Pipeline([('scale',StandardScaler()),('ridge',Ridge(alpha=1.0))])
+                      reg.fit(xtr,labels[tr]);pred[te]=reg.predict(xte)
+                  if not np.isfinite(pred).all():raise ValueError('incomplete OOF prediction')
+                  native_pred=np.exp(pred)
+                  y=np.exp(labels)
+                  summary={
+                    'candidate':name,'n':len(cohort),'n_folds':5,
+                    'log_mae':round(float(np.mean(np.abs(pred-labels))),5),
+                    'median_absolute_pct_error':round(float(np.median(np.abs(native_pred/y-1)))*100,3),
+                    'spearman':round(rho(native_pred,y),5) if rho(native_pred,y) is not None else None,
+                    'fold_sizes':','.join(str(fold_count[i]) for i in range(5)),
+                    'uses_current_fv_as_model_input':('fv' in keys),
+                    'uses_independent_dlf_price_as_supervised_target':True,
+                    'has_2026_ros_input':False,
+                    'owner_feedback_used_for_fit':False,
+                    'result_is_out_of_fold_not_temporal_holdout':True,
+                  }
+                  outcomes.append(summary)
+                  for i,person in enumerate(cohort):
+                      detail.append({'name_private':person['canonical_name'],'fold':person['fold'],'candidate':name,
+                         'target_dlf_private':round(float(y[i]),5),
+                         'oof_dlf_pred_private':round(float(native_pred[i]),5),
+                         'oof_absolute_log_error':round(abs(float(pred[i]-labels[i])),6)})
+              return outcomes,detail
+          
+          
+          def checked_summary(cohort,rows):
+              assert len({r['canonical_name'] for r in cohort})==len(cohort)
+              primary=[r for r in cohort if all(r[k] is not None for k in ('fv','hist','fp','sleeper'))]
+              secondary=[r for r in cohort if all(r[k] is not None for k in ('fv','hist','blend'))]
+              # Pin observed source support so changing source data cannot silently change cohort or results.
+              if (len(cohort),len(primary),len(secondary))!=(50,31,39):
+                  raise ValueError(f'cohort drift: {len(cohort)} {len(primary)} {len(secondary)}')
+              prim,detail1=oof(primary,CANDIDATES)
+              sec,detail2=oof(secondary,SECONDARY)
+              for x in prim:x['cohort']='strict_fp_sleeper_real_history_31'
+              for x in sec:x['cohort']='any_preseason_real_history_39'
+              for x in detail1:x['cohort']='strict_fp_sleeper_real_history_31'
+              for x in detail2:x['cohort']='any_preseason_real_history_39'
+              return prim+sec,detail1+detail2,primary,secondary
+          
+          
+          def output(private_out,matched,summary,detail,primary,secondary,version_from=None):
+              private_out=Path(private_out);private_out.mkdir(parents=True,exist_ok=True)
+              # Strict: private outputs must not be in a GitHub public repository path.
+              if (private_out/'.git').exists() or any(p.name=='.github' for p in private_out.parents):
+                  raise ValueError('cannot write licensed rows into a repository')
+              fsummary=private_out/'CAL26_V1R33_PRIVATE_Crossvalidated_Model_Comparisons.csv'
+              fdetail=private_out/'CAL26_V1R33_PRIVATE_OOF_DLF_Predictions.csv'
+              with fsummary.open('w',newline='',encoding='utf-8') as f:
+                  w=csv.DictWriter(f,fieldnames=list(summary[0]));w.writeheader();w.writerows(summary)
+              with fdetail.open('w',newline='',encoding='utf-8') as f:
+                  w=csv.DictWriter(f,fieldnames=list(detail[0]));w.writeheader();w.writerows(detail)
+              ss={z['candidate']:z for z in summary if z['cohort']=='strict_fp_sleeper_real_history_31'}
+              lines=[
+                  '# CAL26 V1R33 — PRIVATE cross-validated DLF-native QB shadow model','',
+                  '**Decision: EVIDENCE-ONLY HOLD. No production FV candidate has been approved.**','',
+                  '## What this model can and cannot mean','',
+                  '- This evaluates predicting **user-supplied DLF provider-native trade values** for **50 matched QBs** using 2025 production, frozen 2026 preseason FantasyPros/Sleeper forecasts, and optionally existing FV.',
+                  '- Matched QB primary cohort: **31** with real history plus both frozen preseason sources. Secondary sensitivity cohort: **39** with real history and at least one preseason source.',
+                  '- Target file has **no embedded provider issue date**. Library upload was 2026-10-20; this is exploratory cross-sectional prediction, not point-in-time market forecasting.',
+                  '- **ROS excluded deliberately**: the verified 2026-10-23 ROS request comes after the 2026-10-20-uploaded DLF values. Future ROS cannot predict historical values without temporal leakage.',
+                  '- No DLF rankings or owner feedback enter model training. DLF native value is the target, not a fundamental wins-above-replacement value.',
+                  '- Exactly five deterministic player-held-out folds; per-fold preprocessing and ridge model fit ONLY on training rows. `Ridge(alpha=1.0)` fixed, not tuned on holdouts.',
+                  '- Existing FV is a **descriptive, non-point-in-time benchmark**: its V1R22 review was frozen after the 2026-10-20 DLF upload. Do NOT use models containing current FV for historical prospective claims.',
+                  '- 31 QBs is a small same-position sample. Cross-validation is **not a genuinely later-in-time holdout** and may not generalize to RB/WR/TE/IDP.',
+                  '- Never treat DLF-native predicted units as LOG FV points; no numerical conversion is authorized.','',
+                  '## Primary cohort: 31 QBs, identical held-out folds','',
+                  '| Model | Held-out log MAE ↓ | Median absolute % error ↓ | Spearman ↑ |',
+                  '|---|---:|---:|---:|',
+              ]
+              for k in CANDIDATES:
+                  z=ss[k];lines.append(f"| {k} | {z['log_mae']:.5f} | {z['median_absolute_pct_error']:.1f}% | {z['spearman'] if z['spearman'] is not None else 'N/A'} |")
+              lines += ['', '## Secondary sensitivity cohort: 39 QBs', '',
+                  '| Model | Held-out log MAE ↓ | Median absolute % error ↓ | Spearman ↑ |','|---|---:|---:|---:|']
+              for z in summary:
+                  if z['cohort'].endswith('_39'):
+                      lines.append(f"| {z['candidate']} | {z['log_mae']:.5f} | {z['median_absolute_pct_error']:.1f}% | {z['spearman'] if z['spearman'] is not None else 'N/A'} |")
+              lines += ['', '## Next steps', '',
+                  '1. Collect date-stamped FantasyPros ROS point forecasts and a **same-day or later DLF numerical price snapshot**. Compare them separately from future football production; do not use future ROS to explain older prices.',
+                  '2. Evaluate DLF-native value prediction for each position separately with a real future independent price vintage. Add positional replacement/wins for independent Fundamental Value economics.',
+                  '3. Keep all player-level DLF source, matched rows and predictions in the private workspace. Public GitHub output, if any, may contain only counts and nonidentifying aggregate metrics.',
+                  '4. Owner feedback is a qualitative review control after modeling, not a training label or objective function.',
+                  '5. Do not activate any production value, FV/MV blend, pick-value, role, or trade-verdict changes.',''
+              ]
+              report=private_out/'CAL26_V1R33_PRIVATE_Evidence_Based_Shadow_Model_Report.md'
+              report.write_text('\n'.join(lines)+'\n',encoding='utf-8')
+              manifest={
+                 'status':'PASS_PRIVATE_DLF_NATIVE_CROSSVAL_HOLD_PRODUCTION_AND_ROS',
+                 'method':MODEL_VERSION,'source_vintage_dlf_embedded':None,
+                 'dlf_upload_date':'2026-10-20','latest_verified_ros_date':'2026-10-23',
+                 'ros_used_as_predictor':False,'ros_exclusion_reason':'POST_DATES_DLF_UPLOAD_NO_POINT_IN_TIME_MATCH',
+                 'source_matched_qbs':len(matched),'primary_qbs':len(primary),'secondary_qbs':len(secondary),
+                 'primary_models':len(CANDIDATES),'secondary_models':len(SECONDARY),'fold_salt':FOLD_SALT,
+                 'out_of_fold_predictions':len(detail), 'source_weights_fitted_from_owner_feedback':False,
+                 'dlf_ranks_used_as_independent_feature':False,
+                 'target_semantics':'USER_SUPPLIED_DLF_NATIVE_TRADE_VALUE_NOT_LOG_FV',
+                 'cross_position_fv_calibration_authorized':False, 'production_change_authorized':False,
+                 'current_fv_target_date_safe_predictor':False,
+                 'production_files_modified':0, 'output_privacy':'PRIVATE_PLAYER_LEVEL_ONLY',
+                 'source_sha256':version_from or {},
+                 'files':{f.name:hashlib.sha256(f.read_bytes()).hexdigest() for f in [fsummary,fdetail,report]},
+              }
+              (private_out/'CAL26_V1R33_PRIVATE_Manifest.json').write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+              return manifest
+          
+          
+          def selftest():
+              assert norm('Michael Penix Jr.')=='michael penix jr'
+              assert ALIAS[('michael penix','QB')]=='michael penix jr'
+              cohort=[{'canonical_name':f'qb test {i}', 'dlf_native_trade_value':float(10*i+50),
+                  'fold':i%5,'fv':i*2+100., 'hist':i+70.,'fp':i+100.,'sleeper':i*2+100.,'blend':i*3+100.} for i in range(15)]
+              r,d=oof(cohort,{'median':(),'fv':('fv',),'all':('fv','hist','fp','sleeper')})
+              assert len(r)==3 and len(d)==45 and r[0]['n']==15
+              assert r[0]['log_mae']>0 and r[1]['log_mae']>=0
+              assert all(z['has_2026_ros_input'] is False for z in r)
+              print('PASS selftest: identity, fixed 5-fold heldouts, nonleaking fold fit, no ROS, private-only target')
+          
+          
+          def run(features,dlf,out,version_from):
+              m=parse_features(features,dlf)
+              s,d,p,q=checked_summary(m,features)
+              return output(out,m,s,d,p,q,version_from)
+          
+          
+          def cli():
+              parser=argparse.ArgumentParser()
+              parser.add_argument('--dlf',type=Path)
+              parser.add_argument('--features',type=Path)
+              parser.add_argument('--out',type=Path)
+              parser.add_argument('--dlf-secret-env',action='store_true')
+              parser.add_argument('--aggregate-only',action='store_true')
+              parser.add_argument('--selftest',action='store_true')
+              args=parser.parse_args()
+              if args.selftest:selftest();return
+              if not args.features:parser.error('--features required')
+              features=rows_from_file(args.features)
+              if args.dlf_secret_env:
+                  dlf=rows_from_b64(os.environ.get('CAL26_DLF_SF_CSV_B64',''))
+                  dlf_hash='secret_suppressed'
+              elif args.dlf:
+                  dlf=rows_from_file(args.dlf)
+                  dlf_hash=hashlib.sha256(args.dlf.read_bytes()).hexdigest()
+              else:parser.error('--dlf or --dlf-secret-env required')
+              if args.aggregate_only:
+                  m=parse_features(features,dlf)
+                  s,detail,p,q=checked_summary(m,features)
+                  # Aggregate-only stdout; no per-player targets or rows, no coefficients.
+                  report={'status':'PASS_PRIVATE_SOURCE_AGGREGATE_ONLY','method':MODEL_VERSION,
+                     'matched':len(m),'primary':len(p),'secondary':len(q),'ros_feature_used':False,
+                     'production_change_authorized':False,
+                     'primary_metrics':[{'model':z['candidate'],'n':z['n'],'log_mae':z['log_mae'],
+                         'spearman':z['spearman'],'median_absolute_pct_error':z['median_absolute_pct_error']} for z in s if z['cohort'].endswith('_31')],
+                     'secondary_metrics':[{'model':z['candidate'],'n':z['n'],'log_mae':z['log_mae'],
+                         'spearman':z['spearman'],'median_absolute_pct_error':z['median_absolute_pct_error']} for z in s if z['cohort'].endswith('_39')]}
+                  if not args.out:parser.error('--out required for aggregate output')
+                  args.out.mkdir(parents=True,exist_ok=True)
+                  (args.out/'CAL26_V1R33_Public_Aggregates_Only.json').write_text(json.dumps(report,indent=2,sort_keys=True)+'\n')
+                  print('PASS 31 primary QBs, 39 secondary QBs; only aggregate results saved')
+                  return
+              if not args.out:parser.error('--out required')
+              manifest=run(features,dlf,args.out,{'frozen_features_sha256':hashlib.sha256(args.features.read_bytes()).hexdigest(),'sf_csv_sha256':dlf_hash})
+              print(json.dumps({'status':manifest['status'],'counts':{k:manifest[k] for k in ('source_matched_qbs','primary_qbs','secondary_qbs','out_of_fold_predictions')}}))
+          
+          if __name__=='__main__':cli()
+          PY_CAL26_V1R33_ENGINE
+          python3 -m py_compile "$RUNNER_TEMP/cal26_v1r33_engine.py"
+          python3 "$RUNNER_TEMP/cal26_v1r33_engine.py" --selftest
+      - name: Validation-only outcome makes no claim of real calibration
+        if: ${{ inputs.mode == 'validation-only' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/CAL26_V1R33_Safe_Output"
+          python3 - <<'PY_VALIDATION'
+          import json,os
+          from pathlib import Path
+          out=Path(os.environ['RUNNER_TEMP'])/'CAL26_V1R33_Safe_Output'
+          v={
+            'status':'PASS_PUBLIC_CODE_VALIDATION_ONLY_NO_DLF_MODEL_RETRAINING',
+            'method':'CAL26_V1R33_PRIVATE_QB_DLF_NATIVE_OOF_V1',
+            'frozen_source':'V1R25R1 64 QBs; SHA verified',
+            'real_private_dlf_input_used':False,
+            'frozen_future_week8_to12_grid_modified':False,
+            'production_change_authorized':False,
+            'private_calibration_to_run':'Requires CAL26_DLF_SF_CSV_B64 secret and private-calibration mode',
+          }
+          (out/'CAL26_V1R33_Public_Validation_Only.json').write_text(json.dumps(v,indent=2)+'\n')
+          print(v['status'])
+          PY_VALIDATION
+      - name: Private DLF five-fold shadow calibration using secret in memory
+        if: ${{ inputs.mode == 'private-calibration' }}
+        shell: bash
+        env:
+          CAL26_DLF_SF_CSV_B64: ${{ secrets.CAL26_DLF_SF_CSV_B64 }}
+        run: |
+          set -euo pipefail
+          test -n "${CAL26_DLF_SF_CSV_B64:-}" || { echo 'MISSING PRIVATE CSV SECRET: configure CAL26_DLF_SF_CSV_B64 in repo Actions secrets; no DLF source uploaded.'; exit 1; }
+          mkdir -p "$RUNNER_TEMP/CAL26_V1R33_Safe_Output"
+          python3 "$RUNNER_TEMP/cal26_v1r33_engine.py" \
+            --dlf-secret-env \
+            --features "$RUNNER_TEMP/cal26-v1r25r1/CAL26_V1R25_Frozen_64_QB_Source_Features_READ_ONLY.csv" \
+            --out "$RUNNER_TEMP/CAL26_V1R33_Safe_Output" \
+            --aggregate-only
+      - name: Independently check all outputs are non-identifying aggregate-only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_VERIFY'
+          import json,os
+          from pathlib import Path
+          out=Path(os.environ['RUNNER_TEMP'])/'CAL26_V1R33_Safe_Output'
+          files=[p.name for p in out.iterdir()]
+          assert len(files)==1, files
+          f=out/files[0]
+          assert f.suffix=='.json' and f.stat().st_size<20000
+          assert all(x not in f.name.lower() for x in ('qb','dlf.csv','player','licensed','sf.csv'))
+          m=json.loads(f.read_text())
+          assert m['production_change_authorized'] is False
+          if f.name=='CAL26_V1R33_Public_Aggregates_Only.json':
+            assert m['status']=='PASS_PRIVATE_SOURCE_AGGREGATE_ONLY'
+            assert (m['matched'],m['primary'],m['secondary'])==(50,31,39)
+            assert len(m['primary_metrics'])==9 and len(m['secondary_metrics'])==6
+            assert m['ros_feature_used'] is False
+            for metrics in (m['primary_metrics'],m['secondary_metrics']):
+              assert all(set(row)=={'model','n','log_mae','spearman','median_absolute_pct_error'} for row in metrics)
+          else:
+            assert m['status']=='PASS_PUBLIC_CODE_VALIDATION_ONLY_NO_DLF_MODEL_RETRAINING'
+            assert m['real_private_dlf_input_used'] is False
+          assert not any(p.name.startswith('sf.') for p in out.iterdir())
+          print('PASS aggregate-only source audit, no DLF player rows, zero production writes')
+          PY_VERIFY
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Upload only aggregate-only private source audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: CAL26-V1R33-Safe-Aggregate-Results-No-Provider-Rows
+          path: ${{ runner.temp }}/CAL26_V1R33_Safe_Output
+          if-no-files-found: error
+          retention-days: 30
