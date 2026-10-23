@@ -1,0 +1,453 @@
+name: CAL26 V1R48 - QB Opportunity and Conditional Skill Historical Holdout (Read Only)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cal26-v1r48-qb-component-decomposition-research
+  cancel-in-progress: false
+
+jobs:
+  historical-qb-opportunity-skill-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout read-only repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Reproduce R46 and test opportunity versus skill decomposition
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/cal26_v1r48_engine.py" <<'PY_CAL26_V1R48_ENGINE'
+          #!/usr/bin/env python3
+          """CAL26 V1R46: historical weekly QB recency and breakout validation, shadow research only.
+
+          Holds: 2026 outcomes never downloaded; no owner FV target fit; no production writes.
+          Uses nflverse 2016-2025 weekly player statistics, 2017-2022 training, 2023-2025 test.
+          Predicted quantity: remaining-season fantasy points per team game, including zero weeks.
+          """
+          from __future__ import annotations
+          import argparse,collections,csv,hashlib,io,json,math,os,statistics,time,urllib.request,sys
+          from pathlib import Path
+
+          YEARS=tuple(range(2016,2026)); ORIGINS=(6,10,14); TRAIN=(2017,2018,2019,2020,2021,2022); TEST=(2023,2024,2025)
+          SOURCE='https://github.com/nflverse/nflverse-data/releases/download/stats_player/'
+          URL=lambda yr:SOURCE+f'stats_player_week_{yr}.csv'
+          # Unoptimized predeclared candidate grid. Fits use TRAIN only; test years never determine weights.
+          # a=recent3, b=current-YTD, c=previous season, with a+b+c=1 and 25% increments.
+          WITH_PRIOR=tuple((a/4,b/4,(4-a-b)/4) for a in range(5) for b in range(5-a))
+          NO_PRIOR=tuple((a/4,(4-a)/4,0.) for a in range(5))
+          PREFIX='CAL26_V1R46'
+
+
+          def check(ok,msg):
+              if not ok:raise AssertionError(msg)
+
+
+          def digest(b):return hashlib.sha256(b).hexdigest()
+
+
+          def csv_string(rows,keys):
+              stream=io.StringIO(newline='');w=csv.DictWriter(stream,fieldnames=keys,extrasaction='ignore',lineterminator='\n');w.writeheader()
+              for r in rows:w.writerow({k:r.get(k,'') for k in keys})
+              return stream.getvalue()
+
+
+          def get_year(yr,folder,download):
+              file=folder/f'stats_player_week_{yr}.csv'
+              if not download:
+                  check(file.is_file(),f'SOURCE_YEAR_MISSING_{yr}')
+                  dat=file.read_bytes()
+              else:
+                  if file.exists() and file.stat().st_size>300: dat=file.read_bytes()
+                  else:
+                      err=None
+                      for att in range(3):
+                          try:
+                              req=urllib.request.Request(URL(yr),headers={'User-Agent':'CAL26-V1R46-NonCommercial-Research/1.0'})
+                              with urllib.request.urlopen(req,timeout=75) as res:
+                                  check(res.status==200,'HISTORICAL_HTTP_NON200')
+                                  dat=res.read(75_000_001)
+                              check(300<len(dat)<75_000_000,f'HISTORICAL_FILE_SIZE_INVALID_{yr}')
+                              folder.mkdir(parents=True,exist_ok=True);file.write_bytes(dat);break
+                          except Exception as ex:
+                              err=ex
+                              if att<2:time.sleep((att+1)*2)
+                      else:raise RuntimeError(f'QB_WEEKLY_SOURCE_DOWNLOAD_ERROR_{yr}_{err}')
+              check(dat[:3]!=b'PK\x03','CSV_EXPECTED_NOT_ZIP')
+              check(b'player_id' in dat[:2500] and b'fantasy_points' in dat[:2500],f'STAT_CSV_HEADER_INVALID_{yr}')
+              return dat
+
+
+          def parse_all(assets):
+              """all team game weeks extracted from any weekly player rows, not guessed by calendar week."""
+              season={};teams={};stats=[]
+              req={'player_id','position','season','season_type','week','team','attempts','fantasy_points'}
+              for yr,data in sorted(assets.items()):
+                  rdr=csv.DictReader(io.StringIO(data.decode('utf-8-sig')))
+                  check(req.issubset(rdr.fieldnames or []),f'REQUIRED_COLUMNS_MISSING_{yr}_{req-set(rdr.fieldnames or [])}')
+                  t=collections.defaultdict(set);qb=collections.defaultdict(list);raw_qb=0
+                  for x in rdr:
+                      if (x.get('season_type') or '').strip().upper()!='REG':
+                          continue  # Explicitly remove playoff weeks (numbered 1..N again).
+                      try: week=int(x['week']); y=int(x['season'])
+                      except (ValueError,TypeError):raise AssertionError('BAD_SEASON_WEEK')
+                      check(y==yr and 1<=week<=18,f'SEASON_WEEK_DRIFT_{yr}')
+                      team=(x.get('team') or '').strip()
+                      if team:t[team].add(week)
+                      if (x.get('position') or '').strip()!='QB':continue
+                      pid=(x.get('player_id') or '').strip()
+                      if not pid or not team:continue
+                      try: pts=float(x.get('fantasy_points') or 0);att=float(x.get('attempts') or 0)
+                      except (ValueError,TypeError):raise AssertionError(f'INVALID_QB_FLOAT_{yr}')
+                      check(math.isfinite(pts) and math.isfinite(att) and att>=0 and pts>-100,'NONFINITE_QB_METRIC')
+                      qb[pid].append({'week':week,'team':team,'attempts':att,'fantasy_points':pts,'name':x.get('player_display_name') or pid})
+                      raw_qb+=1
+                  if yr>2016:check(len(qb)>=28 and len(t)>=25,f'HISTORICAL_COVERAGE_LOW_{yr}_{len(qb)}_{len(t)}')
+                  for pid,rs in qb.items():
+                      rs.sort(key=lambda r:(r['week'],r['team']))
+                      check(len({r['week'] for r in rs})==len(rs),f'DUPLICATE_QB_ID_WEEK_{yr}_{pid}')
+                  season[yr]=qb;teams[yr]=dict(t);stats.append({'year':yr,'qb_unique':len(qb),'qb_week_rows':raw_qb,'teams_with_games':len(t)})
+              check(set(season)==set(YEARS),'HISTORICAL_YEAR_GAP')
+              return season,teams,stats
+
+
+          def candidate_rows(season,teams):
+              results=[];skips=collections.Counter()
+              for yr in range(2017,2026):
+                  for pid,rs in season[yr].items():
+                      rs_by_week={r['week']:r for r in rs}
+                      for cutoff in ORIGINS:
+                          seen=[r for r in rs if r['week']<=cutoff]
+                          if not seen:continue
+                          attempts=sum(r['attempts'] for r in seen)
+                          games10=sum(r['attempts']>=10 for r in seen)
+                          if attempts<80 or games10<3:
+                              skips['minimum_attempts_and_games']+=1;continue
+                          team=seen[-1]['team'];allgames=sorted(teams[yr].get(team,()))
+                          past=[wk for wk in allgames if wk<=cutoff];future=[wk for wk in allgames if wk>cutoff]
+                          if len(past)<3 or len(future)<2:
+                              skips['too_few_team_games']+=1;continue
+                          ytd=sum(r['fantasy_points'] for r in seen)/len(past)
+                          last3=sum(rs_by_week[wk]['fantasy_points'] for wk in past[-3:] if wk in rs_by_week)/3
+                          previous=season[yr-1].get(pid)
+                          prior=None
+                          if previous:
+                              prior_attempts=sum(r['attempts'] for r in previous)
+                              if prior_attempts>=80 and len(previous)>=3:
+                                  pteam=previous[-1]['team']; pgames=teams[yr-1].get(pteam,set())
+                                  if len(pgames)>=12:prior=sum(r['fantasy_points'] for r in previous)/len(pgames)
+                          # Player may change NFL team; count his post-origin player production, not only original-team stats.
+                          target=sum(r['fantasy_points'] for r in rs if r['week']>cutoff)/len(future)
+                          check(all(math.isfinite(z) for z in (ytd,last3,target)),'MODEL_INPUT_NONFINITE')
+                          breakout=bool(prior is not None and prior>=1 and last3>=prior*1.25 and last3>=prior+3)
+                          results.append({'season':yr,'player_id':pid,'cutoff':cutoff,'team':team,'games_ytd':len(past),'future_team_games':len(future),
+                              'has_prior':prior is not None,'prior_ppg':prior,'ytd_ppg':ytd,'recent3_ppg':last3,'ros_ppg':target,
+                              'recent_vs_prior_breakout':breakout,'name':seen[-1]['name']})
+              check(all(x['season'] in (*TRAIN,*TEST) and x['cutoff'] in ORIGINS for x in results),'OUT_OF_SCOPE_INPUT')
+              return results,skips
+
+
+          def pred(r,w):
+              a,b,c=w
+              return a*r['recent3_ppg']+b*r['ytd_ppg']+c*(r['prior_ppg'] if r['prior_ppg'] is not None else 0)
+
+
+          def mae(rs,w):return sum(abs(pred(r,w)-r['ros_ppg']) for r in rs)/len(rs)
+
+
+          def mse(rs,w):return sum((pred(r,w)-r['ros_ppg'])**2 for r in rs)/len(rs)
+
+
+          def choose(rows):
+              models=[];yearly=[];breakouts=[]
+              for cutoff in ORIGINS:
+                  for prior in (True,False):
+                      cohort=[r for r in rows if r['cutoff']==cutoff and r['has_prior']==prior]
+                      train=[r for r in cohort if r['season'] in TRAIN];test=[r for r in cohort if r['season'] in TEST]
+                      check(len(train)>=35 and len(test)>=16,f'INSUFFICIENT_TEMPORAL_VALIDATION_{cutoff}_{prior}_{len(train)}_{len(test)}')
+                      candidates=WITH_PRIOR if prior else NO_PRIOR
+                      winner=min(candidates,key=lambda w:(mae(train,w),w[0],w[1]))
+                      baselines={'season_ytd':(0.,1.,0.),'last_three_games':(1.,0.,0.)}
+                      if prior:baselines['previous_season']=(0.,0.,1.)
+                      allchoices={'train_selected':winner,**baselines}
+                      t_train=mae(train,winner);t_test=mae(test,winner)
+                      base=mae(test,baselines['season_ytd'])
+                      models.append({'cutoff':cutoff,'prior_season_available':prior,'train_n':len(train),'test_n':len(test),
+                          'recent_three_weight':winner[0],'season_to_date_weight':winner[1],'previous_year_weight':winner[2],
+                          'train_selected_mae':round(t_train,6),'test_selected_mae':round(t_test,6),
+                          'test_ytd_only_mae':round(base,6),'test_relative_mae_gain_vs_ytd_pct':round(100*(base-t_test)/base,4) if base else 0,
+                          'test_model_beats_ytd':t_test<base,'train_selected_weight_is_zero_recency':winner[0]==0,
+                          'test_recent3_only_mae':round(mae(test,baselines['last_three_games']),6)})
+                      for name,w in allchoices.items():
+                          for y in TEST:
+                              subset=[r for r in test if r['season']==y]
+                              if subset:
+                                  yearly.append({'cutoff':cutoff,'prior_season_available':prior,'test_year':y,'model':name,'n':len(subset),
+                                      'mae':round(mae(subset,w),6),'mse':round(mse(subset,w),6)})
+                      if prior:
+                          for b in (True,False):
+                              select=[r for r in test if r['recent_vs_prior_breakout']==b]
+                              if select:
+                                  breakouts.append({'cutoff':cutoff,'breakout_flag':b,'test_n':len(select),
+                                      'recent_3_mean':round(statistics.mean(r['recent3_ppg'] for r in select),4),
+                                      'prior_mean':round(statistics.mean(r['prior_ppg'] for r in select),4),
+                                      'remaining_season_mean':round(statistics.mean(r['ros_ppg'] for r in select),4),
+                                      'maintained_minimum_25pct_lift_over_prior':round(sum(r['ros_ppg']>=1.25*r['prior_ppg'] for r in select)/len(select),4),
+                                      'selected_model_mae':round(mae(select,winner),5),'ytd_only_mae':round(mae(select,baselines['season_ytd']),5)})
+              check(len(models)==6,'MODEL_STRATA_MISSING')
+              return models,yearly,breakouts
+
+
+
+          # ----- CAL26 V1R48: separate future QB opportunity and start-level production -----
+          OLD_R46_SHA={'2016': 'eb0264c65d1ef593196afcd4ba24e9f2e9b7942923bf6f4bb4639684e2c4d470', '2017': '592b0916065987b0b3afb0480162f03350d16b12250dc42b0f194e2ab1378563', '2018': 'c53021bcfc9f89d30edd6f1fe145a1d7d6ce469efeec75974fe9f0adac568642', '2019': 'a05558126b1209b80fe11a8f18938cb35816370bf9990975a87de49e9eed7376', '2020': '05b992676faccc8940efbf6242cb76358069372d31d7c2e02c1a4acdcd3cbe18', '2021': '41915fb49238902ad1f129ebf0405b11a1e710454ae0fe8f7b3e4f9145875f48', '2022': 'ad426c3fe5bf1cc30c3f137fdfe96d054e19d400879ee4413129da49fa7b54be', '2023': 'f19cb71a5de0dce7fd09376026237c9ee9d5a93fe13815a2ea3ec2d37204cb17', '2024': '3ddc45a84f759aa348ce465ae001752c530575455717657cdfe1f8abfcdb4759', '2025': 'e5e0615b3d96a3eaebfaee91e55afb4a4e7fe0caf057454177bcd7d6ad4bcfc2'}
+          OLD_R46_SELECTED=[{'cutoff': '6', 'prior_season_available': 'True', 'train_n': '160', 'test_n': '79', 'recent_three_weight': '0.5', 'season_to_date_weight': '0.0', 'previous_year_weight': '0.5', 'train_selected_mae': '4.743068', 'test_selected_mae': '4.900613', 'test_ytd_only_mae': '5.288728', 'test_relative_mae_gain_vs_ytd_pct': '7.3385', 'test_model_beats_ytd': 'True', 'train_selected_weight_is_zero_recency': 'False', 'test_recent3_only_mae': '5.535276'}, {'cutoff': '6', 'prior_season_available': 'False', 'train_n': '36', 'test_n': '18', 'recent_three_weight': '0.25', 'season_to_date_weight': '0.75', 'previous_year_weight': '0.0', 'train_selected_mae': '4.888434', 'test_selected_mae': '4.971524', 'test_ytd_only_mae': '4.809301', 'test_relative_mae_gain_vs_ytd_pct': '-3.3731', 'test_model_beats_ytd': 'False', 'train_selected_weight_is_zero_recency': 'False', 'test_recent3_only_mae': '5.800076'}, {'cutoff': '10', 'prior_season_available': 'True', 'train_n': '175', 'test_n': '86', 'recent_three_weight': '0.5', 'season_to_date_weight': '0.0', 'previous_year_weight': '0.5', 'train_selected_mae': '4.581399', 'test_selected_mae': '5.793683', 'test_ytd_only_mae': '6.007019', 'test_relative_mae_gain_vs_ytd_pct': '3.5514', 'test_model_beats_ytd': 'True', 'train_selected_weight_is_zero_recency': 'False', 'test_recent3_only_mae': '6.101649'}, {'cutoff': '10', 'prior_season_available': 'False', 'train_n': '51', 'test_n': '30', 'recent_three_weight': '0.0', 'season_to_date_weight': '1.0', 'previous_year_weight': '0.0', 'train_selected_mae': '4.856389', 'test_selected_mae': '5.394232', 'test_ytd_only_mae': '5.394232', 'test_relative_mae_gain_vs_ytd_pct': '0.0', 'test_model_beats_ytd': 'False', 'train_selected_weight_is_zero_recency': 'True', 'test_recent3_only_mae': '5.870929'}, {'cutoff': '14', 'prior_season_available': 'True', 'train_n': '187', 'test_n': '93', 'recent_three_weight': '0.5', 'season_to_date_weight': '0.25', 'previous_year_weight': '0.25', 'train_selected_mae': '4.909905', 'test_selected_mae': '5.778803', 'test_ytd_only_mae': '6.698333', 'test_relative_mae_gain_vs_ytd_pct': '13.7278', 'test_model_beats_ytd': 'True', 'train_selected_weight_is_zero_recency': 'False', 'test_recent3_only_mae': '5.299803'}, {'cutoff': '14', 'prior_season_available': 'False', 'train_n': '64', 'test_n': '37', 'recent_three_weight': '1.0', 'season_to_date_weight': '0.0', 'previous_year_weight': '0.0', 'train_selected_mae': '4.130573', 'test_selected_mae': '5.752387', 'test_ytd_only_mae': '5.591362', 'test_relative_mae_gain_vs_ytd_pct': '-2.8799', 'test_model_beats_ytd': 'False', 'train_selected_weight_is_zero_recency': 'False', 'test_recent3_only_mae': '5.752387'}]
+
+          R48_OUT='CAL26_V1R48'
+          OPPORTUNITY_CUTOFF_PASS_ATTEMPTS=10
+          # Candidate grids were fixed before the 2023–2025 chronological holdout inspection.
+          # 15 two-year mixtures for observed prior-year players and 5 for other QBs.
+
+
+          def clamp(x,lo=0.,hi=1.):return max(lo,min(hi,x))
+
+
+          def features(rows,season,teams):
+              """Annotate exact R46 origin rows with availability and conditional scoring.
+
+              START means >=10 QB passing attempts in a team game, *not* official NFL starter.
+              Fantasy scoring in partial appearances (<10 attempts) stays in the ROS target,
+              but is not predicted by the decomposed skill * starts approximation.
+              """
+              out=[]
+              for r in rows:
+                  y,pid,cutoff=r['season'],r['player_id'],r['cutoff']
+                  seen=[v for v in season[y][pid] if v['week']<=cutoff]
+                  weekmap={v['week']:v for v in seen}
+                  past=sorted(w for w in teams[y][r['team']] if w<=cutoff)
+                  assert len(past)==r['games_ytd']
+                  started=[v for v in seen if v['attempts']>=OPPORTUNITY_CUTOFF_PASS_ATTEMPTS]
+                  check(len(started)>=3,'R48_STARTER_FEATURES_EXPECTED')
+                  recent=[weekmap[w] for w in past[-3:] if w in weekmap and weekmap[w]['attempts']>=OPPORTUNITY_CUTOFF_PASS_ATTEMPTS]
+                  prior=season[y-1].get(pid,[])
+                  prior_started=[v for v in prior if v['attempts']>=OPPORTUNITY_CUTOFF_PASS_ATTEMPTS]
+                  pp=None;sp=None
+                  if r['has_prior']:
+                      prior_team=prior[-1]['team']
+                      den=len(teams[y-1].get(prior_team,set()))
+                      check(den>=12 and len(prior_started)>=3,'R48_PRIOR_VALIDITY_DRIFT')
+                      pp=clamp(len(prior_started)/den)
+                      sp=sum(v['fantasy_points'] for v in prior_started)/len(prior_started)
+                  # Recent zero starts should not translate to zero predicted skill; availability models handle that.
+                  av_ytd=clamp(len(started)/len(past))
+                  av_recent=clamp(len(recent)/3)
+                  skill_ytd=sum(v['fantasy_points'] for v in started)/len(started)
+                  skill_recent=sum(v['fantasy_points'] for v in recent)/len(recent) if recent else skill_ytd
+                  check(all(math.isfinite(v) for v in [av_ytd,av_recent,skill_ytd,skill_recent,r['ros_ppg']]),'R48_NONFINITE')
+                  out.append(dict(r,avail_ytd=av_ytd,avail_recent=av_recent,avail_prior=pp,
+                                  skill_ytd=skill_ytd,skill_recent=skill_recent,skill_prior=sp,
+                                  observed_passing_starts=len(started),recent_passing_starts=len(recent),
+                                  missed_team_games=len(past)-len(started),
+                                  partial_appearance_games=sum(v['attempts']<10 for v in seen)))
+              return out
+
+
+          def new_pred(r,aw,sw):
+              if r['has_prior']:
+                  if r['avail_prior'] is None or r['skill_prior'] is None:raise AssertionError('R48_PRIOR_INPUT_MISSING')
+                  avail=aw[0]*r['avail_recent']+aw[1]*r['avail_ytd']+aw[2]*r['avail_prior']
+                  skill=sw[0]*r['skill_recent']+sw[1]*r['skill_ytd']+sw[2]*r['skill_prior']
+              else:
+                  avail=aw[0]*r['avail_recent']+aw[1]*r['avail_ytd']
+                  skill=sw[0]*r['skill_recent']+sw[1]*r['skill_ytd']
+              return clamp(avail)*max(0.,skill)
+
+
+          def score_new(rows,aw,sw):return sum(abs(new_pred(r,aw,sw)-r['ros_ppg']) for r in rows)/len(rows)
+
+
+          def score_old(rows,w):return sum(abs(pred(r,w)-r['ros_ppg']) for r in rows)/len(rows)
+
+
+          def cross_validate(rows,fixture=False):
+              metrics=[];case=[];year_metrics=[]
+              fixture_selected=choose(rows)[0] if fixture else None
+              for cutoff in ORIGINS:
+                  for prior in (True,False):
+                      tr=[r for r in rows if r['cutoff']==cutoff and r['has_prior']==prior and r['season'] in TRAIN]
+                      te=[r for r in rows if r['cutoff']==cutoff and r['has_prior']==prior and r['season'] in TEST]
+                      orig=next(z for z in (fixture_selected if fixture else OLD_R46_SELECTED) if int(z['cutoff'])==cutoff and str(z['prior_season_available'])==str(prior))
+                      check(len(tr)==int(orig['train_n']) and len(te)==int(orig['test_n']),f'R46_SAMPLE_PARITY_{cutoff}_{prior}')
+                      oldw=(float(orig['recent_three_weight']),float(orig['season_to_date_weight']),float(orig['previous_year_weight']))
+                      old_mae=score_old(te,oldw)
+                      check(abs(old_mae-float(orig['test_selected_mae']))<0.00005, f'R46_SELECTED_SCORE_PARITY_{cutoff}_{prior}')
+                      check(abs(score_old(te,(0,1,0))-float(orig['test_ytd_only_mae']))<0.00005,f'R46_YTD_SCORE_PARITY_{cutoff}_{prior}')
+                      grid=WITH_PRIOR if prior else NO_PRIOR
+                      # Only TRAIN rows used to choose weights; no test outcomes touched for selection.
+                      # Tie preference: more weight to full-season, then less free-form recency.
+                      aw,sw=min(((a,s) for a in grid for s in grid),key=lambda pair:(score_new(tr,*pair), -pair[0][1],-pair[1][1],pair))
+                      test_mae=score_new(te,aw,sw)
+                      old_ytd=score_old(te,(0,1,0))
+                      row={'cutoff_week':cutoff,'has_usable_previous_season':prior,
+                          'train_n':len(tr),'test_n':len(te),
+                          'selected_availability_recent3':aw[0],'selected_availability_YTD':aw[1],'selected_availability_prior':aw[2],
+                          'selected_conditional_skill_recent3':sw[0],'selected_conditional_skill_YTD':sw[1],
+                          'selected_conditional_skill_prior':sw[2],
+                          'decomposed_train_mae':round(score_new(tr,aw,sw),6),
+                          'decomposed_test_mae':round(test_mae,6),
+                          'R46_original_test_mae':round(old_mae,6),
+                          'YTD_only_test_mae':round(old_ytd,6),
+                          'decomposed_beats_R46':test_mae<old_mae,
+                          'decomposed_pct_error_change_vs_R46':round(100*(old_mae-test_mae)/old_mae,4),
+                          'decomposed_beats_YTD':test_mae<old_ytd,
+                          'semantics':'team-game ROS target; opportunity=games with >=10 pass attempts; skill=points per such game'}
+                      metrics.append(row)
+                      for y in TEST:
+                          subset=[r for r in te if r['season']==y]
+                          if not subset:continue
+                          year_metrics.append({'cutoff_week':cutoff,'has_usable_previous_season':prior,
+                               'test_year':y,'n':len(subset),'R46_mae':round(score_old(subset,oldw),6),
+                               'R48_decomposed_mae':round(score_new(subset,aw,sw),6)})
+                      # compact focus-only 2023-2025 findings, no raw NFL weekly rows in artifacts
+                      for r in te:
+                          if r['name'].strip().lower() in ('bryce young','caleb williams','jayden daniels','c.j. stroud','drake maye'):
+                              case.append({'qb':r['name'],'season':r['season'],'origin_week':r['cutoff'],
+                                'season_team_games':r['games_ytd'],'qualified_passing_games':r['observed_passing_starts'],
+                                'prior_usable':prior,'YTD_team_game_ppg':round(r['ytd_ppg'],3),
+                                'YTD_per_qualified_game_ppg':round(r['skill_ytd'],3),
+                                'historical_R46_pred':round(pred(r,oldw),3),
+                                'R48_decomposed_pred':round(new_pred(r,aw,sw),3),
+                                'actual_later_team_game_ppg':round(r['ros_ppg'],3)})
+              check(len(metrics)==6,'R48_SIX_STRATA_EXPECTED')
+              check(all(x['test_n']>=16 for x in metrics),'R48_TEST_SIZE')
+              return metrics,year_metrics,case
+
+
+          def outfiles(assets,metrics,years,cases,out_dir,fixture=False):
+              out_dir.mkdir(parents=True,exist_ok=True)
+              data={}
+              data[f'{R48_OUT}_six_stratum_validation.csv']=csv_string(metrics,list(metrics[0]))
+              data[f'{R48_OUT}_year_by_year_holdout.csv']=csv_string(years,list(years[0]))
+              data[f'{R48_OUT}_focus_QB_historical_examples.csv']=csv_string(cases,list(cases[0])) if cases else csv_string([],['qb','season','origin_week'])
+              wins=sum(r['decomposed_beats_R46'] for r in metrics)
+              report=['# CAL26 V1R48 — QB Opportunity × Conditional Production Historical Backtest','',
+                  '**Status: R48_HISTORICAL_COMPONENT_EVALUATED_PRODUCTION_HOLD**','',
+                  'Verified R47R1 actual artifact: 31/54 QB eligible, with preseason/ROS rank shifts. R47R1 numeric reference unchanged.',
+                  '', '## What we tested',
+                  'Reproduces R46 2017–2022 train / 2023–2025 holdout using SHA-pinned nflverse 2016–2025 weekly source files and EXACT R46 validation losses.',
+                  'All feature calculation is strictly through the origin week (6, 10 or 14). Actual later-week outcomes are targets only for out-of-sample validation.',
+                  'Opportunity proxy: fraction of team games QB had >=10 passing attempts. This is NOT proof of official starter status or ability to play next week.',
+                  'Conditional production proxy: fantasy points per such passing game; partial QB appearances contribute to target but not to conditional production training.',
+                  'Independently fit separate 25%-grid mixtures for probability and conditional skill on TRAIN data, minimizing forecast error of their PRODUCT in team-game fantasy PPG.',
+                  'Compare R48 to the published R46 train-selected single-stage recency formula. Separate prior-eligible and no-prior QBs, identical eligible cohorts, no owner price targets.',
+                  '', '## Actual chronological validation (lower MAE better)',
+                  '| Cutoff | Prior available? | Train n | Test n | R46 test MAE | R48 test MAE | R48 error change vs R46 | R48 better? |',
+                  '|---|---|---:|---:|---:|---:|---:|---|']
+              for r in metrics:report.append(f"| {r['cutoff_week']} | {r['has_usable_previous_season']} | {r['train_n']} | {r['test_n']} | {r['R46_original_test_mae']:.3f} | {r['decomposed_test_mae']:.3f} | {r['decomposed_pct_error_change_vs_R46']:+.2f}% | {r['decomposed_beats_R46']} |")
+              report.extend(['',f'R48 beat established R46 baseline in **{wins}/6** held-out origin/cohort strata. An operationally GREEN GitHub run is not a claim of model improvement.',
+                   '', '## Interpretation and strict holds',
+                   'If the decomposition loses on the 2023–2025 holdout, retain R46 as forecast baseline. Do not pick strata retroactively to make specific QBs look better.',
+                   'Participation and efficiency are not independently identified: pass attempts reflect role and in-game injury; the candidate does not use verified injury reports or depth charts.',
+                   'Fantasy points are standard NFLverse 4-point passing-TD points, not the LOG league scoring unit; only future-team-game forecasting tested, NOT 2026 preseason forecast accuracy.',
+                   'Do not multiply R48 active-start forecast changes into R45R1 54-player rank-reallocated FV references. Build that bridge only after validating 2026 prospective transfer and lifetime horizon.',
+                   '2026 realized player weeks and protected 2026 Week 8–12 holdout are NEVER read by R48. R42–R45 dynasty career model and R46 historical recency results remain intact.',
+                   'Research-only; no DLF/MV or owner target price fitting, no production FV, index.html, or role modifications.', ''])
+              data[f'{R48_OUT}_findings.md']='\n'.join(report)
+              for name,s in data.items():(out_dir/name).write_text(s,encoding='utf8')
+              manifest={'workflow':'CAL26 V1R48 - QB Opportunity and Conditional Skill Historical Holdout (Read Only)',
+                 'semantic_status':'R48_HISTORICAL_COMPONENT_EVALUATED_PRODUCTION_HOLD','fixture_mode':fixture,
+                 'R47R1_join_reference_run':40030717495,'R46_source_run':40027917152,'R46_chronological_holdout_parity_verified':True,
+                 'historical_years':list(YEARS),'train_years':list(TRAIN),'test_years':list(TEST),
+                 'n_origin_strata':len(metrics),'R48_wins_vs_R46':wins,'n_2026_realized_outcomes_read':0,
+                 'future_2026_holdout_read':False,'owner_price_target_fitted':False,'DLF_MV_target_fitted':False,
+                 'production_changes_authorized':False,'index_html_modified':False,'R45R1_numeric_FV_repriced':False,
+                 'scoring_units':'NFLverse standard fantasy points per team game, not LOG league',
+                 'source_sha256':{str(k):digest(v) for k,v in assets.items()},
+                 'output_sha256':{n:digest(v.encode()) for n,v in data.items()}}
+              (out_dir/f'{R48_OUT}_manifest.json').write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n',encoding='utf8')
+              return manifest
+
+
+          def run_r48(assets,out,fixture=False):
+              check(set(assets)==set(YEARS),'R48_HISTORICAL_YEARS_ONLY')
+              if not fixture:
+                  for y,b in assets.items():check(digest(b)==OLD_R46_SHA[str(y)],f'R46_HISTORICAL_SHA_MISMATCH_{y}')
+              season,teams,stats=parse_all(assets)
+              rows,skips=candidate_rows(season,teams)
+              check(len(rows)==1016 or fixture,f'R46_HISTORICAL_EXAMPLE_N_DRIFT_{len(rows)}')
+              enriched=features(rows,season,teams)
+              m,y,c=cross_validate(enriched,fixture=fixture)
+              summary=outfiles(assets,m,y,c,out,fixture)
+              print(json.dumps({'status':summary['semantic_status'],'examples':len(rows),'R48_holdout_wins_vs_R46':summary['R48_wins_vs_R46'],'fixture':fixture},sort_keys=True))
+              return summary
+
+
+          def selftest_r48():
+              check(len(WITH_PRIOR)==15 and len(NO_PRIOR)==5,'R48_GRID_DRIFT')
+              a={'has_prior':True,'avail_recent':1.,'avail_ytd':.5,'avail_prior':.75,
+                 'skill_recent':22.,'skill_ytd':18.,'skill_prior':12.}
+              check(abs(new_pred(a,(.5,.5,0),(.5,0,.5))-12.75)<1e-9,'R48_PRODUCT_TEST')
+              check(clamp(2.)==1. and clamp(-1.)==0.,'R48_CLAMP_TEST')
+              check(2026 not in YEARS and max(TEST)==2025,'R48_NO_FUTURE')
+              print('R48_SELFTEST_GREEN opportunity conditional skill, chronologic holdout, source pins')
+
+
+          def main_r48():
+              ap=argparse.ArgumentParser()
+              ap.add_argument('--selftest',action='store_true');ap.add_argument('--download',action='store_true')
+              ap.add_argument('--assets',type=Path,default=Path('historical-assets'))
+              ap.add_argument('--out',type=Path,default=Path('cal26-v1r48'))
+              ap.add_argument('--fixture',action='store_true')
+              args=ap.parse_args()
+              if args.selftest:selftest_r48();return
+              assets={y:get_year(y,args.assets,args.download) for y in YEARS}
+              run_r48(assets,args.out,args.fixture)
+
+          if __name__=='__main__':main_r48()
+          PY_CAL26_V1R48_ENGINE
+          python -m py_compile "$RUNNER_TEMP/cal26_v1r48_engine.py"
+          python "$RUNNER_TEMP/cal26_v1r48_engine.py" --selftest
+          python "$RUNNER_TEMP/cal26_v1r48_engine.py" --download --assets "$RUNNER_TEMP/cal26_v1r48_source" --out "$RUNNER_TEMP/cal26_v1r48_report"
+          python - "$RUNNER_TEMP/cal26_v1r48_report" <<'PY_CAL26_V1R48_VERIFY'
+          from pathlib import Path
+          import hashlib,csv,json,sys
+          p=Path(sys.argv[1]);m=json.loads((p/'CAL26_V1R48_manifest.json').read_text())
+          assert m['semantic_status']=='R48_HISTORICAL_COMPONENT_EVALUATED_PRODUCTION_HOLD'
+          assert m['fixture_mode'] is False
+          assert m['R46_source_run']==40027917152 and m['R47R1_join_reference_run']==40030717495
+          assert m['R46_chronological_holdout_parity_verified'] is True
+          assert m['n_origin_strata']==6 and 0<=m['R48_wins_vs_R46']<=6
+          assert m['historical_years']==list(range(2016,2026))
+          assert m['train_years']==list(range(2017,2023))
+          assert m['test_years']==[2023,2024,2025]
+          assert m['n_2026_realized_outcomes_read']==0 and m['future_2026_holdout_read'] is False
+          assert m['owner_price_target_fitted'] is False and m['DLF_MV_target_fitted'] is False
+          assert m['production_changes_authorized'] is False and m['index_html_modified'] is False
+          assert m['R45R1_numeric_FV_repriced'] is False
+          assert len(m['source_sha256'])==10
+          for fn,h in m['output_sha256'].items():
+              f=p/fn;assert f.is_file() and hashlib.sha256(f.read_bytes()).hexdigest()==h
+          with (p/'CAL26_V1R48_six_stratum_validation.csv').open() as f:r=list(csv.DictReader(f))
+          assert len(r)==6 and all(int(x['test_n'])>=16 for x in r)
+          print('R48_GREEN: exact R46 temporal holdout reproduced; 6 component models backtested; no production changes')
+          PY_CAL26_V1R48_VERIFY
+          test -z "$(git status --porcelain)"
+          echo '## CAL26 V1R48 — QB opportunity × conditional production (read-only)' >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/cal26_v1r48_report/CAL26_V1R48_findings.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload only aggregate historical QB model evaluation
+        uses: actions/upload-artifact@v4
+        with:
+          name: CAL26_V1R48_QB_OPPORTUNITY_SKILL_TEMPORAL_VALIDATION_READ_ONLY
+          path: ${{ runner.temp }}/cal26_v1r48_report/
+          if-no-files-found: error
+          retention-days: 90
