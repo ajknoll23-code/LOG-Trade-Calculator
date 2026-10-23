@@ -1,0 +1,428 @@
+name: CAL26 V1R38 - Offensive Pre-Holdout Freeze and FV Rank Gap Audit (Read Only)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cal26-v1r38-offense-preholdout-readonly
+  cancel-in-progress: false
+
+jobs:
+  preholdout-freeze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out only repository-frozen evidence
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Validate engine and freeze preseason candidates without outcome access
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/cal26_v1r38_engine.py" <<'PY_CAL26_V1R38_SOURCE_EOF'
+          #!/usr/bin/env python3
+          """CAL26 V1R38: read-only, strictly preseason FV-vs-production gap review and
+          pre-holdout forecast-candidate ledger for 2026 offensive positions.
+          
+          Never loads 2026 realized outcomes, any DLF/4for4 licensed private rows, or
+          production price files. Does not alter V1R27 QB candidate sets.
+          """
+          from __future__ import annotations
+          import argparse
+          import csv
+          import hashlib
+          import io
+          import json
+          import math
+          import subprocess
+          from collections import Counter, defaultdict
+          from pathlib import Path
+          
+          PRE = 'research/production-v2/production_v2_phase2_preseason_baseline.json'
+          PRE_SHA = 'ed5025134ca5992b460fa8b850033f82d7ea450f'
+          POSITIONS = ('QB', 'RB', 'WR', 'TE')
+          POSITION_UNIVERSE = {'QB': 64, 'RB': 97, 'WR': 114, 'TE': 44}
+          POSITION_ELIGIBLE = {'QB': 31, 'RB': 62, 'WR': 72, 'TE': 30}
+          MODELS = (
+              'history_2025', 'fantasypros_2026', 'sleeper_2026',
+              'preseason_provider_50_50', 'frozen_reference_45_55',
+          )
+          FIELDNAMES = [
+              'position', 'canonical_name', 'sleeper_id', 'age_as_frozen',
+              'frozen_current_fv', 'history_2025', 'fantasypros_2026',
+              'sleeper_2026', 'preseason_provider_50_50', 'frozen_reference_45_55',
+              'qb_v1r27_policy',
+          ]
+          
+          
+          def need(condition, message):
+              if not condition:
+                  raise AssertionError(message)
+          
+          
+          def finite(x):
+              return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+          
+          
+          def json_load_strict(path):
+              def check_pairs(pairs):
+                  obj = {}
+                  for key, val in pairs:
+                      need(key not in obj, f'duplicate JSON key {key!r} in {path}')
+                      obj[key] = val
+                  return obj
+              return json.loads(Path(path).read_text('utf-8'), object_pairs_hook=check_pairs)
+          
+          
+          def average_rank_desc(values):
+              """Tie-aware rank 1 is largest; return average ranks at exact ties."""
+              order = sorted(range(len(values)), key=lambda i: (-values[i], i))
+              out = [None] * len(values)
+              i = 0
+              while i < len(order):
+                  j = i + 1
+                  while j < len(order) and values[order[j]] == values[order[i]]:
+                      j += 1
+                  avg_rank = (i + 1 + j) / 2.0
+                  for k in range(i, j):
+                      out[order[k]] = avg_rank
+                  i = j
+              return out
+          
+          
+          def output_csv(rows, fields):
+              buf = io.StringIO(newline='')
+              writer = csv.DictWriter(buf, fieldnames=fields, lineterminator='\n', extrasaction='ignore')
+              writer.writeheader()
+              for row in rows:
+                  writer.writerow(row)
+              return buf.getvalue()
+          
+          
+          def assemble(pre, enforce_full=True):
+              need(pre.get('status') == 'FROZEN_PRESEASON_BASELINE_RESEARCH_ONLY',
+                   'preseason source research-only status changed')
+              need(pre.get('production_mutation_authorized') is False,
+                   'preseason source unexpectedly authorizes production mutations')
+              ref = pre.get('reference_scenario', {})
+              for key, expected in [
+                  ('history_weight', .45), ('forward_weight', .55),
+                  ('fantasypros_weight', .5), ('sleeper_weight_when_both', .5),
+              ]:
+                  need(ref.get(key) == expected, f'frozen reference weight changed: {key}')
+          
+              players = pre['frozen_players']
+              if enforce_full:
+                  need(len(players) == 549, f'expected 549 frozen players, got {len(players)}')
+              seen_ids = defaultdict(list)
+              counts = {pos: Counter() for pos in POSITIONS}
+              eligible = {pos: [] for pos in POSITIONS}
+              parity_failures = []
+              for name, p in sorted(players.items()):
+                  pos = p.get('pos')
+                  if pos not in POSITIONS:
+                      continue
+                  counts[pos]['frozen_offense_universe'] += 1
+                  if p.get('sleeper_id') is not None:
+                      seen_ids[str(p['sleeper_id'])].append(name)
+                  hist, fp, sl = (p.get('history_component_2025'),
+                                  p.get('fantasypros_2026_points'),
+                                  p.get('sleeper_2026_points'))
+                  if finite(fp) and finite(sl):
+                      counts[pos]['both_preseason_providers'] += 1
+                      canonical = p.get('canonical_forward_2026_points')
+                      if not finite(canonical) or abs(canonical - (fp + sl) / 2) > 1e-4:
+                          parity_failures.append(name)
+                  if p.get('history_note') != 'real' or not finite(hist):
+                      counts[pos]['excluded_no_real_2025_history'] += 1
+                      continue
+                  if not finite(fp):
+                      counts[pos]['excluded_no_fantasypros_preseason'] += 1
+                      continue
+                  if not finite(sl):
+                      counts[pos]['excluded_no_sleeper_preseason'] += 1
+                      continue
+                  need(finite(p.get('current_fundamental_value')),
+                       f'eligible FV nonnumeric: {name}')
+                  blend = (fp + sl) / 2
+                  eligible[pos].append({
+                      'position': pos,
+                      'canonical_name': name,
+                      'sleeper_id': str(p.get('sleeper_id') or ''),
+                      'age_as_frozen': p.get('age'),
+                      'frozen_current_fv': p['current_fundamental_value'],
+                      'history_2025': round(hist, 6),
+                      'fantasypros_2026': round(fp, 6),
+                      'sleeper_2026': round(sl, 6),
+                      'preseason_provider_50_50': round(blend, 6),
+                      'frozen_reference_45_55': round(.45 * hist + .55 * blend, 6),
+                      'qb_v1r27_policy': ('REFERENCE_ONLY_DO_NOT_SUPERSEDE_V1R27' if pos == 'QB'
+                                            else 'V1R38_NEW_PROSPECTIVE_POSITION'),
+                  })
+                  counts[pos]['pre_holdout_source_eligible'] += 1
+          
+              dup_ids = {ident: names for ident, names in seen_ids.items() if len(names) > 1}
+              need(not dup_ids, f'offensive Sleeper ID collisions: {dup_ids}')
+              need(not parity_failures, f'frozen preseason 50/50 source parity failures: {parity_failures[:10]}')
+              for pos in POSITIONS:
+                  if enforce_full:
+                      need(counts[pos]['frozen_offense_universe'] == POSITION_UNIVERSE[pos],
+                           f'{pos} offense universe unexpectedly changed')
+                      need(counts[pos]['pre_holdout_source_eligible'] == POSITION_ELIGIBLE[pos],
+                           f'{pos} pre-holdout cohort unexpectedly changed')
+                  eligible[pos].sort(key=lambda row: row['canonical_name'])
+          
+              ledger = [row for pos in POSITIONS for row in eligible[pos]]
+              need(not enforce_full or len(ledger) == 195, 'expected full 195-person ledger')
+              need(not enforce_full or len([r for r in ledger if r['position'] != 'QB']) == 164,
+                   'expected 164 RB/WR/TE extension players')
+              gaps = []
+              for pos in POSITIONS:
+                  rows = eligible[pos]
+                  fv_rank = average_rank_desc([r['frozen_current_fv'] for r in rows])
+                  proj_rank = average_rank_desc([r['preseason_provider_50_50'] for r in rows])
+                  for idx, r in enumerate(rows):
+                      gaps.append({
+                          'position': pos,
+                          'canonical_name': r['canonical_name'],
+                          'frozen_current_fv': r['frozen_current_fv'],
+                          'frozen_fv_within_eligible_rank': fv_rank[idx],
+                          'preseason_blend_within_eligible_rank': proj_rank[idx],
+                          'fv_rank_minus_preseason_rank': round(fv_rank[idx] - proj_rank[idx], 3),
+                          'age_as_frozen': r['age_as_frozen'],
+                          'interpretation': 'RANK_DIAGNOSTIC_ONLY_NOT_PRICE_DELTA',
+                      })
+              gaps.sort(key=lambda r: (POSITIONS.index(r['position']),
+                                      -abs(r['fv_rank_minus_preseason_rank']),
+                                      r['canonical_name']))
+              return ledger, gaps, {p: dict(counts[p]) for p in POSITIONS}
+          
+          
+          def make_outputs(pre, out):
+              ledger, gaps, qa = assemble(pre, enforce_full=True)
+              out.mkdir(parents=True, exist_ok=True)
+              ledger_text = output_csv(ledger, FIELDNAMES)
+              ledger_digest = hashlib.sha256(ledger_text.encode('utf-8')).hexdigest()
+              extension = [x for x in ledger if x['position'] != 'QB']
+              extension_text = output_csv(extension, FIELDNAMES)
+              extension_digest = hashlib.sha256(extension_text.encode('utf-8')).hexdigest()
+              gaps_fields = [
+                  'position', 'canonical_name', 'frozen_current_fv',
+                  'frozen_fv_within_eligible_rank', 'preseason_blend_within_eligible_rank',
+                  'fv_rank_minus_preseason_rank', 'age_as_frozen', 'interpretation',
+              ]
+              (out / 'CAL26_V1R38_offense_reference_195.csv').write_text(ledger_text, encoding='utf-8')
+              (out / 'CAL26_V1R38_RB_WR_TE_frozen_candidates_164.csv').write_text(extension_text, encoding='utf-8')
+              (out / 'CAL26_V1R38_FV_vs_preseason_rank_disagreements.csv').write_text(
+                  output_csv(gaps, gaps_fields), encoding='utf-8')
+              model_definitions = {
+                  'history_2025': 'frozen 2025 history_component_2025; history_note must be real',
+                  'fantasypros_2026': 'frozen FantasyPros 2026 season points',
+                  'sleeper_2026': 'frozen Sleeper 2026 season points',
+                  'preseason_provider_50_50': '0.5 * FantasyPros + 0.5 * Sleeper, unoptimized',
+                  'frozen_reference_45_55': '0.45 * frozen 2025 history + 0.55 * frozen provider 50/50 blend',
+              }
+              manifest = {
+                  'workflow': 'CAL26 V1R38 - Offensive Pre-Holdout Freeze and FV Rank Gap Audit (Read Only)',
+                  'semantic_status': 'PREHOLDOUT_RB_WR_TE_FROZEN_PRODUCTION_HOLD',
+                  'production_mutation_authorized': False,
+                  'research_only': True,
+                  'does_not_read_2026_outcomes': True,
+                  'not_an_FV_calibration': True,
+                  'inputs': {PRE: {'git_blob_sha1': PRE_SHA, 'source_status': pre['status']}},
+                  'positions': list(POSITIONS),
+                  'frozen_cohort_as_of_preseason': {p: qa[p]['pre_holdout_source_eligible'] for p in POSITIONS},
+                  'extension_cohort_RB_WR_TE': len(extension),
+                  'existing_QB_v1r27_reference_count': qa['QB']['pre_holdout_source_eligible'],
+                  'frozen_reference_existing_weights': {
+                      'history': .45, 'forward': .55,
+                      'provider_fantasypros': .5, 'provider_sleeper': .5,
+                  },
+                  'candidate_models': model_definitions,
+                  'immutable_snapshot_checksums': {
+                      'reference_195_csv_sha256': ledger_digest,
+                      'RB_WR_TE_extension_164_csv_sha256': extension_digest,
+                  },
+                  'preregistered_future_evaluation': {
+                      'initial_window_2026_weeks': [8, 9, 10, 11, 12],
+                      'confirmation_window_2026_weeks': [13, 14, 15, 16, 17, 18],
+                      'outcomes_must_be_scored_using': 'league-scored fantasy points per active game',
+                      'future_primary_inclusion': 'Source-eligible players with >=3 active games and positive fantasy points per active game IN the evaluation window; same players for every forecast model per position',
+                      'primary_metric': 'within-position Spearman rank correlation',
+                      'secondary_metrics': ['paired-player percentile bootstrap of Spearman differences relative to frozen 45/55 reference, 2000 samples seed 1382026', 'directional percentage of correctly ordered player pairs'],
+                      'do_not_scale_annual_to_weekly_without_game_denominator': True,
+                      'no_calibration_on_2026_weeks_1_to_6': True,
+                      'no_parameter_search_on_2026_weeks_8_to_12': True,
+                      'qb_policy': 'Preserve independent V1R27 20-candidate/31-QB frozen protocol; this QB copy is informational reference only.',
+                      'no_automatic_FV_change': True,
+                  },
+                  'quality_assurance': qa,
+              }
+              (out / 'CAL26_V1R38_manifest.json').write_text(
+                  json.dumps(manifest, sort_keys=True, indent=2) + '\n', encoding='utf-8')
+              lines = [
+                  '# CAL26 V1R38 — Offensive Pre-Holdout Freeze and FV Rank Gap Audit',
+                  '',
+                  '**Semantic status:** `PREHOLDOUT_RB_WR_TE_FROZEN_PRODUCTION_HOLD`',
+                  '',
+                  '**Scope:** Research only; no production FV/MV changes; no Week 1–6 or future outcomes read.',
+                  f'**Source:** `{PRE}` (`{PRE_SHA}` Git blob)',
+                  '',
+                  '## Frozen sources and candidate coverage',
+                  '',
+                  '| Position | Frozen universe | Complete real-history/both-provider candidates | Policy |',
+                  '|---|---:|---:|---|',
+              ]
+              for pos in POSITIONS:
+                  policy = ('V1R27 separate QB freeze left untouched' if pos == 'QB'
+                            else 'V1R38 extension, frozen before Week 8')
+                  lines.append(f"| {pos} | {qa[pos]['frozen_offense_universe']} | {qa[pos]['pre_holdout_source_eligible']} | {policy} |")
+              lines += [
+                  '',
+                  '**Total:** 195 source-eligible offense players, including 164 NEW RB/WR/TE extension players.',
+                  '',
+                  '## Predefined forecast candidates',
+                  '',
+                  '| Score | Formula |',
+                  '|---|---|',
+              ]
+              for name, definition in model_definitions.items():
+                  lines.append(f'| `{name}` | {definition} |')
+              lines += [
+                  '',
+                  '## Immediate diagnostic: largest FV vs preseason projection rank differences',
+                  '',
+                  'Ranks below compare the *same frozen eligible players within each position*. A rank mismatch is NOT a numerical FV error; age, longevity, positional opportunity and dynasty outlook can justify it.',
+                  '',
+                  '| Position | Player | Frozen FV | FV rank | Projection rank | FV rank − projection rank |',
+                  '|---|---|---:|---:|---:|---:|',
+              ]
+              for pos in POSITIONS:
+                  for r in [x for x in gaps if x['position'] == pos][:5]:
+                      lines.append(f"| {pos} | {r['canonical_name']} | {r['frozen_current_fv']} | {r['frozen_fv_within_eligible_rank']:.1f} | {r['preseason_blend_within_eligible_rank']:.1f} | {r['fv_rank_minus_preseason_rank']:+.1f} |")
+              lines += [
+                  '',
+                  '## Future outcome evaluation contract (no outcome reads in this workflow)',
+                  '',
+                  '- Primary window: **2026 Weeks 8–12**; confirmation window: **Weeks 13–18**.',
+                  '- Eligibility: freeze player membership now, require at least 3 active window games and positive league-scored active PPG when future outcomes exist.',
+                  '- Compare all five fixed scores on identical players in each position via Spearman rank correlation. Percentile paired-player bootstrap against the existing frozen reference is secondary.',
+                  '- Do not tune to Weeks 1–6, do not alter V1R27 QB choices, do not auto-promote an FV or market-price change.',
+                  '',
+                  '## Frozen artifacts and provenance',
+                  '',
+                  f'- `CAL26_V1R38_offense_reference_195.csv` SHA256 `{ledger_digest}`',
+                  f'- `CAL26_V1R38_RB_WR_TE_frozen_candidates_164.csv` SHA256 `{extension_digest}`',
+                  '- `CAL26_V1R38_FV_vs_preseason_rank_disagreements.csv` (diagnostic only)',
+                  '- `CAL26_V1R38_manifest.json` (prespecification, counts, validation, checksums)',
+                  '',
+                  '**Interpretation:** This establishes the full offense pre-holdout comparison inputs without mistaking rank alignment or external market value for independent FV truth. No index.html reads, writes or deployment occur.',
+              ]
+              (out / 'CAL26_V1R38_report.md').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+              return manifest
+          
+          
+          def selftest():
+              need(average_rank_desc([7, 10, 10, 3]) == [3, 1.5, 1.5, 4],
+                   'descending average ranks incorrect')
+              fp_ref = {'history_weight': .45, 'forward_weight': .55,
+                        'fantasypros_weight': .5, 'sleeper_weight_when_both': .5}
+              pre = {'status': 'FROZEN_PRESEASON_BASELINE_RESEARCH_ONLY',
+                     'production_mutation_authorized': False, 'reference_scenario': fp_ref,
+                     'frozen_players': {
+                         'robert one': {'pos': 'RB', 'history_note': 'real',
+                                        'history_component_2025': 200, 'fantasypros_2026_points': 180,
+                                        'sleeper_2026_points': 200, 'canonical_forward_2026_points': 190,
+                                        'current_fundamental_value': 3000, 'sleeper_id': '321', 'age': 25},
+                         'robert two': {'pos': 'RB', 'history_note': 'real',
+                                        'history_component_2025': 150, 'fantasypros_2026_points': 160,
+                                        'sleeper_2026_points': 180, 'canonical_forward_2026_points': 170,
+                                        'current_fundamental_value': 2000, 'sleeper_id': '322', 'age': 29},
+                         'rookie qb': {'pos': 'QB', 'history_note': 'real',
+                                        'history_component_2025': 200, 'fantasypros_2026_points': 180,
+                                        'sleeper_2026_points': 180, 'canonical_forward_2026_points': 180,
+                                        'current_fundamental_value': 1000, 'sleeper_id': '323', 'age': 22},
+                     }}
+              ledger, gaps, counts = assemble(pre, enforce_full=False)
+              need(len(ledger) == 3 and len(gaps) == 3 and counts['RB']['pre_holdout_source_eligible'] == 2,
+                   'synthetic cohort/filter test failed')
+              need(next(x for x in ledger if x['canonical_name'] == 'robert one')['preseason_provider_50_50'] == 190 and
+                   next(x for x in ledger if x['canonical_name'] == 'robert one')['frozen_reference_45_55'] == round(.45 * 200 + .55 * 190, 6),
+                   'model arithmetic failed')
+              need(all(x['qb_v1r27_policy'] != 'V1R38_NEW_PROSPECTIVE_POSITION' for x in ledger if x['position'] == 'QB'),
+                   'QB preserve-contract broken')
+              broken = json.loads(json.dumps(pre))
+              broken['frozen_players']['robert one']['canonical_forward_2026_points'] = 999
+              try:
+                  assemble(broken, enforce_full=False)
+              except AssertionError as exc:
+                  need('parity' in str(exc), f'wrong guard failed: {exc}')
+              else:
+                  raise AssertionError('synthetic parity tampering was not rejected')
+              broken = json.loads(json.dumps(pre))
+              broken['frozen_players']['robert two']['sleeper_id'] = '321'
+              try:
+                  assemble(broken, enforce_full=False)
+              except AssertionError as exc:
+                  need('Sleeper ID' in str(exc), f'wrong duplicate-id guard failed: {exc}')
+              else:
+                  raise AssertionError('synthetic duplicate identity was not rejected')
+              need(output_csv(ledger, FIELDNAMES) == output_csv(ledger, FIELDNAMES),
+                   'nondeterministic serialization')
+              print('SELFTEST_GREEN: arithmetic, ties, QB policy, identity/parity, deterministic CSV')
+          
+          
+          def main():
+              p = argparse.ArgumentParser()
+              p.add_argument('--selftest', action='store_true')
+              p.add_argument('--repo', type=Path, default=Path('.'))
+              p.add_argument('--out', type=Path, default=Path('out-cal26-v1r38'))
+              args = p.parse_args()
+              if args.selftest:
+                  selftest()
+                  return
+              source = args.repo / PRE
+              need(source.is_file(), 'frozen preseason file missing; do not use a replacement')
+              sha = subprocess.check_output(['git', 'hash-object', '--', PRE],
+                                            cwd=args.repo, text=True).strip()
+              need(sha == PRE_SHA, f'frozen baseline Git blob changed ({sha}); stop and review')
+              pre = json_load_strict(source)
+              manifest = make_outputs(pre, args.out)
+              print('PREHOLDOUT_RB_WR_TE_FROZEN_PRODUCTION_HOLD')
+              print('eligible:', manifest['frozen_cohort_as_of_preseason'])
+              print('extension:', manifest['extension_cohort_RB_WR_TE'])
+              print('ledger_sha256:', manifest['immutable_snapshot_checksums']['reference_195_csv_sha256'])
+              print('extension_sha256:', manifest['immutable_snapshot_checksums']['RB_WR_TE_extension_164_csv_sha256'])
+          
+          
+          if __name__ == '__main__':
+              main()
+          PY_CAL26_V1R38_SOURCE_EOF
+          python -m py_compile "$RUNNER_TEMP/cal26_v1r38_engine.py"
+          python "$RUNNER_TEMP/cal26_v1r38_engine.py" --selftest
+          python "$RUNNER_TEMP/cal26_v1r38_engine.py" \
+            --repo "$GITHUB_WORKSPACE" \
+            --out "$RUNNER_TEMP/cal26-v1r38"
+          test -s "$RUNNER_TEMP/cal26-v1r38/CAL26_V1R38_manifest.json"
+          test -s "$RUNNER_TEMP/cal26-v1r38/CAL26_V1R38_report.md"
+          test -s "$RUNNER_TEMP/cal26-v1r38/CAL26_V1R38_RB_WR_TE_frozen_candidates_164.csv"
+          echo '## CAL26 V1R38 — Read-only pre-holdout freeze' >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/cal26-v1r38/CAL26_V1R38_report.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Preserve reproducible research artifacts (never deployed)
+        uses: actions/upload-artifact@v4
+        with:
+          name: CAL26_V1R38_PREHOLDOUT_RESEARCH_ONLY
+          path: ${{ runner.temp }}/cal26-v1r38/
+          if-no-files-found: error
+          retention-days: 90
