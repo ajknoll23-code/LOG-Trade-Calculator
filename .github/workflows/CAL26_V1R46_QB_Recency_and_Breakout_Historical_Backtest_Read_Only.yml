@@ -1,0 +1,323 @@
+name: CAL26 V1R46 - QB Recency and Breakout Historical Backtest (Read Only)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cal26-v1r46-historical-qb-recency-backtest-readonly
+  cancel-in-progress: false
+
+jobs:
+  historic-qb-recency-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout for a clean-tree read-only safeguard
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Historical NFL weekly recency holdout study
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/cal26_v1r46.py" <<'PY_CAL26_V1R46_ENGINE'
+          #!/usr/bin/env python3
+          """CAL26 V1R46: historical weekly QB recency and breakout validation, shadow research only.
+
+          Holds: 2026 outcomes never downloaded; no owner FV target fit; no production writes.
+          Uses nflverse 2016-2025 weekly player statistics, 2017-2022 training, 2023-2025 test.
+          Predicted quantity: remaining-season fantasy points per team game, including zero weeks.
+          """
+          from __future__ import annotations
+          import argparse,collections,csv,hashlib,io,json,math,os,statistics,time,urllib.request,sys
+          from pathlib import Path
+
+          YEARS=tuple(range(2016,2026)); ORIGINS=(6,10,14); TRAIN=(2017,2018,2019,2020,2021,2022); TEST=(2023,2024,2025)
+          SOURCE='https://github.com/nflverse/nflverse-data/releases/download/stats_player/'
+          URL=lambda yr:SOURCE+f'stats_player_week_{yr}.csv'
+          # Unoptimized predeclared candidate grid. Fits use TRAIN only; test years never determine weights.
+          # a=recent3, b=current-YTD, c=previous season, with a+b+c=1 and 25% increments.
+          WITH_PRIOR=tuple((a/4,b/4,(4-a-b)/4) for a in range(5) for b in range(5-a))
+          NO_PRIOR=tuple((a/4,(4-a)/4,0.) for a in range(5))
+          PREFIX='CAL26_V1R46'
+
+
+          def check(ok,msg):
+              if not ok:raise AssertionError(msg)
+
+
+          def digest(b):return hashlib.sha256(b).hexdigest()
+
+
+          def csv_string(rows,keys):
+              stream=io.StringIO(newline='');w=csv.DictWriter(stream,fieldnames=keys,extrasaction='ignore',lineterminator='\n');w.writeheader()
+              for r in rows:w.writerow({k:r.get(k,'') for k in keys})
+              return stream.getvalue()
+
+
+          def get_year(yr,folder,download):
+              file=folder/f'stats_player_week_{yr}.csv'
+              if not download:
+                  check(file.is_file(),f'SOURCE_YEAR_MISSING_{yr}')
+                  dat=file.read_bytes()
+              else:
+                  if file.exists() and file.stat().st_size>300: dat=file.read_bytes()
+                  else:
+                      err=None
+                      for att in range(3):
+                          try:
+                              req=urllib.request.Request(URL(yr),headers={'User-Agent':'CAL26-V1R46-NonCommercial-Research/1.0'})
+                              with urllib.request.urlopen(req,timeout=75) as res:
+                                  check(res.status==200,'HISTORICAL_HTTP_NON200')
+                                  dat=res.read(75_000_001)
+                              check(300<len(dat)<75_000_000,f'HISTORICAL_FILE_SIZE_INVALID_{yr}')
+                              folder.mkdir(parents=True,exist_ok=True);file.write_bytes(dat);break
+                          except Exception as ex:
+                              err=ex
+                              if att<2:time.sleep((att+1)*2)
+                      else:raise RuntimeError(f'QB_WEEKLY_SOURCE_DOWNLOAD_ERROR_{yr}_{err}')
+              check(dat[:3]!=b'PK\x03','CSV_EXPECTED_NOT_ZIP')
+              check(b'player_id' in dat[:2500] and b'fantasy_points' in dat[:2500],f'STAT_CSV_HEADER_INVALID_{yr}')
+              return dat
+
+
+          def parse_all(assets):
+              """all team game weeks extracted from any weekly player rows, not guessed by calendar week."""
+              season={};teams={};stats=[]
+              req={'player_id','position','season','season_type','week','team','attempts','fantasy_points'}
+              for yr,data in sorted(assets.items()):
+                  rdr=csv.DictReader(io.StringIO(data.decode('utf-8-sig')))
+                  check(req.issubset(rdr.fieldnames or []),f'REQUIRED_COLUMNS_MISSING_{yr}_{req-set(rdr.fieldnames or [])}')
+                  t=collections.defaultdict(set);qb=collections.defaultdict(list);raw_qb=0
+                  for x in rdr:
+                      if (x.get('season_type') or '').strip().upper()!='REG':
+                          continue  # Explicitly remove playoff weeks (numbered 1..N again).
+                      try: week=int(x['week']); y=int(x['season'])
+                      except (ValueError,TypeError):raise AssertionError('BAD_SEASON_WEEK')
+                      check(y==yr and 1<=week<=18,f'SEASON_WEEK_DRIFT_{yr}')
+                      team=(x.get('team') or '').strip()
+                      if team:t[team].add(week)
+                      if (x.get('position') or '').strip()!='QB':continue
+                      pid=(x.get('player_id') or '').strip()
+                      if not pid or not team:continue
+                      try: pts=float(x.get('fantasy_points') or 0);att=float(x.get('attempts') or 0)
+                      except (ValueError,TypeError):raise AssertionError(f'INVALID_QB_FLOAT_{yr}')
+                      check(math.isfinite(pts) and math.isfinite(att) and att>=0 and pts>-100,'NONFINITE_QB_METRIC')
+                      qb[pid].append({'week':week,'team':team,'attempts':att,'fantasy_points':pts,'name':x.get('player_display_name') or pid})
+                      raw_qb+=1
+                  if yr>2016:check(len(qb)>=28 and len(t)>=25,f'HISTORICAL_COVERAGE_LOW_{yr}_{len(qb)}_{len(t)}')
+                  for pid,rs in qb.items():
+                      rs.sort(key=lambda r:(r['week'],r['team']))
+                      check(len({r['week'] for r in rs})==len(rs),f'DUPLICATE_QB_ID_WEEK_{yr}_{pid}')
+                  season[yr]=qb;teams[yr]=dict(t);stats.append({'year':yr,'qb_unique':len(qb),'qb_week_rows':raw_qb,'teams_with_games':len(t)})
+              check(set(season)==set(YEARS),'HISTORICAL_YEAR_GAP')
+              return season,teams,stats
+
+
+          def candidate_rows(season,teams):
+              results=[];skips=collections.Counter()
+              for yr in range(2017,2026):
+                  for pid,rs in season[yr].items():
+                      rs_by_week={r['week']:r for r in rs}
+                      for cutoff in ORIGINS:
+                          seen=[r for r in rs if r['week']<=cutoff]
+                          if not seen:continue
+                          attempts=sum(r['attempts'] for r in seen)
+                          games10=sum(r['attempts']>=10 for r in seen)
+                          if attempts<80 or games10<3:
+                              skips['minimum_attempts_and_games']+=1;continue
+                          team=seen[-1]['team'];allgames=sorted(teams[yr].get(team,()))
+                          past=[wk for wk in allgames if wk<=cutoff];future=[wk for wk in allgames if wk>cutoff]
+                          if len(past)<3 or len(future)<2:
+                              skips['too_few_team_games']+=1;continue
+                          ytd=sum(r['fantasy_points'] for r in seen)/len(past)
+                          last3=sum(rs_by_week[wk]['fantasy_points'] for wk in past[-3:] if wk in rs_by_week)/3
+                          previous=season[yr-1].get(pid)
+                          prior=None
+                          if previous:
+                              prior_attempts=sum(r['attempts'] for r in previous)
+                              if prior_attempts>=80 and len(previous)>=3:
+                                  pteam=previous[-1]['team']; pgames=teams[yr-1].get(pteam,set())
+                                  if len(pgames)>=12:prior=sum(r['fantasy_points'] for r in previous)/len(pgames)
+                          # Player may change NFL team; count his post-origin player production, not only original-team stats.
+                          target=sum(r['fantasy_points'] for r in rs if r['week']>cutoff)/len(future)
+                          check(all(math.isfinite(z) for z in (ytd,last3,target)),'MODEL_INPUT_NONFINITE')
+                          breakout=bool(prior is not None and prior>=1 and last3>=prior*1.25 and last3>=prior+3)
+                          results.append({'season':yr,'player_id':pid,'cutoff':cutoff,'team':team,'games_ytd':len(past),'future_team_games':len(future),
+                              'has_prior':prior is not None,'prior_ppg':prior,'ytd_ppg':ytd,'recent3_ppg':last3,'ros_ppg':target,
+                              'recent_vs_prior_breakout':breakout,'name':seen[-1]['name']})
+              check(all(x['season'] in (*TRAIN,*TEST) and x['cutoff'] in ORIGINS for x in results),'OUT_OF_SCOPE_INPUT')
+              return results,skips
+
+
+          def pred(r,w):
+              a,b,c=w
+              return a*r['recent3_ppg']+b*r['ytd_ppg']+c*(r['prior_ppg'] if r['prior_ppg'] is not None else 0)
+
+
+          def mae(rs,w):return sum(abs(pred(r,w)-r['ros_ppg']) for r in rs)/len(rs)
+
+
+          def mse(rs,w):return sum((pred(r,w)-r['ros_ppg'])**2 for r in rs)/len(rs)
+
+
+          def choose(rows):
+              models=[];yearly=[];breakouts=[]
+              for cutoff in ORIGINS:
+                  for prior in (True,False):
+                      cohort=[r for r in rows if r['cutoff']==cutoff and r['has_prior']==prior]
+                      train=[r for r in cohort if r['season'] in TRAIN];test=[r for r in cohort if r['season'] in TEST]
+                      check(len(train)>=35 and len(test)>=16,f'INSUFFICIENT_TEMPORAL_VALIDATION_{cutoff}_{prior}_{len(train)}_{len(test)}')
+                      candidates=WITH_PRIOR if prior else NO_PRIOR
+                      winner=min(candidates,key=lambda w:(mae(train,w),w[0],w[1]))
+                      baselines={'season_ytd':(0.,1.,0.),'last_three_games':(1.,0.,0.)}
+                      if prior:baselines['previous_season']=(0.,0.,1.)
+                      allchoices={'train_selected':winner,**baselines}
+                      t_train=mae(train,winner);t_test=mae(test,winner)
+                      base=mae(test,baselines['season_ytd'])
+                      models.append({'cutoff':cutoff,'prior_season_available':prior,'train_n':len(train),'test_n':len(test),
+                          'recent_three_weight':winner[0],'season_to_date_weight':winner[1],'previous_year_weight':winner[2],
+                          'train_selected_mae':round(t_train,6),'test_selected_mae':round(t_test,6),
+                          'test_ytd_only_mae':round(base,6),'test_relative_mae_gain_vs_ytd_pct':round(100*(base-t_test)/base,4) if base else 0,
+                          'test_model_beats_ytd':t_test<base,'train_selected_weight_is_zero_recency':winner[0]==0,
+                          'test_recent3_only_mae':round(mae(test,baselines['last_three_games']),6)})
+                      for name,w in allchoices.items():
+                          for y in TEST:
+                              subset=[r for r in test if r['season']==y]
+                              if subset:
+                                  yearly.append({'cutoff':cutoff,'prior_season_available':prior,'test_year':y,'model':name,'n':len(subset),
+                                      'mae':round(mae(subset,w),6),'mse':round(mse(subset,w),6)})
+                      if prior:
+                          for b in (True,False):
+                              select=[r for r in test if r['recent_vs_prior_breakout']==b]
+                              if select:
+                                  breakouts.append({'cutoff':cutoff,'breakout_flag':b,'test_n':len(select),
+                                      'recent_3_mean':round(statistics.mean(r['recent3_ppg'] for r in select),4),
+                                      'prior_mean':round(statistics.mean(r['prior_ppg'] for r in select),4),
+                                      'remaining_season_mean':round(statistics.mean(r['ros_ppg'] for r in select),4),
+                                      'maintained_minimum_25pct_lift_over_prior':round(sum(r['ros_ppg']>=1.25*r['prior_ppg'] for r in select)/len(select),4),
+                                      'selected_model_mae':round(mae(select,winner),5),'ytd_only_mae':round(mae(select,baselines['season_ytd']),5)})
+              check(len(models)==6,'MODEL_STRATA_MISSING')
+              return models,yearly,breakouts
+
+
+          def write(out,assets,stats,rows,skips,model):
+              models,yearly,breakouts=model
+              out.mkdir(parents=True,exist_ok=True)
+              report=['# CAL26 V1R46 — Historical QB recency and breakout evidence','',
+              '**Status:** RECENCY_BACKTEST_COMPLETE_RESEARCH_ONLY_PRODUCTION_HOLD','',
+              'Source: nflverse 2016–2025 weekly official player statistics, standard 4-point-passing-TD fantasy-points proxy. No 2026 outcomes, owner FV targets, DLF/MV, or frozen future holdouts were used.','',
+              '**Target:** Rest-of-season fantasy points per *team game* after the origin, including player-absence zero point games when the team plays. This is not per-start fantasy PPG. Trades after the origin count player production, which can distort denominator.','',
+              '**Origin cutoffs:** NFL weeks 6, 10 and 14; pre-cutoff data is the only predictor input. Eligible QB has >=80 passing attempts and >=3 games with >=10 attempts as of origin. Season-to-date includes team-game zeros; last three means latest three team games, not latest three QB starts.','',
+              '**Split:** 2017–2022 training only; 2023–2025 genuinely later seasons for out-of-sample evaluation. 2016 is used solely as previous-year context. Training selects weights by MAE from preregistered 25% increments; no test-year optimizer or winner cherry-picking. Prior-season-unavailable QB strata are evaluated separately.','',
+              '## Temporal holdout: selected weights and later performance','',
+              '| Week | Prior season available | Train / Test N | Last 3 | YTD | Previous season | Test selected MAE | Test YTD MAE | Relative gain vs YTD |',
+              '|---|---|---:|---:|---:|---:|---:|---:|---:|']
+              for x in models:
+                  report.append(f"| {x['cutoff']} | {x['prior_season_available']} | {x['train_n']} / {x['test_n']} | {x['recent_three_weight']:.2f} | {x['season_to_date_weight']:.2f} | {x['previous_year_weight']:.2f} | {x['test_selected_mae']:.3f} | {x['test_ytd_only_mae']:.3f} | {x['test_relative_mae_gain_vs_ytd_pct']:+.2f}% |")
+              wins=sum(x['test_model_beats_ytd'] for x in models)
+              report+=['',f'**Temporal validation:** Selected recency candidate beats season-to-date-only in {wins} of {len(models)} strata. This is a predictive diagnostic, not FV price or model deployment authorization.',
+                      '', '## Recent-breakout diagnostic (predeclared threshold; not fitted)',
+                      'Breakout flag: last three team games >=125% of previous-season per-team-game scoring AND at least +3 fantasy points per team game.',
+                      '| Week | Breakout? | N | Prior PPG | Recent 3 PPG | Future ROS PPG | Future >=25% prior lift |',
+                      '|---|---|---:|---:|---:|---:|---:|']
+              for b in breakouts:report.append(f"| {b['cutoff']} | {b['breakout_flag']} | {b['test_n']} | {b['prior_mean']:.2f} | {b['recent_3_mean']:.2f} | {b['remaining_season_mean']:.2f} | {b['maintained_minimum_25pct_lift_over_prior']:.1%} |")
+              report+=['','## Limitations and next action','',
+                  'No player-specific live deployment from a cohort-level rule. These seasonal fantasy point statistics do not establish accuracy of the independent 2026 preseason projection tier or league-specific QB scoring. The 2026 weeks 8–12 holdouts remain frozen and unread.',
+                  'The prediction target includes availability, but does not isolate skill, injury, role or opponent effect. Same QB can appear across three origin weeks; row-level samples are not fully independent, and no confidence interval is claimed. Breakout flags are retrospective pattern labels evaluated on later-season holdouts.',
+                  'Next: review whether train-selected weights beat season-to-date-only on the 2023–2025 holdout, and whether breakout persistence is materially above comparison. Only then integrate the improvement as a shadow forward-production input into R45-style long-horizon FV; do NOT adjust current FV by the raw PPG percentage.',
+                  'Production index.html changed: NO. Frozen P2 source changed: NO. Historical career evidence R42–45 replaced: NO.', '']
+              files={
+                  f'{PREFIX}_selected_weights_and_holdout.csv':csv_string(models,list(models[0])),
+                  f'{PREFIX}_year_by_year_holdout.csv':csv_string(yearly,list(yearly[0])),
+                  f'{PREFIX}_breakout_holdout.csv':csv_string(breakouts,list(breakouts[0])),
+                  f'{PREFIX}_source_integrity.csv':csv_string([{'asset':f'stats_player_week_{yr}.csv','url':URL(yr),'bytes':len(bs),'sha256':digest(bs)} for yr,bs in sorted(assets.items())],['asset','url','bytes','sha256']),
+                  f'{PREFIX}_report.md':'\n'.join(report)
+              }
+              for name,s in files.items():(out/name).write_text(s,encoding='utf8')
+              m={'workflow':'CAL26 V1R46 - QB Recency and Breakout Historical Backtest (Read Only)',
+                  'semantic_status':'RECENCY_BACKTEST_COMPLETE_RESEARCH_ONLY_PRODUCTION_HOLD',
+                  'historical_seasons':list(YEARS),'train_seasons':list(TRAIN),'test_seasons':list(TEST),'cutoffs':list(ORIGINS),
+                  'qb_examples_2017_2025':len(rows),'selected_strata':len(models),'test_year_rows':len(yearly),
+                  'test_recent_wins':sum(x['test_model_beats_ytd'] for x in models),
+                  'scoring_unit':'standard nflverse fantasy_points per team game; not full LOG QB scoring',
+                  'only_pre_cutoff_features':True,'target_outcome_has_team_game_zeros':True,
+                  '2026_actuals_read':False,'future_2026_holdout_read':False,
+                  'production_authorized':False,'live_index_edited':False,'frozen_model_edited':False,'model_is_numeric_FV_price':False,
+                  'owner_FV_target_fit':False,'DLF_or_MV_fit':False,
+                  'source_sha256':{yr:digest(bs) for yr,bs in assets.items()},
+                  'source_counts':stats,'skipped':dict(skips),'output_sha256':{fn:digest(s.encode()) for fn,s in files.items()}}
+              (out/f'{PREFIX}_manifest.json').write_text(json.dumps(m,sort_keys=True,indent=2)+'\n')
+              return m
+
+
+          def run(assets,out):
+              s,t,st=parse_all(assets)
+              rs,skips=candidate_rows(s,t)
+              check(len(rs)>300,'QB_ORIGIN_DATA_TOO_SPARSE')
+              models=choose(rs)
+              m=write(out,assets,st,rs,skips,models)
+              print(json.dumps({'status':m['semantic_status'],'examples':len(rs),'holdout_wins':m['test_recent_wins'],'cohorts':m['selected_strata'],'n_years':len(assets)},sort_keys=True))
+              return m
+
+
+          def selftest():
+              check(len(WITH_PRIOR)==15 and len(NO_PRIOR)==5,'WEIGHT_GRID_SIZE')
+              check(all(abs(sum(x)-1)<1e-9 for x in (*WITH_PRIOR,*NO_PRIOR)),'WEIGHTS_NOT_NORMALIZED')
+              example={'recent3_ppg':20.,'ytd_ppg':10.,'prior_ppg':5.,'ros_ppg':0.}
+              check(pred(example,(.5,.25,.25))==13.75,'WEIGHTED_PREDICTION_MATH')
+              check(YEARS[-1]==2025 and 2026 not in YEARS,'2026_HOLDOUT_INPUT_EXCLUSION')
+              print('SELFTEST_GREEN no future data in predictors, normalized preregistered weights, correct scoring arithmetic')
+
+
+          def main():
+              ap=argparse.ArgumentParser();ap.add_argument('--selftest',action='store_true');ap.add_argument('--download',action='store_true')
+              ap.add_argument('--assets',type=Path,default=Path('historical-assets'))
+              ap.add_argument('--out',type=Path,default=Path('cal26-v1r46-output'))
+              a=ap.parse_args()
+              if a.selftest:selftest();return
+              assets={y:get_year(y,a.assets,a.download) for y in YEARS}
+              run(assets,a.out)
+
+          if __name__=='__main__':main()
+          PY_CAL26_V1R46_ENGINE
+          python -m py_compile "$RUNNER_TEMP/cal26_v1r46.py"
+          python "$RUNNER_TEMP/cal26_v1r46.py" --selftest
+          python "$RUNNER_TEMP/cal26_v1r46.py" --download --assets "$RUNNER_TEMP/cal26_v1r46_weekly_cache" --out "$RUNNER_TEMP/cal26_v1r46_research"
+          python - "$RUNNER_TEMP/cal26_v1r46_research" <<'PY_CAL26_V1R46_ASSERT'
+          import json,hashlib,csv,sys,pathlib
+          root=pathlib.Path(sys.argv[1]);m=json.loads((root/'CAL26_V1R46_manifest.json').read_text())
+          assert m['semantic_status']=='RECENCY_BACKTEST_COMPLETE_RESEARCH_ONLY_PRODUCTION_HOLD'
+          assert m['historical_seasons']==list(range(2016,2026)) and m['test_seasons']==[2023,2024,2025]
+          assert m['train_seasons']==[2017,2018,2019,2020,2021,2022] and m['cutoffs']==[6,10,14]
+          assert m['selected_strata']==6 and m['qb_examples_2017_2025']>300
+          assert m['2026_actuals_read'] is False and m['future_2026_holdout_read'] is False
+          assert m['only_pre_cutoff_features'] is True and m['target_outcome_has_team_game_zeros'] is True
+          assert m['production_authorized'] is False and m['live_index_edited'] is False
+          assert m['frozen_model_edited'] is False and m['owner_FV_target_fit'] is False
+          assert m['DLF_or_MV_fit'] is False and m['model_is_numeric_FV_price'] is False
+          assert len(m['source_sha256'])==10
+          for name,checksum in m['output_sha256'].items():
+              dest=root/name; assert dest.is_file() and hashlib.sha256(dest.read_bytes()).hexdigest()==checksum
+          with (root/'CAL26_V1R46_selected_weights_and_holdout.csv').open() as f:
+              models=list(csv.DictReader(f))
+          assert len(models)==6 and all(float(row['recent_three_weight'])+float(row['season_to_date_weight'])+float(row['previous_year_weight'])==1 for row in models)
+          print('GREEN: train-only recency selection, 2023-25 temporal holdout, breakout diagnostics; no live FV mutation')
+          PY_CAL26_V1R46_ASSERT
+          test -z "$(git status --porcelain)"
+          echo '## CAL26 V1R46 — QB Recency and Breakout (historical read only)' >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/cal26_v1r46_research/CAL26_V1R46_report.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload historical aggregate backtest results only
+        uses: actions/upload-artifact@v4
+        with:
+          name: CAL26_V1R46_QB_RECENCY_HISTORICAL_BACKTEST_RESEARCH_ONLY
+          path: ${{ runner.temp }}/cal26_v1r46_research/
+          if-no-files-found: error
+          retention-days: 90
