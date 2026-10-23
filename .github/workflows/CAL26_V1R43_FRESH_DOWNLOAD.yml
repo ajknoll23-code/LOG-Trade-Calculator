@@ -1,0 +1,500 @@
+name: CAL26 V1R43 - Historical QB Validation Adjudication (Read Only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      r42_run_id:
+        description: 'Optional successful R42 run ID (blank = discover latest successful main-branch R42)'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: cal26-v1r43-historical-qb-adjudication-readonly
+  cancel-in-progress: false
+
+jobs:
+  adjudicate-historical-qb-results:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout frozen repository without write credentials
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Verify R42 artifact and adjudicate predictive performance
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          R42_RUN_ID: ${{ inputs.r42_run_id }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/cal26_v1r43_engine.py" <<'PY_CAL26_V1R43_ENGINE'
+          #!/usr/bin/env python3
+          """CAL26 V1R43: adjudicate the R42 produced artifacts, without training or FV mutation."""
+          from __future__ import annotations
+          import argparse, csv, hashlib, io, json, math, os, pathlib, re, sys, tempfile
+          import urllib.error, urllib.parse, urllib.request, zipfile
+          from collections import Counter
+
+          PREFIX='CAL26_V1R43'
+          R42='CAL26_V1R42'
+          WORKFLOW_FILE='CAL26_V1R42_Historical_QB_Career_Continuation_and_Surplus_Read_Only.yml'
+          ARTIFACT_NAME='CAL26_V1R42_HISTORICAL_QB_RESEARCH_ONLY'
+          EXPECTED_FILES={
+              'CAL26_V1R42_manifest.json',
+              'CAL26_V1R42_historical_findings.md',
+              'CAL26_V1R42_source_sha256.csv',
+              'CAL26_V1R42_year_qb24_proxy.csv',
+              'CAL26_V1R42_temporal_validation.csv',
+              'CAL26_V1R42_54_QB_empirical_shadow.csv',
+              'CAL26_V1R42_60_conditional_horizon_cells.csv',
+          }
+          P2_SHA='ed5025134ca5992b460fa8b850033f82d7ea450f'
+          LABELS=('future_above_QB24','future_pass_150','future_surplus')
+          FOCUS=('bryce young','jayden daniels','cj stroud','caleb williams','drake maye')
+
+
+          def require(test,msg):
+              if not test: raise AssertionError(msg)
+
+
+          def sha256(b):return hashlib.sha256(b).hexdigest()
+
+
+          def rows_csv(b,fieldnames):
+              reader=csv.DictReader(io.StringIO(b.decode('utf-8-sig')))
+              require(reader.fieldnames is not None,'CSV_HEADER_MISSING')
+              require(set(fieldnames).issubset(set(reader.fieldnames)),'CSV_COLUMN_MISSING_'+str(set(fieldnames)-set(reader.fieldnames)))
+              return list(reader)
+
+
+          def num(v,label,minimum=None):
+              try:f=float(v)
+              except (TypeError,ValueError):raise AssertionError('NON_NUMERIC_'+label)
+              require(math.isfinite(f),'NONFINITE_'+label)
+              if minimum is not None:require(f>=minimum,'NEGATIVE_'+label)
+              return f
+
+
+          def safe_zip(blob):
+              require(len(blob)<20_000_000,'R42_ARCHIVE_TOO_LARGE')
+              try:z=zipfile.ZipFile(io.BytesIO(blob))
+              except zipfile.BadZipFile as e:raise AssertionError('R42_ARTIFACT_BAD_ZIP') from e
+              files={}
+              for entry in z.infolist():
+                  if entry.is_dir():continue
+                  path=pathlib.PurePosixPath(entry.filename)
+                  require('..' not in path.parts and not path.is_absolute(),'ARCHIVE_UNSAFE_PATH')
+                  require((entry.external_attr>>16)&0o170000 != 0o120000,'ARCHIVE_SYMLINK_NOT_ALLOWED')
+                  base=path.name
+                  require(base not in files,'R42_DUPLICATE_FILE_'+base)
+                  require(base in EXPECTED_FILES,'R42_UNEXPECTED_ARTIFACT_FILE_'+base)
+                  require(entry.file_size<2_000_000,'R42_OVERSIZE_ARTIFACT_'+base)
+                  files[base]=z.read(entry)
+              require(set(files)==EXPECTED_FILES,'R42_REQUIRED_ARTIFACTS_MISSING_'+str(EXPECTED_FILES-set(files)))
+              return files
+
+
+          class SafeRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self,req,fp,code,msg,headers,newurl):
+                  new=super().redirect_request(req,fp,code,msg,headers,newurl)
+                  if new and urllib.parse.urlparse(req.full_url).hostname!=urllib.parse.urlparse(newurl).hostname:
+                      new.remove_header('Authorization')
+                  return new
+
+
+          def api(url,token,raw=False):
+              require(token and len(token)>10,'GITHUB_TOKEN_REQUIRED')
+              require(urllib.parse.urlparse(url).scheme=='https','HTTPS_REQUIRED')
+              hdr={'Authorization':'Bearer '+token,'Accept':'application/vnd.github+json',
+                   'X-GitHub-Api-Version':'2022-11-28','User-Agent':'CAL26-V1R43-Research-Only'}
+              request=urllib.request.Request(url,headers=hdr)
+              try:
+                  with urllib.request.build_opener(SafeRedirect()).open(request,timeout=40) as response:
+                      data=response.read(20_000_001)
+                      require(len(data)<20_000_000,'API_RESPONSE_OVERSIZE')
+              except urllib.error.HTTPError as exc:
+                  raise RuntimeError(f'GITHUB_ACTIONS_API_HTTP_{exc.code}_FOR_{urllib.parse.urlparse(url).path}') from exc
+              return data if raw else json.loads(data)
+
+
+          def discover(repo,token,explicit,branch):
+              base=f'https://api.github.com/repos/{repo}'
+              if explicit:
+                  require(re.fullmatch('[0-9]{4,20}',explicit),'BAD_R42_RUN_ID')
+                  obj=api(base+'/actions/runs/'+explicit,token)
+                  candidates=[obj]
+              else:
+                  workflow=urllib.parse.quote(WORKFLOW_FILE,safe='')
+                  obj=api(base+f'/actions/workflows/{workflow}/runs?event=workflow_dispatch&status=success&per_page=50',token)
+                  candidates=obj.get('workflow_runs',[])
+              matched=[]
+              for run in candidates:
+                  if run.get('conclusion')!='success' or run.get('status')!='completed':continue
+                  if branch and run.get('head_branch')!=branch:continue
+                  if run.get('name')!='CAL26 V1R42 - Historical QB Career Continuation and Multi-Year Surplus (Read Only)':continue
+                  path=(run.get('path') or '')
+                  if not path.endswith('/'+WORKFLOW_FILE):continue
+                  matched.append(run)
+              require(matched,'R42_SUCCESSFUL_WORKFLOW_RUN_NOT_FOUND')
+              run=matched[0]
+              rid=run['id']
+              artifact_info=api(base+f'/actions/runs/{rid}/artifacts?per_page=100',token)
+              artifacts=[a for a in artifact_info.get('artifacts',[]) if a.get('name')==ARTIFACT_NAME and a.get('expired') is False]
+              require(len(artifacts)==1,'R42_RESEARCH_ARTIFACT_NOT_FOUND_OR_EXPIRED')
+              artifact=artifacts[0]
+              archive=api(base+f"/actions/artifacts/{artifact['id']}/zip",token,raw=True)
+              return safe_zip(archive),{'run_id':rid,'run_url':run.get('html_url',''),
+                  'head_sha':run.get('head_sha',''),'artifact_id':artifact['id'],
+                  'artifact_name':ARTIFACT_NAME,'archive_sha256':sha256(archive),
+                  'source_mode':'github_actions_read_api'}
+
+
+          def verify_and_analyze(files,source):
+              manifest=json.loads(files[f'{R42}_manifest.json'])
+              require(manifest['semantic_status']=='HISTORICAL_EMPIRICAL_RESEARCH_ONLY_PRICE_CALIBRATION_HOLD','R42_UNEXPECTED_SEMANTIC_STATUS')
+              require(manifest['production_change_authorized'] is False and manifest['index_html_modified'] is False,'R42_PRODUCTION_GUARD')
+              require(manifest['used_2026_realized_outcomes'] is False and manifest['future_2026_holdout_read'] is False,'R42_HOLDOUT_GUARD')
+              require(manifest['DLF_or_MV_used_for_fit'] is False and manifest['owner_target_ranges_used_for_fit'] is False,'R42_EXTERNAL_PRICE_FIT_GUARD')
+              require(manifest['n_2026_frozen_forward_QBs']==54 and manifest['n_example_models']==60,'R42_COUNTS_DRIFT')
+              require(manifest['source_historical_min_year']==2013 and manifest['source_historical_max_year']==2025,'R42_HISTORICAL_RANGE_DRIFT')
+              require(manifest['validated_horizons']==[1,2,3] and manifest['unvalidated_horizons']==[4],'R42_HORIZON_SEMANTICS_DRIFT')
+              require(manifest['frozen_preseason_git_blob_pin']==P2_SHA,'R42_PRESEASON_PIN_DRIFT')
+              require(manifest['n_raw_external_source_rows_in_artifact']==0,'R42_PRIVATE_RAW_ROWS_IN_ARTIFACT')
+              require(manifest['n_historical_QB_seasons']>500,'R42_HISTORICAL_SAMPLE_TOO_SMALL')
+              for name,digest in manifest['output_sha256'].items():
+                  require(name in files,'R42_OUTPUT_SHA_MISSING_'+name)
+                  require(sha256(files[name])==digest,'R42_OUTPUT_SHA_DRIFT_'+name)
+              require(set(manifest['output_sha256'])==EXPECTED_FILES-{f'{R42}_manifest.json'},'R42_OUTPUT_MANIFEST_COVERAGE_DRIFT')
+
+              source_csv=rows_csv(files[f'{R42}_source_sha256.csv'],['asset','sha256','bytes'])
+              require(len(source_csv)==14,'R42_SOURCE_COUNT_DRIFT')
+              require(len(set(x['asset'] for x in source_csv))==14,'R42_DUPLICATE_SOURCE_ASSET')
+              for r in source_csv:
+                  require(manifest['source_sha256'][r['asset']]==r['sha256'],'R42_SOURCE_SHA_MANIFEST_MISMATCH')
+                  require(re.fullmatch('[a-f0-9]{64}',r['sha256']),'R42_SOURCE_SHA_BAD_FORMAT')
+                  require(num(r['bytes'],'SOURCE_BYTES',1)>300,'R42_SOURCE_FILE_TOO_SMALL')
+              require(set(manifest['source_sha256'])=={r['asset'] for r in source_csv},'R42_SOURCE_LIST_MISMATCH')
+
+              annual=rows_csv(files[f'{R42}_year_qb24_proxy.csv'],['season','qb24_points','qb_n'])
+              require(sorted(int(r['season']) for r in annual)==list(range(2013,2026)),'R42_13_SEASON_GAP')
+              require(all(num(r['qb24_points'],'QB24',1)>20 and num(r['qb_n'],'QB_ROWS',1)>20 for r in annual),'R42_HISTORICAL_ANNUAL_COVERAGE')
+              val=rows_csv(files[f'{R42}_temporal_validation.csv'],
+                  ['horizon','outcome','n','score_type','age_tier_loss','tier_loss','global_loss','delta_loss_vs_global'])
+              require(len(val)==9,'R42_EXPECTED_NINE_VALIDATION_ROWS')
+              indexed={}; comparisons=[]
+              for row in val:
+                  h=int(row['horizon']);label=row['outcome']
+                  require(h in (1,2,3) and label in LABELS,'R42_VALIDATION_LABEL_DRIFT')
+                  key=(h,label);require(key not in indexed,'R42_DUPLICATE_VALIDATION_LABEL');indexed[key]=row
+                  n=int(row['n']);require(n>=12,'R42_VALIDATION_N_TOO_LOW')
+                  if label=='future_surplus':require(row['score_type']=='mse','R42_SURPLUS_LOSS_SEMANTICS')
+                  else:require(row['score_type']=='brier','R42_PROBABILITY_LOSS_SEMANTICS')
+                  a=num(row['age_tier_loss'],'age_tier_loss',0)
+                  t=num(row['tier_loss'],'tier_loss',0)
+                  g=num(row['global_loss'],'global_loss',0)
+                  d=num(row['delta_loss_vs_global'],'delta_loss_vs_global')
+                  require(abs(d-(a-g))<=0.000005,'R42_DELTA_MISMATCH')
+                  gain_vs_global=100*(g-a)/g if g>0 else None
+                  gain_vs_tier=100*(t-a)/t if t>0 else None
+                  comparisons.append({'horizon':h,'outcome':label,'n_test':n,'loss_metric':row['score_type'],
+                      'age_tier_loss':a,'tier_loss':t,'global_loss':g,
+                      'percent_gain_vs_global':round(gain_vs_global,3) if gain_vs_global is not None else '',
+                      'percent_gain_vs_tier':round(gain_vs_tier,3) if gain_vs_tier is not None else '',
+                      'age_tier_beats_global':a<g,'age_tier_beats_tier':a<t,
+                      'best_of_three':'age_tier' if a<t and a<g else ('tier_only' if t<g else 'global'),
+                      'stronger_complexity_justified':a<t and a<g})
+              require(set(indexed)=={(h,lab) for h in (1,2,3) for lab in LABELS},'R42_VALIDATION_GRID_GAP')
+
+              cells=rows_csv(files[f'{R42}_60_conditional_horizon_cells.csv'],
+                  ['horizon','age_band','baseline_tier','p_QB24','p_150_attempts','future_ratio_surplus','local_n','tier_n'])
+              require(len(cells)==60,'R42_CELL_GRID_COUNT_DRIFT')
+              seen=set();weak=0;byh=Counter();
+              for row in cells:
+                  key=(int(row['horizon']),row['age_band'],row['baseline_tier']);require(key not in seen,'R42_CELL_GRID_DUPLICATE');seen.add(key)
+                  require(key[0] in (1,2,3,4) and key[1] in ('<=24','25-28','29-32','33-36','37+') and key[2] in ('below_090','near_090_110','above_110'),'R42_CELL_GRID_INVALID')
+                  for k in ('p_QB24','p_150_attempts'):
+                      value=num(row[k],k);require(0<=value<=1,'R42_PROBABILITY_OUT_OF_RANGE')
+                  require(num(row['future_ratio_surplus'],'FUTURE_SURPLUS',0)<=2,'R42_SURPLUS_OUT_OF_RANGE')
+                  require(num(row['tier_n'],'TIER_N',0)>=num(row['local_n'],'LOCAL_N',0),'R42_TIER_SAMPLE_LESS_THAN_LOCAL')
+                  if int(row['local_n'])<10:weak+=1
+                  byh[key[0]]+=1
+              require(all(byh[h]==15 for h in (1,2,3,4)),'R42_CELL_HORIZON_COVERAGE')
+
+              shadow=rows_csv(files[f'{R42}_54_QB_empirical_shadow.csv'],
+                  ['name','frozen_FV_reference_only','five_season_relative_surplus_research_only',
+                    'shadow_is_numeric_FV_price','ratio_2026_forward_to_QB24','h1_p_above_QB24'])
+              require(len(shadow)==54 and len(set(x['name'] for x in shadow))==54,'R42_QB_SHADOW_COVERAGE')
+              require(all(x['shadow_is_numeric_FV_price']=='False' for x in shadow),'R42_SHADOW_MISLABELED_PRICE')
+              require(all(num(x['five_season_relative_surplus_research_only'],'SHADOW_SURPLUS',0)>=0 for x in shadow),'R42_SHADOW_NONFINITE')
+              require(set(FOCUS).issubset(set(x['name'] for x in shadow)),'R42_FOCUS_QB_MISSING')
+              shadow_sorted=sorted(shadow,key=lambda x:-num(x['five_season_relative_surplus_research_only'],'SHADOW'))
+              for rank,row in enumerate(shadow_sorted,1):row['shadow_rank']=rank
+              ref_sorted=sorted(shadow,key=lambda x:-num(x['frozen_FV_reference_only'],'FV',0))
+              fv_rank={r['name']:i+1 for i,r in enumerate(ref_sorted)}
+              compare_rows=[]
+              for row in shadow_sorted:
+                  rank=row['shadow_rank']; ref=fv_rank[row['name']]
+                  compare_rows.append({'name':row['name'],'shadow_rank':rank,'frozen_FV_rank':ref,
+                      'rank_gap_shadow_minus_FV':ref-rank,
+                      'frozen_FV_reference_only':row['frozen_FV_reference_only'],
+                      'five_season_relative_surplus':row['five_season_relative_surplus_research_only'],
+                      'shadow_is_numeric_price':False})
+              rank_by_name={x['name']:x for x in compare_rows}
+              # Better covariates selected separately by horizon and outcome; a held out performance assessment, NOT promotion.
+              winners=Counter()
+              for c in comparisons:winners[c['best_of_three']]+=1
+              groups={lab:[x for x in comparisons if x['outcome']==lab] for lab in LABELS}
+              verdict={}
+              for lab,rs in groups.items():
+                  beats=[r for r in rs if r['stronger_complexity_justified']]
+                  verdict[lab]={'age_tier_wins_both_count':len(beats),'tested_horizons':3,
+                      'outcomes_by_horizon':{str(r['horizon']):r['best_of_three'] for r in rs},
+                      'simple_baseline_preferred_or_tied':len(beats)<2}
+              summary={
+                  'workflow':'CAL26 V1R43 - Historical QB Validation Adjudication (Read Only)',
+                  'semantic_status':'HISTORICAL_HOLDOUT_REVIEW_COMPLETE_FV_PRICE_CALIBRATION_HOLD',
+                  'operational_green_does_not_mean_predictive_win':True,
+                  'R42_workflow_run_id':source['run_id'],
+                  'R42_workflow_run_url':source['run_url'],
+                  'R42_research_artifact_id':source['artifact_id'],
+                  'R42_artifact_zip_sha256':source['archive_sha256'],
+                  'R42_research_semantic_status':manifest['semantic_status'],
+                  'R42_years':[2013,2025],
+                  'n_historical_QB_seasons':manifest['n_historical_QB_seasons'],
+                  'validation_horizons':[1,2,3],
+                  'unvalidated_horizons':[4],
+                  'n_validation_rows':len(val),'n_local_conditional_cells_below_10':weak,
+                  'n_conditional_cells':len(cells),'n_2026_preseason_QBs':len(shadow),
+                  'model_best_of_three_row_counts':dict(winners),
+                  'label_model_verdicts':verdict,
+                  'source_sha256_verified_inside_R42_artifact':True,
+                  'historical_4pt_TD_vs_LOG_league_scoring_mismatch_resolved':False,
+                  'historical_realized_ratio_vs_2026_preseason_projection_ratio_shift_resolved':False,
+                  'test_row_level_resampling_or_CIs_available_in_R42_artifact':False,
+                  'future_2026_holdout_read':False,'R42_future_2026_holdout_read':False,
+                  'source_external_raw_player_rows_uploaded':False,
+                  'DLF_or_owner_target_prices_used_for_fit':False,
+                  'numeric_FV_prices_calibrated':False,
+                  'production_change_authorized':False,'index_html_modified':False,
+                  'candidate_2026_player_price_changes_authorized':False,
+              }
+              report=['# CAL26 V1R43 — Adjudication of R42 historical QB validation','',
+                  '**Decision: Historical holdout reviewed. Dynasty FV point calibration remains HOLD.**','',
+                  f"R42 workflow run: {source['run_url'] or source['run_id']} ; source artifact ID {source['artifact_id']}.",
+                  f"R42 historical input seasons: 2013–2025; {manifest['n_historical_QB_seasons']} QB seasons. Output manifest and all six R42 research files SHA256-verified.",
+                  '', '## Actual chronological evaluation; smaller squared loss is better',
+                  '| Horizon | Outcome | Validation n | Age+tier loss | Tier loss | Global loss | Age+tier gain vs global | Best loss |',
+                  '|---|---|---:|---:|---:|---:|---:|---|']
+              for x in sorted(comparisons,key=lambda x:(x['horizon'],x['outcome'])):
+                  gain=x['percent_gain_vs_global'];gain=str(gain)+'%' if gain!='' else 'N/A'
+                  report.append(f"| H{x['horizon']} | {x['outcome']} | {x['n_test']} | {x['age_tier_loss']:.5f} | {x['tier_loss']:.5f} | {x['global_loss']:.5f} | {gain} | {x['best_of_three']} |")
+              report.extend(['','## Model complexity verdict by outcome',
+                  'Models are judged per label and horizon. When age+tier does not beat **both** simpler comparators in observed holdouts, retain simpler fallback. No model is promoted solely because a workflow is green.'])
+              for label,v in verdict.items():
+                  report.append(f"- {label}: age+tier wins both comparisons in {v['age_tier_wins_both_count']}/3 tested horizons; "+', '.join(f"H{h}={choice}" for h,choice in v['outcomes_by_horizon'].items())+'.')
+              report.extend(['','## Sample size and uncertainty',
+                  f'- {weak}/60 conditional age×tier×horizon cells contain fewer than 10 training observations.',
+                  '- R42 publishes aggregate validation scores but not paired row-level labels/predictions. Therefore bootstrap confidence intervals and significance claims **cannot** be reconstructed from this artifact. A subsequent blinded row-level backtest would be required.',
+                  '- Four-year forecasts have no independently observed 2022+ origin holdout; all four-year signals are unvalidated extrapolations.',
+                  '', '## Frozen 2026 QB illustrative shadow—not prices',
+                  '| Player | 5-season normalized surplus | Surplus rank | Frozen FV rank | Rank gap |',
+                  '|---|---:|---:|---:|---:|'])
+              for name in FOCUS:
+                  x=rank_by_name[name]
+                  report.append(f"| {name} | {float(x['five_season_relative_surplus']):.3f} | {x['shadow_rank']} | {x['frozen_FV_rank']} | {int(x['rank_gap_shadow_minus_FV']):+d} |")
+              report.extend(['','## Essential limitations',
+                  '- Historical nflverse fantasy points used standard 4-point passing touchdown proxy. The LOG league-scored projection scale is not independently reconciled.',
+                  '- Historical model stratified QBs using actual full-season realized ratios, whereas 2026 shadow stratifies on preseason projected ratios; this forecast-to-realized measurement mismatch is unresolved.',
+                  '- R42 does not estimate independently justified conversion from season surplus ratios into cross-position FV points, nor does this audit estimate it.',
+                  '- Missing 2026 outcomes are never read; Weeks 8–12 and 13–18 holdouts remain untouched.',
+                  '- Frozen QB FV comparisons are diagnosis only; owner ranges, DLF market values and Live production overlays do not fit this model.',
+                  '', '## Next actionable research',
+                  'If observed loss favors age+tier in the key target, preserve it as a shadow feature. If it loses, simplify rather than introduce another tuning gate. Next verify league scoring and correct the realized-to-projected predictor shift before calculating any numeric QB FV prices.',
+                  '', '**Status: RESEARCH_ONLY, HOLD numeric FV calibration; no index.html edits or deployments.**',''])
+              return summary,comparisons,compare_rows,'\n'.join(report)
+
+
+          def csv_text(rows,cols):
+              f=io.StringIO(newline='');w=csv.DictWriter(f,fieldnames=cols,extrasaction='ignore',lineterminator='\n');w.writeheader();w.writerows(rows);return f.getvalue()
+
+
+          def write_outputs(dest,summary,compare,shadow,report,quiet=False):
+              dest.mkdir(parents=True,exist_ok=True)
+              data={f'{PREFIX}_validation_comparisons.csv':csv_text(compare,list(compare[0])),
+                    f'{PREFIX}_54_QB_shadow_rank_diagnostics.csv':csv_text(shadow,list(shadow[0])),
+                    f'{PREFIX}_research_findings.md':report+'\n'}
+              summary['output_sha256']={n:sha256(txt.encode()) for n,txt in data.items()}
+              for name,body in data.items(): (dest/name).write_text(body,encoding='utf-8')
+              (dest/f'{PREFIX}_decision_manifest.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+              if quiet:return
+              print(json.dumps({'semantic_status':summary['semantic_status'],
+                    'R42_run':summary['R42_workflow_run_id'],
+                    'best_of_three':summary['model_best_of_three_row_counts'],
+                    'h4_unvalidated':True,'production_mutation':False},sort_keys=True))
+
+
+          def fake_archive():
+              def write_csv(rs,cols):return csv_text(rs,cols).encode()
+              years=[{'season':y,'qb24_points':200+y-2013,'qb_n':64} for y in range(2013,2026)]
+              sources=[{'asset':f'stats_player_reg_{y}.csv','sha256':sha256(str(y).encode()),'bytes':500} for y in range(2013,2026)]
+              sources.append({'asset':'players.csv','sha256':sha256(b'players'),'bytes':500})
+              val=[]
+              for h in (1,2,3):
+                  for lbl in LABELS:
+                      t=.16;g=.17;a=.14 if h==1 else (.165 if h==2 else .18)
+                      val.append({'horizon':h,'outcome':lbl,'n':25,'score_type':'mse' if lbl=='future_surplus' else 'brier',
+                           'age_tier_loss':a,'tier_loss':t,'global_loss':g,
+                           'delta_loss_vs_global':round(a-g,6)})
+              cells=[{'horizon':h,'age_band':age,'baseline_tier':tier,'p_QB24':.3,'p_150_attempts':.45,
+                      'future_ratio_surplus':.25,'local_n':6,'tier_n':40}
+                     for h in (1,2,3,4) for age in ('<=24','25-28','29-32','33-36','37+')
+                     for tier in ('below_090','near_090_110','above_110')]
+              shadow=[{'name':name,'frozen_FV_reference_only':4000+i*30,
+                    'five_season_relative_surplus_research_only':1+i/90,
+                    'shadow_is_numeric_FV_price':False,
+                    'ratio_2026_forward_to_QB24':.95,'h1_p_above_QB24':.5}
+                   for i,name in enumerate(FOCUS+tuple(f'qb_mock_{i}' for i in range(49)))]
+              b={
+                  f'{R42}_historical_findings.md':b'# R42 historical findings\n',
+                  f'{R42}_source_sha256.csv':write_csv(sources,list(sources[0])),
+                  f'{R42}_year_qb24_proxy.csv':write_csv(years,list(years[0])),
+                  f'{R42}_temporal_validation.csv':write_csv(val,list(val[0])),
+                  f'{R42}_60_conditional_horizon_cells.csv':write_csv(cells,list(cells[0])),
+                  f'{R42}_54_QB_empirical_shadow.csv':write_csv(shadow,list(shadow[0])),
+              }
+              m={'semantic_status':'HISTORICAL_EMPIRICAL_RESEARCH_ONLY_PRICE_CALIBRATION_HOLD',
+                 'production_change_authorized':False,'index_html_modified':False,
+                 'used_2026_realized_outcomes':False,'future_2026_holdout_read':False,
+                 'DLF_or_MV_used_for_fit':False,'owner_target_ranges_used_for_fit':False,
+                 'n_2026_frozen_forward_QBs':54,'n_example_models':60,'source_historical_min_year':2013,
+                 'source_historical_max_year':2025,'validated_horizons':[1,2,3],
+                 'unvalidated_horizons':[4],'frozen_preseason_git_blob_pin':P2_SHA,
+                 'n_raw_external_source_rows_in_artifact':0,'n_historical_QB_seasons':700,
+                 'output_sha256':{n:sha256(x) for n,x in b.items()},
+                 'source_sha256':{row['asset']:row['sha256'] for row in sources}}
+              b[f'{R42}_manifest.json']=(json.dumps(m,indent=2)+'\n').encode()
+              stream=io.BytesIO()
+              with zipfile.ZipFile(stream,'w',compression=zipfile.ZIP_DEFLATED) as z:
+                  for name,raw in b.items():z.writestr(name,raw)
+              return stream.getvalue()
+
+
+          def selftest():
+              blob=fake_archive();files=safe_zip(blob)
+              source={'run_id':42,'run_url':'fixture://R42_green','artifact_id':999,
+                      'archive_sha256':sha256(blob),'source_mode':'synthetic_selftest'}
+              summary,compare,shadow,report=verify_and_analyze(files,source)
+              require(len(compare)==9 and len(shadow)==54,'SELFTEST_OUTPUT_SIZES')
+              require(summary['model_best_of_three_row_counts'].get('age_tier')==3,'SELFTEST_MODEL_SELECTION')
+              require(summary['n_local_conditional_cells_below_10']==60,'SELFTEST_LOCAL_CELL_FLAG')
+              require('bryce young' in report and 'H4' not in report,'SELFTEST_REPORT')
+              bad=dict(files);bad[f'{R42}_temporal_validation.csv']=bad[f'{R42}_temporal_validation.csv']+b'corrupted'
+              try:verify_and_analyze(bad,source)
+              except AssertionError as e:require('R42_OUTPUT_SHA_DRIFT' in str(e),'SELFTEST_HASH_ERROR_SPECIFIC')
+              else:raise AssertionError('SELFTEST_HASH_MISMATCH_ACCEPTED')
+              bad=dict(files);m=json.loads(bad[f'{R42}_manifest.json']);m['used_2026_realized_outcomes']=True
+              bad[f'{R42}_manifest.json']=json.dumps(m).encode()
+              try:verify_and_analyze(bad,source)
+              except AssertionError as e:require('R42_HOLDOUT_GUARD' in str(e),'SELFTEST_HOLDOUT_ERROR_SPECIFIC')
+              else:raise AssertionError('SELFTEST_HOLDOUT_LEAK_ACCEPTED')
+              try:safe_zip(b'not a zip')
+              except AssertionError as e:require('R42_ARTIFACT_BAD_ZIP' in str(e),'SELFTEST_ZIP_ERROR_SPECIFIC')
+              else:raise AssertionError('SELFTEST_BAD_ZIP_ACCEPTED')
+              # Mock the GitHub Actions API to test both latest-successful and explicit-run discovery.
+              previous_api=globals()['api']
+              def mock_api(url,token,raw=False):
+                  if url.endswith('/runs?event=workflow_dispatch&status=success&per_page=50'):
+                      return {'workflow_runs':[
+                          {'id':40,'name':'other workflow','status':'completed','conclusion':'success','head_branch':'main','path':'.github/workflows/other.yml'},
+                          {'id':4242,'name':'CAL26 V1R42 - Historical QB Career Continuation and Multi-Year Surplus (Read Only)',
+                           'status':'completed','conclusion':'success','head_branch':'main','path':'.github/workflows/'+WORKFLOW_FILE,
+                           'html_url':'https://github.com/mock/actions/runs/4242','head_sha':'a'*40}]}
+                  if url.endswith('/actions/runs/4242'):
+                      return {'id':4242,'name':'CAL26 V1R42 - Historical QB Career Continuation and Multi-Year Surplus (Read Only)',
+                           'status':'completed','conclusion':'success','head_branch':'main','path':'.github/workflows/'+WORKFLOW_FILE,
+                           'html_url':'https://github.com/mock/actions/runs/4242','head_sha':'a'*40}
+                  if url.endswith('/actions/runs/4242/artifacts?per_page=100'):
+                      return {'artifacts':[{'name':ARTIFACT_NAME,'id':999,'expired':False}]}
+                  if url.endswith('/actions/artifacts/999/zip') and raw:return blob
+                  raise AssertionError('SELFTEST_UNEXPECTED_GITHUB_API_URL_'+url)
+              try:
+                  globals()['api']=mock_api
+                  for explicit in ('','4242'):
+                      xf,metadata=discover('mock/repo','fake-token-123456',explicit,'main')
+                      require(metadata['run_id']==4242 and xf==files,'SELFTEST_API_DISCOVERY')
+              finally:globals()['api']=previous_api
+              with tempfile.TemporaryDirectory() as d:
+                  write_outputs(pathlib.Path(d),summary,compare,shadow,report,quiet=True)
+                  require(len(list(pathlib.Path(d).iterdir()))==4,'SELFTEST_OUTPUT_FILES')
+              print('CAL26_V1R43_SELFTEST_GREEN SHA, no future leakage, model-selection, summary, output, invalid ZIP')
+
+
+          def main():
+              p=argparse.ArgumentParser()
+              p.add_argument('--selftest',action='store_true')
+              p.add_argument('--fixture',action='store_true')
+              p.add_argument('--out',type=pathlib.Path,default=pathlib.Path('out-r43'))
+              p.add_argument('--repo',default=os.environ.get('GITHUB_REPOSITORY',''))
+              p.add_argument('--branch',default='main')
+              p.add_argument('--r42-run-id',default='')
+              a=p.parse_args()
+              if a.selftest:selftest();return
+              if a.fixture:
+                  blob=fake_archive();files=safe_zip(blob)
+                  source={'run_id':42,'run_url':'fixture://R42_green','artifact_id':999,
+                          'archive_sha256':sha256(blob),'source_mode':'synthetic_selftest'}
+              else:
+                  require(re.fullmatch('[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+',a.repo or '') is not None,'GITHUB_REPOSITORY_INVALID')
+                  files,source=discover(a.repo,os.environ.get('GH_TOKEN',''),a.r42_run_id,a.branch)
+              summary,comparisons,shadow,report=verify_and_analyze(files,source)
+              write_outputs(a.out,summary,comparisons,shadow,report)
+
+          if __name__=='__main__':main()
+          PY_CAL26_V1R43_ENGINE
+          python -m py_compile "$RUNNER_TEMP/cal26_v1r43_engine.py"
+          python "$RUNNER_TEMP/cal26_v1r43_engine.py" --selftest
+          python "$RUNNER_TEMP/cal26_v1r43_engine.py" --repo "$GITHUB_REPOSITORY" --branch "${GITHUB_REF_NAME:-main}" --r42-run-id "$R42_RUN_ID" --out "$RUNNER_TEMP/cal26-v1r43-artifacts"
+          python - "$RUNNER_TEMP/cal26-v1r43-artifacts" <<'PY_CAL26_V1R43_ASSERT'
+          import json,hashlib,sys,pathlib,csv
+          dest=pathlib.Path(sys.argv[1]);m=json.loads((dest/'CAL26_V1R43_decision_manifest.json').read_text())
+          assert m['semantic_status']=='HISTORICAL_HOLDOUT_REVIEW_COMPLETE_FV_PRICE_CALIBRATION_HOLD'
+          assert m['operational_green_does_not_mean_predictive_win'] is True
+          assert m['n_validation_rows']==9 and m['n_conditional_cells']==60
+          assert m['n_2026_preseason_QBs']==54
+          assert m['validation_horizons']==[1,2,3] and m['unvalidated_horizons']==[4]
+          assert m['historical_4pt_TD_vs_LOG_league_scoring_mismatch_resolved'] is False
+          assert m['historical_realized_ratio_vs_2026_preseason_projection_ratio_shift_resolved'] is False
+          assert m['numeric_FV_prices_calibrated'] is False
+          assert m['production_change_authorized'] is False and m['index_html_modified'] is False
+          assert m['future_2026_holdout_read'] is False and m['DLF_or_owner_target_prices_used_for_fit'] is False
+          assert m['test_row_level_resampling_or_CIs_available_in_R42_artifact'] is False
+          for n,digest in m['output_sha256'].items():
+              p=dest/n;assert p.is_file() and p.stat().st_size>20
+              assert hashlib.sha256(p.read_bytes()).hexdigest()==digest
+          with (dest/'CAL26_V1R43_validation_comparisons.csv').open() as fp:
+              rr=list(csv.DictReader(fp));assert len(rr)==9
+          print('GREEN: original R42 research artifact SHA verified and nine actual chronological evaluations adjudicated; no numeric FV price authorization')
+          PY_CAL26_V1R43_ASSERT
+          test -z "$(git status --porcelain)"
+          echo '## CAL26 V1R43 — Historical QB validation adjudication (read only)' >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/cal26-v1r43-artifacts/CAL26_V1R43_research_findings.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload adjudication report (no raw historical rows, no price changes)
+        uses: actions/upload-artifact@v4
+        with:
+          name: CAL26_V1R43_HISTORICAL_QB_VALIDATION_ADJUDICATION_READ_ONLY
+          path: ${{ runner.temp }}/cal26-v1r43-artifacts/
+          if-no-files-found: error
+          retention-days: 90
