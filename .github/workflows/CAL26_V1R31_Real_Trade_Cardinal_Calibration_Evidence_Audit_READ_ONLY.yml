@@ -1,0 +1,290 @@
+# CAL26 V1R31 — Observed trades only: no fitted values, no external data pull, no production writes.
+name: CAL26 V1R31 - Real Trade Cardinal Calibration Evidence Audit READ ONLY
+'on':
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: cal26-v1r31-trade-evidence-audit-readonly
+  cancel-in-progress: false
+jobs:
+  audit:
+    name: Validate accepted trade evidence and independent price calibration eligibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout canonical repository with no write credentials
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Verify branch source files and no implicit writes
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/main
+          for file in data/trade_history.json research/package-adjustment-v1/prospective/trade_evidence.json scripts/artifacts/generated/market_values.json scripts/validation/snapshot_values.py index.html; do
+            test -s "$file"
+          done
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Materialize deterministic audit engine and validate synthetic cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/cal26_v1r31_engine.py" <<'PY_CAL26_V1R31'
+          #!/usr/bin/env python3
+          """CAL26 V1R31. Accepted trade audit; never fit FV against its own market quantiles."""
+          from __future__ import annotations
+          import argparse,csv,hashlib,importlib.util,json,math,re
+          from pathlib import Path
+          from collections import Counter
+          from datetime import datetime,timezone
+
+          TRADE='data/trade_history.json'
+          PRETRADE='research/package-adjustment-v1/prospective/trade_evidence.json'
+          MARKET='scripts/artifacts/generated/market_values.json'
+          SNAPSHOT='scripts/validation/snapshot_values.py'
+          HTML='index.html'
+
+
+          def digest(p):return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+          def jload(p):return json.loads(Path(p).read_text(encoding='utf-8'))
+          def normalize(s):return re.sub(r'\s+',' ',re.sub(r"[.'’\-]",'',str(s).lower())).strip()
+          def hard(cond,msg):
+              if not cond:raise AssertionError(msg)
+
+          def trade_analysis(history,qb_names):
+              seasons=history['seasons']; trades=history['trades_with_picks']
+              years={str(s['season']) for s in seasons}
+              hard(all('scoring_settings' in s and 'roster_positions' in s for s in seasons),'Season rules must be preserved')
+              hard(len(years)==len(seasons),'Duplicate seasons')
+              result=[]; seen=set()
+              for t in trades:
+                  tid=str(t['transaction_id'])
+                  hard(tid and tid not in seen,'duplicate or blank transaction ID'); seen.add(tid)
+                  yr=str(t['league_season'])
+                  hard(yr in years,'unknown league season '+yr)
+                  sides=t.get('sides',[])
+                  hard(isinstance(sides,list) and len(sides)>=2,'trade has fewer than two parties')
+                  players=[];picks=[]; qb=[]
+                  for s in sides:
+                      p=s.get('received_players',[]);k=s.get('received_picks',[])
+                      hard(isinstance(p,list) and isinstance(k,list),'invalid assets schema')
+                      players.append(len(p));picks.append(len(k))
+                      qb.append(sum(normalize(x.get('name')) in qb_names for x in p))
+                  two=len(sides)==2
+                  player_only=two and all(n>=1 for n in players) and not any(picks)
+                  singles=player_only and players==[1,1]
+                  qb_n=sum(qb)
+                  if not any(players):structure='picks_only'
+                  elif not any(picks):structure='players_only'
+                  else:structure='mixed_player_pick'
+                  result.append({'transaction_id':tid,'season':yr,'side_count':len(sides),'received_players_by_side':'|'.join(map(str,players)),
+                                 'received_picks_by_side':'|'.join(map(str,picks)),'asset_structure':structure,
+                                 'has_players_on_both_sides':two and all(n>=1 for n in players),
+                                 'player_only_two_sided':player_only,'clean_single_for_single':singles,
+                                 'includes_identified_qb':qb_n>0,'qb_assets':qb_n,
+                                 'independent_cardinal_price_observed':False,
+                                 'interpretation':'observed_agreement_not_independent_cardinal_price'})
+              return result
+
+          def pretrade_analysis(source):
+              t=source['trades'];hard(isinstance(t,dict),'unexpected pretrade evidence schema')
+              docs=list(t.values());eligible=[d for d in docs if d.get('eligible_for_numeric_package_research') is True]
+              hard(len(docs)==source['counts']['trade_count'],'pretrade trade count drift')
+              hard(len(eligible)==source['counts']['eligible_numeric_trade_count'],'pretrade eligibility count drift')
+              infos=[]
+              for d in eligible:
+                  hard(d.get('pretrade_snapshot') is not None,'eligible without pretrade source')
+                  sides=d.get('sides',[])
+                  hard(len(sides)==2,'eligible nonbinary trade')
+                  raw=[s.get('package_geometry',{}).get('raw_fv') for s in sides]
+                  hard(all(isinstance(x,(int,float)) and x>0 for x in raw),'pretrade package raw values missing')
+                  defaulted=sum(a.get('tier_source')=='future_pick_default_mid' for s in sides for a in s.get('received_assets',[]))
+                  qb_count=sum(a.get('pos')=='QB' for s in sides for a in s.get('received_assets',[]))
+                  infos.append({'transaction_id':str(d['transaction_id']),'raw_fv_ratio_high_to_low':round(max(raw)/min(raw),4),
+                                'number_qb_assets':qb_count,'default_mid_pick_assets':defaulted,
+                                'derived_from_existing_fv':True,'independent_calibration_label':False})
+              return docs,eligible,infos
+
+          def compute(root, out):
+              files=[TRADE,PRETRADE,MARKET,HTML,SNAPSHOT]
+              for f in files:hard((root/f).is_file(),'Required source absent: '+f)
+              history=jload(root/TRADE); pre=jload(root/PRETRADE); market=jload(root/MARKET)
+              spec=importlib.util.spec_from_file_location('cal26_v1r31_snapshot',(root/SNAPSHOT))
+              mod=importlib.util.module_from_spec(spec);spec.loader.exec_module(mod)
+              live=mod.compute_all_values(mod.load_from_html(root/HTML))
+              hard(len(live)>=565,'unexpected canonical cohort size')
+              qbs={normalize(k) for k,v in live.items() if v['pos']=='QB'}
+              hard(len(qbs)==64,'64 QBs required for verified comparator')
+              rows=trade_analysis(history,qbs)
+              docs,eligible,pkg_rows=pretrade_analysis(pre)
+              hard(market.get('scale_semantics')=='league_rank_quantile_mapped_to_trade_desk_points_v1',
+                   'Market value scale semantics changed; do not trust quantile-loop analysis')
+              hard(market.get('policy',{}).get('fundamental_formula_policy')=='never modified or blended by this artifact',
+                   'Market source policy changed')
+              market_quality=market.get('market_quality',{})
+              hard(market.get('counts',{}).get('fundamental_model_players')==len(live),'market snapshot cohort mismatch')
+              c=Counter(x['asset_structure'] for x in rows)
+              years=Counter(x['season'] for x in rows)
+              rr={
+                 'trades_total':len(rows),'trades_by_season':dict(sorted(years.items())),'source_season_rule_sets':len(history['seasons']),
+                 'trades_with_players_on_both_sides':sum(x['has_players_on_both_sides'] for x in rows),
+                 'trades_with_qb_assets':sum(x['includes_identified_qb'] for x in rows),
+                 'player_only_two_sided_trades':sum(x['player_only_two_sided'] for x in rows),
+                 'clean_single_for_single_trades':sum(x['clean_single_for_single'] for x in rows),
+                 'trade_structure_counts':dict(sorted(c.items())),
+                 'prospective_trades':len(docs),'eligible_pretrade_valued_packages':len(eligible),
+                 'eligible_pretrade_packages_with_default_mid_pick':sum(x['default_mid_pick_assets']>0 for x in pkg_rows),
+                 'eligible_pretrade_packages_with_qb':sum(x['number_qb_assets']>0 for x in pkg_rows),
+                 'market_vote_rows':market_quality.get('raw_votes'),
+                 'market_effective_votes':market_quality.get('total_effective_votes'),
+                 'market_covered_players':market['counts'].get('resolved_market_players'),
+                 'canonical_players':len(live),'canonical_qbs':len(qbs),
+                 'independent_cardinal_fv_targets_from_these_sources':0,
+              }
+              hard(sum(c.values())==len(rows),'structure count check')
+              # A completed barter does not encode exact cash/price equality; even clean 1:1 would not identify absolute scale.
+              out.mkdir(parents=True,exist_ok=True)
+              def write_csv(name,records):
+                  hard(records,'empty csv '+name)
+                  with (out/name).open('w',newline='',encoding='utf-8') as f:
+                      w=csv.DictWriter(f,fieldnames=list(records[0]));w.writeheader();w.writerows(records)
+              trade_file='CAL26_V1R31_League_Trades_Structure_And_Independent_Price_Eligibility.csv'
+              pre_file='CAL26_V1R31_Eligible_Pretrade_Packages_Circularity_Review.csv'
+              write_csv(trade_file,rows)
+              write_csv(pre_file,pkg_rows)
+              report='CAL26_V1R31_Cardinal_Calibration_Readiness_and_Next_Design.md'
+              lines=['# CAL26 V1R31 — Observed trades and independent FV price identification','',
+                  '**Decision: `HOLD_NO_INDEPENDENT_CARDINAL_PRICE_TARGET`**. This is a positive source audit, **not** a failed run or an authorized valuation change.','',
+                  '## Observed league evidence','',
+                  '| Metric | Verified count |','|---|---:|',
+                  f'| Completed recorded trades (2024–2026) | {rr["trades_total"]} |',
+                  f'| Trades with player assets on both sides | {rr["trades_with_players_on_both_sides"]} |',
+                  f'| Player-only two-sided trades | {rr["player_only_two_sided_trades"]} |',
+                  f'| Clean 1-for-1 player-only trades | {rr["clean_single_for_single_trades"]} |',
+                  f'| Trades involving an identified QB | {rr["trades_with_qb_assets"]} |',
+                  f'| Current-league prospective trade records | {rr["prospective_trades"]} |',
+                  f'| Prospective trades with a valid pre-trade FV snapshot | {rr["eligible_pretrade_valued_packages"]} |',
+                  f'| Eligible packages containing assumed mid-tier future picks | {rr["eligible_pretrade_packages_with_default_mid_pick"]} |','',
+                  'League rules are different across the 2024, 2025 and 2026 trade seasons. Cross-season trades are not exchangeable without context.','',
+                  '## Trade structures','',
+                  *[f'- `{k}`: {v}' for k,v in sorted(c.items())],'',
+                  '## Why the six package records are not independent numerical FV ground truth','',
+                  'Those packages are scored using the very FV model under evaluation. Their assets may include future picks with fallback `mid` tier assumptions. A completed trade is a mutual agreement, not evidence that the numerical point values of both sides were equal, nor does it specify both parties\' preferences, salary/contract rights or team context.','',
+                  '## Market Value source independence','',
+                  f'- Raw league KTC vote rows: **{rr["market_vote_rows"]}**; effective votes after policy weighting: **{rr["market_effective_votes"]}**.',
+                  f'- Resolved market-ordered players: **{rr["market_covered_players"]}**.',
+                  f'- **Exact scale semantics:** `{market["scale_semantics"]}`.',
+                  '- KTC vote ordering can be an **ordinal market signal**. The assigned numerical MV points are quantiles of the existing FV distribution; using them as independent cardinal FV calibration targets creates leakage/circularity.',
+                  '- The DLF ranked PDF provides order, not an independently established FV point scale. FantasyPros dynasty PPR ECR is also ordinal; superflex position weighting remains unverified.','',
+                  '## Practical next modeling step','',
+                  '1. **Production dimension:** retain the frozen V1R27 20-model preseason grid for Weeks 8–12, and separately evaluate available genuine ROS vintages without using ROS as a preseason prediction.',
+                  '2. **Dynasty ordering:** compare DLF superflex rankings and FantasyPros dynasty QB ordering to current FV ranks; keep DLF provider data private and never double-count syndicated 4for4 lists.',
+                  '3. **Cardinal scale:** pursue a genuinely independent, timestamped published player trade-value export (e.g., user-licensed DLF trade values) **or** develop and externally validate a league-specific wins-above-replacement/career-outcome utility scale. Do not infer absolute FV points from ranks or quantile-mapped MV.',
+                  '4. **Trade constraints:** use the existing pre-trade snapshots to inspect package geometry and liquidity only; do not assume accepted multi-asset trades imply exact numerical equality.','',
+                  'No arbitrary per-QB multipliers; owner target bands diagnostic only; no changes to index.html, Model MV, production weights, trade verdicts, or protected players.','']
+              (out/report).write_text('\n'.join(lines),encoding='utf-8')
+              manifest={'schema_version':1,'workflow_id':'CAL26_V1R31','status':'PASS_READ_ONLY_SOURCE_AUDIT_HOLD_CARDINAL_CALIBRATION',
+                'conclusion':'NO_INDEPENDENT_CARDINAL_CALIBRATION_LABEL_IN_AUDITED_SOURCES',
+                'counts':rr,'source_sha256':{f:digest(root/f) for f in files},
+                'conditions':{'observed_trade_is_cardinal_price':False,'synthetic_market_quantile_is_independent_target':False,
+                  'future_picks_have_true_ex_post_outcome':False,'owner_targets_used_to_fit':False,'future_holdout_outcomes_used':False},
+                'production_change_authorized':False,'production_files_mutated':0,
+                'files':{p:digest(out/p) for p in [trade_file,pre_file,report]}}
+              (out/'CAL26_V1R31_Manifest.json').write_text(json.dumps(manifest,sort_keys=True,indent=2)+'\n')
+              print(json.dumps({'status':manifest['status'],'counts':rr},sort_keys=True))
+              return manifest
+
+          def selftest():
+              qb={normalize(x) for x in ['Daniel Jones','Michael Penix Jr']}
+              h={'seasons':[{'season':'2026','roster_positions':['QB'],'scoring_settings':{'pass_td':4}}],
+                 'trades_with_picks':[{'transaction_id':'1','league_season':'2026','sides':[
+                    {'received_players':[{'name':'Michael Penix Jr.'}],'received_picks':[]},
+                    {'received_players':[{'name':'Daniel Jones'}],'received_picks':[]}]},
+                    {'transaction_id':'2','league_season':'2026','sides':[
+                    {'received_players':[],'received_picks':[{'season':'2027','round':2}]},
+                    {'received_players':[],'received_picks':[{'season':'2027','round':3}]}]}]}
+              r=trade_analysis(h,qb)
+              hard(r[0]['clean_single_for_single'] and r[0]['qb_assets']==2,'clean 1:1 qb sample failed')
+              hard(r[1]['asset_structure']=='picks_only','pick-only sample failed')
+              h['trades_with_picks'].append(h['trades_with_picks'][0]);caught=False
+              try:trade_analysis(h,qb)
+              except AssertionError:caught=True
+              hard(caught,'duplicate transaction missed')
+              src={'counts':{'trade_count':1,'eligible_numeric_trade_count':1},'trades':{'1':{'transaction_id':'1','eligible_for_numeric_package_research':True,
+                   'pretrade_snapshot':{'file':'test'},'sides':[{'package_geometry':{'raw_fv':1000},'received_assets':[{'tier_source':'future_pick_default_mid','type':'pick'}]},
+                    {'package_geometry':{'raw_fv':1500},'received_assets':[{'type':'player','pos':'QB'}]}]}}}
+              docs,yes,info=pretrade_analysis(src)
+              hard(len(docs)==len(yes)==1 and info[0]['default_mid_pick_assets']==1 and info[0]['derived_from_existing_fv'],'pretrade circularity flag')
+              src['counts']['eligible_numeric_trade_count']=0; caught=False
+              try:pretrade_analysis(src)
+              except AssertionError:caught=True
+              hard(caught,'eligible denominator integrity missed')
+              print('PASS V1R31 synthetic: structure identity, duplicate IDs, schema, temporal FV circularity, missing-label integrity')
+
+          if __name__=='__main__':
+              ap=argparse.ArgumentParser();ap.add_argument('--repo',type=Path);ap.add_argument('--out',type=Path);ap.add_argument('--selftest',action='store_true')
+              args=ap.parse_args()
+              if args.selftest:selftest()
+              else:
+                  hard(args.repo and args.out,'--repo and --out required');compute(args.repo,args.out)
+          PY_CAL26_V1R31
+          python3 -m py_compile "$RUNNER_TEMP/cal26_v1r31_engine.py"
+          python3 "$RUNNER_TEMP/cal26_v1r31_engine.py" --selftest
+      - name: Audit 2024 to 2026 real league trades and numerical scale independence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/cal26_v1r31_engine.py" \
+            --repo "$GITHUB_WORKSPACE" \
+            --out "$RUNNER_TEMP/CAL26_V1R31_Evidence"
+      - name: Independently check trade coverage reports cryptographic hashes and no FV changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_CAL26_V1R31_VERIFY'
+          import csv,hashlib,json,os
+          from pathlib import Path
+          o=Path(os.environ['RUNNER_TEMP'])/'CAL26_V1R31_Evidence'
+          m=json.loads((o/'CAL26_V1R31_Manifest.json').read_text(encoding='utf-8'))
+          c=m['counts']
+          assert m['status']=='PASS_READ_ONLY_SOURCE_AUDIT_HOLD_CARDINAL_CALIBRATION'
+          assert m['conclusion']=='NO_INDEPENDENT_CARDINAL_CALIBRATION_LABEL_IN_AUDITED_SOURCES'
+          assert c['canonical_players']==565 and c['canonical_qbs']==64
+          assert c['independent_cardinal_fv_targets_from_these_sources']==0
+          assert sum(c['trades_by_season'].values())==c['trades_total']
+          assert sum(c['trade_structure_counts'].values())==c['trades_total']
+          assert c['prospective_trades']>=c['eligible_pretrade_valued_packages']
+          assert m['conditions']['observed_trade_is_cardinal_price'] is False
+          assert m['conditions']['synthetic_market_quantile_is_independent_target'] is False
+          assert m['conditions']['future_holdout_outcomes_used'] is False
+          assert m['conditions']['owner_targets_used_to_fit'] is False
+          assert m['production_change_authorized'] is False and m['production_files_mutated']==0
+          for file,digest in m['source_sha256'].items():
+              assert hashlib.sha256(Path(file).read_bytes()).hexdigest()==digest,file
+          for file,digest in m['files'].items():
+              assert hashlib.sha256((o/file).read_bytes()).hexdigest()==digest,file
+          with (o/'CAL26_V1R31_League_Trades_Structure_And_Independent_Price_Eligibility.csv').open(newline='') as f:
+              rows=list(csv.DictReader(f))
+          assert len(rows)==c['trades_total']
+          assert len({r['transaction_id'] for r in rows})==len(rows)
+          assert sum(r['clean_single_for_single']=='True' for r in rows)==c['clean_single_for_single_trades']
+          assert all(r['independent_cardinal_price_observed']=='False' for r in rows)
+          with (o/'CAL26_V1R31_Eligible_Pretrade_Packages_Circularity_Review.csv').open(newline='') as f:
+              e=list(csv.DictReader(f))
+          assert len(e)==c['eligible_pretrade_valued_packages']
+          assert all(r['derived_from_existing_fv']=='True' and r['independent_calibration_label']=='False' for r in e)
+          print('PASS V1R31 independent audit:', len(rows),'trades;',len(e),'pretrade FV-dependent packages; no external numerical FV target')
+          PY_CAL26_V1R31_VERIFY
+          test -z "$(git status --porcelain --untracked-files=all)"
+          echo 'PASS checkout untouched'
+      - name: Upload count and structure evidence with no private provider rows
+        uses: actions/upload-artifact@v4
+        with:
+          name: CAL26-V1R31-Real-Trade-Cardinal-Calibration-Evidence-READ-ONLY
+          path: ${{ runner.temp }}/CAL26_V1R31_Evidence
+          if-no-files-found: error
+          retention-days: 60
