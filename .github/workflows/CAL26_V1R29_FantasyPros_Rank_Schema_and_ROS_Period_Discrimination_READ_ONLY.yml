@@ -1,0 +1,372 @@
+# CAL26 V1R29. Metadata-only licensed-provider feasibility; no row-level files or valuation changes.
+name: CAL26 V1R29 - FantasyPros QB Dynasty Rank Schema and ROS Period Check READ ONLY
+'on':
+  workflow_dispatch: {}
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: cal26-v1r29-fantasypros-schema-read-only
+  cancel-in-progress: false
+jobs:
+  source_schema_check:
+    name: Verify dynasty rank position fields and independently distinguish QB ROS vs weekly
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout main read only
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Confirm branch and source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/main
+          test -s index.html
+          test -s scripts/validation/snapshot_values.py
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Recover exact V1R27 and V1R28 successful source evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/cal26-v1r27" "$RUNNER_TEMP/cal26-v1r28"
+          gh run download 39963472646 --repo "$GITHUB_REPOSITORY" --name CAL26-V1R27-Frozen-QB-Prospective-20-Model-Grid-Read-Only --dir "$RUNNER_TEMP/cal26-v1r27"
+          gh run download 39965070745 --repo "$GITHUB_REPOSITORY" --name CAL26-V1R28-FantasyPros-ROS-Dynasty-Source-Feasibility-Read-Only --dir "$RUNNER_TEMP/cal26-v1r28"
+          echo 'EXPECTED_SHA  cal26-v1r27/CAL26_V1R27_Manifest.json' | sed -e 's/EXPECTED_SHA/888668a388683c7aa2c66a20d253082f3e8ebc12e9894a2430b1b8d2254c4101/' -e "s|cal26-v1r27|$RUNNER_TEMP/cal26-v1r27|" | sha256sum -c -
+          echo 'EXPECTED_SHA  cal26-v1r28/CAL26_V1R28_Manifest.json' | sed -e 's/EXPECTED_SHA/3a52bea130358ad4d7fac71eb2232761c849cc80b8869924690d4ca4cd16b3e0/' -e "s|cal26-v1r28|$RUNNER_TEMP/cal26-v1r28|" | sha256sum -c -
+      - name: Materialize schema and period checker and run offline regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/cal26_v1r29_engine.py" <<'PY_CAL26_V1R29_ENGINE'
+          #!/usr/bin/env python3
+          """CAL26 V1R29 metadata-only repair of FantasyPros dynasty/QB-ROS evidence."""
+          from __future__ import annotations
+          import argparse
+          import hashlib
+          import importlib.util
+          import json
+          import math
+          import os
+          import re
+          import statistics
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from collections import Counter
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          ROOT_URL='https://api.fantasypros.com/public/v2/json/'
+          PARAMS={
+              'qb_ros': ('nfl/2026/projections', {'position':'QB','ros':'true'}),
+              'qb_weekly': ('nfl/2026/projections', {'position':'QB','week':'7'}),
+              'dynasty_all': ('nfl/2026/consensus-rankings', {'position':'ALL','type':'DYNASTY','scoring':'PPR'}),
+              'dynasty_qb': ('nfl/2026/consensus-rankings', {'position':'QB','type':'DYNASTY','scoring':'PPR'}),
+          }
+          EXPECTED_SOURCE_V1R28='HOLD_SOURCE_ACCESS_OR_COVERAGE_UNVERIFIED'
+
+          def normalized(s):
+              s=str(s or '').lower().strip()
+              s=re.sub(r"[.\-'’]",'',s)
+              return re.sub(r'\s+',' ',s).strip()
+
+          def numeric(x):
+              if isinstance(x,bool): return None
+              try:
+                  n=float(x)
+                  if math.isfinite(n): return n
+              except (ValueError,TypeError): pass
+              return None
+
+          def position(row):
+              # Per FantasyPros consensus docs, player_position_id (NOT position_id).
+              p=(row.get('player_position_id') or row.get('position_id') or row.get('position') or '')
+              if isinstance(p,str) and p.upper()=='QB': return 'QB'
+              pp=row.get('player_positions') or row.get('positions') or row.get('player_eligibility') or ''
+              if isinstance(pp,list): return 'QB' if 'QB' in [str(z).upper() for z in pp] else str(p).upper()
+              if isinstance(pp,str) and 'QB' in re.split(r'[,:/ ]+',pp.upper()): return 'QB'
+              return str(p).upper()
+
+          def playername(r):
+              return normalized(r.get('player_name') or r.get('name'))
+
+          def rows_of(data):
+              if not isinstance(data,dict): return None
+              x=data.get('players')
+              return x if isinstance(x,list) and all(isinstance(r,dict) for r in x) else None
+
+          def roster_names(repo):
+              import sys
+              sp=importlib.util.spec_from_file_location('cal26_v1r29_snapshot',repo/'scripts/validation/snapshot_values.py')
+              m=importlib.util.module_from_spec(sp);sys.modules[sp.name]=m;sp.loader.exec_module(m)
+              vals=m.compute_all_values(m.load_from_html(repo/'index.html'))
+              assert len(vals)==565 and sum(v['pos']=='QB' for v in vals.values())==64, 'LIVE_SCOPE_DRIFT'
+              names={normalized(k) for k,v in vals.items() if v['pos']=='QB'}
+              assert len(names)==64
+              return names
+
+          def fetch(kind,key):
+              path,query=PARAMS[kind]
+              request=urllib.request.Request(ROOT_URL+path+'?'+urllib.parse.urlencode(query),headers={
+                  'x-api-key':key,'Accept':'application/json','User-Agent':'LOG-Trade-Calculator-V1R29-metadata-only'})
+              try:
+                  with urllib.request.urlopen(request, timeout=25) as response:
+                      raw=response.read(12_000_001)
+                  if len(raw)>12_000_000: return {'result':'HOLD_TOO_LARGE'}
+                  doc=json.loads(raw)
+                  if not isinstance(doc,dict): return {'result':'HOLD_NOT_OBJECT'}
+                  return doc,hashlib.sha256(raw).hexdigest()
+              except urllib.error.HTTPError as e:
+                  return {'result':'HOLD_HTTP_ERROR','http_status':int(e.code)}
+              except (urllib.error.URLError,TimeoutError,OSError,ValueError,json.JSONDecodeError):
+                  return {'result':'HOLD_NETWORK_OR_JSON_ERROR'}
+
+          def metadata(kind,doc,roster,sha):
+              rows=rows_of(doc)
+              if rows is None: return {'result':'HOLD_PLAYERS_SCHEMA_NOT_LIST'}
+              q=[r for r in rows if position(r)=='QB']
+              names=[playername(r) for r in q];names=[x for x in names if x]
+              matches=set(names)&roster
+              is_rank=kind.startswith('dynasty')
+              ranks=[numeric(r.get('rank_ecr')) for r in q]
+              nums=[int(x) for x in ranks if x is not None and x>0 and int(x)==x]
+              meta_keys=('season','week','count','positions','scoring','year','ranking_type_name','position_id','last_updated','last_updated_ts','total_experts')
+              fields={k:str(doc[k])[:72] for k in meta_keys if k in doc and isinstance(doc[k],(str,int,float))}
+              return {
+                  'result':'RESPONSE_JSON_RECEIVED',
+                  'response_sha256':sha,
+                  'schema_valid':True,
+                  'source_date_checked_utc':datetime.now(timezone.utc).isoformat(),
+                  'players_returned':len(rows),'qb_rows_recognized':len(q),'qb_names_matched_current_64':len(matches),
+                  'qb_name_collisions':len(names)-len(set(names)),
+                  'numeric_qb_ecr_ranks':len(nums) if is_rank else None,
+                  'position_field_detected':bool(any(r.get('player_position_id') is not None for r in q)) if is_rank else None,
+                  'response_fields':fields,
+                  'superflex_verified':False if is_rank else None,
+              }
+
+          def projection_by_id(doc):
+              rows=rows_of(doc)
+              if rows is None:return {}
+              result={}
+              for r in rows:
+                  if position(r)!='QB': continue
+                  name=playername(r)
+                  ident=str(r.get('fpid') or r.get('player_id') or name)
+                  s=r.get('stats',{})
+                  if not isinstance(s,dict):continue
+                  py=numeric(s.get('pass_yds'))
+                  if not ident or py is None:continue
+                  if ident in result: raise AssertionError('PROJECTION_DUPLICATE_ID')
+                  result[ident]=py
+              return result
+
+          def compare_ros(ros,weekly):
+              a,b=projection_by_id(ros),projection_by_id(weekly)
+              keys=set(a)&set(b)
+              ratios=[];different=0;ros_greater=0
+              for k in keys:
+                  x,y=a[k],b[k]
+                  if x!=y:different+=1
+                  if y>30 and x>0:
+                      ratios.append(x/y)
+                      if x>y*2:ros_greater+=1
+              med=statistics.median(ratios) if ratios else None
+              large=bool(len(ratios)>=15 and different>=15 and med is not None and med>=3.0 and ros_greater/len(ratios)>=0.75)
+              return {'matched_projection_qbs':len(keys),'usable_pass_yard_ratios':len(ratios),
+                      'different_pass_yard_projections':different,
+                      'median_ros_to_weekly_pass_yards_ratio':round(med,3) if med is not None else None,
+                      'share_ros_more_than_double_weekly':round(ros_greater/len(ratios),3) if ratios else None,
+                      'operational_ros_vs_weekly_distinction_supported':large,
+                      'interpretation':'Paired request week=7 compared with ros=true. Different scale is operational evidence only; docs define ros=true as ROS.'}
+
+          def rank_order(doc):
+              rows=rows_of(doc) or []
+              scores={}
+              for r in rows:
+                  if position(r)!='QB':continue
+                  name=playername(r)
+                  rank=numeric(r.get('rank_ecr'))
+                  if not name or rank is None or rank<=0:continue
+                  if name in scores: raise AssertionError('RANK_DUPLICATE_NAME')
+                  scores[name]=rank
+              return scores
+
+          def comparison_rank(a,b):
+              x,y=rank_order(a),rank_order(b)
+              common=sorted(set(x)&set(y))
+              pairs=0;concordant=0;discordant=0;ties=0
+              for i,p in enumerate(common):
+                  for q in common[i+1:]:
+                      t=(x[p]-x[q])*(y[p]-y[q]);pairs+=1
+                      if t>0:concordant+=1
+                      elif t<0:discordant+=1
+                      else:ties+=1
+              return {'shared_qb_ranked':len(common),'pairwise_order_agreement':round(concordant/(concordant+discordant),4) if concordant+discordant else None,
+                  'concordant_pairs':concordant,'discordant_pairs':discordant,'tied_pairs':ties,
+                  'superflex_verified':False}
+
+          def safe_run(repo,freeze,old_report,out,key):
+              roster=roster_names(repo)
+              old=json.loads((old_report/'CAL26_V1R28_Manifest.json').read_text())
+              assert old['status']==EXPECTED_SOURCE_V1R28
+              assert old['source_check']['dynasty_all']['coverage']['players']==480
+              assert old['source_check']['qb_ros']['coverage']['qbs']==64
+              f=json.loads((freeze/'CAL26_V1R27_Manifest.json').read_text())
+              assert f['status']=='PASS_CAL26_V1R27_FROZEN_FUTURE_ONLY_31_QB_20_CANDIDATES'
+              assert (f['same_cohort_qbs'],f['candidate_models'],f['candidate_rows'])==(31,20,620)
+              assert f['holdout_weeks']==[8,9,10,11,12]
+              report={}
+              docs={}
+              for kind in PARAMS:
+                  if not key:
+                      report[kind]={'result':'HOLD_API_KEY_MISSING'};continue
+                  obj=fetch(kind,key)
+                  if isinstance(obj,dict):report[kind]=obj;continue
+                  doc,sha=obj
+                  report[kind]=metadata(kind,doc,roster,sha)
+                  docs[kind]=doc # held in RAM only, never saved or printed
+              pair=compare_ros(docs['qb_ros'],docs['qb_weekly']) if 'qb_ros' in docs and 'qb_weekly' in docs else {'result':'HOLD_UNAVAILABLE'}
+              rank= comparison_rank(docs['dynasty_all'],docs['dynasty_qb']) if 'dynasty_all' in docs and 'dynasty_qb' in docs else {'result':'HOLD_UNAVAILABLE'}
+              good_rank=report.get('dynasty_all',{}).get('qb_names_matched_current_64',0)>=25 and report.get('dynasty_all',{}).get('numeric_qb_ecr_ranks',0)>=25
+              good_ros=pair.get('operational_ros_vs_weekly_distinction_supported',False) and report.get('qb_ros',{}).get('qb_names_matched_current_64',0)>=30
+              # Authorized dynasty rank signal is *within-position order*, never SF cross-position or price scale.
+              current_dynasty_qb_position_evidence=bool(good_rank and report.get('dynasty_qb',{}).get('numeric_qb_ecr_ranks',0)>=25 and rank.get('shared_qb_ranked',0)>=20)
+              status='PASS_METADATA_SOURCE_INTERPRETATION_IMPROVED_READ_ONLY' if good_ros and current_dynasty_qb_position_evidence else 'HOLD_SOME_SOURCE_SEMANTICS_OR_COVERAGE'
+              out.mkdir(parents=True,exist_ok=True)
+              # meta only; never store provider row names, ranks, projection points, IDs, raw bytes, or expert IDs
+              t=datetime.now(timezone.utc).isoformat()
+              summary={'schema_version':1,'status':status,'captured_at_utc':t,'source_v1r27_run':39963472646,
+                       'source_v1r28_run':39965070745,'current_board_qbs':64,'current_board_players':565,
+                       'frozen_qbs':31,'frozen_candidates':20,'frozen_rows':620,
+                       'source_checks':report,'ros_weekly_pairwise_summary':pair,'dynasty_qb_rank_order_summary':rank,
+                       'within_qb_dynasty_order_feasible':current_dynasty_qb_position_evidence,
+                       'ros_operational_period_distinction':bool(good_ros),
+                       'dynasty_superflex_verified':False, 'superflex_cross_position_value_authorized':False,
+                       'player_level_provider_rows_retained':False,'player_level_provider_rows_logged':False,
+                       'licenses_cleared_for_public_player_rows':False,
+                       'source_weights_fitted':False,'owner_ranges_used_for_fitting':False,'future_holdout_outcomes_used':False,
+                       'price_changes_authorized':False,'production_files_mutated':0}
+              md=['# CAL26 V1R29 — FantasyPros ROS and Dynasty Schema/Period Repair','',
+                  f'- Status: `{status}`',f'- Captured UTC: {t}','',
+                  '## Source coverage — metadata only','',
+                  '| Query | Result | Rows | QB rows | Board QB matches | QB numeric ECR |',
+                  '|---|---|---:|---:|---:|---:|']
+              for name in PARAMS:
+                  s=report[name]
+                  md.append(f"| {name} | {s['result']} | {s.get('players_returned','—')} | {s.get('qb_rows_recognized','—')} | {s.get('qb_names_matched_current_64','—')} | {s.get('numeric_qb_ecr_ranks','—')} |")
+              md+=['','## ROS vs week 7 paired evidence','',
+                   f"- Overlapping QB projection records: **{pair.get('matched_projection_qbs','unavailable')}**.",
+                   f"- Median ROS-to-week-7 projected passing yards ratio: **{pair.get('median_ros_to_weekly_pass_yards_ratio','unavailable')}**.",
+                   f"- Evidence that ROS request produces a materially different, longer-horizon forecast: **{pair.get('operational_ros_vs_weekly_distinction_supported',False)}**.",
+                   '', '## Dynasty source interpretation','',
+                   '- FantasyPros rank rows identify position via `player_position_id` / `player_positions`, not projection `position_id`.',
+                   f"- Shared ranked QBs between ALL and QB dynasty queries: **{rank.get('shared_qb_ranked','unavailable')}**.",
+                   f"- Within-QB ordering agreement across overlapping rank pairs: **{rank.get('pairwise_order_agreement','unavailable')}**.",
+                   '- **Superflex format is NOT verified.** NFL dynasty PPR ALL and dynasty PPR QB are not evidence of superflex market prices.',
+                   '- Treat any ranking signal as prospective, within-QB ranking context only; do not price players by ranking alone.',
+                   '', '## Security and next step','',
+                   '- Proprietary player-level provider data was parsed in memory only; no provider player rows, rank numbers, per-player stats, or IDs were logged or uploaded.',
+                   '- Forecast and dynasty-vintage timestamps refer to this run; neither can be backdated to preseason.',
+                   '- V1R27 predictions and holdout remain frozen. No model fit, coefficient selection or price mutations.',
+                   '- The next modeling stage should privatize dated provider evidence and compare it to future outcomes; no automatic release.',
+                   '']
+              report_name='CAL26_V1R29_Source_Schema_and_ROS_Discrimination_Report.md'
+              (out/report_name).write_text('\n'.join(md),encoding='utf8')
+              summary['files']={report_name:hashlib.sha256((out/report_name).read_bytes()).hexdigest()}
+              (out/'CAL26_V1R29_Manifest.json').write_text(json.dumps(summary,sort_keys=True,indent=2)+'\n',encoding='utf8')
+              print('PASS V1R29 metadata-only completion: '+status+', ROS corroborated='+str(good_ros)+', dynasty QB evidence='+str(current_dynasty_qb_position_evidence))
+
+          def selftest():
+              assert normalized('Michael Penix Jr.')==normalized('michael penix jr')
+              r={'player_name':'Josh Allen','player_position_id':'QB','rank_ecr':'3'}
+              assert position(r)=='QB' and playername(r)=='josh allen'
+              assert position({'player_positions':'QB,WR'})=='QB'
+              assert numeric('5')==5 and numeric('nan') is None and numeric(True) is None
+              roster={'josh allen','caleb williams','michael penix jr'}
+              d={'players':[r,{'player_name':'Caleb Williams','player_position_id':'QB','rank_ecr':10},
+                            {'player_name':'Michael Penix Jr.','player_position_id':'QB','rank_ecr':'81'},
+                            {'player_name':'Jamarr Chase','player_position_id':'WR','rank_ecr':2}]}
+              m=metadata('dynasty_all',d,roster,'test-sha')
+              assert (m['qb_rows_recognized'],m['qb_names_matched_current_64'],m['numeric_qb_ecr_ranks'])==(3,3,3),m
+              w={'players':[{'name':'Josh Allen','position_id':'QB','fpid':1,'stats':{'pass_yds':300}}, {'name':'Caleb Williams','position_id':'QB','fpid':2,'stats':{'pass_yds':260}}]}
+              ros={'players':[{'name':'Josh Allen','position_id':'QB','fpid':1,'stats':{'pass_yds':3000}}, {'name':'Caleb Williams','position_id':'QB','fpid':2,'stats':{'pass_yds':2100}}]}
+              c=compare_ros(ros,w);assert c['matched_projection_qbs']==2 and c['median_ros_to_weekly_pass_yards_ratio']>8
+              assert not c['operational_ros_vs_weekly_distinction_supported'] # requires full sample
+              # Test genuine positive paired separation at >=15 players.
+              wa={'players':[]};ra={'players':[]}
+              for i in range(20):
+                  wa['players'].append({'fpid':i+1,'position_id':'QB','stats':{'pass_yds':200+i}})
+                  ra['players'].append({'fpid':i+1,'position_id':'QB','stats':{'pass_yds':1800+i*3}})
+              assert compare_ros(ra,wa)['operational_ros_vs_weekly_distinction_supported']
+              assert not compare_ros(wa,wa)['operational_ros_vs_weekly_distinction_supported']
+              assert comparison_rank(d,d)['pairwise_order_agreement']==1.0
+              # Never classify dynasty as superflex.
+              assert m['superflex_verified'] is False
+              print('PASS V1R29 regression: FantasyPros rank player_position_id, paired ROS-v-weekly, fail-closed SF, no row leakage')
+
+          if __name__=='__main__':
+              ap=argparse.ArgumentParser()
+              ap.add_argument('--repo',type=Path)
+              ap.add_argument('--freeze',type=Path)
+              ap.add_argument('--previous',type=Path)
+              ap.add_argument('--out',type=Path)
+              ap.add_argument('--selftest',action='store_true')
+              args=ap.parse_args()
+              if args.selftest:selftest()
+              else:
+                  assert args.repo and args.freeze and args.previous and args.out
+                  safe_run(args.repo,args.freeze,args.previous,args.out,os.environ.get('FANTASYPROS_API_KEY',''))
+          PY_CAL26_V1R29_ENGINE
+          python3 -m py_compile "$RUNNER_TEMP/cal26_v1r29_engine.py"
+          python3 "$RUNNER_TEMP/cal26_v1r29_engine.py" --selftest
+      - name: Inspect four authorized source queries in memory only
+        shell: bash
+        env:
+          FANTASYPROS_API_KEY: ${{ secrets.FANTASYPROS_API_KEY }}
+        run: |
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/cal26_v1r29_engine.py" \
+            --repo "$GITHUB_WORKSPACE" \
+            --freeze "$RUNNER_TEMP/cal26-v1r27" \
+            --previous "$RUNNER_TEMP/cal26-v1r28" \
+            --out "$RUNNER_TEMP/CAL26_V1R29_Metadata"
+      - name: Independently verify scope evidence hashes and zero writes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_CAL26_V1R29_VERIFY'
+          import json,hashlib,os
+          from pathlib import Path
+          p=Path(os.environ['RUNNER_TEMP'])/'CAL26_V1R29_Metadata'
+          files=sorted(x.name for x in p.iterdir())
+          assert files==['CAL26_V1R29_Manifest.json','CAL26_V1R29_Source_Schema_and_ROS_Discrimination_Report.md'],files
+          m=json.loads((p/'CAL26_V1R29_Manifest.json').read_text())
+          assert m['status'] in ('PASS_METADATA_SOURCE_INTERPRETATION_IMPROVED_READ_ONLY','HOLD_SOME_SOURCE_SEMANTICS_OR_COVERAGE')
+          assert (m['current_board_qbs'],m['current_board_players'],m['frozen_qbs'],m['frozen_candidates'],m['frozen_rows'])==(64,565,31,20,620)
+          assert m['source_v1r27_run']==39963472646 and m['source_v1r28_run']==39965070745
+          assert set(m['source_checks'])=={'qb_ros','qb_weekly','dynasty_all','dynasty_qb'}
+          assert m['dynasty_superflex_verified'] is False and m['superflex_cross_position_value_authorized'] is False
+          assert m['player_level_provider_rows_retained'] is False and m['player_level_provider_rows_logged'] is False
+          assert m['licenses_cleared_for_public_player_rows'] is False
+          assert m['source_weights_fitted'] is False and m['owner_ranges_used_for_fitting'] is False
+          assert m['future_holdout_outcomes_used'] is False
+          assert m['price_changes_authorized'] is False and m['production_files_mutated']==0
+          for filename,digest in m['files'].items():assert hashlib.sha256((p/filename).read_bytes()).hexdigest()==digest
+          print('PASS V1R29 independent: private source rows not retained, no production changes, 31/20 frozen candidates retained')
+          PY_CAL26_V1R29_VERIFY
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Upload metadata-only source diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: CAL26-V1R29-FantasyPros-Rank-Schema-ROS-Period-Read-Only
+          path: ${{ runner.temp }}/CAL26_V1R29_Metadata
+          if-no-files-found: error
+          retention-days: 60
