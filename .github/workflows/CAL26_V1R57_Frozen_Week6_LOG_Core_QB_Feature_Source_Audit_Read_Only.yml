@@ -1,0 +1,246 @@
+name: "CAL26 V1R57 - Frozen Week6 LOG-Core QB Scoring Source Audit (Read Only)"
+'on':
+  workflow_dispatch: {}
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: cal26-v1r57-frozen-week6-log-scoring-readonly
+  cancel-in-progress: false
+jobs:
+  qb-frozen-week6-log-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Read-only checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Download pinned frozen R47R1 Week6 evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: CAL26_V1R47R1_QB_RECENCY_TWO_TRACK_EVIDENCE_READ_ONLY
+          run-id: 40030717495
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ${{ runner.temp }}/cal26-v1r57-inputs/R47
+      - name: Download pinned actual R56 LOG next-season holdout
+        uses: actions/download-artifact@v4
+        with:
+          name: CAL26_V1R56_LOG_WEEK6_NEXT_SEASON_SHADOW_SENSITIVITY_RESEARCH_ONLY
+          run-id: 40049447205
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ${{ runner.temp }}/cal26-v1r57-inputs/R56
+      - name: Evaluate LOG-native Week1-6 QB scoring without post-Week6 signals
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/cal26_v1r57_engine.py" <<'PY_CAL26_V1R57_ENGINE'
+          #!/usr/bin/env python3
+          """CAL26 V1R57: Frozen-Week6 2026 QB LOG-core per-game reconstruction audit.
+          No production writes; no recency repricing; weeks >=7 never evaluated as QB stats.
+          """
+          import argparse, csv, hashlib, io, json, math, pathlib, urllib.request, time
+          from collections import defaultdict
+          ROOT='CAL26_V1R57'
+          SOURCE='https://github.com/nflverse/nflverse-data/releases/download/stats_player/stats_player_week_2026.csv'
+          R47_SHA='7dc0733a1f6cb27ce47a1bd77b3fde03d263d20f43fd3477722846f5f980515e'
+          R56_SHA='1233aaf31e56613dc6e0dbc29c0c9c8d06d828a5a0fbf769faeb0994d096762e'
+          R47_MANIFEST_SHA='08fecccd8025e71c04ec7323483f194bf79c31cc71298ba844868cd248791269'
+          R56_MANIFEST_SHA='0f76e1ce51981592a023c5817bd50ce6f16e332e2bf31d50bbdb815897841fe1'
+          GLOBAL_FACTOR=1.0781268010135738
+          REQUIRED={'season','week','season_type','position','player_id','team','attempts','fantasy_points','carries','receptions','passing_yards','rushing_yards','receiving_yards'}
+          
+          def req(cond,msg):
+           if not cond: raise AssertionError(msg)
+          def sha(data):return hashlib.sha256(data).hexdigest()
+          def number(s):
+           if s in ('',None):return 0.0
+           x=float(s)
+           req(math.isfinite(x),'NONFINITE_SCORING_FIELD')
+           return x
+          def score(row):
+           pas=number(row['passing_yards']);ru=number(row['rushing_yards']);re=number(row['receiving_yards'])
+           v=number(row['fantasy_points'])+.2*number(row['carries'])+.5*number(row['receptions'])
+           v+=3 if pas>=400 else 2 if pas>=300 else 0
+           v+=3 if ru>=200 else 2 if ru>=100 else 0
+           v+=3 if re>=200 else 2 if re>=100 else 0
+           return v
+          
+          def load_csv(path, digest):
+           data=path.read_bytes();req(sha(data)==digest,'PIN_DRIFT_'+path.name)
+           return list(csv.DictReader(io.StringIO(data.decode('utf-8-sig'))))
+          
+          def get(url):
+           last=None
+           for n in range(3):
+            try:
+             with urllib.request.urlopen(urllib.request.Request(url,headers={'User-Agent':'CAL26-V1R57-ReadOnly'}),timeout=30) as r:return r.read()
+            except Exception as e:
+             last=e;time.sleep(1+n)
+           raise RuntimeError('NFLVERSE_2026_DOWNLOAD_FAILED: '+str(last))
+          
+          def read_source(data):
+           # csv.reader: check only season and week (and REG/QB) BEFORE constructing any feature dictionary.
+           stream=io.StringIO(data.decode('utf-8-sig'));rdr=csv.reader(stream)
+           head=next(rdr);fields=set(head);req(REQUIRED<=fields,'NFLVERSE_MISSING_REQUIRED_FIELDS_'+str(sorted(REQUIRED-fields)))
+           ix={name:head.index(name) for name in REQUIRED};seen=set();result=defaultdict(list)
+           for values in rdr:
+            if not values:continue
+            req(len(values)==len(head),'CSV_ROW_SHAPE_MISMATCH')
+            if values[ix['season']]!='2026':continue
+            try:w=int(values[ix['week']])
+            except ValueError:raise AssertionError('BAD_WEEK')
+            req(1<=w<=18,'INVALID_2026_WEEK')
+            if w>6:continue   # hard boundary; no Week7+ player or scoring fields accessed
+            if values[ix['season_type']]!='REG' or values[ix['position']]!='QB':continue
+            d={key:values[j] for key,j in ix.items()}
+            pid=d['player_id'];req(pid.startswith('00-'),'INVALID_GSIS_ID')
+            req(d['team'].strip(),'MISSING_TEAM')
+            key=(pid,w);req(key not in seen,'DUPLICATE_ID_WEEK_'+pid+'_'+str(w));seen.add(key)
+            d['week_int']=w;d['std']=number(d['fantasy_points']);d['log']=score(d)
+            result[pid].append(d)
+           return result
+          
+          def output(artifact_dir,source,results):
+           a=artifact_dir/'R47';b=artifact_dir/'R56'
+           m47_data=(a/'CAL26_V1R47_manifest.json').read_bytes();req(sha(m47_data)==R47_MANIFEST_SHA,'PIN_DRIFT_R47_MANIFEST')
+           m47=json.loads(m47_data);rows47=load_csv(a/'CAL26_V1R47_54_QB_two_track_evidence.csv',R47_SHA)
+           rows56=load_csv(b/'CAL26_V1R56_54_QB_recency_numerical_sensitivity_NOT_FV.csv',R56_SHA)
+           req(len(rows47)==54 and len(rows56)==54,'54_QB_CONTRACT_FAIL')
+           x47={r['name']:r for r in rows47};x56={r['name']:r for r in rows56}
+           req(len(x47)==54 and set(x47)==set(x56),'54_QB_IDENTITY_DRIFT')
+           allowed=[r for r in rows47 if r['R46_2026_week6_qualifies']=='True']
+           req(len(allowed)==31 and sum(r['R47_Week6_qualified']=='True' for r in rows56)==31,'31_QB_COHORT_DRIFT')
+           m56bytes=(b/'CAL26_V1R56_manifest.json').read_bytes();req(sha(m56bytes)==R56_MANIFEST_SHA,'PIN_DRIFT_R56_MANIFEST')
+           r56=json.loads(m56bytes)
+           req(not r56['production_change_authorized'] and not r56['protected_2026_weeks8_12_read'],'R56_PRODUCTION_OR_HOLDOUT_DRIFT')
+           req(r56['cohort_holdout_decisions'][0]['MSE_gain_pct']>0 and r56['cohort_holdout_decisions'][0]['holdout_n']==50,'R56_EMPIRICAL_DRIFT')
+           raw_sha=sha(source);original_sha=m47['2026_weekly_source_sha256']
+           weekly=read_source(source);found=0;comparable=0;parity=0;differences=[];rows=[];high=[]
+           for name in sorted(x47):
+            src=x47[name];r56row=x56[name];eligible=src['R46_2026_week6_qualifies']=='True'
+            pid=src['nflverse_id'];games=sorted(weekly.get(pid,[]),key=lambda d:d['week_int']) if pid else []
+            std_ytd=round(sum(g['std'] for g in games)/len(games),5) if games else None
+            log_ytd=round(sum(g['log'] for g in games)/len(games),5) if games else None
+            std_last3=round(sum(g['std'] for g in games[-3:])/len(games[-3:]),5) if games else None
+            log_last3=round(sum(g['log'] for g in games[-3:])/len(games[-3:]),5) if games else None
+            r47_std=number(src['ytd_std_ppg']) if src['ytd_std_ppg'] else None
+            r47_recent=number(src['recent3_std_ppg']) if src['recent3_std_ppg'] else None
+            ytd_diff=round(std_ytd-r47_std,5) if std_ytd is not None and r47_std is not None else None
+            recent_diff=round(std_last3-r47_recent,5) if std_last3 is not None and r47_recent is not None else None
+            rows_match= bool(eligible and games and len(games)==int(src['observed_games']) and
+                             ytd_diff is not None and recent_diff is not None and abs(ytd_diff)<=0.015 and abs(recent_diff)<=0.015)
+            if eligible:
+             found+=bool(games)
+             comparable+=bool(games and ytd_diff is not None and recent_diff is not None)
+             parity+=rows_match
+             if not rows_match:high.append(name)
+             if std_last3 is not None and log_last3 is not None:
+              differences.append(abs(log_last3-GLOBAL_FACTOR*number(src['recent3_std_ppg'])))
+            rows.append({'name':name,'r47_eligible':eligible,'nflverse_id':pid,'r47_observed_games':src['observed_games'],
+             '2026_source_games_through6':len(games),'2026_source_std_ytd_ppg':std_ytd,'2026_source_LOG_core_ytd_ppg':log_ytd,
+             '2026_source_std_recent3_ppg':std_last3,'2026_source_LOG_core_recent3_ppg':log_last3,
+             'R47_frozen_std_YTD_ppg':r47_std,'R47_frozen_std_recent3_ppg':r47_recent,
+             'R47_frozen_LOG_active_ppg_observation':src.get('weeks1_6_LOG_active_ppg_OBSERVATION_ONLY',''),
+             'LOG_core_ytd_minus_R47_LOG_active_observation':round(log_ytd-number(src['weeks1_6_LOG_active_ppg_OBSERVATION_ONLY']),5) if log_ytd is not None and src.get('weeks1_6_LOG_active_ppg_OBSERVATION_ONLY') else None,
+             'source_std_YTD_minus_R47_frozen':ytd_diff,'source_std_recent3_minus_R47_frozen':recent_diff,
+             'frozen_R47_std_features_reconstructed':rows_match,
+             'R56_historical_global_factor_recent3_LOG_estimate':round(number(src['recent3_std_ppg'])*GLOBAL_FACTOR,5) if src['recent3_std_ppg'] else None,
+             'player_specific_LOG_recent3_minus_global_proxy':round(log_last3-number(src['recent3_std_ppg'])*GLOBAL_FACTOR,5) if log_last3 is not None and src['recent3_std_ppg'] else None,
+             'R56_inner_selected_signal':r56row['R56_selected_LOG_signal'],
+             'reprice_authorized':False})
+           req(found>=25 and comparable>=25,'INSUFFICIENT_FROZEN_WEEK6_QB_SOURCE_COVERAGE')
+           # Only a byte-identical source can claim the underlying NFLverse Week6 snapshot itself was exactly reproduced.
+           strict_snapshot=bool(raw_sha==original_sha and parity==31 and comparable==31)
+           status=('PINNED_2026_WEEK6_LOG_CORE_RECONSTRUCTED_RESEARCH_ONLY' if strict_snapshot else
+                   'OBSERVATIONAL_LOG_CORE_WEEK6_RECONSTRUCTION_NOT_FROZEN_CERTIFIED')
+           stats={'workflow':'CAL26 V1R57 - Frozen Week6 LOG Native QB Scoring Evidence Audit (Read Only)',
+            'semantic_status':status,'frozen_snapshot_byte_verified':raw_sha==original_sha,
+            'r47_original_source_sha256':original_sha,'current_source_sha256':raw_sha,'source_url':SOURCE,
+            'r47_qualified_QB_count':31,'R56_54_QB_joined':54,'qualified_source_matches_found':found,
+            'qualified_features_compared':comparable,'qualified_features_parity_pass':parity,
+            'feature_drift_names':high,'mean_abs_recent3_LOG_vs_historical_global_conversion_ppg':round(sum(differences)/len(differences),5) if differences else None,
+            'future_week_scoring_fields_evaluated':False,'week7_or_later_QB_player_stats_used':False,
+            '2026_Week8_12_sealed_targets_used':False,'2027_outcomes_read':False,
+            'has_actual_next_season_price_scale':False,'prior_2025_exact_same_source_LOG_feature_added':False,
+            'real_FV_scoring_verified':False,'index_html_modified':False,'production_change_authorized':False,
+            'scoring_limitation':'LOG-core nflverse proxy, not every Sleeper LOG official/special-teams scoring category',
+            'R56_recency_signal_retrained':False,'R56_20_units_price_proxy_recommended':False}
+           results.mkdir(parents=True,exist_ok=True)
+           csv_name=ROOT+'_54_QB_week6_LOG_core_feature_diagnostics_NOT_FV.csv'
+           with (results/csv_name).open('w',newline='') as f:
+            writer=csv.DictWriter(f,fieldnames=list(rows[0]));writer.writeheader();writer.writerows(rows)
+           findings=[f'# CAL26 V1R57 — Frozen 2026 Week6 LOG-core QB scoring audit',
+            '**No production FV changes.** Research only; no owner targets or market-price labels.',
+            '',f'**Result:** `{status}`',
+            '',f'- Found {found}/31 frozen Week6 eligible QBs; checked {comparable}/31; strict per-player YTD + recent3 standard feature parity {parity}/31.',
+            f'- Original R47 source SHA ` {original_sha} ` vs this retrieval SHA ` {raw_sha} `; raw source byte identity: **{raw_sha==original_sha}**.',
+            '- Source rows for 2026 Week7 and later are skipped before player/stat/point fields are used.',
+            '- Adds actual player-specific LOG-core weekly YTD/recent3 diagnostics (same R55 scoring convention) where available.',
+            '- Includes a comparison to frozen observed LOG active PPG where available; differences are flagged diagnostically, not treated as identical scoring pipelines.',
+            '- Does not turn the R56 illustrative price proxy into FV, substitute this result for prior-year LOG, or silently approve missing categories.',
+            '', '## Diagnostic exceptions',
+            ('No missing or YTD/recent3 standard parity differences in the 31 eligible cohort.' if not high else 'Frozen-feature parity failed or data missing for: '+', '.join(high)),
+            '', '## Next decision',
+            ('Byte-identical pinned source and 31/31 player parity: the 2026 historical LOG-core per-QB feature bridge is verified; next calibrate prior-year LOG with the same-source cutoff and production FV scale.' if strict_snapshot else
+             '2026 source is changed or incomplete versus R47 freeze. Treat all player-specific LOG results as observational. Recover byte-identical Week6 input or independently approve row-level equivalence before recency model is refit.'),
+            'Even a passing freeze does not establish exact Sleeper LOG scoring, a 2–3 year signal transfer, or an empirically calibrated cross-position cardinal FV scale.', '']
+           report=ROOT+'_findings.md';(results/report).write_text('\n'.join(findings))
+           stats['output_sha256']={csv_name:sha((results/csv_name).read_bytes()),report:sha((results/report).read_bytes())}
+           (results/(ROOT+'_manifest.json')).write_text(json.dumps(stats,indent=2,sort_keys=True)+'\n')
+           print(json.dumps({'status':status,'found':found,'parity':parity,'byte_identical':raw_sha==original_sha,'production_change_authorized':False}))
+          
+          def selftest():
+           d={'passing_yards':'400','rushing_yards':'200','receiving_yards':'100','carries':'5','receptions':'1','fantasy_points':'20'}
+           req(abs(score(d)-29.5)<1e-9,'LOG_SCORER_SELFTEST')
+           d['passing_yards']='299';d['rushing_yards']='0';d['receiving_yards']='0'
+           req(abs(score(d)-21.5)<1e-9,'MILESTONE_NONQUALIFY_SELFTEST')
+           req(len(R47_SHA)==64 and len(R56_SHA)==64,'PIN_LENGTH')
+           data=('season,week,season_type,position,player_id,team,attempts,fantasy_points,carries,receptions,passing_yards,rushing_yards,receiving_yards\n'
+           '2026,1,REG,QB,00-001,AAA,20,10,1,0,300,0,0\n'
+           '2026,7,REG,QB,00-001,AAA,garbage,BAD,BAD,BAD,BAD,BAD,BAD\n').encode()
+           q=read_source(data);req(len(q['00-001'])==1 and abs(q['00-001'][0]['log']-12.2)<1e-7,'WEEK7_EXCLUSION_SELFTEST')
+           print('CAL26_R57_SELFTEST_GREEN: milestone, no bonus, pinned lengths, Week7 poison ignored')
+          
+          if __name__=='__main__':
+           a=argparse.ArgumentParser();a.add_argument('--artifacts',type=pathlib.Path);a.add_argument('--out',type=pathlib.Path);a.add_argument('--source',type=pathlib.Path);a.add_argument('--selftest',action='store_true');t=a.parse_args()
+           if t.selftest:selftest()
+           else:
+            src=t.source.read_bytes() if t.source else get(SOURCE)
+            output(t.artifacts,src,t.out)
+          PY_CAL26_V1R57_ENGINE
+          python -m py_compile "$RUNNER_TEMP/cal26_v1r57_engine.py"
+          python "$RUNNER_TEMP/cal26_v1r57_engine.py" --selftest
+          python "$RUNNER_TEMP/cal26_v1r57_engine.py" --artifacts "$RUNNER_TEMP/cal26-v1r57-inputs" --out "$RUNNER_TEMP/cal26-v1r57-results"
+          python - "$RUNNER_TEMP/cal26-v1r57-results" <<'PY_CAL26_V1R57_VERIFY'
+          import csv,hashlib,json,pathlib,sys
+          p=pathlib.Path(sys.argv[1]);m=json.loads((p/'CAL26_V1R57_manifest.json').read_text())
+          assert m['r47_qualified_QB_count']==31 and m['R56_54_QB_joined']==54
+          assert m['2026_Week8_12_sealed_targets_used'] is False
+          assert m['week7_or_later_QB_player_stats_used'] is False
+          assert not m['production_change_authorized'] and not m['index_html_modified']
+          assert not m['has_actual_next_season_price_scale'] and not m['R56_recency_signal_retrained']
+          for name,digest in m['output_sha256'].items():
+              assert hashlib.sha256((p/name).read_bytes()).hexdigest()==digest,name
+          with (p/'CAL26_V1R57_54_QB_week6_LOG_core_feature_diagnostics_NOT_FV.csv').open() as f:
+              rows=list(csv.DictReader(f))
+          assert len(rows)==54 and sum(r['r47_eligible']=='True' for r in rows)==31
+          assert all(r['reprice_authorized']=='False' for r in rows)
+          assert m['semantic_status'] in ('PINNED_2026_WEEK6_LOG_CORE_RECONSTRUCTED_RESEARCH_ONLY','OBSERVATIONAL_LOG_CORE_WEEK6_RECONSTRUCTION_NOT_FROZEN_CERTIFIED')
+          print('CAL26_R57_GITHUB_ASSERT_GREEN: source evidence inspected, any drift disclosed; FV held')
+          PY_CAL26_V1R57_VERIFY
+          test -z "$(git status --porcelain)"
+          echo '## CAL26 V1R57 — 2026 Week6 LOG-core QB Feature Reconstruction' >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/cal26-v1r57-results/CAL26_V1R57_findings.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload source integrity and player-specific diagnostics (Read Only)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CAL26_V1R57_FROZEN_WEEK6_LOG_CORE_QB_FEATURE_AUDIT_READ_ONLY
+          path: ${{ runner.temp }}/cal26-v1r57-results/
+          if-no-files-found: warn
+          retention-days: 60
