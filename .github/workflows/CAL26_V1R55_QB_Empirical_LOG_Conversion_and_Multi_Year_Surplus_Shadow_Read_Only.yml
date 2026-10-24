@@ -1,0 +1,421 @@
+name: CAL26 V1R55 - QB Empirical LOG Scoring Transfer and Multi Year Surplus (Read Only)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: cal26-v1r55-scoring-multiyear-shadow-readonly
+  cancel-in-progress: false
+
+jobs:
+  qb-log-multi-year-shadow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Read-only checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Use Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Download pinned R42 54-QB horizon evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: CAL26_V1R42_HISTORICAL_QB_RESEARCH_ONLY
+          run-id: 40021246762
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ${{ runner.temp }}/cal26-v1r55-inputs/R42
+      - name: Download pinned R53R1 LOG historical reference
+        uses: actions/download-artifact@v4
+        with:
+          name: CAL26_V1R53R1_HISTORICAL_LOG_SEASONS_REPLACEMENT_SHARED_SURPLUS_READ_ONLY
+          run-id: 40045370120
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ${{ runner.temp }}/cal26-v1r55-inputs/R53
+      - name: Download pinned R54 numerical shadow reference
+        uses: actions/download-artifact@v4
+        with:
+          name: CAL26_V1R54_QB_NUMERICAL_SHADOW_SURPLUS_SCORING_TRANSFER_HOLD
+          run-id: 40047481172
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ${{ runner.temp }}/cal26-v1r55-inputs/R54
+      - name: Compute 2016-25 paired LOG scores and historical 1-3 year holdouts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/cal26_v1r55_engine.py" <<'PY_CAL26_V1R55_ENGINE'
+          #!/usr/bin/env python3
+          """CAL26 R55: paired historical LOG-scoring transfer + prospective 54-QB shadow, READ-ONLY.
+          Historical completed nflverse 2016-2025 seasons only. No 2026 outcomes, market prices, owner targets.
+          The recalculated LOG score retains nflverse standard points and adds LOG-only rush, reception and milestone bonuses; differences from Sleeper sources are disclosed.
+          """
+          from __future__ import annotations
+          import argparse,collections,csv,hashlib,io,json,math,pathlib,time,urllib.request
+
+          ROOT='CAL26_V1R55'
+          SRC='https://github.com/nflverse/nflverse-data/releases/download/stats_player/'
+          PIN={
+          2016:'eb0264c65d1ef593196afcd4ba24e9f2e9b7942923bf6f4bb4639684e2c4d470',
+          2017:'592b0916065987b0b3afb0480162f03350d16b12250dc42b0f194e2ab1378563',
+          2018:'c53021bcfc9f89d30edd6f1fe145a1d7d6ce469efeec75974fe9f0adac568642',
+          2019:'a05558126b1209b80fe11a8f18938cb35816370bf9990975a87de49e9eed7376',
+          2020:'05b992676faccc8940efbf6242cb76358069372d31d7c2e02c1a4acdcd3cbe18',
+          2021:'41915fb49238902ad1f129ebf0405b11a1e710454ae0fe8f7b3e4f9145875f48',
+          2022:'ad426c3fe5bf1cc30c3f137fdfe96d054e19d400879ee4413129da49fa7b54be',
+          2023:'f19cb71a5de0dce7fd09376026237c9ee9d5a93fe13815a2ea3ec2d37204cb17',
+          2024:'3ddc45a84f759aa348ce465ae001752c530575455717657cdfe1f8abfcdb4759',
+          2025:'e5e0615b3d96a3eaebfaee91e55afb4a4e7fe0caf057454177bcd7d6ad4bcfc2'}
+          INPUTS={'R42':{'qb':('CAL26_V1R42_54_QB_empirical_shadow.csv','38d0d4d62a0a1c2722feffafb124e6def853b26dbf838f6639612ca0964ab1c4'),
+                            'manifest':('CAL26_V1R42_manifest.json','6f378970384f5b3c74304def7a1ab7a8d7e1e8158e612d28c2c7c8786e679617'),
+                            'year':('CAL26_V1R42_year_qb24_proxy.csv','3bd9e0cb7af2ac64ee31240cb23fd81acdb2e2178e1097191d20f03a82460e05')},
+          'R54':{'qb':('CAL26_V1R54_54_QB_numerical_SHADOW_not_FV.csv','26ee4379004b4390f8ec8eec4274ce6bcb12b729dde19a5126d87958f47a8015'),
+                 'manifest':('CAL26_V1R54_manifest.json','2c17ee55f39428cc1b96a4b35d933ae1e4eefb53d545d8c0bbaa4f0d9e23210f')},
+          'R53':{'year':('CAL26_V1R53_2024_2025_historical_LOG_replacement_ranks.csv','b093956d3e929a2217ecd1a12c81bc5a990897c8e02e0fa3dc40e4bd26a24e89'),
+                 'manifest':('CAL26_V1R53_manifest.json','8d2227cee818345e048dfc689ea54ebe60a299419e6e0faa133c98d4913af5ed')}}
+          YEARS=tuple(PIN)
+          REQUIRED={'player_id','position','season','season_type','week','team','attempts','fantasy_points','passing_yards','rushing_yards','receiving_yards','carries','receptions'}
+          OPTIONAL=('passing_2pt_conversions','rushing_2pt_conversions','receiving_2pt_conversions','sack_fumbles_lost','rushing_fumbles_lost','receiving_fumbles_lost','special_teams_tds')
+          TRAIN_CAL=tuple(range(2016,2023))
+          TEST_CAL=(2023,2024,2025)
+          TRAIN_END_LABEL=2021
+          TEST_FIRST_ORIGIN=2022
+          DISCOUNT=.9
+          SCALES=(15,20,25)
+          DIAGNOSTICS=('bryce young','jayden daniels','cj stroud','caleb williams','drake maye','matthew stafford')
+
+          def req(ok,what):
+              if not ok:raise AssertionError(what)
+          def sha(b):return hashlib.sha256(b).hexdigest()
+          def num(x):
+              try: f=float(x or 0)
+              except (TypeError,ValueError):raise AssertionError('NONNUMERIC_SOURCE_STAT')
+              req(math.isfinite(f),'NONFINITE_SOURCE_STAT');return f
+
+          def csv_output(rows,fields):
+              q=io.StringIO(newline='');w=csv.DictWriter(q,fieldnames=fields,lineterminator='\n',extrasaction='raise');w.writeheader();w.writerows(rows);return q.getvalue()
+          def input_csv(blob):return list(csv.DictReader(io.StringIO(blob.decode('utf-8'))))
+          def input_artifacts(base):
+              b={};prov={}
+              for k,vals in INPUTS.items():
+                  b[k]={};prov[k]={}
+                  for v,(name,pin) in vals.items():
+                      raw=(base/k/name).read_bytes(); req(sha(raw)==pin,f'ARTIFACT_PIN_DRIFT_{k}_{v}');b[k][v]=raw;prov[k][v]=pin
+              m42=json.loads(b['R42']['manifest']);m54=json.loads(b['R54']['manifest']);m53=json.loads(b['R53']['manifest'])
+              req(m42['n_2026_frozen_forward_QBs']==54 and m42['future_2026_holdout_read'] is False,'R42_RELEASE_HOLD')
+              req(m54['n_QB_shadows']==54 and m54['production_change_authorized'] is False and m54['2026_realized_outcomes_read'] is False,'R54_RELEASE_HOLD')
+              req(m53['n_R51_54_qbs']==54 and m53['production_change_authorized'] is False and m53['2026_actuals_read'] is False,'R53_RELEASE_HOLD')
+              return b,prov
+
+          def load_data(year,folder,download,fixture):
+              path=folder/f'stats_player_week_{year}.csv'
+              if download:
+                  e=None
+                  for i in range(3):
+                      try:
+                          r=urllib.request.Request(SRC+path.name,headers={'User-Agent':'CAL26-V1R55-LOG-scoring-read-only'})
+                          with urllib.request.urlopen(r,timeout=80) as fp:
+                              req(fp.status==200,'DATA_HTTP_NOT_200');data=fp.read(13_000_001)
+                          req(300<len(data)<13_000_000,'BAD_SOURCE_SIZE');path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(data)
+                          break
+                      except Exception as ex:
+                          e=ex
+                          if i<2:time.sleep(2*(i+1))
+                  else:raise RuntimeError(f'DATA_DOWNLOAD_FAILED_{year}_{e}')
+              else:
+                  req(path.is_file(),f'MISSING_CSV_{year}');data=path.read_bytes()
+              if not fixture:req(sha(data)==PIN[year],f'R50_R46_NFLVERSE_PIN_DRIFT_{year}: {sha(data)}')
+              req(b'player_id' in data[:2600],'EXPECTED_CSV_HEADER')
+              return data
+
+          def log_qb_week(row):
+              """Same-source exact delta over nflverse fantasy_points standard scoring.
+              nflverse standard already includes passing/rushing/receiving TD, INT, all
+              three lost-fumble categories, 2pt and special teams TDs. LOG differs for
+              QB on carries (.2), catches (.5), and weekly 300/400 pass, 100/200 rush
+              and 100/200 receiving yardage milestone bonuses. Avoid double-counting.
+              """
+              pas=num(row['passing_yards']);rush=num(row['rushing_yards']);rec=num(row['receiving_yards'])
+              x=num(row['fantasy_points'])+.2*num(row['carries'])+.5*num(row['receptions'])
+              x+=(3 if pas>=400 else 2 if pas>=300 else 0)
+              x+=(3 if rush>=200 else 2 if rush>=100 else 0)
+              x+=(3 if rec>=200 else 2 if rec>=100 else 0)
+              return x
+
+          def parse_sources(folder,download,fixture):
+              season={};coverage=[];optional_seen={};source_shas={}
+              for year in YEARS:
+                  blob=load_data(year,folder,download,fixture);source_shas[str(year)]=sha(blob)
+                  rdr=csv.DictReader(io.StringIO(blob.decode('utf-8-sig')))
+                  fields=set(rdr.fieldnames or ());req(REQUIRED<=fields,f'NFLVERSE_REQUIRED_SCORING_FIELD_MISSING_{year}:{sorted(REQUIRED-fields)}')
+                  optional_seen[str(year)]={col:col in fields for col in OPTIONAL}
+                  players=collections.defaultdict(lambda:dict(std=0.,log=0.,attempts=0.,games=0,weekset=set()))
+                  qa={'year':year,'scored_qbs':0,'qb_week_rows':0,'missing_optional_fields':';'.join(c for c in OPTIONAL if c not in fields),'non_finite_rejected':True}
+                  for row in rdr:
+                      if str(row.get('season_type','')).strip().upper()!='REG' or row['position']!='QB':continue
+                      try: y=int(row['season']);w=int(row['week'])
+                      except (TypeError,ValueError):raise AssertionError(f'BAD_YEAR_WEEK_{year}')
+                      req(y==year and 1<=w<=18,f'YEAR_WEEK_OUTSIDE_SOURCE_{year}')
+                      pid=str(row['player_id']).strip();t=str(row['team']).strip()
+                      if not pid or not t:continue
+                      d=players[pid];req(w not in d['weekset'],f'DUPLICATE_PLAYER_WEEK_{year}_{pid}_{w}');d['weekset'].add(w)
+                      d['attempts']+=num(row['attempts']);d['games']+=1
+                      d['std']+=num(row['fantasy_points']);d['log']+=log_qb_week(row)
+                      qa['qb_week_rows']+=1
+                  for row in players.values():row.pop('weekset')
+                  qa['scored_qbs']=len(players);req(qa['scored_qbs']>=20 if fixture else qa['scored_qbs']>=45,f'INSUFFICIENT_QB_ROWS_{year}')
+                  season[year]=dict(players);coverage.append(qa)
+              return season,coverage,optional_seen,source_shas
+
+          def yearly_thresholds(season,fixture):
+              thresholds={};rows=[]
+              for year,ps in season.items():
+                  std=sorted([max(0,p['std']) for p in ps.values()],reverse=True)
+                  log=sorted([max(0,p['log']) for p in ps.values()],reverse=True)
+                  req(len(std)>=24 and std[23]>30 and log[23]>30,f'QB24_SOURCE_COVERAGE_{year}')
+                  thresholds[year]=(std[23],log[23]);rows.append({'year':year,'NFLVERSE_same_source_QB24_standard':round(std[23],3),'NFLVERSE_same_source_QB24_LOG_core':round(log[23],3),'LOG_over_standard_QB24_ratio_same_source':round(log[23]/std[23],5),'is_full_LOG_scoring_guaranteed':False})
+              return thresholds,rows
+
+          def tier(v):return 'below_090' if v<.90 else 'near_090_110' if v<=1.10 else 'above_110'
+
+          def convert_train(annual,thr):
+              rows=[]
+              for yr in YEARS:
+                  qstd,qlog=thr[yr]
+                  for pid,v in annual[yr].items():
+                      if v['attempts']<150:continue
+                      sx=max(0,v['std']/qstd-1);ly=max(0,v['log']/qlog-1)
+                      rows.append({'year':yr,'player_id':pid,'std_s':sx,'log_s':ly,'tier':tier(v['std']/qstd),'LOG_anchor_tier':tier(v['log']/qlog)})
+              train=[r for r in rows if r['year'] in TRAIN_CAL]
+              test=[r for r in rows if r['year'] in TEST_CAL]
+              req(len(train)>=70 and len(test)>=35,'INSUFFICIENT_CALIBRATION_CASES')
+              xx=sum(r['std_s']**2 for r in train);xy=sum(r['std_s']*r['log_s'] for r in train)
+              # Twenty pseudo-observations centered on equality to reduce overfitting.
+              k=(xy+20)/(xx+20)
+              req(0.60<k<1.60,'CALIBRATOR_OUTSIDE_PRESPECIFIED_SANITY')
+              def score(part,slope):return sum((r['log_s']-slope*r['std_s'])**2 for r in part)/len(part)
+              naive=score(test,1);learned=score(test,k)
+              # LOG scoring may move a QB above threshold despite <=QB24 standard scoring.
+              qa={'train_years':list(TRAIN_CAL),'test_years':list(TEST_CAL),'train_n':len(train),'test_n':len(test),
+                  'slope_pseudo_count':20,'learned_slope':round(k,7),'test_naive_mse':round(naive,7),
+                  'test_learned_mse':round(learned,7),'test_improvement_pct':round(100*(1-learned/naive),4) if naive else None,
+                  'paired_same_player_same_season':True,'selection_not_based_on_test':True,
+                  'score_proxy_complete_LOG_certain':False,
+                  'n_test_std_surplus_zero_but_LOG_positive':sum(r['std_s']<=0 and r['log_s']>0 for r in test)}
+              out=[{'year':year,'n':sum(r['year']==year for r in rows),
+                     'mse_identity':round(score([r for r in rows if r['year']==year],1),6),
+                     'mse_trained_slope':round(score([r for r in rows if r['year']==year],k),6),
+                     'is_final_calibration_holdout':year in TEST_CAL} for year in YEARS]
+              return k,qa,out
+
+          def tier_horizon_study(annual,thr):
+              predictions={};results=[];qa=[]
+              for h in (1,2,3):
+                  # Training future labels are no later than 2021; evaluation is on disjoint 2022+ anchor years.
+                  trains=[];tests=[]
+                  for yr in YEARS:
+                      if yr+h>2025:continue
+                      cur=annual[yr];future=annual[yr+h];logref=thr[yr+h][1];stdref,anchorref=thr[yr]
+                      for pid,v in cur.items():
+                          if v['attempts']<150:continue
+                          outcome=max(0,future.get(pid,{'log':0})['log']/logref-1)
+                          case={'origin':yr,'pid':pid,'origin_tier':tier(v['log']/anchorref),'future_log_ratio_surplus':outcome}
+                          if yr+h<=TRAIN_END_LABEL:trains.append(case)
+                          elif yr>=TEST_FIRST_ORIGIN:tests.append(case)
+                  req(len(trains)>=55 and len(tests)>=20,f'INSUFFICIENT_TEMPORAL_MULTISEASON_H{h}_TRAIN_{len(trains)}_TEST_{len(tests)}')
+                  mean=sum(r['future_log_ratio_surplus'] for r in trains)/len(trains)
+                  per={};counts={}
+                  for t in ('below_090','near_090_110','above_110'):
+                      vals=[r['future_log_ratio_surplus'] for r in trains if r['origin_tier']==t]
+                      counts[t]=len(vals)
+                      per[t]=(sum(vals)+12*mean)/(len(vals)+12)
+                  score=lambda f:sum((f(r)-r['future_log_ratio_surplus'])**2 for r in tests)/len(tests)
+                  base=score(lambda r:mean);candidate=score(lambda r:per[r['origin_tier']])
+                  predictions[h]=per
+                  results.append({'horizon':h,'train_origin_years':';'.join(str(y) for y in sorted(set(r['origin'] for r in trains))),
+                                  'test_origin_years':';'.join(str(y) for y in sorted(set(r['origin'] for r in tests))),
+                                  'max_train_label_year':max(r['origin']+h for r in trains),
+                                  'min_test_origin_year':min(r['origin'] for r in tests),
+                                  'train_n':len(trains),'test_n':len(tests),'tier_counts':str(counts),
+                                  'baseline_global_mean':round(mean,6),
+                                  'tier_mean_below_090':round(per['below_090'],6),
+                                  'tier_mean_near_090_110':round(per['near_090_110'],6),
+                                  'tier_mean_above_110':round(per['above_110'],6),
+                                  'test_global_MSE':round(base,7),'test_tier_MSE':round(candidate,7),
+                                  'test_improvement_pct':round(100*(1-candidate/base),4) if base else None,
+                                  '2026_preseason_tier_to_prior_season_cohort_transfer_verified':False})
+                  qa+=tests
+              return predictions,results
+
+          def run(assets,art,out,download=False,fixture=False):
+              contents,prov=input_artifacts(art)
+              annual,coverage,seen,source_shas=parse_sources(assets,download,fixture)
+              threshold,annualqa=yearly_thresholds(annual,fixture)
+              std42=input_csv(contents['R42']['year'])
+              for year in (2024,2025):
+                  b=[num(r['qb24_points']) for r in std42 if int(r['season'])==year]
+                  req(len(b)==1,'R42_STANDARD_QB24_MISSING')
+                  delta=threshold[year][0]-b[0]
+                  req(abs(delta)<.1 if not fixture else abs(delta)<250, f'R42_R55_SAME_NFLVERSE_STANDARD_POINTS_DRIFT_{year}_{delta:.3f}')
+              slope,scoring,transfer_years=convert_train(annual,threshold)
+              estimated,holds=tier_horizon_study(annual,threshold)
+              old=input_csv(contents['R42']['qb']);r54=input_csv(contents['R54']['qb'])
+              a={r['name']:r for r in old};b={r['name']:r for r in r54}
+              req(len(a)==len(b)==54 and a.keys()==b.keys(),'FROZEN_QB_SOURCE_JOIN_54')
+              qa53=input_csv(contents['R53']['year'])
+              cross=[]
+              for yr in (2024,2025):
+                  x=[num(r['points_exact_LOG_weekly_scored']) for r in qa53 if int(r['season'])==yr and r['position']=='QB' and int(r['rank'])==24]
+                  req(len(x)==1,'R53_LOG_QB24_MISSING')
+                  expected=threshold[yr][1];cross.append({'season':yr,'NFLVERSE_LOG_core_QB24':round(expected,3),
+                    'Sleeper_weekly_exact_LOG_QB24':round(x[0],3),'difference_pct':round(100*(expected/x[0]-1),3),
+                    'player_id_matched':False,'same_source_scoring_complete':False})
+              output=[]
+              for name,r in a.items():
+                  old54=b[name]; projected=num(r['frozen_2026_forward']);q24=num(r['QB24_2026_frozen']);req(abs(q24-270.855)<.001,'QB24_FROZEN_DRIFT')
+                  req(abs(projected-num(old54['current_year_LOG_projected_points']))<.01,'2026_QB_FROZEN_INPUT_DRIFT')
+                  req(int(r['frozen_FV_reference_only'])==int(old54['frozen_FV_UNCHANGED']),'FROZEN_FV_DRIFT')
+                  yr0=max(0,projected-q24)
+                  selected=r['baseline_tier'];req(selected in ('below_090','near_090_110','above_110'),'TIER_DRIFT')
+                  h_old=[num(r[f'h{h}_expected_ratio_surplus']) for h in (1,2,3)]
+                  fut_before=sum((DISCOUNT**h)*q24*h_old[h-1] for h in (1,2,3))
+                  fut_paired=sum((DISCOUNT**h)*q24*h_old[h-1]*slope for h in (1,2,3))
+                  fut_tier=sum((DISCOUNT**h)*q24*estimated[h][selected] for h in (1,2,3))
+                  r54sum=num(old54['discounted_four_year_QB24_LOG_equivalent_PROXY_points']);req(abs(r54sum-(yr0+fut_before))<.05,'R54_OLD_PROXY_PARITY')
+                  vals={
+                      'name':name,'age_2026':r['age_2026_frozen'],'R42_age_band':r['age_band'],'projected_LOG_core_pts':round(projected,3),
+                      'frozen_FV_UNCHANGED':int(r['frozen_FV_reference_only']),'QB24_projected_baseline':q24,'R42_tier':selected,
+                      'year0_projected_LOG_surplus_points':round(yr0,4),
+                      'R54_original_unvalidated_four_year_proxy_points':round(r54sum,4),
+                      'R55_paired_empirical_conversion_slope':round(slope,6),
+                      'R55_paired_adjusted_R42_future_h1_3_points':round(fut_paired,4),
+                      'R55_paired_adjusted_four_year_PROXY_points':round(yr0+fut_paired,4),
+                      'R55_direct_LOG_tier_h1_3_future_points_age_UNMODELED':round(fut_tier,4),
+                      'R55_direct_LOG_tier_four_year_PROXY_points_age_UNMODELED':round(yr0+fut_tier,4),
+                      'R55_paired_15units_ILLUSTRATIVE_NOT_FV':round(15*(yr0+fut_paired)),
+                      'R55_paired_20units_ILLUSTRATIVE_NOT_FV':round(20*(yr0+fut_paired)),
+                      'R55_paired_25units_ILLUSTRATIVE_NOT_FV':round(25*(yr0+fut_paired)),
+                      'R55_direct_LOG_tier_20units_ILLUSTRATIVE_NOT_FV':round(20*(yr0+fut_tier)),
+                      'owner_target_used':False,'2026_realized_read':False,'recency_R50_built_into_pricing':False,
+                      'age_risk_age_band_R42_carried_from_standard_model':True,'numerical_FV_repricing_authorized':False}
+                  output.append(vals)
+              output.sort(key=lambda v:(-v['R55_paired_adjusted_four_year_PROXY_points'],v['name']))
+              for j,row in enumerate(output,1):row['paired_shadow_rank_QB_only']=j
+              ref={r['name']:r for r in output}
+              report=[
+                  '# CAL26 V1R55 — Historical paired NFLverse LOG-scoring transfer and dynasty QB shadow (read only)',
+                  '**Status: EMPIRICAL_LOG_TRANSFER_AND_FUTURE_SURPLUS_EVIDENCE__PRODUCTION_HOLD**',
+                  'R54 numerical shadows remain *illustrative*, not deployable FV. This run pairs 2016–2025 standard and LOG-core weekly scoring for the same nflverse QB-season (stable GSIS ID), measures and evaluates a preseason-independent same-player scoring transfer, and produces comparable 54-QB shadows.',
+                  '', '## Calibrator — training 2016–22, final test 2023–25',
+                  '| Trained player-level LOG/standard surplus slope | Train N | Test N | Holdout MSE naive identity | Holdout MSE fitted | Improvement |',
+                  '|---:|---:|---:|---:|---:|---:|',
+                  f"| {slope:.4f} | {scoring['train_n']} | {scoring['test_n']} | {scoring['test_naive_mse']:.6f} | {scoring['test_learned_mse']:.6f} | {scoring['test_improvement_pct']:+.2f}% |",
+                  'LOG core here is computed using nflverse standard points plus LOG-specific rushing-attempt, half-PPR, and per-game yardage milestone bonuses; provider field coverage and between-source differences are reported. This is *not* proof that every LOG special-team or bonus point is represented.',
+                  '', '## Direct next-1/2/3-season LOG-core model — tier predictor vs global mean',
+                  '| Horizon | Train N | Final test N | Final test origin years | MSE tier | MSE global | Tier gain |',
+                  '|---:|---:|---:|---|---:|---:|---:|']
+              for row in holds:report.append(f"| {row['horizon']} | {row['train_n']} | {row['test_n']} | {row['test_origin_years']} | {row['test_tier_MSE']:.5f} | {row['test_global_MSE']:.5f} | {row['test_improvement_pct']:+.2f}% |")
+              report+=['', 'The independent LOG-core tier model conditions on the **prior completed NFL season** at historical origins; applying it to a **preseason projection** for 2026 is not separately validated. It also does not yet model age and should not be used alone to value older quarterbacks.',
+                     '', '## 54-QB research-only numerical examples',
+                     '| Quarterback | Frozen FV | R54 ×20 shadow | R55 paired ×20 proxy | R55 direct LOG-tier ×20 proxy |',
+                     '|---|---:|---:|---:|---:|']
+              for key in DIAGNOSTICS:
+                  row=ref[key];report.append(f"| {key} | {row['frozen_FV_UNCHANGED']} | {round(row['R54_original_unvalidated_four_year_proxy_points']*20)} | {row['R55_paired_20units_ILLUSTRATIVE_NOT_FV']} | {row['R55_direct_LOG_tier_20units_ILLUSTRATIVE_NOT_FV']} |")
+              report+=['', '## Scoring-reconciliation and safety limitations',
+                 '- Player-level matching here is **within nflverse only**. The 2024–25 separate Sleeper historical QB24 comparisons remain ordinal QB24 across sources, **not matched players**.',
+                 '- Same-season standard-to-LOG calibration does not by itself prove a future multi-season forecast. R42 future age/tier ratios still come from its separately trained historical standard model; the paired R55 calibrator adjusts *scoring units*, not model accuracy.',
+                 '- A one-size-fits-all 20× quote convention (15×/25× sensitivity) is not an independently established cross-position dynasty FV price scale. The 2026 projected QB24 is not demonstrated to be actual waiver replacement.',
+                 '- No present 2026 Weeks 1–6 outcomes have been used in these prices: R50 recency and breakout signals are preserved separately, not spuriously blended before future-score calibration.',
+                 '- The fixed score conversion and direct tier model are **evaluated on later historical seasons**. Successful script execution does not imply the model beats its baselines or is ready for production.',
+                 '- No 2026 realized outcomes, protected Weeks 8–12, market prices, owner targets, live FV, `index.html`, or owner overrides are accessed or changed.',
+                 '', '**Next:** Review held-out conversion/tier results. If evidence holds, calibrate explicit cross-position FV scale and separately fit LOG-compatible Week6-to-future signal; seek explicit owner approval before any production repricing. Avoid arbitrary boosts.',
+                 '', '**Production FV: HOLD.**']
+              data={ROOT+'_54_QB_LOG_calibrated_num_SHADOW_not_FV.csv':csv_output(output,list(output[0])),
+                    ROOT+'_paired_scoring_holdout_by_season.csv':csv_output(transfer_years,list(transfer_years[0])),
+                    ROOT+'_future_LOG_tier_holdout.csv':csv_output(holds,list(holds[0])),
+                    ROOT+'_annual_LOG_scoring_reference.csv':csv_output(annualqa,list(annualqa[0])),
+                    ROOT+'_source_coverage.csv':csv_output(coverage,list(coverage[0])),
+                    ROOT+'_Sleeper_vs_NFLverse_QB24_QA.csv':csv_output(cross,list(cross[0])),
+                    ROOT+'_findings.md':'\n'.join(report)+'\n'}
+              m={'workflow':'CAL26 V1R55 - QB Paired LOG Scoring Historical Holdout and Numerical Shadow (Read Only)',
+                 'semantic_status':'EMPIRICAL_LOG_TRANSFER_AND_FUTURE_SURPLUS_EVIDENCE__PRODUCTION_HOLD',
+                 'production_change_authorized':False,'index_html_modified':False,'owner_overrides_modified':False,
+                 '2026_realized_read':False,'protected_2026_holdout_read':False,'market_or_owner_FV_fit':False,
+                 'n_source_years':10,'source_sha256':source_shas,'r46_r50_pin_verified':not fixture,
+                 'historical_QB_weekly_optional_field_coverage':seen,'n_54_QB_candidates':len(output),
+                 'scoring_transfer_model':scoring,'future_LOG_horizon_validation':holds,'source_artifact_hashes':prov,
+                 'scoring_proxy_not_full_coverage_guaranteed':True,
+                 'retained_R42_horizon_risk_not_independently_revalidated':True,
+                 'future_R50_nextseason_signal_integrated':False,
+                 'output_sha256':{name:sha(t.encode('utf8')) for name,t in data.items()}}
+              out.mkdir(parents=True,exist_ok=True)
+              for name,s in data.items():(out/name).write_text(s,encoding='utf8')
+              (out/(ROOT+'_manifest.json')).write_text(json.dumps(m,indent=2,sort_keys=True)+'\n',encoding='utf8')
+              print(json.dumps({'semantic_status':m['semantic_status'],'54_QB':len(output),'transfer_slope':round(slope,5),'transfer_test_gain_pct':scoring['test_improvement_pct'],
+                                'tier_log_model_gains_h1_h3':[r['test_improvement_pct'] for r in holds],
+                                'production_FV_change':False,'historical_pins_verified':not fixture},sort_keys=True))
+              return m
+
+          def selftest():
+              req(all(len(s)==64 and all(c in '0123456789abcdef' for c in s) for s in PIN.values()),'BAD_HISTORICAL_HASH')
+              req(all(len(v[1])==64 and all(c in '0123456789abcdef' for c in v[1]) for d in INPUTS.values() for v in d.values()),'BAD_ARTIFACT_HASH')
+              req(sha(b'hello')=='2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824','SHA_UNIT')
+              fake={'fantasy_points':'20','passing_yards':'350','carries':'5','rushing_yards':'45','receiving_yards':'0','receptions':'1'}
+              expected=20+5*.2+1*.5+2
+              req(abs(log_qb_week(fake)-expected)<1e-9,'WEEKLY_LOG_SCORING_UNIT')
+              req(tier(.8)=='below_090' and tier(1)=='near_090_110' and tier(1.2)=='above_110','TIER_UNIT')
+              print('R55_SELFTEST_GREEN scoring, source digest shapes, frozen future horizons, risk and research-only')
+
+          def main():
+              p=argparse.ArgumentParser();p.add_argument('--assets',type=pathlib.Path);p.add_argument('--artifacts',type=pathlib.Path);p.add_argument('--out',type=pathlib.Path);p.add_argument('--download',action='store_true');p.add_argument('--fixture',action='store_true');p.add_argument('--selftest',action='store_true');x=p.parse_args()
+              if x.selftest:selftest();return
+              req(x.assets is not None and x.artifacts is not None and x.out is not None,'INPUTS_REQUIRED')
+              run(x.assets,x.artifacts,x.out,x.download,x.fixture)
+          if __name__=='__main__':main()
+          PY_CAL26_V1R55_ENGINE
+          python -m py_compile "$RUNNER_TEMP/cal26_v1r55_engine.py"
+          python "$RUNNER_TEMP/cal26_v1r55_engine.py" --selftest
+          python "$RUNNER_TEMP/cal26_v1r55_engine.py" \
+            --download \
+            --assets "$RUNNER_TEMP/cal26-v1r55-history" \
+            --artifacts "$RUNNER_TEMP/cal26-v1r55-inputs" \
+            --out "$RUNNER_TEMP/cal26-v1r55-results"
+          python - "$RUNNER_TEMP/cal26-v1r55-results" <<'PY_CAL26_V1R55_VERIFY'
+          import csv,hashlib,json,pathlib,sys
+          folder=pathlib.Path(sys.argv[1]);prefix='CAL26_V1R55'
+          m=json.loads((folder/(prefix+'_manifest.json')).read_text())
+          assert m['semantic_status']=='EMPIRICAL_LOG_TRANSFER_AND_FUTURE_SURPLUS_EVIDENCE__PRODUCTION_HOLD'
+          assert m['n_54_QB_candidates']==54 and m['n_source_years']==10
+          assert m['r46_r50_pin_verified'] is True and len(m['source_sha256'])==10
+          assert m['2026_realized_read'] is False and m['protected_2026_holdout_read'] is False
+          assert m['production_change_authorized'] is False and m['index_html_modified'] is False
+          assert m['owner_overrides_modified'] is False and m['market_or_owner_FV_fit'] is False
+          assert m['future_R50_nextseason_signal_integrated'] is False
+          assert len(m['future_LOG_horizon_validation'])==3
+          assert all(int(x['max_train_label_year'])<=2021 and int(x['min_test_origin_year'])>=2022 for x in m['future_LOG_horizon_validation'])
+          assert m['scoring_transfer_model']['test_years']==[2023,2024,2025]
+          for name,digest in m['output_sha256'].items():
+              assert hashlib.sha256((folder/name).read_bytes()).hexdigest()==digest,name
+          with (folder/(prefix+'_54_QB_LOG_calibrated_num_SHADOW_not_FV.csv')).open() as fp:
+              players=list(csv.DictReader(fp))
+          assert len(players)==54 and len({x['name'] for x in players})==54
+          assert all(x['numerical_FV_repricing_authorized']=='False' and x['owner_target_used']=='False' for x in players)
+          assert {x['name'] for x in players}.issuperset({'bryce young','jayden daniels','cj stroud','caleb williams','drake maye','matthew stafford'})
+          print('CAL26_V1R55_GITHUB_INTEGRITY_GREEN - factual holdouts produced; production price HOLD')
+          PY_CAL26_V1R55_VERIFY
+          test -z "$(git status --porcelain)"
+          echo '## CAL26 V1R55 — Empirical LOG multi-year QB surplus (Read Only)' >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/cal26-v1r55-results/CAL26_V1R55_findings.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload all read-only research outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CAL26_V1R55_EMPIRICAL_LOG_MULTISEASON_QB_SHADOW_RESEARCH_ONLY
+          path: ${{ runner.temp }}/cal26-v1r55-results/
+          if-no-files-found: warn
+          retention-days: 30
