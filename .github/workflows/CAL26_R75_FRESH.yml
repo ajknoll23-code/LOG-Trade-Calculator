@@ -1,0 +1,266 @@
+name: CAL26 V1R75 - Private DLF Multi-Year Market Signal Test (Read Only)
+'on':
+  workflow_dispatch: {}
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: cal26-r75-private-market-eval
+  cancel-in-progress: false
+jobs:
+  private-market-shadow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - name: Read-only checkout immutable deployed FV structure
+      uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - name: Python 3.11
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    - name: Install fixed statistical dependencies
+      shell: bash
+      run: python -m pip install --disable-pip-version-check --quiet "numpy==2.2.6" "scikit-learn==1.8.0"
+    - name: Download pinned successful R74 future-season evidence
+      uses: actions/download-artifact@v4
+      with:
+        name: CAL26_R74_CHRONOLOGICAL_NEXT_SEASON_SURPLUS_FV_HOLD
+        run-id: 40106627943
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        path: ${{ runner.temp }}/cal26-r75-in/R74
+    - name: Download pinned successful R72 exact live FV formula replay
+      uses: actions/download-artifact@v4
+      with:
+        name: CAL26_R72_518_NATIVE_FV_FORMULA_REPLAY_AND_SENSITIVITY_FV_HOLD
+        run-id: 40102341863
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        path: ${{ runner.temp }}/cal26-r75-in/R72
+    - name: Private value holdout face validity; never export provider rows or LOG price changes
+      shell: bash
+      env:
+        CAL26_DLF_SF_CSV_B64: ${{ secrets.CAL26_DLF_SF_CSV_B64 }}
+      run: |-
+        set -euo pipefail
+        # No later source edits or implicit consumption of future result weeks.
+        test "$(git hash-object index.html)" = "5630bb681dd8710f8e45bc5363488f358ce9ebe2"
+        test -z "$(git status --porcelain)"
+        test ! -e sf.csv
+        cat > "$RUNNER_TEMP/CAL26_R75_engine.py" <<'PY_R75_ENGINE'
+        #!/usr/bin/env python3
+        """R75: private DLF value signal test, no provider rows or names in output, zero live FV changes.
+        Source DLF CSV via existing GitHub secret only. Never create files with DLF data.
+        This is same-vintage market face-validity, not a time-prospective or true-FV test.
+        """
+        import argparse,base64,csv,hashlib,io,json,math,os,pathlib,statistics,re
+        import numpy as np
+        from sklearn.linear_model import Ridge
+        from sklearn.preprocessing import StandardScaler
+        P=pathlib.Path
+        PIN={
+         'R74/CAL26_R74_518_next_season_2027_surplus_evidence_NOT_FV.csv':'2e3e3bcd005fcaa1480b2200893c5b4c3548a1b3be2dd0ce8fdb8af9d0d8b50b',
+         'R74/CAL26_R74_7position_chronological_transition_risk.csv':'de552a013876b60c9d5a1b84db0d400ffb1f5e74b275af55ee761fa9b7f19c17',
+         'R72/CAL26_R72_518_exact_JS_FV_replay_and_multiplier_sensitivity_NO_RELEASE.csv':'2ebce111316cdb578d0bd240e1858a4ac87e1b61543dff01fffc3b60e943d2b2'
+        }
+        POS=('QB','RB','WR','TE','DL','LB','DB')
+        DLF_POS=('QB','RB','WR','TE')
+        def chk(c,s):
+         if not c:raise AssertionError(s)
+        def sha(p):return hashlib.sha256(P(p).read_bytes()).hexdigest()
+        def norm(s):return re.sub(r'\s+',' ',re.sub(r"[.'’\-]",'',s.strip().lower()))
+        def read(p):
+         with P(p).open(newline='',encoding='utf-8-sig') as f:return list(csv.DictReader(f))
+        def write(p,rr):
+         with P(p).open('w',newline='',encoding='utf-8') as f:
+          w=csv.DictWriter(f,fieldnames=list(rr[0]));w.writeheader();w.writerows(rr)
+        def val(s):
+         try:
+          f=float(s);return f if math.isfinite(f) else None
+         except (TypeError,ValueError):return None
+        def parse_dlf(secret):
+         if not secret:return None
+         try:decoded=base64.b64decode(secret,validate=True).decode('utf-8-sig')
+         except Exception as e:raise ValueError('PRIVATE_INPUT_INVALID_BASE64_OR_UTF8') from None
+         f=io.StringIO(decoded);reader=csv.DictReader(f)
+         chk(reader.fieldnames == ['name','position','team','value'],'PRIVATE_DLF_SCHEMA_CHANGED')
+         out={}
+         for row in reader:
+          pos=row['position'].strip().upper()
+          if pos not in DLF_POS:continue  # IDP isn't present in DLF SF offensive values file
+          name=norm(row['name']);pv=val(row['value'])
+          chk(name and pv is not None and pv>0,'PRIVATE_DLF_BAD_ROW')
+          k=(name,pos);chk(k not in out,'PRIVATE_DLF_DUPLICATE_IDENTITY')
+          out[k]=pv
+         chk(len(out)>=25,'PRIVATE_DLF_TOO_FEW_VALID_OFFENSE_VALUES')
+         return out
+
+        def model_market(rows,dlf):
+         # This is a price predictability comparison, NOT a LOG FV scale calibration.
+         cohorts={p:[] for p in DLF_POS}
+         for r in rows:
+          p=r['position'];name=norm(r['name'])
+          if p not in DLF_POS or (name,p) not in dlf:continue
+          y0=val(r['2026_year0_replacement_surplus_RESEARCH'])
+          h1=val(r['2027_H1_predicted_surplus_2021trained_YTD_CONTROL_RESEARCH'])
+          live=val(r['live_JS_FV_UNCHANGED'])
+          age=val(r['age']);gp=val(r['games_played_through_2026_week6'])
+          if any(z is None for z in (y0,h1,live,age,gp)) or live<=0:continue
+          # Restricted to 4+ observed games: missing playing time is not automatically poor dynasty value.
+          if gp<4:continue
+          baseline=[math.log(live)]
+          extended=[math.log(live),math.log1p(max(0,y0)),math.log1p(max(0,h1))]
+          cohorts[p].append({'name':name,'baseline':baseline,'extended':extended,'y':math.log(dlf[(name,p)])})
+         summary=[]
+         for p in POS:
+          cc=cohorts.get(p,[])
+          n=len(cc);r={'position':p,'eligible_private_licensed_market_matches':n if p in DLF_POS else 0,
+            'market_source':'private_DLF_SF_offense_2026_10_20' if p in DLF_POS else 'NO_IDP_NUMERIC_DLF_SOURCE',
+            'price_baseline_OOF_log_MAE':'','multi_year_augmented_OOF_log_MAE':'','augmented_vs_live_MAE_improvement_pct':'',
+            'market_price_out_of_time_holdout':False,'LOG_FV_cardinal_transfer_validated':False,'auto_price_release_authorized':False,
+            'decision':'NO_OFFENSE_DLF_SOURCE' if p not in DLF_POS else 'INSUFFICIENT_MATCHED_PRIVATE_ROWS'}
+          if p not in DLF_POS or n<20:summary.append(r);continue
+          cc.sort(key=lambda x:hashlib.sha256((p+'|'+x['name']).encode()).hexdigest())
+          outs=[];positive=True
+          for features in ('baseline','extended'):
+           errors=[]
+           for fold in range(5):
+            tr=[t for i,t in enumerate(cc) if i%5!=fold];te=[t for i,t in enumerate(cc) if i%5==fold]
+            assert len(tr)>=16 and len(te)>=4
+            Xtr=np.array([t[features] for t in tr],dtype=float);Xte=np.array([t[features] for t in te],dtype=float)
+            ytr=np.array([t['y'] for t in tr],dtype=float)
+            sc=StandardScaler().fit(Xtr)
+            mdl=Ridge(alpha=5.0).fit(sc.transform(Xtr),ytr)
+            pred=mdl.predict(sc.transform(Xte))
+            errors.extend(abs(float(yp)-t['y']) for yp,t in zip(pred,te))
+           outs.append(statistics.mean(errors))
+          gain=100*(1-outs[1]/outs[0]) if outs[0]>0 else 0
+          r.update({'price_baseline_OOF_log_MAE':round(outs[0],6),'multi_year_augmented_OOF_log_MAE':round(outs[1],6),
+            'augmented_vs_live_MAE_improvement_pct':round(gain,2),
+            'decision':'PROMISING_PRIVATE_CROSS_SECTIONAL_NOT_FV' if gain>2 else 'NO_CLEAR_MARKET_IMPROVEMENT'})
+          summary.append(r)
+         return summary
+
+        def build(r74,r72,out,secret):
+         p=P(out);p.mkdir(parents=True,exist_ok=True)
+         for key,h in PIN.items():
+          q=(P(r74) if key.startswith('R74/') else P(r72))/key.split('/',1)[1]
+          chk(q.is_file(),'PINNED_FILE_MISSING '+key)
+          chk(sha(q)==h,'PINNED_SOURCE_SHA_DRIFT '+key)
+         full=read(P(r74)/'CAL26_R74_518_next_season_2027_surplus_evidence_NOT_FV.csv')
+         raw=read(P(r72)/'CAL26_R72_518_exact_JS_FV_replay_and_multiplier_sensitivity_NO_RELEASE.csv')
+         rr={(norm(x['name']),x['position']):x for x in raw}
+         chk(len(full)==len(rr)==518,'PLAYER_COUNT_DRIFT')
+         seen=set()
+         for r in full:
+          k=(norm(r['name']),r['position']);chk(k not in seen and k in rr,'BAD_IDENTITY_'+str(k));seen.add(k)
+          chk(int(r['live_JS_FV_UNCHANGED'])==int(rr[k]['exact_production_JS_replayed_FV']),'LIVE_JS_QUOTE_DRIFT')
+          chk(r['proposed_FV']=='' and r['FV_production_change_authorized']=='False','INADVERTENT_PRICE_RELEASE')
+          chk(r['2028_H2_independent_future_outcome_certified']=='False','2028_SEALED_H2_DRIFT')
+         chk({r['position'] for r in full}==set(POS),'POSITION_COUNT_DRIFT')
+         chk(sum(r['owner_price_anchor_protected']=='True' for r in full)==15,'ANCHOR_COUNT_DRIFT')
+         market=parse_dlf(secret)
+         result=model_market(full,market) if market is not None else [
+          {'position':pos,'eligible_private_licensed_market_matches':'','market_source':('PRIVATE_DLF_SECRET_NOT_CONFIGURED' if pos in DLF_POS else 'NO_IDP_NUMERIC_DLF_SOURCE'),
+            'price_baseline_OOF_log_MAE':'','multi_year_augmented_OOF_log_MAE':'','augmented_vs_live_MAE_improvement_pct':'',
+            'market_price_out_of_time_holdout':False,'LOG_FV_cardinal_transfer_validated':False,'auto_price_release_authorized':False,
+            'decision':'PRIVATE_SOURCE_MISSING' if pos in DLF_POS else 'NO_OFFENSE_DLF_SOURCE'} for pos in POS]
+         # No provider rows, individual provider labels, or named DLF predictions leave memory.
+         cards=[]
+         focus=['bryce young','caleb williams','drake maye','jayden daniels','cj stroud','puka nacua','myles garrett','brian burns','maxx crosby','josh allen','jahmyr gibbs','will anderson','trevor lawrence','jeremiyah love','breece hall','patrick mahomes']
+         by={norm(r['name']):r for r in full}
+         for name in focus:
+          r=by[name];cards.append({'name':r['name'],'position':r['position'],'current_live_FV_NO_CHANGE':r['live_JS_FV_UNCHANGED'],
+           '2026_H0_surplus_research':r['2026_year0_replacement_surplus_RESEARCH'],
+           '2027_H1_surplus_research':r['2027_H1_predicted_surplus_2021trained_YTD_CONTROL_RESEARCH'],
+           '2027_research_uncertainty_lower':r['2027_H1_residual_p10_lower_RESEARCH_NOT_PROBABILISTIC'],
+           '2027_research_uncertainty_upper':r['2027_H1_residual_p90_upper_RESEARCH_NOT_PROBABILISTIC'],
+           '2026_GP':r['games_played_through_2026_week6'],
+           'independent_DLF_individual_value_or_derived_prediction':'PRIVATE_NOT_EXPORTED',
+           'FV_numeric_proposal':'','FV_release_authorized':False})
+         write(p/'CAL26_R75_7position_market_price_predictability_AGGREGATE_ONLY.csv',result)
+         write(p/'CAL26_R75_16_owner_multi_year_cards_NO_PRICE_RELEASE.csv',cards)
+         n_eligible=sum(int(r['eligible_private_licensed_market_matches']) for r in result if isinstance(r['eligible_private_licensed_market_matches'],int))
+         status='PRIVATE_MARKET_CROSS_SECTIONAL_AUDITED_FV_HOLD' if market is not None else 'PRIVATE_MARKET_SOURCE_ABSENT_FV_HOLD'
+         lines=['# CAL26 V1R75 — independent market predictability (licensed data private)','',
+          '**Decision: NO FV PRICE RELEASE.** GitHub success means the pinned inputs and private-data boundary worked, not that multi-year pricing has been calibrated.','',
+          'Private DLF source provided through `CAL26_DLF_SF_CSV_B64`: '+('YES — privately analyzed' if market else 'NO — not configured'),'',
+          'The DLF source is the offensive superflex DLF 2026-10-20 upload, not an IDP market price source. The date is provenance inherited from R33, not freshly verified by this run.','',
+          'Model comparison uses fixed five-fold *player-held-out* ridge regression on log(DLF values) within positions, using training-only normalization and a fixed regularization. Baseline: current live FV. Augmented: current live FV + 2026 one-year surplus + 2027 experimental H1 surplus.','',
+          'This is **cross-sectional** benchmark with model/features sourced around Oct 24, NOT a point-in-time Oct 20 prospectively frozen valuation backtest. It cannot prove FV, does not validate a 2028 horizon, and cannot transfer raw DLF units to LOG FV. Small/sparse positions are withheld.','',
+          '| Position | Private eligible comparisons | Live-only OOF log MAE | Multi-year OOF log MAE | Relative error improvement | Decision |','|---|---:|---:|---:|---:|---|']
+         for s in result:
+          lines.append('| '+s['position']+' | '+str(s['eligible_private_licensed_market_matches'] or '—')+' | '+str(s['price_baseline_OOF_log_MAE'] or '—')+' | '+str(s['multi_year_augmented_OOF_log_MAE'] or '—')+' | '+str(s['augmented_vs_live_MAE_improvement_pct'] if s['augmented_vs_live_MAE_improvement_pct']!='' else '—')+' | '+s['decision']+' |')
+         lines+=['','Any source CSV contents, provider-name matches, DLF values, and player-level learned prices were held in memory and **not** written to GitHub logs or artifacts.','',
+          'IDP market calibration: **unavailable from the provided offensive DLF file**. Live FV and all owner price anchors remain unchanged.','',
+          'If the secret is missing, privately configure the existing repository secret `CAL26_DLF_SF_CSV_B64` from the user-provided licensed `sf.csv`, then rerun the same workflow. Do not commit `sf.csv` or embed its contents in YAML.','',
+          'No future 2026 weeks (7+) outcomes, protected Weeks8–12 holdout, or hypothetical 2027/2028 results are consumed.']
+         (p/'CAL26_R75_decision.md').write_text('\n'.join(lines)+'\n')
+         outs=[q.name for q in p.iterdir() if q.is_file()]
+         m={'run':'CAL26_V1R75','status':status,'input_sha256':PIN,'source_type':'DLF_OFFENSE_NATIVE_VALUE_PRIVATE_OR_ABSENT',
+          'private_DLF_secret_configured':market is not None,'licensed_rows_exposed_in_outputs':False,'market_player_labels_exported':False,
+          'full_player_count':len(full),'owner_card_count':len(cards),'positions':list(POS),'2026_week6_only':True,'H2_2028_prospectively_validated':False,
+          'one_to_one_DLF_to_LOG_FV_scale_validated':False,'production_changes':0,'owner_price_anchors_protected':15,
+          'per_position_private_eligible_suppressed_if_lt20':True,
+          'output_sha256':{n:sha(p/n) for n in outs}}
+         (p/'CAL26_R75_manifest.json').write_text(json.dumps(m,indent=2,sort_keys=True)+'\n')
+         print('R75_COMPLETE_NO_FV_RELEASE',status,'players',len(full),'private_market_source',bool(market),'positions',len(result))
+         return m
+
+        def main():
+         a=argparse.ArgumentParser();a.add_argument('--r74');a.add_argument('--r72');a.add_argument('--out');a.add_argument('--selftest',action='store_true');args=a.parse_args()
+         if args.selftest:
+          chk(norm('C.J. Stroud')=='cj stroud','NAME_NORMALIZATION')
+          chk(parse_dlf('') is None,'EMPTY_PRIVATE_SECRET')
+          try:parse_dlf('not-base64^^');raise AssertionError('BAD_SECRET_NOT_REJECTED')
+          except ValueError:pass
+          # No licensed inputs; only synthetic test for deterministic OOF logic.
+          synthetic=[];dlf={}
+          for p in DLF_POS:
+           for i in range(25):
+            name='fixture '+p.lower()+' '+str(i)
+            synthetic.append({'name':name,'position':p,'age':str(22+i%12),'games_played_through_2026_week6':'6',
+              '2026_year0_replacement_surplus_RESEARCH':str(i*2),'2027_H1_predicted_surplus_2021trained_YTD_CONTROL_RESEARCH':str(i*3),
+              'live_JS_FV_UNCHANGED':str(700+i*190)})
+            dlf[(name,p)]=100+i*30
+          out=model_market(synthetic,dlf)
+          chk(len(out)==7 and all(t['eligible_private_licensed_market_matches']==25 for t in out if t['position'] in DLF_POS),'PRIVATE_OOF_SELFTEST')
+          print('R75_SELFTEST_GREEN synthetic private OOF; missing private source; corrupted private input')
+          return
+         chk(args.r74 and args.r72 and args.out,'MISSING_REQUIRED_SOURCE_DIRS')
+         build(args.r74,args.r72,args.out,os.environ.get('CAL26_DLF_SF_CSV_B64',''))
+        if __name__=='__main__':main()
+        PY_R75_ENGINE
+        python -m py_compile "$RUNNER_TEMP/CAL26_R75_engine.py"
+        python "$RUNNER_TEMP/CAL26_R75_engine.py" --selftest
+        python "$RUNNER_TEMP/CAL26_R75_engine.py" \
+          --r74 "$RUNNER_TEMP/cal26-r75-in/R74" \
+          --r72 "$RUNNER_TEMP/cal26-r75-in/R72" \
+          --out "$RUNNER_TEMP/cal26-r75-results"
+        python - "$RUNNER_TEMP/cal26-r75-results" <<'PY_R75_VERIFY'
+        import csv,json,hashlib,sys,pathlib
+        p=pathlib.Path(sys.argv[1]);m=json.loads((p/'CAL26_R75_manifest.json').read_text())
+        assert m['run']=='CAL26_V1R75' and m['full_player_count']==518 and m['owner_card_count']==16
+        assert m['owner_price_anchors_protected']==15 and m['production_changes']==0
+        assert m['positions']==['QB','RB','WR','TE','DL','LB','DB'] and m['2026_week6_only']
+        assert not m['licensed_rows_exposed_in_outputs'] and not m['market_player_labels_exported']
+        assert not m['one_to_one_DLF_to_LOG_FV_scale_validated'] and not m['H2_2028_prospectively_validated']
+        assert m['status'] in ('PRIVATE_MARKET_CROSS_SECTIONAL_AUDITED_FV_HOLD','PRIVATE_MARKET_SOURCE_ABSENT_FV_HOLD')
+        for n,d in m['output_sha256'].items():assert hashlib.sha256((p/n).read_bytes()).hexdigest()==d,n
+        with (p/'CAL26_R75_7position_market_price_predictability_AGGREGATE_ONLY.csv').open() as f:r=list(csv.DictReader(f))
+        assert len(r)==7 and {x['position'] for x in r}=={'QB','RB','WR','TE','DL','LB','DB'}
+        assert all(x['auto_price_release_authorized']=='False' and x['LOG_FV_cardinal_transfer_validated']=='False' for x in r)
+        with (p/'CAL26_R75_16_owner_multi_year_cards_NO_PRICE_RELEASE.csv').open() as f:owners=list(csv.DictReader(f))
+        assert len(owners)==16 and all(x['FV_numeric_proposal']=='' and x['FV_release_authorized']=='False' for x in owners)
+        print('R75_PINNED_PRIVATE_MARKET_FACE_VALIDITY_GREEN',m['status'])
+        PY_R75_VERIFY
+        test -z "$(git status --porcelain)"
+        cat "$RUNNER_TEMP/cal26-r75-results/CAL26_R75_decision.md" >> "$GITHUB_STEP_SUMMARY"
+    - name: Upload aggregate comparison and owner nonpricing cards
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: CAL26_R75_PRIVATE_DLF_MARKET_FACE_VALIDITY_AGGREGATES_FV_HOLD
+        path: ${{ runner.temp }}/cal26-r75-results/
+        retention-days: 60
+        if-no-files-found: warn
