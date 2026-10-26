@@ -1,0 +1,241 @@
+name: A - FA01R2 Free Agent Board CI Repair (Guarded)
+
+# Source review: 2026-10-26. This patches ONLY the Python regression
+# test harness, never index.html, the free-agent board, model state or prices.
+# PREVIEW validates and uploads the patch; APPLY commits only
+# scripts/validation/repo_regression_checks.py after every gate passes.
+# Also repairs current-CAL22 successor regression: its immutable historic
+# index SHA must not be compared to later approved live index releases.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Preview first; Apply commits the single regression-harness file'
+        required: true
+        type: choice
+        default: preview
+        options:
+          - preview
+          - apply
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  guarded-repair:
+    name: FA01R2 - repair and validate current regression harness
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out latest main (never edit production files)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python and Node
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install original regression dependency
+        run: python3 -m pip install --disable-pip-version-check --no-cache-dir requests
+
+      - name: Verify frozen repair inputs and clean workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)" || { echo 'Fresh runner checkout is unexpectedly dirty'; exit 1; }
+          test "$(git hash-object index.html)" = '5630bb681dd8710f8e45bc5363488f358ce9ebe2' || { echo 'Canonical index changed; refuse to patch unreviewed code'; exit 1; }
+          test "$(git hash-object scripts/validation/repo_regression_checks.py)" = '402e9dfaceb2c0b97e8617c57f7c6f0897c1134a' || { echo 'Regression harness changed; refuse to patch unreviewed code'; exit 1; }
+          python3 - <<'PY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, str(Path('scripts/validation').resolve()))
+          import snapshot_values
+          cfg = snapshot_values.load_from_html('index.html')
+          assert len(cfg['cal26_fv_owner_anchors']) == 15, 'Unexpected count of owner price anchors'
+          assert 'drake maye' in cfg['player_db']
+          assert 'drake maye' not in cfg['cal26_fv_owner_anchors']
+          print('PASS pinned production source and 15-anchor preflight')
+          PY
+
+      - name: Patch ONLY scripts/validation/repo_regression_checks.py
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('scripts/validation/repo_regression_checks.py')
+          src = p.read_text(encoding='utf-8')
+
+          # The JS harness needs the same approved overlay already consumed
+          # by the live playerValue() and the Python snapshot evaluator.
+          old = '        _extract_const_object(text, "RB_BIRTH_DATE_DATA"),\n'
+          assert src.count(old) == 1, 'Unexpected JS extract-list structure'
+          assert '_extract_const_object(text, "CAL26_FV_OWNER_ANCHORS")' not in src, 'Already patched; refuse duplicate'
+          src = src.replace(old, old + '        _extract_const_object(text, "CAL26_FV_OWNER_ANCHORS"),\n', 1)
+
+          # Hard-code 15 approved exact values as independent regression
+          # oracles. Comparing JS to Python alone would not detect both
+          # implementations drifting together.
+          target = '    assert not diffs, f"snapshot/live valuation drift: first differences {diffs[:10]}"\n'
+          assert src.count(target) == 1, 'Unexpected snapshot-parity function structure'
+          explicit_guards = '''
+              # FA01R2: permanent owner-price regression oracles. Never tune FV here.
+              expected_anchors = {
+                  "breece hall": 5336,
+                  "brian branch": 3436,
+                  "derrick henry": 4112,
+                  "fred warner": 5071,
+                  "jahmyr gibbs": 9497,
+                  "jaxson dart": 5091,
+                  "jeremiyah love": 5015,
+                  "jonathan taylor": 6025,
+                  "marvin harrison": 4207,
+                  "nik bonitto": 4919,
+                  "patrick mahomes": 5756,
+                  "roquan smith": 5188,
+                  "tetairoa mcmillan": 5252,
+                  "trevor lawrence": 6509,
+                  "trey mcbride": 5823,
+              }
+              assert len(expected_anchors) == 15
+              assert cfg["cal26_fv_owner_anchors"] == expected_anchors, (
+                  "Unexpected change to protected 15-player FV price control table"
+              )
+              for key, expected_value in expected_anchors.items():
+                  assert key in py_rows and key in js_rows, f"Owner anchor missing: {key}"
+                  assert py_rows[key]["value"] == expected_value, f"Python owner FV drift: {key}"
+                  assert js_rows[key]["value"] == expected_value, f"JavaScript owner FV drift: {key}"
+
+              # A non-anchor must still use its normal position/age/production
+              # formula, not an inadvertent default/owner override.
+              normal_key = "drake maye"
+              assert normal_key not in expected_anchors
+              assert normal_key in py_rows and normal_key in js_rows
+              pos = cfg["player_db"][normal_key]["pos"]
+              j = js_rows[normal_key]
+              normal_formula_fv = math.floor(
+                  100 * cfg["position_weight"][pos] * j["age_mult"] * j["prod_mult"] * 55 + 0.5
+              )
+              assert j["value"] == normal_formula_fv, "Non-anchor player bypassed standard FV formula"
+              assert py_rows[normal_key]["value"] == normal_formula_fv, "Non-anchor Python/JS FV differs"
+              print("PASS FA01R2: 15 exact owner anchors and 1 non-anchor standard-formula control")
+          '''
+          # Dedent precisely 10 spaces introduced by the literal in this
+          # workflow, leaving its intended four-space function indentation.
+          from textwrap import dedent
+          guard = dedent(explicit_guards)
+          guard = '\n'.join(('    ' + line if line else '') for line in guard.strip('\n').split('\n')) + '\n'
+          src = src.replace(target, target + guard, 1)
+          # FA01R2: replace the obsolete *current-live* historical hash test
+          # with strict live CAL22 successor checks. This does not modify the
+          # independent historical release validator or any production file.
+          old_cal22 = 'def check_deployed_idp_v1_invariants():\n    if (REPO_ROOT / "model/releases/cal22-legacy-048-raw-floor-continuity-v1/release.json").exists():\n        import validate_cal22_monotone_guard\n        result = validate_cal22_monotone_guard.validate_deployment_successor()\n        assert result["status"] == "PASS"\n        return\n'
+          assert src.count(old_cal22) == 1, 'CAL22 branch changed; refuse unreviewed rewrite'
+          new_cal22 = 'def check_deployed_idp_v1_invariants():\n    if (REPO_ROOT / "model/releases/cal22-legacy-048-raw-floor-continuity-v1/release.json").exists():\n        # The exact CAL22 byte-SHA assertion is historical and belongs on\n        # its frozen release. The live calculator now contains later approved\n        # releases, so current CI enforces the same 48-key behavior instead.\n        result = _check_cal22_current_successor()\n        assert result["status"] == "PASS"\n        return\n'
+          src = src.replace(old_cal22, new_cal22, 1)
+          check_fn = 'def _check_cal22_current_successor():\n    """Current-live CAL22 invariant, not its historical one-time SHA check.\n\n    The original release\'s exact-byte validator remains unchanged and usable\n    on its own release bytes. Later approved CAL26 price releases legitimately\n    change index.html SHA, so current CI checks the still-deployed functional\n    guard and its exact 48-member historical cohort instead.\n    """\n    import validate_cal22_monotone_guard as cal22\n    release_path = REPO_ROOT / cal22.REL\n    release = json.loads(release_path.read_text(encoding="utf-8"))\n    assert release["release_id"] == "cal22-legacy-048-raw-floor-continuity-v1"\n    assert release["guard_key_count"] == len(release["frozen_keys"]) == 48\n    assert release["no_current_price_changes"] is True\n    assert release["market_value_untouched"] is True\n    index_text = INDEX.read_text(encoding="utf-8")\n    board_text = (REPO_ROOT / "free-agent-board.html").read_text(encoding="utf-8")\n    assert index_text.count(cal22.BEGIN) == 1\n    assert index_text.count(cal22.END) == 1\n    assert index_text.count(cal22.ADDITIONAL) == 1\n    assert cal22.sync_fa.render_synced(index_text, board_text) == board_text\n    assert all(cal22.sync_fa.parity_regions(index_text, board_text).values())\n\n    cfg = snapshot_values.load_from_html(INDEX)\n    assert len(cfg["player_db"]) == 565\n    assert cfg["cal22_keys"] == set(release["frozen_keys"])\n    assert cfg["role_mult"]["Speculative"] == 0.22\n    for key in release["frozen_keys"]:\n        assert key in cfg["player_db"] and cfg["player_db"][key]["role"] == "Speculative", key\n        assert key in cfg["no_real_history"], key\n        assert cfg["prod_mult"][key] == 0.15, key\n\n    # A no-drift test on CURRENT live code, including any later approved FV\n    # anchors: strip exactly the CAL22 guard, compare all current price outputs.\n    original = cal22.original_html(index_text)\n    after = snapshot_values.compute_all_values(cfg)\n    with tempfile.TemporaryDirectory(prefix="cal22-current-regression-") as td:\n        prior = Path(td) / "current_without_cal22_guard.html"\n        prior.write_text(original, encoding="utf-8")\n        before = snapshot_values.compute_all_values(snapshot_values.load_from_html(prior))\n    assert {k: row["value"] for k, row in after.items()} == (\n        {k: row["value"] for k, row in before.items()}\n    ), "CAL22 guard changes a currently deployed FV price"\n\n    # Retain the original 48 x 11 functional monotonicity probes, with\n    # equal-price-or-higher behavior required on each raw multiplier step.\n    for key in release["frozen_keys"]:\n        previous_effective = 0.0\n        previous_fv = -1\n        for raw in (0.15, 0.150001, 0.151, 0.1575, 0.165, 0.18,\n                    0.219999, 0.22, 0.220001, 0.24, 0.3):\n            effective, _ = snapshot_values.production_multiplier(\n                key, "Speculative", {key: raw}, cfg["no_real_history"],\n                cfg["role_mult"], cfg["cal22_keys"]\n            )\n            assert effective + 1e-12 >= previous_effective, (key, raw, effective)\n            previous_effective = effective\n            probe = dict(cfg)\n            probe["prod_mult"] = dict(cfg["prod_mult"])\n            probe["prod_mult"][key] = raw\n            candidate_fv = snapshot_values.compute_all_values(probe)[key]["value"]\n            assert candidate_fv >= previous_fv, (key, raw, candidate_fv, previous_fv)\n            previous_fv = candidate_fv\n\n    print("PASS CAL22 current successor: 48 preserved keys; 565/565 no-FV-drift; "\n          "528 monotonicity probes; historical one-time SHA unchanged")\n    return {"status": "PASS", "guard_keys": 48, "current_fv_changes": 0}\n'
+          assert 'def _check_cal22_current_successor():' not in src
+          src = src.replace('def check_deployed_idp_v1_invariants():',
+                            check_fn + '\n\n' + 'def check_deployed_idp_v1_invariants():', 1)
+          compile(src, str(p), 'exec')
+          p.write_text(src, encoding='utf-8')
+          PY
+          python3 -m py_compile scripts/validation/repo_regression_checks.py
+          git diff --check -- scripts/validation/repo_regression_checks.py
+          test "$(git diff --name-only)" = 'scripts/validation/repo_regression_checks.py'
+          mkdir -p "$RUNNER_TEMP/fa01r2"
+          git diff -- scripts/validation/repo_regression_checks.py > "$RUNNER_TEMP/fa01r2/FA01R2_harness_only.patch"
+          cp scripts/validation/repo_regression_checks.py "$RUNNER_TEMP/fa01r2/validated_harness.py"
+
+      - name: Run canonical parser and exact no-drift regression checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/snapshot_values.py --selftest
+          python3 scripts/sync/sync_free_agent_valuation.py --check
+          python3 scripts/validation/validate_free_agent_valuation_parity.py
+          # Runner-only refresh of deterministic derived data, as in the
+          # existing manual Repo Regression Checks workflow. Never commit it.
+          python3 scripts/maintenance/refresh_repo_derived_state.py --write
+          python3 scripts/maintenance/refresh_repo_derived_state.py --check
+          python3 scripts/validation/repo_regression_checks.py
+          python3 scripts/validation/validate_idp_v1_final_deployment.py
+
+      - name: Restore runner-only generated changes and enforce single-file patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Restore the Git checkout (runner workspace only), then reinstate
+          # the separately saved, validated harness patch. This guarantees
+          # generated board/data files are never included in the commit.
+          git reset --hard HEAD
+          cp "$RUNNER_TEMP/fa01r2/validated_harness.py" scripts/validation/repo_regression_checks.py
+          test "$(git diff --name-only)" = 'scripts/validation/repo_regression_checks.py'
+          test "$(git hash-object index.html)" = '5630bb681dd8710f8e45bc5363488f358ce9ebe2'
+          test "$(git hash-object free-agent-board.html)" = "$(git rev-parse HEAD:free-agent-board.html)"
+          test "$(git hash-object data/free_agents.json)" = "$(git rev-parse HEAD:data/free_agents.json)"
+          test "$(git hash-object data/free_agent_utility_v1.json)" = "$(git rev-parse HEAD:data/free_agent_utility_v1.json)"
+          git diff --check -- scripts/validation/repo_regression_checks.py
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          out=Path(os.environ['RUNNER_TEMP'])/'fa01r2'/'FA01R2_manifest.json'
+          out.write_text(json.dumps({
+              'workflow':'FA01R2',
+              'mode':os.environ.get('FA01_MODE', 'preview'),
+              'status':'PASS_LOCAL_RUNNER_TESTS_ONLY',
+              'changed_repository_file':'scripts/validation/repo_regression_checks.py',
+              'protected_owner_anchors':15,
+              'cal22_protected_keys':48,
+              'cal22_mandatory_raw_monotonicity_probes':528,
+              'historical_cal22_release_validator_modified':False,
+              'non_anchor_control':'drake maye',
+              'price_changes_authorized':False,
+              'production_data_changes_authorized':False,
+              'free_agent_v1_refresh_executed':False,
+              'full_repo_regression_required':True,
+              'next_action':'Manual Free Agent Utility V1 - Refresh after apply',
+          },indent=2)+'\n')
+          PY
+        env:
+          FA01_MODE: ${{ inputs.mode }}
+
+      - name: Upload exact single-file patch and test manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: FA01R2_GUARDED_HARNESS_ONLY_PATCH_AND_REPORT
+          path: |
+            ${{ runner.temp }}/fa01r2/FA01R2_harness_only.patch
+            ${{ runner.temp }}/fa01r2/FA01R2_manifest.json
+          if-no-files-found: error
+
+      - name: Apply owner-authorized one-file CI repair to main
+        if: ${{ inputs.mode == 'apply' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git diff --name-only)" = 'scripts/validation/repo_regression_checks.py'
+          git config user.name 'fa01-regression-repair-bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add -- scripts/validation/repo_regression_checks.py
+          test "$(git diff --cached --name-only)" = 'scripts/validation/repo_regression_checks.py'
+          git diff --cached --check
+          git commit -m 'FA01R2: repair owner-anchor JS regression harness and exact-price guards'
+          # No rebase/force push: fail if main advanced during validation.
+          git push origin HEAD:main
+          echo 'PASS FA01R2 one-file CI repair committed; no price, board or free-agent data changed'
+
+      - name: Report preview-only disposition
+        if: ${{ inputs.mode == 'preview' }}
+        run: echo 'PASS FA01R2 preview only. Select mode=apply in a new run to commit the validated one-file repair.'
