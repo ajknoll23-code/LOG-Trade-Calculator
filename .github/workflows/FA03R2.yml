@@ -1,0 +1,332 @@
+name: A - FA03R2 Prospective Free Agent Snapshot and Factual Watches (Guarded)
+
+# R2 fixes R1 apply-path mismatch (generator uses _2026W, not -2026W).
+# Captures a real current Sleeper waiver cohort. No simulated breakout probabilities.
+# Preview: report files as GitHub artifacts. Apply: persist ONE immutable research
+# JSON snapshot, never modify live calculator, board, or existing sources.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Preview without commit or apply an immutable research-only snapshot'
+        type: choice
+        required: true
+        default: preview
+        options:
+          - preview
+          - apply
+      target_week:
+        description: '2026 prospective target week (1-18); kickoff check is downstream'
+        type: string
+        required: true
+        default: '9'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  freeze:
+    name: Validate factual free-agent pool and capture research-only snapshot
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Checkout current main (with complete league roster slots)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Assert unmodified checkout
+        run: test -z "$(git status --porcelain)"
+
+      - name: Self-test factual filters and freeze guards
+        env:
+          REPORT_DIR: ${{ runner.temp }}/a-fa03r2
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$REPORT_DIR"
+          cat > "$REPORT_DIR/a_fa03r2.py" <<'PYCODE'
+          #!/usr/bin/env python3
+          """A-FA03R2: time-stamped true-current free-agent cohort; NO prediction model."""
+          import argparse
+          import csv
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          from collections import Counter
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          ALLOWED = ('QB', 'RB', 'WR', 'TE', 'DL', 'LB', 'DB')
+          ROSTER_SLOTS = ('starters', 'bench', 'taxi', 'reserve_ir')
+          BLOCKED_INJURY = {'IR', 'OUT', 'DOUBTFUL', 'PUP', 'SUSPENDED', 'NFI'}
+
+
+          def build(free_agents, ranks, rosters, role, now, target_week):
+              fa = free_agents.get('free_agents')
+              assert isinstance(fa, list) and fa, 'Nonempty current Sleeper free-agent list required'
+              assert len(fa) == free_agents.get('count'), 'Free-agent cache count mismatch'
+              assert 1 <= target_week <= 18
+              assert str(free_agents.get('league_id')) == str(rosters.get('league_id'))
+              assert isinstance(rosters.get('rosters'), list) and len(rosters['rosters']) == 12
+
+              roster_ids = set()
+              for team in rosters['rosters']:
+                  for slot in ROSTER_SLOTS:
+                      for p in team.get(slot) or []:
+                          if p.get('player_id') is not None:
+                              roster_ids.add(str(p['player_id']))
+              fa_ids = [str(p.get('player_id')) for p in fa]
+              assert len(set(fa_ids)) == len(fa_ids), 'Duplicate available Sleeper player ID'
+              assert not (set(fa_ids) & roster_ids), 'Supposed free agent belongs to another roster, taxi or IR'
+
+              util_source = ranks.get('source') or {}
+              rank_fresh = (
+                  free_agents.get('synced_at') == util_source.get('free_agents_synced_at')
+                  and str(free_agents.get('league_id')) == str(util_source.get('league_id'))
+                  and len(fa) == util_source.get('free_agents_count')
+              )
+              position_rank = {}
+              if rank_fresh:
+                  for r in ranks.get('players') or []:
+                      pid = str(r['player_id'])
+                      if pid not in set(fa_ids) or pid in position_rank:
+                          raise AssertionError('Unexpected/duplicate ranked player ID')
+                      position_rank[pid] = (r['pos'], int(r['priority_rank']))
+
+              captured_utc = now.astimezone(timezone.utc).isoformat(timespec='seconds')
+              age_hours = (now.timestamp() - float(free_agents['synced_at'])) / 3600
+              if age_hours < -0.05:
+                  raise AssertionError('Current free-agent snapshot comes from the future')
+
+              role_by_id = {str(p.get('sleeper_id')): p.get('role_tier') for p in role.get('players', [])}
+              records = []
+              for p in fa:
+                  pid = str(p['player_id']); pos = p.get('pos')
+                  if pos not in ALLOWED:
+                      continue
+                  pos_r, rank = position_rank.get(pid, (None, None))
+                  if rank is not None and pos_r != pos:
+                      raise AssertionError('Fresh utility rank position disagrees with Sleeper')
+                  depth = p.get('depth_chart_order')
+                  depth = int(depth) if isinstance(depth, (int, float)) and not isinstance(depth, bool) and depth >= 1 else None
+                  age = p.get('age'); age = int(age) if isinstance(age, (int, float)) and not isinstance(age, bool) else None
+                  exp = p.get('years_exp'); exp = int(exp) if isinstance(exp, (int, float)) and not isinstance(exp, bool) else None
+                  injury = (p.get('injury_status') or '').upper()
+                  active = (p.get('status') or '').lower() == 'active' and injury not in BLOCKED_INJURY
+                  opp = bool(active and depth is not None and depth <= 2)
+                  stash = bool(active and age is not None and age <= 25 and exp is not None and exp <= 2 and (depth is None or depth >= 2))
+                  flags = []
+                  if depth is None: flags.append('DEPTH_UNKNOWN')
+                  if rank is None: flags.append('V1_NOT_DATA_BACKED_OR_STALE')
+                  if injury: flags.append('INJURY_STATUS_REPORTED')
+                  if not active: flags.append('NOT_ACTIVE_AVAILABLE_NFL_STATUS')
+                  records.append({
+                      'player_id': pid, 'name': p.get('name'), 'pos': pos, 'team': p.get('team'),
+                      'age': age, 'years_exp': exp, 'depth_chart_order': depth,
+                      'nfl_status': p.get('status'), 'injury_status': p.get('injury_status'),
+                      'v1_priority_rank_within_position': rank,
+                      'role_snapshot_week5_tier_DISPLAY_ONLY': role_by_id.get(pid),
+                      'opportunity_factual_filter': opp,
+                      'dynasty_stash_factual_filter': stash,
+                      'flags': flags,
+                  })
+
+              # Rank is ONLY within-position; do not compare across positions.
+              def order(r):
+                  return (r['v1_priority_rank_within_position'] is None,
+                          r['v1_priority_rank_within_position'] if r['v1_priority_rank_within_position'] is not None else 99999,
+                          r['depth_chart_order'] if r['depth_chart_order'] is not None else 999,
+                          r['name'] or '', r['player_id'])
+              def stash_order(r):
+                  # No fabricated stash probabilities. Younger age/experience is merely an explicit
+                  # deterministic display order; this is NOT a dynasty-valued model.
+                  return (r['age'] is None, r['age'] or 99, r['years_exp'] or 0,
+                          r['v1_priority_rank_within_position'] is None,
+                          r['v1_priority_rank_within_position'] if r['v1_priority_rank_within_position'] is not None else 99999,
+                          r['name'] or '', r['player_id'])
+              watches = {}
+              for pos in ALLOWED:
+                  pool = [r for r in records if r['pos'] == pos]
+                  watches[pos] = {
+                      'available_total': len(pool),
+                      'data_backed_v1': sum(r['v1_priority_rank_within_position'] is not None for r in pool),
+                      'opportunity_watch_total': sum(r['opportunity_factual_filter'] for r in pool),
+                      'dynasty_stash_watch_total': sum(r['dynasty_stash_factual_filter'] for r in pool),
+                      'opportunity_examples': [r['player_id'] for r in sorted((r for r in pool if r['opportunity_factual_filter']),key=order)[:20]],
+                      'stash_examples': [r['player_id'] for r in sorted((r for r in pool if r['dynasty_stash_factual_filter']),key=stash_order)[:20]],
+                  }
+              warnings = [
+                'Not a trained or validated breakout prediction; observed depth-chart fields and age are not proof of increased snaps.',
+                'Depth-chart order is a current Sleeper field, not an audited historical or official team depth chart.',
+                'Free-agent status is valid for THIS LEAGUE AT THE COMMITTED CACHE SYNC, not guaranteed at any later time.',
+                'No historical player availability inferred from old matchups; Week 2025 historical FA02R2 proxy remains unproven.',
+                'The role model is a frozen Week-5 display-only tier, not live Week 8 or 9 usage.',
+                'No actual nflverse 2026 snap trend was calculated by this capture. Those signals require a separate point-in-time bridge.',
+                'Do not claim the snapshot predates target-week kickoff without separate official schedule verification.',
+                'V1 ranks are within-position and coverage-limited, not cross-position dynasty values.',
+              ]
+              result = {
+                'schema_version': 1, 'study': 'A-FA03R2 true-current waiver snapshot + factual screens',
+                'captured_at_utc': captured_utc, 'source_free_agents_synced_at': free_agents['synced_at'],
+                'source_free_agents_cache_age_hours': round(age_hours,2), 'target_season': 2026,
+                'target_week_requested_not_kickoff_certified': target_week,
+                'classification': 'PROSPECTIVE_CURRENT_AVAILABILITY_CAPTURE_NOT_PREDICTION',
+                'league_id': str(free_agents['league_id']),
+                'rank_fresh': rank_fresh,
+                'source_role_snapshot_week': role.get('week'),
+                'source_role_snapshot_is_display_only': role.get('publication_scope') == 'DISPLAY_ONLY_FROZEN_PROSPECTIVE_ROLE_SNAPSHOT',
+                'counts': {'available_cache_total':len(fa),'eligible_positions_total':len(records),
+                           'ranked_data_backed_eligible':sum(r['v1_priority_rank_within_position'] is not None for r in records),
+                           'all_rostered_ids_including_taxi_ir':len(roster_ids)},
+                'by_position': watches, 'players': sorted(records,key=lambda r:(ALLOWED.index(r['pos']),r['name'] or '',r['player_id'])),
+                'limitations': warnings,
+                'pricing_changes_authorized': False,'board_changes_authorized':False,
+                'predictive_accuracy_established':False,
+              }
+              assert not (set(r['player_id'] for r in records)&roster_ids)
+              return result
+
+
+          def selftest():
+              f={'league_id':'demo','synced_at':100.0,'count':3,'free_agents':[
+                {'player_id':'1','name':'A','pos':'RB','age':22,'years_exp':1,'depth_chart_order':2,'status':'Active','injury_status':None},
+                {'player_id':'2','name':'B','pos':'LB','age':24,'years_exp':2,'depth_chart_order':1,'status':'Active','injury_status':'IR'},
+                {'player_id':'3','name':'C','pos':'WR','age':27,'years_exp':3,'depth_chart_order':2,'status':'Active','injury_status':None}]}
+              r={'league_id':'demo','rosters':[{'roster_id':i,'starters':[],'bench':[],'taxi':[],'reserve_ir':[]} for i in range(12)]}
+              u={'source':{'league_id':'demo','free_agents_count':3,'free_agents_synced_at':100.0},'players':[{'player_id':'1','pos':'RB','priority_rank':1}]}
+              role={'week':5,'players':[],'publication_scope':'DISPLAY_ONLY_FROZEN_PROSPECTIVE_ROLE_SNAPSHOT'}
+              now=datetime.fromtimestamp(200,timezone.utc)
+              x=build(f,u,r,role,now,9)
+              assert x['counts']['ranked_data_backed_eligible']==1
+              assert x['by_position']['RB']['opportunity_watch_total']==1
+              assert x['by_position']['RB']['dynasty_stash_watch_total']==1
+              assert x['by_position']['LB']['opportunity_watch_total']==0
+              u['source']['free_agents_synced_at']=99.0
+              x=build(f,u,r,role,now,9)
+              assert not x['rank_fresh'] and x['counts']['ranked_data_backed_eligible']==0
+              r['rosters'][2]['taxi'].append({'player_id':'1'})
+              try: build(f,u,r,role,now,9)
+              except AssertionError: pass
+              else: raise AssertionError('Failed to exclude rostered taxi player')
+              print('PASS A-FA03R2 source snapshot, stale ranking fail-closed, taxi overlap, separate watchlists')
+
+
+          def main():
+              a=argparse.ArgumentParser(); a.add_argument('--selftest',action='store_true');a.add_argument('--target-week',type=int,default=9);args=a.parse_args()
+              if args.selftest: return selftest()
+              cwd=Path.cwd(); root=Path(os.environ['REPORT_DIR']);root.mkdir(parents=True,exist_ok=True)
+              inputs={
+                'fa':'data/free_agents.json','ranks':'data/free_agent_utility_v1.json',
+                'rosters':'data/league_rosters.json','role':'data/player_role_v2_week5.json',
+              }
+              docs={k:json.loads((cwd/v).read_text()) for k,v in inputs.items()}
+              now=datetime.now(timezone.utc)
+              result=build(docs['fa'],docs['ranks'],docs['rosters'],docs['role'],now,args.target_week)
+              # Strong freshness protection only for APPLY, expressed in manifest for review.
+              result['cache_fresh_enough_to_freeze_72h'] = result['source_free_agents_cache_age_hours'] <= 72
+              result['input_sha256'] = {k:hashlib.sha256((cwd/v).read_bytes()).hexdigest() for k,v in inputs.items()}
+              result['git_revision_at_capture'] = subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+              stamp=now.strftime('%Y-%m-%dT%H-%M-%SZ')
+              filename=f'{stamp}_2026W{args.target_week:02d}.json'
+              repo_path=f'research/free-agent-opportunity/prospective-snapshots/{filename}'
+              result['immutable_snapshot_repo_path'] = repo_path
+              (root/'A_FA03R2_snapshot.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
+              with (root/'A_FA03R2_current_waivers.csv').open('w',newline='') as f:
+                columns=['player_id','name','pos','team','age','years_exp','depth_chart_order','nfl_status','injury_status','v1_priority_rank_within_position','role_snapshot_week5_tier_DISPLAY_ONLY','opportunity_factual_filter','dynasty_stash_factual_filter','flags']
+                wr=csv.DictWriter(f,fieldnames=columns);wr.writeheader()
+                for r in result['players']:
+                  row={k:r.get(k) for k in columns};row['flags']=';'.join(row.get('flags') or []);wr.writerow(row)
+              rows=[
+                '# A - FA03R2 Prospective True Waiver Snapshot + Factual Watchlists',
+                '', '**Classification: captured roster availability, NOT a predicted breakout signal.**',
+                '',f"Capture timestamp: `{result['captured_at_utc']}`",
+                f"Source free-agent cache age: `{result['source_free_agents_cache_age_hours']}` hours",
+                f"Current cache: {result['counts']['available_cache_total']} available, with {result['counts']['ranked_data_backed_eligible']} currently data-backed V1 rankings.",
+                f"Rank freshness: `{result['rank_fresh']}`. Cache freshness <=72h: `{result['cache_fresh_enough_to_freeze_72h']}`.",
+                f"Requested prospective origin: 2026 Week {args.target_week}; kickoff timestamp NOT certified.",
+                '', '| Position | Available | V1 ranked | Depth <=2, healthy-ish | Young development stashes |',
+                '|---|---:|---:|---:|---:|',
+              ]
+              for p,v in result['by_position'].items():
+                rows.append(f"| {p} | {v['available_total']} | {v['data_backed_v1']} | {v['opportunity_watch_total']} | {v['dynasty_stash_watch_total']} |")
+              rows += ['', '## Examples based on factual filters; NOT predictive recommendations','']
+              by_id={r['player_id']:r for r in result['players']}
+              for p,v in result['by_position'].items():
+                rows += [f'### {p}', '', 'Opportunity examples: '+(', '.join(f"{by_id[k]['name']} (depth {by_id[k]['depth_chart_order']}, V1 {by_id[k]['v1_priority_rank_within_position'] or 'n/a'})" for k in v['opportunity_examples'][:6]) or 'none'), '',
+                         'Stash examples: '+(', '.join(f"{by_id[k]['name']} (age {by_id[k]['age']}, exp {by_id[k]['years_exp']})" for k in v['stash_examples'][:6]) or 'none'), '']
+              rows += ['## Critical limitations','']+['- '+s for s in result['limitations']]
+              rows += ['', '**Next:** Add frozen *NFL snap changes* and explicit 1/2/4-week realized fantasy outcome comparisons before claiming predictive edge.','']
+              (root/'A_FA03R2_report.md').write_text('\n'.join(rows))
+              (root/'repo_path.txt').write_text(repo_path+'\n')
+              if not result['cache_fresh_enough_to_freeze_72h']:
+                raise SystemExit('Source FA cache is older than 72 hours: refresh Sleeper Maintenance + Free Agent Utility before prospective capture')
+              print('PASS A_FA03R2 factual source snapshot:', json.dumps({k:v for k,v in result.items() if k in ('captured_at_utc','counts','rank_fresh','cache_fresh_enough_to_freeze_72h','immutable_snapshot_repo_path')},indent=2))
+
+          if __name__ == '__main__': main()
+          PYCODE
+          python3 "$REPORT_DIR/a_fa03r2.py" --selftest
+          python3 "$REPORT_DIR/a_fa03r2.py" --target-week "${{ inputs.target_week }}"
+          test -z "$(git status --porcelain)"
+          python3 -m json.tool "$REPORT_DIR/A_FA03R2_snapshot.json" >/dev/null
+          # Assert the actual generated path matches the guarded APPLY contract.
+          # R1 failed here (used a hyphen rather than the generated underscore).
+          p="$(cat "$REPORT_DIR/repo_path.txt")"
+          case "$p" in
+            research/free-agent-opportunity/prospective-snapshots/2026-*_2026W*.json) echo 'PASS guarded snapshot path naming contract' ;;
+            *) echo "ERROR: generated snapshot path fails commit allowlist: $p"; exit 1 ;;
+          esac
+
+      - name: Upload independent audit output (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A_FA03R2_TRUE_WAIVER_SNAPSHOT_AND_FACTUAL_WATCHES
+          path: |
+            ${{ runner.temp }}/a-fa03r2/A_FA03R2_snapshot.json
+            ${{ runner.temp }}/a-fa03r2/A_FA03R2_report.md
+            ${{ runner.temp }}/a-fa03r2/A_FA03R2_current_waivers.csv
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Apply one immutable research snapshot only
+        if: ${{ inputs.mode == 'apply' }}
+        shell: bash
+        env:
+          REPORT_DIR: ${{ runner.temp }}/a-fa03r2
+        run: |
+          set -euo pipefail
+          p="$(cat "$REPORT_DIR/repo_path.txt")"
+          case "$p" in
+            research/free-agent-opportunity/prospective-snapshots/2026-*_2026W*.json) ;;
+            *) echo "Invalid research path"; exit 1 ;;
+          esac
+          test ! -e "$p" || { echo "Snapshot path already exists; immutable reuse forbidden"; exit 1; }
+          mkdir -p "$(dirname "$p")"
+          cp "$REPORT_DIR/A_FA03R2_snapshot.json" "$p"
+          test -z "$(git diff --name-only)"
+          test "$(git ls-files --others --exclude-standard)" = "$p" || { echo 'Unexpected untracked files'; exit 1; }
+          git config user.name 'a-fa03-research-snapshot-bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add -- "$p"
+          test "$(git diff --cached --name-only)" = "$p"
+          git diff --cached --check
+          git commit -m "A FA03R2: freeze prospective current free-agent cohort for Week ${{ inputs.target_week }} (research only)"
+          git push origin HEAD:main
+          echo 'PASS: one immutable research snapshot committed; live site, model and cache unchanged'
+
+      - name: Preview-only result
+        if: ${{ inputs.mode == 'preview' }}
+        run: echo 'PASS preview report. Select apply to persist this prospective snapshot to repository.'
