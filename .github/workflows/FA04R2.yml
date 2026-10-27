@@ -1,0 +1,436 @@
+name: A - FA04R2 Week 9 Early Snap Movers and Four-Week Readiness (Read Only)
+
+# Descriptive research only: uses committed FA03R2 immutable waiver cohort.
+# Reports complete W5-W7 early snap movers now; W5-W8 comparison only when W8 exists.
+# No FV changes, live board writes, or CAL26 holdout/evaluator file access.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a-fa04r2-snap-trend-readonly
+  cancel-in-progress: false
+
+jobs:
+  weekly-usage:
+    name: Audit W7 early evidence and W8 four-week readiness
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout current main without write credentials
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify frozen snapshot and clean research scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+          test "$(git hash-object research/free-agent-opportunity/prospective-snapshots/2026-10-27T16-07-46Z_2026W09.json)" = "75e4b907de655b1d47ff9c3721cbc2b8e69bd0b5"
+          test "$(git hash-object research/player-role-v2/player_role_v2_b43_v4r2_sleeper_gsis_identity_snapshot.csv)" = "eb45acce716cd834e862493da44c4303a4583573"
+
+      - name: Build explicitly labeled W7 single-week and W8 four-week comparison
+        shell: bash
+        env:
+          REPORT_DIR: ${{ runner.temp }}/a-fa04r2
+        run: |
+          set -euo pipefail
+          mkdir -p "$REPORT_DIR"
+          cat > "$REPORT_DIR/A_FA04R2_engine.py" <<'PYCODE'
+          #!/usr/bin/env python3
+          """FA04R2: early single-week versus four-week snap trend with explicit readiness.
+
+          Uses 2026 W5-8 public snap share, joined by same-week normalized name/team/position
+          against GSIS identity, then uniquely mapped through the frozen B43 Sleeper crosswalk.
+          Never opens any CAL26 evaluation files, any future target outcomes, or modifies FV.
+          """
+          import csv
+          import hashlib
+          import io
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import time
+          import unicodedata
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+
+          ROOT = Path.cwd()
+          REPORT = Path(os.environ.get('REPORT_DIR', '/tmp/a-fa04r2'))
+          REPORT.mkdir(parents=True, exist_ok=True)
+          ORIGIN = 9
+          YEAR = '2026'
+          EARLY = (5, 6)
+          LATE = (7, 8)
+          WEEKS = EARLY + LATE
+          POSITIONS = ('QB', 'RB', 'WR', 'TE', 'DL', 'LB', 'DB')
+          FROZEN = 'research/free-agent-opportunity/prospective-snapshots/2026-10-27T16-07-46Z_2026W09.json'
+          FROZEN_BLOB = '75e4b907de655b1d47ff9c3721cbc2b8e69bd0b5'
+          IDS = 'research/player-role-v2/player_role_v2_b43_v4r2_sleeper_gsis_identity_snapshot.csv'
+          IDS_BLOB = 'eb45acce716cd834e862493da44c4303a4583573'
+          SOURCES = {
+              'snaps': 'https://github.com/nflverse/nflverse-data/releases/download/snap_counts/snap_counts_2026.csv',
+              'stats': 'https://github.com/nflverse/nflverse-data/releases/download/stats_player/stats_player_week_2026.csv',
+          }
+
+
+          def sha(raw):
+              return hashlib.sha256(raw).hexdigest()
+
+
+          def namekey(s):
+              s = unicodedata.normalize('NFKD', s or '')
+              return re.sub('[^a-z0-9]', '', ''.join(c for c in s if not unicodedata.combining(c)).lower())
+
+
+          def teamkey(s):
+              s = (s or '').strip().upper()
+              return {'JAC':'JAX','WSH':'WAS','LA':'LAR','STL':'LAR','SD':'LAC','OAK':'LV'}.get(s, s)
+
+
+          def poskey(s):
+              s = (s or '').strip().upper()
+              if s in ('QB','RB','WR','TE'):
+                  return s
+              if s in ('DL','DE','DT','NT','EDGE','ED'):
+                  return 'DL'
+              if s in ('LB','MLB','ILB','OLB'):
+                  return 'LB'
+              if s in ('DB','CB','S','SS','FS','SAF'):
+                  return 'DB'
+              return None
+
+
+          def valid_week(row, typ):
+              if str(row.get('season')) != YEAR:
+                  return None
+              kind = str(row.get('game_type' if typ == 'snaps' else 'season_type') or 'REG').upper()
+              if kind not in ('REG', 'REGULAR'):
+                  return None
+              try:
+                  week = int(row['week'])
+              except (KeyError, TypeError, ValueError):
+                  return None
+              return week if week in WEEKS else None
+
+
+          def fetch(name):
+              url = SOURCES[name]
+              for attempt in range(3):
+                  try:
+                      req = Request(url, headers={'User-Agent': 'LOG-free-agent-FA04R2-research/1.0'})
+                      with urlopen(req, timeout=75) as resp:
+                          data = resp.read(100_000_001)
+                          last_modified = resp.headers.get('Last-Modified')
+                      if len(data) > 100_000_000:
+                          raise RuntimeError('Source exceeds 100MB safety cap')
+                      rows = list(csv.DictReader(io.StringIO(data.decode('utf-8-sig'))))
+                      if not rows:
+                          raise RuntimeError('Empty source')
+                      return rows, {'url':url, 'bytes':len(data), 'sha256':sha(data), 'last_modified_header':last_modified,
+                                    'rows_all_weeks':len(rows), 'fetched_at_utc':datetime.now(timezone.utc).isoformat()}
+                  except Exception as exc:
+                      if attempt == 2:
+                          raise RuntimeError(f'{name} download/parse blocked: {exc}') from exc
+                      time.sleep(attempt + 1)
+
+
+          def load_frozen():
+              snap = ROOT / FROZEN
+              ids = ROOT / IDS
+              for name, p, blob in [('research snapshot', snap, FROZEN_BLOB), ('identity', ids, IDS_BLOB)]:
+                  actual = subprocess.check_output(['git', 'hash-object', str(p)], text=True).strip()
+                  if actual != blob:
+                      raise RuntimeError(f'{name} changed: expected {blob}, got {actual}')
+              obj = json.loads(snap.read_text(encoding='utf-8'))
+              assert obj['immutable_snapshot_repo_path'] == FROZEN
+              assert obj['target_season'] == 2026 and obj['target_week_requested_not_kickoff_certified'] == ORIGIN
+              assert obj['rank_fresh'] and obj['counts']['available_cache_total'] == 1607
+              assert obj['classification'] == 'PROSPECTIVE_CURRENT_AVAILABILITY_CAPTURE_NOT_PREDICTION'
+              ps = obj['players']
+              assert len(ps) == 1607
+              unique = {str(r['player_id']) for r in ps}
+              assert len(unique) == len(ps)
+              ids_rows = list(csv.DictReader(ids.open(encoding='utf-8-sig', newline='')))
+              return obj, ps, ids_rows
+
+
+          def bridge(snaps, stats, ids_rows):
+              # Frozen crosswalk is from B43; identity mapping is not proof of an
+              # as-of historical team, so team is matched inside the SAME 2026 week.
+              by_gsis = defaultdict(set)
+              for r in ids_rows:
+                  if r.get('gsis_id') and r.get('sleeper_id'):
+                      by_gsis[r['gsis_id'].strip()].add(r['sleeper_id'].strip())
+              unique_gsis = {g: next(iter(s)) for g,s in by_gsis.items() if len(s) == 1}
+              by_sleeper = defaultdict(set)
+              for g, s in unique_gsis.items():
+                  by_sleeper[s].add(g)
+              # Skip ambiguous inverse relationships too, rather than silently merge.
+              gsis_sid = {g:s for g,s in unique_gsis.items() if len(by_sleeper[s]) == 1}
+
+              indexed = defaultdict(set)
+              stat_counts = Counter()
+              stat_weeks = Counter()
+              for r in stats:
+                  w = valid_week(r, 'stats')
+                  if w is None:
+                      continue
+                  p = poskey(r.get('position'))
+                  k = (w, teamkey(r.get('team')), namekey(r.get('player_display_name') or r.get('player_name')), p)
+                  sid = (r.get('player_id') or '').strip()
+                  if not (all(k) and sid):
+                      continue
+                  indexed[k].add(sid)
+                  stat_counts['eligible_rows'] += 1
+                  stat_weeks[w] += 1
+
+              paired = defaultdict(list)
+              issues = Counter()
+              snap_weeks = Counter()
+              for r in snaps:
+                  w = valid_week(r, 'snaps')
+                  if w is None:
+                      continue
+                  p = poskey(r.get('position'))
+                  k = (w, teamkey(r.get('team')), namekey(r.get('player')), p)
+                  if not all(k):
+                      continue
+                  issues['eligible_snap_rows'] += 1
+                  snap_weeks[w] += 1
+                  vals = indexed.get(k, set())
+                  if len(vals) != 1:
+                      issues['ambiguous_gsis' if len(vals) > 1 else 'unmatched_same_week_name_team_pos'] += 1
+                      continue
+                  gsis = next(iter(vals))
+                  sleeper = gsis_sid.get(gsis)
+                  if not sleeper:
+                      issues['no_unique_gsis_sleeper_link'] += 1
+                      continue
+                  try:
+                      pct = float(r.get('defense_pct') if p in ('DL','LB','DB') else r.get('offense_pct'))
+                  except (TypeError, ValueError):
+                      issues['missing_snap_share'] += 1
+                      continue
+                  if not 0 <= pct <= 1.01:
+                      issues['invalid_share_not_fraction'] += 1
+                      continue
+                  paired[(sleeper,w)].append((pct,p))
+              accepted = {}
+              for key, rows in paired.items():
+                  if len(rows) != 1:
+                      issues['duplicate_player_week_excluded'] += 1
+                  else:
+                      accepted[key] = rows[0]
+              return accepted, {'diagnostic':dict(sorted(issues.items())), 'accepted_player_weeks':len(accepted),
+                                'stat_weeks':dict(sorted(stat_weeks.items())), 'snap_weeks':dict(sorted(snap_weeks.items())),
+                                'unique_b43_gsis_to_sleeper':len(gsis_sid),
+                                'crosswalk_gsis_collisions':sum(len(x)>1 for x in by_gsis.values()),
+                                'crosswalk_inverse_sleeper_collisions':sum(len(x)>1 for x in by_sleeper.values())}
+
+
+          def summarize(snapshot_players, matched):
+              output=[]
+              for r in snapshot_players:
+                  pid=str(r['player_id']); p=r['pos']; observed={}; mismatch=0
+                  for week in WEEKS:
+                      if (pid,week) in matched:
+                          pct,pos=matched[(pid,week)]
+                          if pos != p: mismatch+=1
+                          else: observed[week]=pct
+                  # An early W7 signal requires three *real observations*, never fills missing with zero.
+                  early_complete=all(w in observed for w in (5,6,7))
+                  full_complete=early_complete and 8 in observed
+                  baseline=round((observed[5]+observed[6])/2,5) if early_complete else None
+                  w7=observed.get(7)
+                  early_delta=round((w7-baseline)*100,2) if early_complete else None
+                  late=round((observed[7]+observed[8])/2,5) if full_complete else None
+                  full_delta=round((late-baseline)*100,2) if full_complete else None
+                  attention_early=bool(early_complete and w7 >= 0.25 and early_delta >= 10)
+                  attention_full=bool(full_complete and late >= .25 and full_delta >= 10)
+                  # Descriptive factual screens: veteran increases are not rookie breakout picks.
+                  age=r.get('age'); experience=r.get('years_exp')
+                  young_usage=bool(attention_early and isinstance(age,int) and age <= 26
+                                  and isinstance(experience,int) and experience <= 3)
+                  reason=('COMPLETE_FOUR_WEEKS' if full_complete else
+                          'COMPLETE_W5_W7_ONLY__W8_UNAVAILABLE_OR_UNMATCHED' if early_complete else
+                          'INCOMPLETE_EARLY_HISTORY' if observed else 'NO_LINKED_SNAP_HISTORY')
+                  if mismatch:reason+=';POSITION_CONFLICT_EXCLUDED'
+                  output.append({
+                      'player_id':pid,'name':r.get('name'),'pos':p,'team_at_frozen_origin':r.get('team'),
+                      'age_at_origin':age,'experience_at_origin':experience,
+                      'v1_priority_rank_within_position':r.get('v1_priority_rank_within_position'),
+                      'opportunity_factual_filter':r.get('opportunity_factual_filter'),
+                      'dynasty_stash_factual_filter':r.get('dynasty_stash_factual_filter'),
+                      'w5_pct':observed.get(5),'w6_pct':observed.get(6),
+                      'w7_pct':w7,'w8_pct':observed.get(8),
+                      'w5_w6_baseline':baseline,
+                      'w7_single_week_delta_pp':early_delta,
+                      'w7_w8_mean':late,'four_week_delta_pp':full_delta,
+                      'w5_w7_complete':early_complete,'w5_w8_complete':full_complete,
+                      'observed_weeks_count':len(observed),
+                      'early_w7_attention_not_prediction':attention_early,
+                      'full_four_week_attention_not_prediction':attention_full,
+                      'young_usage_screen_not_prediction':young_usage,
+                      'coverage_reason':reason,'breakout_probability':None,
+                      'w9_future_outcome':None,
+                  })
+              return output
+
+
+          def synthetic_selftest():
+              assert teamkey('JAC')=='JAX' and poskey('CB')=='DB' and poskey('DT')=='DL'
+              ids=[{'gsis_id':'abc','sleeper_id':'111'}]
+              st=[{'season':'2026','season_type':'REG','week':str(w),'team':'JAX','player_display_name':'Test Mover','player_id':'abc','position':'CB'} for w in WEEKS]
+              sp=[{'season':'2026','game_type':'REG','week':str(w),'team':'JAC','player':'Test Mover','position':'CB','defense_pct':str(v)} for w,v in zip(WEEKS,(.2,.3,.55,.65))]
+              row={'player_id':'111','name':'Test Mover','pos':'DB','team':'JAX','age':24,'years_exp':2,
+                   'v1_priority_rank_within_position':3,'opportunity_factual_filter':False,'dynasty_stash_factual_filter':True}
+              joined,diag=bridge(sp,st,ids)
+              assert diag['accepted_player_weeks']==4
+              complete=summarize([row],joined)[0]
+              assert complete['w5_w7_complete'] and complete['w5_w8_complete']
+              assert complete['w7_single_week_delta_pp']==30 and complete['four_week_delta_pp']==35
+              assert complete['early_w7_attention_not_prediction'] and complete['full_four_week_attention_not_prediction']
+              assert complete['young_usage_screen_not_prediction']
+              partial=dict(joined);del partial[('111',8)]
+              e=summarize([row],partial)[0]
+              assert e['w5_w7_complete'] and not e['w5_w8_complete']
+              assert e['w7_single_week_delta_pp']==30 and e['four_week_delta_pp'] is None
+              assert e['early_w7_attention_not_prediction'] and not e['full_four_week_attention_not_prediction']
+              weaker=dict(joined);del weaker[('111',5)]
+              w=summarize([row],weaker)[0]
+              assert not w['w5_w7_complete'] and w['w7_single_week_delta_pp'] is None
+              veteran=summarize([{**row,'age':30,'years_exp':8}],partial)[0]
+              assert veteran['early_w7_attention_not_prediction'] and not veteran['young_usage_screen_not_prediction']
+              sp.append({'season':'2026','game_type':'REG','week':'9','team':'JAC','player':'Test Mover','position':'CB','defense_pct':'1.0'})
+              assert len(bridge(sp,st,ids)[0])==4
+              ids.append({'gsis_id':'abc','sleeper_id':'222'})
+              assert not bridge(sp,st,ids)[0]
+              print('PASS FA04R2 W7 early/Four-week separation, age screen, missing-W8, collision, W9 leakage')
+
+
+          def main():
+              if '--selftest' in sys.argv:
+                  synthetic_selftest();return
+              frozen,players,ids_rows=load_frozen()
+              snaps,smeta=fetch('snaps');stats,wmeta=fetch('stats')
+              matched,diag=bridge(snaps,stats,ids_rows)
+              rows=summarize(players,matched)
+              pos_stats={}
+              for p in POSITIONS:
+                  subset=[r for r in rows if r['pos']==p]
+                  early=[r for r in subset if r['w5_w7_complete']]
+                  complete=[r for r in subset if r['w5_w8_complete']]
+                  flags=[r for r in early if r['early_w7_attention_not_prediction']]
+                  mature_flags=[r for r in complete if r['full_four_week_attention_not_prediction']]
+                  flags.sort(key=lambda r:(-r['w7_single_week_delta_pp'],-r['w7_pct'],r['name'] or ''))
+                  mature_flags.sort(key=lambda r:(-r['four_week_delta_pp'],-r['w7_w8_mean'],r['name'] or ''))
+                  pos_stats[p]={
+                    'available':len(subset),
+                    'any_linked_snap':sum(r['observed_weeks_count']>0 for r in subset),
+                    'complete_w5_w7':len(early),
+                    'early_w7_usage_increases':len(flags),
+                    'early_young_usage_increases':sum(r['young_usage_screen_not_prediction'] for r in flags),
+                    'complete_w5_w8':len(complete),
+                    'full_four_week_usage_increases':len(mature_flags),
+                    'early_examples':[{k:r[k] for k in ('player_id','name','pos','team_at_frozen_origin','age_at_origin',
+                         'experience_at_origin','w5_w6_baseline','w7_pct','w7_single_week_delta_pp',
+                         'v1_priority_rank_within_position','young_usage_screen_not_prediction')} for r in flags[:20]],
+                    'full_examples':[{k:r[k] for k in ('player_id','name','w5_w6_baseline','w7_w8_mean','four_week_delta_pp')} for r in mature_flags[:20]],
+                  }
+              # Warning here is deliberately not a false failure: W8 may not be published.
+              has_w8_snap=diag['snap_weeks'].get(8,0)>0
+              has_w8_stats=diag['stat_weeks'].get(8,0)>0
+              source_ready=has_w8_snap and has_w8_stats
+              stage='FOUR_WEEK_SOURCE_READY' if source_ready else 'EARLY_W7_ONLY__W8_NOT_YET_PUBLISHED_IN_BOTH_SOURCES'
+              early_count=sum(v['complete_w5_w7'] for v in pos_stats.values())
+              flag_count=sum(v['early_w7_usage_increases'] for v in pos_stats.values())
+              complete_count=sum(v['complete_w5_w8'] for v in pos_stats.values())
+              status='RESEARCH_W7_EARLY_SIGNAL_PASS' if diag['accepted_player_weeks'] and early_count else 'BLOCKED_NO_COMPLETE_W5_W7_USAGE'
+              report={
+                  'study':'A-FA04R2 Early W7 mover + W8 readiness', 'status':status,'stage':stage,
+                  'classification':'DESCRIPTIVE_SNAPS_NOT_TRAINED_PREDICTION',
+                  'analysis_captured_at_utc':datetime.now(timezone.utc).isoformat(),
+                  'frozen_waiver_snapshot_git_blob':FROZEN_BLOB,'frozen_waiver_snapshot_path':FROZEN,
+                  'waiver_capture_at_utc':frozen['captured_at_utc'], 'origin_week':ORIGIN,
+                  'feature_weeks':list(WEEKS),'future_target_weeks_excluded':True,
+                  'research_input_git_commit':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
+                  'source_downloads':{'snaps':smeta,'identity_only_weekly_stats':wmeta},'bridge':diag,
+                  'current_waivers':len(rows),'positions':pos_stats,
+                  'total_complete_w5_w7':early_count,'total_early_w7_attention':flag_count,
+                  'total_complete_w5_w8':complete_count,
+                  'source_w8_present_in_both':source_ready,
+                  'limits':[
+                      'Current league availability is certified only by the saved FA03R2 cache date, not a historical waiver claim.',
+                      'Public nflverse snap and stats files are downloaded at run time and might have changed since waiver capture.',
+                      'Identity stats are used only for player ID, team, name and position. Do not read fantasy outcome fields.',
+                      'The W7 early comparison uses W5-W6 mean versus ONE W7 week; it is NOT the W7-W8 average.',
+                      'Missing weeks stay unknown, not zero. Source readiness is distinct from player coverage.',
+                      'Age <=26 and <=3 years experience is a factual developmental screen, not a validated breakout feature.',
+                      'Week9 or later is excluded from both sources, even if files include it. No CAL26 holdout used.',
+                      'The 10 percentage point and >=25% snaps screens are arbitrary descriptive attention filters, not optimized thresholds.',
+                      'No feature, ranking, FV, production board, trade outcome, or price is changed.',
+                  ],'breakout_probability_established':False,'pricing_changes_authorized':False,
+                  'board_changes_authorized':False,
+              }
+              (REPORT/'A_FA04R2_report.json').write_text(json.dumps(report,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+              with (REPORT/'A_FA04R2_2026W09_usage.csv').open('w',newline='',encoding='utf-8') as f:
+                  wr=csv.DictWriter(f,fieldnames=list(rows[0]));wr.writeheader();wr.writerows(rows)
+              md=['# A - FA04R2: Early Week7 Free Agent Snap Movers and W8 Readiness','',
+                  f"**Status:** `{status}`. **W8 readiness:** `{stage}`. This is *not* a prediction model.",'',
+                  f"Frozen available players: {len(rows)}; W5-W7 complete: {early_count}; W7 usage increases: {flag_count}; W5-W8 complete: {complete_count}.",'',
+                  '| Pos | Waivers | With any snap | Full W5-W7 | W7 +10pp and >=25% | Full W5-W8 | Full 4wk +10pp |',
+                  '|---|---:|---:|---:|---:|---:|---:|']
+              for p,v in pos_stats.items():
+                  md.append(f"| {p} | {v['available']} | {v['any_linked_snap']} | {v['complete_w5_w7']} | {v['early_w7_usage_increases']} | {v['complete_w5_w8']} | {v['full_four_week_usage_increases']} |")
+              md.extend(['','## W7-only usage increases (W5-W6 mean versus observed W7; NOT four-week trends)',''])
+              for p,v in pos_stats.items():
+                  if v['early_examples']:
+                      md.append(f'### {p}')
+                      for q in v['early_examples']:
+                          qualifier='young screen' if q['young_usage_screen_not_prediction'] else 'veteran/other age screen'
+                          md.append(f"- {q['name']} ({q['team_at_frozen_origin']}): {q['w5_w6_baseline']:.0%} -> {q['w7_pct']:.0%}, +{q['w7_single_week_delta_pp']:.1f}pp; {qualifier}; within-position V1 rank {q['v1_priority_rank_within_position'] or 'n/a'}")
+              if not flag_count:md.append('- None qualifying with full W5-W7 observations; do not confuse with no usage change.')
+              md.extend(['','## Four-week results',''])
+              if not source_ready:md.append('**NOT READY: Week8 absent from one or both public data sources. No four-week comparisons are computed for missing players.**')
+              else:md.append(f'Week8 present in both sources; {complete_count} free agents have full four-week observations.')
+              md.extend(['','## Identity/source diagnostics','',f"```json\n{json.dumps(diag,indent=2)}\n```",'',
+                         '## Limitations',''])
+              md.extend('- '+x for x in report['limits'])
+              (REPORT/'A_FA04R2_report.md').write_text('\n'.join(md)+'\n',encoding='utf-8')
+              print(f'{status}: {len(rows)} available, {early_count} complete W5-7, {flag_count} W7 attention increases; W8 source ready={source_ready}, {complete_count} full W5-8')
+              if status.startswith('BLOCKED'):
+                  raise SystemExit('Insufficient source identity coverage to support even a W7-only change audit')
+
+
+          if __name__=='__main__':
+              main()
+          PYCODE
+          python3 "$REPORT_DIR/A_FA04R2_engine.py" --selftest
+          python3 "$REPORT_DIR/A_FA04R2_engine.py"
+          test -z "$(git status --porcelain)"
+
+      - name: Preserve all research reports as GitHub artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A_FA04R2_W7_EARLY_MOVERS_AND_W8_READINESS
+          path: |
+            ${{ runner.temp }}/a-fa04r2/A_FA04R2_report.md
+            ${{ runner.temp }}/a-fa04r2/A_FA04R2_report.json
+            ${{ runner.temp }}/a-fa04r2/A_FA04R2_2026W09_usage.csv
+          if-no-files-found: warn
+          retention-days: 90
