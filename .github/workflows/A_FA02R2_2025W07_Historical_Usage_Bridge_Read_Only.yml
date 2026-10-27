@@ -1,0 +1,405 @@
+name: A - FA02R2 Historical Waiver Proxy and Snap Usage Bridge (Read Only)
+
+# This study evaluates retrospective historical data feasibility ONLY.
+# No historical waiver availability, holdout access, or predictive edge is claimed.
+# All repo files are read-only. Reports are runner artifacts; none are pushed.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a-fa02r2-historical-usage-readonly
+  cancel-in-progress: false
+
+jobs:
+  historical-cohort:
+    name: Reconstruct one 2025 pre-origin usage cohort and report limitations
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout current main in read-only mode
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify clean checkout and immutable research scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+          test -f research/roster-economics/weekly_points_by_season.json
+          test -f research/roster-economics/historical_lineup_demand.json
+          test -f research/player-role-v2/player_role_v2_b43_v4r2_sleeper_gsis_identity_snapshot.csv
+          test -f data/free_agent_utility_v1.json
+
+      - name: Reconstruct 2025 Week 7 usage bridge (prior weeks 3-6 only)
+        shell: bash
+        env:
+          REPORT_DIR: ${{ runner.temp }}/a-fa02r2
+        run: |
+          set -euo pipefail
+          mkdir -p "$REPORT_DIR"
+          cat > "$RUNNER_TEMP/a-fa02r2_engine.py" <<'A_FA02R2_SCRIPT'
+          #!/usr/bin/env python3
+          """A-FA02R2 reproducible source/identity/2025-W07 waiver-proxy feasibility.
+
+          This is NOT a waiver backtest or a fitted prediction model. Sources:
+            - existing historical 2025 Sleeper lineup+weekly LOG scoring archives
+            - 2025 public nflverse snap-count and player-week CSVs (SHA-pinned)
+            - frozen B43 sleeper_id<->gsis_id identity snapshot (current-time capture)
+          Historical lineup 'players' excludes taxi/IR. No true historical FA set is claimed.
+          """
+          from __future__ import annotations
+          import csv
+          import hashlib
+          import io
+          import json
+          import os
+          import re
+          import sys
+          import time
+          import unicodedata
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from urllib.request import urlopen, Request
+
+          ROOT=Path.cwd()
+          DEST=Path(os.environ.get('REPORT_DIR','/tmp/a-fa02r2'))
+          DEST.mkdir(parents=True,exist_ok=True)
+          ORIGIN=7
+          SEASON='2025'
+          PRIOR_WEEKS=(3,4,5,6)
+          LATER_WEEKS=(7,8,9,10)
+          SOURCES={
+           'snap': {
+             'url':'https://github.com/nflverse/nflverse-data/releases/download/snap_counts/snap_counts_2025.csv',
+             'sha256':'3fc2deb0e9ad86d34d4578cb80bb21c95253e088ee22ca028adf46f7485eff1f',
+           },
+           'stats': {
+             'url':'https://github.com/nflverse/nflverse-data/releases/download/stats_player/stats_player_week_2025.csv',
+             'sha256':'e5e0615b3d96a3eaebfaee91e55afb4a4e7fe0caf057454177bcd7d6ad4bcfc2',
+           },
+          }
+          FILES={
+           'outcomes':'research/roster-economics/weekly_points_by_season.json',
+           'lineups':'research/roster-economics/historical_lineup_demand.json',
+           'identity':'research/player-role-v2/player_role_v2_b43_v4r2_sleeper_gsis_identity_snapshot.csv',
+          }
+
+
+          def namekey(s):
+              s=unicodedata.normalize('NFKD',s or '')
+              s=''.join(c for c in s if not unicodedata.combining(c)).lower()
+              return re.sub('[^a-z0-9]','',s)
+
+
+          def teamkey(s):
+              s=(s or '').strip().upper()
+              return {'JAC':'JAX','WSH':'WAS','LA':'LAR','STL':'LAR','SD':'LAC','OAK':'LV'}.get(s,s)
+
+
+          def poskey(s):
+              s=(s or '').strip().upper()
+              if s in ('QB','RB','WR','TE'):return s
+              if s in ('DL','DE','DT','NT','EDGE','ED'):return 'DL'
+              if s in ('LB','MLB','ILB','OLB'):return 'LB'
+              if s in ('DB','CB','S','SS','FS','SAF'):return 'DB'
+              return None
+
+
+          def sha(x):return hashlib.sha256(x).hexdigest()
+
+
+          def get_source(name):
+              info=SOURCES[name]; last=None
+              for attempt in range(3):
+                  try:
+                      req=Request(info['url'],headers={'User-Agent':'LOG-FA02R2-historical-feasibility/1.0'})
+                      with urlopen(req,timeout=75) as resp: raw=resp.read(80_000_000)
+                      h=sha(raw)
+                      if h != info['sha256']:
+                          raise RuntimeError(f'{name}: content digest changed; pinned={info["sha256"]} actual={h}')
+                      return list(csv.DictReader(io.StringIO(raw.decode('utf-8-sig')))), {'url':info['url'],'sha256':h,'byte_count':len(raw)}
+                  except Exception as e:
+                      last=e
+                      if 'digest changed' in str(e): break
+                      time.sleep(attempt+1)
+              raise RuntimeError(f'{name} fetch or pinned digest failed: {last}')
+
+
+          def league_data():
+              raw={k:(ROOT/p).read_bytes() for k,p in FILES.items()}
+              data={k:json.loads(raw[k]) for k in ('outcomes','lineups')}
+              ids=list(csv.DictReader(io.StringIO(raw['identity'].decode('utf-8-sig'))))
+              return data['outcomes'],data['lineups'],ids,{k:sha(v) for k,v in raw.items()}
+
+
+          def usage_bridge(snaps,stats,ids):
+              """Conservative exact within-week historical NAME+TEAM+POS bridge.
+
+              No current-time player team or contemporary player position is used to make
+              the historical match. GSIS<->Sleeper mapping is a current captured table,
+              and therefore identified as a provenance caveat, not P.I.T. validated.
+              """
+              by_gsis=defaultdict(set)
+              for r in ids:
+                  if r.get('gsis_id') and r.get('sleeper_id'):
+                      by_gsis[str(r['gsis_id']).strip()].add(str(r['sleeper_id']).strip())
+              gsis_unique={k:next(iter(v)) for k,v in by_gsis.items() if len(v)==1}
+              gsis_collision=sum(1 for v in by_gsis.values() if len(v)>1)
+
+              # Week + as-played team + full exact normalized name + position family.
+              by_key=defaultdict(set)
+              checked_stats=0
+              for r in stats:
+                  if str(r.get('season')) != SEASON or str(r.get('season_type') or 'REG').upper() not in ('REG','REGULAR'):continue
+                  try:w=int(r['week'])
+                  except (ValueError,TypeError):continue
+                  if w not in PRIOR_WEEKS:continue
+                  pid=str(r.get('player_id') or '').strip()
+                  pos=poskey(r.get('position'))
+                  name=namekey(r.get('player_display_name') or r.get('player_name'))
+                  team=teamkey(r.get('team'))
+                  if not (pid and pos and name and team):continue
+                  checked_stats+=1
+                  by_key[(w,team,name,pos)].add(pid)
+
+              snap_rows=0; snap_key_collisions=0; no_stat_name=0; no_id=0; valid=0
+              week_pid=defaultdict(list)
+              for r in snaps:
+                  if str(r.get('season')) != SEASON:continue
+                  if str(r.get('game_type') or 'REG').upper() not in ('REG','REGULAR'):continue
+                  try:w=int(r['week'])
+                  except (ValueError,TypeError):continue
+                  if w not in PRIOR_WEEKS:continue
+                  p=poskey(r.get('position'))
+                  name=namekey(r.get('player'));team=teamkey(r.get('team'))
+                  if not (p and name and team):continue
+                  snap_rows+=1
+                  matches=by_key.get((w,team,name,p),set())
+                  if len(matches)>1:snap_key_collisions+=1;continue
+                  if not matches:no_stat_name+=1;continue
+                  gsis=next(iter(matches))
+                  sid=gsis_unique.get(gsis)
+                  if not sid:no_id+=1;continue
+                  try: snap_pct=float(r['defense_pct'] if p in ('DL','LB','DB') else r['offense_pct'])
+                  except (TypeError,ValueError):continue
+                  if not (0 <= snap_pct <= 1.01): continue  # share, not count; ambiguous units excluded
+                  valid+=1
+                  week_pid[(sid,w)].append((snap_pct,p))
+              accepted={}; duplicates=0
+              for (pid,w),v in week_pid.items():
+                  if len(v)!=1:duplicates+=1;continue  # duplicate games/roles excluded
+                  accepted[(pid,w)]=v[0]
+              return accepted,{
+                'snap_rows_prior4_eligible':snap_rows,
+                'weekly_stat_rows_prior4_eligible':checked_stats,
+                'accepted_snap_rows_preduplicate_check':valid,
+                'accepted_player_week_matches':len(accepted),
+                'no_week_team_exact_name_pos_match':no_stat_name,
+                'ambiguous_week_team_name_pos_keys':snap_key_collisions,
+                'missing_unique_gsis_to_sleeper_id':no_id,
+                'gsis_to_sleeper_collisions':gsis_collision,
+                'duplicate_player_week_excluded':duplicates,
+                'bridge_type':'EXACT_WEEK_TEAM_NORMALIZED_NAME_POSITION -> GSIS -> CURRENT_CAPTURED_SLEEPER_GSIS_ID',
+                'bridge_is_verified_historical_point_in_time':False,
+              }
+
+
+          def evaluate(outcomes,lineups,joined):
+              seasons=outcomes.get('seasons') or {};hist=seasons.get(SEASON)
+              lineup_season=(lineups.get('seasons') or {}).get(SEASON)
+              if not isinstance(hist,dict) or not isinstance(lineup_season,dict):
+                  raise RuntimeError('Archived 2025 weekly outcomes or historical lineups absent')
+              records=lineup_season.get('records') or []
+              active_records=[r for r in records if str(r.get('week'))==str(ORIGIN) and str(r.get('player_id') or '') not in ('','0','None')]
+              active_ids={str(r['player_id']) for r in active_records}
+              teams={str(r['roster_id']) for r in active_records if r.get('roster_id') is not None}
+              if len(teams)<10 or len(active_ids)<200:
+                  raise RuntimeError(f'Cannot trust W07 archived active roster; teams={len(teams)}, players={len(active_ids)}')
+              per_pid=defaultdict(dict)
+              for (pid,w),(pct,pos) in joined.items():per_pid[pid][w]=(pct,pos)
+              all_candidate_rows=[]; grade=Counter(); missing_horizon=0
+              for sid,priors in per_pid.items():
+                  # Avoid hindsight eligibility: must have played in >=2 of W3-W6, with latest W6.
+                  if sid in active_ids:grade['known_active_rostered_excluded']+=1;continue
+                  h=hist.get(sid)
+                  if h is None:grade['no_historical_sleeper_log_points_record']+=1;continue
+                  p=poskey(h.get('pos_bucket'))
+                  if p not in ('QB','RB','WR','TE','DL','LB','DB'):grade['unknown_historical_pos_excluded']+=1;continue
+                  points=h.get('weekly_points') or {}
+                  # Only player records observed by end of Week 6 may create cohort members.
+                  earlier=[w for w in PRIOR_WEEKS if str(w) in points]
+                  if len(earlier)<2:grade['insufficient_pre_origin_played_weeks']+=1;continue
+                  use=[(w,priors[w][0]) for w in PRIOR_WEEKS if w in priors and priors[w][1]==p]
+                  if len(use)<2:grade['insufficient_consistent_prior_snaps']+=1;continue
+                  if 6 not in dict(use):grade['no_last_week_snap_excluded']+=1;continue
+                  early=[v for w,v in use if w in (3,4)]
+                  recent=[v for w,v in use if w in (5,6)]
+                  delta=(sum(recent)/len(recent)-sum(early)/len(early)) if (recent and early) else None
+                  obs_future={str(w):points.get(str(w)) for w in LATER_WEEKS}
+                  present={w:v for w,v in obs_future.items() if isinstance(v,(int,float)) and not isinstance(v,bool)}
+                  if len(present)!=4:missing_horizon+=1
+                  all_candidate_rows.append({
+                    'sleeper_id':sid,'player_name':h.get('name'),'position':p,
+                    'origin_season':SEASON,'origin_week':ORIGIN,
+                    'waiver_status':'NOT_ON_ARCHIVED_ACTIVE_ROSTER__TAXI_IR_UNVERIFIED',
+                    'prior_snap_weeks_observed':len(use),
+                    'prior_snap_w3_w4_mean':round(sum(early)/len(early),4) if early else None,
+                    'prior_snap_w5_w6_mean':round(sum(recent)/len(recent),4) if recent else None,
+                    'prior_snap_pct_change':round(delta,4) if delta is not None else None,
+                    'known_log_pts_w3_w6':round(sum(float(points[str(w)]) for w in earlier),2),
+                    'known_log_pts_w3_w6_week_count':len(earlier),
+                    'future_log_pts_w7_w10_observed_sum':round(sum(float(v) for v in present.values()),2),
+                    'future_log_pts_w7_w10_observed_week_count':len(present),
+                    'complete_future_four_week_observation':len(present)==4,
+                    'future_complete_four_week_label':round(sum(float(v) for v in present.values()),2) if len(present)==4 else None,
+                    'prediction_probability':None,
+                    'live_value_change_authorized':False,
+                  })
+              all_candidate_rows.sort(key=lambda r:(r['prior_snap_pct_change'] is None,-(r['prior_snap_pct_change'] or 0),r['position'],r['sleeper_id']))
+              return all_candidate_rows,{
+                'archived_active_rostered_unique_players':len(active_ids),
+                'archived_active_roster_team_count':len(teams),
+                'historical_logged_point_players_total':len(hist),
+                'eligible_not_on_active_roster_snapshot_count':len(all_candidate_rows),
+                'future_four_week_complete_label_count':sum(r['complete_future_four_week_observation'] for r in all_candidate_rows),
+                'future_four_week_partial_label_count':missing_horizon,
+                'cohort_disposition':dict(sorted(grade.items())),
+                'historical_availability_truth':'ACTIVE_ROSTER_ABSENCE_PROXY_ONLY__TAXI_IR_NOT_COVERED',
+                '2025_league_rules':'PRESERVE_ARCHIVED_2025_CONFIGURATION_NOT_2026',
+              }
+
+
+          def selftest():
+              assert namekey('D.K. Metcalf')=='dkmetcalf'
+              assert teamkey('JAC')=='JAX'
+              assert poskey('OLB')=='LB' and poskey('DT')=='DL'
+              ids=[{'gsis_id':'00-0001','sleeper_id':'a'}]
+              stats=[{'season':'2025','season_type':'REG','week':'6','team':'NE','player_display_name':'Test Player','player_id':'00-0001','position':'LB'}]
+              snap=[{'season':'2025','game_type':'REG','week':'6','team':'NE','player':'Test Player','position':'LB','defense_pct':'0.75'}]
+              got, diag=usage_bridge(snap,stats,ids)
+              assert got=={('a',6):(0.75,'LB')},(got,diag)
+              snap[0]['player']='Other Player'
+              got,diag=usage_bridge(snap,stats,ids)
+              assert not got and diag['no_week_team_exact_name_pos_match']==1
+              snap[0]['player']='Test Player'
+              ids.append({'gsis_id':'00-0001','sleeper_id':'b'})
+              got,diag=usage_bridge(snap,stats,ids)
+              assert not got and diag['gsis_to_sleeper_collisions']==1
+              print('PASS synthetic exact identity, name mismatch, collision and normalization guards')
+
+
+          def run():
+              selftest()
+              report={
+                'study':'A-FA02R2 2025-W07 retrospective usage bridge',
+                'classification':'READ_ONLY_RETROSPECTIVE_RECONSTRUCTION_NOT_ASOF_FREE_AGENT_BACKTEST',
+                'origin':{'season':SEASON,'week':ORIGIN,'feature_weeks':list(PRIOR_WEEKS),'outcome_weeks':list(LATER_WEEKS)},
+                'provenance':{},'checks':{},'governance':{
+                  'no_actual_historical_waiver_availability_claim':True,
+                  'taxi_ir_omitted_from_historical_active_roster':True,
+                  'historical_asof_projection_snapshots_unverified':True,
+                  'identity_crosswalk_captured_after_2025':True,
+                  'no_2026_week7_plus_holdout_use':True,
+                  'no_v1_rank_backtest':True,
+                  'no_breakout_probability_or_accuracy_claim':True,
+                  'no_prod_code_or_data_changes':True,
+                }
+              }
+              try:
+                  outcomes,lineups,ids,file_sha=league_data()
+                  report['provenance']['local_archive_sha256']=file_sha
+                  snaps,ss=get_source('snap');stats,st=get_source('stats')
+                  report['provenance']['public_downloads']={'snap':ss,'stats':st}
+                  joined,diag=usage_bridge(snaps,stats,ids)
+                  report['identity_bridge']=diag
+                  candidates,cohort=evaluate(outcomes,lineups,joined)
+                  report['historical_cohort']=cohort
+                  report['checks']={
+                    'retrospective_cohort_nonempty':bool(candidates),
+                    'snap_bridge_nonempty':bool(joined),
+                    'lineup_snapshot_12_teams':cohort['archived_active_roster_team_count']==12,
+                    'public_inputs_sha256_pinned':True,
+                    'no_future_as_features':max(PRIOR_WEEKS)<ORIGIN<=min(LATER_WEEKS),
+                    'no_full_horizon_false_zero_label':all(r['future_complete_four_week_label'] is None for r in candidates if not r['complete_future_four_week_observation']),
+                  }
+                  cols=['sleeper_id','player_name','position','origin_season','origin_week','waiver_status','prior_snap_weeks_observed','prior_snap_w3_w4_mean','prior_snap_w5_w6_mean','prior_snap_pct_change','known_log_pts_w3_w6','known_log_pts_w3_w6_week_count','future_log_pts_w7_w10_observed_sum','future_log_pts_w7_w10_observed_week_count','complete_future_four_week_observation','future_complete_four_week_label','prediction_probability','live_value_change_authorized']
+                  with (DEST/'A_FA02R2_2025_W07_cohort.csv').open('w',newline='',encoding='utf-8') as f:
+                      w=csv.DictWriter(f,fieldnames=cols,extrasaction='ignore');w.writeheader();w.writerows(candidates)
+                  report['status']='RETROSPECTIVE_BRIDGE_PASS' if all(report['checks'].values()) else 'RETROSPECTIVE_BRIDGE_INCOMPLETE'
+              except Exception as e:
+                  report['status']='BLOCKED_INPUT_OR_JOIN'
+                  report['blocker']=str(e)
+              lines=[
+                '# A - FA02R2 | 2025 Week 7 historical usage and availability-proxy audit',
+                '',f'**Status:** `{report["status"]}`',
+                '**Interpretation:** A historical reconstruction, not a pregame-frozen historical free-agent pool or a validated breakout predictor.',
+                '', '## 2025 Week 7 historical cohort design',
+                '- Historical inputs from completed Weeks 3-6, evaluated against outcomes Weeks 7-10.',
+                '- Availability indicator: **not listed on any active roster in archived Week 7 Sleeper matchup lineups**. Taxi/IR are not in that archive; these are NOT confirmed free agents.',
+                '- Snap identity bridge uses 2025 team, week, exact normalized name and position plus a later-captured Sleeper/GSIS table; name collisions excluded.',
+                '- Separate missing outcomes from zero production; four-week labels given only for four observed weeks.',
+                '- 2025 league rules are retained, NOT overwritten with current 2026 starter requirements.',
+                "- 2026 Week 7+ holdout data, contemporary owner votes and today's V1 ranks are excluded.",
+                '', '## Findings',
+              ]
+              cohort=report.get('historical_cohort',{})
+              bridge=report.get('identity_bridge',{})
+              for key in ('archived_active_roster_team_count','archived_active_rostered_unique_players','eligible_not_on_active_roster_snapshot_count','future_four_week_complete_label_count','future_four_week_partial_label_count'):
+                  lines.append(f'- {key}: **{cohort.get(key,"NOT VERIFIED")}**')
+              for key in ('snap_rows_prior4_eligible','accepted_player_week_matches','no_week_team_exact_name_pos_match','missing_unique_gsis_to_sleeper_id','ambiguous_week_team_name_pos_keys','duplicate_player_week_excluded'):
+                  lines.append(f'- {key}: **{bridge.get(key,"NOT VERIFIED")}**')
+              if report.get('status')=='RETROSPECTIVE_BRIDGE_PASS' and candidates:
+                  lines += ['', '## Historical high-usage-trend examples (NOT confirmed free agents or prospectively validated)', '',
+                            '| 2025 player | Pos | Weeks 3-4 snap % | Weeks 5-6 snap % | Change (pct. pts) | Later LOG points observed |',
+                            '|---|---|---:|---:|---:|---:|']
+                  for row in candidates[:12]:
+                      pp=lambda x: '—' if x is None else f'{x*100:.1f}'
+                      n=str(row['player_name']).replace('|','/')
+                      lines.append(f"| {n} | {row['position']} | {pp(row['prior_snap_w3_w4_mean'])} | {pp(row['prior_snap_w5_w6_mean'])} | {pp(row['prior_snap_pct_change'])} | {row['future_log_pts_w7_w10_observed_sum']} ({row['future_log_pts_w7_w10_observed_week_count']}/4 weeks) |")
+              if report.get('blocker'):lines.append(f'- **Blocker:** `{report["blocker"]}`')
+              lines += ['', '## What this cannot prove',
+                 '- The earliest moment a historical player became available on waivers.',
+                 '- A verified as-of free-agent ranking, since historic V1 provider rank snapshots are missing.',
+                 '- Predictive lead-time/precision or calibrated breakout probability.',
+                 '- Forward dynasty value gain, which is a separate target.',
+                 '', '## Next decision',
+                 'Use source coverage and candidate counts to decide whether to collect prospective waiver snapshots and expand crosswalks before modeling. Never silently backfill a historical true-availability flag.',
+              ]
+              (DEST/'A_FA02R2_report.json').write_text(json.dumps(report,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+              (DEST/'A_FA02R2_report.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
+              print(report['status'],json.dumps({
+                'bridge':bridge,
+                'cohort':cohort,
+                'blocker':report.get('blocker'),
+                'checks':report['checks']},indent=2,sort_keys=True))
+              if report['status'] != 'RETROSPECTIVE_BRIDGE_PASS':sys.exit(2)
+
+          if __name__=='__main__':
+              if len(sys.argv)>1 and sys.argv[1]=='--selftest':selftest()
+              else:run()
+          A_FA02R2_SCRIPT
+          python3 "$RUNNER_TEMP/a-fa02r2_engine.py" --selftest
+          python3 "$RUNNER_TEMP/a-fa02r2_engine.py"
+          test -z "$(git status --porcelain)" || { echo 'FAIL: study unexpectedly modified repo'; exit 1; }
+
+      - name: Upload research-only reports including failure diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A_FA02R2_2025W07_HISTORICAL_USAGE_BRIDGE_READ_ONLY
+          path: |
+            ${{ runner.temp }}/a-fa02r2/A_FA02R2_report.md
+            ${{ runner.temp }}/a-fa02r2/A_FA02R2_report.json
+            ${{ runner.temp }}/a-fa02r2/A_FA02R2_2025_W07_cohort.csv
+          if-no-files-found: warn
