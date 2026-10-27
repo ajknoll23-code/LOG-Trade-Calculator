@@ -180,6 +180,7 @@ def live_js_values():
         _extract_const_object(text, "CAL22_LEGACY_MONOTONE_KEYS"),
         _extract_const_object(text, "PLAYER_DB"),
         _extract_const_object(text, "RB_BIRTH_DATE_DATA"),
+        _extract_const_object(text, "CAL26_FV_OWNER_ANCHORS"),
         re.search(r"function normalizeName\(s\)\{.*?\n\}", text, re.S).group(0),
         _extract_function(text, "productionMultiplier"),
         _extract_function(text, "ageMultiplier"),
@@ -233,6 +234,46 @@ def check_snapshot_parity():
         if abs(p["age_mult"] - j["age_mult"]) > 1e-6:
             diffs.append((key, "age_mult", p["age_mult"], j["age_mult"]))
     assert not diffs, f"snapshot/live valuation drift: first differences {diffs[:10]}"
+    # FA01R3: permanent owner-price regression oracles. Never tune FV here.
+    expected_anchors = {
+        "breece hall": 5336,
+        "brian branch": 3436,
+        "derrick henry": 4112,
+        "fred warner": 5071,
+        "jahmyr gibbs": 9497,
+        "jaxson dart": 5091,
+        "jeremiyah love": 5015,
+        "jonathan taylor": 6025,
+        "marvin harrison": 4207,
+        "nik bonitto": 4919,
+        "patrick mahomes": 5756,
+        "roquan smith": 5188,
+        "tetairoa mcmillan": 5252,
+        "trevor lawrence": 6509,
+        "trey mcbride": 5823,
+    }
+    assert len(expected_anchors) == 15
+    assert cfg["cal26_fv_owner_anchors"] == expected_anchors, (
+        "Unexpected change to protected 15-player FV price control table"
+    )
+    for key, expected_value in expected_anchors.items():
+        assert key in py_rows and key in js_rows, f"Owner anchor missing: {key}"
+        assert py_rows[key]["value"] == expected_value, f"Python owner FV drift: {key}"
+        assert js_rows[key]["value"] == expected_value, f"JavaScript owner FV drift: {key}"
+
+    # A non-anchor must still use its normal position/age/production
+    # formula, not an inadvertent default/owner override.
+    normal_key = "drake maye"
+    assert normal_key not in expected_anchors
+    assert normal_key in py_rows and normal_key in js_rows
+    pos = cfg["player_db"][normal_key]["pos"]
+    j = js_rows[normal_key]
+    normal_formula_fv = math.floor(
+        100 * cfg["position_weight"][pos] * j["age_mult"] * j["prod_mult"] * 55 + 0.5
+    )
+    assert j["value"] == normal_formula_fv, "Non-anchor player bypassed standard FV formula"
+    assert py_rows[normal_key]["value"] == normal_formula_fv, "Non-anchor Python/JS FV differs"
+    print("PASS FA01R3: 15 exact owner anchors and 1 non-anchor standard-formula control")
     print(f"PASS snapshot/live valuation parity: {len(py_rows)} players, 0 differences")
 
 
@@ -504,10 +545,81 @@ def check_preferred_bake_preview_invariants():
     )
 
 
+def _check_cal22_current_successor():
+    """Current-live CAL22 invariant, not its historical one-time SHA check.
+
+    The original release's exact-byte validator remains unchanged and usable
+    on its own release bytes. Later approved CAL26 price releases legitimately
+    change index.html SHA, so current CI checks the still-deployed functional
+    guard and its exact 48-member historical cohort instead.
+    """
+    import validate_cal22_monotone_guard as cal22
+    release_path = REPO_ROOT / cal22.REL
+    release = json.loads(release_path.read_text(encoding="utf-8"))
+    assert release["release_id"] == "cal22-legacy-048-raw-floor-continuity-v1"
+    assert release["guard_key_count"] == len(release["frozen_keys"]) == 48
+    assert release["no_current_price_changes"] is True
+    assert release["market_value_untouched"] is True
+    index_text = INDEX.read_text(encoding="utf-8")
+    board_text = (REPO_ROOT / "free-agent-board.html").read_text(encoding="utf-8")
+    assert index_text.count(cal22.BEGIN) == 1
+    assert index_text.count(cal22.END) == 1
+    assert index_text.count(cal22.ADDITIONAL) == 1
+    assert cal22.sync_fa.render_synced(index_text, board_text) == board_text
+    assert all(cal22.sync_fa.parity_regions(index_text, board_text).values())
+
+    cfg = snapshot_values.load_from_html(INDEX)
+    assert len(cfg["player_db"]) == 565
+    assert cfg["cal22_keys"] == set(release["frozen_keys"])
+    assert cfg["role_mult"]["Speculative"] == 0.22
+    for key in release["frozen_keys"]:
+        assert key in cfg["player_db"] and cfg["player_db"][key]["role"] == "Speculative", key
+        assert key in cfg["no_real_history"], key
+        assert cfg["prod_mult"][key] == 0.15, key
+
+    # A no-drift test on CURRENT live code, including any later approved FV
+    # anchors: strip exactly the CAL22 guard, compare all current price outputs.
+    original = cal22.original_html(index_text)
+    after = snapshot_values.compute_all_values(cfg)
+    with tempfile.TemporaryDirectory(prefix="cal22-current-regression-") as td:
+        prior = Path(td) / "current_without_cal22_guard.html"
+        prior.write_text(original, encoding="utf-8")
+        before = snapshot_values.compute_all_values(snapshot_values.load_from_html(prior))
+    assert {k: row["value"] for k, row in after.items()} == (
+        {k: row["value"] for k, row in before.items()}
+    ), "CAL22 guard changes a currently deployed FV price"
+
+    # Retain the original 48 x 11 functional monotonicity probes, with
+    # equal-price-or-higher behavior required on each raw multiplier step.
+    for key in release["frozen_keys"]:
+        previous_effective = 0.0
+        previous_fv = -1
+        for raw in (0.15, 0.150001, 0.151, 0.1575, 0.165, 0.18,
+                    0.219999, 0.22, 0.220001, 0.24, 0.3):
+            effective, _ = snapshot_values.production_multiplier(
+                key, "Speculative", {key: raw}, cfg["no_real_history"],
+                cfg["role_mult"], cfg["cal22_keys"]
+            )
+            assert effective + 1e-12 >= previous_effective, (key, raw, effective)
+            previous_effective = effective
+            probe = dict(cfg)
+            probe["prod_mult"] = dict(cfg["prod_mult"])
+            probe["prod_mult"][key] = raw
+            candidate_fv = snapshot_values.compute_all_values(probe)[key]["value"]
+            assert candidate_fv >= previous_fv, (key, raw, candidate_fv, previous_fv)
+            previous_fv = candidate_fv
+
+    print("PASS CAL22 current successor: 48 preserved keys; 565/565 no-FV-drift; "
+          "528 monotonicity probes; historical one-time SHA unchanged")
+    return {"status": "PASS", "guard_keys": 48, "current_fv_changes": 0}
+
+
 def check_deployed_idp_v1_invariants():
     if (REPO_ROOT / "model/releases/cal22-legacy-048-raw-floor-continuity-v1/release.json").exists():
-        import validate_cal22_monotone_guard
-        result = validate_cal22_monotone_guard.validate_deployment_successor()
+        # The exact CAL22 byte-SHA assertion is historical and belongs on
+        # its frozen release. The live calculator now contains later approved
+        # releases, so current CI enforces the same 48-key behavior instead.
+        result = _check_cal22_current_successor()
         assert result["status"] == "PASS"
         return
     if (REPO_ROOT / "model/releases/cal15-idp-2026-horizon-bounded-v1/release.json").exists():
