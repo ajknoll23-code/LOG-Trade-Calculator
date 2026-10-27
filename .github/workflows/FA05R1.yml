@@ -1,0 +1,274 @@
+name: A - FA05R1 Direct Sleeper-ID Free Agent Usage Coverage (Read Only)
+
+# Actual verified results only. Stable sleeper_id, no fuzzy joins.
+# Reports coverage/field feasibility; DOES NOT predict breakout, change FV, or release to live board.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a-fa05r1-stable-id-readonly
+  cancel-in-progress: false
+
+jobs:
+  coverage:
+    name: Test 2026 W5-7 direct Sleeper ID usage for frozen Week 9 waivers
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout main (read only)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify immutable waiver snapshot and no changed files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+          test "$(git hash-object research/free-agent-opportunity/prospective-snapshots/2026-10-27T16-07-46Z_2026W09.json)" = "75e4b907de655b1d47ff9c3721cbc2b8e69bd0b5"
+
+      - name: Query completed W5-7 weekly Sleeper source and produce exact-ID diagnostics
+        shell: bash
+        env:
+          REPORT_DIR: ${{ runner.temp }}/a-fa05r1
+        run: |
+          set -euo pipefail
+          mkdir -p "$REPORT_DIR"
+          cat > "$REPORT_DIR/A_FA05R1_engine.py" <<'PYCODE'
+          #!/usr/bin/env python3
+          """FA05R1: stable Sleeper ID opportunity-data coverage, descriptive only."""
+          import collections
+          import csv
+          import hashlib
+          import json
+          import os
+          import sys
+          import time
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          
+          ROOT=Path.cwd()
+          OUT=Path(os.environ.get('REPORT_DIR','/tmp/a-fa05r1'))
+          OUT.mkdir(parents=True,exist_ok=True)
+          FROZEN=Path('research/free-agent-opportunity/prospective-snapshots/2026-10-27T16-07-46Z_2026W09.json')
+          FROZEN_BLOB='75e4b907de655b1d47ff9c3721cbc2b8e69bd0b5'
+          SEASON=2026
+          WEEKS=(5,6,7)
+          POS=('QB','RB','WR','TE','DL','LB','DB')
+          FAMILIES={
+           'pass_attempts':('pass_att','pass_attempts','attempts'),
+           'carries':('rush_att','carries'),
+           'targets':('rec_tgt','targets','tgt'),
+           'receptions':('rec','receptions'),
+           'rush_yards':('rush_yd','rushing_yards'),
+           'receive_yards':('rec_yd','receiving_yards'),
+           'solo_tackles':('idp_tkl_solo','tkl_solo'),
+           'assisted_tackles':('idp_tkl_ast','tkl_ast'),
+           'quarterback_hits':('idp_qb_hit','qb_hit'),
+           'sacks':('idp_sack','sacks'),
+           'pass_defenses':('idp_pass_def','pass_defended'),
+           'offensive_snaps':('off_snp','off_snap','off_snaps','offense_snaps'),
+           'defensive_snaps':('def_snp','def_snap','def_snaps','defense_snaps'),
+          }
+          
+          def digest(p): return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+          
+          def fetch_week(week):
+              url=f'https://api.sleeper.app/v1/stats/nfl/regular/{SEASON}/{week}'
+              last=None
+              for attempt in range(3):
+                  try:
+                      req=Request(url,headers={'User-Agent':'LOG-FA05R1-read-only-opportunity-audit/1.0', 'Accept':'application/json'})
+                      with urlopen(req,timeout=60) as response: data=response.read(30_000_000)
+                      if len(data)>25_000_000: raise RuntimeError('Unbounded Sleeper weekly response')
+                      doc=json.loads(data)
+                      if not isinstance(doc,dict) or not doc: raise RuntimeError('Empty/non-object Sleeper stats response')
+                      if not any(isinstance(v,dict) for v in doc.values()):raise RuntimeError('No player-keyed rows')
+                      return doc, {'url':url,'sha256_at_read':hashlib.sha256(data).hexdigest(),'row_count':len(doc),'fetched_at_utc':datetime.now(timezone.utc).isoformat()}
+                  except Exception as exc:
+                      last=exc
+                      time.sleep(attempt+1)
+              raise RuntimeError(f'Week {week} Sleeper live endpoint unavailable: {last}')
+          
+          def num(stat,aliases):
+              if not isinstance(stat,dict):return None,None
+              for k in aliases:
+                  v=stat.get(k)
+                  if isinstance(v,(int,float)) and not isinstance(v,bool):return float(v),k
+              return None,None
+          
+          def derive(pool,by_week,meta):
+              assert isinstance(pool.get('players'),list) and len(pool['players'])==1607
+              ids=[str(r['player_id']) for r in pool['players']]
+              assert len(ids)==len(set(ids)),'Duplicate frozen Sleeper IDs'
+              assert set(by_week)==set(WEEKS),'One or more data weeks missing'
+              stats_keys=collections.Counter()
+              stats_examples={}
+              for w,doc in by_week.items():
+                  for sid,stats in doc.items():
+                      if isinstance(stats,dict):
+                          stats_keys.update(stats.keys())
+                          if 'gp' in stats and 'gp' not in stats_examples:stats_examples['gp']=stats['gp']
+              out=[]; overlap_counts=collections.Counter(); coverage_by_position=collections.defaultdict(collections.Counter)
+              for p in pool['players']:
+                  sid=str(p['player_id']); pos=p['pos']
+                  record={'player_id':sid,'name':p['name'],'pos':pos,'team_at_freeze':p.get('team'),
+                          'age_at_freeze':p.get('age'), 'years_exp_at_freeze':p.get('years_exp'),
+                          'depth_chart_order_at_freeze':p.get('depth_chart_order'),
+                          'v1_rank_within_position':p.get('v1_priority_rank_within_position'),
+                          'factual_opportunity_flag':p.get('opportunity_factual_filter'),
+                          'factual_stash_flag':p.get('dynasty_stash_factual_filter')}
+                  observed=0; played=0
+                  for w in WEEKS:
+                      row=by_week[w].get(sid)
+                      has_row=isinstance(row,dict)
+                      record[f'w{w}_record_present']=has_row
+                      observed+=int(has_row)
+                      gp,_=num(row,('gp',))
+                      record[f'w{w}_gp_reported']=gp
+                      played+=int(gp is not None and gp>=1)
+                      for family,keys in FAMILIES.items():
+                          value,source=num(row,keys)
+                          record[f'w{w}_{family}']=value
+                          if value is not None:overlap_counts[family]+=1
+                  age=p.get('age'); exp=p.get('years_exp')
+                  young= isinstance(age,(int,float)) and isinstance(exp,(int,float)) and age<=26 and exp<=3
+                  record['young_factual_screen']=young
+                  record['weeks_with_sleeper_stats_rows']=observed
+                  record['weeks_with_confirmed_gp']=played
+                  # Do not call missing Sleeper stat rows a zero, no W8 or W9 outcomes.
+                  record['weekly_scoring_outcomes_computed']=False
+                  record['snapshot_class']='DIRECT_SLEPPER_ID_WEEKLY_USAGE_COVERAGE_NOT_PROBABILITY'
+                  out.append(record)
+                  c=coverage_by_position[pos]
+                  c['waivers']+=1
+                  c['young_factual_pool']+=int(young)
+                  c['with_any_weekly_stat_row']+=int(observed>0)
+                  c['with_two_plus_stat_rows']+=int(observed>=2)
+                  c['with_all_three_stat_rows']+=int(observed==3)
+                  c['young_with_any_stat_row']+=int(young and observed>0)
+                  c['with_at_least_one_game_played_field']+=int(played>0)
+                  for family in ('targets','carries','solo_tackles','offensive_snaps','defensive_snaps'):
+                      c[f'with_any_{family}']+=int(any(record[f'w{w}_{family}'] is not None for w in WEEKS))
+              report={
+                  'study':'A-FA05R1 stable Sleeper ID weekly usage feasibility',
+                  'status':'DIRECT_ID_SOURCE_COVERAGE_PASS' if sum(c['with_any_weekly_stat_row'] for c in coverage_by_position.values())>0 else 'BLOCKED_NO_WEEKLY_OVERLAP',
+                  'classification':'RESEARCH_COVERAGE_ONLY_NOT_BREAKOUT_PREDICTION',
+                  'data_captured_at_utc':datetime.now(timezone.utc).isoformat(),
+                  'free_agent_snapshot_frozen_at_utc':pool['captured_at_utc'],
+                  'waiver_freeze_git_blob':FROZEN_BLOB,
+                  'season':SEASON,'completed_data_weeks':list(WEEKS),
+                  'future_week8_or_week9_used':False,
+                  'sleeper_sources_by_week':meta,
+                  'snap_share_available_from_sleeper':any(stats_keys.get(k,0)>0 for k in ('off_snp','off_snap','off_snaps','offense_snaps','def_snp','def_snap','def_snaps','defense_snaps')),
+                  'source_weekly_field_presence': {k:int(stats_keys[k]) for k in sorted(stats_keys) if k in set(sum((list(v) for v in FAMILIES.values()),['gp']))},
+                  'metric_present_player_week_counts':dict(overlap_counts),
+                  'by_position':{pos:dict(coverage_by_position[pos]) for pos in POS},
+                  'total_available_free_agents':len(out),
+                  'with_any_weekly_stat_row':sum(int(r['weeks_with_sleeper_stats_rows']>0) for r in out),
+                  'young_with_any_weekly_stat_row':sum(int(r['young_factual_screen'] and r['weeks_with_sleeper_stats_rows']>0) for r in out),
+                  'with_all_three_weekly_stat_rows':sum(int(r['weeks_with_sleeper_stats_rows']==3) for r in out),
+                  'method':'Exact Sleeper player_id keyed weekly stat response, no name/team/position fuzzy joins',
+                  'limitations':[
+                      'A Sleeper weekly player record is not proof of positive NFL snaps or fantasy points. Confirm gp and numeric fields separately.',
+                      'Missing stat rows and missing stat keys are unknown, not zero.',
+                      'All weekly inputs fetched on run date; no immutable pregame as-of origin timing is certified.',
+                      'Frozen waiver list is as of prior cache sync, not continuously live.',
+                      'Targets/touches/tackles are usage or realized participation evidence, not trained breakout probabilities.',
+                      'Current free-agent pool contains many developmental players without real playing time; missing records must not exclude stash names.',
+                      'No W8/W9 outcomes, CAL26 protected holdouts, FV/MV/TU or production board write.',
+                  ],
+                  'production_changes_authorized':False, 'predictive_edge_established':False,
+              }
+              return report,out
+          
+          def tests():
+              fake={'captured_at_utc':'2026-10-27T16:07:46Z','players':[
+                  {'player_id':'a','name':'A','pos':'RB','age':23,'years_exp':1,'team':'T','depth_chart_order':2},
+                  {'player_id':'b','name':'B','pos':'LB','age':29,'years_exp':6,'team':'T','depth_chart_order':1},
+              ]+ [{'player_id':f'd{i}','name':f'D{i}','pos':'DB','age':None,'years_exp':None} for i in range(1605)]}
+              d={5:{'a':{'gp':1,'rush_att':2},'b':{'idp_tkl_solo':2}},6:{'a':{'gp':1,'rush_att':0}},7:{'a':{'gp':1,'rush_att':5},'b':{'gp':0,'idp_tkl_solo':0}}}
+              m={w:{'url':'synthetic','sha256_at_read':'mock'} for w in WEEKS}
+              report,rows=derive(fake,d,m)
+              a,b=rows[0],rows[1]
+              assert report['with_any_weekly_stat_row']==2
+              assert report['young_with_any_weekly_stat_row']==1
+              assert a['w6_carries']==0 and a['w7_carries']==5
+              assert a['w5_targets'] is None and b['w7_solo_tackles']==0
+              assert not rows[2]['w7_record_present'] and rows[2]['w7_gp_reported'] is None
+              assert report['with_all_three_weekly_stat_rows']==1
+              try:derive(fake,{5:d[5],6:d[6]},m)
+              except AssertionError: pass
+              else:raise AssertionError('Incomplete week window accepted')
+              print('PASS FA05R1 stable IDs, absent-not-zero, young coverage, numeric zero, W5-7 only')
+          
+          def main():
+              if '--selftest' in sys.argv:return tests()
+              data=json.loads(FROZEN.read_text())
+              assert data['classification']=='PROSPECTIVE_CURRENT_AVAILABILITY_CAPTURE_NOT_PREDICTION'
+              assert data['target_week_requested_not_kickoff_certified']==9
+              assert data['rank_fresh'] is True
+              week_docs={};week_meta={};errors={}
+              for week in WEEKS:
+                  try:
+                      doc,meta=fetch_week(week)
+                      week_docs[week]=doc;week_meta[str(week)]=meta
+                  except Exception as e:errors[str(week)]=str(e)
+              if errors:
+                  (OUT/'A_FA05R1_download_failure.json').write_text(json.dumps({'error':'Sleeper weekly source unavailable','weeks':errors},indent=2))
+                  raise RuntimeError('Required W5-7 Sleeper weekly source failed: '+str(errors))
+              report,rows=derive(data,week_docs,week_meta)
+              (OUT/'A_FA05R1_report.json').write_text(json.dumps(report,indent=2,sort_keys=True)+'\n')
+              fields=list(rows[0])
+              with (OUT/'A_FA05R1_2026W09_direct_sleeper_coverage.csv').open('w',newline='',encoding='utf-8') as f:
+                  wr=csv.DictWriter(f,fieldnames=fields);wr.writeheader();wr.writerows(rows)
+              lines=['# A - FA05R1: Frozen Week 9 Waiver Pool, Direct Sleeper ID Coverage','',
+                  f"**Result:** `{report['status']}` — engineering coverage only, NOT breakout prediction.",'',
+                  f"Frozen available players: **{report['total_available_free_agents']}**; directly linked weekly stats: **{report['with_any_weekly_stat_row']}**; direct linked young players: **{report['young_with_any_weekly_stat_row']}**.",
+                  f"W5–W7 three-record coverage: **{report['with_all_three_weekly_stat_rows']}**.",
+                  f"Does Sleeper expose any named offensive/defensive snap count fields? **{report['snap_share_available_from_sleeper']}** (counts alone may require an external team denominator).",
+                  '', '| Position | Waivers | Young pool | Any stable-ID record | Young with record | Three weekly records |',
+                  '|---|---:|---:|---:|---:|---:|']
+              for pos in POS:
+                  c=report['by_position'][pos]
+                  lines.append(f"| {pos} | {c['waivers']} | {c['young_factual_pool']} | {c['with_any_weekly_stat_row']} | {c['young_with_any_stat_row']} | {c['with_all_three_stat_rows']} |")
+              lines+=['','## Weekly field occurrence counts','', '```json', json.dumps(report['source_weekly_field_presence'],indent=2), '```', '', '## Example young players with direct weekly evidence (coverage only)','']
+              for pos in POS:
+                  x=[r for r in rows if r['pos']==pos and r['young_factual_screen'] and r['weeks_with_sleeper_stats_rows']>0]
+                  x.sort(key=lambda r:(-r['weeks_with_sleeper_stats_rows'],-r['weeks_with_confirmed_gp'],r['name'] or ''))
+                  names=[f"{r['name']} (rows {r['weeks_with_sleeper_stats_rows']}/3, gp-confirmed {r['weeks_with_confirmed_gp']}/3)" for r in x[:8]]
+                  lines.append(f"- **{pos}:** "+('; '.join(names) if names else 'None linked'))
+              lines+=['','## Limits','']+['- '+x for x in report['limitations']]
+              lines+=['', '**Decision:** If stable-ID coverage recovers young players, compare direct usage with the snap bridge and develop factual role change watchlists; otherwise use depth/injury monitoring and new as-of weekly snapshots instead of manufacturing a breakout number.', '']
+              (OUT/'A_FA05R1_report.md').write_text('\n'.join(lines),encoding='utf-8')
+              print(f"{report['status']}: {len(rows)} waivers; {report['with_any_weekly_stat_row']} Sleeper linked; {report['young_with_any_weekly_stat_row']} young; {report['with_all_three_weekly_stat_rows']} full 3-week records")
+              if report['status'].startswith('BLOCKED'):raise RuntimeError('Zero confirmed source overlap; do not claim success')
+          
+          if __name__=='__main__':main()
+          PYCODE
+          python3 "$REPORT_DIR/A_FA05R1_engine.py" --selftest
+          python3 "$REPORT_DIR/A_FA05R1_engine.py"
+          test -z "$(git status --porcelain)"
+
+      - name: Preserve all read-only research artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A_FA05R1_STABLE_SLEEPER_WEEKLY_COVERAGE
+          path: |
+            ${{ runner.temp }}/a-fa05r1/A_FA05R1_report.md
+            ${{ runner.temp }}/a-fa05r1/A_FA05R1_report.json
+            ${{ runner.temp }}/a-fa05r1/A_FA05R1_2026W09_direct_sleeper_coverage.csv
+            ${{ runner.temp }}/a-fa05r1/A_FA05R1_download_failure.json
+          if-no-files-found: warn
+          retention-days: 90
