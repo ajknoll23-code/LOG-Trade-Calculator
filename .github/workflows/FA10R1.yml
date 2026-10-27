@@ -1,0 +1,317 @@
+name: A - FA10R1 Frozen Week 9 Control Baseline LOG Scoring Audit (Read Only)
+
+# Research-only baseline comparability review for already-committed FA08+FA09 pairs.
+# Consumes ONLY completed pre-Week9 NFL weeks 5-7. Does not revisit matching,
+# touch protected CAL26 holdouts, modify rankings or predict future outcomes.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a-fa10r1-controls-baseline-readonly
+  cancel-in-progress: false
+
+jobs:
+  baseline-audit:
+    name: Exact LOG pre-origin scoring for 42 immutable watch/control pairs
+    runs-on: ubuntu-latest
+    timeout-minutes: 17
+    steps:
+      - name: Checkout current main with no write credentials
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify frozen registries and clean checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+          a='research/free-agent-opportunity/forward-registrations/2026-W09_FA08R1_frozen_42_shadow_watch.json'
+          b='research/free-agent-opportunity/forward-registrations/2026-W09_FA09R1_frozen_42_matched_controls.json'
+          test "$(git hash-object "$a")" = 'f5d005b6a37a33444be76ec28e6b6a98174af47b'
+          test "$(git hash-object "$b")" = '100b934aaa4aeaebd0a10944d88d37e0e499fdc8'
+          test -f scripts/model/ppg_pipeline.py
+
+      - name: Compute pre-Week9 LOG baseline for unchanged watch-control pairs
+        shell: bash
+        env:
+          REPORT_DIR: ${{ runner.temp }}/a-fa10r1
+        run: |
+          set -euo pipefail
+          mkdir -p "$REPORT_DIR"
+          cat > "$REPORT_DIR/FA10R1_engine.py" <<'FA10R1_PYTHON'
+          #!/usr/bin/env python3
+          """FA10R1: read-only pre-origin LOG fantasy baseline for frozen FA08/FA09 pairs.
+          Only 2026 regular-season weeks 5-7 are queried; never W8+ or other holdouts.
+          Pairs are NEVER rematched using scoring, which would introduce researcher degrees of freedom.
+          """
+          import argparse
+          import ast
+          import csv
+          import hashlib
+          import json
+          import os
+          import statistics
+          import time
+          from collections import Counter,defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+
+          OUT=Path(os.environ.get('REPORT_DIR','/tmp/fa10r1'))
+          FA08='research/free-agent-opportunity/forward-registrations/2026-W09_FA08R1_frozen_42_shadow_watch.json'
+          FA09='research/free-agent-opportunity/forward-registrations/2026-W09_FA09R1_frozen_42_matched_controls.json'
+          FA08_BLOB='f5d005b6a37a33444be76ec28e6b6a98174af47b'
+          FA09_BLOB='100b934aaa4aeaebd0a10944d88d37e0e499fdc8'
+          SCORE_PATH='scripts/model/ppg_pipeline.py'
+          WEEKS=(5,6,7)
+          ORIG_FA07_WEEK_SHA={5:'11ae27fcc6872eb04f3972259fa63bdb510e22e51314198bd0ce962af4f82070',6:'e9086612023efd3beea10174475c7010ae8401305d0b489923ddfeaeb1e7d77e',7:'32743d45cfa8b1997630c7585c72aeed7455de8c00a55d4250c2cef8d69cfdd4'}
+          FIELDS={'pass_yd','pass_td','pass_2pt','pass_int','rush_yd','rush_att','rush_td','rush_2pt','rec_yd','rec','rec_td','rec_2pt','fum_lost','fum_rec_td','idp_tkl_solo','idp_tkl_ast','idp_tkl_loss','idp_sack','sack','idp_qb_hit','idp_int','int','idp_fum_rec','idp_ff','idp_safety','blk_kick','idp_td','idp_pass_def','st_td','st_ff','st_fum_rec'}
+
+
+          def sha(x): return hashlib.sha256(x).hexdigest()
+          def num(x):
+              if isinstance(x,bool) or not isinstance(x,(int,float)) or not (-1e10<float(x)<1e10): return None
+              return float(x)
+
+
+          def scorer_from_repo():
+              source=Path(SCORE_PATH).read_bytes();tree=ast.parse(source,filename=SCORE_PATH)
+              fns=[x for x in tree.body if isinstance(x,ast.FunctionDef) and x.name=='score_week']
+              if len(fns)!=1:raise RuntimeError('Canonical LOG score_week must be uniquely defined')
+              fn=fns[0];fn.decorator_list=[]
+              ns={};exec(compile(ast.fix_missing_locations(ast.Module(body=[fn],type_ignores=[])),SCORE_PATH,'exec'),ns)
+              scorer=ns['score_week']
+              fixtures=[({},0.0),({'pass_yd':300,'pass_td':2},22.0),({'rush_att':10,'rush_yd':100},14.0),({'rec':4,'rec_yd':50},7.0),({'idp_tkl_solo':4,'idp_tkl_ast':2},7.5),({'idp_sack':2,'idp_qb_hit':1},10.0)]
+              for args,expected in fixtures:
+                  if abs(scorer(args)-expected)>1e-9:raise RuntimeError('League LOG canonical scoring fixture drift')
+              return scorer,sha(source)
+
+
+          def score_week(row,score):
+              if not isinstance(row,dict):return None,'NO_WEEK_ROW'
+              gp=num(row.get('gp'))
+              if gp is None:return None,'GP_UNREPORTED'
+              if gp<1:return None,'NOT_CONFIRMED_PLAYED'
+              if any(k in row and row[k] is not None and num(row[k]) is None for k in FIELDS):return None,'NONNUMERIC_SCORING_INPUT'
+              try:
+                  v=float(score(row))
+                  if not(-1e8<v<1e8): raise ValueError('Unreasonable score')
+              except (ValueError,TypeError,KeyError,ZeroDivisionError):return None,'SCORING_ERROR'
+              return round(v,3),'SCORED_CONFIRMED_GP'
+
+
+          def validate_registries(watch,controls):
+              assert watch['classification']=='FROZEN_RESEARCH_WATCH_NOT_CALIBRATED_PREDICTION'
+              assert controls['classification']=='PROSPECTIVE_RESEARCH_CONTROLS_NOT_PREDICTIVE_ACCURACY'
+              assert controls['source_FA08_git_blob']==FA08_BLOB
+              assert watch['counts']['watch_total']==42 and controls['candidate_population']['control_count']==42
+              assert watch['registered_for_week']==controls['evaluation_start_week']==9
+              assert watch['registered_for_season']==controls['registered_season']==2026
+              assert watch['usage_and_scoring_feature_weeks']==controls['feature_weeks']==list(WEEKS)
+              assert watch['future_outcomes_used_as_features'] is False and controls['future_outcomes_used'] is False
+              assert watch['pricing_changes_authorized'] is False and controls['pricing_changes_authorized'] is False
+              assert len(watch['players'])==len(controls['pairs'])==42
+              wa={str(x['player_id']):x for x in watch['players']}
+              p=controls['pairs']
+              assert len(wa)==42 and len({str(x['watch_id']) for x in p})==42 and len({str(x['control_id']) for x in p})==42
+              assert {str(x['watch_id']) for x in p}==set(wa)
+              assert not({str(x['control_id']) for x in p}&set(wa))
+              for pair in p:
+                  w=wa[str(pair['watch_id'])]
+                  assert pair['watch_name']==w['name'] and pair['position']==w['position']
+                  assert pair['comparability_tier'] in ('PRIMARY_LE_10_SNAPS','SECONDARY_LE_20_SNAPS','WEAK_GT_20_SNAPS')
+                  assert pair['baseline_week7_scoring_not_computed'] is True and pair['future_fantasy_scores_not_accessed'] is True
+              return wa
+
+
+          def fetch_week(w):
+              if w not in WEEKS:raise ValueError('NO WEEK8 OR FUTURE OR HOLDOOUT ALLOWED')
+              url=f'https://api.sleeper.app/v1/stats/nfl/regular/2026/{w}'
+              err=None
+              for i in range(3):
+                  try:
+                      with urlopen(Request(url,headers={'User-Agent':'LOG-FA10R1-Research/1.0','Accept':'application/json'}),timeout=65) as res:body=res.read(18_000_000)
+                      data=json.loads(body)
+                      if not isinstance(data,dict) or len(data)<150:raise ValueError('Unexpected Sleeper weekly data size')
+                      return data,{'week':w,'sha256':sha(body),'same_raw_content_as_FA07R1':sha(body)==ORIG_FA07_WEEK_SHA[w],'player_rows':len(data),'url':url}
+                  except Exception as e:
+                      err=e;time.sleep(i+1)
+              raise RuntimeError(f'Cannot fetch 2026 Week {w}: {err}')
+
+
+          def prep_scored(ids,sources,scorer):
+              out={}
+              for pid in ids:
+                  detail={w:score_week(sources[w].get(pid),scorer) for w in WEEKS}
+                  pts={w:detail[w][0] for w in WEEKS}
+                  valid=all(pts[w] is not None for w in WEEKS)
+                  out[pid]={
+                      'points':pts,'statuses':{w:detail[w][1] for w in WEEKS},'full_pre_week9_three_weeks':valid,
+                      'week5_7_mean':round(sum(pts.values())/3,3) if valid else None,
+                      'week5_6_mean':round((pts[5]+pts[6])/2,3) if valid else None,
+                      'week7_vs_w5w6_delta':round(pts[7]-(pts[5]+pts[6])/2,3) if valid else None,
+                  }
+              return out
+
+
+          def build(watch,controls,scored,manifest,scorer_sha):
+              wa=validate_registries(watch,controls)
+              rows=[]
+              for pair in controls['pairs']:
+                  wid=str(pair['watch_id']);cid=str(pair['control_id'])
+                  w=scored[wid];c=scored[cid];wr=wa[wid]
+                  good=w['full_pre_week9_three_weeks'] and c['full_pre_week9_three_weeks']
+                  drift=good and any(abs(w['points'][week]-float(wr[f'week{week}_LOG_pts']))>0.05 for week in WEEKS)
+                  snap_ok=pair['comparability_tier']=='PRIMARY_LE_10_SNAPS'
+                  week7_abs=round(abs(w['points'][7]-c['points'][7]),3) if good else None
+                  three_mean_diff=round(w['week5_7_mean']-c['week5_7_mean'],3) if good else None
+                  # An illustrative diagnostic, not an eligibility filter: preserve all original controls.
+                  balance_tag=('UNKNOWN_INCOMPLETE' if not good else 'WATCH_SCORING_SOURCE_DRIFT' if drift else
+                               'SNAP_AND_PTS_APPROX_BALANCED' if snap_ok and abs(three_mean_diff)<=5 else
+                               'SNAP_CLOSE_PTS_IMBALANCED' if snap_ok else 'WEAK_SNAP_CONTROL')
+                  rows.append({
+                      'position':pair['position'],'comparability_tier':pair['comparability_tier'],
+                      'young_screen':pair['young_screen'],'watch_lane':pair['watch_lane'],
+                      'watch_id':wid,'watch_name':pair['watch_name'],
+                      'control_id':cid,'control_name':pair['control_name'],
+                      'abs_week7_snap_gap':pair['abs_w7_snap_gap'],
+                      'watch_week5_pts':w['points'][5], 'watch_week6_pts':w['points'][6], 'watch_week7_pts':w['points'][7],
+                      'control_week5_pts':c['points'][5], 'control_week6_pts':c['points'][6], 'control_week7_pts':c['points'][7],
+                      'watch_preorigin_three_week_avg':w['week5_7_mean'], 'control_preorigin_three_week_avg':c['week5_7_mean'],
+                      'watch_minus_control_preorigin_avg':three_mean_diff,
+                      'abs_week7_log_pts_gap':week7_abs,
+                      'both_have_complete_w5_w7_scores':good,
+                      'watch_scoring_changed_vs_frozen_FA08':drift,
+                      'preorigin_balance_diagnostic':balance_tag,
+                      'missing_status_watch':';'.join(f'w{wk}:{w["statuses"][wk]}' for wk in WEEKS if w['points'][wk] is None),
+                      'missing_status_control':';'.join(f'w{wk}:{c["statuses"][wk]}' for wk in WEEKS if c['points'][wk] is None),
+                  })
+              assert len(rows)==42
+              quality={}
+              for tier in ('PRIMARY_LE_10_SNAPS','SECONDARY_LE_20_SNAPS','WEAK_GT_20_SNAPS'):
+                  group=[x for x in rows if x['comparability_tier']==tier]
+                  good=[x for x in group if x['both_have_complete_w5_w7_scores']]
+                  quality[tier]={
+                      'n_pairs':len(group),'full_scored':len(good),
+                      'mean_abs_w7_points_gap':round(statistics.mean(x['abs_week7_log_pts_gap'] for x in good),3) if good else None,
+                      'median_abs_w7_points_gap':round(statistics.median(x['abs_week7_log_pts_gap'] for x in good),3) if good else None,
+                      'mean_watch_minus_control_3wk_pts':round(statistics.mean(x['watch_minus_control_preorigin_avg'] for x in good),3) if good else None,
+                  }
+              count=Counter(x['preorigin_balance_diagnostic'] for x in rows)
+              report={
+                  'status':'BASELINE_RESEARCH_COMPLETE' if any(x['both_have_complete_w5_w7_scores'] for x in rows) else 'BLOCKED_ZERO_COMPLETELY_SCORED_PAIRS',
+                  'study':'A FA10R1 Week9 Prospective Matched Pair Pre-Origin LOG Point Balance Audit',
+                  'classification':'PRE_ORIGIN_DESCRIPTIVE_BASELINE_NOT_FORWARD_VALIDATION',
+                  'built_at_utc':datetime.now(timezone.utc).isoformat(),
+                  'watch_count':42,'control_count':42,'complete_pair_preorigin_scoring':sum(x['both_have_complete_w5_w7_scores'] for x in rows),
+                  'original_match_tiers':{k:v['n_pairs'] for k,v in quality.items()},
+                  'by_comparability_tier':quality,'diagnostic_counts':dict(count),
+                  'watch_score_source_drift_pairs':sum(x['watch_scoring_changed_vs_frozen_FA08'] for x in rows),
+                  'all_weekly_sources_same_as_FA07_R1':all(x['same_raw_content_as_FA07R1'] for x in manifest),
+                  'source_weekly_manifest':manifest,'source_FA08_git_blob':FA08_BLOB,'source_FA09_git_blob':FA09_BLOB,
+                  'source_scorer_sha256':scorer_sha,'source_scorer':'scripts/model/ppg_pipeline.py',
+                  'research_only':True,'live_board_updates_authorized':False,'valuation_changes_authorized':False,
+                  'future_2026_week9_plus_accessed':False,'predictive_accuracy_established':False,
+                  'cautions':[
+                      'Week5-7 baseline is retrospective and explicitly selected by Week7 snap increase; NEVER interpret as a prospective test.',
+                      'Control pairing is frozen and intentionally NOT changed to equalize prior fantasy points, which could select on the same signal under study.',
+                      'W7 snap matching alone does not ensure fantasy-point or opportunity quality equivalence. Retain poor matches and report primary/secondary/weak separately.',
+                      'Threshold of 5 LOG points for a baseline imbalance is descriptive and has not been trained or validated.',
+                      'Only a post-origin Week9+ evaluation with comparable scoring and missingness treatment can assess predictive usefulness.',
+                      'Sleeper archived weekly API content may be revised. Raw source digests and scorer SHA are recorded. Watch scoring drift is explicitly reported.',
+                      'A confirmed gp with absent scoring fields uses the canonical LOG sparse-zero scoring convention; no gp means missing, not zero.',
+                      'No Week8 or Week9 statistics or protected CAL26 holdouts were accessed, and no live calculator, FV/MV, or board changes are permitted.',
+                  ],
+              }
+              return rows,report
+
+
+          def output(rows,report):
+              OUT.mkdir(parents=True,exist_ok=True)
+              (OUT/'A_FA10R1_baseline_report.json').write_text(json.dumps(report,indent=2,sort_keys=True)+'\n')
+              with (OUT/'A_FA10R1_pair_baselines.csv').open('w',newline='') as f:
+                  wr=csv.DictWriter(f,fieldnames=list(rows[0]));wr.writeheader();wr.writerows(rows)
+              lines=['# FA10R1 – Frozen controls: pre-Week9 fantasy-scoring balance','',
+                     '**Research only. Scoring includes 2026 Weeks 5–7; no Week9 outcome, trained prediction, or production change.**','',
+                     f"- Complete 3-week scoring pairs: **{report['complete_pair_preorigin_scoring']}/42**",
+                     f"- Frozen primary snap matches: **{report['original_match_tiers']['PRIMARY_LE_10_SNAPS']}/42**",
+                     f"- Pairs with pre-origin scorer drift against frozen watch: **{report['watch_score_source_drift_pairs']}**",
+                     f"- Same raw W5–7 Sleeper files as FA07R1: **{report['all_weekly_sources_same_as_FA07_R1']}**",'',
+                     '| Frozen match tier | Pairs | Full scoring | Mean abs Week7 pts gap | Mean watch – control 3-week points |',
+                     '|---|---:|---:|---:|---:|']
+              for k,v in report['by_comparability_tier'].items():
+                  lines.append(f"| {k} | {v['n_pairs']} | {v['full_scored']} | {v['mean_abs_w7_points_gap']} | {v['mean_watch_minus_control_3wk_pts']} |")
+              lines.extend(['','## Balance flags',''])
+              lines.extend(f'- {k}: {v}' for k,v in sorted(report['diagnostic_counts'].items()))
+              lines.extend(['','## Interpretation',''])
+              lines.extend('- '+s for s in report['cautions'])
+              (OUT/'A_FA10R1_baseline_report.md').write_text('\n'.join(lines)+'\n')
+
+
+          def selftest():
+              def fn(r):return r.get('rec',0)*.5+r.get('idp_tkl_solo',0)*1.5
+              assert score_week({'gp':1,'rec':4},fn)==(2.0,'SCORED_CONFIRMED_GP')
+              assert score_week({'gp':0,'rec':4},fn)==(None,'NOT_CONFIRMED_PLAYED')
+              assert score_week(None,fn)==(None,'NO_WEEK_ROW')
+              assert score_week({'gp':1,'rec':'bad'},fn)==(None,'NONNUMERIC_SCORING_INPUT')
+              try:fetch_week(9)
+              except ValueError:pass
+              else:raise AssertionError('Future week access allowed')
+              watch={'classification':'FROZEN_RESEARCH_WATCH_NOT_CALIBRATED_PREDICTION','counts':{'watch_total':42},'registered_for_week':9,'registered_for_season':2026,'usage_and_scoring_feature_weeks':[5,6,7],'future_outcomes_used_as_features':False,'pricing_changes_authorized':False,'players':[]}
+              controls={'classification':'PROSPECTIVE_RESEARCH_CONTROLS_NOT_PREDICTIVE_ACCURACY','source_FA08_git_blob':FA08_BLOB,'candidate_population':{'control_count':42},'evaluation_start_week':9,'registered_season':2026,'feature_weeks':[5,6,7],'future_outcomes_used':False,'pricing_changes_authorized':False,'pairs':[]}
+              for i in range(42):
+                  watch['players'].append({'player_id':str(i),'name':f'W{i}','position':'LB','week5_LOG_pts':1.,'week6_LOG_pts':2.,'week7_LOG_pts':3.})
+                  controls['pairs'].append({'watch_id':str(i),'watch_name':f'W{i}','control_id':str(i+42),'control_name':f'C{i}','position':'LB','comparability_tier':('PRIMARY_LE_10_SNAPS' if i<30 else 'WEAK_GT_20_SNAPS'),'abs_w7_snap_gap':1 if i<30 else 30,'young_screen':True,'watch_lane':'DYNASTY_STASH','baseline_week7_scoring_not_computed':True,'future_fantasy_scores_not_accessed':True})
+              wa=validate_registries(watch,controls);assert len(wa)==42
+              scored={str(i):{'points':{5:1.,6:2.,7:3.},'statuses':{5:'SCORED',6:'SCORED',7:'SCORED'},'full_pre_week9_three_weeks':True,'week5_7_mean':2.,'week5_6_mean':1.5,'week7_vs_w5w6_delta':1.5} for i in range(84)}
+              rows,report=build(watch,controls,scored,[{'week':w,'same_raw_content_as_FA07R1':True} for w in WEEKS],'demo');assert report['complete_pair_preorigin_scoring']==42 and report['original_match_tiers']['PRIMARY_LE_10_SNAPS']==30
+              scored['42']['points'][5]=None;scored['42']['full_pre_week9_three_weeks']=False;scored['42']['week5_7_mean']=None
+              rows,report=build(watch,controls,scored,[{'week':w,'same_raw_content_as_FA07R1':True} for w in WEEKS],'demo');assert report['complete_pair_preorigin_scoring']==41 and rows[0]['both_have_complete_w5_w7_scores'] is False
+              print('PASS FA10R1 synthetic source guard, missing != zero, scorer and frozen comparability tiers')
+
+
+          def main():
+              arg=argparse.ArgumentParser();arg.add_argument('--selftest',action='store_true');a=arg.parse_args()
+              if a.selftest:return selftest()
+              scorer,s_sha=scorer_from_repo()
+              watch=json.loads(Path(FA08).read_text());controls=json.loads(Path(FA09).read_text())
+              validate_registries(watch,controls)
+              sources={};manifest=[]
+              for w in WEEKS:
+                  sources[w],m=fetch_week(w);manifest.append(m)
+              ids=set()
+              for p in controls['pairs']:ids.update((str(p['watch_id']),str(p['control_id'])))
+              scored=prep_scored(ids,sources,scorer)
+              rows,report=build(watch,controls,scored,manifest,s_sha)
+              output(rows,report)
+              print('FA10R1_PRE_ORIGIN_BASELINE:',json.dumps({'status':report['status'],'complete_scored':report['complete_pair_preorigin_scoring'],'watch_scorer_drift':report['watch_score_source_drift_pairs'],'tags':report['diagnostic_counts']},sort_keys=True))
+              if report['status'].startswith('BLOCKED'):raise SystemExit('No valid pre-origin scoring pairs')
+
+          if __name__=='__main__':main()
+          FA10R1_PYTHON
+          python3 "$REPORT_DIR/FA10R1_engine.py" --selftest
+          python3 "$REPORT_DIR/FA10R1_engine.py"
+          python3 -m json.tool "$REPORT_DIR/A_FA10R1_baseline_report.json" >/dev/null
+          test -z "$(git status --porcelain)"
+
+      - name: Upload read-only baseline comparison diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A_FA10R1_PRE_ORIGIN_42_PAIR_LOG_SCORE_BASELINE
+          path: |
+            ${{ runner.temp }}/a-fa10r1/A_FA10R1_baseline_report.json
+            ${{ runner.temp }}/a-fa10r1/A_FA10R1_baseline_report.md
+            ${{ runner.temp }}/a-fa10r1/A_FA10R1_pair_baselines.csv
+          if-no-files-found: warn
+          retention-days: 90
