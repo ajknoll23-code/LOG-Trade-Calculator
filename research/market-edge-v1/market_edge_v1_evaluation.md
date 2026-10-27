@@ -28,7 +28,7 @@
 This is descriptive only and cannot rescue a failed market-movement result.
 
 - 2w: n=503, position-gap→production-surprise Spearman **0.657**
-- 4w: n=503, position-gap→production-surprise Spearman **0.680**
+- 4w: n=503, position-gap→production-surprise Spearman **0.681**
 
 ## Governance
 
