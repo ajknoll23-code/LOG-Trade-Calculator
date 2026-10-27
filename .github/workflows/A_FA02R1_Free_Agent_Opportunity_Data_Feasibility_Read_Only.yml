@@ -1,0 +1,306 @@
+name: A - FA02R1 Free Agent Opportunity Data & Historical Evidence Audit (Read Only)
+
+# A-only naming. Run manually. No writes to GitHub repository or production models.
+# Green means input/source feasibility, NOT signal accuracy or breakout probabilities.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a-fa02-opportunity-audit-readonly
+  cancel-in-progress: false
+
+jobs:
+  feasibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout current main read only
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Prepare Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Audit historical inputs, scorer parity and as-of limitations
+        shell: bash
+        env:
+          REPORT_DIR: ${{ runner.temp }}/a-fa02r1
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+          mkdir -p "$REPORT_DIR"
+          python3 - <<'PYIN'
+          #!/usr/bin/env python3
+          """A FA02R1: source and label feasibility only; no predictive claims."""
+          import ast
+          import collections
+          import hashlib
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+          from datetime import datetime, timezone
+
+          ROOT = Path.cwd()
+          DEST = Path(os.environ["REPORT_DIR"])
+          DEST.mkdir(parents=True, exist_ok=True)
+
+          PATHS = {
+              "fa": "data/free_agents.json",
+              "utility": "data/free_agent_utility_v1.json",
+              "outcomes": "research/roster-economics/weekly_points_by_season.json",
+              "lineups": "research/roster-economics/historical_lineup_demand.json",
+              "feasibility": "research/player-role-v2/player_role_v2_b41a_source_feasibility.json",
+              "historical_targets": "research/player-role-v2/player_role_v2_b41c_historical_target_source_feasibility.json",
+              "role": "data/player_role_v2_week5.json",
+              "prospective": "research/schedule-utility-v1/prospective-snapshots/2026-W06.json",
+              "scorer": "scripts/model/ppg_pipeline.py",
+              "historical_scorer": "research/roster-economics/historical_weekly_points_pipeline.py",
+          }
+
+
+          def load(name):
+              p = ROOT / PATHS[name]
+              return json.loads(p.read_text(encoding="utf-8")) if p.is_file() else None
+
+
+          def digest(name):
+              p = ROOT / PATHS[name]
+              return hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else None
+
+
+          def nested(o, *keys, default=None):
+              for k in keys:
+                  if not isinstance(o, dict):
+                      return default
+                  o = o.get(k)
+              return default if o is None else o
+
+
+          def get_scorer_ast(name):
+              p = ROOT / PATHS[name]
+              if not p.is_file():
+                  return None
+              tree = ast.parse(p.read_text(encoding="utf-8"))
+              found = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "score_week"]
+              if len(found) != 1:
+                  raise ValueError(f"Expected exactly one score_week in {p}")
+              node = found[0]
+              node.decorator_list = []
+              # Docstrings are not part of the pricing behavior.
+              if node.body and isinstance(node.body[0], ast.Expr) and isinstance(node.body[0].value, ast.Constant) and isinstance(node.body[0].value.value, str):
+                  node.body.pop(0)
+              return node
+
+
+          def check_scorer_parity():
+              a, b = get_scorer_ast("scorer"), get_scorer_ast("historical_scorer")
+              if a is None or b is None:
+                  return {"available": False, "matched_ast": False, "fixture_parity": False}
+              matched = ast.dump(a, include_attributes=False) == ast.dump(b, include_attributes=False)
+              ns_a, ns_b = {}, {}
+              exec(compile(ast.fix_missing_locations(ast.Module(body=[a], type_ignores=[])), "scorer_a", "exec"), ns_a)
+              exec(compile(ast.fix_missing_locations(ast.Module(body=[b], type_ignores=[])), "scorer_b", "exec"), ns_b)
+              fixtures = [
+                  {}, {"gp": 1, "pass_yd": 305, "pass_td": 2, "pass_int": 1},
+                  {"rush_att": 16, "rush_yd": 107, "rush_td": 1, "rec": 4, "rec_yd": 24},
+                  {"rec": 7, "rec_yd": 203, "rec_td": 2},
+                  {"idp_tkl_solo": 8, "idp_tkl_ast": 3, "idp_tkl_loss": 2, "idp_sack": 2,
+                   "idp_qb_hit": 3, "idp_pass_def": 3, "idp_int": 1},
+                  {"fum_lost": 2, "idp_ff": 1, "idp_fum_rec": 1, "idp_td": 1},
+                  {"pass_yd": 401, "rush_yd": 201, "rec_yd": 202},
+              ]
+              same = all(abs(ns_a["score_week"](x) - ns_b["score_week"](x)) < 1e-10 for x in fixtures)
+              return {"available": True, "matched_ast": matched, "fixture_parity": same, "fixture_count": len(fixtures)}
+
+
+          fa, utility = load("fa"), load("utility")
+          if not fa or not utility:
+              raise SystemExit("Current public free-agent and utility sources are mandatory")
+
+          fa_rows, util_rows = fa.get("free_agents", []), utility.get("players", [])
+          fa_ids = [str(r.get("player_id")) for r in fa_rows]
+          util_ids = [str(r.get("player_id")) for r in util_rows]
+          fa_by_id = {str(r["player_id"]): r for r in fa_rows}
+          position_counts = dict(sorted(collections.Counter(r.get("pos", "UNKNOWN") for r in util_rows).items()))
+          check = {
+              "fa_cache_count_matches": fa.get("count") == len(fa_rows),
+              "fa_ids_unique": len(set(fa_ids)) == len(fa_ids),
+              "utility_ids_unique": len(set(util_ids)) == len(util_ids),
+              "utility_subset_of_fa": set(util_ids) <= set(fa_ids),
+              "utility_position_consistency": all(str(r.get("pos")) == str(fa_by_id[str(r["player_id"])].get("pos")) for r in util_rows if str(r["player_id"]) in fa_by_id),
+              "snapshot_timestamp_equal": nested(utility, "source", "free_agents_synced_at") == fa.get("synced_at"),
+              "utility_league_match": str(nested(utility, "source", "league_id")) == str(fa.get("league_id")),
+          }
+
+          hist = load("outcomes")
+          weekly_table = (hist.get("seasons") or {}) if isinstance(hist, dict) else {}
+          weekly_summary = {}
+          for season, players in sorted(weekly_table.items()):
+              if not isinstance(players, dict):
+                  continue
+              count_by_pos, week_by_pos = collections.Counter(), collections.Counter()
+              nonnumeric, empty_weeks, known_week_count = 0, 0, set()
+              for pid, row in players.items():
+                  if not isinstance(row, dict):
+                      continue
+                  p = row.get("pos_bucket") or "UNKNOWN"
+                  count_by_pos[p] += 1
+                  weeks = row.get("weekly_points") or {}
+                  if not isinstance(weeks, dict) or not weeks:
+                      empty_weeks += 1
+                      continue
+                  for w, value in weeks.items():
+                      if not str(w).isdigit() or not (1 <= int(w) <= 18):
+                          nonnumeric += 1
+                          continue
+                      if not isinstance(value, (float, int)) or isinstance(value, bool):
+                          nonnumeric += 1
+                          continue
+                      week_by_pos[p] += 1
+                      known_week_count.add(int(w))
+              weekly_summary[str(season)] = {
+                  "players": len(players), "player_count_by_position": dict(sorted(count_by_pos.items())),
+                  "player_weeks_by_position": dict(sorted(week_by_pos.items())),
+                  "observed_weeks": sorted(known_week_count),
+                  "empty_player_week_records": empty_weeks,
+                  "invalid_week_or_point_entries": nonnumeric,
+                  "points_generation_is_retrospective_not_asof": True,
+              }
+
+          feas = load("feasibility") or {}
+          feas_sources = feas.get("sources") or {}
+          snap = nested(feas_sources, "nflverse_snap_counts", "seasons", default={}) or {}
+          stat = nested(feas_sources, "nflverse_weekly_player_stats", "seasons", default={}) or {}
+          source_summary = {}
+          for season in sorted(set(snap) | set(stat)):
+              s1, s2 = snap.get(season) or {}, stat.get(season) or {}
+              headers = s2.get("headers") or []
+              sh = s1.get("headers") or []
+              source_summary[str(season)] = {
+                  "historical_source_probe_exists": True,
+                  "snap_row_count_from_prior_probe": s1.get("row_count"),
+                  "snap_required_columns_ok": s1.get("required_columns_ok"),
+                  "snap_columns_offense_defense_pct": all(x in sh for x in ("offense_pct", "defense_pct")),
+                  "snap_player_id_field": "pfr_player_id" if "pfr_player_id" in sh else "UNVERIFIED",
+                  "weekly_stat_rows_from_prior_probe": s2.get("row_count"),
+                  "weekly_stat_has_target_share": "target_share" in headers,
+                  "weekly_stat_has_idp_fields": all(x in headers for x in ("def_tackles_solo", "def_sacks", "def_qb_hits")),
+                  "weekly_stats_player_id_field": "player_id" if "player_id" in headers else "UNVERIFIED",
+                  "live_download_or_full_id_join_verified_this_run": False,
+                  "prior_probe_sha256_snap": s1.get("sha256"),
+                  "prior_probe_sha256_weekly": s2.get("sha256"),
+              }
+
+          lineup = load("lineups")
+          lineup_summary = {
+              "archived_file_present": lineup is not None,
+              "top_level_keys": sorted(lineup)[:25] if isinstance(lineup, dict) else [],
+              "archived_2024_2025_rules_differ_from_2026": True,
+              "do_not_apply_2026_rb_lb_starters_to_old_seasons": True,
+          }
+
+          role = load("role") or {}
+          pros = load("prospective") or {}
+          scorer = check_scorer_parity()
+
+          checks_pass = all(check.values()) and scorer["available"] and scorer["fixture_parity"] and scorer["matched_ast"]
+
+          head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          report = {
+              "study": "A-FA02R1 Free Agent Opportunity Evidence Feasibility",
+              "status": "SOURCE_AUDIT_PASS" if checks_pass else "SOURCE_AUDIT_FLAGGED",
+              "classification": "READ_ONLY_FEASIBILITY_NOT_PREDICTION_VALIDATION",
+              "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+              "git_head": head,
+              "current_fa_board": {
+                  "available_player_count": len(fa_rows),
+                  "ranked_data_backed_player_count": len(util_rows),
+                  "ranked_by_position": position_counts,
+                  "snapshot_matches": check["snapshot_timestamp_equal"],
+                  "checks": check,
+                  "v1_rank_policy": utility.get("policy_id"),
+              },
+              "historical_points": weekly_summary,
+              "historical_lineup_archive": lineup_summary,
+              "prior_historical_source_probe": source_summary,
+              "scorer_equivalence": scorer,
+              "existing_prospective_snapshots": {
+                  "role_snapshot_season": role.get("season"),
+                  "role_snapshot_week": role.get("week"),
+                  "role_snapshot_is_display_only": role.get("publication_scope") == "DISPLAY_ONLY_FROZEN_PROSPECTIVE_ROLE_SNAPSHOT",
+                  "schedule_snapshot_week": pros.get("origin_week"),
+                  "schedule_snapshot_freeze_before_cutoff": nested(pros, "governance", "snapshot_created_before_origin_cutoff"),
+                  "warning": "These snapshots were frozen for other studies; do not reclassify as free-agent predictions or use restricted holdouts.",
+              },
+              "inputs_sha256": {k: digest(k) for k in PATHS},
+              "blocked_until_separate_asof_proof": [
+                  "Historical V1 priority-rank backtest: no weekly as-of V1 source snapshots verified by this audit.",
+                  "Historical player availability: today's free agents cannot stand in for past waiver availability.",
+                  "Raw nflverse snap and weekly stats files and as-of player crosswalk were not downloaded or fully joined here.",
+                  "Source timestamps and injury/depth-chart history are not established for pre-origin features.",
+                  "2026 week 7+ protected CAL26 holdouts were not opened.",
+                  "This did not prove prediction accuracy, precision@k, or future dynasty value growth.",
+              ],
+              "recommended_next_step": "A-FA02R2: one historical as-of cohort using historical waiver availability, weekly snap usage, ID crosswalk, and preregistered 1/2/4-week outcomes; preserve research-only scope.",
+              "pricing_changes_authorized": False,
+              "release_changes_authorized": False,
+              "production_data_changes_authorized": False,
+          }
+
+          (DEST / "A_FA02R1_report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          rows = [
+              "# A — FA02R1: Free Agent Opportunity Evidence Feasibility",
+              "", f"**Result:** `{report['status']}` — engineering/source audit ONLY; no predictive edge established.",
+              "", f"**Commit audited:** `{head}`", "",
+              "## Free Agent Board currently live", "",
+              f"- Free agents in current cache: **{len(fa_rows)}**.",
+              f"- Data-backed V1-ranked players: **{len(util_rows)}**.",
+              f"- Stale rank protection: **{'fresh snapshots match' if check['snapshot_timestamp_equal'] else 'STALE / source mismatch'}**.",
+              f"- Ranked by position: `{json.dumps(position_counts, sort_keys=True)}`.",
+              "", "## Existing historical outcomes (scored with LOG rules)", "",
+              "| Season | Players | Player-weeks | Weeks observed | Invalid week/value entries |",
+              "|---|---:|---:|---|---:|",
+          ]
+          for yr,v in weekly_summary.items():
+              rows.append(f"| {yr} | {v['players']} | {sum(v['player_weeks_by_position'].values())} | {', '.join(map(str,v['observed_weeks']))} | {v['invalid_week_or_point_entries']} |")
+          if not weekly_summary:
+              rows.append("| No archived season | — | — | — | — |")
+          rows += [
+              "", "Scorer parity: `" + json.dumps(scorer, sort_keys=True) + "`.",
+              "", "**Important:** 2024–2025 historical starting lineups used older dedicated RB/LB rules. These are **retrospective outcomes**, not frozen waiver recommendations.",
+              "", "## Prior public nflverse source checks (not freshly downloaded)", "",
+              "| Year | Snap rows | Snap % columns | Weekly stat rows | IDP fields |", "|---|---:|---|---:|---|",
+          ]
+          for yr,v in source_summary.items():
+              rows.append(f"| {yr} | {v['snap_row_count_from_prior_probe'] or '—'} | {'Yes' if v['snap_columns_offense_defense_pct'] else 'No'} | {v['weekly_stat_rows_from_prior_probe'] or '—'} | {'Yes' if v['weekly_stat_has_idp_fields'] else 'No'} |")
+          rows += [
+              "", "**Identity issue:** historical snap data uses PFR IDs; weekly stats use a separate player_id. A verified point-in-time crosswalk is required, particularly for IDPs.",
+              "", "## Next decision and hard limitations", "",
+          ]
+          rows.extend(f"- {x}" for x in report['blocked_until_separate_asof_proof'])
+          rows += ["", "**Next:** A-FA02R2 historical availability + ID crosswalk + pre-outcome snap trends. No live board feature or FV change before additional evidence.", ""]
+          (DEST / "A_FA02R1_report.md").write_text("\n".join(rows), encoding="utf-8")
+          print(f"{report['status']}: {len(fa_rows)} free agents, {len(util_rows)} ranked, {len(weekly_summary)} historical outcome seasons, {len(source_summary)} source-probe seasons")
+          if not checks_pass:
+              print("FLAGGED CHECKS:", {k:v for k,v in check.items() if not v}, "scorer", scorer)
+              raise SystemExit(2)
+          PYIN
+          test -z "$(git status --porcelain)"
+
+      - name: Publish read-only research reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A_FA02R1_HISTORICAL_OPPORTUNITY_DATA_AUDIT
+          path: |
+            ${{ runner.temp }}/a-fa02r1/A_FA02R1_report.md
+            ${{ runner.temp }}/a-fa02r1/A_FA02R1_report.json
+          if-no-files-found: warn
