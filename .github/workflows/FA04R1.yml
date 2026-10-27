@@ -1,0 +1,397 @@
+name: A - FA04R1 Frozen Week 9 Free Agent Snap Trend Audit (Read Only)
+
+# Descriptive research only: uses committed FA03R2 immutable waiver cohort.
+# Reads public NFLverse W5-W8 player usage and identity columns only.
+# No FV changes, live board writes, or CAL26 holdout/evaluator file access.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a-fa04r1-snap-trend-readonly
+  cancel-in-progress: false
+
+jobs:
+  weekly-usage:
+    name: Match snap-share trends for frozen Week 9 waiver pool
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout current main without write credentials
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify frozen snapshot and clean research scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+          test "$(git hash-object research/free-agent-opportunity/prospective-snapshots/2026-10-27T16-07-46Z_2026W09.json)" = "75e4b907de655b1d47ff9c3721cbc2b8e69bd0b5"
+          test "$(git hash-object research/player-role-v2/player_role_v2_b43_v4r2_sleeper_gsis_identity_snapshot.csv)" = "eb45acce716cd834e862493da44c4303a4583573"
+
+      - name: Match 2026 W5-W8 usage with strict collision and missingness handling
+        shell: bash
+        env:
+          REPORT_DIR: ${{ runner.temp }}/a-fa04r1
+        run: |
+          set -euo pipefail
+          mkdir -p "$REPORT_DIR"
+          cat > "$REPORT_DIR/A_FA04R1_engine.py" <<'PYCODE'
+          #!/usr/bin/env python3
+          """FA04R1: descriptive Week-9 free-agent snap trend coverage, not prediction.
+
+          Uses 2026 W5-8 public snap share, joined by same-week normalized name/team/position
+          against GSIS identity, then uniquely mapped through the frozen B43 Sleeper crosswalk.
+          Never opens any CAL26 evaluation files, any future target outcomes, or modifies FV.
+          """
+          import csv
+          import hashlib
+          import io
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import time
+          import unicodedata
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+
+          ROOT = Path.cwd()
+          REPORT = Path(os.environ.get('REPORT_DIR', '/tmp/a-fa04r1'))
+          REPORT.mkdir(parents=True, exist_ok=True)
+          ORIGIN = 9
+          YEAR = '2026'
+          EARLY = (5, 6)
+          LATE = (7, 8)
+          WEEKS = EARLY + LATE
+          POSITIONS = ('QB', 'RB', 'WR', 'TE', 'DL', 'LB', 'DB')
+          FROZEN = 'research/free-agent-opportunity/prospective-snapshots/2026-10-27T16-07-46Z_2026W09.json'
+          FROZEN_BLOB = '75e4b907de655b1d47ff9c3721cbc2b8e69bd0b5'
+          IDS = 'research/player-role-v2/player_role_v2_b43_v4r2_sleeper_gsis_identity_snapshot.csv'
+          IDS_BLOB = 'eb45acce716cd834e862493da44c4303a4583573'
+          SOURCES = {
+              'snaps': 'https://github.com/nflverse/nflverse-data/releases/download/snap_counts/snap_counts_2026.csv',
+              'stats': 'https://github.com/nflverse/nflverse-data/releases/download/stats_player/stats_player_week_2026.csv',
+          }
+
+
+          def sha(raw):
+              return hashlib.sha256(raw).hexdigest()
+
+
+          def namekey(s):
+              s = unicodedata.normalize('NFKD', s or '')
+              return re.sub('[^a-z0-9]', '', ''.join(c for c in s if not unicodedata.combining(c)).lower())
+
+
+          def teamkey(s):
+              s = (s or '').strip().upper()
+              return {'JAC':'JAX','WSH':'WAS','LA':'LAR','STL':'LAR','SD':'LAC','OAK':'LV'}.get(s, s)
+
+
+          def poskey(s):
+              s = (s or '').strip().upper()
+              if s in ('QB','RB','WR','TE'):
+                  return s
+              if s in ('DL','DE','DT','NT','EDGE','ED'):
+                  return 'DL'
+              if s in ('LB','MLB','ILB','OLB'):
+                  return 'LB'
+              if s in ('DB','CB','S','SS','FS','SAF'):
+                  return 'DB'
+              return None
+
+
+          def valid_week(row, typ):
+              if str(row.get('season')) != YEAR:
+                  return None
+              kind = str(row.get('game_type' if typ == 'snaps' else 'season_type') or 'REG').upper()
+              if kind not in ('REG', 'REGULAR'):
+                  return None
+              try:
+                  week = int(row['week'])
+              except (KeyError, TypeError, ValueError):
+                  return None
+              return week if week in WEEKS else None
+
+
+          def fetch(name):
+              url = SOURCES[name]
+              for attempt in range(3):
+                  try:
+                      req = Request(url, headers={'User-Agent': 'LOG-free-agent-FA04R1-research/1.0'})
+                      with urlopen(req, timeout=75) as resp:
+                          data = resp.read(100_000_001)
+                          last_modified = resp.headers.get('Last-Modified')
+                      if len(data) > 100_000_000:
+                          raise RuntimeError('Source exceeds 100MB safety cap')
+                      rows = list(csv.DictReader(io.StringIO(data.decode('utf-8-sig'))))
+                      if not rows:
+                          raise RuntimeError('Empty source')
+                      return rows, {'url':url, 'bytes':len(data), 'sha256':sha(data), 'last_modified_header':last_modified,
+                                    'rows_all_weeks':len(rows), 'fetched_at_utc':datetime.now(timezone.utc).isoformat()}
+                  except Exception as exc:
+                      if attempt == 2:
+                          raise RuntimeError(f'{name} download/parse blocked: {exc}') from exc
+                      time.sleep(attempt + 1)
+
+
+          def load_frozen():
+              snap = ROOT / FROZEN
+              ids = ROOT / IDS
+              for name, p, blob in [('research snapshot', snap, FROZEN_BLOB), ('identity', ids, IDS_BLOB)]:
+                  actual = subprocess.check_output(['git', 'hash-object', str(p)], text=True).strip()
+                  if actual != blob:
+                      raise RuntimeError(f'{name} changed: expected {blob}, got {actual}')
+              obj = json.loads(snap.read_text(encoding='utf-8'))
+              assert obj['immutable_snapshot_repo_path'] == FROZEN
+              assert obj['target_season'] == 2026 and obj['target_week_requested_not_kickoff_certified'] == ORIGIN
+              assert obj['rank_fresh'] and obj['counts']['available_cache_total'] == 1607
+              assert obj['classification'] == 'PROSPECTIVE_CURRENT_AVAILABILITY_CAPTURE_NOT_PREDICTION'
+              ps = obj['players']
+              assert len(ps) == 1607
+              unique = {str(r['player_id']) for r in ps}
+              assert len(unique) == len(ps)
+              ids_rows = list(csv.DictReader(ids.open(encoding='utf-8-sig', newline='')))
+              return obj, ps, ids_rows
+
+
+          def bridge(snaps, stats, ids_rows):
+              # Frozen crosswalk is from B43; identity mapping is not proof of an
+              # as-of historical team, so team is matched inside the SAME 2026 week.
+              by_gsis = defaultdict(set)
+              for r in ids_rows:
+                  if r.get('gsis_id') and r.get('sleeper_id'):
+                      by_gsis[r['gsis_id'].strip()].add(r['sleeper_id'].strip())
+              unique_gsis = {g: next(iter(s)) for g,s in by_gsis.items() if len(s) == 1}
+              by_sleeper = defaultdict(set)
+              for g, s in unique_gsis.items():
+                  by_sleeper[s].add(g)
+              # Skip ambiguous inverse relationships too, rather than silently merge.
+              gsis_sid = {g:s for g,s in unique_gsis.items() if len(by_sleeper[s]) == 1}
+
+              indexed = defaultdict(set)
+              stat_counts = Counter()
+              stat_weeks = Counter()
+              for r in stats:
+                  w = valid_week(r, 'stats')
+                  if w is None:
+                      continue
+                  p = poskey(r.get('position'))
+                  k = (w, teamkey(r.get('team')), namekey(r.get('player_display_name') or r.get('player_name')), p)
+                  sid = (r.get('player_id') or '').strip()
+                  if not (all(k) and sid):
+                      continue
+                  indexed[k].add(sid)
+                  stat_counts['eligible_rows'] += 1
+                  stat_weeks[w] += 1
+
+              paired = defaultdict(list)
+              issues = Counter()
+              snap_weeks = Counter()
+              for r in snaps:
+                  w = valid_week(r, 'snaps')
+                  if w is None:
+                      continue
+                  p = poskey(r.get('position'))
+                  k = (w, teamkey(r.get('team')), namekey(r.get('player')), p)
+                  if not all(k):
+                      continue
+                  issues['eligible_snap_rows'] += 1
+                  snap_weeks[w] += 1
+                  vals = indexed.get(k, set())
+                  if len(vals) != 1:
+                      issues['ambiguous_gsis' if len(vals) > 1 else 'unmatched_same_week_name_team_pos'] += 1
+                      continue
+                  gsis = next(iter(vals))
+                  sleeper = gsis_sid.get(gsis)
+                  if not sleeper:
+                      issues['no_unique_gsis_sleeper_link'] += 1
+                      continue
+                  try:
+                      pct = float(r.get('defense_pct') if p in ('DL','LB','DB') else r.get('offense_pct'))
+                  except (TypeError, ValueError):
+                      issues['missing_snap_share'] += 1
+                      continue
+                  if not 0 <= pct <= 1.01:
+                      issues['invalid_share_not_fraction'] += 1
+                      continue
+                  paired[(sleeper,w)].append((pct,p))
+              accepted = {}
+              for key, rows in paired.items():
+                  if len(rows) != 1:
+                      issues['duplicate_player_week_excluded'] += 1
+                  else:
+                      accepted[key] = rows[0]
+              return accepted, {'diagnostic':dict(sorted(issues.items())), 'accepted_player_weeks':len(accepted),
+                                'stat_weeks':dict(sorted(stat_weeks.items())), 'snap_weeks':dict(sorted(snap_weeks.items())),
+                                'unique_b43_gsis_to_sleeper':len(gsis_sid),
+                                'crosswalk_gsis_collisions':sum(len(x)>1 for x in by_gsis.values()),
+                                'crosswalk_inverse_sleeper_collisions':sum(len(x)>1 for x in by_sleeper.values())}
+
+
+          def summarize(snapshot_players, matched):
+              output = []
+              for r in snapshot_players:
+                  pid = str(r['player_id'])
+                  p = r['pos']
+                  observed = {}
+                  mismatch = 0
+                  for week in WEEKS:
+                      if (pid,week) in matched:
+                          pct, pos = matched[(pid,week)]
+                          if p != pos:
+                              mismatch += 1
+                          else:
+                              observed[week] = pct
+                  has_early = all(w in observed for w in EARLY)
+                  has_late = all(w in observed for w in LATE)
+                  complete = has_early and has_late
+                  early = round(sum(observed[w] for w in EARLY)/2,5) if has_early else None
+                  late = round(sum(observed[w] for w in LATE)/2,5) if has_late else None
+                  delta_pp = round((late-early)*100,2) if complete else None
+                  # Descriptive attention filter, NOT predictive probability or ranking.
+                  attention = bool(complete and late >= .25 and delta_pp >= 10)
+                  reason = 'COMPLETE_FOUR_WEEKS' if complete else ('INCOMPLETE_SNAP_HISTORY' if observed else 'NO_LINKED_SNAP_HISTORY')
+                  if mismatch:
+                      reason += '; POSITION_CONFLICT_EXCLUDED'
+                  output.append({
+                      'player_id':pid,'name':r.get('name'),'pos':p,'team_at_frozen_origin':r.get('team'),
+                      'v1_priority_rank_within_position':r.get('v1_priority_rank_within_position'),
+                      'opportunity_factual_filter':r.get('opportunity_factual_filter'),
+                      'dynasty_stash_factual_filter':r.get('dynasty_stash_factual_filter'),
+                      'w5_pct':observed.get(5),'w6_pct':observed.get(6),
+                      'w7_pct':observed.get(7),'w8_pct':observed.get(8),
+                      'w5_w6_mean':early,'w7_w8_mean':late,'snap_share_delta_percentage_points':delta_pp,
+                      'four_week_observations_complete':complete,'observed_weeks_count':len(observed),
+                      'descriptive_snap_rise_attention':attention,'coverage_reason':reason,
+                      'probability_of_breakout':None,'observed_future_week9_outcome':None,
+                  })
+              return output
+
+
+          def synthetic_selftest():
+              assert teamkey('JAC') == 'JAX'
+              assert poskey('CB') == 'DB' and poskey('DT') == 'DL'
+              ids = [{'gsis_id':'abc','sleeper_id':'111'}]
+              st = [{'season':'2026','season_type':'REG','week':str(w),'team':'JAX','player_display_name':'First Test','player_id':'abc','position':'CB'} for w in WEEKS]
+              sp = [{'season':'2026','game_type':'REG','week':str(w),'team':'JAC','player':'First Test','position':'CB','defense_pct':str(v)} for w,v in zip(WEEKS,(0.4,0.5,0.7,0.8))]
+              joined,diag = bridge(sp,st,ids)
+              assert len(joined) == 4 and diag['accepted_player_weeks']==4
+              cohort=[{'player_id':'111','name':'First Test','pos':'DB','team':'JAX','v1_priority_rank_within_position':3,'opportunity_factual_filter':False,'dynasty_stash_factual_filter':True}]
+              result=summarize(cohort,joined)
+              assert result[0]['descriptive_snap_rise_attention'] and result[0]['snap_share_delta_percentage_points']==30.0
+              less = dict(joined)
+              del less[('111',7)]
+              assert not summarize(cohort,less)[0]['descriptive_snap_rise_attention']
+              st[0]['player_id']='ambiguous'
+              assert len(bridge(sp,st,ids)[0])==3
+              st[0]['player_id']='abc'
+              ids.append({'gsis_id':'abc','sleeper_id':'222'})
+              assert not bridge(sp,st,ids)[0]
+              sp.append({'season':'2026','game_type':'REG','week':'9','team':'JAC','player':'First Test','position':'CB','defense_pct':'1.0'})
+              ids.pop()
+              assert len(bridge(sp,st,ids)[0])==4 # Future week excluded even if published
+              print('PASS FA04R1 synthetic identity collision, missingness, 4-week trend and W9 leakage guards')
+
+
+          def main():
+              if '--selftest' in sys.argv:
+                  synthetic_selftest()
+                  return
+              frozen, players, ids_rows = load_frozen()
+              snaps, smeta = fetch('snaps')
+              stats, wmeta = fetch('stats')
+              matched, diag = bridge(snaps,stats,ids_rows)
+              rows = summarize(players, matched)
+              positions = {}
+              for p in POSITIONS:
+                  subset=[r for r in rows if r['pos']==p]
+                  complete = [r for r in subset if r['four_week_observations_complete']]
+                  flagged = [r for r in complete if r['descriptive_snap_rise_attention']]
+                  flagged.sort(key=lambda r:(-r['snap_share_delta_percentage_points'],-r['w7_w8_mean'],r['name'] or ''))
+                  positions[p]={'waiver_players':len(subset),'with_any_linked_snap_week':sum(r['observed_weeks_count']>0 for r in subset),
+                                'full_four_week_samples':len(complete),'descriptive_rise_attention_count':len(flagged),
+                                'examples':[{'name':r['name'],'team':r['team_at_frozen_origin'],'w5_w6_mean':r['w5_w6_mean'],
+                                             'w7_w8_mean':r['w7_w8_mean'],'delta_pp':r['snap_share_delta_percentage_points'],
+                                             'rank_within_position':r['v1_priority_rank_within_position']} for r in flagged[:6]]}
+              status = 'SOURCE_AND_IDENTITY_AUDIT_PASS' if diag['accepted_player_weeks'] > 0 else 'BLOCKED_NO_VERIFIED_PLAYER_WEEKS'
+              report={'status':status,'classification':'READ_ONLY_DESCRIPTIVE_SNAP_USAGE_NOT_BREAKOUT_PREDICTION',
+                      'analysis_captured_at_utc':datetime.now(timezone.utc).isoformat(),
+                      'frozen_waiver_snapshot_git_blob':FROZEN_BLOB,'frozen_waiver_snapshot_path':FROZEN,
+                      'waiver_capture_at_utc':frozen['captured_at_utc'],'waiver_cache_synced_at_epoch':frozen['source_free_agents_synced_at'],
+                      'research_input_git_commit':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
+                      'origin_week':ORIGIN,'source_feature_weeks':list(WEEKS),'future_target_weeks_excluded':True,
+                      'source_downloads':{'snaps':smeta,'identity_only_weekly_stats':wmeta},
+                      'bridge':diag,'current_waivers':len(rows),'by_position':positions,
+                      'total_full_four_week_samples':sum(x['full_four_week_samples'] for x in positions.values()),
+                      'total_descriptive_attention_names':sum(x['descriptive_rise_attention_count'] for x in positions.values()),
+                      'limits':[
+                          'This uses an immutable Week 9 waiver capture, but downloads nflverse data at research-run time; post-capture corrections could have occurred.',
+                          'Weekly stat source is used ONLY for same-week player identity and team/position; fantasy outcomes are not read or evaluated.',
+                          'W9 or later rows are categorically excluded from the join, even if present in downloaded CSVs.',
+                          'B43 GSIS-to-Sleeper crosswalk is frozen from a prior study, not independently proven historical point-in-time.',
+                          'Absence of a snap match is UNKNOWN, not zero usage. Partial observations are NOT used for four-week delta.',
+                          'Snap share is percentage of offensive snaps (QB/RB/WR/TE) or defensive snaps (DL/LB/DB), not a production or dynasty value forecast.',
+                          'The descriptive >=10pp increase and >=25% recent share threshold is illustrative and has never been backtested for breakout prediction.',
+                          'No production FV, current ranking, actual Week9 outcomes, or CAL26 evaluator/holdout artifacts were opened or modified.',
+                      ],'fv_changes_authorized':False,'live_board_changes_authorized':False,'predictive_edge_established':False}
+              (REPORT/'A_FA04R1_report.json').write_text(json.dumps(report,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+              fields=list(rows[0]) if rows else []
+              with (REPORT/'A_FA04R1_2026W09_waiver_snap_usage.csv').open('w',newline='',encoding='utf-8') as f:
+                  w=csv.DictWriter(f,fieldnames=fields)
+                  w.writeheader();w.writerows(rows)
+              md=['# A - FA04R1: Week 9 Waiver Snap Usage, Research Only','',
+                  f"**Status:** {status}. Not a validated breakout or dynasty value model.",'',
+                  f"Frozen free-agent origin: `{frozen['captured_at_utc']}`; {len(rows)} players.",
+                  'Feature windows: W5-W6 versus W7-W8. No Week 9 outcomes or CAL26 holdout artifacts used.','',
+                  '| Position | Waivers | Any linked snaps | Full 4 weeks | Descriptive rises |',
+                  '|---|---:|---:|---:|---:|']
+              for p,v in positions.items():
+                  md.append(f"| {p} | {v['waiver_players']} | {v['with_any_linked_snap_week']} | {v['full_four_week_samples']} | {v['descriptive_rise_attention_count']} |")
+              md.extend(['','## Attention-screen examples (not recommendations)',''])
+              for p,v in positions.items():
+                  md.append(f'### {p}')
+                  for ex in v['examples']:
+                      md.append(f"- {ex['name']} ({ex['team']}): {ex['w5_w6_mean']:.1%} -> {ex['w7_w8_mean']:.1%}, {ex['delta_pp']:+.2f}pp; V1 within-position rank {ex['rank_within_position'] or 'n/a'}")
+                  if not v['examples']: md.append('- No full-coverage rise meeting the illustrative threshold')
+                  md.append('')
+              md.extend(['## Source bridge diagnostics','',f"```json\n{json.dumps(diag,indent=2)}\n```",'', '## Limitations',''])
+              md.extend('- '+s for s in report['limits'])
+              md.append('')
+              (REPORT/'A_FA04R1_report.md').write_text('\n'.join(md),encoding='utf-8')
+              print(f"{status}: {len(rows)} snap-sourced waiver rows; {report['total_full_four_week_samples']} full W5-8 observations; {report['total_descriptive_attention_names']} illustrative attention flags")
+              if status.startswith('BLOCKED'):
+                  raise SystemExit('No player-week rows bridged; research report generated but source/identity validation blocked')
+
+
+          if __name__=='__main__':
+              main()
+          PYCODE
+          python3 "$REPORT_DIR/A_FA04R1_engine.py" --selftest
+          python3 "$REPORT_DIR/A_FA04R1_engine.py"
+          test -z "$(git status --porcelain)"
+
+      - name: Preserve all research reports as GitHub artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A_FA04R1_2026W09_PUBLIC_SNAP_USAGE_AUDIT
+          path: |
+            ${{ runner.temp }}/a-fa04r1/A_FA04R1_report.md
+            ${{ runner.temp }}/a-fa04r1/A_FA04R1_report.json
+            ${{ runner.temp }}/a-fa04r1/A_FA04R1_2026W09_waiver_snap_usage.csv
+          if-no-files-found: warn
+          retention-days: 90
