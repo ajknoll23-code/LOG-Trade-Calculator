@@ -1,0 +1,220 @@
+name: A - ID01 Sleeper Suffix Identity Valuation Audit (Read Only)
+run-name: A-ID01 identity audit
+'on':
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: a-id01-read-only-identity-audit
+  cancel-in-progress: false
+jobs:
+  identity-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Analyze stable-ID and suffix identity mismatches without modifying files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/a-id01"
+          cat > "$RUNNER_TEMP/a-id01/audit.py" <<'PY_ID01'
+          #!/usr/bin/env python3
+          """A-ID01: strict read-only audit; no valuation or repository writes."""
+          import csv
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          OUTPUT = Path(os.environ['RUNNER_TEMP']) / 'a-id01' / 'results'
+          OUTPUT.mkdir(parents=True, exist_ok=True)
+          ROOT = Path.cwd()
+          UI = ROOT / 'index.html'
+          SECOND_UI = ROOT / 'trade-desk-preview.html'
+          LEAGUE = ROOT / 'data/league_rosters.json'
+          MARKET = ROOT / 'scripts/artifacts/generated/market_values.json'
+          VOTES = ROOT / 'scripts/artifacts/generated/fv_informed_estimate_cal15.json'
+          CROSSWALK = ROOT / 'scripts/identity_crosswalk.json'
+          assert all(p.is_file() for p in [UI,SECOND_UI,LEAGUE,MARKET,VOTES,CROSSWALK]), 'Missing required source; stop'
+          assert subprocess.check_output(['git','status','--porcelain'],text=True).strip() == '', 'Dirty checkout; stop'
+
+          def norm(value):
+              # Exactly mirror normalizeName() in the browser: punctuation removal
+              return re.sub(r'\s+',' ',re.sub(r"[.'’\-]",'',str(value).strip().lower()))
+
+          def parse_db(path):
+              code=path.read_text(encoding='utf8')
+              start=code.index('const PLAYER_DB = {')
+              stop=code.index('\n};',start)
+              chunk=code[start:stop]
+              entries={}
+              for m in re.finditer(r"'([^']+)':\{\s*pos:'([^']+)',\s*age:(\d+),\s*role:'([^']+)'",chunk):
+                  key,pos,age,role=m.groups()
+                  if key in entries:raise AssertionError('Duplicate curated key '+key)
+                  entries[key]={'pos':pos,'age':int(age),'role':role}
+              assert len(entries)>350, f'Unexpected db size: {len(entries)}'
+              assert 'function resolveExistingKey(key)' in code
+              assert 'function mergeLiveRoster(data)' in code
+              assert 'function mergeLeagueRosters(data)' in code
+              a=code.index('const ALIASES = {')
+              b=code.index('\n};',a)
+              alias=dict(re.findall(r"'([^']+)':'([^']+)'",code[a:b]))
+              return entries,alias,code
+
+          db, aliases, source = parse_db(UI)
+          db2,aliases2,source2=parse_db(SECOND_UI)
+          league=json.loads(LEAGUE.read_text())
+          market=json.loads(MARKET.read_text()).get('players',{})
+          votes=json.loads(VOTES.read_text()).get('players',{})
+          crosswalk=json.loads(CROSSWALK.read_text())
+          # Do not treat FP crosswalk name matching as proof of canonical ID.
+          # Show it only as corroborative evidence where the Sleeper ID matches.
+          by_id={}
+          for item in crosswalk:
+              sid=str(item.get('sleeper_id') or '')
+              if sid:
+                  by_id.setdefault(sid,[]).append({
+                      'fp_name':item.get('name'),
+                      'confidence':item.get('match_confidence'),
+                      'method':item.get('match_method'),
+                      'manual_review':item.get('requires_manual_review'),
+                  })
+
+          expected={'Ernest Jones IV':'7672','Marvin Harrison Jr.':'11628',
+                    'Will Anderson Jr.':'10892','Kenneth Walker III':'8151',
+                    'Alex Singleton':'2617'}
+          seen={}
+          rows=[]
+          for roster in league.get('rosters',[]):
+              for slot in ['starters','bench','taxi','reserve_ir']:
+                  for player in roster.get(slot,[]):
+                      name=player.get('name','')
+                      key=norm(name)
+                      if not name:continue
+                      seen[name]=str(player.get('player_id',''))
+                      if key in db:
+                          canonical=key
+                          identity_status='EXACT'
+                      elif key in aliases and aliases[key] in db:
+                          canonical=aliases[key]
+                          identity_status='KNOWN_ALIAS'
+                      else:
+                          stem=re.sub(r' (?:jr|sr|ii|iii|iv|v)$','',key)
+                          if stem in db and stem != key:
+                              canonical=stem
+                              identity_status='SUFFIX_CANDIDATE_REVIEW'
+                          else:
+                              continue
+                      if identity_status!='SUFFIX_CANDIDATE_REVIEW' and name not in expected:
+                          continue
+                      info=db.get(canonical,{})
+                      ppos=player.get('fantasy_positions') or [player.get('position')]
+                      eligible={'DL' if x in ('DE','DT') else 'DB' if x in ('CB','S','SS','FS') else x for x in ppos if x}
+                      pos_ok=info.get('pos') in eligible
+                      cm=market.get(canonical,{})
+                      cv=votes.get(canonical,{})
+                      c2=db2.get(canonical,{})
+                      row={
+                          'sleeper_name':name, 'sleeper_id':str(player.get('player_id','')),
+                          'canonical_key':canonical, 'identity_status':identity_status,
+                          'roster_id':str(roster.get('roster_id')), 'roster_slot':slot,
+                          'sleeper_pos':player.get('position'), 'sleeper_eligibility':','.join(sorted(eligible)),
+                          'curated_pos':info.get('pos'), 'position_matches':bool(pos_ok),
+                          'curated_age':info.get('age'),'current_age':player.get('age'),
+                          'curated_role':info.get('role'), 'generic_fallback_role':{'starters':'Starter','bench':'Rotational','taxi':'Speculative','reserve_ir':'Depth'}[slot],
+                          'stored_fv':cm.get('fundamental_value'),
+                          'stored_fv_votes':cv.get('fv_informed_estimate'),
+                          'stored_mv':cm.get('market_value'),
+                          'preview_ui_pos':c2.get('pos'),
+                          'preview_ui_role':c2.get('role'),
+                          'preview_ui_age':c2.get('age'),
+                          'preview_ui_matches_primary':c2==info,
+                          'crosswalk_sleeper_id_matches':by_id.get(str(player.get('player_id','')),[]),
+                      }
+                      rows.append(row)
+          for name,sid in expected.items():
+              assert seen.get(name)==sid, f'Named player ID changed/missing: {name}: {seen.get(name)} != {sid}'
+          targets={n:next((r for r in rows if r['sleeper_name']==n),None) for n in expected}
+          assert all(targets.values()), 'All named players must be represented'
+          assert all(targets[n]['identity_status']=='SUFFIX_CANDIDATE_REVIEW' for n in list(expected)[:4]), 'Expected suffix mismatch not reproduced; examine main source'
+          assert targets['Alex Singleton']['identity_status']=='EXACT', 'Alex Singleton control should be exact'
+          candidates=[r for r in rows if r['identity_status']=='SUFFIX_CANDIDATE_REVIEW']
+          assert candidates, 'No suffix mismatches found; stop'
+          # Collision protection: exact name/ID integrity, not blanket suffix stripping.
+          ids={}
+          for r in candidates:
+              if r['canonical_key'] in ids and ids[r['canonical_key']]!=r['sleeper_id']:
+                  r['collision_warning']='canonical key points to multiple live IDs; MUST NOT merge'
+              ids[r['canonical_key']]=r['sleeper_id']
+          different_pos=[r for r in candidates if not r['position_matches']]
+          preview_drift=[r for r in rows if not r['preview_ui_matches_primary']]
+          report={
+              'status':'IDENTITY_BUG_CONFIRMED_READ_ONLY',
+              'commit':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
+              'scope':'Current 12-team Sleeper roster; exact and suffix-candidate matches to curated UI records',
+              'league_player_count':sum(len(roster.get(slot,[])) for roster in league.get('rosters',[]) for slot in ['starters','bench','taxi','reserve_ir']),
+              'curated_count':len(db),
+              'suffix_candidate_count':len(candidates),
+              'position_conflict_count':len(different_pos),
+              'preview_curated_data_drift_count':len(preview_drift),
+              'preview_db_count':len(db2),
+              'targets':targets,
+              'candidates':candidates,
+              'source_sha256':{str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for p in [UI,SECOND_UI,LEAGUE,MARKET,VOTES,CROSSWALK]},
+              'no_production_changes':True,
+              'no_automatic_suffix_rewriting':True,
+              'policy':'Any repair requires exact Sleeper ID-to-canonical mapping, explicit collision guards, and separate owner-authorized release.',
+          }
+          (OUTPUT/'A-ID01_audit.json').write_text(json.dumps(report,indent=2)+'\n')
+          fields=['sleeper_name','sleeper_id','canonical_key','roster_id','roster_slot','sleeper_pos','sleeper_eligibility','curated_pos','position_matches','curated_age','current_age','curated_role','generic_fallback_role','preview_ui_role','preview_ui_matches_primary','stored_fv','stored_fv_votes','stored_mv']
+          with (OUTPUT/'A-ID01_suffix_candidates.csv').open('w',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=fields,extrasaction='ignore')
+              w.writeheader();w.writerows(candidates)
+          lines=['# A-ID01 — Sleeper identity / valuation disconnect audit','',
+                 '- Status: **IDENTITY_BUG_CONFIRMED_READ_ONLY**',
+                 f'- Main commit: `{report["commit"]}`',
+                 f'- Players in league snapshot: **{report["league_player_count"]}**',
+                 f'- Suffix candidates not resolving to curated player records: **{len(candidates)}**',
+                 f'- Candidate position mismatches needing separate manual examination: **{len(different_pos)}**',
+                 f'- Named/candidate rows with different curated metadata between main and preview UIs: **{len(preview_drift)}**',
+                 '', '## Five named players', '',
+                 '| Sleeper player (ID) | Database key | Match | Current stored FV | FV+ | MV |',
+                 '|---|---|---|---:|---:|---:|']
+          for name,row in targets.items():
+              lines.append(f'| {name} (`{row["sleeper_id"]}`) | `{row["canonical_key"]}` | {row["identity_status"]} | {row["stored_fv"]} | {row["stored_fv_votes"]} | {row["stored_mv"]} |')
+          lines+=['','## Every suffix candidate', '',
+                  '| Sleeper name | ID | Database key | Slot | Position parity |',
+                  '|---|---|---|---|---|']
+          for row in candidates:
+              lines.append(f'| {row["sleeper_name"]} | `{row["sleeper_id"]}` | `{row["canonical_key"]}` | {row["roster_slot"]} | {"OK" if row["position_matches"] else "REVIEW"} |')
+          lines+=['','## Release safety', '',
+                  'Do **not** apply a global `Jr/II/III` string-strip rule. All mappings must be checked against their Sleeper IDs and position eligibility. A clean candidate name is not proof of identity. The report uses stored FV / FV+ / MV for reference; it does **not** claim these are new computed live prices.',
+                  'This run changes no repository code, prices, role multipliers, or live data. Repair both roster ingestion paths and preview UI parity, then run explicit release/regression checks in a separate owner-approved workflow.']
+          (OUTPUT/'A-ID01_report.md').write_text('\n'.join(lines)+'\n')
+          print(json.dumps({k:report[k] for k in ['status','commit','league_player_count','suffix_candidate_count','position_conflict_count','no_production_changes']},sort_keys=True))
+          PY_ID01
+          python3 -m py_compile "$RUNNER_TEMP/a-id01/audit.py"
+          python3 "$RUNNER_TEMP/a-id01/audit.py"
+      - name: Upload immutable read-only findings
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A-ID01-Identity-Audit
+          path: ${{ runner.temp }}/a-id01/results/
+          retention-days: 30
+      - name: Publish summary
+        if: always()
+        shell: bash
+        run: |
+          if test -f "$RUNNER_TEMP/a-id01/results/A-ID01_report.md"; then
+            cat "$RUNNER_TEMP/a-id01/results/A-ID01_report.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Audit not completed; inspect logs.' >> "$GITHUB_STEP_SUMMARY"
+          fi
