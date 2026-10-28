@@ -1,0 +1,322 @@
+name: A - W7R1 Identity Repair
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Preview changes without committing, or apply only the guarded outcome-capture source fix'
+        type: choice
+        required: true
+        default: PREVIEW
+        options:
+          - PREVIEW
+          - APPLY
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  guarded-outcome-identity-repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout main, no rebases or force pushes
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up isolated Python runtime
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install existing HTTP dependency
+        run: python -m pip install 'requests>=2.32,<3'
+
+      - name: Verify exactly scoped source and unchanged 565 player names
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git hash-object scripts/validation/capture_realized_outcomes.py)" = '999d418302a6523a5558eb3926c921977e66d0e9'
+          test "$(git hash-object scripts/artifacts/generated/sleeper_2026_raw_categories.json)" = '8b879c2292a888426ad38f43ff9d0594c140f635'
+          python scripts/validation/capture_realized_outcomes.py --selftest
+          python - <<'PY_CHECK'
+          import sys
+          sys.path.insert(0,'scripts/validation')
+          import snapshot_values
+          d=snapshot_values.load_from_html('index.html')['player_db']
+          assert len(d)==565,len(d)
+          print('PASS: exactly 565 model keys; original source and historical baseline pinned')
+          PY_CHECK
+
+      - name: Build strictly constrained script patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY_PATCH'
+          from pathlib import Path
+          p = Path('scripts/validation/capture_realized_outcomes.py')
+          s = p.read_text(encoding='utf-8')
+
+          rules = [
+              (
+                'def resolve_model_identities(player_db, by_name, by_id):',
+                'def resolve_model_identities(player_db, by_name, by_id, minimum_coverage=0.95, strict_position=False):',
+              ),
+              (
+                '''            if len(candidates) == 1:
+                          chosen = candidates[0]
+                          chosen_method = name_method
+                          break''',
+                '''            if len(candidates) == 1:
+                          if strict_position and not (
+                              model_pos == candidates[0].get("pos")
+                              or model_pos in (candidates[0].get("fantasy_positions") or [])
+                          ):
+                              reason = f"unique name {search_name!r} incompatible with model position {model_pos!r}"
+                              continue
+                          chosen = candidates[0]
+                          chosen_method = name_method
+                          break''',
+              ),
+              (
+                '    if coverage < 0.95:\n',
+                '    if coverage < minimum_coverage:\n',
+              ),
+              (
+                '''def build_outcomes(state_fetcher=fetch_state, week_fetcher=fetch_week):''',
+                '''def fetch_full_sleeper_identity_directory():
+              # Stable ID directory, independent of current week projections.
+              # Only used for previously unresolved players.
+              response = requests.get("https://api.sleeper.app/v1/players/nfl", timeout=90)
+              response.raise_for_status()
+              index = response.json()
+              if not isinstance(index, dict) or len(index) < 5000:
+                  raise RuntimeError("Full Sleeper player directory missing or implausibly small")
+              rows = []
+              for sid, player in index.items():
+                  if not isinstance(player, dict):
+                      continue
+                  name = (player.get("full_name") or (
+                      f"{player.get('first_name') or ''} {player.get('last_name') or ''}"
+                  )).strip()
+                  if not name:
+                      continue
+                  rows.append({
+                      "sleeper_id": str(sid),
+                      "player": name,
+                      "pos": player.get("position"),
+                      "team": player.get("team"),
+                      "fantasy_positions": player.get("fantasy_positions") or [],
+                  })
+              return rows
+
+
+          def resolve_with_full_directory_fallback(player_db, projected_rows, directory_fetcher=fetch_full_sleeper_identity_directory):
+              # Only unique, position-compatible matches; keep original 95% gate.
+              by_name, by_id = build_sleeper_identity_index(projected_rows)
+              primary, _ = resolve_model_identities(player_db, by_name, by_id, minimum_coverage=0.0)
+              missing = {k: player_db[k] for k in player_db if k not in primary}
+              fallback = {}
+              if missing:
+                  directory = directory_fetcher()
+                  full_names, full_ids = build_sleeper_identity_index(directory, minimum_ids=5000)
+                  candidates, _ = resolve_model_identities(
+                      missing, full_names, full_ids, minimum_coverage=0.0, strict_position=True
+                  )
+                  existing_ids = {r["sleeper_id"] for r in primary.values()}
+                  for key in sorted(candidates):
+                      row = candidates[key]
+                      sid = row["sleeper_id"]
+                      if sid in existing_ids:
+                          continue  # A duplicate player identity is NOT silently adopted.
+                      existing_ids.add(sid)
+                      fallback[key] = {**row, "match_method": "directory_verified_" + row["match_method"]}
+
+              resolved = {**primary, **fallback}
+              unresolved = [{
+                  "model_key": key, "model_pos": player_db[key].get("pos"),
+                  "reason": "not uniquely verified by projection input or full Sleeper directory",
+              } for key in player_db if key not in resolved]
+              coverage = len(resolved) / max(1, len(player_db))
+              if coverage < 0.95:
+                  raise RuntimeError(
+                      f"Only {len(resolved)}/{len(player_db)} model keys resolved to Sleeper IDs "
+                      f"({coverage:.1%}); refusing to capture a materially incomplete outcome target."
+                  )
+              return resolved, unresolved, len(primary), len(fallback)
+
+
+          def build_outcomes(state_fetcher=fetch_state, week_fetcher=fetch_week):''',
+              ),
+              (
+                '''    by_name, by_id = build_sleeper_identity_index(identity_rows)
+              resolved, unresolved = resolve_model_identities(player_db, by_name, by_id)''',
+                '''    resolved, unresolved, projected_count, directory_backfill_count = (
+                  resolve_with_full_directory_fallback(player_db, identity_rows)
+              )''',
+              ),
+              (
+                '''        "resolved_model_key_count": len(resolved),''',
+                '''        "resolved_model_key_count": len(resolved),
+                  "resolved_from_projection_identity": projected_count,
+                  "resolved_from_full_directory_fallback": directory_backfill_count,
+                  "full_directory_fallback_requires_position_compatibility": True,''',
+              ),
+          ]
+          for old, new in rules:
+              if s.count(old) != 1:
+                  raise SystemExit(f'FAIL CLOSED: expected exactly one source anchor, got {s.count(old)}: {old[:85]!r}')
+              s = s.replace(old, new, 1)
+          p.write_text(s, encoding='utf-8')
+          print('PASS: scope-limited outcome identity fallback patch assembled')
+          PY_PATCH
+
+      - name: Verify patched self-tests and negative identity scenarios
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile scripts/validation/capture_realized_outcomes.py
+          python - <<'PY_SELFTEST'
+          import sys
+          sys.path.insert(0, 'scripts/validation')
+          import capture_realized_outcomes as c
+
+          # Existing collision/alias selftests must continue to pass.
+          c.run_selftest()
+
+          # Demonstrate projection-coverage dropout: official full directory saves
+          # missing player IDs without inventing or relabeling model keys.
+          pdb = {
+              'alpha test': {'pos': 'QB'},
+              'beta test': {'pos': 'RB'},
+              'gamma test': {'pos': 'WR'},
+          }
+          def row(id,name,pos):
+              return {'sleeper_id':id,'player':name,'pos':pos,'team':'TST',
+                      'fantasy_positions':[pos]}
+          projected = [row('101','alpha test','QB')] + [
+              row(str(50000+i),f'projection irrelevant {i}','QB') for i in range(500)
+          ]
+          full = [row('101','alpha test','QB'), row('102','beta test','RB'),
+                  row('103','gamma test','WR')]
+          # The function expects >=5000 official directory IDs. Add clearly unrelated
+          # synthetic players; no false aliases can pass the test.
+          full += [row(str(10000+i),f'unrelated synthetic {i}','QB') for i in range(5000)]
+          r, unresolved, direct, fallback = c.resolve_with_full_directory_fallback(
+              pdb, projected, directory_fetcher=lambda: full
+          )
+          assert (len(r), len(unresolved), direct, fallback) == (3,0,1,2)
+          assert r['beta test']['match_method'].startswith('directory_verified_')
+
+          # Negative test: unique but position-incompatible name cannot be added.
+          not_valid = dict(pdb)
+          not_valid['wrong position'] = {'pos':'DL'}
+          full += [row('104','wrong position','QB')]
+          try:
+              c.resolve_with_full_directory_fallback(
+                 not_valid, projected, directory_fetcher=lambda: full
+              )
+          except RuntimeError as e:
+              assert 'materially incomplete outcome target' in str(e), str(e)
+          else:
+              raise AssertionError('Incorrect-position candidate was not refused')
+
+          print('PASS synthetic dropout recovery, stable IDs, position validation and fail-closed gate')
+          PY_SELFTEST
+
+      - name: Reproduce fresh Sleeper projection inputs without committing them
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/projections/sleeper_projections_pipeline.py --selftest
+          python scripts/projections/sleeper_projections_pipeline.py
+
+      - name: Recompute Week 7 realized outcomes with full-directory fallback
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/validation/capture_realized_outcomes.py
+          python - <<'PY_EVIDENCE'
+          import json, os
+          from pathlib import Path
+          p=Path('research/model-history/outcomes/2026.json')
+          d=json.loads(p.read_text())
+          expected=565
+          assert d['model_key_count']==expected, d['model_key_count']
+          assert d['resolved_model_key_count']==expected, (
+              'Must preserve the previous 565/565 evidence standard, not lower the gate',
+              d['resolved_model_key_count'], d['unresolved_model_keys']
+          )
+          assert 7 in d['weeks_with_realized_data'], d['weeks_with_realized_data']
+          assert d['resolved_from_full_directory_fallback'] > 0, 'No dropout recovery observed'
+          summary={
+            'status':'PASS_WEEK7_OUTCOME_IDENTITY_REPAIR_CANDIDATE',
+            'mode':os.environ.get('REPAIR_MODE'),
+            'season':2026,
+            'model_key_count':expected,
+            'resolved_model_key_count':d['resolved_model_key_count'],
+            'projection_matches':d['resolved_from_projection_identity'],
+            'directory_verified_fallbacks':d['resolved_from_full_directory_fallback'],
+            'unresolved_model_keys':d['unresolved_model_keys'],
+            'weeks_with_realized_data':d['weeks_with_realized_data'],
+            'production_changes_authorized':False,
+            'changed_source_scope':['scripts/validation/capture_realized_outcomes.py'],
+          }
+          out=Path(os.environ['RUNNER_TEMP'])/'week7-identity-repair-audit.json'
+          out.write_text(json.dumps(summary,indent=2)+'\n')
+          print(json.dumps(summary,indent=2))
+          PY_EVIDENCE
+        env:
+          REPAIR_MODE: ${{ inputs.mode }}
+
+      - name: Prove no deployed calculator files were touched
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in index.html free-agent-board.html scripts/model/ppg_pipeline.py scripts/validation/snapshot_values.py; do
+            git diff --quiet -- "$f" || { echo "::error::Unexpected protected-surface edit: $f"; exit 1; }
+          done
+          # Only patch the outcome resolver; fresh source and derived outcomes
+          # remain unstaged so the next Scheduled Data Refresh can regenerate
+          # and commit the complete evidence package atomically.
+          git add scripts/validation/capture_realized_outcomes.py
+          staged="$(git diff --cached --name-only)"
+          test "$staged" = 'scripts/validation/capture_realized_outcomes.py'
+          git diff --cached --check
+          echo 'PASS: no production pricing or frozen model files staged'
+
+      - name: APPLY guarded outcome resolver source fix
+        if: inputs.mode == 'APPLY'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'A W7R1: preserve realized outcome identities when projections drop players'
+          git push origin HEAD:main
+          echo 'Applied only outcome-capture resolver source. Next run Scheduled Data Refresh (full).'
+
+      - name: Upload preproduction evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A-W7R1-Outcome-Identity-Repair-${{ inputs.mode }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/week7-identity-repair-audit.json
+          if-no-files-found: warn
+
+      - name: Final mode summary
+        if: success()
+        run: |
+          if [ '${{ inputs.mode }}' = 'PREVIEW' ]; then
+            echo 'PREVIEW GREEN: validated a Week 7 565/565 candidate; repository remains unchanged.' >> "$GITHUB_STEP_SUMMARY"
+            echo 'If this evidence is acceptable, rerun this workflow with mode APPLY.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'APPLY GREEN: resolver source fix committed; run Scheduled Data Refresh with mode full.' >> "$GITHUB_STEP_SUMMARY"
+          fi
