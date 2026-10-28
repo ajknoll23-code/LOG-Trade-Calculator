@@ -61,6 +61,7 @@ SLEEPER_IDENTITY_PATH = (
 )
 OUTPUT_PATH = REPO_ROOT / "research" / "model-history" / "outcomes" / f"{SEASON}.json"
 SCORING_SOURCE_PATH = REPO_ROOT / "scripts" / "model" / "ppg_pipeline.py"
+FROZEN_OUTCOME_REGISTRY_PATH = REPO_ROOT / "research" / "model-history" / "identity" / "2026-w06-sleeper-registry.json"
 
 STATE_URL = "https://api.sleeper.app/v1/state/nfl"
 STATS_URL = "https://api.sleeper.app/v1/stats/nfl/regular/{season}/{week}"
@@ -158,7 +159,7 @@ def build_sleeper_identity_index(rows: Any, minimum_ids: int = 500):
     return dict(by_name), by_id
 
 
-def resolve_model_identities(player_db, by_name, by_id):
+def resolve_model_identities(player_db, by_name, by_id, minimum_coverage=0.95):
     resolved = {}
     unresolved = []
 
@@ -266,7 +267,7 @@ def resolve_model_identities(player_db, by_name, by_id):
             })
 
     coverage = len(resolved) / max(1, len(player_db))
-    if coverage < 0.95:
+    if coverage < minimum_coverage:
         raise RuntimeError(
             f"Only {len(resolved)}/{len(player_db)} model keys resolved to Sleeper IDs "
             f"({coverage:.1%}); refusing to capture a materially incomplete outcome target."
@@ -349,13 +350,79 @@ def build_week_rows(week_data, resolved):
     return rows
 
 
+def resolve_with_frozen_outcome_registry(player_db, current_projection_rows):
+    # Unlike projections, Sleeper IDs remain stable when projected stats disappear.
+    # Reuse the previously GREEN 565-player identity audit; never estimate an ID.
+    import hashlib
+    registry = load_json(FROZEN_OUTCOME_REGISTRY_PATH)
+    entries = registry.get("entries")
+    if registry.get("schema_version") != 1 or not isinstance(entries, dict):
+        raise RuntimeError("Missing or invalid frozen outcome identity registry")
+    if registry.get("source_resolution_count") != 565 or len(entries) != 565:
+        raise RuntimeError("Frozen identity registry does not contain its verified 565 entries")
+    if set(entries) != set(player_db):
+        removed = sorted(set(entries)-set(player_db))
+        added = sorted(set(player_db)-set(entries))
+        raise RuntimeError(f"Model identity pool changed; audit new identities first. added={added} removed={removed}")
+    current_signature = json.dumps(
+        {k: player_db[k]["pos"] for k in sorted(player_db)},
+        sort_keys=True, separators=(",", ":"),
+    )
+    current_hash = hashlib.sha256(current_signature.encode()).hexdigest()
+    if current_hash != registry.get("model_key_pos_sha256"):
+        raise RuntimeError("Model position/identity signature differs from validated historical registry")
+
+    by_name, by_id = build_sleeper_identity_index(current_projection_rows)
+    projected, _ = resolve_model_identities(
+        player_db, by_name, by_id, minimum_coverage=0.0
+    )
+    resolved = {}
+    mismatch = []
+    for key in sorted(player_db):
+        frozen = entries[key]
+        sid = str(frozen.get("sleeper_id") or "")
+        if not sid or frozen.get("model_pos") != player_db[key]["pos"]:
+            raise RuntimeError(f"Invalid frozen stable-ID record: {key}")
+        fresh = projected.get(key)
+        if fresh and fresh["sleeper_id"] != sid:
+            mismatch.append({
+                "model_key": key, "frozen_id": sid,
+                "projected_id": fresh["sleeper_id"],
+            })
+        resolved[key] = {
+            **frozen,
+            "model_key": key,
+            "model_pos": player_db[key]["pos"],
+            "model_team": str(player_db[key].get("team") or "").upper(),
+            "match_method": (
+                "historical_stable_id_reconfirmed_by_current_projection"
+                if fresh else "historical_stable_id_player_dropped_from_projection"
+            ),
+        }
+    if mismatch:
+        raise RuntimeError(
+            "Stable-ID conflicts with newly generated projections; manual review required: "
+            + json.dumps(mismatch, sort_keys=True)
+        )
+    # Preserve the same collision structure as the original known-good registry.
+    groups = defaultdict(list)
+    for key, record in resolved.items():
+        groups[record["sleeper_id"]].append(key)
+    old_dupes = registry.get("id_collisions_in_known_good_baseline", {})
+    new_dupes = {sid: sorted(keys) for sid, keys in groups.items() if len(keys) > 1}
+    if new_dupes != old_dupes:
+        raise RuntimeError("Previously audited stable-ID collision pattern changed")
+    return resolved, [], len(projected), len(resolved)-len(projected)
+
+
 def build_outcomes(state_fetcher=fetch_state, week_fetcher=fetch_week):
     cfg = snapshot_values.load_from_html(INDEX_PATH)
     player_db = cfg["player_db"]
 
     identity_rows = load_json(SLEEPER_IDENTITY_PATH)
-    by_name, by_id = build_sleeper_identity_index(identity_rows)
-    resolved, unresolved = resolve_model_identities(player_db, by_name, by_id)
+    resolved, unresolved, current_projected_count, historical_fallback_count = (
+        resolve_with_frozen_outcome_registry(player_db, identity_rows)
+    )
 
     grouped_ids = defaultdict(list)
     for model_key, identity in resolved.items():
@@ -389,7 +456,10 @@ def build_outcomes(state_fetcher=fetch_state, week_fetcher=fetch_week):
         "source_url_template": STATS_URL,
         "scoring_source": "scripts/model/ppg_pipeline.py::score_week",
         "scoring_source_sha256": sha256_file(SCORING_SOURCE_PATH),
-        "identity_source": str(SLEEPER_IDENTITY_PATH.relative_to(REPO_ROOT)),
+        "identity_source": str(FROZEN_OUTCOME_REGISTRY_PATH.relative_to(REPO_ROOT)),
+        "projection_identity_source": str(SLEEPER_IDENTITY_PATH.relative_to(REPO_ROOT)),
+        "frozen_registry_reconfirmed_by_projection": current_projected_count,
+        "frozen_registry_fallback_for_projection_dropouts": historical_fallback_count,
         "model_source": "index.html::PLAYER_DB",
         "model_key_count": len(player_db),
         "resolved_model_key_count": len(resolved),
