@@ -1,0 +1,307 @@
+# Revision R2 after failed PREVIEW run 40616293432.
+# Upload as .github/workflows/A-W7R2.yml; keep old R1 only until R2 is green.
+name: A - W7R2 Identity Repair
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'PREVIEW tests only; APPLY commits outcome-registry repair after guards pass'
+        required: true
+        default: PREVIEW
+        type: choice
+        options: [PREVIEW, APPLY]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  guarded-outcome-identity-repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install existing dependency
+        run: python -m pip install 'requests>=2.32,<3'
+
+      - name: Preserve the 565 original verified Sleeper identities
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Pin original tested implementation and the Oct 20 known-good identity pool.
+          test "$(git hash-object scripts/validation/capture_realized_outcomes.py)" = '999d418302a6523a5558eb3926c921977e66d0e9'
+          test "$(git hash-object scripts/artifacts/generated/sleeper_2026_raw_categories.json)" = '8b879c2292a888426ad38f43ff9d0594c140f635'
+          python scripts/validation/capture_realized_outcomes.py --selftest
+          python - <<'PY_REGISTRY'
+          import sys, json, hashlib
+          from datetime import datetime, timezone
+          from pathlib import Path
+          sys.path.insert(0, 'scripts/validation')
+          import capture_realized_outcomes as o
+          import snapshot_values
+
+          db = snapshot_values.load_from_html('index.html')['player_db']
+          assert len(db)==565, f'Expected known-good 565 model keys; got {len(db)}'
+          raw = o.load_json(o.SLEEPER_IDENTITY_PATH)
+          names, ids = o.build_sleeper_identity_index(raw)
+          resolved, unresolved = o.resolve_model_identities(db, names, ids)
+          assert len(resolved)==565 and not unresolved, (
+              'Previously committed Sleeper projection identity source no longer recovers 565/565', unresolved
+          )
+
+          # This is an evidence snapshot, not an identity guess or pricing input.
+          # Preserve historical duplicate SIDs, if any, for audit instead of silently modifying them.
+          entries = {}
+          sid_groups = {}
+          for key in sorted(resolved):
+              row = resolved[key]
+              sid = row['sleeper_id']
+              sid_groups.setdefault(sid, []).append(key)
+              entries[key] = {
+                  'sleeper_id': sid,
+                  'player': row['player'],
+                  'pos': row['pos'],
+                  'team': row['team'],
+                  'fantasy_positions': row['fantasy_positions'],
+                  'model_pos': db[key]['pos'],
+                  'match_method_at_2026w06_close': row['match_method'],
+              }
+          collisions = {sid: ks for sid, ks in sid_groups.items() if len(ks)>1}
+          # A deterministic checksum detects roster identity/name/position changes.
+          signature = json.dumps({k: db[k]['pos'] for k in sorted(db)}, sort_keys=True, separators=(',', ':'))
+          roster_hash = hashlib.sha256(signature.encode()).hexdigest()
+          path = Path('research/model-history/identity/2026-w06-sleeper-registry.json')
+          path.parent.mkdir(parents=True, exist_ok=True)
+          payload = {
+              'schema_version': 1,
+              'status': 'FROZEN_OUTCOME_IDENTITY_REGISTRY_FROM_LAST_GREEN_REFRESH',
+              'source': 'scripts/artifacts/generated/sleeper_2026_raw_categories.json',
+              'source_sha256': o.sha256_file(o.SLEEPER_IDENTITY_PATH),
+              'model_key_pos_sha256': roster_hash,
+              'model_key_count': 565,
+              'source_resolution_count': 565,
+              'id_collisions_in_known_good_baseline': collisions,
+              'entries': entries,
+              'production_pricing_authorized': False,
+          }
+          path.write_text(json.dumps(payload, indent=2, sort_keys=True)+'\n')
+          print('FROZEN REGISTRY: 565/565 recovered from the original committed source')
+          print('Known-good duplicate-ID groups:', json.dumps(collisions, sort_keys=True))
+          print('Registry SHA256:', hashlib.sha256(path.read_bytes()).hexdigest())
+          PY_REGISTRY
+
+      - name: Patch only the outcomes resolver to use historical stable IDs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY_PATCH'
+          from pathlib import Path
+          p=Path('scripts/validation/capture_realized_outcomes.py')
+          s=p.read_text(encoding='utf-8')
+          rules=[
+              (
+                  'SCORING_SOURCE_PATH = REPO_ROOT / "scripts" / "model" / "ppg_pipeline.py"',
+                  'SCORING_SOURCE_PATH = REPO_ROOT / "scripts" / "model" / "ppg_pipeline.py"\n'
+                  'FROZEN_OUTCOME_REGISTRY_PATH = REPO_ROOT / "research" / "model-history" / "identity" / "2026-w06-sleeper-registry.json"'
+              ),
+              (
+                  'def resolve_model_identities(player_db, by_name, by_id):',
+                  'def resolve_model_identities(player_db, by_name, by_id, minimum_coverage=0.95):'
+              ),
+              (
+                  '    if coverage < 0.95:\n',
+                  '    if coverage < minimum_coverage:\n'
+              ),
+              (
+                  'def build_outcomes(state_fetcher=fetch_state, week_fetcher=fetch_week):',
+                  '''def resolve_with_frozen_outcome_registry(player_db, current_projection_rows):
+              # Unlike projections, Sleeper IDs remain stable when projected stats disappear.
+              # Reuse the previously GREEN 565-player identity audit; never estimate an ID.
+              import hashlib
+              registry = load_json(FROZEN_OUTCOME_REGISTRY_PATH)
+              entries = registry.get("entries")
+              if registry.get("schema_version") != 1 or not isinstance(entries, dict):
+                  raise RuntimeError("Missing or invalid frozen outcome identity registry")
+              if registry.get("source_resolution_count") != 565 or len(entries) != 565:
+                  raise RuntimeError("Frozen identity registry does not contain its verified 565 entries")
+              if set(entries) != set(player_db):
+                  removed = sorted(set(entries)-set(player_db))
+                  added = sorted(set(player_db)-set(entries))
+                  raise RuntimeError(f"Model identity pool changed; audit new identities first. added={added} removed={removed}")
+              current_signature = json.dumps(
+                  {k: player_db[k]["pos"] for k in sorted(player_db)},
+                  sort_keys=True, separators=(",", ":"),
+              )
+              current_hash = hashlib.sha256(current_signature.encode()).hexdigest()
+              if current_hash != registry.get("model_key_pos_sha256"):
+                  raise RuntimeError("Model position/identity signature differs from validated historical registry")
+
+              by_name, by_id = build_sleeper_identity_index(current_projection_rows)
+              projected, _ = resolve_model_identities(
+                  player_db, by_name, by_id, minimum_coverage=0.0
+              )
+              resolved = {}
+              mismatch = []
+              for key in sorted(player_db):
+                  frozen = entries[key]
+                  sid = str(frozen.get("sleeper_id") or "")
+                  if not sid or frozen.get("model_pos") != player_db[key]["pos"]:
+                      raise RuntimeError(f"Invalid frozen stable-ID record: {key}")
+                  fresh = projected.get(key)
+                  if fresh and fresh["sleeper_id"] != sid:
+                      mismatch.append({
+                          "model_key": key, "frozen_id": sid,
+                          "projected_id": fresh["sleeper_id"],
+                      })
+                  resolved[key] = {
+                      **frozen,
+                      "model_key": key,
+                      "model_pos": player_db[key]["pos"],
+                      "model_team": str(player_db[key].get("team") or "").upper(),
+                      "match_method": (
+                          "historical_stable_id_reconfirmed_by_current_projection"
+                          if fresh else "historical_stable_id_player_dropped_from_projection"
+                      ),
+                  }
+              if mismatch:
+                  raise RuntimeError(
+                      "Stable-ID conflicts with newly generated projections; manual review required: "
+                      + json.dumps(mismatch, sort_keys=True)
+                  )
+              # Preserve the same collision structure as the original known-good registry.
+              groups = defaultdict(list)
+              for key, record in resolved.items():
+                  groups[record["sleeper_id"]].append(key)
+              old_dupes = registry.get("id_collisions_in_known_good_baseline", {})
+              new_dupes = {sid: sorted(keys) for sid, keys in groups.items() if len(keys) > 1}
+              if new_dupes != old_dupes:
+                  raise RuntimeError("Previously audited stable-ID collision pattern changed")
+              return resolved, [], len(projected), len(resolved)-len(projected)
+
+
+          def build_outcomes(state_fetcher=fetch_state, week_fetcher=fetch_week):'''
+              ),
+              (
+                  '''    by_name, by_id = build_sleeper_identity_index(identity_rows)
+              resolved, unresolved = resolve_model_identities(player_db, by_name, by_id)''',
+                  '''    resolved, unresolved, current_projected_count, historical_fallback_count = (
+                  resolve_with_frozen_outcome_registry(player_db, identity_rows)
+              )'''
+              ),
+              (
+                  '        "identity_source": str(SLEEPER_IDENTITY_PATH.relative_to(REPO_ROOT)),',
+                  '''        "identity_source": str(FROZEN_OUTCOME_REGISTRY_PATH.relative_to(REPO_ROOT)),
+                  "projection_identity_source": str(SLEEPER_IDENTITY_PATH.relative_to(REPO_ROOT)),
+                  "frozen_registry_reconfirmed_by_projection": current_projected_count,
+                  "frozen_registry_fallback_for_projection_dropouts": historical_fallback_count,'''
+              ),
+          ]
+          for old,new in rules:
+              n=s.count(old)
+              if n!=1:
+                  raise RuntimeError(f'FAIL CLOSED: expected 1 patch anchor, found {n}: {old[:100]!r}')
+              s=s.replace(old,new,1)
+          p.write_text(s,encoding='utf-8')
+          print('PASS patched six exact source anchors')
+          PY_PATCH
+          python -m py_compile scripts/validation/capture_realized_outcomes.py
+          python scripts/validation/capture_realized_outcomes.py --selftest
+
+      - name: Refresh projection evidence in test workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/projections/sleeper_projections_pipeline.py --selftest
+          python scripts/projections/sleeper_projections_pipeline.py
+
+      - name: Check refreshed identity conflicts and Week 7 outcomes
+        shell: bash
+        env:
+          REPAIR_MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          # Logs number of historical fallback IDs; fails CLOSED on ID conflicts.
+          python scripts/validation/capture_realized_outcomes.py
+          python - <<'PY_EVIDENCE'
+          import json, os
+          from pathlib import Path
+          d=json.loads(Path('research/model-history/outcomes/2026.json').read_text())
+          assert d['model_key_count']==565, d['model_key_count']
+          assert d['resolved_model_key_count']==565, d['resolved_model_key_count']
+          assert not d['unresolved_model_keys'], d['unresolved_model_keys']
+          assert 7 in d['weeks_with_realized_data'], d['weeks_with_realized_data']
+          assert d['frozen_registry_fallback_for_projection_dropouts']>0, 'No projection dropout reproduced'
+          evidence={
+              'status': 'PASS_W7R2_GUARDED_PREVIEW_CANDIDATE',
+              'mode': os.environ['REPAIR_MODE'],
+              'resolved': 565,
+              'reconfirmed_current_projection': d['frozen_registry_reconfirmed_by_projection'],
+              'retrieved_from_last_green_identity_snapshot': d['frozen_registry_fallback_for_projection_dropouts'],
+              'completed_weeks': d['weeks_with_realized_data'],
+              'protected_production_pricing_changed': False,
+          }
+          out=Path(os.environ['RUNNER_TEMP'])/'A-W7R2-repair-evidence.json'
+          out.write_text(json.dumps(evidence,indent=2)+'\n')
+          print(json.dumps(evidence, indent=2))
+          PY_EVIDENCE
+
+      - name: Verify protected pricing untouched and stage two repair files only
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in index.html free-agent-board.html scripts/model/ppg_pipeline.py scripts/validation/snapshot_values.py scripts/identity_crosswalk.json; do
+            git diff --quiet -- "$f" || { echo "::error::Protected file unexpectedly changed: $f"; exit 1; }
+          done
+          git add scripts/validation/capture_realized_outcomes.py \
+            research/model-history/identity/2026-w06-sleeper-registry.json
+          python - <<'PY_STAGE'
+          import subprocess
+          changed=set(subprocess.check_output(['git','diff','--cached','--name-only'],text=True).splitlines())
+          allowed={
+            'scripts/validation/capture_realized_outcomes.py',
+            'research/model-history/identity/2026-w06-sleeper-registry.json',
+          }
+          assert changed==allowed, (changed, allowed)
+          print('PASS only two outcome-research files staged; no calculator/production changes')
+          PY_STAGE
+          git diff --cached --check
+
+      - name: APPLY verified research-only patch
+        if: inputs.mode == 'APPLY'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'A W7R2: restore stable player IDs for Week 7 outcomes'
+          git push origin HEAD:main
+          echo 'APPLY GREEN: fixed outcome resolver and saved 565 audited identities.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Next: run Scheduled Data Refresh in full mode.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A-W7R2-${{ inputs.mode }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/A-W7R2-repair-evidence.json
+          if-no-files-found: warn
+
+      - name: PREVIEW summary
+        if: success() && inputs.mode == 'PREVIEW'
+        run: |
+          echo 'PREVIEW GREEN: 565/565 auditable ID resolution, Week 7 outcomes present.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'No changes committed; rerun APPLY to write only the two approved outcome files.' >> "$GITHUB_STEP_SUMMARY"
