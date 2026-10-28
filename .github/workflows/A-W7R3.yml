@@ -1,0 +1,230 @@
+# Week 7 follow-on: Scheduled Data Refresh run 40636422018 succeeded at
+# capturing 565/565 outcome identities, but failed in build_value_uncertainty.py
+# because it still called the old projection-only identity resolver.
+# Install at .github/workflows/A-W7R3.yml
+name: A - W7R3 Uncertainty Repair
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'PREVIEW tests without committing; APPLY commits one validated source fix'
+        required: true
+        default: PREVIEW
+        type: choice
+        options: [PREVIEW, APPLY]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  uncertainty-identity-repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install existing HTTP dependency
+        run: python -m pip install 'requests>=2.32,<3'
+
+      - name: Assert W7R2 source and frozen registry are present
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git hash-object scripts/validation/capture_realized_outcomes.py)" = '50d272093aa34135eeec4bd2f3ae4715bad744b6'
+          test "$(git hash-object scripts/validation/build_value_uncertainty.py)" = '18bc83fe39a50b4e7cbaf6b1f5799f471afa5f6f'
+          test -s research/model-history/identity/2026-w06-sleeper-registry.json
+          python scripts/validation/capture_realized_outcomes.py --selftest
+          python scripts/validation/build_value_uncertainty.py --selftest
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p=Path('research/model-history/identity/2026-w06-sleeper-registry.json')
+          j=json.loads(p.read_text())
+          assert j['source_resolution_count']==565 and len(j['entries'])==565
+          print('PASS: immutable verified 565-player registry and both baseline self-tests')
+          PY
+
+      - name: Patch only uncertainty identity consumer
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('scripts/validation/build_value_uncertainty.py')
+          s=p.read_text(encoding='utf-8')
+          anchor_start = '    identity_rows = read_json(SLEEPER_IDENTITY_PATH)\n'
+          anchor_end = '    model_to_sleeper = {\n'
+          if s.count(anchor_start) != 1 or s.count(anchor_end) != 1:
+              raise RuntimeError('FAIL CLOSED: uncertainty identity anchors changed')
+          i = s.index(anchor_start)
+          j = s.index(anchor_end, i)
+          old = s[i:j]
+          expected = (
+              'capture_realized_outcomes.resolve_model_identities(',
+              'capture_realized_outcomes.build_sleeper_identity_index(',
+              'corroborate_projection_missing_identities(',
+              'historical_ppg_rows = read_json(PPG_PATH)',
+          )
+          if any(old.count(piece) != 1 for piece in expected):
+              raise RuntimeError('FAIL CLOSED: old identity consumer does not match reviewed logic')
+          new_lines = [
+              '    identity_rows = read_json(SLEEPER_IDENTITY_PATH)',
+              '    # Reuse outcome-history stable IDs when players drop from projections.',
+              '    # The shared resolver rejects changed names, positions, ID conflicts,',
+              '    # and baseline collisions; never guess an unknown Sleeper identity.',
+              '    resolved, unresolved, projected_count, fallback_count = (',
+              '        capture_realized_outcomes.resolve_with_frozen_outcome_registry(',
+              '            cfg["player_db"], identity_rows',
+              '        )',
+              '    )',
+              '    if (unresolved or len(resolved) != len(cfg["player_db"])',
+              '            or projected_count + fallback_count != len(resolved)):',
+              '        raise RuntimeError("Uncertainty identity coverage/accounting failed")',
+              '    # Crosswalk/PPG remain evidence inputs, not identity fallback guesses.',
+              '    crosswalk_rows = read_json(IDENTITY_CROSSWALK_PATH)',
+              '    historical_ppg_rows = read_json(PPG_PATH)',
+              '',
+          ]
+          s = s[:i] + '\n'.join(new_lines) + '\n' + s[j:]
+          p.write_text(s,encoding='utf-8')
+          print('PASS: updated one identity-consumer block; envelope formula untouched')
+          PY
+          python -m py_compile scripts/validation/build_value_uncertainty.py
+          python scripts/validation/build_value_uncertainty.py --selftest
+          git diff --check
+
+      - name: Verify existing 565 IDs and reject conflict scenarios
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sys, json, copy, tempfile
+          from pathlib import Path
+          sys.path.insert(0,'scripts/validation')
+          import snapshot_values as sv
+          import capture_realized_outcomes as o
+          db=sv.load_from_html('index.html')['player_db']
+          source=json.loads(o.SLEEPER_IDENTITY_PATH.read_text())
+          resolved,unresolved,pcount,fcount=o.resolve_with_frozen_outcome_registry(db,source)
+          assert len(resolved)==565 and not unresolved
+          assert pcount+fcount==565
+          assert len({row['sleeper_id'] for row in resolved.values()})==565
+          original=o.FROZEN_OUTCOME_REGISTRY_PATH
+          source_registry=json.loads(original.read_text())
+          with tempfile.TemporaryDirectory() as td:
+              tmp=Path(td)/'registry.json'
+              trial=copy.deepcopy(source_registry)
+              k=next(iter(trial['entries']))
+              trial['entries'][k]['model_pos']='MISMATCH'
+              tmp.write_text(json.dumps(trial))
+              try:
+                  o.FROZEN_OUTCOME_REGISTRY_PATH=tmp
+                  try:
+                      o.resolve_with_frozen_outcome_registry(db,source)
+                  except RuntimeError:
+                      print('PASS: altered frozen position record rejected')
+                  else:
+                      raise AssertionError('Tampered identity registry was accepted')
+              finally:
+                  o.FROZEN_OUTCOME_REGISTRY_PATH=original
+          print(f'PASS: baseline identities 565/565, current projections {pcount}, historical fallback {fcount}')
+          PY
+
+      - name: Recreate live Sleeper projection dropout in isolated test workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/projections/sleeper_projections_pipeline.py --selftest
+          python scripts/projections/sleeper_projections_pipeline.py
+
+      - name: Build and validate 565-player value uncertainty envelope
+        shell: bash
+        env:
+          REPAIR_MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          python scripts/validation/build_value_uncertainty.py --write
+          python - <<'PY'
+          import sys, json, os, hashlib
+          from pathlib import Path
+          sys.path.insert(0, 'scripts/validation')
+          import snapshot_values as sv
+          import capture_realized_outcomes as o
+          db=sv.load_from_html('index.html')
+          model_values=sv.compute_all_values(db)
+          j=json.loads(Path('scripts/artifacts/generated/value_uncertainty.json').read_text())
+          assert j['counts']['player_count']==565, j['counts']
+          assert len(j['players'])==565, len(j['players'])
+          for key in model_values:
+              assert key in j['players'], key
+              assert j['players'][key]['center_value']==model_values[key]['value'], key
+          resolved,unresolved,pcount,fcount=o.resolve_with_frozen_outcome_registry(
+              db['player_db'],json.loads(o.SLEEPER_IDENTITY_PATH.read_text()))
+          assert len(resolved)==565 and not unresolved and pcount+fcount==565
+          summary={
+              'status':'PASS_W7R3_UNCERTAINTY_REPAIR_PREVIEW_VALIDATED',
+              'mode':os.environ['REPAIR_MODE'],
+              'model_keys':565,'identity_matches':len(resolved),
+              'matched_current_projection':pcount,'matched_historical_registry_fallback':fcount,
+              'uncertainty_records':len(j['players']),
+              'centers_equal_deployed_values':True,
+              'source_change_authorized_only':'scripts/validation/build_value_uncertainty.py',
+              'FV_MV_or_uncertainty_formula_changes_authorized':False,
+          }
+          path=Path(os.environ['RUNNER_TEMP'])/'A-W7R3-evidence.json'
+          path.write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(summary,indent=2,sort_keys=True))
+          PY
+
+      - name: Ensure only the uncertainty source patch can be committed
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --quiet -- index.html trade-desk.html free-agent-board.html scripts/validation/capture_realized_outcomes.py scripts/model/ppg_pipeline.py
+          git diff --check
+          git add scripts/validation/build_value_uncertainty.py
+          python - <<'PY'
+          import subprocess
+          staged=subprocess.check_output(['git','diff','--cached','--name-only'],text=True).splitlines()
+          assert staged==['scripts/validation/build_value_uncertainty.py'], staged
+          print('PASS: exactly one vetted source file staged; no pricing or scoring source staged')
+          PY
+
+      - name: APPLY one tested uncertainty source fix
+        if: ${{ inputs.mode == 'APPLY' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'A-W7R3: align uncertainty identity with verified Week 7 outcome registry'
+          git push origin main
+          echo 'APPLY GREEN: uncertainty consumer fixed; next run Scheduled Data Refresh in full mode.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A-W7R3-${{ inputs.mode }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/A-W7R3-evidence.json
+          if-no-files-found: warn
+
+      - name: PREVIEW summary
+        if: ${{ inputs.mode == 'PREVIEW' }}
+        run: |
+          echo 'PREVIEW GREEN: uncertainty engine built all 565 records and preserved all existing FV centers.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'No repair committed. Rerun the same workflow in APPLY mode.' >> "$GITHUB_STEP_SUMMARY"
