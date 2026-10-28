@@ -1,0 +1,364 @@
+name: A - QA02 Roster Integrity Phantom Player Repair (Guarded)
+run-name: A-QA02 ${{ inputs.mode }}
+'on':
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Run PREVIEW first; APPLY requires matching green PREVIEW run
+        required: true
+        type: choice
+        default: PREVIEW
+        options:
+          - PREVIEW
+          - APPLY
+      preview_run_id:
+        description: Numeric green A-QA02 PREVIEW run ID (APPLY only)
+        type: string
+        required: false
+        default: ''
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+jobs:
+  qa02:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      QA02_MODE: ${{ inputs.mode }}
+      QA02_PREVIEW_RUN_ID: ${{ inputs.preview_run_id }}
+      QA02_OUT: /tmp/A-QA02-review
+    steps:
+      - name: Check out exact current main without write credentials
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Materialize and syntax-check A-QA02 pinned audit engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/qa02_engine.py" <<'PY_QA02_ENGINE'
+          #!/usr/bin/env python3
+          """A-QA02: exact-source, preflighted and review-pinned roster phantom repair.
+
+          PREVIEW does not mutate the repository. APPLY requires reviewed matching successful
+          PREVIEW artifact, source SHA equality, and a dedicated push secret. Modifies
+          index.html and trade-desk-preview.html only. Production FV math unchanged.
+          """
+          from __future__ import annotations
+          import difflib, hashlib, json, os, pathlib, re, subprocess, sys, tempfile
+          from datetime import datetime, timezone
+          ROOT=pathlib.Path.cwd()
+          OUT=pathlib.Path(os.environ.get('QA02_OUT','/tmp/a-qa02-report'))
+          UIS=('index.html','trade-desk-preview.html')
+          PERSONAL="    for(const p of (data[slot] || [])){\n      const key = resolveExistingKey(normalizeName(p.name),p.player_id);"
+          LEAGUE="      for(const p of (roster[slot] || [])){\n        const key = resolveExistingKey(normalizeName(p.name),p.player_id);"
+          VALUE="""function playerValueByKey(key){
+            const info = PLAYER_DB[key];
+            if(!info) return null;
+            return playerValue(info.pos, info.age, info.role, titleCase(key));
+          }"""
+          GUARD="""// A-QA02: a Sleeper sentinel is NOT a player; never price or roster it.
+                if(p && String(p.player_id) === '0' && normalizeName(p.name || '') === 'unknown (0)' &&
+                   !p.position && (!Array.isArray(p.fantasy_positions) || !p.fantasy_positions.length)) continue;
+          """
+          VALUE_NEW="""function playerValueByKey(key){
+            const info = PLAYER_DB[key];
+            // A-QA02: an unrecognized position must never receive the default 5,500 FV.
+            // Keep the existing playerValue() formula unchanged for legitimate players.
+            if(!info || !Object.prototype.hasOwnProperty.call(POSITION_WEIGHT, info.pos)) return null;
+            const value = playerValue(info.pos, info.age, info.role, titleCase(key));
+            return Number.isFinite(value) && value >= 0 ? value : null;
+          }"""
+
+
+          def sha(b):return hashlib.sha256(b).hexdigest()
+          def git(*args):return subprocess.check_output(['git',*args],text=True).strip()
+          def require(ok,msg):
+              if not ok:raise AssertionError(msg)
+          def norm(s):return re.sub(r'\s+',' ',re.sub(r"[.'’\-]",'',str(s or '').strip().lower())).strip()
+
+          def inspect_league():
+              j=json.loads((ROOT/'data/league_rosters.json').read_text(encoding='utf8'))
+              rosters=j.get('rosters',[])
+              require(len(rosters)==12,f'Expected 12 teams, found {len(rosters)}')
+              allrows=[]
+              for r in rosters:
+                  for slot in ('starters','bench','taxi','reserve_ir'):
+                      for p in r.get(slot,[]):allrows.append((r,slot,p))
+              require(len(allrows)>=500,f'Expected full roster, got {len(allrows)}')
+              invalid=[(r,slot,p) for r,slot,p in allrows if str(p.get('player_id'))=='0']
+              require(len(invalid)==1,'Expected exactly one zero-ID sentinel; re-audit new sync state')
+              r,slot,p=invalid[0]
+              require(r.get('roster_id')==8 and slot=='starters','Sentinel source location changed')
+              require(norm(p.get('name'))=='unknown (0)' and not p.get('position') and not p.get('fantasy_positions'), 'Sentinel changed to plausible real player; stop')
+              require(len({str(p.get('player_id')) for _,_,p in allrows})==len(allrows), 'Duplicate roster player IDs; stop')
+              return {'rosters':len(rosters),'source_players':len(allrows),'real_players':len(allrows)-1,'sentinel':{'id':'0','name':p['name'],'roster_id':r['roster_id'],'slot':slot}}
+
+          def patch(src,path):
+              require('A-QA02: a Sleeper sentinel is NOT a player;' not in src,f'{path} already patched')
+              require(src.count(PERSONAL)==1,f'{path}: personal exact anchor missing/ambiguous')
+              require(src.count(LEAGUE)==1,f'{path}: league exact anchor missing/ambiguous')
+              require(src.count(VALUE)==1,f'{path}: key value anchor missing/ambiguous')
+              require(src.count('function playerValue(')==1,f'{path}: pricing formula anchor drift')
+              require(src.count('function resolveExistingKey(')==1,f'{path}: identity resolver drift')
+              require(src.count('const A_ID02_VERIFIED_SLEEPER_IDENTITIES = Object.freeze({')==1, f'{path}: stable-ID map missing')
+              out=src.replace(PERSONAL, PERSONAL.replace('      const key', '      '+GUARD+'      const key'))
+              out=out.replace(LEAGUE, LEAGUE.replace('        const key', '        '+GUARD.replace('\n      if(', '\n        if(').replace('\n         !p.', '\n           !p.')+'        const key'))
+              out=out.replace(VALUE,VALUE_NEW)
+              require(out!=src and out.count('A-QA02: a Sleeper sentinel is NOT a player;')==2, f'{path}: unexpected patch result')
+              require(out.count('A-QA02: an unrecognized position')==1, f'{path}: missing value guard')
+              return out
+
+          # Extract only the production JS definitions required by the actual valuation and
+          # roster-strength calculation. This is the same balanced approach as the existing
+          # scripts/validation/repo_regression_checks.py live-JS parity test.
+          def balanced(text,marker):
+              start=text.find(marker)
+              require(start>=0,'Missing JS marker: '+marker)
+              i=text.find('{',start)
+              require(i>=0,'No opening brace: '+marker)
+              depth=0;quote=None;escape=False;line=False;block=False
+              k=i
+              while k<len(text):
+                  c=text[k];n=text[k+1] if k+1<len(text) else ''
+                  if line:
+                      if c=='\n':line=False
+                  elif block:
+                      if c=='*' and n=='/':block=False;k+=1
+                  elif quote:
+                      if escape:escape=False
+                      elif c=='\\':escape=True
+                      elif c==quote:quote=None
+                  elif c=='/' and n=='/':line=True;k+=1
+                  elif c=='/' and n=='*':block=True;k+=1
+                  elif c in ('\'','"','`'):quote=c
+                  elif c=='{':depth+=1
+                  elif c=='}':
+                      depth-=1
+                      if depth==0:
+                          e=k+1
+                          while e<len(text) and text[e].isspace():e+=1
+                          if e<len(text) and text[e]==';':e+=1
+                          return text[start:e]
+                  k+=1
+              raise AssertionError('Unbalanced JS marker: '+marker)
+
+          def const(src,key):return balanced(src,'const '+key+' =')
+          def fn(src,key):return balanced(src,'function '+key+'(')
+          def scalar(src,key):
+              m=re.search(r'const\s+'+re.escape(key)+r'\s*=\s*[^;]+;',src)
+              require(m is not None,'Missing scalar: '+key)
+              return m.group(0)
+
+          def live_js_parts(src,path):
+              parts=[]
+              for key in ('POSITION_WEIGHT','AGE_CURVE'):parts.append(const(src,key))
+              for key in ('QB_POST_PEAK_FLOOR','LB_POST_PEAK_DECAY_POWER'):parts.append(scalar(src,key))
+              for key in ('ROLE_MULT','PROD_MULT_DATA'):parts.append(const(src,key))
+              parts.append('const PROD_MULT = PROD_MULT_DATA;')
+              for key in ('NO_REAL_PRODUCTION_HISTORY','PLAYER_DB','RB_BIRTH_DATE_DATA','ALIASES'):
+                  parts.append(const(src,key))
+              if 'const CAL22_LEGACY_MONOTONE_KEYS =' in src:parts.append(const(src,'CAL22_LEGACY_MONOTONE_KEYS'))
+              else:parts.append('const CAL22_LEGACY_MONOTONE_KEYS = {};')
+              if path=='index.html':parts.append(const(src,'CAL26_FV_OWNER_ANCHORS'))
+              else:parts.append('const CAL26_FV_OWNER_ANCHORS = {};')
+              parts.append('const ALIASES_REVERSE = Object.fromEntries(Object.entries(ALIASES).map(([a,c]) => [c,a]));')
+              start=src.index('const A_ID02_VERIFIED_SLEEPER_IDENTITIES = Object.freeze({')
+              end=src.index('\n});',start)
+              parts.append(src[start:end+4])
+              for key in ('normalizeName','titleCase'):
+                  # Regex literals containing quotes in normalizeName are not JS strings.
+                  # Match these stable, short functions directly, like repo regression does.
+                  m=re.search(r'function '+key+r'\([^)]*\)\{.*?\n\}',src,re.S)
+                  require(m is not None,f'{path}: cannot extract {key}')
+                  parts.append(m.group(0))
+              for key in ('productionMultiplier','ageMultiplier','fractionalAgeFromBirthDate','rbMonotoneAgeAnchor','rbContinuousAgeMultiplier','effectiveAgeMultiplier','playerValue','resolveExistingKey','normalizePos','pickBestPosition','mergeLeagueRosters','playerValueByKey','computeRosterStrength'):
+                  parts.append(fn(src,key))
+              return '\n\n'.join(parts)
+
+          DRIVER=r'''
+          const fs=require('fs');
+          const source=JSON.parse(fs.readFileSync('data/league_rosters.json','utf8'));
+          const LEAGUE_ROSTERS = {};
+          const TU_SYNC_ELIGIBILITY = new Map(), TU_SYNC_ELIGIBILITY_CONFLICTS = new Set();
+          function resolveSyncedTeam(p,key,existing){return (p && p.team) || (existing && existing.team) || null;}
+          function qf8RecordEligibility(p,key,verified){} // no FV effect; eligibility registry is outside this audit
+          function qf9StatusConflictFlag(p,existing,key){return null;} // warning-only annotation, no FV effect
+          function computeTeamPicks(){return [];} // compare player totals; draft pick prices untouched
+          mergeLeagueRosters(source);
+          const teams=computeRosterStrength();
+          const rosterPlayers={};
+          for(const roster of source.rosters || []){
+            for(const slot of ['starters','bench','taxi','reserve_ir']){
+              for(const p of roster[slot]||[]){
+                const key=resolveExistingKey(normalizeName(p.name),p.player_id);
+                const o=LEAGUE_ROSTERS[roster.roster_id];
+                rosterPlayers[String(p.player_id)]={roster_id:roster.roster_id,slot,key,present:o.players.some(x=>x.key===key),value:playerValueByKey(key),pos:PLAYER_DB[key]?.pos ?? null,age:PLAYER_DB[key]?.age ?? null,role:PLAYER_DB[key]?.role ?? null};
+              }
+            }
+          }
+          const staticProbeKey='__qa02_invalid_position_probe__';
+          PLAYER_DB[staticProbeKey]={pos:null,age:24,role:'Starter'};
+          const invalidProbe=playerValueByKey(staticProbeKey);
+          delete PLAYER_DB[staticProbeKey];
+          const x={teams:teams.map(t=>({roster_id:String(t.rosterId),total:t.total,player_count:t.players.length})),players:rosterPlayers,invalid_position_probe:invalidProbe};
+          process.stdout.write(JSON.stringify(x));
+          '''
+
+          def evaluate(src,path):
+              text=live_js_parts(src,path)+'\n'+DRIVER
+              with tempfile.NamedTemporaryFile('w',suffix='.cjs',delete=False) as tmp:
+                  tmp.write(text);name=tmp.name
+              try:
+                  p=subprocess.run(['node',name],text=True,capture_output=True,timeout=70)
+                  require(p.returncode==0,f'Node actual JS roster/price runtime failed for {path}: {p.stderr[-2800:]}')
+                  return json.loads(p.stdout)
+              finally:pathlib.Path(name).unlink(missing_ok=True)
+
+          def syntax_check(src,path):
+              # Exact inline JS including dependencies must remain parser-valid.
+              scripts=re.findall(r'<script[^>]*>(.*?)</script>',src,re.S|re.I)
+              require(scripts,f'{path}: no inline scripts')
+              for js in scripts:
+                  if not js.strip():continue
+                  with tempfile.NamedTemporaryFile('w',suffix='.js',delete=False) as tmp:
+                      tmp.write(js);name=tmp.name
+                  try:
+                      p=subprocess.run(['node','--check',name],capture_output=True,text=True)
+                      require(p.returncode==0,f'JS syntax error in {path}: {p.stderr[-2000:]}')
+                  finally:pathlib.Path(name).unlink(missing_ok=True)
+
+          def validate_prices(before,after,path,info):
+              real_count=info['real_players']
+              before_ids=set(before['players']);after_ids=set(after['players'])
+              require(before_ids==after_ids and len(before_ids)==real_count+1,f'{path}: source roster player IDs unexpectedly changed')
+              require('0' in before['players'] and before['players']['0']['present'] and before['players']['0']['value']==5500,f'{path}: original placeholder finding changed, re-audit')
+              require(not after['players']['0']['present'] and after['players']['0']['value'] is None,f'{path}: invalid placeholder still admitted/priced')
+              require(before['invalid_position_probe']==5500 and after['invalid_position_probe'] is None,f'{path}: global invalid-position guard missing')
+              for sid in before_ids-{'0'}:
+                  b=before['players'][sid];a=after['players'][sid]
+                  require(b==a, f'{path}: real player {sid} changed unexpectedly: {b} -> {a}')
+                  require(a['present'], f'{path}: real player {sid} missing after repair')
+                  require(isinstance(a['value'],int) and a['value']>=0, f'{path}: real player {sid} has invalid FV')
+              bteams={t['roster_id']:t for t in before['teams']};ateams={t['roster_id']:t for t in after['teams']}
+              require(bteams.keys()==ateams.keys() and len(bteams)==12,f'{path}: missing team')
+              for rid in bteams:
+                  b=bteams[rid];a=ateams[rid]
+                  if rid=='8':
+                      require(b['total']-a['total']==5500 and b['player_count']-a['player_count']==1,f'{path}: Apex Predators player-only total not corrected exactly 5500')
+                  else:require(b==a,f'{path}: roster {rid} unexpectedly changed totals: {b} -> {a}')
+              return {'tested_valid_player_ids':real_count,'value_changes_valid_players':0,'invalid_placeholder_fv_before':5500,'invalid_placeholder_fv_after':None,'apex_player_fv_reduction':5500,'other_team_player_fv_changes':0,'invalid_position_probe_after':'NULL','tests':'PASS'}
+
+          def markdown(m):
+              rows=['# A-QA02 — Roster Integrity & Phantom Player Repair','','**Status:** '+m['status'],f'**Source SHA:** `{m["head_sha"]}`','**Scope:** `index.html`, `trade-desk-preview.html` only','**Production price data:** unchanged','','## Exact bug','Sleeper ID `0`, `Unknown (0)`, occupies a starter slot in **Apex Predators** (roster 8).','The pre-fix valuation engine treats its missing position as weight 1.0 and assigns an FV of **5,500**.','The fix excludes only this exact unpositioned sentinel from roster merges and makes `playerValueByKey()` return null for any invalid position/nonfinite FV.','', '## PREVIEW before/after runtime regression','| Page | Genuine roster players tested | Changes to real player FV | Apex player-only total reduction | Other teams changed |','|---|---:|---:|---:|---:|']
+              for page,vals in m['checks'].items():rows.append(f'| `{page}` | {vals["tested_valid_player_ids"]} | {vals["value_changes_valid_players"]} | {vals["apex_player_fv_reduction"]:,} | {vals["other_team_player_fv_changes"]} |')
+              rows+=['','The Node regression executes the actual source `mergeLeagueRosters`, `playerValueByKey`, and `computeRosterStrength` functions for both pages. Draft picks are stubbed as zero for player-only comparison; live pricing functions and real 12-team source data are used. Status annotations/eligibility trackers are stubbed because they do not change FV.','', '**PREVIEW is read-only**. APPLY requires the exact successful PREVIEW run ID and unchanged main commit, a matching complete preview manifest, and `WFC01_PUSH_TOKEN`.','No market, FV+, MV, projection, frozen-study, Sleeper sync, or repository-data files are changed.']
+              return '\n'.join(rows)+'\n'
+
+          def main():
+              require(len(sys.argv)==2 and sys.argv[1] in ('PREVIEW','APPLY'),'Usage: QA02_engine.py PREVIEW|APPLY')
+              mode=sys.argv[1]
+              require(git('branch','--show-current')=='main','Audit only current main')
+              require(not git('status','--porcelain','--untracked-files=all'),'Source checkout dirty; stop')
+              info=inspect_league()
+              originals={};patched={};diff=[];checks={}
+              for path in UIS:
+                  before=(ROOT/path).read_text(encoding='utf8')
+                  after=patch(before,path)
+                  syntax_check(after,path)
+                  checks[path]=validate_prices(evaluate(before,path),evaluate(after,path),path,info)
+                  originals[path]=before;patched[path]=after
+                  diff.extend(difflib.unified_diff(before.splitlines(True),after.splitlines(True),fromfile='a/'+path,tofile='b/'+path))
+              manifest={'schema_version':1,'status':'QA02_PREVIEW_VALIDATED_READ_ONLY','head_sha':git('rev-parse','HEAD'),'scope':list(UIS),'source':info,
+                  'source_sha256':{path:sha(originals[path].encode()) for path in UIS},
+                  'patched_sha256':{path:sha(patched[path].encode()) for path in UIS},
+                  'checks':checks,'change_fv_formula':False,'change_price_artifacts':False}
+              OUT.mkdir(parents=True,exist_ok=True)
+              (OUT/'QA02_Preview.json').write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n')
+              (OUT/'QA02_diff.patch').write_text(''.join(diff))
+              (OUT/'QA02_Report.md').write_text(markdown(manifest))
+              if mode=='PREVIEW':
+                  print(json.dumps({'status':manifest['status'],'sha':manifest['head_sha'],'tested_real_players':info['real_players'],'checks':checks},sort_keys=True))
+                  return
+              require(os.environ.get('QA02_MODE')=='APPLY','Explicit APPLY required')
+              prior=OUT/'QA02_Approved_Preview.json'
+              require(prior.is_file(),'Prior successful preview manifest missing')
+              require(json.loads(prior.read_text())==manifest,'SHA/source/patch/validation differs from reviewed preview; stop')
+              token=os.environ.get('WFC01_PUSH_TOKEN')
+              require(token,'Missing WFC01_PUSH_TOKEN')
+              for path,s in patched.items():(ROOT/path).write_text(s,encoding='utf8')
+              git('add','--',*UIS)
+              changed=set(filter(None,git('diff','--cached','--name-only').splitlines()))
+              require(changed==set(UIS),f'Unexpected staged changes: {changed}')
+              require(not git('diff','--name-only'),'Unexpected unstaged diff')
+              git('diff','--cached','--check')
+              git('config','user.name','github-actions[bot]')
+              git('config','user.email','github-actions[bot]@users.noreply.github.com')
+              git('commit','-m','A-QA02: exclude zero-ID roster placeholder and guard invalid-position FV')
+              remote='https://x-access-token:'+token+'@github.com/'+os.environ['GITHUB_REPOSITORY']+'.git'
+              subprocess.run(['git','push',remote,'HEAD:main'],check=True)
+              print(json.dumps({'status':'QA02_PATCH_PUSHED','commit':git('rev-parse','HEAD'),'files':list(UIS),'real_player_value_changes':0}))
+
+          if __name__=='__main__':main()
+          PY_QA02_ENGINE
+          python3 -m py_compile "$RUNNER_TEMP/qa02_engine.py"
+      - name: PREVIEW full roster and live JavaScript regression without writes
+        if: inputs.mode == 'PREVIEW'
+        run: python3 "$RUNNER_TEMP/qa02_engine.py" PREVIEW
+      - name: Upload exact PREVIEW manifest and source diff
+        if: inputs.mode == 'PREVIEW'
+        uses: actions/upload-artifact@v4
+        with:
+          name: A-QA02-Preview
+          path: /tmp/A-QA02-review/
+          retention-days: 30
+      - name: APPLY verify green PREVIEW from this same workflow and unchanged main
+        if: inputs.mode == 'APPLY'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WFC01_PUSH_TOKEN: ${{ secrets.WFC01_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ "$QA02_PREVIEW_RUN_ID" =~ ^[0-9]{7,15}$ ]] || { echo '::error::Supply the successful PREVIEW run ID'; exit 1; }
+          test -n "$WFC01_PUSH_TOKEN" || { echo '::error::Missing WFC01_PUSH_TOKEN'; exit 1; }
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$QA02_PREVIEW_RUN_ID" --jq '[.conclusion,.event,.path,.head_sha,.display_title]|@tsv' > "$RUNNER_TEMP/qa02_preview.tsv"
+          IFS=$'\t' read -r result event path sha title < "$RUNNER_TEMP/qa02_preview.tsv"
+          current_workflow="${GITHUB_WORKFLOW_REF#"$GITHUB_REPOSITORY/"}"
+          current_workflow="${current_workflow%%@*}"
+          [[ "$GITHUB_WORKFLOW_REF" == "$GITHUB_REPOSITORY/.github/workflows/"* ]] || { echo '::error::Invalid workflow ref'; exit 1; }
+          [[ "$current_workflow" =~ ^\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml$ ]] && test -f "$current_workflow" || { echo '::error::Workflow file missing'; exit 1; }
+          test "$result" = success && test "$event" = workflow_dispatch && test "$path" = "$current_workflow" && test "$sha" = "$(git rev-parse HEAD)" && test "$title" = 'A-QA02 PREVIEW' || { echo '::error::PREVIEW run/commit/workflow mismatch'; exit 1; }
+      - name: Download the exact reviewed PREVIEW manifest
+        if: inputs.mode == 'APPLY'
+        uses: actions/download-artifact@v4
+        with:
+          name: A-QA02-Preview
+          run-id: ${{ inputs.preview_run_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          path: /tmp/A-QA02-approved
+      - name: APPLY the reviewed two-HTML-file patch
+        if: inputs.mode == 'APPLY'
+        shell: bash
+        env:
+          WFC01_PUSH_TOKEN: ${{ secrets.WFC01_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$QA02_OUT"
+          cp /tmp/A-QA02-approved/QA02_Preview.json "$QA02_OUT/QA02_Approved_Preview.json"
+          python3 "$RUNNER_TEMP/qa02_engine.py" APPLY
+      - name: Publish readable report
+        if: always()
+        shell: bash
+        run: |
+          if test -f "$QA02_OUT/QA02_Report.md"; then
+            cat "$QA02_OUT/QA02_Report.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Audit did not complete; inspect failed step.' >> "$GITHUB_STEP_SUMMARY"
+          fi
