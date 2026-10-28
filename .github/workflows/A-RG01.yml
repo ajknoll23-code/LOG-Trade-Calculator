@@ -1,0 +1,222 @@
+name: A - RG01 Pearce Alias Repair
+
+# A narrowly scoped identity-display repair for the regression audit.
+# PREVIEW proves the live Sleeper audit and the full repository regression suite.
+# APPLY commits ONLY the audit source and its regenerated evidence artifact.
+# This workflow must not reprice players or change the production calculator.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Preview first; APPLY only after green
+        required: true
+        type: choice
+        default: PREVIEW
+        options:
+          - PREVIEW
+          - APPLY
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  guarded-repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      REPAIR_MODE: ${{ inputs.mode }}
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install existing dependencies
+        run: python -m pip install --disable-pip-version-check requests
+
+      - name: Guard baseline and apply ID-specific audit patch locally
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          python3 - <<'PY_PATCH'
+          from pathlib import Path
+          import json
+
+          src_path = Path('scripts/validation/dual_eligibility_pipeline.py')
+          audit_path = Path('scripts/artifacts/generated/dual_eligibility_results.json')
+          source = src_path.read_text(encoding='utf-8')
+          historical = json.loads(audit_path.read_text(encoding='utf-8'))
+          assert isinstance(historical, list) and len(historical) >= 250
+
+          # The current regression is that the previously audited SID 12585
+          # disappeared following Sleeper's display-name suffix change.
+          assert 'james pearce' not in {
+              r.get('player') for r in historical
+              if r.get('current_position_is_eligible') is False
+          }, 'Already repaired: audit contains the James Pearce mismatch'
+          assert 'travis hunter' in {
+              r.get('player') for r in historical
+              if r.get('current_position_is_eligible') is False
+          }, 'Historical Travis Hunter control missing; stop for review'
+          assert "'james pearce':{pos:'LB'" in Path('index.html').read_text(encoding='utf-8'), (
+              'Model position changed; stop before using old mismatch expectation'
+          )
+
+          anchor = '\ndef eligible_buckets(fantasy_positions):\n'
+          assert source.count(anchor) == 1, 'Source contract changed: helper anchor'
+          helper = '''
+          # Audited, ID-specific display-name bridge. The source's stable Sleeper ID
+          # 12585 was previously "James Pearce" and is now "James Pearce Jr".
+          # Do not strip suffixes globally or merge other people by name.
+          def audited_trade_desk_name(sleeper_id, source_name):
+              key = normalize_name(source_name)
+              if str(sleeper_id) == "12585" and key == "james pearce jr":
+                  return "james pearce"
+              return key
+          
+          '''
+          source = source.replace(anchor, '\n' + helper + 'def eligible_buckets(fantasy_positions):\n')
+
+          exact_lookup = 'key = normalize_name(name)'
+          assert source.count(exact_lookup) == 2, 'Source contract changed: lookup sites'
+          source = source.replace(exact_lookup, 'key = audited_trade_desk_name(pid, name)')
+
+          marker = '    print("dual_eligibility_pipeline self-test passed.")'
+          assert source.count(marker) == 1, 'Source contract changed: selftest marker'
+          extra_tests = '''    # Regression: the same audited Sleeper ID now includes a Jr suffix.
+              pearce = analyze_player_index({
+                  "12585": {"full_name": "James Pearce Jr", "team": "ATL",
+                            "position": "DL", "fantasy_positions": ["DL"]},
+              }, {"james pearce": "LB"})
+              assert len(pearce) == 1, pearce
+              assert pearce[0]["sleeper_id"] == "12585"
+              assert pearce[0]["player"] == "james pearce"
+              assert pearce[0]["current_position_is_eligible"] is False
+              assert pearce[0]["eligible_buckets"] == ["DL"]
+              # No generic suffix removal or ID substitution is allowed.
+              unrelated = analyze_player_index({
+                  "99999": {"full_name": "James Pearce Jr", "team": "ATL",
+                            "position": "DL", "fantasy_positions": ["DL"]},
+              }, {"james pearce": "LB"})
+              assert unrelated == [], unrelated
+              # Two individuals sharing a canonical name must not be collapsed.
+              collision = analyze_player_index({
+                  "12585": {"full_name": "James Pearce Jr", "team": "ATL",
+                            "position": "DL", "fantasy_positions": ["DL"]},
+                  "99999": {"full_name": "James Pearce", "team": "ATL",
+                            "position": "DL", "fantasy_positions": ["DL"]},
+              }, {"james pearce": "LB"})
+              assert collision == [], collision
+          '''
+          source = source.replace(marker, extra_tests + '\n' + marker)
+          compile(source, str(src_path), 'exec')
+          src_path.write_text(source, encoding='utf-8')
+          print('PASS: precisely scoped SID 12585 alias applied; model and pricing unchanged')
+          PY_PATCH
+          python3 scripts/validation/dual_eligibility_pipeline.py --selftest
+
+      - name: Refresh live Sleeper audit and assert both mismatch controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/dual_eligibility_pipeline.py
+          python3 - <<'PY_AUDIT'
+          import json
+          from pathlib import Path
+          rows=json.loads(Path('scripts/artifacts/generated/dual_eligibility_results.json').read_text())
+          assert isinstance(rows,list) and len(rows)>=250, len(rows)
+          keys=[(str(r.get('sleeper_id')),r.get('player')) for r in rows]
+          assert len(set(keys))==len(keys), 'Duplicate identity rows in refreshed audit'
+          mismatch={r.get('player'):r for r in rows if r.get('current_position_is_eligible') is False}
+          assert 'james pearce' in mismatch, f'James Pearce missing: {sorted(mismatch)}'
+          jp=mismatch['james pearce']
+          assert str(jp['sleeper_id'])=='12585', jp
+          assert jp['current_trade_desk_position']=='LB', jp
+          assert jp['eligible_buckets']==['DL'], jp
+          assert jp['team']=='ATL', jp
+          assert 'travis hunter' in mismatch, f'Travis Hunter control missing: {sorted(mismatch)}'
+          assert all('recommended_bucket' not in r for r in rows), 'Retired economic recommendation returned'
+          print('PASS: current Sleeper SID 12585 maps to model James Pearce; DL-only vs model LB remains flagged')
+          print('PASS: Travis Hunter review retained; refreshed audit rows=',len(rows))
+          PY_AUDIT
+
+      - name: Run full regression suite and downstream checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/maintenance/refresh_repo_derived_state.py --check
+          python3 scripts/sync/sync_free_agent_valuation.py --check
+          python3 scripts/validation/validate_free_agent_valuation_parity.py
+          python3 scripts/validation/repo_regression_checks.py
+          node scripts/validation/role_band_inline_regression.js
+          python3 scripts/validation/validate_idp_v1_final_deployment.py
+          python3 - <<'PY_JS'
+          import os,re,pathlib,subprocess,tempfile
+          for filename in ('index.html','free-agent-board.html'):
+              source=pathlib.Path(filename).read_text(encoding='utf-8')
+              parts=re.findall(r'<script(?:\s[^>]*)?>(.*?)</script>',source,re.S|re.I)
+              fd,path=tempfile.mkstemp(suffix='.js');os.close(fd)
+              try:
+                  pathlib.Path(path).write_text('\n'.join(parts),encoding='utf-8')
+                  subprocess.run(['node','--check',path],check=True)
+              finally:
+                  pathlib.Path(path).unlink(missing_ok=True)
+              print('PASS inline JS:',filename)
+          PY_JS
+
+      - name: Enforce two-file research-only change scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_SCOPE'
+          import subprocess
+          permitted={
+             'scripts/validation/dual_eligibility_pipeline.py',
+             'scripts/artifacts/generated/dual_eligibility_results.json',
+          }
+          result=subprocess.check_output(['git','status','--porcelain=v1','--untracked-files=all'],text=True)
+          changed={line[3:] for line in result.splitlines() if line.strip()}
+          assert changed==permitted, f'Unexpected working tree changes: {sorted(changed)}'
+          print('PASS source scope:',sorted(changed))
+          PY_SCOPE
+          git diff --exit-code -- index.html free-agent-board.html \
+            scripts/validation/repo_regression_checks.py \
+            scripts/validation/capture_realized_outcomes.py \
+            scripts/validation/build_value_uncertainty.py
+
+      - name: APPLY audited source and refreshed audit artifact
+        if: env.REPAIR_MODE == 'APPLY'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add -- scripts/validation/dual_eligibility_pipeline.py \
+            scripts/artifacts/generated/dual_eligibility_results.json
+          git diff --cached --check
+          git diff --cached --quiet && { echo 'No change to commit'; exit 1; }
+          git commit -m 'RG01: restore verified James Pearce Jr audit identity by SID'
+          git push origin HEAD:main
+          echo 'PASS APPLY: only the identity audit source and evidence were committed.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: PREVIEW report
+        if: env.REPAIR_MODE == 'PREVIEW'
+        run: |
+          echo 'PASS PREVIEW: current Sleeper audit and full local regression validated.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'No files committed; rerun APPLY after review.' >> "$GITHUB_STEP_SUMMARY"
