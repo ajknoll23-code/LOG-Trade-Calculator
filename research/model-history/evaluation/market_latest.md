@@ -5,10 +5,10 @@ Protocol SHA256: `fe6ccf0d5b05bf15038e9239f4c7b18c1d8a40ba93f4f9db8cb01fcec6b076
 
 ## Status
 
-- Full snapshots seen: **35**
-- Weekly market states after deduplication: **8**
+- Full snapshots seen: **36**
+- Weekly market states after deduplication: **9**
 - Same-week snapshots deduplicated: **27**
-- Evaluated origin/horizon pairs: **17**
+- Evaluated origin/horizon pairs: **20**
 - Pending origin/horizon pairs: **7**
 
 ## What this measures
@@ -33,9 +33,12 @@ This is a **market-target** backtest, not a fundamental player-quality backtest.
 | 2026-W39 | 2026-W43 | 4w | 483 | 0.380 | 1.000 | -0.620 | — | — |
 | 2026-W40 | 2026-W41 | 1w | 483 | 0.380 | 1.000 | -0.620 | — | — |
 | 2026-W40 | 2026-W42 | 2w | 483 | 0.380 | 1.000 | -0.620 | — | — |
+| 2026-W40 | 2026-W44 | 4w | 483 | 0.380 | 1.000 | -0.620 | — | — |
 | 2026-W41 | 2026-W42 | 1w | 483 | 0.380 | 1.000 | -0.620 | — | — |
 | 2026-W41 | 2026-W43 | 2w | 483 | 0.380 | 1.000 | -0.620 | — | — |
 | 2026-W42 | 2026-W43 | 1w | 483 | 0.380 | 1.000 | -0.620 | — | — |
+| 2026-W42 | 2026-W44 | 2w | 483 | 0.380 | 1.000 | -0.620 | — | — |
+| 2026-W43 | 2026-W44 | 1w | 483 | 0.384 | 1.000 | -0.616 | — | — |
 
 ## Interpretation guardrails
 

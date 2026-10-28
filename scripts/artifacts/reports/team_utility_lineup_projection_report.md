@@ -15,29 +15,29 @@
 
 ## Artifact coverage
 
-- Total projected players: **1523**
-- Position counts: **{"DB": 354, "DL": 353, "LB": 227, "QB": 78, "RB": 148, "TE": 141, "WR": 222}**
-- Source counts: **{"fantasypros_normalized_fallback": 91, "idp_v1_both": 462, "idp_v1_fp_only": 7, "idp_v1_no_new_data": 1, "idp_v1_sleeper_only": 464, "sleeper_league_scored": 498}**
+- Total projected players: **1533**
+- Position counts: **{"DB": 353, "DL": 353, "LB": 231, "QB": 81, "RB": 150, "TE": 142, "WR": 223}**
+- Source counts: **{"fantasypros_normalized_fallback": 94, "idp_v1_both": 509, "idp_v1_fp_only": 8, "idp_v1_no_new_data": 1, "idp_v1_sleeper_only": 419, "sleeper_league_scored": 502}**
 
 ## Current league validation
 
 - Teams checked: **12**
 - Teams with all 17 legal slots fillable: **12 / 12**
 - Teams with a projection-complete non-K starting lineup: **12 / 12**
-- Active non-K roster projection coverage: **98.58%**
+- Active non-K roster projection coverage: **99.06%**
 - Selected non-K players needing fallback: **0**
 
 ## Team detail
 
 | Team | Active non-K coverage | Legal starters | Missing projected starters |
 |---|---:|---:|---:|
-| Just Run Power | 97.1% | 17/17 | 0 |
+| Just Run Power | 100.0% | 17/17 | 0 |
 | Sunday Brunson  | 100.0% | 17/17 | 0 |
 | Narroway Farms M714 | 100.0% | 17/17 | 0 |
 | Landry's Hat | 100.0% | 17/17 | 0 |
 | Pullham Bluecocks  | 97.1% | 17/17 | 0 |
-| Cock Mchorse 🐴 | 94.6% | 17/17 | 0 |
-| Jersey Bagels | 97.0% | 17/17 | 0 |
+| Cock Mchorse 🐴 | 94.4% | 17/17 | 0 |
+| Jersey Bagels | 100.0% | 17/17 | 0 |
 | Apex Predators | 100.0% | 17/17 | 0 |
 | Toddy2times | 100.0% | 17/17 | 0 |
 | Moose Knuckles | 100.0% | 17/17 | 0 |
@@ -46,7 +46,7 @@
 
 ## Identity / provenance
 
-- FantasyPros IDs mapped to Sleeper IDs: **984**
+- FantasyPros IDs mapped to Sleeper IDs: **1067**
 - Manual-review identity rows skipped: **0**
 
 The artifact is deterministic: its input file SHA-256 hashes are stored in the JSON, and no wall-clock timestamp is embedded.
