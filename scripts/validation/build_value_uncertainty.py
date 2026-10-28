@@ -680,20 +680,21 @@ def build_payload() -> dict[str, Any]:
     model_values = snapshot_values.compute_all_values(cfg)
 
     identity_rows = read_json(SLEEPER_IDENTITY_PATH)
-    by_name, by_id = capture_realized_outcomes.build_sleeper_identity_index(identity_rows)
-    resolved, unresolved = capture_realized_outcomes.resolve_model_identities(
-        cfg["player_db"], by_name, by_id
+    # Reuse outcome-history stable IDs when players drop from projections.
+    # The shared resolver rejects changed names, positions, ID conflicts,
+    # and baseline collisions; never guess an unknown Sleeper identity.
+    resolved, unresolved, projected_count, fallback_count = (
+        capture_realized_outcomes.resolve_with_frozen_outcome_registry(
+            cfg["player_db"], identity_rows
+        )
     )
+    if (unresolved or len(resolved) != len(cfg["player_db"])
+            or projected_count + fallback_count != len(resolved)):
+        raise RuntimeError("Uncertainty identity coverage/accounting failed")
+    # Crosswalk/PPG remain evidence inputs, not identity fallback guesses.
     crosswalk_rows = read_json(IDENTITY_CROSSWALK_PATH)
     historical_ppg_rows = read_json(PPG_PATH)
-    if unresolved:
-        resolved, unresolved = corroborate_projection_missing_identities(
-            resolved, unresolved, by_id, crosswalk_rows, historical_ppg_rows
-        )
-    if unresolved:
-        raise RuntimeError(
-            f"Uncertainty engine requires complete model identity coverage; unresolved={unresolved[:5]}"
-        )
+
     model_to_sleeper = {
         key: str(row["sleeper_id"])
         for key, row in resolved.items()
