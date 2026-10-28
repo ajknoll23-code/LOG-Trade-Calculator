@@ -1,0 +1,126 @@
+name: Repo Regression Checks
+
+# IMPORTANT: this is the ACTIVE GitHub Actions copy. GitHub only executes
+# workflow files under .github/workflows/.
+#
+# Manual runs normalize deterministic derived artifacts inside the runner
+# before strict validation. Pull requests stay strict/read-only and fail if
+# committed generated artifacts are stale.
+#
+# Successful Scheduled Data Refresh runs trigger this workflow automatically.
+on:
+  workflow_dispatch: {}
+  pull_request:
+  workflow_run:
+    workflows:
+      - Scheduled Data Refresh
+    types:
+      - completed
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out refreshed main
+        if: github.event_name == 'workflow_run'
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Check out requested revision
+        if: github.event_name != 'workflow_run'
+        uses: actions/checkout@v4
+
+      - name: Confirm workflow version
+        run: echo "TRADE_DESK_REPO_REGRESSION_WORKFLOW=2026-09-01-v12-separate-market-value"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Python dependencies
+        run: pip install requests
+
+      - name: Run focused self-tests
+        run: |
+          python3 scripts/validation/snapshot_values.py --selftest
+          python3 scripts/validation/build_value_uncertainty.py --selftest
+          python3 scripts/validation/build_value_uncertainty.py --write
+          python3 scripts/market/build_market_value.py --selftest
+          python3 scripts/market/build_market_value.py --write
+          python3 scripts/validation/capture_model_history.py --selftest
+          python3 scripts/validation/capture_realized_outcomes.py --selftest
+          python3 scripts/validation/evaluate_model_history.py --selftest
+          python3 scripts/validation/evaluate_market_history.py --selftest
+          python3 scripts/sync/sync_sleeper.py --selftest
+          python3 scripts/validation/dual_eligibility_pipeline.py --selftest
+          python3 scripts/maintenance/team_field_refresh_pipeline.py --selftest
+          python3 scripts/utilities/generate_player_positions.py --selftest
+          python3 scripts/sync/sync_free_agent_valuation.py --selftest
+          python3 scripts/maintenance/refresh_repo_derived_state.py --selftest
+          python3 scripts/projections/filter_sleeper_idp_only.py --selftest
+          python3 scripts/projections/sleeper_projections_pipeline.py --selftest
+          python3 scripts/market/draft_slot_projection_pipeline.py --selftest
+
+      - name: Normalize deterministic derived artifacts for manual validation
+        if: github.event_name == 'workflow_dispatch'
+        run: python3 scripts/maintenance/refresh_repo_derived_state.py --write
+
+      - name: Enforce deterministic derived-artifact parity
+        run: python3 scripts/maintenance/refresh_repo_derived_state.py --check
+
+      - name: Validate free-agent canonical valuation sync
+        run: |
+          python3 scripts/sync/sync_free_agent_valuation.py --check
+          python3 scripts/validation/validate_free_agent_valuation_parity.py
+
+      - name: Run repository regression suite
+        run: python3 scripts/validation/repo_regression_checks.py
+
+      - name: Validate inline Week 5 role-band display
+        run: node scripts/validation/role_band_inline_regression.js
+
+      - name: Validate frozen IDP V1 and approved successor lineage
+        run: python3 scripts/validation/validate_idp_successor_lineage.py
+
+      - name: Validate inline JavaScript syntax
+        run: |
+          python3 - <<'PY'
+          import re, pathlib, subprocess, tempfile, os
+          for filename in ('index.html', 'free-agent-board.html'):
+              text = pathlib.Path(filename).read_text(encoding='utf-8')
+              scripts = re.findall(r'<script(?:\s[^>]*)?>(.*?)</script>', text, re.S | re.I)
+              js = '\n'.join(scripts)
+              fd, path = tempfile.mkstemp(suffix='.js')
+              os.close(fd)
+              try:
+                  pathlib.Path(path).write_text(js, encoding='utf-8')
+                  subprocess.run(['node', '--check', path], check=True)
+              finally:
+                  pathlib.Path(path).unlink(missing_ok=True)
+              print(f'PASS {filename} inline JavaScript syntax')
+          PY
+
+      - name: Verify production index was not modified by normalization
+        run: git diff --exit-code -- index.html
+
+      - name: Report derived files normalized in runner
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          changed=$(git diff --name-only -- free-agent-board.html data/free_agents.json scripts/artifacts/generated/player_positions.json)
+          if [ -n "$changed" ]; then
+            echo "::notice::Validation normalized these deterministic derived files in the runner:"
+            echo "$changed"
+            echo "They were NOT pushed by this read-only validation workflow."
+          else
+            echo "Committed deterministic derived artifacts were already current."
+          fi
