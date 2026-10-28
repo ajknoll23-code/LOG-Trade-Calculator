@@ -37,6 +37,16 @@ def normalize_name(s):
     return re.sub(r"\s+", " ", re.sub(r"[.'\u2019-]", "", (s or "").strip().lower()))
 
 
+
+# Audited, ID-specific display-name bridge. The source's stable Sleeper ID
+# 12585 was previously "James Pearce" and is now "James Pearce Jr".
+# Do not strip suffixes globally or merge other people by name.
+def audited_trade_desk_name(sleeper_id, source_name):
+    key = normalize_name(source_name)
+    if str(sleeper_id) == "12585" and key == "james pearce jr":
+        return "james pearce"
+    return key
+
 def eligible_buckets(fantasy_positions):
     buckets = []
     for fp in fantasy_positions or []:
@@ -73,10 +83,10 @@ def analyze_player_index(player_index, trade_desk_positions=None):
     # share one name. Only compare a Trade Desk name-keyed position to Sleeper
     # when that normalized name is unique in the player index.
     name_counts = {}
-    for p in player_index.values():
+    for pid, p in player_index.items():
         name = (p.get("full_name") or f"{p.get('first_name','')} {p.get('last_name','')}").strip()
         if name:
-            key = normalize_name(name)
+            key = audited_trade_desk_name(pid, name)
             name_counts[key] = name_counts.get(key, 0) + 1
 
     for pid, p in player_index.items():
@@ -86,7 +96,7 @@ def analyze_player_index(player_index, trade_desk_positions=None):
         name = (p.get("full_name") or f"{p.get('first_name','')} {p.get('last_name','')}").strip()
         if not name:
             continue
-        key = normalize_name(name)
+        key = audited_trade_desk_name(pid, name)
         name_collision = name_counts.get(key, 0) > 1
         current = None if name_collision else trade_desk_positions.get(key)
         current_is_eligible = (current in buckets) if current and buckets else None
@@ -138,6 +148,31 @@ def run_selftest():
     stale = next(r for r in rows if r["sleeper_id"] == "4")
     assert stale["is_dual_eligible"] is False
     assert stale["current_position_is_eligible"] is False
+    # Regression: the same audited Sleeper ID now includes a Jr suffix.
+    pearce = analyze_player_index({
+        "12585": {"full_name": "James Pearce Jr", "team": "ATL",
+                  "position": "DL", "fantasy_positions": ["DL"]},
+    }, {"james pearce": "LB"})
+    assert len(pearce) == 1, pearce
+    assert pearce[0]["sleeper_id"] == "12585"
+    assert pearce[0]["player"] == "james pearce"
+    assert pearce[0]["current_position_is_eligible"] is False
+    assert pearce[0]["eligible_buckets"] == ["DL"]
+    # No generic suffix removal or ID substitution is allowed.
+    unrelated = analyze_player_index({
+        "99999": {"full_name": "James Pearce Jr", "team": "ATL",
+                  "position": "DL", "fantasy_positions": ["DL"]},
+    }, {"james pearce": "LB"})
+    assert unrelated == [], unrelated
+    # Two individuals sharing a canonical name must not be collapsed.
+    collision = analyze_player_index({
+        "12585": {"full_name": "James Pearce Jr", "team": "ATL",
+                  "position": "DL", "fantasy_positions": ["DL"]},
+        "99999": {"full_name": "James Pearce", "team": "ATL",
+                  "position": "DL", "fantasy_positions": ["DL"]},
+    }, {"james pearce": "LB"})
+    assert collision == [], collision
+
     print("dual_eligibility_pipeline self-test passed.")
 
 
