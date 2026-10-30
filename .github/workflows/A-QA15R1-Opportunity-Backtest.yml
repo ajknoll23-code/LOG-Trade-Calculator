@@ -1,0 +1,396 @@
+name: A-QA15 - Opportunity-Aware FV Comparator Backtest (Read Only)
+run-name: A-QA15 opportunity-aware peer FV audit READ ONLY
+
+'on':
+  workflow_dispatch:
+    inputs:
+      qa14_run_id:
+        description: Verified successful QA14 internal FV range backtest run
+        required: true
+        type: string
+        default: '41095976610'
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: a-qa15-opportunity-peer-read-only
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      QA14_RUN_ID: ${{ inputs.qa14_run_id }}
+      QA15_IN: /tmp/a-qa15-qa14
+      QA15_OUT: /tmp/a-qa15-out
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout without any write credentials
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Install Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Verify exact successful QA14 run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$QA14_RUN_ID" =~ ^[0-9]{7,15}$ ]] || exit 1
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$QA14_RUN_ID" > "$RUNNER_TEMP/qa15_qa14_run.json"
+          python3 - <<'PY_VERIFY_QA15'
+          import json,os,pathlib
+          r=json.loads((pathlib.Path(os.environ['RUNNER_TEMP'])/'qa15_qa14_run.json').read_text())
+          expected={'status':'completed','conclusion':'success','event':'workflow_dispatch',
+             'path':'.github/workflows/A-QA14R1-Price-Calibration-Backtest.yml',
+             'display_title':'A-QA14 unbiased established-peer FV range and backtest READ ONLY',
+             'head_branch':'main'}
+          for k,v in expected.items():assert r.get(k)==v,(k,r.get(k),v)
+          assert r.get('repository',{}).get('full_name')==os.environ['GITHUB_REPOSITORY']
+          print('QA14 source completed successfully:',r['id'])
+          PY_VERIFY_QA15
+      - name: Download exact QA14 source artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: A-QA14-Internal-Peer-Range-Backtest
+          run-id: ${{ inputs.qa14_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: /tmp/a-qa15-qa14
+      - name: Pin original historical source and verify prior report
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_SHA_QA15'
+          import json,os,pathlib,re
+          m=json.loads((pathlib.Path(os.environ['QA15_IN'])/'QA14_Manifest.json').read_text())
+          assert m['status']=='QA14_INTERNAL_PEER_RANGE_BACKTEST_COMPLETE_READ_ONLY'
+          assert m['source_qa13_run']=='41093056447' and m['cohort']==72
+          assert m['review_16_mature_inversions']==16
+          assert m['new_fv_recommended']==0 and m['read_only'] is True
+          assert m['independent_market_verified'] is False
+          assert all(m[k]==0 for k in ('fv_changes','fv_plus_changes','mv_changes','repo_mutations'))
+          sha=m['source_git_sha'];assert re.fullmatch('[0-9a-f]{40}',sha)
+          (pathlib.Path(os.environ['RUNNER_TEMP'])/'qa15_sha').write_text(sha)
+          with open(os.environ['GITHUB_ENV'],'a') as f:f.write('QA15_SOURCE_SHA='+sha+'\n')
+          PY_SHA_QA15
+          git fetch --depth=1 origin "$(cat "$RUNNER_TEMP/qa15_sha")"
+          git checkout --detach "$(cat "$RUNNER_TEMP/qa15_sha")"
+          test "$(git rev-parse HEAD)" = "$(cat "$RUNNER_TEMP/qa15_sha")"
+      - name: Backtest opportunity-aware peers and compare all 16 cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$QA15_OUT"
+          cat > "$RUNNER_TEMP/qa15_engine.py" <<'PY_QA15_ENGINE'
+          #!/usr/bin/env python3
+          """QA15 opportunity-aware peer shadow. This script never proposes or applies production FV."""
+          import collections
+          import csv
+          import datetime
+          import hashlib
+          import json
+          import math
+          import os
+          from pathlib import Path
+          import statistics
+          
+          SRC = Path(os.environ['QA15_IN'])
+          OUT = Path(os.environ['QA15_OUT'])
+          OUT.mkdir(parents=True, exist_ok=True)
+          
+          def fail(reason):
+              raise RuntimeError('QA15 FAIL-CLOSED: ' + str(reason))
+          
+          def load(path):
+              if not path.is_file():
+                  fail('Missing input: ' + str(path))
+              return json.loads(path.read_text(encoding='utf-8'))
+          
+          def sha(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+          
+          def number(x):
+              return float(x) if type(x) in (int,float) and math.isfinite(x) else None
+          
+          def percentile(a, frac):
+              if not a: return None
+              a=sorted(a)
+              v=(len(a)-1)*frac
+              i=math.floor(v);j=math.ceil(v)
+              return a[i]+(a[j]-a[i])*(v-i)
+          
+          def history_class(g):
+              if g is None: return 'NOT_RECORDED'
+              if g <= 1: return 'ZERO_OR_ONE'
+              if g < 5: return 'TWO_TO_FOUR'
+              return 'FIVE_PLUS'
+          
+          def distance(a,b):
+              # Price NEVER enters neighbor selection. Historical opportunities are observations,
+              # not direct measures of future talent; do not translate them into arbitrary cuts.
+              d=abs(math.log1p(a['proj'])-math.log1p(b['proj']))
+              d+=0.115*abs(a['age']-b['age'])
+              ac=history_class(a['games']);bc=history_class(b['games'])
+              if ac!=bc:
+                  if ac=='FIVE_PLUS' or bc=='FIVE_PLUS':d+=1.25
+                  elif ac=='NOT_RECORDED' or bc=='NOT_RECORDED':d+=0.32
+                  else:d+=0.18
+              elif ac=='FIVE_PLUS':
+                  d+=0.035*abs(a['games']-b['games'])
+              return d
+          
+          manifest=load(SRC/'QA14_Manifest.json')
+          expected={
+              'status':'QA14_INTERNAL_PEER_RANGE_BACKTEST_COMPLETE_READ_ONLY',
+              'source_qa13_run':'41093056447','cohort':72,
+              'review_16_mature_inversions':16,'selected_by_price':False,
+              'independent_market_verified':False,'new_fv_recommended':0,
+              'fv_changes':0,'fv_plus_changes':0,'mv_changes':0,'repo_mutations':0,
+              'read_only':True,'owner_release_authorized':False,
+          }
+          for k,v in expected.items():
+              if manifest.get(k)!=v:fail(f'QA14 manifest mismatch {k}: {manifest.get(k)}')
+          if manifest.get('source_git_sha')!=os.environ.get('QA15_SOURCE_SHA'):
+              fail('Pinned source commit mismatch')
+          
+          cases=load(SRC/'QA14_All72_Shadow_Peer_Ranges.json')
+          if len(cases)!=72 or len({str(x['sleeper_id']) for x in cases})!=72:
+              fail('QA14 source 72-player identity error')
+          if any(x['production_changes']!='NONE' or x['recommended_new_fv']!='' for x in cases):
+              fail('Unexpected upstream price mutation')
+          if len([x for x in cases if x['shadow_evidence_gate']=='NEIGHBOR_SENSITIVITY_HOLD'])!=4:
+              fail('QA14 did not contain four held QBs')
+          
+          unc=load(Path('scripts/artifacts/generated/value_uncertainty.json'))
+          proj=load(Path('scripts/artifacts/generated/team_utility_lineup_projections.json'))
+          ppg=load(Path('scripts/ppg_results.json'))
+          if unc.get('counts',{}).get('player_count')!=565:
+              fail('Unexpected curated FV universe')
+          if proj.get('purpose')!='Team Utility starter selection only; never Fundamental Value':
+              fail('Projected points must remain context only')
+          if proj.get('identity')!='stable Sleeper player_id' or proj.get('season')!=2026:
+              fail('Projection identity / season mismatch')
+          if not isinstance(ppg,list) or not isinstance(proj.get('players'),dict):
+              fail('Bad source schema')
+          
+          hist=collections.defaultdict(list)
+          for r in ppg:
+              sid=str(r.get('sleeper_id') or '')
+              if sid:hist[sid].append(r)
+          
+          def games_of(sid,pos):
+              matched=[r for r in hist.get(str(sid),[]) if r.get('pos')==pos]
+              if len(matched)!=1: return None
+              val=matched[0].get('games_played')
+              return val if type(val)==int and 0<=val<=18 else None
+          
+          positions=('QB','RB','WR','TE','DL','LB','DB')
+          refs=collections.defaultdict(list)
+          for name,x in unc['players'].items():
+              sid=str(x.get('sleeper_id') or '')
+              pos=x.get('pos')
+              p=proj['players'].get(sid)
+              if not p or pos not in positions or p.get('pos')!=pos: continue
+              age=number(x.get('age'));fv=number(x.get('center_value'));pts=number(p.get('projection'))
+              if age is None or fv is None or pts is None:continue
+              if not (18<=age<=45 and fv>0 and pts>=0):continue
+              refs[pos].append({'id':sid,'name':name,'pos':pos,'age':age,'fv':fv,'proj':pts,
+                                'games':games_of(sid,pos)})
+          if len(refs['QB'])<45 or sum(map(len,refs.values()))<380:
+              fail('No adequate expanded curated peer pool')
+          
+          def neighbors(p,exclude=None):
+              c=[]
+              for candidate in refs[p['pos']]:
+                  if candidate['id']==exclude or abs(candidate['age']-p['age'])>6:continue
+                  c.append((distance(p,candidate),candidate))
+              c.sort(key=lambda row:(row[0],row[1]['id']))
+              return c
+          
+          def estimate(p,exclude=None):
+              c=neighbors(p,exclude)
+              if len(c)<10:return None
+              nearest=[x for _,x in c[:12]]
+              vv=[x['fv'] for x in nearest]
+              mid=statistics.median(vv)
+              mid8=statistics.median(x['fv'] for x in nearest[:8])
+              lo=percentile(vv,.25);hi=percentile(vv,.75)
+              return {'count':len(c),'min_similarity':round(c[0][0],3),
+                  'median':round(mid),'low':round(lo),'high':round(hi),'top8_median':round(mid8),
+                  'relative_iqr':round((hi-lo)/max(1,mid),3),
+                  'neighbor_shift':round(abs(mid8-mid)/max(1,mid),3),
+                  'neighbors':nearest}
+          
+          # LOO holds out the target player by stable ID; evaluate against existing internal FV only.
+          loo=[];bypos={}
+          for pos,base in refs.items():
+              abs_err=[]
+              for p in base:
+                  prediction=estimate(p,exclude=p['id'])
+                  if prediction is None:continue
+                  error=abs(prediction['median']-p['fv'])/p['fv']
+                  abs_err.append(error)
+                  loo.append({'position':pos,'sleeper_id':p['id'],'player':p['name'],
+                      'reference_fv':int(p['fv']),'opportunity_peer_median':prediction['median'],
+                      'absolute_pct_error':round(100*error,2),
+                      'validation':'INTERNAL_CURATED_FV_SELF_CONSISTENCY_ONLY'})
+              bypos[pos]={'reference_players':len(base),'loo_count':len(abs_err),
+                  'median_abs_pct_error':round(100*statistics.median(abs_err),1) if abs_err else None,
+                  'p75_abs_pct_error':round(100*percentile(abs_err,.75),1) if abs_err else None,
+                  'qa14_p75_abs_pct_error':manifest['loo_by_position'].get(pos,{}).get('loo_p75_abs_pct_error')}
+          if len(loo)<350 or bypos['QB']['loo_count']<35:
+              fail('Too few opportunity-aware LOO tests')
+          
+          with (OUT/'QA15_LOO_Opportunity_Results.csv').open('w',newline='',encoding='utf8') as f:
+              w=csv.DictWriter(f,fieldnames=list(loo[0]));w.writeheader();w.writerows(loo)
+          
+          results=[]
+          for c in cases:
+              sid=str(c['sleeper_id']);pos=c['position'];fv=int(c['current_fv_UNCHANGED'])
+              review=c['QA13_review_disposition'] in ('REPEATED_CURATED_PEER_FV_INVERSION','CURATED_PEER_FV_INVERSION_REVIEW')
+              row={'sleeper_id':sid,'player':c['player'],'position':pos,'age':c['age'],
+                   'current_fv_UNCHANGED':fv,'qa14_evidence_gate':c['shadow_evidence_gate'],
+                   'qa14_reference_median':c['neighbor_median_FV_HYPOTHETICAL'],
+                   'historical_games_observed':None,'history_evidence_class':'',
+                   'new_peer_count':None,'new_range_low_CONTEXT_ONLY':None,
+                   'new_range_median_CONTEXT_ONLY':None,'new_range_high_CONTEXT_ONLY':None,
+                   'neighbor_top8_median_CONTEXT_ONLY':None,
+                   'opportunity_loo_p75_error_pct':bypos.get(pos,{}).get('p75_abs_pct_error'),
+                   'review_status':'NOT_IN_16_MEMBER_REVIEW',
+                   'new_fv_recommended':'','production_changed':'NO'}
+              if review:
+                  pts=number(c.get('2026_projection_CONTEXT_ONLY'))
+                  age=number(c.get('age'));games=games_of(sid,pos)
+                  row['historical_games_observed']=games
+                  row['history_evidence_class']=history_class(games)
+                  if pos not in positions or pts is None or age is None:
+                      row['review_status']='MISSING_OR_POSITION_POLICY_HOLD'
+                  elif age<=24:
+                      row['review_status']='YOUNG_PROSPECT_HOLD'
+                  else:
+                      point={'id':sid,'age':age,'proj':pts,'pos':pos,'games':games}
+                      est=estimate(point,exclude=sid)
+                      if not est:row['review_status']='TOO_FEW_OPPORTUNITY_PEERS_HOLD'
+                      else:
+                          row.update({'new_peer_count':est['count'],'new_range_low_CONTEXT_ONLY':est['low'],
+                              'new_range_median_CONTEXT_ONLY':est['median'],
+                              'new_range_high_CONTEXT_ONLY':est['high'],
+                              'neighbor_top8_median_CONTEXT_ONLY':est['top8_median']})
+                          p75=bypos[pos]['p75_abs_pct_error']
+                          if p75 is None or p75>55:
+                              status='POSITION_BACKTEST_TOO_WEAK_HOLD'
+                          elif est['relative_iqr']>0.9 or est['neighbor_shift']>0.30:
+                              status='NEIGHBOR_STABILITY_HOLD'
+                          elif est['median']>=fv:
+                              status='NO_DOWNWARD_INTERNAL_SIGNAL'
+                          else:
+                              status='OPPORTUNITY_CHECKED_INTERNAL_RANGE_FOR_REVIEW'
+                          row['review_status']=status
+              results.append(row)
+          
+          if len(results)!=72 or len({r['sleeper_id'] for r in results})!=72:
+              fail('72-player cohort identity drift')
+          if sum(r['review_status']!='NOT_IN_16_MEMBER_REVIEW' for r in results)!=16:
+              fail('Unexpected candidate review population')
+          if any(r['new_fv_recommended'] or r['production_changed']!='NO' for r in results):
+              fail('Production mutated')
+          
+          results.sort(key=lambda r:(0 if r['qa14_evidence_gate']=='NEIGHBOR_SENSITIVITY_HOLD' else
+                                      1 if r['review_status']!='NOT_IN_16_MEMBER_REVIEW' else 2,
+                                      -r['current_fv_UNCHANGED'],r['player']))
+          with (OUT/'QA15_All72_Opportunity_Ranges.csv').open('w',newline='',encoding='utf8') as f:
+              w=csv.DictWriter(f,fieldnames=list(results[0]));w.writeheader();w.writerows(results)
+          (OUT/'QA15_All72_Opportunity_Ranges.json').write_text(json.dumps(results,indent=2)+'\n')
+          status=collections.Counter(r['review_status'] for r in results)
+          report=['# A-QA15 — Opportunity-Aware Internal FV Comparator Backtest','',
+           '**READ ONLY — no production FV, FV+, MV or player role changes. No replacement price recommended.**','',
+           '## What is different from QA14','',
+           '- The full eligible curated source cohort includes backup/low-opportunity cases rather than only 5-plus-game veterans.',
+           '- Peer selection is same-position age, logarithmic 2026 projected points and a **historical-games evidence class** (including missing-history as a separate class).',
+           '- FV is never used to select a neighbor; it is used only as the historical comparison target.',
+           '- The existing 2026 projection source is Team Utility-only; its use here is an audit experiment, not an approved FV formula.',
+           '- Missing historical records mean NOT RECORDED rather than 0 actual games.',
+           '- LOO measures **internal self-consistency** only; source FV and these comparison values are not validated against independent dynasty-market prices.',
+           '', '## Backtest against QA14 (p75 absolute error; lower is better)', '',
+           '| Position | Eligible references | LOO n | QA14 p75 | QA15 p75 | QA15 median error |',
+           '|---|---:|---:|---:|---:|---:|']
+          for pos in positions:
+              z=bypos[pos]
+              report.append(f"| {pos} | {z['reference_players']} | {z['loo_count']} | {z['qa14_p75_abs_pct_error']}% | {z['p75_abs_pct_error']}% | {z['median_abs_pct_error']}% |")
+          report +=['', '## 16 internally flagged cases','',
+           '| Player | Current FV | QA14 median | New opportunity-aware range | New median | Status |',
+           '|---|---:|---:|---|---:|---|']
+          for r in results:
+              if r['review_status']=='NOT_IN_16_MEMBER_REVIEW':continue
+              interval=('N/A' if r['new_range_low_CONTEXT_ONLY'] is None else
+                       f"{r['new_range_low_CONTEXT_ONLY']:,}–{r['new_range_high_CONTEXT_ONLY']:,}")
+              report.append('| '+' | '.join([r['player'],str(f"{r['current_fv_UNCHANGED']:,}"),
+                 str(r['qa14_reference_median'] or 'N/A'),interval,
+                 str(r['new_range_median_CONTEXT_ONLY'] or 'N/A'),r['review_status']])+' |')
+          report +=['','## Audit verdict','',
+           '- This study does not endorse a numeric replacement FV; stable internal comparators are **not independent dynasty market anchors**.',
+           '- A change that lowers backtest self-consistency error does not necessarily improve real valuation accuracy.',
+           '- Preserve all curated prices and prospect upside pending independent evidence and explicit owner approval.',
+           '- Any deployment requires a separately authorized preview, then APPLY, with existing FV/FV+/MV regression and exact baseline checks.',
+           '', '## Files','',
+           '- `QA15_All72_Opportunity_Ranges.csv` — full cohort review, comparison ranges and holds.',
+           '- `QA15_LOO_Opportunity_Results.csv` — leave-one-out full eligible curated reference evaluations.',
+           '- `QA15_Manifest.json` — source hashes, error metrics, decisions and zero-change record.',
+           '', 'Generated: '+datetime.datetime.now(datetime.timezone.utc).isoformat()]
+          (OUT/'QA15_Report.md').write_text('\n'.join(report)+'\n',encoding='utf8')
+          outmanifest={'status':'QA15_OPPORTUNITY_AWARE_FV_BACKTEST_READ_ONLY',
+            'source_qa14_run':os.environ['QA14_RUN_ID'],'source_git_sha':manifest['source_git_sha'],
+            'cohort':72,'candidate_reviews':16,'reference_players':sum(len(x) for x in refs.values()),
+            'loo_count':len(loo),'by_position':bypos,'review_counts':dict(status),
+            'source_sha256':{p.name:sha(p) for p in [
+                Path('scripts/artifacts/generated/value_uncertainty.json'),
+                Path('scripts/artifacts/generated/team_utility_lineup_projections.json'),
+                Path('scripts/ppg_results.json'),SRC/'QA14_Manifest.json',SRC/'QA14_All72_Shadow_Peer_Ranges.json']},
+            'independent_market_validated':False,'fv_changes':0,'fv_plus_changes':0,'mv_changes':0,
+            'recommended_fv_count':0,'repo_mutations':0,'read_only':True,'release_approved':False,
+            'created_utc':datetime.datetime.now(datetime.timezone.utc).isoformat()}
+          (OUT/'QA15_Manifest.json').write_text(json.dumps(outmanifest,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({'status':outmanifest['status'],'references':outmanifest['reference_players'],
+          'loo':outmanifest['loo_count'],'review_counts':outmanifest['review_counts']}))
+          PY_QA15_ENGINE
+          python3 -m py_compile "$RUNNER_TEMP/qa15_engine.py"
+          python3 "$RUNNER_TEMP/qa15_engine.py"
+      - name: Enforce zero live valuation or repository changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          test -z "$(git status --porcelain --untracked-files=all)"
+          python3 - <<'PY_QA15_RELEASE'
+          import json,os,pathlib
+          m=json.loads((pathlib.Path(os.environ['QA15_OUT'])/'QA15_Manifest.json').read_text())
+          assert m['status']=='QA15_OPPORTUNITY_AWARE_FV_BACKTEST_READ_ONLY'
+          assert m['cohort']==72 and m['candidate_reviews']==16 and m['read_only']
+          assert not m['independent_market_validated'] and not m['release_approved']
+          assert all(m[k]==0 for k in ('fv_changes','fv_plus_changes','mv_changes','repo_mutations','recommended_fv_count'))
+          PY_QA15_RELEASE
+      - name: Upload QA15 evidence and numerical shadows
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A-QA15-Opportunity-Aware-Peer-Shadow
+          path: /tmp/a-qa15-out/
+          retention-days: 30
+          if-no-files-found: error
+      - name: Mobile summary
+        if: always()
+        shell: bash
+        run: |
+          if test -f "$QA15_OUT/QA15_Report.md"; then
+            cat "$QA15_OUT/QA15_Report.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'QA15 halted before producing verified results; no FV, FV+ or MV changed.' >> "$GITHUB_STEP_SUMMARY"
+          fi
