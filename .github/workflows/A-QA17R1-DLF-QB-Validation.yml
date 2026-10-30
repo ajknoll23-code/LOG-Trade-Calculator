@@ -1,0 +1,300 @@
+name: A-QA17 - Private DLF QB Market Crosscheck (Read Only)
+run-name: A-QA17 four-QB independent dynasty market crosscheck NO RELEASE
+
+'on':
+  workflow_dispatch:
+    inputs:
+      qa16_run_id:
+        description: Exact successful QA16R1 source run
+        required: true
+        type: string
+        default: '41107911946'
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: a-qa17-qb-market-review-read-only
+  cancel-in-progress: false
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      QA17_QA16_RUN_ID: ${{ inputs.qa16_run_id }}
+      QA17_INPUT: /tmp/a-qa17-qa16
+      QA17_OUTPUT: /tmp/a-qa17-output
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout without write credentials
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Validate exact successful QA16R1 source run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$QA17_QA16_RUN_ID" =~ ^[0-9]{7,15}$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$QA17_QA16_RUN_ID" > "$RUNNER_TEMP/qa17_source_run.json"
+          python3 - <<'PY_VALIDATE'
+          import json,os,pathlib
+          r=json.loads((pathlib.Path(os.environ['RUNNER_TEMP'])/'qa17_source_run.json').read_text())
+          expected={
+              'status':'completed','conclusion':'success','event':'workflow_dispatch',
+              'head_branch':'main',
+              'path':'.github/workflows/A-QA16R1-Mobile-Review-Repair.yml',
+              'display_title':'A-QA16R1 repaired mobile summary - paired QB review READ ONLY',
+          }
+          for k,v in expected.items():
+              assert r.get(k)==v,(k,r.get(k),v)
+          assert r.get('repository',{}).get('full_name')==os.environ['GITHUB_REPOSITORY']
+          PY_VALIDATE
+
+      - name: Retrieve QA16 evidence from the verified green run
+        uses: actions/download-artifact@v4
+        with:
+          name: A-QA16-Paired-QB-Price-Review
+          run-id: ${{ inputs.qa16_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: /tmp/a-qa17-qa16
+
+      - name: Pin historical source and validate unreleased QA16 contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_PIN'
+          import json,os,pathlib,re
+          p=pathlib.Path(os.environ['QA17_INPUT'])
+          m=json.loads((p/'QA16_Manifest.json').read_text())
+          expected={
+              'status':'QA16_PAIRED_BACKTEST_AND_QB_OWNER_REVIEW_READ_ONLY',
+              'source_qa14_run':'41095976610','source_qa15_run':'41099108472',
+              'paired_count':360,'paired_qb_count':39,
+              'owner_pricing_candidates_approved':0,'fv_changes':0,
+              'fv_plus_changes':0,'mv_changes':0,'repo_mutations':0,
+              'owner_release_authorized':False,'independent_market_price_verified':False,
+          }
+          for k,v in expected.items():assert m.get(k)==v,(k,m.get(k))
+          assert re.fullmatch('[0-9a-f]{40}',m['source_git_sha'])
+          (pathlib.Path(os.environ['RUNNER_TEMP'])/'qa17_source_sha').write_text(m['source_git_sha'])
+          PY_PIN
+          git fetch --depth=1 origin "$(cat "$RUNNER_TEMP/qa17_source_sha")"
+          git checkout --detach "$(cat "$RUNNER_TEMP/qa17_source_sha")"
+          test "$(git rev-parse HEAD)" = "$(cat "$RUNNER_TEMP/qa17_source_sha")"
+
+      - name: Crosscheck four QBs against private DLF market order in memory
+        shell: bash
+        env:
+          CAL26_DLF_SF_CSV_B64: ${{ secrets.CAL26_DLF_SF_CSV_B64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$QA17_OUTPUT"
+          cat > "$RUNNER_TEMP/qa17_engine.py" <<'PY_QA17'
+          #!/usr/bin/env python3
+          """QA17: private DLF is parsed in memory only; do not output raw provider values.
+          External same-vintage ranking is a diagnostic, not cardinal FV calibration.
+          """
+          import base64,collections,csv,datetime,hashlib,io,json,math,os,pathlib,re,statistics
+          inp=pathlib.Path(os.environ['QA17_INPUT'])
+          out=pathlib.Path(os.environ['QA17_OUTPUT']);out.mkdir(parents=True,exist_ok=True)
+          def stop(msg):raise RuntimeError('QA17 INTEGRITY/PRIVATE INPUT HALT: '+msg)
+          def normalize(s):
+              # Exact normalized name only; never fuzzy-match a licensed identity.
+              t=str(s or '').lower().replace('’',"'")
+              t=re.sub(r"[.'\-]",'',t)
+              t=re.sub(r'\b(jr|sr|ii|iii|iv)\b','',t)
+              return ' '.join(t.split())
+          def percentile(value,values):
+              if value is None or not values:return None
+              return round(100*(sum(x<value for x in values)+.5*sum(x==value for x in values))/len(values),1)
+          def quartile(v):
+              if v is None:return 'NOT_AVAILABLE'
+              if v<=25:return 'BOTTOM_QUARTILE'
+              if v<=50:return 'SECOND_QUARTILE'
+              if v<=75:return 'THIRD_QUARTILE'
+              return 'TOP_QUARTILE'
+          def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
+          m=json.loads((inp/'QA16_Manifest.json').read_text())
+          if m.get('status')!='QA16_PAIRED_BACKTEST_AND_QB_OWNER_REVIEW_READ_ONLY' or m.get('owner_release_authorized'):
+              stop('QA16 upstream release or status drift')
+          source_sha=os.popen('git rev-parse HEAD').read().strip()
+          if m['source_git_sha']!=source_sha:stop('Pinned source mismatch')
+          with (inp/'QA16_16_Case_Owner_Review.csv').open(newline='',encoding='utf8') as f:cases=list(csv.DictReader(f))
+          if len(cases)!=16 or len({x['sleeper_id'] for x in cases})!=16:stop('QA16 exact case count or duplicate stable ID')
+          focus=[x for x in cases if x['position']=='QB']
+          ids={'7083':'Tyler Huntley','5854':'Drew Lock','8162':'Sam Howell','1737':'Case Keenum'}
+          if len(focus)!=4 or {x['sleeper_id'] for x in focus}!=set(ids):stop('Four-QB scope drift')
+          for r in focus:
+              if r['player']!=ids[r['sleeper_id']] or r['production_fv_changed']!='NO' or r['production_price_recommendation']:
+                  stop('Wrong QB identity or unexpected prior FV proposal')
+              if r['independent_market_price_observed']!='NO':stop('Upstream independent evidence unexpectedly set')
+          secret=os.environ.get('CAL26_DLF_SF_CSV_B64','').strip()
+          if not secret:stop('CAL26_DLF_SF_CSV_B64 secret not configured; do not fake independent DLF evidence')
+          try: decoded=base64.b64decode(secret,validate=True).decode('utf-8-sig')
+          except Exception:stop('DLF secret is not valid base64 UTF-8')
+          src=csv.DictReader(io.StringIO(decoded))
+          if src.fieldnames!=['name','position','team','value']:
+              stop('Private DLF schema changed; required name,position,team,value')
+          all_values=collections.defaultdict(list)
+          qb_market={};provider_rows=0
+          for line in src:
+              name=normalize(line['name']);pos=str(line['position']).strip().upper()
+              if pos not in ('QB','RB','WR','TE'):continue
+              try:v=float(line['value'])
+              except (TypeError,ValueError):stop('Invalid private DLF numeric value')
+              if not name or not math.isfinite(v) or v<=0:stop('Invalid private DLF field')
+              provider_rows+=1
+              all_values[pos].append(v)
+              if pos=='QB':
+                  if name in qb_market:stop('Private DLF duplicate exact-normalized QB identity')
+                  qb_market[name]=v
+          # Licensed provider rows and numbers are discarded after derived bands.
+          if provider_rows<25 or len(qb_market)<12:stop('Private DLF QB source coverage too small')
+          internal=json.loads(pathlib.Path('scripts/artifacts/generated/value_uncertainty.json').read_text())
+          if internal.get('counts',{}).get('player_count')!=565:stop('Curated source cohort changed')
+          qb_fvs=[];matched_qbs=[]
+          for name,rec in internal['players'].items():
+              if rec.get('pos')!='QB':continue
+              fv=rec.get('center_value')
+              if type(fv) not in (int,float) or not math.isfinite(fv) or fv<=0:stop('Invalid curated QB FV')
+              qb_fvs.append(float(fv))
+              key=normalize(name)
+              if key in qb_market:matched_qbs.append((float(fv),qb_market[key]))
+          if len(qb_fvs)<40:stop('Curated QB universe too small')
+          # Exact relative rank agreement across independent DLF and current internal
+          # prices. This is face-validity, not trade outcomes, and source vintage
+          # may be stale. Never export provider raw values.
+          def rank_corr(pairs):
+              if len(pairs)<10:return None
+              xs=[p[0] for p in pairs];ys=[p[1] for p in pairs]
+              xr=[percentile(v,xs) for v in xs];yr=[percentile(v,ys) for v in ys]
+              mx=sum(xr)/len(xr);my=sum(yr)/len(yr)
+              den=math.sqrt(sum((v-mx)**2 for v in xr)*sum((v-my)**2 for v in yr))
+              return round(sum((a-mx)*(b-my) for a,b in zip(xr,yr))/den,3) if den else None
+          correlations=rank_corr(matched_qbs)
+          records=[]
+          for r in focus:
+              current=int(r['current_fv_UNCHANGED']);name=r['player'];sleeper_id=r['sleeper_id']
+              dlf_value=qb_market.get(normalize(name))
+              dlf_percentile=percentile(dlf_value,all_values['QB'])
+              cur_pct=percentile(current,qb_fvs)
+              shadow=int(r['qa15_opportunity_median_INTERNAL_ONLY'])
+              shadow_pct=percentile(shadow,qb_fvs)
+              if dlf_value is None:
+                  finding='DLF_UNRANKED_OR_MISSING_NO_INFERENCE'
+              elif cur_pct>=70 and dlf_percentile<=35:
+                  finding='HIGH_INTERNAL_FV_LOW_DLF_RELATIVE_MARKET_SIGNAL'
+              elif cur_pct>=70 and dlf_percentile>=60:
+                  finding='HIGH_INTERNAL_FV_MARKET_DIRECTION_MAY_SUPPORT'
+              else:
+                  finding='MIXED_MARKET_RANK_EVIDENCE_REVIEW'
+              records.append({
+                'sleeper_id':sleeper_id,'player':name,'position':'QB',
+                'current_FV_UNCHANGED':current,
+                'current_FV_percentile_among_curated_QBs_CONTEXT':cur_pct,
+                'QA15_internal_peer_median_NOT_RECOMMENDED':shadow,
+                'QA15_internal_peer_median_percentile_CONTEXT':shadow_pct,
+                'DLF_private_QB_relative_quartile_ONLY':quartile(dlf_percentile),
+                'DLF_exact_name_QB_match':'YES' if dlf_value is not None else 'NO',
+                'market_direction_evidence':finding,
+                'DLF_source_date_verifiable':'NO_SOURCE_DATE_IN_SECRET_SCHEMA',
+                'independent_cardinal_FV_calibration':'NOT_ESTABLISHED',
+                'owner_decision':'HOLD_PENDING_DATE_ROLE_AND_OWNER_REVIEW',
+                'proposed_new_FV':'','FV_changed':'NO',
+              })
+          records.sort(key=lambda x:-x['current_FV_UNCHANGED'])
+          with (out/'QA17_Four_QB_DLF_Market_Crosscheck.csv').open('w',newline='',encoding='utf8') as f:
+              writer=csv.DictWriter(f,fieldnames=list(records[0]));writer.writeheader();writer.writerows(records)
+          matched=sum(x['DLF_exact_name_QB_match']=='YES' for x in records)
+          report=['# A-QA17 — Private DLF Four-QB Market Crosscheck (Read Only)','',
+            '**NO RELEASE, NO PROPOSED PRICES, NO PRIVATE DLF NUMERIC VALUES EXPORTED.**','',
+            '## Provenance', '',
+            '- Matched four explicit QA16 quarterbacks by immutable Sleeper ID; pinned historical production source.',
+            '- Private DLF CSV was decoded only inside job memory from existing GitHub secret.',
+            '- Name matching used exact normalized QB name and position; no fuzzy aliases or team guesses.',
+            '- The private DLF secret has no observation timestamp: **source freshness is unverified**.',
+            '- DLF market rank only tests *independent ordering*, not the correct cardinal FV conversion.',
+            '- Projection-based QA15 medians remain internal-only and are not approved price estimates.',
+            '', '## Four QBs — independent ordering crosscheck', '',
+            '| QB | Current FV | Internal FV percentile | QA15 shadow median | Private DLF QB quartile | Review signal |',
+            '|---|---:|---:|---:|---|---|']
+          for r in records:
+              report.append(f"| {r['player']} | {r['current_FV_UNCHANGED']:,} | {r['current_FV_percentile_among_curated_QBs_CONTEXT']} | {r['QA15_internal_peer_median_NOT_RECOMMENDED']:,} | {r['DLF_private_QB_relative_quartile_ONLY']} | {r['market_direction_evidence']} |")
+          report+=['','## External-source diagnostic', '',
+                f'- QB names in DLF private input: **{len(qb_market)}** (raw values excluded).',
+                f'- Four QB exact-name DLF coverage: **{matched}/4**.',
+                f'- Curated QBs with a market-name intersection: **{len(matched_qbs)}**.',
+                f'- Internal-FV vs DLF rank association on intersection: **{correlations if correlations is not None else "Not enough matches"}** (not causal or cardinal validation).',
+                '', '## Owner decision and next step', '',
+                '1. Do not treat missing DLF coverage as a value of zero; a backup may be unranked.',
+                '2. If DLF supports low relative ranks for the inflated QBs, advance to an **owner-reviewed numeric preview**, not an automatic formula cut.',
+                '3. Explicitly establish source date, current NFL opportunity, injury and dynasty horizon for each target before authorizing numerical FV.',
+                '4. No non-QB adjustments are proposed, and no existing FV, FV+ or MV was changed.',
+                '', 'File: QA17_Four_QB_DLF_Market_Crosscheck.csv', '']
+          (out/'QA17_Report.md').write_text('\n'.join(report),encoding='utf8')
+          manifest={'status':'QA17_PRIVATE_DLF_QB_ORDERING_READ_ONLY',
+            'qa16_verified_run':os.environ['QA17_QA16_RUN_ID'],
+            'source_git_sha':source_sha,'qa16_manifest_sha256':sha(inp/'QA16_Manifest.json'),
+            'qa16_cases_sha256':sha(inp/'QA16_16_Case_Owner_Review.csv'),
+            'focus_qb_count':4,'private_dlf_qb_count':len(qb_market),
+            'private_dlf_four_case_matches':matched,
+            'independent_rank_evidence_available':matched>0,
+            'source_vintage_verified':False,'external_cardinal_FV_calibrated':False,
+            'raw_private_dlf_rows_exported':0,'raw_private_dlf_values_exported':0,
+            'fv_changes':0,'fv_plus_changes':0,'mv_changes':0,'repo_mutations':0,
+            'owner_release_authorized':False,'read_only':True,
+            'generated_utc':datetime.datetime.now(datetime.timezone.utc).isoformat()}
+          (out/'QA17_Manifest.json').write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({'status':manifest['status'],'four_qb_private_dlf_matches':matched,
+            'all_production_values_changed':0,'raw_private_dlf_values_exported':0}))
+          PY_QA17
+          python3 -m py_compile "$RUNNER_TEMP/qa17_engine.py"
+          python3 "$RUNNER_TEMP/qa17_engine.py"
+
+      - name: Confirm no repository mutation or release
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          test -z "$(git status --porcelain --untracked-files=all)"
+          python3 - <<'PY_HOLD'
+          import json,os,pathlib
+          m=json.loads((pathlib.Path(os.environ['QA17_OUTPUT'])/'QA17_Manifest.json').read_text())
+          assert m['status']=='QA17_PRIVATE_DLF_QB_ORDERING_READ_ONLY'
+          assert m['read_only'] and not m['owner_release_authorized']
+          assert not m['source_vintage_verified'] and not m['external_cardinal_FV_calibrated']
+          for k in ('raw_private_dlf_rows_exported','raw_private_dlf_values_exported',
+                    'fv_changes','fv_plus_changes','mv_changes','repo_mutations'):
+              assert m[k]==0,(k,m[k])
+          PY_HOLD
+
+      - name: Upload sanitized four-QB owner evidence only
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A-QA17-Private-DLF-QB-Ordering-ReadOnly
+          path: /tmp/a-qa17-output/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Mobile review
+        if: always()
+        shell: bash
+        run: |
+          if test -f "$QA17_OUTPUT/QA17_Report.md"; then
+            cat "$QA17_OUTPUT/QA17_Report.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'QA17 held before external market check; no pricing changed.' >> "$GITHUB_STEP_SUMMARY"
+          fi
