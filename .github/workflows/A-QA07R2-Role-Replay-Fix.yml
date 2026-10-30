@@ -1,0 +1,393 @@
+name: A-QA07R2 - Live Fallback Role Causality Replay (Read Only)
+run-name: A-QA07R2 corrected role-only FV shadow replay
+
+'on':
+  workflow_dispatch:
+    inputs:
+      qa06_run_id:
+        description: Successful A-QA06 run containing exact 72-player casebook
+        required: true
+        default: '41055571041'
+        type: string
+      qa05_run_id:
+        description: Successful A-QA05 run containing ages and upstream lineage
+        required: true
+        default: '41054400674'
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: a-qa07r2-role-causality-read-only
+  cancel-in-progress: false
+
+jobs:
+  shadow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      QA06_RUN_ID: ${{ inputs.qa06_run_id }}
+      QA05_RUN_ID: ${{ inputs.qa05_run_id }}
+      QA06_IN: /tmp/a-qa07-qa06
+      QA05_IN: /tmp/a-qa07-qa05
+      QA07_OUT: /tmp/a-qa07-reports
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout source without write credentials
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Install runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Verify exact green upstream run identities
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$QA06_RUN_ID" =~ ^[0-9]{7,15}$ ]] && [[ "$QA05_RUN_ID" =~ ^[0-9]{7,15}$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$QA06_RUN_ID" > "$RUNNER_TEMP/qa06_run.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$QA05_RUN_ID" > "$RUNNER_TEMP/qa05_run.json"
+          python3 - <<'PY_CHECK_RUNS'
+          import json, os, pathlib
+          t=pathlib.Path(os.environ['RUNNER_TEMP'])
+          for label, expected_path, expected_title in (
+              ('qa06','.github/workflows/QA06-Fallback-Audit-Renamed.yml','A-QA06 fallback role pricing diagnostic READ ONLY'),
+              ('qa05','.github/workflows/A-QA05.yml','A-QA05 read-only valuation screening'),
+          ):
+              r=json.loads((t/f'{label}_run.json').read_text())
+              expected={'conclusion':'success','status':'completed','event':'workflow_dispatch',
+                'path':expected_path,'display_title':expected_title,'head_branch':'main'}
+              for k,v in expected.items():
+                  assert r.get(k)==v, f'{label} run changed or is not green: {k}'
+              assert r.get('repository',{}).get('full_name')==os.environ['GITHUB_REPOSITORY']
+          print('Both read-only source runs verified.')
+          PY_CHECK_RUNS
+
+      - name: Download exact QA06 casebook
+        uses: actions/download-artifact@v4
+        with:
+          name: A-QA06-Fallback-Mechanism-Diagnostic
+          run-id: ${{ inputs.qa06_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: /tmp/a-qa07-qa06
+
+      - name: Download exact QA05 age and FV lineage
+        uses: actions/download-artifact@v4
+        with:
+          name: A-QA05-Valuation-Review-Read-Only
+          run-id: ${{ inputs.qa05_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: /tmp/a-qa07-qa05
+
+      - name: Pin checkout to original QA04 source revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_PIN'
+          import json,os,pathlib,re,hashlib
+          base=pathlib.Path(os.environ['QA06_IN'])
+          m=json.loads((base/'QA06_Manifest.json').read_text())
+          assert m['status']=='QA06_SOURCE_ROLE_DIAGNOSTIC_COMPLETE_READ_ONLY'
+          assert m['cohort']==72 and m['new_fv_candidates_count']==0
+          assert all(m[k]==0 for k in ('fv_changes','fv_plus_changes','mv_changes','repo_mutations'))
+          assert m['roster_slot_is_proven_causal_fv_input'] is False
+          assert str(m['input_qa05_run'])==os.environ['QA05_RUN_ID']
+          assert str(m['source_qa04_run'])=='41005846747'
+          sha=m.get('source_qa04_sha','')
+          assert re.fullmatch('[a-f0-9]{40}',sha)
+          qa05manifest=pathlib.Path(os.environ['QA05_IN'])/'QA05_Manifest.json'
+          qa05csv=pathlib.Path(os.environ['QA05_IN'])/'QA05_All72_Review.csv'
+          assert hashlib.sha256(qa05manifest.read_bytes()).hexdigest()==m['qa05_manifest_sha256']
+          assert hashlib.sha256(qa05csv.read_bytes()).hexdigest()==m['qa05_all72_sha256']
+          (pathlib.Path(os.environ['RUNNER_TEMP'])/'qa07_source_sha').write_text(sha)
+          print('Exact reference commit:',sha)
+          PY_PIN
+          git fetch --depth=1 origin "$(cat "$RUNNER_TEMP/qa07_source_sha")"
+          git checkout --detach "$(cat "$RUNNER_TEMP/qa07_source_sha")"
+          test "$(git rev-parse HEAD)" = "$(cat "$RUNNER_TEMP/qa07_source_sha")"
+          python3 - <<'PY_VERIFY_SHA'
+          import hashlib,json,os,pathlib
+          m=json.loads((pathlib.Path(os.environ['QA06_IN'])/'QA06_Manifest.json').read_text())
+          assert hashlib.sha256(pathlib.Path('index.html').read_bytes()).hexdigest()==m['source_index_sha256'],'Source drift'
+          PY_VERIFY_SHA
+
+      - name: Prepare strictly matched 72-player replay inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$QA07_OUT"
+          python3 - <<'PY_JOIN'
+          import csv,json,os,pathlib,hashlib
+          b=pathlib.Path(os.environ['QA06_IN'])
+          c=pathlib.Path(os.environ['QA05_IN'])
+          o=pathlib.Path(os.environ['QA07_OUT'])
+          def read(p):
+              with p.open(encoding='utf-8',newline='') as f:return list(csv.DictReader(f))
+          casebook=read(b/'QA06_Casebook.csv')
+          upstream=read(c/'QA05_All72_Review.csv')
+          a=json.loads((c/'QA05_Manifest.json').read_text())
+          assert a['status']=='QA05_EVIDENCE_SCREEN_COMPLETE_READ_ONLY' and a['cohort']==72
+          assert a['source_qa04_head_sha']==(pathlib.Path(os.environ['RUNNER_TEMP'])/'qa07_source_sha').read_text()
+          assert len(casebook)==len(upstream)==72
+          u={r['sleeper_id']:r for r in upstream}
+          assert len(u)==72 and len({r['sleeper_id'] for r in casebook})==72
+          assert set(u)=={r['sleeper_id'] for r in casebook}
+          rows=[]
+          for x in casebook:
+              y=u[x['sleeper_id']]
+              assert x['player']==y['name'] and x['position']==y['position']
+              assert x['role_in_QA05_from_slot']==y['weak_roster_derived_role']
+              assert x['current_fv_UNCHANGED']==y['current_production_fv_UNCHANGED']
+              assert x['fantasy_roster_slot']==y['source_roster_slot']
+              assert x['production_change']=='NONE' and y['production_changes']=='NONE'
+              assert y['proposed_new_fv']==''
+              age=float(y['age'])
+              assert 18<=age<=45
+              rows.append({'sleeper_id':x['sleeper_id'],'player':x['player'],
+                'position':x['position'],'age':age,'slot':x['fantasy_roster_slot'],
+                'assigned_role':x['role_in_QA05_from_slot'],'fv':int(x['current_fv_UNCHANGED']),
+                'review_disposition':x['disposition'],'priority':x['priority']})
+          (o/'QA07_Input72.json').write_text(json.dumps(rows,indent=2)+'\n')
+          print('Prepared 72 exact stable IDs; no owner prices or source rows changed.')
+          PY_JOIN
+
+      - name: Execute original JavaScript FV formula with role-only counterfactuals
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/qa07_exact.js" <<'JS_REPLAY'
+          'use strict';
+          const fs=require('fs');
+          const vm=require('vm');
+          const source=fs.readFileSync('index.html','utf8');
+          const cases=JSON.parse(fs.readFileSync(process.env.QA07_OUT+'/QA07_Input72.json','utf8'));
+          function fail(s){throw new Error('QA07R2 SOURCE/REPLAY STOP: '+s)}
+          // Fail closed on changes to the actual live source-flow anchors.
+          for (const p of [
+            /function mergeLeagueRosters\(data\)\{/,
+            /role:\s*existing\s*\?\s*existing\.role\s*:\s*slotDefaults\[slot\]/,
+            /function playerValue\(pos, age, role, name\)\{/,
+            /const rm = productionMultiplier\(name \|\| '', role\);/,
+            /return Math\.round\(100 \* pw \* am \* rm \* 55\);/,
+            /function productionMultiplier\(name, role\)\{/,
+            /return roleEstimate;/
+          ]) if(!p.test(source)) fail('Core source link changed: '+p);
+          const roleLines=source.match(/const slotDefaults = \{[^\n]+\};/g)||[];
+          if(!roleLines.some(x=>x.includes("reserve_ir:'Depth'")&&x.includes("starters:'Starter'")))
+            fail('League-wide slot map changed');
+          // Capture exact source definitions rather than reimplement the pricing formula.
+          function getConst(name){
+            const re=new RegExp('^const '+name+'\\s*=', 'm');
+            const m=re.exec(source);
+            if(!m) fail('Constant missing: '+name);
+            const start=m.index, rhsStart=start+m[0].length;
+            const tail=source.slice(rhsStart);
+            const rhs=tail.trimStart();
+            if(rhs.startsWith('{')){
+              // R2 repair: some constants (POSITION_WEIGHT and ROLE_MULT) are
+              // complete single-line objects. R1 incorrectly captured through
+              // the NEXT multiline object's close, redeclaring AGE_CURVE.
+              // Match the exact one-line object before trying a multiline close.
+              const firstLine=tail.split('\n',1)[0];
+              if(/^\s*\{[^{}]*\}\s*;\s*(?:\/\/.*)?$/.test(firstLine))
+                return source.slice(start,rhsStart+firstLine.length);
+              const end=/^};\s*$/m.exec(tail);
+              if(!end) fail('Could not safely locate object closing: '+name);
+              const result=source.slice(start,rhsStart+end.index+end[0].length);
+              // A multiline object must end on the line containing its own
+              // closing brace; no intervening top-level declaration allowed.
+              if(/^const [A-Za-z_$][\w$]*\s*=/m.test(result.slice(m[0].length)))
+                fail('Object extraction swallowed another constant: '+name);
+              return result;
+            }
+            const lineEnd=source.indexOf('\n',rhsStart);
+            const one=source.slice(start,lineEnd<0?source.length:lineEnd);
+            if(!one.includes(';')) fail('Nonliteral simple constant: '+name);
+            return one;
+          }
+          function getFn(name){
+            const re=new RegExp('^function '+name+'\\([^\\n]*\\)\\s*\\{', 'm');
+            const m=re.exec(source);
+            if(!m) fail('Function missing: '+name);
+            const tail=source.slice(m.index);
+            const end=/^}\s*$/m.exec(tail);
+            if(!end) fail('Unable to locate exact function end: '+name);
+            return tail.slice(0,end.index+end[0].length);
+          }
+          const constants=[
+            'POSITION_WEIGHT','AGE_CURVE','QB_POST_PEAK_FLOOR','LB_POST_PEAK_DECAY_POWER',
+            'ROLE_MULT','PROD_MULT_DATA','NO_REAL_PRODUCTION_HISTORY',
+            'CAL22_LEGACY_MONOTONE_KEYS','PROD_MULT','PLAYER_DB','RB_BIRTH_DATE_DATA',
+            'CAL26_FV_OWNER_ANCHORS'
+          ];
+          const functions=[
+            'normalizeName','productionMultiplier','ageMultiplier',
+            'fractionalAgeFromBirthDate','rbMonotoneAgeAnchor','rbContinuousAgeMultiplier',
+            'effectiveAgeMultiplier','playerValue'
+          ];
+          const script=constants.map(getConst).join('\n')+'\n'+functions.map(getFn).join('\n')+
+            '\nglobalThis.QA07_EXPORT={playerValue,productionMultiplier,normalizeName,PROD_MULT,NO_REAL_PRODUCTION_HISTORY};';
+          const sandbox={};
+          try{vm.runInNewContext(script,sandbox,{timeout:12000});}
+          catch(e){fail('Could not isolate exact live source functions: '+e.message)}
+          const run=sandbox.QA07_EXPORT;
+          if(!run||typeof run.playerValue!=='function')fail('Source replay exports unavailable');
+          const rows=[];
+          const variants=['Starter','Rotational','Depth','Speculative'];
+          for(const c of cases){
+            const name=c.player;
+            const key=run.normalizeName(name);
+            const valueFor=r=>run.playerValue(c.position,c.age,r,name);
+            const model={};
+            for(const role of variants){
+              const n=valueFor(role);
+              if(!Number.isInteger(n)||n<0||n>20000)fail('Illegal scenario result: '+name+' '+role+' '+n);
+              model[role]=n;
+            }
+            const baseline=model[c.assigned_role];
+            if(!Number.isInteger(baseline))fail('Unsupported assigned role: '+name);
+            const drift=baseline-c.fv;
+            const productionPresent=Object.prototype.hasOwnProperty.call(run.PROD_MULT,key);
+            const noHistoryFlag=Object.prototype.hasOwnProperty.call(run.NO_REAL_PRODUCTION_HISTORY,key);
+            const productionRaw=productionPresent?run.PROD_MULT[key]:null;
+            const sourceSensitivity=(Math.max(...Object.values(model))-Math.min(...Object.values(model)));
+            rows.push({
+              ...c, baseline_model_fv:baseline, published_fv:c.fv,
+              baseline_replay_drift:drift,
+              baseline_parity:Math.abs(drift)<=3?'PASS':'HOLD_BASELINE_MISMATCH',
+              source_key:key, production_multiplier_entry_present:productionPresent,
+              raw_production_multiplier:productionRaw,no_real_history_flag:noHistoryFlag,
+              role_sensitive:sourceSensitivity>0, model_scenario_spread:sourceSensitivity,
+              value_if_Starter_HYPOTHETICAL:model.Starter,
+              value_if_Rotational_HYPOTHETICAL:model.Rotational,
+              value_if_Depth_HYPOTHETICAL:model.Depth,
+              value_if_Speculative_HYPOTHETICAL:model.Speculative,
+              sensitivity_to_Depth_not_recommendation:model.Depth-baseline,
+              replacement_fv:'',production_change:'NONE'
+            });
+          }
+          if(rows.length!==72)fail('Replay cohort size not 72');
+          const passed=rows.filter(x=>x.baseline_parity==='PASS').length;
+          const impacted=rows.filter(x=>x.baseline_parity==='PASS'&&x.role_sensitive).length;
+          fs.writeFileSync(process.env.QA07_OUT+'/QA07_Exact_Replay.json',JSON.stringify({
+            source_contract:'exact original JS functions, isolated for read-only evaluation',
+            baseline_parity_pass:passed, baseline_parity_hold:72-passed,
+            verified_role_sensitive_players:impacted,
+            results:rows},null,2)+'\n');
+          console.log(JSON.stringify({cohort:72,exact_replay_parity:passed,role_sensitive:impacted}));
+          if(passed<65)fail('Replay baseline insufficient; inspect artifact rather than trust scenario prices');
+          JS_REPLAY
+          node --check "$RUNNER_TEMP/qa07_exact.js"
+          node "$RUNNER_TEMP/qa07_exact.js"
+
+      - name: Produce evidence-indexed decisions and prevent price authorization
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_REPORT'
+          import csv,json,os,pathlib,collections,hashlib,datetime
+          out=pathlib.Path(os.environ['QA07_OUT'])
+          data=json.loads((out/'QA07_Exact_Replay.json').read_text())
+          rows=data['results']
+          assert len(rows)==72
+          for x in rows:
+              assert x['replacement_fv']=='' and x['production_change']=='NONE'
+          keys=['priority','sleeper_id','player','position','age','slot','assigned_role','published_fv',
+                'baseline_model_fv','baseline_replay_drift','baseline_parity','production_multiplier_entry_present',
+                'raw_production_multiplier','no_real_history_flag','role_sensitive','model_scenario_spread',
+                'value_if_Starter_HYPOTHETICAL','value_if_Rotational_HYPOTHETICAL',
+                'value_if_Depth_HYPOTHETICAL','value_if_Speculative_HYPOTHETICAL',
+                'sensitivity_to_Depth_not_recommendation','review_disposition',
+                'replacement_fv','production_change']
+          with (out/'QA07_All72_Role_Counterfactuals.csv').open('w',encoding='utf8',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=keys);w.writeheader();w.writerows({k:x[k] for k in keys} for x in rows)
+          valid=[x for x in rows if x['baseline_parity']=='PASS']
+          sensitive=[x for x in valid if x['role_sensitive']]
+          largest=sorted(sensitive,key=lambda x: -abs(x['sensitivity_to_Depth_not_recommendation']))[:20]
+          lines=['# A-QA07 — Exact Live Role-Causality Shadow Replay','',
+            '**READ ONLY: NO production FV, FV+, or MV changes. No recommended replacement FV.**','',
+            '## Source data-flow confirmed', '',
+            '- `mergeLeagueRosters()` uses the Sleeper fantasy-roster slot to set role for uncurated players.',
+            '- `playerValue()` calls `productionMultiplier()` with that role.',
+            '- The production multiplier uses `ROLE_MULT` when no baked production is available,',
+            '  plus narrowly guarded zero-history floor-rescue cases.',
+            '- Exact `playerValue()` and all dependent source routines are isolated from the pinned',
+            '  historical `index.html` and re-executed without rewriting their formulas.',
+            '', '## Verification', '',
+            f'- Stable-ID players tested: **{len(rows)}**.',
+            f'- Original baseline within ±3 FV of QA05 published value: **{len(valid)}/{len(rows)}**.',
+            f'- Players with a nonzero exact role-only sensitivity AND parity pass: **{len(sensitive)}**.',
+            '- Hypothetical role scenarios are **not** evidence that a given role is deserved.',
+            '- A player with a baseline parity hold must not be interpreted as a verified valuation effect.',
+            '', '## Leading role-only hypothetical sensitivity', '',
+            '| Player | Current FV | Assigned role | Replay original | Hypothetical Depth FV | Delta* |',
+            '|---|---:|---|---:|---:|---:|']
+          for x in largest:
+              lines.append(f"| {x['player'].replace('|','/')} | {x['published_fv']:,} | {x['assigned_role']} | {x['baseline_model_fv']:,} | {x['value_if_Depth_HYPOTHETICAL']:,} | {x['sensitivity_to_Depth_not_recommendation']:+,} |")
+          lines += ['', '*Delta = changing only the input role to Depth, keeping age, position,',
+                    'source production and the actual live FV formula fixed. **Not a suggested new price.**',
+                    '', '## Interpretation', '',
+                    '1. Fixing a causal dependence on fantasy roster-slot assignment does NOT prove the hypothetical Depth role is accurate.',
+                    '2. Preserve dynasty prospect upside and independent current-NFL role evidence; do not apply arbitrary cuts.',
+                    '3. Source-backed role alternatives and dynasty market/ROS evidence are required before pricing candidates.',
+                    '4. Any future production action requires separately authorized PREVIEW and APPLY stages.',
+                    '', '## Files', '',
+                    '- `QA07_All72_Role_Counterfactuals.csv`: per-player exact original replay plus four role sensitivities.',
+                    '- `QA07_Exact_Replay.json`: unrounded raw metadata and full casebook.',
+                    '- `QA07_Manifest.json`: contract, source pin, counts, zero-change proof.',
+                    '',f"Generated: {datetime.datetime.now(datetime.timezone.utc).isoformat()}"]
+          (out/'QA07_Report.md').write_text('\n'.join(lines)+'\n',encoding='utf8')
+          qa06=json.loads((pathlib.Path(os.environ['QA06_IN'])/'QA06_Manifest.json').read_text())
+          manifest={
+            'status':'QA07_ROLE_ONLY_LIVE_JS_SHADOW_COMPLETE_READ_ONLY',
+            'source_qa06_run':os.environ['QA06_RUN_ID'],'source_qa05_run':os.environ['QA05_RUN_ID'],
+            'source_git_sha':qa06['source_qa04_sha'],'source_index_sha256':qa06['source_index_sha256'],
+            'cohort':72,'replay_parity_pass':len(valid),'replay_parity_hold':72-len(valid),
+            'verified_role_sensitive_count':len(sensitive),
+            'recommended_price_candidates':0,'fv_changes':0,'fv_plus_changes':0,'mv_changes':0,
+            'repo_mutations':0,'read_only':True,
+            'generated_utc':datetime.datetime.now(datetime.timezone.utc).isoformat()}
+          (out/'QA07_Manifest.json').write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(manifest,sort_keys=True))
+          PY_REPORT
+
+      - name: Enforce zero repository mutation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          test -z "$(git status --porcelain --untracked-files=all)" || {
+            echo 'Read-only contract violated'; exit 1;
+          }
+
+      - name: Upload QA07 role-causality evidence
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A-QA07R2-Exact-Role-Only-Shadow
+          path: /tmp/a-qa07-reports/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Mobile review summary
+        if: always()
+        shell: bash
+        run: |
+          if test -f "$QA07_OUT/QA07_Report.md"; then
+            cat "$QA07_OUT/QA07_Report.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'QA07 stopped before generating valid results; no production prices changed.' >> "$GITHUB_STEP_SUMMARY"
+          fi
