@@ -1,0 +1,253 @@
+name: A-QA04 - Evidence Based Fallback Shadow Audit (Read Only)
+run-name: A-QA04 read-only shadow review
+'on':
+  workflow_dispatch:
+    inputs:
+      qa03_run_id:
+        description: Green A-QA03 run ID (default verified run)
+        required: true
+        default: '41003655991'
+        type: string
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: a-qa04-shadow-read-only
+  cancel-in-progress: false
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      QA03_RUN_ID: ${{ inputs.qa03_run_id }}
+      QA03_SOURCE_DIR: /tmp/a-qa04-qa03/a-qa03-results
+      QA04_OUT: /tmp/a-qa04-reports
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout current main read only
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Validate QA03 prior run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$QA03_RUN_ID" =~ ^[0-9]{7,15}$ ]] || { echo 'Invalid QA03 run ID'; exit 1; }
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$QA03_RUN_ID" \
+            --jq '[.conclusion,.event,.path,.display_title]|@tsv' > /tmp/a-qa04-prior.tsv
+          IFS=$'\t' read -r conclusion event path title < /tmp/a-qa04-prior.tsv
+          test "$conclusion" = success && test "$event" = workflow_dispatch \
+            && test "$path" = '.github/workflows/A-QA03.yml' && test "$title" = 'A-QA03 read-only triage'
+      - name: Download exact QA03 report and player cohort
+        uses: actions/download-artifact@v4
+        with:
+          name: A-QA03-Uncurated-Player-Triage
+          run-id: ${{ inputs.qa03_run_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          path: /tmp/a-qa04-qa03
+      - name: Materialize audited Python engine and syntax check
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/qa04_engine.py" <<'PY_QA04_ENGINE'
+          #!/usr/bin/env python3
+          """A-QA04: exact QA03 cohort 2026 evidence and FV comparator review. No writes to repo."""
+          import csv, hashlib, json, math, os, pathlib, statistics, sys
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone
+          
+          ROOT=pathlib.Path.cwd(); OUT=pathlib.Path(os.environ.get('QA04_OUT','/tmp/a-qa04-reports'))
+          PRIOR=pathlib.Path(os.environ.get('QA03_SOURCE_DIR','/tmp/a-qa04-qa03'))
+          VALID=ROOT/'scripts'/'validation';sys.path.insert(0,str(VALID))
+          import snapshot_values
+          
+          def fail(why): raise RuntimeError('QA04_SOURCE_GUARD: '+why)
+          def digest(path): return hashlib.sha256(path.read_bytes()).hexdigest()
+          def load(path):
+              if not path.is_file():fail('missing source: '+str(path))
+              return json.loads(path.read_text(encoding='utf8'))
+          def num(v):
+              if isinstance(v,bool):return None
+              try:
+                  x=float(v)
+                  return x if math.isfinite(x) else None
+              except (TypeError,ValueError):return None
+          
+          def fmt(v):return '' if v is None else round(v,2)
+          def median_or_none(vals):return statistics.median(vals) if vals else None
+          
+          def review():
+              qa_manifest=load(PRIOR/'QA03_Manifest.json')
+              if qa_manifest.get('status')!='QA03_COMPLETE_WITH_REVIEW_FINDINGS' or not qa_manifest.get('read_only'):
+                  fail('QA03 manifest not a completed read-only audit')
+              with (PRIOR/'QA03_Priority.csv').open(newline='',encoding='utf8') as f:
+                  rows=list(csv.DictReader(f))
+              if len(rows)!=qa_manifest['uncurated_count'] or len(rows)<10:fail('QA03 cohort count does not match manifest')
+              ids=[r['sleeper_id'] for r in rows]
+              if len(set(ids)) != len(ids):fail('QA03 duplicate stable IDs')
+              cfg=snapshot_values.load_from_html(ROOT/'index.html'); fv=snapshot_values.compute_all_values(cfg)
+              rosters=load(ROOT/'data'/'league_rosters.json')
+              pp=load(ROOT/'scripts'/'ppg_results.json')
+              proj=load(ROOT/'scripts'/'artifacts'/'generated'/'team_utility_lineup_projections.json')
+              cross=load(ROOT/'scripts'/'identity_crosswalk.json')
+              if proj.get('season')!=2026 or proj.get('purpose')!='Team Utility starter selection only; never Fundamental Value':fail('projection source semantics changed')
+              if not isinstance(proj.get('players'),dict) or len(proj['players'])<500:fail('projection map unexpectedly small')
+              if len(fv)<300:fail('curated FV baseline unexpectedly small')
+              by_sid={}
+              for roster in rosters['rosters']:
+                  for slot in ('starters','bench','taxi','reserve_ir'):
+                      for r in roster.get(slot,[]):
+                          pid=str(r.get('player_id',''))
+                          if not pid or pid=='0':continue
+                          if pid in by_sid:fail('duplicated Sleeper ID in league: '+pid)
+                          by_sid[pid]=(r,slot,roster['roster_id'])
+              pp_id={str(p.get('sleeper_id')):p for p in pp if p.get('sleeper_id') is not None}
+              cross_id={str(p['sleeper_id']):p for p in cross if p.get('sleeper_id') is not None and p.get('requires_manual_review') is False}
+              projected=proj['players']
+              # Map curated projection rows by normalized curated key. Colliding names are withheld.
+              def normal(s):return ''.join(c for c in (s or '').lower() if c.isalnum() or c.isspace()).strip()
+              curated_idx=defaultdict(list)
+              for sid,r in projected.items():
+                  k=normal(r.get('player',''))
+                  if k in fv and r.get('pos')==fv[k]['pos']:
+                      value=num(r.get('projection'))
+                      if value is not None and value>=0:
+                          curated_idx[k].append({'sid':str(sid),'points':value,'source':r.get('source')})
+              comps_by_pos=defaultdict(list)
+              for key,candidates in curated_idx.items():
+                  if len(candidates)!=1:continue
+                  v=fv[key]; c=candidates[0]
+                  comps_by_pos[v['pos']].append({'name':key,'fv':v['value'],'age':v['age'],'proj':c['points'],'sid':c['sid']})
+              findings=[]
+              for item in rows:
+                  sid=item['sleeper_id']
+                  if sid not in by_sid:fail('QA03 stable ID no longer rostered: '+sid)
+                  person,slot,rid=by_sid[sid]
+                  if str(person.get('name','')).casefold()!=item['name'].casefold() or str(rid)!=str(item['roster_id']) or slot!=item['slot']:
+                      fail('QA03 roster member changed; rerun QA03: '+sid)
+                  if person.get('position')!=item['position']:
+                      fail('QA03 source position changed; rerun QA03: '+sid)
+                  if normal(person.get('name')) in fv:
+                      fail('QA03 purported uncurated player now curated: '+sid)
+                  e=projected.get(sid); ppdata=pp_id.get(sid); x=cross_id.get(sid)
+                  points=num(e.get('projection')) if e else None
+                  games=int(ppdata.get('games_played') or 0) if ppdata else 0
+                  true_ppg=num(ppdata.get('true_ppg')) if ppdata else None
+                  history_total=num(ppdata.get('total_points')) if ppdata else None
+                  pos=item['position']; age=num(person.get('age'))
+                  # Comparator selection uses actual saved FV for curated names. It is not
+                  # a recommended price, learned model, market quote, or production forecast.
+                  possible=[]
+                  if points is not None and points >= 0:
+                      for c in comps_by_pos[pos]:
+                          # Require economically comparable projected workload; no giant
+                          # near-zero-usage to full-season-starter substitutions.
+                          if points>=30:
+                              if not (0.50 * points <= c['proj'] <= 2.0 * points):continue
+                          elif c['proj'] > max(35,2.0*points):continue
+                          delta=abs(math.log((c['proj']+20)/(points+20)))
+                          agegap=abs(c['age']-age) if age is not None else 6
+                          if agegap>8:continue
+                          distance=delta+0.035*agegap
+                          possible.append((distance,c))
+                  possible.sort(key=lambda a:(a[0],a[1]['name']))
+                  matched=[c for _,c in possible[:5]]
+                  # These are observed prices of other curated players, never a FV estimate
+                  # for the subject or a calibrated production model.
+                  range_values=sorted(c['fv'] for c in matched)
+                  result={
+                    'priority':item['priority'],'name':person['name'],'sleeper_id':sid,
+                    'position':pos,'age':person.get('age'),'slot':slot,
+                    'role_from_roster_slot':item['fallback_role'],'current_main_fv':item['main_fv'],
+                    'projection_2026_points':fmt(points),'projection_source':e.get('source') if e else 'MISSING',
+                    'projection_weeks':e.get('weeks_with_projection_data') if e else None,
+                    'history_2025_games':games,'history_2025_ppg':fmt(true_ppg),'history_2025_points':fmt(history_total),
+                    'fantasypros_crosswalk':'high_confidence' if x and x.get('match_confidence')=='high' else ('other' if x else 'not_verified'),
+                    'fantasypros_id':x.get('fantasypros_id') if x else None,
+                    'comparable_curated_count':len(matched),
+                    'comparator_fv_low':range_values[0] if len(matched)>=3 else None,
+                    'comparator_fv_median':median_or_none(range_values) if len(matched)>=3 else None,
+                    'comparator_fv_high':range_values[-1] if len(matched)>=3 else None,
+                    'comparable_names':'; '.join(c['name'] for c in matched),
+                    'comparable_fv':'; '.join(str(c['fv']) for c in matched),
+                    'comparator_not_price_recommendation':'YES',
+                    'shadow_status':('REVIEW_WITH_COMPARATORS' if len(matched)>=3 else 'HOLD_INSUFFICIENT_COMPARATORS') if points is not None else 'HOLD_MISSING_PROJECTION',
+                    'production_change':'NONE',
+                  }
+                  findings.append(result)
+              OUT.mkdir(parents=True,exist_ok=True)
+              columns=list(findings[0])
+              with (OUT/'QA04_Evidence.csv').open('w',newline='',encoding='utf8') as f:
+                  w=csv.DictWriter(f,fieldnames=columns);w.writeheader();w.writerows(findings)
+              summary=Counter(r['shadow_status'] for r in findings)
+              src_paths=['index.html','data/league_rosters.json','scripts/ppg_results.json','scripts/identity_crosswalk.json','scripts/artifacts/generated/team_utility_lineup_projections.json']
+              manifest={'status':'QA04_SHADOW_EVIDENCE_COMPLETE_READ_ONLY','cohort':len(rows),'source_qa03_run_id':os.environ.get('QA03_RUN_ID'),
+                'source_qa03_commit':qa_manifest['source_commit'],'priority_count':dict(Counter(r['priority'] for r in findings)),
+                'shadow_status_counts':dict(summary),'sources_sha256':{k:digest(ROOT/k) for k in src_paths},
+                'curated_fv_reference_count':len(fv),'comparator_method':'same_position_projection_0.5x_to_2x_age_within_8_years_nearest_5_NO_FV_AUTHORIZATION',
+                'price_changes':0,'repo_mutations':0,'generated_utc':datetime.now(timezone.utc).isoformat()}
+              (OUT/'QA04_Manifest.json').write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n')
+              out=['# A-QA04 — Source-Evidenced Fallback Pricing Shadow Audit','','**Status:** COMPLETE, READ ONLY. **No FV, FV+, or MV changes.**',
+                 '','## Audit scope',f'- Reused {len(rows)} exact Sleeper-ID QA03 cohort members; {len(fv)} curated FV reference players.',
+                 '- 2025 historical fantasy points, 2026 projection sources and verified crosswalks are attached when available.',
+                 '- Same-position curated comparators are identified by age and projected points, **not** used as price adjustments.',
+                 '- These are season-total projection sources designed for Team Utility, **not direct dynasty FV inputs**.',
+                 '', '## Current fallback prices vs source opportunity (high priority)',
+                 '| Player | Current FV | 2026 projected pts | 2025 games | 2025 PPG | Curated comparable band* | Decision |',
+                 '|---|---:|---:|---:|---:|---|---|']
+              for r in findings:
+                  if r['priority']!='HIGH':continue
+                  band=(f"{r['comparator_fv_low']:,}–{r['comparator_fv_high']:,}" if r['comparator_fv_low'] is not None else 'insufficient')
+                  points=r['projection_2026_points'];ppg=r['history_2025_ppg']
+                  out.append(f"| {r['name']} | {int(r['current_main_fv']):,} | {points if points!='' else 'missing'} | {r['history_2025_games']} | {ppg if ppg!='' else 'missing'} | {band} | {r['shadow_status']} |")
+              out+=['','*Comparator band: observed prices of nearest existing curated players with the same position, approximately comparable season projections and similar ages. **Not an approved or calibrated price target.**',
+                 '', '## Source/quality findings']
+              for code,n in sorted(summary.items()):out.append(f'- {code}: **{n}**')
+              out+=['', '## Recommendation',
+                 'Do not assign dynasty FV from fantasy-roster Starter/Rotational slots. A small season-total projection cannot on its own support several thousand FV.',
+                 'Evidence sufficiency and differing source semantics must be resolved before any FV replacement. Preserve strong dynasty assets with weak one-season opportunity; evaluate age, career history, and prospect/market indicators individually.',
+                 'Next: review the full 72-row CSV, validate comparable quality, and produce explicit **separately approved** valuation candidates. Treat missing evidence as HOLD, not FV=0.',
+                 '', '### Integrity guarantees',
+                 'Workflow uses contents:read and actions:read, runs against checked-out repository sources, changes no HTML, and does not commit or push.',
+                 'QA03 stable-ID, name, roster and position evidence must still match; otherwise audit aborts.',
+                 '', f"Source QA03 run: {os.environ.get('QA03_RUN_ID','not supplied')}",
+              ]
+              (OUT/'QA04_Report.md').write_text('\n'.join(out)+'\n',encoding='utf8')
+              print(json.dumps({'status':manifest['status'],'rows':len(rows),'summary':dict(summary)},sort_keys=True))
+          
+          if __name__=='__main__':review()
+          PY_QA04_ENGINE
+          python3 -m py_compile "$RUNNER_TEMP/qa04_engine.py"
+      - name: Run read-only evidence and curated comparator audit
+        shell: bash
+        run: python3 "$RUNNER_TEMP/qa04_engine.py"
+      - name: Confirm checkout remained unmodified
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          test -z "$(git status --porcelain --untracked-files=all)" || { echo 'QA04 unexpectedly modified checkout'; exit 1; }
+      - name: Upload independent evidence review
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A-QA04-Evidence-Shadow
+          path: /tmp/a-qa04-reports/
+          retention-days: 30
+      - name: Publish mobile-friendly summary
+        if: always()
+        shell: bash
+        run: |
+          if test -f "$QA04_OUT/QA04_Report.md"; then
+            cat "$QA04_OUT/QA04_Report.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'QA04 did not complete; see failed step logs.' >> "$GITHUB_STEP_SUMMARY"
+          fi
