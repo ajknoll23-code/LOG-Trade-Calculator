@@ -1,0 +1,142 @@
+name: A-QA04R1 - Evidence-Based Fallback Shadow Audit (Fixed)
+run-name: A-QA04R1 read-only shadow review
+
+'on':
+  workflow_dispatch:
+    inputs:
+      qa03_run_id:
+        description: Green A-QA03 run ID (default verified run)
+        required: true
+        default: '41003655991'
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: a-qa04r1-shadow-read-only
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      QA03_RUN_ID: ${{ inputs.qa03_run_id }}
+      QA03_SOURCE_DIR: /tmp/a-qa04-qa03/a-qa03-results
+      QA04_OUT: /tmp/a-qa04-reports
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout main without write credentials
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Validate green QA03 source run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$QA03_RUN_ID" =~ ^[0-9]{7,15}$ ]] || { echo 'Invalid QA03 run ID'; exit 1; }
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$QA03_RUN_ID" \
+            --jq '[.conclusion,.event,.path,.display_title]|@tsv' > /tmp/a-qa04r1-prior.tsv
+          IFS=$'\t' read -r conclusion event path title < /tmp/a-qa04r1-prior.tsv
+          test "$conclusion" = success && test "$event" = workflow_dispatch \
+            && test "$path" = '.github/workflows/A-QA03.yml' \
+            && test "$title" = 'A-QA03 read-only triage'
+
+      - name: Download exact QA03 player evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: A-QA03-Uncurated-Player-Triage
+          run-id: ${{ inputs.qa03_run_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          path: /tmp/a-qa04-qa03
+
+      - name: Recover pinned QA04 audit and correct effective position check
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_QA04R1_PATCH'
+          from pathlib import Path
+          import os, subprocess
+
+          original = Path('.github/workflows/A-QA04.yml')
+          expected_sha = 'd66decc0095ee1994c5a188ac2228dc6ca25abf2'
+          sha = subprocess.check_output(['git', 'hash-object', str(original)], text=True).strip()
+          assert sha == expected_sha, 'Pinned QA04 workflow changed; review before patching'
+          source = original.read_text(encoding='utf-8')
+          begin = '          cat > "$RUNNER_TEMP/qa04_engine.py" <<\'PY_QA04_ENGINE\'\n'
+          end = '\n          PY_QA04_ENGINE'
+          assert source.count(begin) == 1 and source.count(end) == 1, 'QA04 engine markers changed'
+          block = source.split(begin, 1)[1].split(end, 1)[0]
+          lines = block.splitlines()
+          assert len(lines) > 100 and all(not s or s.startswith('          ') for s in lines), 'QA04 engine indentation drift'
+          engine = '\n'.join(s[10:] if s.startswith('          ') else s for s in lines) + '\n'
+
+          before = (
+              "        if person.get('position')!=item['position']:\n"
+              "            fail('QA03 source position changed; rerun QA03: '+sid)"
+          )
+          after = (
+              "        # Use QA01's effective-position rule, rather than raw Sleeper position.\n"
+              "        # Derrick Barnes is a DL/LB in fantasy_positions but raw LB.\n"
+              "        pos_map={'DE':'DL','DT':'DL','DL':'DL','OLB':'LB','ILB':'LB',\n"
+              "                 'LB':'LB','CB':'DB','S':'DB','SS':'DB','FS':'DB',\n"
+              "                 'DB':'DB','QB':'QB','RB':'RB','WR':'WR','TE':'TE','K':'K'}\n"
+              "        elig=person.get('fantasy_positions') or []\n"
+              "        selected=next((pos_map[p] for p in elig if p in pos_map),\n"
+              "                      pos_map.get(person.get('position')))\n"
+              "        if selected!=item['position']:\n"
+              "            fail('QA03 effective position changed; rerun QA03: '+sid+\n"
+              "                 ' expected='+item['position']+' observed='+str(selected))"
+          )
+          assert engine.count(before) == 1, 'QA04 position-check patch anchor changed'
+          engine = engine.replace(before, after)
+          assert engine.count('QA03 effective position changed') == 1
+          output = Path(os.environ['RUNNER_TEMP']) / 'qa04_engine.py'
+          output.write_text(engine, encoding='utf-8')
+          print('Patched one QA04 raw-position guard to QA03-compatible effective position selection.')
+          PY_QA04R1_PATCH
+          python3 -m py_compile "$RUNNER_TEMP/qa04_engine.py"
+
+      - name: Run unchanged evidence and comparator analysis with corrected guard
+        shell: bash
+        run: python3 "$RUNNER_TEMP/qa04_engine.py"
+
+      - name: Verify repository remained unmodified
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          test -z "$(git status --porcelain --untracked-files=all)" || {
+            echo 'Unexpected checkout modification'; exit 1;
+          }
+
+      - name: Upload QA04R1 shadow evidence
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A-QA04R1-Evidence-Shadow
+          path: /tmp/a-qa04-reports/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Show summary
+        if: always()
+        shell: bash
+        run: |
+          if test -f "$QA04_OUT/QA04_Report.md"; then
+            cat "$QA04_OUT/QA04_Report.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'QA04R1 did not complete; inspect the failed step logs.' >> "$GITHUB_STEP_SUMMARY"
+          fi
