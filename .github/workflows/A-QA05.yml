@@ -1,0 +1,423 @@
+name: A-QA05 - Evidence-Supported Valuation Candidate Screening (Read Only)
+run-name: A-QA05 read-only valuation screening
+
+'on':
+  workflow_dispatch:
+    inputs:
+      qa04_run_id:
+        description: Successful A-QA04R1 run ID (exact evidence source)
+        required: true
+        default: '41005846747'
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: a-qa05-shadow-review-read-only
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      QA04_RUN_ID: ${{ inputs.qa04_run_id }}
+      QA04_IN: /tmp/a-qa05-qa04
+      QA05_OUT: /tmp/a-qa05-output
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout without persistent write credentials
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Verify green QA04R1 provenance and pin source revision
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$QA04_RUN_ID" =~ ^[0-9]{7,15}$ ]] || { echo 'Invalid QA04 run ID'; exit 1; }
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$QA04_RUN_ID" > "$RUNNER_TEMP/qa04_run_metadata.json"
+          python3 - <<'PY_QA05_SOURCE'
+          import json, os, pathlib, re
+          p = pathlib.Path(os.environ['RUNNER_TEMP']) / 'qa04_run_metadata.json'
+          r = json.loads(p.read_text())
+          expected = {
+              'conclusion': 'success', 'event': 'workflow_dispatch',
+              'path': '.github/workflows/A-QA04R1.yml',
+              'display_title': 'A-QA04R1 read-only shadow review',
+              'head_branch': 'main',
+          }
+          for field, value in expected.items():
+              assert r.get(field) == value, f'QA04R1 source mismatch for {field}'
+          assert r.get('repository', {}).get('full_name') == os.environ['GITHUB_REPOSITORY']
+          sha = r.get('head_sha', '')
+          assert re.fullmatch(r'[a-f0-9]{40}', sha), 'Invalid QA04R1 commit SHA'
+          (pathlib.Path(os.environ['RUNNER_TEMP']) / 'qa04_source_sha').write_text(sha)
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              f.write('QA04_HEAD_SHA=' + sha + '\n')
+          print('Pinned QA04 source SHA:', sha)
+          PY_QA05_SOURCE
+          git fetch --depth=1 origin "$(cat "$RUNNER_TEMP/qa04_source_sha")"
+          git checkout --detach "$(cat "$RUNNER_TEMP/qa04_source_sha")"
+          test "$(git rev-parse HEAD)" = "$(cat "$RUNNER_TEMP/qa04_source_sha")"
+
+      - name: Retrieve exact A-QA04R1 evidence artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: A-QA04R1-Evidence-Shadow
+          run-id: ${{ inputs.qa04_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: /tmp/a-qa05-qa04
+
+      - name: Validate evidence and perform non-pricing shadow screening
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/qa05_engine.py" <<'PY_QA05_ENGINE'
+          #!/usr/bin/env python3
+          """A-QA05 read-only: validate QA04R1 cohort, score peer gaps, export review queue.
+
+          No proposed production FV: QA04 comparators were not calibrated for dynasty FV.
+          """
+          import collections
+          import csv
+          from datetime import datetime, timezone
+          import hashlib
+          import json
+          import math
+          import os
+          from pathlib import Path
+          import statistics
+
+          BASE = Path(os.environ.get('QA04_IN', '/tmp/a-qa05-qa04'))
+          OUT = Path(os.environ.get('QA05_OUT', '/tmp/a-qa05-output'))
+          OUT.mkdir(parents=True, exist_ok=True)
+
+
+          def fail(message):
+              raise RuntimeError('A-QA05 INTEGRITY STOP: ' + message)
+
+
+          def numeric(val, label, allow_blank=False):
+              if val is None or str(val).strip() == '':
+                  if allow_blank:
+                      return None
+                  fail('Missing ' + label)
+              try:
+                  result = float(val)
+                  if not math.isfinite(result):
+                      raise ValueError('Not finite')
+                  return result
+              except (ValueError, TypeError):
+                  fail('Non-numeric ' + label + ': ' + repr(val))
+
+
+          def fmt(val):
+              return '' if val is None else f'{round(val):.0f}'
+
+
+          def med(lo):
+              return statistics.median(lo)
+
+
+          def sig(num):
+              return f'{num:+,.0f}'
+
+
+          manifest_path = BASE / 'QA04_Manifest.json'
+          csv_path = BASE / 'QA04_Evidence.csv'
+          if not manifest_path.is_file() or not csv_path.is_file():
+              fail('Missing exact QA04R1 source files')
+          manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+          if manifest.get('status') != 'QA04_SHADOW_EVIDENCE_COMPLETE_READ_ONLY':
+              fail('QA04R1 manifest status not final')
+          if manifest.get('cohort') != 72 or manifest.get('price_changes') != 0 or manifest.get('repo_mutations') != 0:
+              fail('QA04R1 baseline integrity or cohort count changed')
+          if manifest.get('source_qa03_run_id') != '41003655991':
+              fail('Unexpected QA03 source lineage')
+          if manifest.get('priority_count') != {'HIGH': 10, 'MEDIUM': 32, 'LOW': 30}:
+              fail('Unexpected QA04 priority cohort')
+          if manifest.get('shadow_status_counts') != {'HOLD_MISSING_PROJECTION': 5, 'REVIEW_WITH_COMPARATORS': 67}:
+              fail('Unexpected QA04 source status distribution')
+
+          # The workflow checks out the exact SHA that produced QA04. Refuse source drift.
+          sources = manifest.get('sources_sha256')
+          if not isinstance(sources, dict) or len(sources) != 5:
+              fail('Expected five QA04 tracked source files')
+          for path, expected in sources.items():
+              f = Path(path)
+              if f.is_absolute() or '..' in f.parts or not f.is_file():
+                  fail('Source path unavailable: ' + path)
+              actual = hashlib.sha256(f.read_bytes()).hexdigest()
+              if actual != expected:
+                  fail('Source file drift: ' + path)
+
+          with csv_path.open(newline='', encoding='utf-8') as f:
+              rows = list(csv.DictReader(f))
+          required = {
+              'priority', 'name', 'sleeper_id', 'position', 'age', 'current_main_fv',
+              'projection_2026_points', 'projection_source', 'projection_weeks',
+              'history_2025_games', 'history_2025_ppg', 'history_2025_points',
+              'fantasypros_crosswalk', 'fantasypros_id', 'comparable_curated_count',
+              'comparator_fv_low', 'comparator_fv_median', 'comparator_fv_high',
+              'comparable_names', 'comparable_fv', 'comparator_not_price_recommendation',
+              'shadow_status', 'production_change', 'slot', 'role_from_roster_slot'
+          }
+          if len(rows) != 72 or not rows or not required.issubset(rows[0]):
+              fail('Wrong QA04 row count or CSV schema')
+          if len({r['sleeper_id'] for r in rows}) != len(rows):
+              fail('Duplicate sleeper ID in QA04 evidence')
+          if not all(r['name'].strip() and r['sleeper_id'].isdigit() for r in rows):
+              fail('Invalid QA04 player identity')
+          if dict(collections.Counter(r['priority'] for r in rows)) != {'HIGH': 10, 'MEDIUM': 32, 'LOW': 30}:
+              fail('CSV priority counts disagree with manifest')
+          if dict(collections.Counter(r['shadow_status'] for r in rows)) != {
+              'REVIEW_WITH_COMPARATORS': 67, 'HOLD_MISSING_PROJECTION': 5
+          }:
+              fail('CSV statuses disagree with manifest')
+          if any(r['production_change'] != 'NONE' for r in rows):
+              fail('QA04 contains a production change')
+          if any(r['comparator_not_price_recommendation'] != 'YES' for r in rows):
+              fail('QA04 did not explicitly disclaim comparator pricing')
+
+          results = []
+          for source in rows:
+              name, sid = source['name'].strip(), source['sleeper_id']
+              price = numeric(source['current_main_fv'], name + ': FV')
+              if price < 0:
+                  fail('Negative FV: ' + sid)
+              age = numeric(source['age'], name + ': age', True)
+              games = numeric(source['history_2025_games'], name + ': games')
+              ppg = numeric(source['history_2025_ppg'], name + ': ppg', True)
+              proj = numeric(source['projection_2026_points'], name + ': projection', True)
+              count = int(numeric(source['comparable_curated_count'], name + ': comp count'))
+              comps = [numeric(x, name + ': comparable FV') for x in source['comparable_fv'].split(';') if x.strip()]
+              names = [x.strip() for x in source['comparable_names'].split(';') if x.strip()]
+              if len(comps) != count or len(names) != count:
+                  fail('Comparator count mismatch for ' + sid)
+              if games == 0 and ppg is not None:
+                  fail('Zero games has populated PPG: ' + sid)
+              if count:
+                  if len(comps) < 3 or proj is None:
+                      fail('Peer evidence inconsistent: ' + sid)
+                  peer_low, peer_mid, peer_high = min(comps), med(comps), max(comps)
+                  if any(abs(v - expected) > 0.015 for v, expected in (
+                      (peer_low, numeric(source['comparator_fv_low'], name)),
+                      (peer_mid, numeric(source['comparator_fv_median'], name)),
+                      (peer_high, numeric(source['comparator_fv_high'], name)))):
+                      fail('QA04 peer statistic drift: ' + sid)
+                  sorted_comps = sorted(comps)
+                  mid_idx = len(sorted_comps) // 2
+                  if len(sorted_comps) % 2:
+                      lower_half = sorted_comps[:mid_idx]
+                      upper_half = sorted_comps[mid_idx + 1:]
+                  else:
+                      lower_half = sorted_comps[:mid_idx]
+                      upper_half = sorted_comps[mid_idx:]
+                  peer_q1, peer_q3 = med(lower_half), med(upper_half)
+                  ratio = price / peer_mid if peer_mid else None
+                  gap = price - peer_mid
+                  span = peer_high / peer_low if peer_low > 0 else None
+                  if ratio is None or span is None:
+                      fail('Nonpositive peer comparators: ' + sid)
+                  direction = ('CURRENT_ABOVE_PEERS' if ratio >= 1.35 else
+                               'CURRENT_BELOW_PEERS' if ratio <= 1 / 1.35 else
+                               'NO_MATERIAL_PEER_GAP')
+                  if ratio >= 2.0 or ratio <= 0.5:
+                      size = 'EXTREME'
+                  elif direction != 'NO_MATERIAL_PEER_GAP':
+                      size = 'MATERIAL'
+                  else:
+                      size = 'SMALL'
+                  spread = 'WIDE' if span > 2.5 else 'MODERATE'
+              else:
+                  if proj is not None or comps or names:
+                      fail('Missing-comparator hold has other peer data: ' + sid)
+                  peer_low = peer_mid = peer_high = peer_q1 = peer_q3 = ratio = gap = span = None
+                  direction, size, spread = 'NO_PROJECTION_HOLD', 'NOT_SCORED', 'NONE'
+
+              missing = []
+              if proj is None:
+                  missing.append('2026_projection')
+              if games <= 0:
+                  missing.append('documented_2025_games')
+              if age is None:
+                  missing.append('age')
+              if source['fantasypros_crosswalk'] != 'high_confidence':
+                  missing.append('high_confidence_identity_crosswalk')
+              if count and span > 2.5:
+                  missing.append('tight_peer_band')
+              # Fundamental blockers even if other sources look strong.
+              missing.extend(['independent_dynasty_rank_or_trade_market', 'multi_year_role_and_future_opportunity'])
+              if source['shadow_status'] == 'HOLD_MISSING_PROJECTION':
+                  next_step = 'HOLD_MISSING_PROJECTION'
+              elif games <= 0 and age is not None and age <= 24:
+                  next_step = 'PROSPECT_HOLD_VALIDATE_PRIOR_AND_UPSIDE'
+              elif games <= 0:
+                  next_step = 'HOLD_NO_RECENT_GAMES_GET_DYNASTY_SOURCES'
+              elif count and span > 2.5:
+                  next_step = 'COMPARATOR_SPREAD_TOO_WIDE_GET_BETTER_PEERS'
+              elif direction == 'CURRENT_ABOVE_PEERS':
+                  next_step = 'INVESTIGATE_POTENTIAL_OVERPRICING'
+              elif direction == 'CURRENT_BELOW_PEERS':
+                  next_step = 'INVESTIGATE_POTENTIAL_UNDERPRICING'
+              else:
+                  next_step = 'NO_IMMEDIATE_PEER_GAP_VALIDATE_INDEPENDENTLY'
+              results.append({
+                  'priority': source['priority'], 'sleeper_id': sid, 'name': name,
+                  'position': source['position'], 'age': source['age'], 'source_roster_slot': source['slot'],
+                  'weak_roster_derived_role': source['role_from_roster_slot'],
+                  'current_production_fv_UNCHANGED': fmt(price),
+                  'illustrative_peer_median_NOT_PROPOSED_FV': fmt(peer_mid),
+                  'illustrative_peer_q1_NOT_PROPOSED_FV': fmt(peer_q1),
+                  'illustrative_peer_q3_NOT_PROPOSED_FV': fmt(peer_q3),
+                  'illustrative_peer_min_NOT_PROPOSED_FV': fmt(peer_low),
+                  'illustrative_peer_max_NOT_PROPOSED_FV': fmt(peer_high),
+                  'illustrative_change_to_peer_median_NOT_RECOMMENDED': fmt(-gap) if gap is not None else '',
+                  'current_vs_peer_median_ratio': f'{ratio:.3f}' if ratio is not None else '',
+                  'peer_range_ratio': f'{span:.3f}' if span is not None else '',
+                  'peer_band_quality': spread, 'gap_direction': direction, 'gap_severity': size,
+                  '2026_season_projection_points_TEAM_UTILITY_ONLY': fmt(proj),
+                  '2026_projection_source': source['projection_source'],
+                  '2026_projection_weeks': source['projection_weeks'],
+                  '2025_games': fmt(games), '2025_ppg': str(ppg) if ppg is not None else '',
+                  'fantasypros_crosswalk': source['fantasypros_crosswalk'],
+                  'comparable_curated_count': str(count), 'comparable_names': source['comparable_names'],
+                  'comparable_fv': source['comparable_fv'],
+                  'review_disposition': next_step,
+                  'missing_evidence_before_price_decision': ';'.join(missing),
+                  'proposed_new_fv': '',
+                  'final_pricing_decision': 'HOLD_REQUIRES_INDEPENDENT_DYNASTY_EVIDENCE_AND_OWNER_APPROVAL',
+                  'production_changes': 'NONE',
+              })
+
+          # Preserve QA04 priority order for cross-referencing. Extra ranking is supplied separately.
+          cols = list(results[0])
+          with (OUT / 'QA05_All72_Review.csv').open('w', newline='', encoding='utf-8') as f:
+              w = csv.DictWriter(f, fieldnames=cols)
+              w.writeheader()
+              w.writerows(results)
+          priority = {'HIGH': 0, 'MEDIUM': 1, 'LOW': 2}
+          queue = sorted(results, key=lambda r: (
+              priority[r['priority']],
+              0 if r['gap_severity'] == 'EXTREME' else (1 if r['gap_severity'] == 'MATERIAL' else 2),
+              -abs(float(r['illustrative_change_to_peer_median_NOT_RECOMMENDED'] or 0)),
+              r['name']))
+          with (OUT / 'QA05_Review_Queue.csv').open('w', newline='', encoding='utf-8') as f:
+              w = csv.DictWriter(f, fieldnames=cols)
+              w.writeheader()
+              w.writerows(queue)
+          counts = collections.Counter(r['review_disposition'] for r in results)
+          directions = collections.Counter(r['gap_direction'] for r in results)
+          lines = [
+              '# A-QA05 — Evidence-Supported Valuation Candidate Screening (Read Only)', '',
+              '**Status: COMPLETE — SHADOW SCREEN ONLY. Zero production FV, FV+, or MV changes.**', '',
+              'QA04R1 comparator values are **not calibrated dynasty prices**. The values below are',
+              'illustrative peer-median sensitivity checkpoints, **NOT** approved or recommended new FV.', '',
+              '## Scope and integrity', '',
+              f'- Source QA04R1 run: `{os.environ.get("QA04_RUN_ID", "UNKNOWN")}`; QA03 lineage: `{manifest["source_qa03_run_id"]}`.',
+              f'- Stable-ID QA04R1 cohort: **{len(results)} players** (10 HIGH / 32 MEDIUM / 30 LOW).',
+              f'- {sum(r["gap_direction"] != "NO_PROJECTION_HOLD" for r in results)} with peer comparisons; 5 kickers missing source projections.',
+              '- Production changes: **0**. All 72 proposed_new_fv fields remain blank.',
+              '- Revalidated SHA-256 hashes of the five QA04 input files at the exact QA04 source revision.',
+              '', '## High-priority valuation screens', '',
+              '| Player | Current FV | Peer median (illustrative) | Difference to median* | 2025 games | Decision |',
+              '|---|---:|---:|---:|---:|---|'
+          ]
+          for r in results:
+              if r['priority'] != 'HIGH':
+                  continue
+              diff = r['illustrative_change_to_peer_median_NOT_RECOMMENDED']
+              # Delta is peer median minus current; no implied recommendation.
+              lines.append('| ' + ' | '.join([
+                  r['name'].replace('|', '/'),
+                  f'{int(r["current_production_fv_UNCHANGED"]):,}',
+                  f'{int(r["illustrative_peer_median_NOT_PROPOSED_FV"]):,}',
+                  sig(float(diff)),
+                  r['2025_games'], r['review_disposition']]) + ' |')
+          lines.extend([
+              '', '*Difference to median = peer median − current FV; **not** an adjustment instruction.',
+              '', '## Screening disposition counts', '',
+          ])
+          for key, num in sorted(counts.items(), key=lambda p: (-p[1], p[0])):
+              lines.append(f'- {key}: **{num}**')
+          lines.extend([
+              '', '## QA05 decisions and limitations', '',
+              '1. **No numerical replacement FV is approved.** The QA04 evidence includes only a one-season projection,',
+              '   2025 points where observed, and potentially noisy age/position/projection peers.',
+              '2. **Protect future upside.** Zero prior-year games do not prove low dynasty value,',
+              '   especially for prospects and players facing role changes or injuries.',
+              '3. **Do not price from starter/bench roster slots.** These are league-manager decisions, not durable NFL roles.',
+              '4. **Investigate both directions.** Curated peers can flag underpricing as well as overpricing.',
+              '5. **Before pricing:** attach independent current dynasty ranks/trade prices (e.g. permitted DLF / FantasyPros),',
+              '   injury/contract/depth-chart and multi-year production or prospect context, with identity and as-of-date checks.',
+              '6. **Any subsequent FV proposal requires a separate owner-approved preview and later APPLY authorization.**',
+              '', '## Artifact contents', '',
+              '- `QA05_All72_Review.csv`: full evidence and missing-source gates for all 72.',
+              '- `QA05_Review_Queue.csv`: sorted review queue.',
+              '- `QA05_Manifest.json`: pinned SHA, source lineage, integrity and decision counts.',
+              '', f'Generated: {datetime.now(timezone.utc).isoformat()}', ''
+          ])
+          (OUT / 'QA05_Report.md').write_text('\n'.join(lines), encoding='utf-8')
+          result_manifest = {
+              'status': 'QA05_EVIDENCE_SCREEN_COMPLETE_READ_ONLY',
+              'source_qa04_run_id': os.environ.get('QA04_RUN_ID'),
+              'source_qa04_head_sha': os.environ.get('QA04_HEAD_SHA'),
+              'source_qa03_run_id': manifest['source_qa03_run_id'],
+              'source_qa04_manifest_sha256': hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+              'source_qa04_csv_sha256': hashlib.sha256(csv_path.read_bytes()).hexdigest(),
+              'source_files_checked': sorted(sources), 'cohort': len(results),
+              'review_dispositions': dict(sorted(counts.items())),
+              'gap_directions': dict(sorted(directions.items())),
+              'fv_changes': 0, 'fv_plus_changes': 0, 'mv_changes': 0, 'repo_mutations': 0,
+              'proposed_new_fv_count': 0,
+              'peer_median_is_calibrated_dynasty_fv': False,
+              'independent_dynasty_evidence_present': False,
+              'owner_price_approval': False,
+              'generated_utc': datetime.now(timezone.utc).isoformat(),
+          }
+          (OUT / 'QA05_Manifest.json').write_text(json.dumps(result_manifest, sort_keys=True, indent=2) + '\n', encoding='utf-8')
+          print(json.dumps({'status': result_manifest['status'], 'cohort': len(results),
+                            'directions': dict(directions), 'review_dispositions': dict(counts)}, sort_keys=True))
+          PY_QA05_ENGINE
+          python3 -m py_compile "$RUNNER_TEMP/qa05_engine.py"
+          python3 "$RUNNER_TEMP/qa05_engine.py"
+
+      - name: Verify checked-out repository was never modified
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          test -z "$(git status --porcelain --untracked-files=all)" || {
+            echo 'A-QA05 read-only integrity contract violated'; exit 1;
+          }
+
+      - name: Upload QA05 evidence and review queue
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A-QA05-Valuation-Review-Read-Only
+          path: /tmp/a-qa05-output/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Report screening findings
+        if: always()
+        shell: bash
+        run: |
+          if test -f "$QA05_OUT/QA05_Report.md"; then
+            cat "$QA05_OUT/QA05_Report.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'QA05 stopped before evidence completion. Inspect workflow logs; no pricing changed.' >> "$GITHUB_STEP_SUMMARY"
+          fi
