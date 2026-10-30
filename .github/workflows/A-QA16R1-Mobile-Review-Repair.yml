@@ -1,0 +1,339 @@
+name: A-QA16R1 - Paired QB Calibration Mobile Summary Repair (Read Only)
+run-name: A-QA16R1 repaired mobile summary - paired QB review READ ONLY
+
+'on':
+  workflow_dispatch:
+    inputs:
+      qa15_run_id:
+        description: Successful A-QA15 opportunity-aware peer audit
+        required: true
+        type: string
+        default: '41099108472'
+      qa14_run_id:
+        description: Successful A-QA14 internal peer range audit
+        required: true
+        type: string
+        default: '41095976610'
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: a-qa16-paired-qb-review-read-only
+  cancel-in-progress: false
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      QA16_QA14_RUN_ID: ${{ inputs.qa14_run_id }}
+      QA16_QA15_RUN_ID: ${{ inputs.qa15_run_id }}
+      QA16_QA14: /tmp/a-qa16-qa14
+      QA16_QA15: /tmp/a-qa16-qa15
+      QA16_OUT: /tmp/a-qa16-output
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout without persistent write credentials
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Verify exact completed green QA14 and QA15 source runs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$QA16_QA14_RUN_ID" =~ ^[0-9]{7,15}$ ]]
+          [[ "$QA16_QA15_RUN_ID" =~ ^[0-9]{7,15}$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$QA16_QA14_RUN_ID" > "$RUNNER_TEMP/qa16_qa14_run.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$QA16_QA15_RUN_ID" > "$RUNNER_TEMP/qa16_qa15_run.json"
+          python3 - <<'PY_VERIFY'
+          import json,os,pathlib
+          t=pathlib.Path(os.environ['RUNNER_TEMP'])
+          expected=(('qa14','.github/workflows/A-QA14R1-Price-Calibration-Backtest.yml',
+                    'A-QA14 unbiased established-peer FV range and backtest READ ONLY'),
+                    ('qa15','.github/workflows/A-QA15R1-Opportunity-Backtest.yml',
+                    'A-QA15 opportunity-aware peer FV audit READ ONLY'))
+          for key,path,title in expected:
+              o=json.loads((t/f'qa16_{key}_run.json').read_text())
+              for k,v in {'status':'completed','conclusion':'success','event':'workflow_dispatch',
+                          'path':path,'display_title':title,'head_branch':'main'}.items():
+                  assert o.get(k)==v,(key,k,o.get(k),v)
+              assert o.get('repository',{}).get('full_name')==os.environ['GITHUB_REPOSITORY']
+          print('Original QA14 and QA15 success and provenance verified.')
+          PY_VERIFY
+
+      - name: Retrieve exact QA14 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: A-QA14-Internal-Peer-Range-Backtest
+          run-id: ${{ inputs.qa14_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: /tmp/a-qa16-qa14
+
+      - name: Retrieve exact QA15 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: A-QA15-Opportunity-Aware-Peer-Shadow
+          run-id: ${{ inputs.qa15_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: /tmp/a-qa16-qa15
+
+      - name: Pin historical pricing reference and validate source provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_SHA'
+          import json,os,pathlib,re,hashlib
+          a=json.loads((pathlib.Path(os.environ['QA16_QA14'])/'QA14_Manifest.json').read_text())
+          b=json.loads((pathlib.Path(os.environ['QA16_QA15'])/'QA15_Manifest.json').read_text())
+          assert a['status']=='QA14_INTERNAL_PEER_RANGE_BACKTEST_COMPLETE_READ_ONLY'
+          assert b['status']=='QA15_OPPORTUNITY_AWARE_FV_BACKTEST_READ_ONLY'
+          assert b['source_qa14_run']==os.environ['QA16_QA14_RUN_ID']
+          assert b['source_sha256']['QA14_Manifest.json']==hashlib.sha256((pathlib.Path(os.environ['QA16_QA14'])/'QA14_Manifest.json').read_bytes()).hexdigest()
+          assert a['source_git_sha']==b['source_git_sha']
+          assert re.fullmatch(r'[0-9a-f]{40}',a['source_git_sha'])
+          (pathlib.Path(os.environ['RUNNER_TEMP'])/'qa16_source_sha').write_text(a['source_git_sha'])
+          with open(os.environ['GITHUB_ENV'],'a') as f:f.write('QA16_SOURCE_SHA='+a['source_git_sha']+'\n')
+          print('Pinned source SHA:',a['source_git_sha'])
+          PY_SHA
+          git fetch --depth=1 origin "$(cat "$RUNNER_TEMP/qa16_source_sha")"
+          git checkout --detach "$(cat "$RUNNER_TEMP/qa16_source_sha")"
+          test "$(git rev-parse HEAD)" = "$(cat "$RUNNER_TEMP/qa16_source_sha")"
+
+      - name: Run paired out-of-sample self-consistency comparison and QB review
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$QA16_OUT"
+          cat > "$RUNNER_TEMP/qa16_engine.py" <<'PY_QA16_ENGINE'
+          #!/usr/bin/env python3
+          """QA16 paired accuracy diagnostics and owner QB REVIEW ONLY. No FV recommendation."""
+          import csv, datetime, hashlib, json, math, os, pathlib, random, statistics
+          from collections import defaultdict
+          P14=pathlib.Path(os.environ['QA16_QA14'])
+          P15=pathlib.Path(os.environ['QA16_QA15'])
+          OUT=pathlib.Path(os.environ['QA16_OUT']); OUT.mkdir(parents=True,exist_ok=True)
+          def readjson(p):return json.loads(p.read_text(encoding='utf8'))
+          def readcsv(p):
+              with p.open(newline='',encoding='utf8') as f:return list(csv.DictReader(f))
+          def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
+          def fail(msg):raise RuntimeError('A-QA16 INTEGRITY STOP: '+str(msg))
+          def pct(values,p):
+              values=sorted(values)
+              if not values:return None
+              v=(len(values)-1)*p;i=math.floor(v);j=math.ceil(v)
+              return values[i]+(values[j]-values[i])*(v-i)
+          def rnd(x):return None if x is None else round(x,2)
+          
+          m14=readjson(P14/'QA14_Manifest.json');m15=readjson(P15/'QA15_Manifest.json')
+          assert m14['status']=='QA14_INTERNAL_PEER_RANGE_BACKTEST_COMPLETE_READ_ONLY'
+          assert m15['status']=='QA15_OPPORTUNITY_AWARE_FV_BACKTEST_READ_ONLY'
+          assert m15['source_qa14_run']==os.environ['QA16_QA14_RUN_ID']
+          assert m14['source_qa13_run']=='41093056447'
+          assert m14['cohort']==m15['cohort']==72 and m15['candidate_reviews']==16
+          assert m14['source_git_sha']==m15['source_git_sha']==os.environ['QA16_SOURCE_SHA']
+          assert m14['loo_tests']>=300 and m15['loo_count']>=400
+          assert not m14['independent_market_verified'] and not m15['independent_market_validated']
+          assert m14['read_only'] and m15['read_only'] and not m14['owner_release_authorized'] and not m15['release_approved']
+          for m in (m14,m15):
+              assert all(m[k]==0 for k in ('fv_changes','fv_plus_changes','mv_changes','repo_mutations'))
+          assert m15['source_sha256']['QA14_Manifest.json']==sha(P14/'QA14_Manifest.json')
+          assert m15['source_sha256']['QA14_All72_Shadow_Peer_Ranges.json']==sha(P14/'QA14_All72_Shadow_Peer_Ranges.json')
+          
+          l14=readcsv(P14/'QA14_Established_Peer_LOO_Backtest.csv')
+          l15=readcsv(P15/'QA15_LOO_Opportunity_Results.csv')
+          assert len(l14)==m14['loo_tests'] and len(l15)==m15['loo_count']
+          A={(x['position'],str(x['id'])):x for x in l14}
+          B={(x['position'],str(x['sleeper_id'])):x for x in l15}
+          assert len(A)==len(l14) and len(B)==len(l15)
+          common=sorted(set(A)&set(B))
+          assert len(common)>=300,'Too few paired cases'
+          paired=[]
+          for key in common:
+              a,b=A[key],B[key]
+              if a['player']!=b['player'] or int(a['actual_curated_FV'])!=int(b['reference_fv']):
+                  fail('Non-comparable LOO observation '+str(key))
+              e14=float(a['absolute_pct_error']);e15=float(b['absolute_pct_error'])
+              if not all(math.isfinite(v) and v>=0 for v in (e14,e15)):fail('Bad LOO errors')
+              if a['market_validation']!='NOT_ESTABLISHED' or b['validation']!='INTERNAL_CURATED_FV_SELF_CONSISTENCY_ONLY':fail('Unverified external source')
+              paired.append({'position':key[0],'sleeper_id':key[1],'player':a['player'],
+                  'curated_fv_REFERENCE_ONLY':int(a['actual_curated_FV']),
+                  'qa14_abs_pct_error':e14,'qa15_abs_pct_error':e15,
+                  'qa15_minus_qa14_error_pct_points':round(e15-e14,2),
+                  'better_method':'QA15' if e15<e14 else ('QA14' if e15>e14 else 'TIE')})
+          assert 30<=len([r for r in paired if r['position']=='QB'])<=60
+          with (OUT/'QA16_Paired_LOO_Results.csv').open('w',newline='',encoding='utf8') as f:
+              w=csv.DictWriter(f,fieldnames=list(paired[0]));w.writeheader();w.writerows(paired)
+          
+          rng=random.Random(20261030)
+          summary={}
+          for pos in ('QB','RB','WR','TE','DL','LB','DB'):
+              z=[r for r in paired if r['position']==pos]
+              if len(z)<20:fail('Too few paired observations '+pos)
+              x=[r['qa14_abs_pct_error'] for r in z];y=[r['qa15_abs_pct_error'] for r in z]
+              # Bootstrap retains paired errors, which avoids the cohort-composition bias.
+              diffs=[]
+              for _ in range(2000):
+                  ii=[rng.randrange(len(z)) for _ in z]
+                  diffs.append(pct([y[i] for i in ii],.75)-pct([x[i] for i in ii],.75))
+              d=pct(y,.75)-pct(x,.75)
+              summary[pos]={
+                  'paired_count':len(z),
+                  'qa14_p75_abs_pct_error':rnd(pct(x,.75)),
+                  'qa15_p75_abs_pct_error':rnd(pct(y,.75)),
+                  'paired_p75_delta_percentage_points':rnd(d),
+                  'qa14_median_abs_pct_error':rnd(statistics.median(x)),
+                  'qa15_median_abs_pct_error':rnd(statistics.median(y)),
+                  'qa15_individual_wins':sum(a>b for a,b in zip(x,y)),
+                  'qa14_individual_wins':sum(a<b for a,b in zip(x,y)),
+                  'ties':sum(a==b for a,b in zip(x,y)),
+                  'paired_bootstrap_p75_delta_95pct_low':rnd(pct(diffs,.025)),
+                  'paired_bootstrap_p75_delta_95pct_high':rnd(pct(diffs,.975)),
+                  'bootstrap_resamples':len(diffs),
+                  'statistical_robust_improvement': pct(diffs,.975)<0,
+                  'validation_scope':'INTERNAL_FV_SELF_CONSISTENCY_ONLY'}
+          
+          c14=readjson(P14/'QA14_All72_Shadow_Peer_Ranges.json');c15=readjson(P15/'QA15_All72_Opportunity_Ranges.json')
+          assert len(c14)==len(c15)==72
+          cmap={str(x['sleeper_id']):x for x in c14}
+          assert len(cmap)==72 and {str(x['sleeper_id']) for x in c15}==set(cmap)
+          candidates=[]
+          for x in c15:
+              y=cmap[str(x['sleeper_id'])]
+              if x['player']!=y['player'] or x['position']!=y['position'] or x['current_fv_UNCHANGED']!=y['current_fv_UNCHANGED']:
+                  fail('QA14/15 identity or price drift '+str(x['sleeper_id']))
+              if x['new_fv_recommended']!='' or x['production_changed']!='NO':fail('Forbidden source FV proposal')
+              if x['review_status']=='NOT_IN_16_MEMBER_REVIEW':continue
+              assert y['QA13_review_disposition'] in ('REPEATED_CURATED_PEER_FV_INVERSION','CURATED_PEER_FV_INVERSION_REVIEW')
+              qb=x['position']=='QB'; status=x['review_status']
+              # Three QB rows clear stable-neighbor review; Case Keenum is held.
+              # NO market-confirmed new FV is assigned, even in a preview.
+              label=('QB_OWNER_RANGE_REVIEW_NOT_MARKET_VALIDATED' if qb and status=='OPPORTUNITY_CHECKED_INTERNAL_RANGE_FOR_REVIEW' else
+                  'QB_NEIGHBOR_STABILITY_HOLD' if qb else
+                  'NON_QB_COMPARATOR_RESEARCH_ONLY')
+              candidates.append({
+                  'sleeper_id':x['sleeper_id'],'player':x['player'],'position':x['position'],
+                  'current_fv_UNCHANGED':x['current_fv_UNCHANGED'],
+                  'qa14_age_projection_median_INTERNAL_ONLY':x['qa14_reference_median'],
+                  'qa15_opportunity_lower_quartile_INTERNAL_ONLY':x['new_range_low_CONTEXT_ONLY'],
+                  'qa15_opportunity_median_INTERNAL_ONLY':x['new_range_median_CONTEXT_ONLY'],
+                  'qa15_opportunity_upper_quartile_INTERNAL_ONLY':x['new_range_high_CONTEXT_ONLY'],
+                  'qa15_status':status,'qa16_review_gate':label,
+                  'independent_market_price_observed':'NO',
+                  'production_price_recommendation':'',
+                  'production_fv_changed':'NO'})
+          assert len(candidates)==16 and sum(r['position']=='QB' for r in candidates)==4
+          assert sum(r['qa16_review_gate']=='QB_OWNER_RANGE_REVIEW_NOT_MARKET_VALIDATED' for r in candidates)==3
+          candidates.sort(key=lambda r: (0 if r['position']=='QB' else 1,-r['current_fv_UNCHANGED'],r['player']))
+          with (OUT/'QA16_16_Case_Owner_Review.csv').open('w',newline='',encoding='utf8') as f:
+              w=csv.DictWriter(f,fieldnames=list(candidates[0]));w.writeheader();w.writerows(candidates)
+          
+          q=summary['QB'];lines=[
+              '# A-QA16 — Matched-Player QA14 vs QA15 Backtest and QB Owner Review','',
+              '**READ ONLY. NO production price recommendation, commit, role update or deployment.**','',
+              '## What this corrects','',
+              'QA14 and QA15 used different eligible peer populations. Comparing their original',
+              'backtest aggregate percentiles is not a fair matched test. QA16 matches the same',
+              'Sleeper ID, position, source name and reference FV before computing both errors.','',
+              '## Same-player leave-one-out comparisons','',
+              '| Position | Matched n | QA14 p75 | QA15 p75 | QA15 improvement | QA15 wins / QA14 wins / ties |',
+              '|---|---:|---:|---:|---:|---:|']
+          for pos,z in summary.items():
+              lines.append(f"| {pos} | {z['paired_count']} | {z['qa14_p75_abs_pct_error']}% | {z['qa15_p75_abs_pct_error']}% | {-z['paired_p75_delta_percentage_points']:+.2f} pp | {z['qa15_individual_wins']}/{z['qa14_individual_wins']}/{z['ties']} |")
+          lines +=['','## QB uncertainty','',
+              f"- Matched QBs: **{q['paired_count']}**.",
+              f"- QA15 p75 minus QA14 p75: **{q['paired_p75_delta_percentage_points']:+.2f} percentage points** (lower is better).",
+              f"- Paired bootstrap 95% interval for that difference: **{q['paired_bootstrap_p75_delta_95pct_low']:+.2f} to {q['paired_bootstrap_p75_delta_95pct_high']:+.2f} pp**.",
+              '- A 95% bootstrap interval crossing zero means we cannot call this improvement statistically established.',
+              '- Both methods evaluate *existing internal FV*, not market correctness or future trade outcomes.',
+              '','## Four QB cases — owner review, NOT proposed prices','',
+              '| Player | Current FV | QA14 median | QA15 middle 50% | QA15 median | Status |',
+              '|---|---:|---:|---|---:|---|']
+          for r in candidates:
+              if r['position']!='QB':continue
+              a=r['qa15_opportunity_lower_quartile_INTERNAL_ONLY'];b=r['qa15_opportunity_upper_quartile_INTERNAL_ONLY'];mid=r['qa15_opportunity_median_INTERNAL_ONLY']
+              interval='N/A' if a is None else f'{a:,}–{b:,}'
+              lines.append(f"| {r['player']} | {r['current_fv_UNCHANGED']:,} | {r['qa14_age_projection_median_INTERNAL_ONLY'] or 'N/A'} | {interval} | {mid if mid is not None else 'N/A'} | {r['qa16_review_gate']} |")
+          lines+=['','## Decision for calculator development','',
+              '1. Do not apply QA15 to non-QBs globally. Its direction varies by position.',
+              '2. Three QB cases have internally stable comparison ranges; Case Keenum remains held.',
+              '3. Evidence required before an actual FV candidate: independently sourced dynasty value/order,',
+              '   source date, match by stable ID or audited alias, and protection for prospects.',
+              '4. Tyler Huntley, Drew Lock and Sam Howell still require owner examination of their specific',
+              '   future-role evidence before any new FV can be justified.',
+              '5. Do not assign any new price by blindly substituting QA15 peer medians.',
+              '6. Separate owner release authorization is mandatory before a production APPLY.',
+              '', 'Files: `QA16_Paired_LOO_Results.csv`, `QA16_16_Case_Owner_Review.csv`,',
+              '`QA16_Paired_Backtest_Summary.json`, `QA16_Manifest.json`.','',
+              'Generated UTC: '+datetime.datetime.now(datetime.timezone.utc).isoformat(),'']
+          (OUT/'QA16_Report.md').write_text('\n'.join(lines),encoding='utf8')
+          (OUT/'QA16_Paired_Backtest_Summary.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+          result={'status':'QA16_PAIRED_BACKTEST_AND_QB_OWNER_REVIEW_READ_ONLY',
+              'source_qa14_run':os.environ['QA16_QA14_RUN_ID'],
+              'source_qa15_run':os.environ['QA16_QA15_RUN_ID'],
+              'source_git_sha':m14['source_git_sha'],
+              'source_qa14_manifest_sha256':sha(P14/'QA14_Manifest.json'),
+              'source_qa15_manifest_sha256':sha(P15/'QA15_Manifest.json'),
+              'paired_count':len(paired),'paired_qb_count':q['paired_count'],
+              'matched_player_reference_value_verified':True,
+              'statistically_robust_qb_p75_improvement':q['statistical_robust_improvement'],
+              'scope':'INTERNAL_FV_SELF_CONSISTENCY_ONLY',
+              'independent_market_price_verified':False,
+              'owner_pricing_candidates_approved':0,
+              'fv_changes':0,'fv_plus_changes':0,'mv_changes':0,'repo_mutations':0,
+              'owner_release_authorized':False,
+              'generated_utc':datetime.datetime.now(datetime.timezone.utc).isoformat()}
+          (OUT/'QA16_Manifest.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
+          assert result['paired_qb_count']>=30 and not result['owner_release_authorized'] and result['fv_changes']==0
+          print(json.dumps({'paired':len(paired),'qb':q,'review_qb':[c['player'] for c in candidates if c['position']=='QB'],'production_change':0}))
+          PY_QA16_ENGINE
+          python3 -m py_compile "$RUNNER_TEMP/qa16_engine.py"
+          python3 "$RUNNER_TEMP/qa16_engine.py"
+
+      - name: Confirm no production valuation or repository mutation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          test -z "$(git status --porcelain --untracked-files=all)"
+          python3 - <<'PY_NO_APPLY'
+          import os,pathlib,json
+          o=pathlib.Path(os.environ['QA16_OUT'])
+          m=json.loads((o/'QA16_Manifest.json').read_text())
+          assert m['status']=='QA16_PAIRED_BACKTEST_AND_QB_OWNER_REVIEW_READ_ONLY'
+          assert m['paired_qb_count']>=30 and m['paired_count']>=300
+          assert not m['owner_release_authorized'] and not m['independent_market_price_verified']
+          assert m['owner_pricing_candidates_approved']==0
+          assert all(m[k]==0 for k in ('fv_changes','fv_plus_changes','mv_changes','repo_mutations'))
+          PY_NO_APPLY
+
+      - name: Upload QA16 paired QB evidence
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A-QA16-Paired-QB-Price-Review
+          path: /tmp/a-qa16-output/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Mobile review
+        if: always()
+        shell: bash
+        run: |
+          if test -f "$QA16_OUT/QA16_Report.md"; then
+            cat "$QA16_OUT/QA16_Report.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'QA16 halted before producing the paired review. No production valuations changed.' >> "$GITHUB_STEP_SUMMARY"
+            fi
