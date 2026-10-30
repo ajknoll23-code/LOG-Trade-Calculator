@@ -1,0 +1,179 @@
+name: A-QA03 - Uncurated Player Valuation Triage (Read Only)
+run-name: A-QA03 read-only triage
+'on':
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: a-qa03-read-only-uncurated-triage
+  cancel-in-progress: false
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      QA01_OUT: /tmp/a-qa03-qa01
+      QA03_OUT: /tmp/a-qa03-results
+    steps:
+      - name: Check out source revision without write credentials
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Setup Python and Node
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install existing repository regression requirements
+        run: python3 -m pip install requests
+      - name: Recover audited A-QA01 source and syntax-check
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_QA03_EXTRACT'
+          from pathlib import Path
+          src=Path('.github/workflows/A-QA01R2.yml').read_text()
+          marker="<<'PY_QA01_AUDIT'\n"
+          assert src.count(marker)==1 and src.count('          PY_QA01_AUDIT\n')==1, 'Pinned QA01 audit source changed'
+          payload=src.split(marker,1)[1].split('          PY_QA01_AUDIT\n',1)[0]
+          lines=payload.splitlines()
+          assert len(lines)>100 and all(x.startswith('          ') or not x for x in lines),'QA01 source indentation drift'
+          text='\n'.join(x[10:] if x.startswith('          ') else x for x in lines)+'\n'
+          Path('/tmp/qa03_source_qa01.py').write_text(text)
+          PY_QA03_EXTRACT
+          python3 -m py_compile /tmp/qa03_source_qa01.py
+      - name: Run pinned full-league source-value analysis
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 /tmp/qa03_source_qa01.py
+      - name: Audit uncurated players without price changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/qa03_rank.py" <<'PY_QA03_RANK'
+          #!/usr/bin/env python3
+          """A-QA03: prioritize uncurated, legitimate Sleeper roster players using existing A-QA01 evidence.
+          Only creates files in QA03_OUT. Does not modify the repository or pricing artifacts.
+          """
+          import csv, json, os, statistics, collections, pathlib, math
+          from datetime import datetime, timezone
+
+          OUT=pathlib.Path(os.getenv('QA03_OUT','/tmp/a-qa03-results'))
+          SOURCE=pathlib.Path(os.getenv('QA01_OUT','/tmp/a-qa03-qa01'))
+          OUT.mkdir(parents=True,exist_ok=True)
+          rows=list(csv.DictReader((SOURCE/'QA01_All_Players.csv').open(encoding='utf8',newline='')))
+          source=json.loads((SOURCE/'QA01_Integrity.json').read_text(encoding='utf8'))
+          assert source['js_python_static_parity']=='PASS', 'Curated live JS / Python parity failed; stop review'
+          assert source['rostered_players'] >= 400, 'Unexpectedly small live roster data; stop review'
+          assert all(key in rows[0] for key in ['identity_status','main_fv','sleeper_id','name','role_main','effective_position','crosswalk_high_confidence']), 'QA01 schema changed'
+
+          active=[r for r in rows if str(r['sleeper_id']) not in ('0','') and r['name'] and not r['name'].startswith('Unknown (')]
+          uncurated=[r for r in active if r['identity_status']=='new_or_unmatched']
+          assert len(active) >= 450 and 1 <= len(uncurated) <= len(active), 'Missing active players or unexpected uncurated coverage'
+          assert len({r['sleeper_id'] for r in active})==len(active),'Nonunique Sleeper IDs; check before calibrating'
+
+          bins=collections.defaultdict(list)
+          for r in active:
+              try: val=int(r['main_fv'])
+              except (ValueError,TypeError): continue
+              bins[r['effective_position']].append(val)
+
+          exact_fallback=collections.defaultdict(list)
+          for r in uncurated:
+              exact_fallback[(r['effective_position'],r['role_main'],r['main_fv'])].append(r['sleeper_id'])
+
+          out=[]
+          for r in uncurated:
+              pos=r['effective_position'];role=r['role_main']; fv=int(r['main_fv']) if r['main_fv'] else 0
+              reasons=[];severity='LOW'; cross=str(r['crosswalk_high_confidence']).lower()=='true'
+              if not cross:reasons.append('no_high_confidence_fantasypros_crosswalk')
+              if pos=='QB' and fv>=3500:reasons.append('qb_generic_fv_at_least_3500')
+              if pos in ('LB','DL','DB') and fv>=4000:reasons.append('idp_generic_fv_at_least_4000')
+              if pos in ('RB','WR','TE') and fv>=4000:reasons.append('skill_generic_fv_at_least_4000')
+              if len(exact_fallback[pos,role,r['main_fv']])>=2:reasons.append('shared_exact_role_position_value')
+              if r['effective_position'] not in ('QB','RB','WR','TE','DL','LB','DB','K'):reasons.append('invalid_effective_position')
+              if r['role_main']=='Starter' and r['slot']=='starters':reasons.append('starter_slot_drives_role_without_curated_evidence')
+              pmedian=statistics.median(bins[pos]) if bins[pos] else None
+              if pmedian and fv>pmedian*1.6:reasons.append('value_over_160pct_of_rostered_position_median')
+              if any(v in reasons for v in ('invalid_effective_position','qb_generic_fv_at_least_3500','idp_generic_fv_at_least_4000','skill_generic_fv_at_least_4000')):
+                severity='HIGH'
+              elif reasons:severity='MEDIUM'
+              out.append({'priority':severity,'name':r['name'],'sleeper_id':r['sleeper_id'],'roster_id':r['roster_id'],
+                  'team_name':r['team_name'],'slot':r['slot'],'position':pos,'age':r['age'],'fallback_role':role,
+                  'main_fv':fv,'preview_fv':r['preview_fv'],'position_median_fv':pmedian,
+                  'fantasypros_id_evidence':'high_confidence' if cross else 'missing_or_not_high_confidence',
+                  'match_key':r['canonical_key'],'reason_codes':';'.join(reasons),
+                  'needs_price_change':'UNDECIDED_NO_PRICE_CHANGES_IN_THIS_AUDIT'})
+          out.sort(key=lambda r:({'HIGH':0,'MEDIUM':1,'LOW':2}[r['priority']],-r['main_fv'],r['name']))
+
+          cols=['priority','name','sleeper_id','roster_id','team_name','slot','position','age','fallback_role','main_fv','preview_fv','position_median_fv','fantasypros_id_evidence','match_key','reason_codes','needs_price_change']
+          with (OUT/'QA03_Priority.csv').open('w',encoding='utf8',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=cols);w.writeheader();w.writerows(out)
+
+          counts=collections.Counter(r['priority'] for r in out)
+          position_counts=collections.Counter(r['position'] for r in out)
+          lines=[
+           '# A-QA03 — Uncurated Player Valuation Triage (Read Only)','',
+           '**Audit status:** COMPLETE_WITH_REVIEW_FINDINGS',
+           '**No pricing, projections, HTML, or repository files changed.**','',
+           '## Current league coverage','',
+           f'- QA01 original roster records: **{source["rostered_players"]}**',
+           f'- Actual legitimate roster records, excluding zero-ID/sentinel placeholders: **{len(active)}**',
+           f'- Uncurated roster players requiring fallback-price review: **{len(out)}**',
+           f'- Priority buckets: **{counts["HIGH"]} high, {counts["MEDIUM"]} medium, {counts["LOW"]} low**',
+           '- These are **triage flags, not proof of wrong FV**. Market price is not an objective production target.','',
+           '## High-priority player review','',
+           '| Player | Position | Current main FV | Role | ID evidence | Why review |','|---|---|---:|---|---|---|'
+          ]
+          for r in [x for x in out if x['priority']=='HIGH'][:40]:
+              lines.append(f'| {r["name"].replace("|","/")} | {r["position"]} | {r["main_fv"]:,} | {r["fallback_role"]} | {r["fantasypros_id_evidence"]} | {r["reason_codes"].replace(";", ", ")} |')
+          lines+=['','## Coverage by position','', '| Position | Uncurated count |','|---|---:|']
+          for pos,n in sorted(position_counts.items(),key=lambda x:(-x[1],x[0])):lines.append(f'| {pos} | {n} |')
+          lines+=['','## Interpretation and safe follow-up','',
+           '1. Confirm Sleeper IDs, source positions and team metadata for high-priority players.',
+           '2. Gather historical production and pre-season/ROS projections for each flagged player before considering any new FV.',
+           '3. Distinguish legitimate opportunity/backup values from role-based fallback inflation; do not just multiply FV down.',
+           '4. Compare against DLF/FantasyPros dynasty evidence separately; do not equate MV and FV.',
+           '5. Any later fixes require explicit PREVIEW and APPLY approval, with protected price baseline.', '',
+           '## Audit mechanics and caveats','',
+           '- Re-executes the pinned A-QA01 read-only JavaScript valuation mirror from the current repository and consumes its full CSV.',
+           '- Values are calculated from live source functions, not a real browser DOM render.',
+           '- A-QA01 replay still includes Sleeper sentinel rows in its raw observations; A-QA03 deliberately excludes them by ID/name.',
+           '- The role may come directly from roster slot, which is weak evidence of sustainable opportunity.',
+           '- The repeated value flag means the fallback has low individual differentiation; it does not prove that the number is wrong.',
+           '- The position median is only a comparative screening heuristic, not a calibration target.', '',
+           f'Generated: {datetime.now(timezone.utc).isoformat()}',''
+          ]
+          (OUT/'QA03_Report.md').write_text('\n'.join(lines),encoding='utf8')
+          (OUT/'QA03_Manifest.json').write_text(json.dumps({
+           'status':'QA03_COMPLETE_WITH_REVIEW_FINDINGS','read_only':True,'source_commit':source['source_commit'],
+           'source_qa01_count':source['rostered_players'],'genuine_player_count':len(active),
+           'uncurated_count':len(out),'priority_counts':dict(counts),
+           'changed_price_artifacts':False,'changed_html':False
+          },indent=2,sort_keys=True)+'\n',encoding='utf8')
+          print(json.dumps({'status':'QA03_COMPLETE_WITH_REVIEW_FINDINGS','legitimate_players':len(active),'uncurated':len(out),'priority':dict(counts)},sort_keys=True))
+          PY_QA03_RANK
+          python3 -m py_compile "$RUNNER_TEMP/qa03_rank.py"
+          python3 "$RUNNER_TEMP/qa03_rank.py"
+          test -z "$(git status --porcelain --untracked-files=all)" || { echo 'Read-only contract violated'; exit 1; }
+      - name: Upload report, rankings, and source-audit evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: A-QA03-Uncurated-Player-Triage
+          path: |
+            /tmp/a-qa03-results/
+            /tmp/a-qa03-qa01/QA01_Integrity.json
+          retention-days: 30
+      - name: Show mobile-friendly report
+        if: always()
+        shell: bash
+        run: |
+          if test -f "$QA03_OUT/QA03_Report.md"; then
+            cat "$QA03_OUT/QA03_Report.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Audit did not complete; inspect failed step' >> "$GITHUB_STEP_SUMMARY"
+          fi
