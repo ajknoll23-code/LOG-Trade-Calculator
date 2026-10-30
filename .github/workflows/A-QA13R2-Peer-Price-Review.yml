@@ -1,0 +1,289 @@
+name: A-QA13 - Curated Peer Price Inversion Audit (Read Only)
+run-name: A-QA13 compare inflated fallback FV with stronger curated peers
+
+'on':
+  workflow_dispatch:
+    inputs:
+      qa12_run_id:
+        description: Successful QA12 evidence triage run
+        type: string
+        required: true
+        default: '41089849448'
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: a-qa13-curated-peer-read-only
+  cancel-in-progress: false
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      QA12_RUN_ID: ${{ inputs.qa12_run_id }}
+      QA13_IN: /tmp/a-qa13-qa12
+      QA13_OUT: /tmp/a-qa13-out
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout without write credentials
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Verify successful QA12 source run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$QA12_RUN_ID" =~ ^[0-9]{7,15}$ ]] || exit 1
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$QA12_RUN_ID" > "$RUNNER_TEMP/qa12_run.json"
+          python3 - <<'PY_CHECK'
+          import json,os,pathlib
+          r=json.loads((pathlib.Path(os.environ['RUNNER_TEMP'])/'qa12_run.json').read_text())
+          fields={'conclusion':'success','status':'completed','event':'workflow_dispatch',
+                  'path':'.github/workflows/A-QA12R1-Production-Evidence-Review.yml',
+                  'display_title':'A-QA12 72-player multi-source price contradiction read-only review',
+                  'head_branch':'main'}
+          for k,v in fields.items():assert r.get(k)==v,(k,r.get(k),v)
+          assert r['repository']['full_name']==os.environ['GITHUB_REPOSITORY']
+          print('QA12 run provenance verified')
+          PY_CHECK
+      - name: Download exact QA12 evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: A-QA12-Production-Projection-Evidence
+          run-id: ${{ inputs.qa12_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: /tmp/a-qa13-qa12
+      - name: Pin original pricing source revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_PIN'
+          import json,pathlib,os,re
+          p=pathlib.Path(os.environ['QA13_IN'])/'QA12_Manifest.json'
+          m=json.loads(p.read_text())
+          assert m['status']=='QA12_MULTISOURCE_PRICE_CONTRADICTION_TRIAGE_READ_ONLY'
+          assert m['cohort']==72 and m['exact_baseline_parity']==72
+          assert m['read_only'] is True and m['explicit_release_authorization'] is False
+          assert all(m[k]==0 for k in ('new_roles_assigned','new_fv_proposed','fv_changes','fv_plus_changes','mv_changes','repo_mutations'))
+          sha=m['source_git_sha'];assert re.fullmatch('[a-f0-9]{40}',sha)
+          (pathlib.Path(os.environ['RUNNER_TEMP'])/'qa13_source_sha').write_text(sha)
+          with open(os.environ['GITHUB_ENV'],'a') as f:f.write('QA13_SOURCE_SHA='+sha+'\n')
+          PY_PIN
+          git fetch --depth=1 origin "$(cat "$RUNNER_TEMP/qa13_source_sha")"
+          git checkout --detach "$(cat "$RUNNER_TEMP/qa13_source_sha")"
+          test "$(git rev-parse HEAD)" = "$(cat "$RUNNER_TEMP/qa13_source_sha")"
+      - name: Evaluate matched-position curated FV reference contradictions
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$QA13_OUT"
+          cat > "$RUNNER_TEMP/qa13_peer_engine.py" <<'PY_ENGINE'
+          #!/usr/bin/env python3
+          """Audit local FV rank inversions. Curated FV is an internal comparator, NOT an external market price."""
+          import csv,datetime,hashlib,json,math,os,pathlib,collections,statistics
+          INPUT=pathlib.Path(os.environ['QA13_IN']);OUT=pathlib.Path(os.environ['QA13_OUT'])
+          OUT.mkdir(parents=True,exist_ok=True)
+          def stop(msg):raise RuntimeError('QA13 INTEGRITY STOP: '+msg)
+          def load(p):
+              if not p.is_file():stop('File missing '+str(p))
+              return json.loads(p.read_text(encoding='utf8'))
+          def getnum(v):
+              try:
+                  if isinstance(v,bool) or v is None or v=='':return None
+                  n=float(v)
+                  return n if math.isfinite(n) else None
+              except (ValueError,TypeError):return None
+          manifest=load(INPUT/'QA12_Manifest.json')
+          if manifest['status']!='QA12_MULTISOURCE_PRICE_CONTRADICTION_TRIAGE_READ_ONLY':stop('Bad upstream status')
+          src=manifest['input_sha256']
+          files={'team_utility_lineup_projections.json':'scripts/artifacts/generated/team_utility_lineup_projections.json',
+                 'ppg_results.json':'scripts/ppg_results.json'}
+          for filename,path in files.items():
+              if hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()!=src[filename]:
+                  stop('Pinned source drift: '+path)
+          with (INPUT/'QA12_All72_Evidence_Triage.csv').open(encoding='utf8',newline='') as fh:
+              cases=list(csv.DictReader(fh))
+          if len(cases)!=72 or len({r['sleeper_id'] for r in cases})!=72:stop('QA12 cohort identity mismatch')
+          if not all(r['production_change']=='NONE' and r['replacement_fv']=='' for r in cases):
+              stop('Unexpected upstream release')
+
+          uncertainty=load(pathlib.Path('scripts/artifacts/generated/value_uncertainty.json'))
+          if uncertainty.get('counts',{}).get('player_count')!=565 or uncertainty.get('method_version')!='sensitivity-envelope-v1':
+              stop('Curated 565-player reference provenance changed')
+          if uncertainty.get('range_semantics')!='sensitivity_envelope_v1_not_probability_interval':
+              stop('Uncertainty snapshot semantics changed')
+          projections=load(pathlib.Path(files['team_utility_lineup_projections.json']))
+          if projections.get('purpose')!='Team Utility starter selection only; never Fundamental Value':
+              stop('Projection purpose changed')
+          catalog=projections.get('players',{})
+          byid={}
+          for name,obj in uncertainty['players'].items():
+              sid=str(obj.get('sleeper_id') or '')
+              if not sid:continue
+              if sid in byid:stop('Duplicate curated stable ID '+sid)
+              pos=obj.get('pos');fv=getnum(obj.get('center_value'));age=getnum(obj.get('age'))
+              p=catalog.get(sid)
+              if p is None or p.get('pos')!=pos:continue
+              proj=getnum(p.get('projection'))
+              if fv is None or fv<=0 or age is None or proj is None or proj<0:continue
+              signals=obj.get('signals',{})
+              history=signals.get('history_games_2025')
+              if signals.get('no_real_production_history') is not False:continue
+              if not isinstance(history,int) or history<5:continue
+              byid[sid]={'name':name,'sleeper_id':sid,'position':pos,'age':age,'fv':fv,
+                         'projection':proj,'history_games':history,'projection_source':p.get('source','')}
+          ref=collections.defaultdict(list)
+          for player in byid.values():ref[player['position']].append(player)
+          if sum(map(len,ref.values()))<175:stop('Too few historically established curated peer records')
+
+          total=collections.Counter(); output=[]; peer_rows=[]
+          for row in cases:
+              name=row['player'];sid=row['sleeper_id'];pos=row['position']
+              fv=getnum(row['current_fv_UNCHANGED']);age=getnum(row['age']);proj=getnum(row['2026_projection_points_CONTEXT_ONLY'])
+              if fv is None or age is None:stop('Missing current FV/age '+sid)
+              if row['triage_only'] not in ('LOW_FORWARD_PROJECTION_HISTORY_THIN','YOUNG_UPSIDE_REVIEW_NO_REPRICE',
+                   'INDEPENDENT_ROLE_POSITION_HOLD','PROJECTION_OR_IDENTITY_HOLD','K_SCORING_HOLD',
+                   'YOUNG_CONTEXT_HOLD','MONITOR_NO_DIRECT_EVIDENCE_CONFLICT'):
+                  stop('Unexpected QA12 triage code '+sid)
+              p=catalog.get(sid)
+              same_pos=bool(p and p.get('pos')==pos and getnum(p.get('projection')) is not None)
+              if (row['2026_projection_identity_status']=='POSITION_MATCHED_CONTEXT_ONLY')!=same_pos:
+                  stop('Projection identity status drift '+sid)
+              if same_pos and abs(getnum(p['projection'])-proj)>0.000001:
+                  stop('Current projection changed '+sid)
+              matched=sorted((q for q in ref.get(pos,[]) if abs(q['age']-age)<=6 and q['sleeper_id']!=sid),
+                             key=lambda q:q['fv'])
+              # Explicit, *heuristic* price inversion: a proven-production curated
+              # peer with >=1.5x forward points (and >=position-specific absolute margin)
+              # while receiving <=75% of fallback FV. Not a model or new FV.
+              floor={'QB':35,'RB':25,'WR':25,'TE':20,'DL':20,'LB':25,'DB':20}
+              strong=[q for q in matched if proj is not None and
+                    q['projection']>=max(proj*1.5,proj+floor.get(pos,20))]
+              cheaper=[q for q in strong if q['fv']<=fv*0.75]
+              top=sorted(cheaper,key=lambda q:(-q['projection'],q['fv'],q['name']))
+              for peer in top[:7]:
+                  peer_rows.append({'candidate_id':sid,'candidate':name,'position':pos,'candidate_age':age,
+                     'candidate_fv_UNCHANGED':int(fv),'candidate_proj':proj,'peer_id':peer['sleeper_id'],
+                     'peer_name':peer['name'],'peer_age':peer['age'],'peer_fv_UNCHANGED':int(peer['fv']),
+                     'peer_proj':peer['projection'],'peer_2025_games':peer['history_games'],
+                     'peer_source':peer['projection_source'],'new_fv':''})
+              if pos=='K':action='K_SCORING_HOLD'
+              elif row['triage_only']=='INDEPENDENT_ROLE_POSITION_HOLD':action='POSITION_CONFLICT_HOLD'
+              elif not same_pos:action='PROJECTION_IDENTITY_HOLD'
+              elif age<=24:action='PROSPECT_UPSIDE_CONTEXT_HOLD'
+              elif len(cheaper)>=5:action='REPEATED_CURATED_PEER_FV_INVERSION'
+              elif len(cheaper)>=2:action='CURATED_PEER_FV_INVERSION_REVIEW'
+              elif fv>=4500 and proj is not None and proj<=40 and len(strong)>=4:
+                  action='HIGH_FV_LOW_PROJECTION_CHECK'
+              else:action='NO_STRONG_CURATED_PEER_INVERSION_FOUND'
+              total[action]+=1
+              output.append({'sleeper_id':sid,'player':name,'position':pos,'age':age,
+                 'current_FV_UNCHANGED':int(fv),'2026_projection':proj,
+                 'QA12_disposition':row['triage_only'],
+                 'curated_same_position_eligible_count':len(ref.get(pos,[])),
+                 'curated_age_matched_peer_count':len(matched),
+                 'curated_peers_with_1_5x_or_more_projection':len(strong),
+                 'stronger_projected_25pct_cheaper_curated_peers':len(cheaper),
+                 'example_peers':'; '.join(x['name'] for x in top[:4]),
+                 'review_disposition':action,
+                 'independent_market_value_available':'NOT_ESTABLISHED',
+                 'peer_FV_is_current_release_anchor':'NO',
+                 'recommended_new_FV':'','source_changes':'NONE'})
+          if len(output)!=72:stop('Cohort lost')
+          order={'REPEATED_CURATED_PEER_FV_INVERSION':0,'CURATED_PEER_FV_INVERSION_REVIEW':1,
+                 'HIGH_FV_LOW_PROJECTION_CHECK':2,'PROSPECT_UPSIDE_CONTEXT_HOLD':3,
+                 'POSITION_CONFLICT_HOLD':4,'PROJECTION_IDENTITY_HOLD':5,'K_SCORING_HOLD':6,
+                 'NO_STRONG_CURATED_PEER_INVERSION_FOUND':7}
+          output.sort(key=lambda x:(order[x['review_disposition']],
+                                    -x['stronger_projected_25pct_cheaper_curated_peers'],
+                                    -x['current_FV_UNCHANGED'],x['player']))
+          def write_csv(path,arr):
+              if not arr:stop('Empty CSV output '+str(path))
+              with path.open('w',newline='',encoding='utf8') as fh:
+                  w=csv.DictWriter(fh,fieldnames=list(arr[0]));w.writeheader();w.writerows(arr)
+          write_csv(OUT/'QA13_All72_Curated_Peer_Inversions.csv',output)
+          if peer_rows:write_csv(OUT/'QA13_Concrete_Curated_Peer_Examples.csv',peer_rows)
+          (OUT/'QA13_All72_Peer_Inversions.json').write_text(json.dumps(output,indent=2,allow_nan=False)+'\n')
+          stats={'source_qa12_run_id':os.environ['QA12_RUN_ID'],'source_commit':os.environ['QA13_SOURCE_SHA'],
+             'cohort':72,'curated_model_players':565,'established_curated_matched_id_peers':len(byid),
+             'triage_counts':dict(sorted(total.items())),
+             'read_only':True,'automatic_repricing_allowed':False,'independent_market_anchor_verified':False,
+             'fv_changes':0,'fv_plus_changes':0,'mv_changes':0,'repo_mutations':0,
+             'input_sha256':{'qa12_csv':hashlib.sha256((INPUT/'QA12_All72_Evidence_Triage.csv').read_bytes()).hexdigest(),
+               'uncertainty':hashlib.sha256(pathlib.Path('scripts/artifacts/generated/value_uncertainty.json').read_bytes()).hexdigest(),
+               'projection':hashlib.sha256(pathlib.Path(files['team_utility_lineup_projections.json']).read_bytes()).hexdigest()},
+             'generated_utc':datetime.datetime.now(datetime.timezone.utc).isoformat()}
+          (OUT/'QA13_Manifest.json').write_text(json.dumps(stats,sort_keys=True,indent=2)+'\n')
+          lines=['# A-QA13 — Curated Peer FV Inversion Audit (Read Only)','',
+             '**NO NEW PRICES, NO PRODUCTION CHANGES.**','',
+             '## Why QA13 differs from QA12','',
+             '- QA12 ranked a 2026 projection among all players at a position, including very low or missing opportunity. This did not detect multiple obvious FV concerns.',
+             '- QA13 compares each fallback FV against **historically established curated players** from the original 565-player snapshot, identified by stable Sleeper ID.',
+             '- The same Team Utility projections are used consistently for both sides, but those projections are strictly CONTEXT ONLY, never the intrinsic FV formula.',
+             '- A comparison peer must match position, be within 6 years of age, have at least 5 historical 2025 games and known history, project at least 1.5x as many points AND the position-specific absolute point margin, yet be priced at no more than 75% of the candidate FV.',
+             '- These are **triage thresholds chosen to surface contradictions**, not statistically calibrated dynasty valuations.',
+             '- Curated reference FV is itself produced by this calculator; it is **not independent external market evidence**. The audit cannot establish correct FV or validate model pricing.',
+             '- Young players (24 and under), kickers, missing identity matches and conflicting DL/LB position evidence are held.',
+             '', '## Review dispositions','', '| Disposition | Count |','|---|---:|']
+          for k,v in sorted(total.items(),key=lambda z:(order[z[0]],z[0])):lines.append(f'| {k} | {v} |')
+          lines.extend(['','## Leading examples','',
+             '| Player | Current FV | 2026 projection | Stronger-projected, 25% cheaper peers | Disposition |',
+             '|---|---:|---:|---:|---|'])
+          for row in output[:24]:
+              lines.append('| '+ ' | '.join([
+                 row['player'].replace('|','/'),format(row['current_FV_UNCHANGED'],','),
+                 'N/A' if row['2026_projection'] is None else f"{row['2026_projection']:,.1f}",
+                 str(row['stronger_projected_25pct_cheaper_curated_peers']),row['review_disposition']])+' |')
+          lines.extend(['','## Next decision','',
+             'Review the named peer comparisons, then collect independent dynasty market and multi-year opportunity evidence on cases with repeated price inversions. Do not apply tier substitution, arbitrary discounts, or a 2026-points-to-FV multiplier.',
+             'A PREVIEW of any numerical proposal and a separate owner-authorized APPLY are required before production modification.',
+             '', '## Artifact inventory','',
+             '- `QA13_All72_Curated_Peer_Inversions.csv` and JSON: all 72 and source-quality flags.',
+             '- `QA13_Concrete_Curated_Peer_Examples.csv`: traceable stable-ID comparison examples.',
+             '- `QA13_Manifest.json`: pinned source and zero-mutation evidence.',
+             '', 'Generated UTC: '+stats['generated_utc'],''])
+          (OUT/'QA13_Report.md').write_text('\n'.join(lines),encoding='utf8')
+          print(json.dumps({'candidate_rows':72,'matched_curated_peers':len(byid),
+                            'disposition_counts':stats['triage_counts'],'new_prices':0},sort_keys=True))
+          PY_ENGINE
+          python3 -m py_compile "$RUNNER_TEMP/qa13_peer_engine.py"
+          python3 "$RUNNER_TEMP/qa13_peer_engine.py"
+      - name: Enforce zero repository mutation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          test -z "$(git status --porcelain --untracked-files=all)"
+          python3 - <<'PY_LOCK'
+          import json,os,pathlib
+          r=json.loads((pathlib.Path(os.environ['QA13_OUT'])/'QA13_Manifest.json').read_text())
+          assert r['cohort']==72 and r['read_only'] and not r['automatic_repricing_allowed']
+          assert all(r[k]==0 for k in ('fv_changes','fv_plus_changes','mv_changes','repo_mutations'))
+          PY_LOCK
+      - name: Upload complete QA13 evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: A-QA13-Curated-Peer-Price-Inversion-Review
+          path: /tmp/a-qa13-out/
+          retention-days: 30
+          if-no-files-found: error
+      - name: Publish mobile-readable review
+        if: always()
+        shell: bash
+        run: |
+          if test -f "$QA13_OUT/QA13_Report.md"; then
+            cat "$QA13_OUT/QA13_Report.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'QA13 stopped before evidence completion. Production unchanged.' >> "$GITHUB_STEP_SUMMARY"
+          fi
