@@ -1,0 +1,362 @@
+name: A-QA08 - RB DOB Parity and Role Evidence Gate (Read Only)
+run-name: A-QA08 RB DOB parity and source-role audit
+
+'on':
+  workflow_dispatch:
+    inputs:
+      qa07_run_id:
+        description: Successful A-QA07R2 evidence run ID
+        type: string
+        required: true
+        default: '41058518538'
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: a-qa08-read-only-dob-role
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      QA07_RUN_ID: ${{ inputs.qa07_run_id }}
+      QA07_IN: /tmp/a-qa08-qa07
+      QA08_OUT: /tmp/a-qa08-output
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout without write credentials
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check verified green QA07R2 run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$QA07_RUN_ID" =~ ^[0-9]{7,15}$ ]] || exit 1
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$QA07_RUN_ID" > "$RUNNER_TEMP/qa08_upstream.json"
+          python3 - <<'PY_QA08_VERIFY'
+          import json,os,pathlib
+          r=json.loads((pathlib.Path(os.environ['RUNNER_TEMP'])/'qa08_upstream.json').read_text())
+          expected={'conclusion':'success','status':'completed','event':'workflow_dispatch',
+             'path':'.github/workflows/A-QA07R2-Role-Replay-Fix.yml',
+             'display_title':'A-QA07R2 corrected role-only FV shadow replay','head_branch':'main'}
+          for k,v in expected.items():assert r.get(k)==v,(k,r.get(k))
+          assert r.get('repository',{}).get('full_name')==os.environ['GITHUB_REPOSITORY']
+          PY_QA08_VERIFY
+      - name: Download exact A-QA07R2 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: A-QA07R2-Exact-Role-Only-Shadow
+          run-id: ${{ inputs.qa07_run_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          path: /tmp/a-qa08-qa07
+      - name: Pin exact original source and evidence cohort
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_QA08_PIN'
+          import json,os,pathlib,re
+          m=json.loads((pathlib.Path(os.environ['QA07_IN'])/'QA07_Manifest.json').read_text())
+          sha=m.get('source_git_sha','')
+          assert re.fullmatch('[0-9a-f]{40}',sha)
+          assert m.get('source_qa05_run')=='41054400674' and m.get('source_qa06_run')=='41055571041'
+          (pathlib.Path(os.environ['RUNNER_TEMP'])/'qa08_source_sha').write_text(sha)
+          with open(os.environ['GITHUB_ENV'],'a') as f:f.write('QA08_SHA='+sha+'\n')
+          PY_QA08_PIN
+          git fetch --depth=1 origin "$(cat "$RUNNER_TEMP/qa08_source_sha")"
+          git checkout --detach "$(cat "$RUNNER_TEMP/qa08_source_sha")"
+          test "$(git rev-parse HEAD)" = "$(cat "$RUNNER_TEMP/qa08_source_sha")"
+      - name: Validate pinned identities and prepare test cohort
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_QA08_INPUT'
+          import csv, hashlib, json, os
+          from pathlib import Path
+          out=Path(os.environ['QA08_OUT']);out.mkdir(parents=True,exist_ok=True)
+          base=Path(os.environ['QA07_IN'])
+          manifest=json.loads((base/'QA07_Manifest.json').read_text())
+          expected={'status':'QA07_ROLE_ONLY_LIVE_JS_SHADOW_COMPLETE_READ_ONLY',
+                    'cohort':72,'replay_parity_pass':67,'replay_parity_hold':5,
+                    'verified_role_sensitive_count':34,'fv_changes':0,'fv_plus_changes':0,
+                    'mv_changes':0,'repo_mutations':0,'recommended_price_candidates':0}
+          for k,v in expected.items():
+            assert manifest.get(k)==v,(k,manifest.get(k),v)
+          assert hashlib.sha256(Path('index.html').read_bytes()).hexdigest()==manifest['source_index_sha256']
+          rows=list(csv.DictReader((base/'QA07_All72_Role_Counterfactuals.csv').open(newline='',encoding='utf8')))
+          assert len(rows)==72 and len(set(r['sleeper_id'] for r in rows))==72
+          assert all(r['production_change']=='NONE' and not r['replacement_fv'] for r in rows)
+          rosters=json.loads(Path('data/league_rosters.json').read_text())
+          sid_map={}
+          for rr in rosters['rosters']:
+            for slot in ('starters','bench','taxi','reserve_ir'):
+              for player in rr.get(slot,[]):
+                sid=str(player.get('player_id') or '')
+                if sid and sid!='0':
+                  assert sid not in sid_map,'Duplicate Sleeper identity in league source: '+sid
+                  sid_map[sid]=(slot,player)
+          items=[]
+          for r in rows:
+            sid=r['sleeper_id'];assert sid in sid_map,'Sleeper ID absent from pinned 12-team snapshot '+sid
+            slot,person=sid_map[sid]
+            assert slot==r['slot'],f'Slot changed for {sid}'
+            assert person.get('age')==int(float(r['age'])),f'Age mismatch for {sid}'
+            position=r['position']
+            depth=person.get('depth_chart_order')
+            if depth is not None and (not isinstance(depth,int) or depth<1):depth=None
+            if depth is None: disagreement='UNKNOWN_DEPTH_SOURCE'
+            elif slot=='starters' and depth>1:disagreement='FANTASY_STARTER_NOT_NFL_DEPTH_1'
+            elif slot=='bench' and depth==1:disagreement='FANTASY_BENCH_NFL_DEPTH_1'
+            else:disagreement='NO_DIRECT_DEPTH_SIGNAL_CONFLICT'
+            dob=person.get('birth_date')
+            if not isinstance(dob,str):dob=''
+            items.append({'sleeper_id':sid,'player':r['player'],'position':position,'age':float(r['age']),
+               'assigned_role':r['assigned_role'],'fantasy_slot':slot,
+               'sleeper_birth_date':dob,'depth_order':depth,'years_exp':person.get('years_exp'),
+               'team':person.get('team') or '', 'depth_disagreement':disagreement,
+               'published_fv':int(r['published_fv']),'qa07_replayed_fv':int(r['baseline_model_fv']),
+               'qa07_parity':r['baseline_parity']})
+          (out/'QA08_Input72.json').write_text(json.dumps(items,indent=2)+'\n')
+          print('Pinned source and all 72 Sleeper IDs, ages and fantasy slots verified')
+          PY_QA08_INPUT
+      - name: Replay exact live code with independent DOB input
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/qa08_replay.js" <<'JS_QA08_REPLAY'
+          'use strict';
+          const fs=require('fs');
+          const vm=require('vm');
+          const source=fs.readFileSync('index.html','utf8');
+          const cases=JSON.parse(fs.readFileSync(process.env.QA08_OUT+'/QA08_Input72.json','utf8'));
+          function fail(s){throw new Error('QA08 SOURCE/REPLAY STOP: '+s)}
+          // Fail closed on changes to the actual live source-flow anchors.
+          for (const p of [
+            /function mergeLeagueRosters\(data\)\{/,
+            /role:\s*existing\s*\?\s*existing\.role\s*:\s*slotDefaults\[slot\]/,
+            /function playerValue\(pos, age, role, name\)\{/,
+            /const rm = productionMultiplier\(name \|\| '', role\);/,
+            /return Math\.round\(100 \* pw \* am \* rm \* 55\);/,
+            /function productionMultiplier\(name, role\)\{/,
+            /return roleEstimate;/
+          ]) if(!p.test(source)) fail('Core source link changed: '+p);
+          const roleLines=source.match(/const slotDefaults = \{[^\n]+\};/g)||[];
+          if(!roleLines.some(x=>x.includes("reserve_ir:'Depth'")&&x.includes("starters:'Starter'")))
+            fail('League-wide slot map changed');
+          // Capture exact source definitions rather than reimplement the pricing formula.
+          function getConst(name){
+            const re=new RegExp('^const '+name+'\\s*=', 'm');
+            const m=re.exec(source);
+            if(!m) fail('Constant missing: '+name);
+            const start=m.index, rhsStart=start+m[0].length;
+            const tail=source.slice(rhsStart);
+            const rhs=tail.trimStart();
+            if(rhs.startsWith('{')){
+              // R2 repair: some constants (POSITION_WEIGHT and ROLE_MULT) are
+              // complete single-line objects. R1 incorrectly captured through
+              // the NEXT multiline object's close, redeclaring AGE_CURVE.
+              // Match the exact one-line object before trying a multiline close.
+              const firstLine=tail.split('\n',1)[0];
+              if(/^\s*\{[^{}]*\}\s*;\s*(?:\/\/.*)?$/.test(firstLine))
+                return source.slice(start,rhsStart+firstLine.length);
+              const end=/^};\s*$/m.exec(tail);
+              if(!end) fail('Could not safely locate object closing: '+name);
+              const result=source.slice(start,rhsStart+end.index+end[0].length);
+              // A multiline object must end on the line containing its own
+              // closing brace; no intervening top-level declaration allowed.
+              if(/^const [A-Za-z_$][\w$]*\s*=/m.test(result.slice(m[0].length)))
+                fail('Object extraction swallowed another constant: '+name);
+              return result;
+            }
+            const lineEnd=source.indexOf('\n',rhsStart);
+            const one=source.slice(start,lineEnd<0?source.length:lineEnd);
+            if(!one.includes(';')) fail('Nonliteral simple constant: '+name);
+            return one;
+          }
+          function getFn(name){
+            const re=new RegExp('^function '+name+'\\([^\\n]*\\)\\s*\\{', 'm');
+            const m=re.exec(source);
+            if(!m) fail('Function missing: '+name);
+            const tail=source.slice(m.index);
+            const end=/^}\s*$/m.exec(tail);
+            if(!end) fail('Unable to locate exact function end: '+name);
+            return tail.slice(0,end.index+end[0].length);
+          }
+          const constants=[
+            'POSITION_WEIGHT','AGE_CURVE','QB_POST_PEAK_FLOOR','LB_POST_PEAK_DECAY_POWER',
+            'ROLE_MULT','PROD_MULT_DATA','NO_REAL_PRODUCTION_HISTORY',
+            'CAL22_LEGACY_MONOTONE_KEYS','PROD_MULT','PLAYER_DB','RB_BIRTH_DATE_DATA',
+            'CAL26_FV_OWNER_ANCHORS'
+          ];
+          const functions=[
+            'normalizeName','productionMultiplier','ageMultiplier',
+            'fractionalAgeFromBirthDate','rbMonotoneAgeAnchor','rbContinuousAgeMultiplier',
+            'effectiveAgeMultiplier','playerValue'
+          ];
+          const script=constants.map(getConst).join('\n')+'\n'+functions.map(getFn).join('\n')+
+            '\nglobalThis.QA07_EXPORT={playerValue,productionMultiplier,normalizeName,PROD_MULT,NO_REAL_PRODUCTION_HISTORY,PLAYER_DB};';
+          // Preserve the October 30 2026 source snapshot's calendar day for fractional-age parity.
+          const FIXED_DAY='2026-10-30T12:00:00.000Z';
+          class AuditDate extends Date {
+            constructor(...args){ super(...(args.length?args:[FIXED_DAY])); }
+            static now(){ return Date.parse(FIXED_DAY); }
+          }
+          const sandbox={Date:AuditDate};
+          try{vm.runInNewContext(script,sandbox,{timeout:12000});}
+          catch(e){fail('Could not isolate exact live source functions: '+e.message)}
+          const run=sandbox.QA07_EXPORT;
+          if(!run||typeof run.playerValue!=='function')fail('Source replay exports unavailable');
+
+
+          if(cases.length!==72 || new Set(cases.map(c=>c.sleeper_id)).size!==72) fail('Bad cohort');
+          const outcomes=[];
+          for(const c of cases){
+            const key=run.normalizeName(c.player);
+            const prior=run.PLAYER_DB[key];
+            const staticOnly=run.playerValue(c.position,c.age,c.assigned_role,c.player);
+            if(staticOnly!==c.qa07_replayed_fv) fail('QA07R2 base replay drift '+c.player+' '+staticOnly+' '+c.qa07_replayed_fv);
+            // Mimic only the birth_date propagation from mergeLeagueRosters(), not
+            // the other live mutations. This tests one explicit mechanism in isolation.
+            let withDate=staticOnly;
+            if(c.sleeper_birth_date){
+              run.PLAYER_DB[key]={...(prior||{}),birth_date:c.sleeper_birth_date};
+              withDate=run.playerValue(c.position,c.age,c.assigned_role,c.player);
+            }
+            const effects={};
+            for(const role of ['Starter','Rotational','Depth','Speculative']){
+              effects[role]=run.playerValue(c.position,c.age,role,c.player);
+              if(!Number.isInteger(effects[role])||effects[role]<0||effects[role]>20000)
+                fail('Illegal role scenario '+c.player+' '+role);
+            }
+            if(prior===undefined) delete run.PLAYER_DB[key];
+            else run.PLAYER_DB[key]=prior;
+            const originalDrift=staticOnly-c.published_fv;
+            const patchedDrift=withDate-c.published_fv;
+            const stageStatus=Math.abs(patchedDrift)<=3?'PARITY_PASS':'PARITY_HOLD';
+            outcomes.push({
+              sleeper_id:c.sleeper_id,player:c.player,position:c.position,age:c.age,
+              assigned_role:c.assigned_role,fantasy_slot:c.fantasy_slot,
+              sleeper_birth_date:c.sleeper_birth_date,sleeper_depth_chart_order:c.depth_order,
+              sleeper_team:c.team,sleeper_years_exp:c.years_exp,
+              published_fv:c.published_fv,original_qa07_replay_fv:staticOnly,
+              original_qa07_parity:c.qa07_parity,original_drift:originalDrift,
+              dob_augmented_replay_fv:withDate,corrected_drift:patchedDrift,
+              corrected_parity:stageStatus,role_sensitive_after_dob:Math.max(...Object.values(effects))>Math.min(...Object.values(effects)),
+              value_if_Starter_HYPOTHETICAL:effects.Starter,
+              value_if_Rotational_HYPOTHETICAL:effects.Rotational,
+              value_if_Depth_HYPOTHETICAL:effects.Depth,
+              value_if_Speculative_HYPOTHETICAL:effects.Speculative,
+              source_depth_disagreement:c.depth_disagreement,
+              current_fv_changed:'NO',replacement_fv:'',
+            });
+          }
+          fs.writeFileSync(process.env.QA08_OUT+'/QA08_Replay_DOB.json',JSON.stringify(outcomes,null,2)+'\n');
+          const pass=outcomes.filter(r=>r.corrected_parity==='PARITY_PASS').length;
+          const fixed=outcomes.filter(r=>r.original_qa07_parity==='HOLD_BASELINE_MISMATCH'&&r.corrected_parity==='PARITY_PASS').length;
+          console.log(JSON.stringify({players:72,prior_holds:5,parity_pass:pass,remaining_holds:72-pass,holds_fixed:fixed}));
+          // Don't force green for non-parity players: their outputs are explicitly held.
+          // This workflow validates the cause; it does not price any players.
+          JS_QA08_REPLAY
+          node --check "$RUNNER_TEMP/qa08_replay.js"
+          node "$RUNNER_TEMP/qa08_replay.js"
+      - name: Summarize parity, evidence quality and holds
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_QA08_REPORT'
+          import csv,json,os,hashlib,collections,datetime
+          from pathlib import Path
+          out=Path(os.environ['QA08_OUT']);raw=json.loads((out/'QA08_Replay_DOB.json').read_text())
+          assert len(raw)==72 and len(set(x['sleeper_id'] for x in raw))==72
+          assert all(x['current_fv_changed']=='NO' and x['replacement_fv']=='' for x in raw)
+          cols=list(raw[0])
+          with (out/'QA08_All72_DOB_And_Depth.csv').open('w',newline='',encoding='utf8') as f:
+           w=csv.DictWriter(f,fieldnames=cols);w.writeheader();w.writerows(raw)
+          olds=[x for x in raw if x['original_qa07_parity']=='HOLD_BASELINE_MISMATCH']
+          assert len(olds)==5 and all(x['position']=='RB' for x in olds)
+          new_holds=[x for x in raw if x['corrected_parity']!='PARITY_PASS']
+          fixed=[x for x in olds if x['corrected_parity']=='PARITY_PASS']
+          role_sensitive=sum(x['role_sensitive_after_dob'] and x['corrected_parity']=='PARITY_PASS' for x in raw)
+          depth=collections.Counter(x['source_depth_disagreement'] for x in raw)
+          report=['# A-QA08 — Running Back Birth-Date Parity & Role Evidence Audit','',
+           '**READ ONLY. All alternative FVs hypothetical, not recommended replacement prices.**','',
+           '## Snapshot and mechanism','',
+           '- Replays the exact pinned `playerValue()` JavaScript against the QA07R2 72-player cohort.',
+           '- Merges **only** a Sleeper stable-ID birth date into the replay database, leaving role, position, age and model formulas fixed.',
+           '- Pins the date to **2026-10-30 UTC**, matching the original QA03/QA07R2 assessment day.',
+           '- Separately examines Sleeper NFL depth-chart order against the fantasy starting/bench slot; that feed is not a verified talent ranking.',
+           '', '## Baseline verification','',
+           f'- QA07R2 original unmatched RB cases: **{len(olds)}**.',
+           f'- Exact parity with DOB augmentation (±3 FV): **{72-len(new_holds)}/72**.',
+           f'- Previously held RB cases reconciled: **{len(fixed)}/5**.',
+           f'- Remaining parity holds: **{len(new_holds)}** (do not use these for release decisions).',
+           f'- Verified role-sensitive with DOB-aware parity: **{role_sensitive}**.',
+           '', '## Original five RB parity holds','',
+           '| Player | Published FV | QA07R2 replay | DOB augmented replay | Status |',
+           '|---|---:|---:|---:|---|']
+          for x in olds:
+           report.append(f"| {x['player']} | {x['published_fv']:,} | {x['original_qa07_replay_fv']:,} | {x['dob_augmented_replay_fv']:,} | {x['corrected_parity']} |")
+          report+=['','## NFL depth-chart signal and fantasy-slot disagreements','',
+           '| Classification | Players |','|---|---:|']
+          for k,n in depth.most_common():report.append(f'| {k} | {n} |')
+          report+=['',
+           'NFL depth-chart order is a **source observation**, not a validated dynasty tier or price target. A depth-chart mismatch is a review trigger only.',
+           '## Required before any release','',
+           '1. Prove the replacement role signal is independent of fantasy lineup choice, current, and identified by stable Sleeper ID.',
+           '2. Preserve prospect/rookie upside and multi-year expectations; do not equate No. 2 on an NFL depth chart with a Depth dynasty valuation.',
+           '3. Require independent market and dynasty source evidence before selecting any numerical candidate.',
+           '4. Keep prospective comparison separate from production FV, FV+, and MV.',
+           '5. Any future PREVIEW / APPLY requires a separate explicit owner decision.',
+           '', '## Outputs','',
+           '- `QA08_All72_DOB_And_Depth.csv`: pinned DOB-reconciled role-only sensitivities and NFL depth chart observations.',
+           '- `QA08_Manifest.json`: exact run, snapshot lineage, counts, status and zero-change proof.',
+           '', f"Generated: {datetime.datetime.now(datetime.timezone.utc).isoformat()}",'']
+          (out/'QA08_Report.md').write_text('\n'.join(report))
+          manifest={'status':'QA08_DOB_PARITY_AND_DEPTH_SOURCE_COMPLETE_READ_ONLY','qa07_run_id':os.environ['QA07_RUN_ID'],
+           'source_git_sha':os.environ['QA08_SHA'],'cohort':72,
+           'original_qa07r2_parity_holds':5,'rb_holds_reconciled':len(fixed),'remaining_parity_holds':len(new_holds),
+           'verified_role_sensitive_on_passing_baseline':role_sensitive,'depth_flags':dict(depth),
+           'recommended_new_fv_count':0,'fv_changes':0,'fv_plus_changes':0,'mv_changes':0,'repository_mutations':0,
+           'generated_utc':datetime.datetime.now(datetime.timezone.utc).isoformat()}
+          (out/'QA08_Manifest.json').write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n')
+          print(json.dumps({k:manifest[k] for k in ('cohort','rb_holds_reconciled','remaining_parity_holds','verified_role_sensitive_on_passing_baseline')}))
+          PY_QA08_REPORT
+      - name: Enforce read-only repository contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          test -z "$(git status --porcelain --untracked-files=all)" || {
+            echo 'A-QA08 read-only contract violated'; exit 1;
+          }
+      - name: Upload complete evidence
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A-QA08-DOB-Parity-Role-Evidence
+          path: /tmp/a-qa08-output/
+          retention-days: 30
+          if-no-files-found: error
+      - name: Mobile-friendly QA08 report
+        if: always()
+        shell: bash
+        run: |
+          if test -f "$QA08_OUT/QA08_Report.md"; then
+            cat "$QA08_OUT/QA08_Report.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'QA08 stopped before completing its audit. No production values changed.' >> "$GITHUB_STEP_SUMMARY"
+          fi
