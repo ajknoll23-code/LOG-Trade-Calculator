@@ -1,0 +1,248 @@
+name: A-QA18 - FantasyPros QB Independent Dynasty Rank Check (Read Only)
+run-name: A-QA18 four-QB FP dynasty confirmation NO RELEASE
+
+'on':
+  workflow_dispatch:
+    inputs:
+      qa17_run_id:
+        description: Verified successful A-QA17 private DLF QB crosscheck
+        type: string
+        required: true
+        default: '41110626141'
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: a-qa18-fp-qb-rank-read-only
+  cancel-in-progress: false
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      QA18_SRC: /tmp/qa18-qa17
+      QA18_OUT: /tmp/qa18-output
+      QA17_RUN_ID: ${{ inputs.qa17_run_id }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout without write credentials
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Verify source run is exactly QA17 green
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$QA17_RUN_ID" =~ ^[0-9]{7,15}$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$QA17_RUN_ID" > "$RUNNER_TEMP/qa17_run.json"
+          python3 - <<'PY_CHECK'
+          import os,json,pathlib
+          j=json.loads((pathlib.Path(os.environ['RUNNER_TEMP'])/'qa17_run.json').read_text())
+          wanted={'status':'completed','conclusion':'success','event':'workflow_dispatch',
+              'head_branch':'main','path':'.github/workflows/A-QA17R1-DLF-QB-Validation.yml',
+              'display_title':'A-QA17 four-QB independent dynasty market crosscheck NO RELEASE'}
+          for k,v in wanted.items(): assert j.get(k)==v,(k,j.get(k),v)
+          assert j['repository']['full_name']==os.environ['GITHUB_REPOSITORY']
+          PY_CHECK
+      - name: Download QA17 sanitized private evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: A-QA17-Private-DLF-QB-Ordering-ReadOnly
+          run-id: ${{ inputs.qa17_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: /tmp/qa18-qa17
+      - name: Verify immutable source lineage
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_LINEAGE'
+          import json,os,pathlib,re
+          a=json.loads((pathlib.Path(os.environ['QA18_SRC'])/'QA17_Manifest.json').read_text())
+          assert a['status']=='QA17_PRIVATE_DLF_QB_ORDERING_READ_ONLY'
+          assert a['qa16_verified_run']=='41107911946'
+          assert a['focus_qb_count']==4 and a['private_dlf_four_case_matches']==1
+          assert a['read_only'] and not a['owner_release_authorized']
+          assert not a['external_cardinal_FV_calibrated'] and not a['source_vintage_verified']
+          assert all(a[k]==0 for k in ('fv_changes','fv_plus_changes','mv_changes','repo_mutations','raw_private_dlf_values_exported'))
+          sha=a['source_git_sha'];assert re.fullmatch('[a-f0-9]{40}',sha)
+          (pathlib.Path(os.environ['RUNNER_TEMP'])/'qa18_source_sha').write_text(sha)
+          PY_LINEAGE
+          git fetch --depth=1 origin "$(cat "$RUNNER_TEMP/qa18_source_sha")"
+          git checkout --detach "$(cat "$RUNNER_TEMP/qa18_source_sha")"
+          test "$(git rev-parse HEAD)" = "$(cat "$RUNNER_TEMP/qa18_source_sha")"
+      - name: Compare four QBs with FantasyPros 2026 QB dynasty consensus in memory only
+        shell: bash
+        env:
+          FANTASYPROS_API_KEY: ${{ secrets.FANTASYPROS_API_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$QA18_OUT"
+          cat > "$RUNNER_TEMP/qa18_engine.py" <<'PY_ENGINE'
+          #!/usr/bin/env python3
+          # Licensed FantasyPros individual ranks are held in job memory only.
+          # No source rows, rankings, exact ECR, or credentials are exported.
+          import collections,csv,datetime,hashlib,json,math,os,pathlib,re,urllib.parse,urllib.request,urllib.error
+          IN=pathlib.Path(os.environ['QA18_SRC']);OUT=pathlib.Path(os.environ['QA18_OUT'])
+          OUT.mkdir(parents=True,exist_ok=True)
+          def halt(s):raise RuntimeError('QA18 SOURCE INTEGRITY STOP: '+s)
+          def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
+          def norm(s):
+              s=str(s or '').lower().strip().replace('’',"'")
+              s=re.sub(r"[.\-']",'',s)
+              s=re.sub(r'\b(jr|sr|ii|iii|iv)\b','',s)
+              return ' '.join(s.split())
+          def quartile(score):
+              if score is None:return 'NOT_RANKED_OR_MISSING'
+              if score<=25:return 'TOP_QUARTILE'
+              if score<=50:return 'SECOND_QUARTILE'
+              if score<=75:return 'THIRD_QUARTILE'
+              return 'BOTTOM_QUARTILE'
+          def qb(row):
+              p=str(row.get('player_position_id') or row.get('position_id') or row.get('position') or '').upper()
+              if p=='QB':return True
+              x=row.get('player_positions') or row.get('positions') or []
+              if isinstance(x,list):return any(str(z).upper()=='QB' for z in x)
+              return bool(re.search(r'\bQB\b',str(x).upper()))
+          def score(value,vals):
+              if value is None or not vals:return None
+              # Higher percentile = worse ECR (larger number).
+              return round(100*(sum(x<value for x in vals)+.5*sum(x==value for x in vals))/len(vals),1)
+          m=json.loads((IN/'QA17_Manifest.json').read_text())
+          assert m['status']=='QA17_PRIVATE_DLF_QB_ORDERING_READ_ONLY' and m['read_only']
+          with (IN/'QA17_Four_QB_DLF_Market_Crosscheck.csv').open(newline='',encoding='utf8') as f:
+              rows=list(csv.DictReader(f))
+          expected={'7083':'Tyler Huntley','5854':'Drew Lock','8162':'Sam Howell','1737':'Case Keenum'}
+          if len(rows)!=4 or {r['sleeper_id'] for r in rows}!=set(expected):halt('Unexpected QA17 four-QB cohort')
+          for r in rows:
+              if r['player']!=expected[r['sleeper_id']] or r['position']!='QB':halt('QB identity drift')
+              if r['proposed_new_FV']!='' or r['FV_changed']!='NO':halt('Unexpected upstream pricing release')
+          key=os.environ.get('FANTASYPROS_API_KEY','').strip()
+          check='HOLD_NO_API_SECRET' if not key else 'PENDING'
+          fp={};document_hash=None
+          if key:
+              query=urllib.parse.urlencode({'position':'QB','type':'DYNASTY','scoring':'PPR'})
+              url='https://api.fantasypros.com/public/v2/json/nfl/2026/consensus-rankings?'+query
+              req=urllib.request.Request(url,headers={'x-api-key':key,'Accept':'application/json',
+                 'User-Agent':'LOG-A-QA18-ReadOnly','Cache-Control':'no-cache'})
+              try:
+                  with urllib.request.urlopen(req,timeout=25) as response:raw=response.read(12_000_001)
+                  if len(raw)>12_000_000:halt('API document over permitted size')
+                  doc=json.loads(raw);document_hash=hashlib.sha256(raw).hexdigest()
+                  if not isinstance(doc,dict) or not isinstance(doc.get('players'),list):
+                      check='HOLD_UNEXPECTED_API_DOCUMENT'
+                  elif doc.get('ranking_type_name')!='dynasty':
+                      check='HOLD_NOT_DYNASTY_RANKING'
+                  else:
+                      check='PASS_DYNASTY_QB_SOURCE'
+                      for item in doc['players']:
+                          if not isinstance(item,dict):check='HOLD_UNEXPECTED_PLAYER_SCHEMA';break
+                          if not qb(item):continue
+                          name=norm(item.get('player_name') or item.get('name'))
+                          v=item.get('rank_ecr')
+                          try:r=float(v)
+                          except (ValueError,TypeError):continue
+                          if not name or not math.isfinite(r) or r<=0:continue
+                          if name in fp:check='HOLD_DUPLICATE_QB_IDENTITY';break
+                          fp[name]=r
+                      if len(fp)<12:check='HOLD_TOO_FEW_QB_RANKINGS'
+              except (OSError,urllib.error.URLError,ValueError,json.JSONDecodeError) as e:
+                  check='HOLD_API_UNAVAILABLE_OR_UNREADABLE_'+type(e).__name__
+          if not check.startswith('PASS_'):fp={}
+          vals=list(fp.values());outrows=[]
+          for item in rows:
+              name=item['player'];fv=int(item['current_FV_UNCHANGED'])
+              ecr=fp.get(norm(name))
+              fpq=quartile(score(ecr,vals))
+              dlf=item['DLF_private_QB_relative_quartile_ONLY']
+              if fpq=='NOT_RANKED_OR_MISSING':finding='FP_NOT_RANKED_OR_MISSING_HOLD'
+              elif fpq=='BOTTOM_QUARTILE' and dlf=='BOTTOM_QUARTILE':finding='TWO_SOURCES_LOW_DYNASTY_ORDER_NO_PRICE_CALIBRATION'
+              elif fpq=='BOTTOM_QUARTILE' and dlf=='NOT_AVAILABLE':finding='FP_ONLY_LOW_DYNASTY_ORDER_DLF_MISSING'
+              elif fpq=='TOP_QUARTILE' and dlf=='BOTTOM_QUARTILE':finding='CROSS_PROVIDER_CONTRADICTION_HOLD'
+              else:finding='MIXED_OR_UNCONFIRMED_DYNASTY_ORDER_REVIEW'
+              outrows.append({
+               'sleeper_id':item['sleeper_id'],'player':name,'position':'QB',
+               'current_FV_UNCHANGED':fv,'QA15_internal_comparator_NOT_APPROVED':item['QA15_internal_peer_median_NOT_RECOMMENDED'],
+               'DLF_relative_QB_quartile_FROM_QA17':dlf,
+               'FantasyPros_2026_dynasty_QB_quartile':fpq,
+               'FantasyPros_exact_normalized_QB_name_match':'YES' if ecr is not None else 'NO',
+               'FP_source_check':check,'comparison_finding':finding,
+               'superflex_rank_validation':'NOT_VERIFIED_PPR_DYNASTY',
+               'DLF_source_date_verified':'NO','FP_ranking_asof_date_verified':'NO',
+               'cardinal_market_FV_calibrated':'NO','candidate_FV':'','FV_changed':'NO'})
+          outrows.sort(key=lambda x:-x['current_FV_UNCHANGED'])
+          with (OUT/'QA18_Four_QB_Independent_Rank_Check.csv').open('w',encoding='utf8',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=list(outrows[0]));w.writeheader();w.writerows(outrows)
+          matched=sum(x['FantasyPros_exact_normalized_QB_name_match']=='YES' for x in outrows)
+          manifest={'status':'QA18_FANTASYPROS_DYNASTY_QB_INDEPENDENT_CHECK_READ_ONLY',
+              'qa17_source_run':os.environ['QA17_RUN_ID'],'qa17_manifest_sha256':sha(IN/'QA17_Manifest.json'),
+              'qa17_csv_sha256':sha(IN/'QA17_Four_QB_DLF_Market_Crosscheck.csv'),
+              'source_git_sha':m['source_git_sha'],'four_qb_count':4,
+              'fp_source_status':check,'fp_response_sha256':document_hash,
+              'fp_source_qb_count':len(fp),'fp_matched_target_qbs':matched,
+              'dlf_exact_matched_target_qbs':m['private_dlf_four_case_matches'],
+              'fp_superflex_semantics_verified':False,'provider_data_vintage_verified':False,
+              'new_fv_recommended':0,'fv_changes':0,'fv_plus_changes':0,'mv_changes':0,'repo_mutations':0,
+              'licensed_provider_rank_numbers_exported':0,'read_only':True,'owner_release_authorized':False,
+              'generated_utc':datetime.datetime.now(datetime.timezone.utc).isoformat()}
+          (OUT/'QA18_Manifest.json').write_text(json.dumps(manifest,sort_keys=True,indent=2)+'\n')
+          report=['# A-QA18 — Independent FantasyPros Dynasty QB Rank Check','',
+            '**READ ONLY. This is an additional independent ordinal check, not numerical FV calibration or price authorization.**','',
+            f'- FantasyPros source status: **{check}**.',
+            f'- Valid 2026 FantasyPros dynasty QB entries: **{len(fp)}** (source rows not exported).',
+            f'- Four target QBs with direct FantasyPros ranking: **{matched}/4**.',
+            '- FantasyPros dynasty PPR is not verified superflex and its underlying observation date is not established.',
+            '- Private DLF source vintage also remains unverified; absence from either provider is not evidence of a low valuation.',
+            '', '| QB | Current FV | QA15 internal-only median | DLF QB tier | FantasyPros QB tier | Interpretation |',
+            '|---|---:|---:|---|---|---|']
+          for r in outrows:
+              report.append(f"| {r['player']} | {r['current_FV_UNCHANGED']:,} | {r['QA15_internal_comparator_NOT_APPROVED']} | {r['DLF_relative_QB_quartile_FROM_QA17']} | {r['FantasyPros_2026_dynasty_QB_quartile']} | {r['comparison_finding']} |")
+          report.extend(['','## Practical next decision','',
+            '- Only promote an actual confirmed cross-provider signal to an owner-reviewed numerical *preview* after source freshness, NFL depth, dynasty horizon and peer value calibration are checked.',
+            '- A player missing from a rank list is a missing observation, not zero value.',
+            '- The independent ranks and in-house projection medians do not supply an exact FV replacement or validate a percentage cut.',
+            '- No production prices, player roles or repository code were changed.',''])
+          (OUT/'QA18_Report.md').write_text('\n'.join(report))
+          assert len(outrows)==4 and all(x['FV_changed']=='NO' and x['candidate_FV']=='' for x in outrows)
+          print(json.dumps({'status':check,'matched_qb_count':matched,'cohort':4,'price_changes':0}))
+          PY_ENGINE
+          python3 -m py_compile "$RUNNER_TEMP/qa18_engine.py"
+          python3 "$RUNNER_TEMP/qa18_engine.py"
+      - name: Enforce zero price changes and zero repository mutation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          test -z "$(git status --porcelain --untracked-files=all)"
+          python3 - <<'PY_HOLD'
+          import json,pathlib,os
+          m=json.loads((pathlib.Path(os.environ['QA18_OUT'])/'QA18_Manifest.json').read_text())
+          assert m['four_qb_count']==4 and m['read_only'] and not m['owner_release_authorized']
+          assert not m['fp_superflex_semantics_verified'] and not m['provider_data_vintage_verified']
+          for k in ('new_fv_recommended','fv_changes','fv_plus_changes','mv_changes','repo_mutations',
+                    'licensed_provider_rank_numbers_exported'):
+              assert m[k]==0,(k,m[k])
+          PY_HOLD
+      - name: Upload sanitized independent QB source check
+        uses: actions/upload-artifact@v4
+        with:
+          name: A-QA18-Independent-QB-FantasyPros-Check
+          path: /tmp/qa18-output/
+          retention-days: 30
+          if-no-files-found: error
+      - name: Mobile-readable review
+        if: always()
+        shell: bash
+        run: |
+          if test -f "$QA18_OUT/QA18_Report.md"; then
+            cat "$QA18_OUT/QA18_Report.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'A-QA18 held before report; no prices were changed.' >> "$GITHUB_STEP_SUMMARY"
+          fi
