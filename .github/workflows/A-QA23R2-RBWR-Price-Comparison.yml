@@ -1,0 +1,302 @@
+name: A-QA23R2 - RB WR Price Comparison (Read Only)
+run-name: A-QA23R2 rank-neighbor preview NO RELEASE
+'on':
+  workflow_dispatch:
+    inputs:
+      qa22_run_id:
+        description: Exact successful QA22R3 read-only six-player analysis
+        type: string
+        required: true
+        default: '41213834545'
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: a-qa23r2-six-player-peer-prices-read-only
+  cancel-in-progress: false
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      QA23_RUN_ID: ${{ inputs.qa22_run_id }}
+      QA23_SOURCE: /tmp/qa23-qa22
+      QA23_OUTPUT: /tmp/qa23-output
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout repository without write credentials
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Install Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Verify exact completed QA22R3 source run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$QA23_RUN_ID" =~ ^[0-9]{7,15}$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$QA23_RUN_ID" > "$RUNNER_TEMP/qa23_source_run.json"
+          python3 - <<'PY_VERIFY'
+          import json,os,pathlib
+          r=json.loads((pathlib.Path(os.environ['RUNNER_TEMP'])/'qa23_source_run.json').read_text())
+          expected={'status':'completed','conclusion':'success','event':'workflow_dispatch',
+            'path':'.github/workflows/A-QA22R3-Fixed-Upload-Independent-Review.yml',
+            'display_title':'A-QA22R3 read-only independent RB WR LB valuation check',
+            'head_branch':'main'}
+          for k,v in expected.items():assert r.get(k)==v,(k,r.get(k),v)
+          assert r['repository']['full_name']==os.environ['GITHUB_REPOSITORY']
+          PY_VERIFY
+      - name: Download verified QA22 six-player evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: A-QA22-Six-Player-Independent-Research
+          run-id: ${{ inputs.qa22_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: /tmp/qa23-qa22
+      - name: Calculate guarded same-position owner shadows from FP-ranked curated peers
+        shell: bash
+        env:
+          FANTASYPROS_API_KEY: ${{ secrets.FANTASYPROS_API_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$QA23_OUTPUT"
+          cat > "$RUNNER_TEMP/qa23_engine.py" <<'PY_QA23_ENGINE'
+          #!/usr/bin/env python3
+          """QA23: FantasyPros rank-neighbor internal FV shadow for six cases; no releases."""
+          import csv, datetime, hashlib, json, math, os, pathlib, re, statistics, urllib.parse, urllib.request, urllib.error
+
+          src=pathlib.Path(os.environ['QA23_SOURCE'])
+          out=pathlib.Path(os.environ['QA23_OUTPUT'])
+          out.mkdir(parents=True,exist_ok=True)
+
+          TARGETS={
+           '10235':('Roschon Johnson','RB',4618),
+           '8349':('Jake Hansen','LB',4004),
+           '11630':('Roman Wilson','WR',3575),
+           '8135':('Treylon Burks','WR',3575),
+           '8122':('Zonovan Knight','RB',2391),
+           '7561':('Elijah Mitchell','RB',2336),
+          }
+
+          def norm(s):
+              s=str(s or '').lower().strip().replace('’',"'")
+              s=re.sub(r"[.\-']",'',s)
+              s=re.sub(r'\b(jr|sr|ii|iii|iv)\b','',s)
+              return ' '.join(s.split())
+
+          def fail(msg): raise AssertionError('A_QA23_INTEGRITY_HALT: '+str(msg))
+          def read(p): return json.loads(p.read_text())
+          def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
+          def q(seq,x):
+              z=sorted(seq)
+              if not z:return None
+              ix=(len(z)-1)*x;a=int(math.floor(ix));b=int(math.ceil(ix))
+              return z[a]+(z[b]-z[a])*(ix-a)
+          def rank_band(rank,allranks):
+              if rank is None or not allranks:return 'MISSING_OR_UNRANKED'
+              # QA22 expresses small/better ranks as high relative standing.
+              score=100*(sum(v>rank for v in allranks)+.5*sum(v==rank for v in allranks))/len(allranks)
+              return 'TOP_QUARTILE' if score>=75 else 'UPPER_MIDDLE' if score>=50 else 'LOWER_MIDDLE' if score>=25 else 'BOTTOM_QUARTILE'
+
+          def get_fp(pos,apikey):
+              if not apikey:return 'HOLD_NO_API_KEY',{},None
+              query=urllib.parse.urlencode({'position':pos,'type':'DYNASTY','scoring':'PPR'})
+              url='https://api.fantasypros.com/public/v2/json/nfl/2026/consensus-rankings?'+query
+              req=urllib.request.Request(url,headers={'x-api-key':apikey,'Accept':'application/json',
+                  'User-Agent':'LOG-A-QA23-READONLY','Cache-Control':'no-cache'})
+              try:
+                  with urllib.request.urlopen(req,timeout=25) as resp: raw=resp.read(12_000_001)
+                  if len(raw)>12_000_000:return 'HOLD_OVERSIZE_RESPONSE',{},None
+                  fingerprint=hashlib.sha256(raw).hexdigest()
+                  doc=json.loads(raw)
+                  if not isinstance(doc,dict) or doc.get('ranking_type_name')!='dynasty' or not isinstance(doc.get('players'),list):
+                      return 'HOLD_UNVERIFIED_DYNASTY_SCHEMA',{},fingerprint
+                  scores={}
+                  for p in doc['players']:
+                      if not isinstance(p,dict):return 'HOLD_INVALID_ROW',{},fingerprint
+                      if str(p.get('player_position_id') or p.get('position_id') or p.get('position') or '').upper()!=pos:continue
+                      name=norm(p.get('player_name') or p.get('name'))
+                      try:score=float(p.get('rank_ecr'))
+                      except (TypeError,ValueError):continue
+                      if not name or not math.isfinite(score) or score<=0:continue
+                      if name in scores:return 'HOLD_DUPLICATE_NAME',{},fingerprint
+                      scores[name]=score
+                  if len(scores)<55:return 'HOLD_LOW_RANK_COVERAGE',{},fingerprint
+                  return 'PASS_DYNASTY_RANKING',scores,fingerprint
+              except (ValueError,urllib.error.URLError,OSError,json.JSONDecodeError) as e:
+                  return 'HOLD_FP_REQUEST_'+type(e).__name__,{},None
+
+          manifest=read(src/'QA22_Manifest.json')
+          assert manifest['targets']==6 and manifest['read_only'] and not manifest['release_authorized']
+          assert manifest['qa15_green_run']==41099108472
+          assert all(manifest[x]==0 for x in ['new_fv_proposals','fv_changes','fv_plus_changes','mv_changes','repository_mutations'])
+          source_rows=list(csv.DictReader((src/'QA22_Six_Player_Independent_Evidence.csv').open(newline='',encoding='utf8')))
+          if len(source_rows)!=6 or {r['sleeper_id'] for r in source_rows}!=set(TARGETS):fail('QA22 exact target ID mismatch')
+          for row in source_rows:
+              name,pos,current=TARGETS[row['sleeper_id']]
+              if (row['player'],row['position'],int(row['current_FV_UNCHANGED']))!=(name,pos,current):
+                  fail('QA22 cohort identity or FV baseline drift')
+              if row['FV_changed']!='NO' or row['proposed_new_FV']!='':fail('QA22 contained new FV proposal')
+
+          v=read(pathlib.Path('scripts/artifacts/generated/value_uncertainty.json'))
+          if v['counts']['player_count']!=565:fail('Original curated reference count differs')
+          refs={pos:[] for pos in ('RB','WR')}
+          for name,rec in v['players'].items():
+              pos=rec.get('pos')
+              if pos not in refs:continue
+              value=rec.get('center_value')
+              if not isinstance(value,(int,float)) or not math.isfinite(value) or not 0<value<20000:continue
+              refs[pos].append({'name':norm(name),'fv':int(value),'id':str(rec.get('sleeper_id') or '')})
+
+          key=os.environ.get('FANTASYPROS_API_KEY','').strip()
+          fp={};fp_status={};fp_hash={};matched_refs={};loo={}
+          for pos in ('RB','WR'):
+              status,scores,fingerprint=get_fp(pos,key)
+              fp_status[pos]=status;fp_hash[pos]=fingerprint;fp[pos]=scores
+              rank_refs=[dict(r,rank=scores[r['name']]) for r in refs[pos] if r['name'] in scores]
+              matched_refs[pos]=rank_refs
+              errs=[]
+              if len(rank_refs)>=20:
+                  for r in rank_refs:
+                      neighbors=sorted((x for x in rank_refs if x['id']!=r['id']),key=lambda x:(abs(x['rank']-r['rank']),x['rank'],x['id']))[:10]
+                      if len(neighbors)>=8:
+                          pred=statistics.median(x['fv'] for x in neighbors)
+                          errs.append(abs(pred-r['fv'])/r['fv']*100)
+              loo[pos]={'count':len(errs),'p75_abs_pct_error':round(q(errs,.75),1) if errs else None,
+                        'curated_reference_count':len(refs[pos]),'fp_ranked_curated_count':len(rank_refs)}
+
+          rows=[]
+          for s in source_rows:
+              sid=s['sleeper_id'];name,pos,old=TARGETS[sid]
+              qa15_low=int(s['QA15_internal_low_CONTEXT_ONLY']);qa15_mid=int(s['QA15_internal_median_CONTEXT_ONLY']);qa15_high=int(s['QA15_internal_high_CONTEXT_ONLY'])
+              outrow={'sleeper_id':sid,'player':name,'position':pos,'current_FV_UNCHANGED':old,
+                 'QA15_internal_low':qa15_low,'QA15_internal_median':qa15_mid,'QA15_internal_high':qa15_high,
+                 'QA22_FP_band':s['FantasyPros_dynasty_position_quartile_only'],
+                 'QA22_DLF_band':s['DLF_position_quartile_only'],
+                 'NFL_depth_order_from_QA22':s['NFL_depth_chart_order'],
+                 'injury_from_QA22':s['injury_status'],
+                 'current_FP_source_status':fp_status.get(pos,'NO_IDP_RANKING'),
+                 'FP_band_this_run':'MISSING_OR_UNRANKED',
+                 'curated_FP_matched_peers':len(matched_refs.get(pos,[])),
+                 'same_position_peer_count':0,'rank_neighbor_max_distance':None,
+                 'rank_peer_FV_q25_INTERNAL':None,'rank_peer_FV_median_INTERNAL':None,
+                 'rank_peer_FV_q75_INTERNAL':None,
+                 'rank_peer_LOO_p75_abs_pct_error':loo.get(pos,{}).get('p75_abs_pct_error'),
+                 'QA15_rank_peer_overlap_low':None,'QA15_rank_peer_overlap_high':None,
+                 'illustrative_FV_center_NOT_APPROVED':None,
+                 'gate':'HOLD_SOURCE_OR_COVERAGE','new_FV_recommended':'NO','FV_changed':'NO'}
+              if pos=='LB':outrow['gate']='HOLD_NEEDS_INDEPENDENT_IDP_RANK_AND_SNAP_EVIDENCE'
+              elif fp_status[pos]!='PASS_DYNASTY_RANKING':outrow['gate']='HOLD_FP_SOURCE_UNAVAILABLE'
+              else:
+                  score=fp[pos].get(norm(name))
+                  if score is None:outrow['gate']='HOLD_FP_TARGET_MISSING'
+                  else:
+                      allranks=list(fp[pos].values())
+                      band=rank_band(score,allranks);outrow['FP_band_this_run']=band
+                      if band != s['FantasyPros_dynasty_position_quartile_only']:
+                          outrow['gate']='HOLD_SOURCE_BAND_CHANGED_SINCE_QA22'
+                      elif len(matched_refs[pos])<20:outrow['gate']='HOLD_TOO_FEW_CURATED_RANKED_REFERENCES'
+                      else:
+                          peers=sorted(matched_refs[pos],key=lambda x:(abs(x['rank']-score),x['rank'],x['id']))[:10]
+                          vals=[x['fv'] for x in peers]
+                          lo=int(round(q(vals,.25)));hi=int(round(q(vals,.75)));med=int(round(statistics.median(vals)))
+                          dist=round(max(abs(x['rank']-score) for x in peers),1)
+                          outrow.update({'same_position_peer_count':len(peers),'rank_neighbor_max_distance':dist,
+                              'rank_peer_FV_q25_INTERNAL':lo,'rank_peer_FV_median_INTERNAL':med,'rank_peer_FV_q75_INTERNAL':hi})
+                          overlap_low=max(lo,qa15_low);overlap_hi=min(hi,qa15_high)
+                          val_error=loo[pos]['p75_abs_pct_error']
+                          if val_error is None or val_error>65:outrow['gate']='HOLD_PEER_MODEL_BACKTEST_WEAK'
+                          elif dist>50:outrow['gate']='HOLD_RANK_NEIGHBORS_TOO_DISTANT'
+                          elif hi-lo>1.3*max(1,med):outrow['gate']='HOLD_RANK_PEER_SPREAD_TOO_WIDE'
+                          elif overlap_low>overlap_hi:outrow['gate']='HOLD_TWO_INTERNAL_RANGES_DISAGREE'
+                          else:
+                              outrow['QA15_rank_peer_overlap_low']=overlap_low
+                              outrow['QA15_rank_peer_overlap_high']=overlap_hi
+                              outrow['illustrative_FV_center_NOT_APPROVED']=int(round((overlap_low+overlap_hi)/2))
+                              outrow['gate']='NUMERIC_SHADOW_REQUIRES_OWNER_AND_ROLE_REVIEW'
+              rows.append(outrow)
+          rows.sort(key=lambda r:-r['current_FV_UNCHANGED'])
+
+          with (out/'QA23_Six_Player_Peer_Pricing_Shadow.csv').open('w',newline='',encoding='utf8') as f:
+              w=csv.DictWriter(f,fieldnames=list(rows[0]));w.writeheader();w.writerows(rows)
+          result={'status':'QA23_SIX_PLAYER_FP_ORDERED_INTERNAL_PEER_PREVIEW_READ_ONLY',
+              'source_qa22_run':os.environ['QA23_RUN_ID'],
+              'source_qa22_sha256':sha(src/'QA22_Six_Player_Independent_Evidence.csv'),
+              'FP_sources':fp_status,'FP_response_digests':fp_hash,
+              'curated_reference_counts':{p:len(refs[p]) for p in refs},
+              'rank_matched_references':{p:len(matched_refs[p]) for p in refs},
+              'leave_one_out_internal_consistency':loo,
+              'numerical_shadows':sum(x['illustrative_FV_center_NOT_APPROVED'] is not None for x in rows),
+              'source_date_verified':False,'independent_cardinal_market_price_calibrated':False,
+              'new_FV_approved':0,'FV_changes':0,'FV_plus_changes':0,'MV_changes':0,'repository_mutations':0,
+              'owner_release_authorized':False,'read_only':True,'generated_utc':datetime.datetime.now(datetime.timezone.utc).isoformat()}
+          (out/'QA23_Manifest.json').write_text(json.dumps(result,sort_keys=True,indent=2)+'\n')
+          report=['# A-QA23 — Six-player numerical peer investigation','',
+                  '**READ ONLY — no FV recommendation or production release.**','',
+                  '- FantasyPros positional dynasty ranks are used ONLY to choose same-position neighbors.',
+                  '- Numerically compared values are the existing internal FV of curated players, not independent market prices.',
+                  '- DLF failed source validation in QA22; it is not used in QA23.',
+                  '- QB release (QA21) is separate and not a prerequisite for QA23.',
+                  '- All provider ranking numbers stay in memory. Public outputs contain no licensed raw rankings.',
+                  '- FantasyPros dynasty PPR is not verified superflex; source as-of date remains unverified.',
+                  '', '## Evidence quality', '']
+          for p in ('RB','WR'):
+              x=loo[p]
+              report.append(f"- {p}: FP={fp_status[p]}, ranked curated={x['fp_ranked_curated_count']}/{x['curated_reference_count']}, same-cohort leave-one-out p75={x['p75_abs_pct_error']}% on {x['count']} players")
+          report+=['','| Player | Current FV | QA15 median | Rank-neighbor FV median | Overlap | Illustrative shadow | Gate |',
+          '|---|---:|---:|---:|---|---:|---|']
+          for r in rows:
+              f=lambda v:'—' if v is None else f'{v:,}'
+              span='—' if r['QA15_rank_peer_overlap_low'] is None else f"{f(r['QA15_rank_peer_overlap_low'])}–{f(r['QA15_rank_peer_overlap_high'])}"
+              report.append(f"| {r['player']} | {f(r['current_FV_UNCHANGED'])} | {f(r['QA15_internal_median'])} | {f(r['rank_peer_FV_median_INTERNAL'])} | {span} | {f(r['illustrative_FV_center_NOT_APPROVED'])} | {r['gate']} |")
+          report+=['','## Decision controls','',
+          '- Missing/unranked targets are held; not treated as zero-value.',
+          '- Jake Hansen LB requires independent IDP ranking and recent snap opportunity evidence.',
+          '- Age, NFL depth, injury status, and current ROS projections have not been independently re-verified here.',
+          '- Passing mathematical gates does NOT establish cardinal pricing correctness.',
+          '- Do not apply illustrative centers or change production roles or other player valuations.',
+          '- No FV, FV+, MV, or repository changes were made.','']
+          (out/'QA23_Report.md').write_text('\n'.join(report)+'\n')
+          print(json.dumps({'status':result['status'],'shadows':result['numerical_shadows'],
+                            'ranked_curated':result['rank_matched_references'],'production_changes':0}))
+          PY_QA23_ENGINE
+          python3 -m py_compile "$RUNNER_TEMP/qa23_engine.py"
+          python3 "$RUNNER_TEMP/qa23_engine.py"
+      - name: Verify no production release or repository mutation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          test -z "$(git status --porcelain --untracked-files=all)"
+          python3 - <<'PY_QA23_HOLD'
+          import json,os,pathlib
+          p=pathlib.Path(os.environ['QA23_OUTPUT'])
+          m=json.loads((p/'QA23_Manifest.json').read_text())
+          assert m['status']=='QA23_SIX_PLAYER_FP_ORDERED_INTERNAL_PEER_PREVIEW_READ_ONLY'
+          assert m['read_only'] and not m['owner_release_authorized']
+          assert not m['source_date_verified'] and not m['independent_cardinal_market_price_calibrated']
+          assert all(m[k]==0 for k in ['new_FV_approved','FV_changes','FV_plus_changes','MV_changes','repository_mutations'])
+          assert (p/'QA23_Six_Player_Peer_Pricing_Shadow.csv').exists()
+          PY_QA23_HOLD
+      - name: Upload read-only pricing shadow report
+        uses: actions/upload-artifact@v4
+        with:
+          name: A-QA23-FP-Ordered-Internal-Peer-Shadow
+          path: /tmp/qa23-output/
+          retention-days: 30
+          if-no-files-found: error
+      - name: Mobile owner summary
+        if: always()
+        shell: bash
+        run: |
+          if test -f "$QA23_OUTPUT/QA23_Report.md"; then
+            cat "$QA23_OUTPUT/QA23_Report.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'QA23 held before the numeric preview. No prices changed.' >> "$GITHUB_STEP_SUMMARY"
+          fi
