@@ -1,0 +1,344 @@
+name: A-V2F01R1 - Legacy V1 Immutable Runtime Freeze (Read Only)
+run-name: A-V2F01 Freeze exact V1 baseline
+'on':
+  workflow_dispatch:
+    inputs:
+      freeze_sha:
+        description: Frozen approved legacy V1 Git commit; read only
+        required: true
+        type: string
+        default: f68aad61ae5588e728b7495ff8590bc35738c808
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: a-v2f01-legacy-freeze-${{ inputs.freeze_sha }}
+  cancel-in-progress: false
+jobs:
+  capture:
+    name: Independent browser capture ${{ matrix.capture_id }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        capture_id: [r1, r2]
+    env:
+      FROZEN_SHA: ${{ inputs.freeze_sha }}
+      FROZEN_TIME: '2026-10-31T19:00:00Z'
+      CAPTURE_ID: ${{ matrix.capture_id }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout the exact frozen legacy SHA (not moving main)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.freeze_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          path: frozen
+      - name: Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install pinned headless browser dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          npm init -y >/dev/null
+          npm install --no-save --ignore-scripts --no-audit --no-fund playwright@1.48.2
+          npx playwright install --with-deps chromium
+      - name: Establish frozen code and data SHA-256 inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/v2f01-output"
+          actual="$(git -C frozen rev-parse HEAD)"
+          test "$actual" = "$FROZEN_SHA"
+          python3 - <<'PY_HASHES'
+          import hashlib,json,os,pathlib,subprocess
+          r=pathlib.Path('frozen').resolve()
+          out=pathlib.Path(os.environ['RUNNER_TEMP'])/'v2f01-output'
+          paths=subprocess.check_output(['git','-C',str(r),'ls-files','-z']).split(b'\0')
+          entries=[]
+          for b in paths:
+              if not b:continue
+              rel=b.decode('utf-8','surrogateescape')
+              f=r/rel
+              if f.is_symlink() or not f.is_file():continue
+              digest=hashlib.sha256(f.read_bytes()).hexdigest()
+              entries.append((rel,digest))
+          entries.sort()
+          (out/'inputs.sha256').write_text(''.join(f'{h}  {p}\n' for p,h in entries),encoding='utf-8')
+          sha=os.environ['FROZEN_SHA']
+          manifest={
+              'schema':'a-v2f01-v1-freeze-manifest-v1',
+              'freeze_sha':sha,
+              'frozen_clock_utc':os.environ['FROZEN_TIME'],
+              'repo':'ajknoll23-code/LOG-Trade-Calculator',
+              'tracked_file_count':len(entries),
+              'tracked_file_sha256':hashlib.sha256((out/'inputs.sha256').read_bytes()).hexdigest(),
+              'snapshot_scope':'entire tracked repository; live browser prices are separate',
+              'permission':'read-only',
+              'licensed_raw_vendor_files':'never included directly',
+              'rollback':'restore matching commit AND data; no tag or release created',
+          }
+          (out/'manifest.json').write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n')
+          print('Captured',len(entries),'tracked-file hashes; commit',sha)
+          PY_HASHES
+      - name: Stage audited browser capture logic
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/v2f01-runtime.js" <<'JS_CAPTURE'
+          'use strict';
+          // A-V2F01: frozen, read-only, browser-observed V1 valuation evidence.
+          // No page click, vote submission, network mutation, or repository write.
+          const fs=require('fs');
+          const path=require('path');
+          const crypto=require('crypto');
+          const { chromium }=require('playwright');
+          const ROOT=path.resolve(process.env.FROZEN_ROOT||'frozen');
+          const OUT=path.resolve(process.env.CAPTURE_OUTPUT||'/tmp/v2f01-out');
+          const CLOCK=process.env.FROZEN_TIME||'2026-10-31T19:00:00Z';
+          const ID=process.env.CAPTURE_ID||'r1';
+          const SHA=process.env.FROZEN_SHA||'';
+          const BASE='http://127.0.0.1:8765';
+          const dataFile=(p)=>JSON.parse(fs.readFileSync(path.join(ROOT,p),'utf8'));
+          const sha=(p)=>crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+          function assert(ok,msg){ if(!ok) throw new Error('V2F01_FREEZE_CHECK: '+msg); }
+          const roster=dataFile('data/league_rosters.json');
+          const myRoster=dataFile('data/my_roster.json');
+          const fa=dataFile('data/free_agents.json');
+          const slots=['starters','bench','taxi','reserve_ir'];
+          const rosterEntries=roster.rosters.flatMap(t=>slots.flatMap(slot=>(t[slot]||[]).map(p=>({...p,slot,roster_id:t.roster_id}))));
+          const sid=(p)=>String(p.player_id||'');
+          const allR=new Set(rosterEntries.map(sid));
+          const allF=new Set(fa.free_agents.map(sid));
+          assert(roster.rosters.length===12,'expected 12 source rosters');
+          assert(allR.size===rosterEntries.length,'duplicate rostered Sleeper IDs');
+          assert(allF.size===fa.free_agents.length,'duplicate free-agent Sleeper IDs');
+          assert([...allR].every(x=>!allF.has(x)),'roster/free-agent overlap');
+          assert(roster.league_id===fa.league_id,'cross-source league ID mismatch');
+          assert(allR.size+allF.size===2147,'observed 2026-10-31 universe drift; investigate before freezing');
+          const notes={unexpected:[],missingPinned:[],nonessentialBlocked:{},allowedLocal:0,allowedFrozen:0,blockedWrites:0,jsErrors:[]};
+          async function main(){
+           fs.mkdirSync(OUT,{recursive:true});
+           let browser;
+           try{
+            browser=await chromium.launch({headless:true,args:['--no-sandbox']});
+            const context=await browser.newContext({serviceWorkers:'block',locale:'en-US',timezoneId:'America/Phoenix',viewport:{width:1440,height:900}});
+            await context.route('**/*',async route=>{
+             const req=route.request(),url=req.url(),m=req.method();
+             let u;try{u=new URL(url)}catch(e){notes.unexpected.push({url,method:m,error:'BAD_URL'});return route.abort()}
+             if(!['GET','HEAD'].includes(m)){notes.blockedWrites++;notes.unexpected.push({url,method:m,error:'WRITE_BLOCKED'});return route.abort()}
+             if(u.hostname==='127.0.0.1' && u.port==='8765'){
+              notes.allowedLocal++;return route.continue();
+             }
+             if(u.hostname==='raw.githubusercontent.com'){
+              const p=decodeURIComponent(u.pathname);
+              const prefix='/ajknoll23-code/LOG-Trade-Calculator/';
+              if(!p.startsWith(prefix)){notes.unexpected.push({url,method:m,error:'FOREIGN_REPO'});return route.abort()}
+              const ref=p.slice(prefix.length);
+              const rel=ref.startsWith('refs/heads/main/')?ref.slice('refs/heads/main/'.length):ref.startsWith('main/')?ref.slice('main/'.length):null;
+              if(rel===null){notes.unexpected.push({url,method:m,error:'NON_MAIN_REFERENCE'});return route.abort()}
+              const f=path.resolve(ROOT,rel);
+              if(!f.startsWith(ROOT+path.sep)||!fs.existsSync(f)||!fs.statSync(f).isFile()){
+               notes.missingPinned.push({url,rel});return route.fulfill({status:404,body:'FROZEN_FILE_MISSING'});
+              }
+              notes.allowedFrozen++;
+              const ct=f.endsWith('.json')?'application/json':f.endsWith('.js')?'text/javascript':'text/plain';
+              return route.fulfill({status:200,contentType:ct,body:fs.readFileSync(f),headers:{'Cache-Control':'no-store','Access-Control-Allow-Origin':'*'}});
+             }
+             // Read-only page cosmetics; rejecting these does not change player pricing.
+             if(['fonts.googleapis.com','fonts.gstatic.com','sleepercdn.com'].includes(u.hostname)){
+              notes.nonessentialBlocked[u.hostname]=(notes.nonessentialBlocked[u.hostname]||0)+1;
+              return route.abort();
+             }
+             notes.unexpected.push({url,method:m,error:'UNEXPECTED_EXTERNAL'});
+             return route.abort();
+            });
+            const errors=[];
+            const page=await context.newPage();
+            page.on('pageerror',e=>errors.push(String(e.message).slice(0,300)));
+            await page.clock.install({time:new Date(CLOCK)});
+            await page.goto(BASE+'/index.html',{waitUntil:'domcontentloaded',timeout:60000});
+            await page.waitForFunction(()=>{
+             try{return typeof PLAYER_DB==='object' && typeof playerValueByKey==='function' && typeof LEAGUE_ROSTERS==='object' && Object.keys(LEAGUE_ROSTERS).length===12 &&
+                typeof MARKET_VALUE_STATUS==='string' && MARKET_VALUE_STATUS!=='loading' &&
+                typeof FV_VOTE_ESTIMATE_STATUS==='string' && FV_VOTE_ESTIMATE_STATUS!=='loading';}
+             catch(e){return false}
+            },null,{timeout:60000});
+            const mainObservation=await page.evaluate((entries)=>{
+             const byId={};
+             for(const p of entries){
+              const key=resolveExistingKey(normalizeName(p.name||''),p.player_id);
+              const info=PLAYER_DB[key]||null;
+              const val=playerValueByKey(key);
+              let mv=null,votes=null;
+              if(val!==null){
+               const row=marketValueForPlayer(p.name,val);if(row)mv=row.market_value;
+               const v=fvVoteEstimateRow(p.name,val);if(v)votes=v.fv_informed_estimate;
+              }
+              byId[String(p.player_id)]={id:String(p.player_id),name:p.name||null,pos:info?.pos||p.position||null,league_rostered:true,source:'main-browser',formula_key:key,age:info?.age??null,role:info?.role??null,fv:val,mv,mv_reason:mv===null?'NO_VALID_MV_ROW_OR_FV_MISMATCH':null,fv_votes_estimate:votes,fv_votes_reason:votes===null?'NO_VALID_FV_VOTES_ROW_OR_FV_MISMATCH':null,reason:val===null?'MAIN_MISSING_OR_INVALID_POS':null};
+             }
+             const db={};
+             for(const key of Object.keys(PLAYER_DB).sort()){
+              const p=PLAYER_DB[key],fv=playerValueByKey(key);
+              db[key]={pos:p.pos||null,age:p.age??null,role:p.role||null,fv,reason:fv===null?'INVALID_POSITION':null};
+             }
+             return {rostered:byId, db, db_count:Object.keys(PLAYER_DB).length, market_source_status:MARKET_VALUE_STATUS,votes_source_status:FV_VOTE_ESTIMATE_STATUS,league_rosters:Object.keys(LEAGUE_ROSTERS).length, qa21_approved:{...QA21_OWNER_APPROVED_QB_ROSTER_FV}, owner_anchors:{...CAL26_FV_OWNER_ANCHORS}};
+            },rosterEntries);
+            const board=await context.newPage();
+            board.on('pageerror',e=>errors.push(String(e.message).slice(0,300)));
+            await board.clock.install({time:new Date(CLOCK)});
+            await board.goto(BASE+'/free-agent-board.html',{waitUntil:'domcontentloaded',timeout:60000});
+            await board.waitForFunction(()=>{
+             try{return Array.isArray(FREE_AGENTS) && FREE_AGENTS.length>1500 && document.getElementById('syncStatus')?.classList.contains('ok');}
+             catch(e){return false}
+            },null,{timeout:60000});
+            const boardObservation=await board.evaluate(()=>({
+             qa21_approved:{...QA21_OWNER_APPROVED_QB_ROSTER_FV},
+             free_agents:FREE_AGENTS.map(p=>({id:String(p.playerId),name:p.name||null,pos:p.pos||null,league_rostered:false,source:'free-agent-board-browser',formula_key:p.key||null,age:p.age??null,role:p.role||null,fv:Number.isFinite(p.val)?p.val:null,mv:null,mv_reason:'NOT_EXPOSED_IN_FA_BOARD',fv_votes_estimate:null,fv_votes_reason:'NOT_EXPOSED_IN_FA_BOARD',reason:null,identity_hold:p.identityHeld===true,has_real_data:p.hasRealData===true})),
+             source_rows:FREE_AGENTS.length, utility_active:FREE_AGENT_UTILITY_ACTIVE
+            }));
+            assert(Object.keys(mainObservation.qa21_approved).length===3,'QA21 override count mismatch');
+            assert(Object.keys(mainObservation.owner_anchors).length===15,'owner anchor count mismatch');
+            assert(JSON.stringify(mainObservation.qa21_approved)===JSON.stringify(boardObservation.qa21_approved),'QA21 main/board override difference');
+            assert(mainObservation.qa21_approved['drew lock']===1104 && mainObservation.qa21_approved['sam howell']===1098 && mainObservation.qa21_approved['tyler huntley']===1250,'QA21 approved price drift');
+            const faObserved=new Map(boardObservation.free_agents.map(p=>[p.id,p]));
+            const combined=[];
+            for(const p of rosterEntries){const q=mainObservation.rostered[sid(p)];assert(q,'missing roster ID in browser: '+sid(p));combined.push(q)}
+            for(const p of fa.free_agents){
+             const found=faObserved.get(sid(p));
+             combined.push(found||{id:sid(p),name:p.name||null,pos:p.pos||null,league_rostered:false,source:'board-filtered-or-unavailable',fv:null,mv:null,mv_reason:'NOT_EXPOSED_IN_FA_BOARD',fv_votes_estimate:null,fv_votes_reason:'NOT_EXPOSED_IN_FA_BOARD',formula_key:null,age:p.age??null,role:null,reason:((p.name||'').toLowerCase()==='byron young'&&p.pos==='DL')||((p.name||'').toLowerCase()==='devonta smith'&&p.pos==='DB')?'EXCLUDED_FROM_BOARD':'NOT_DISPLAYED_BY_BOARD'});
+            }
+            combined.sort((a,b)=>a.id.localeCompare(b.id,'en',{numeric:true}));
+            assert(combined.length===2147,'not 2147 records');
+            assert(new Set(combined.map(p=>p.id)).size===2147,'duplicate IDs in final evidence');
+            assert(!notes.unexpected.length,'unexpected external network requests '+JSON.stringify(notes.unexpected.slice(0,5)));
+            assert(!notes.missingPinned.length,'missing pinned raw source file(s) '+JSON.stringify(notes.missingPinned.slice(0,5)));
+            assert(!errors.length,'browser Javascript errors: '+JSON.stringify(errors.slice(0,5)));
+            assert(notes.allowedFrozen>=7,'unexpected low frozen raw data reroute count');
+            const counts={universe:combined.length,rostered:allR.size,free_agents:allF.size,main_db_count:mainObservation.db_count,board_displayed:boardObservation.source_rows,with_fv:combined.filter(p=>Number.isFinite(p.fv)).length,without_fv:combined.filter(p=>!Number.isFinite(p.fv)).length,with_mv:combined.filter(p=>Number.isFinite(p.mv)).length,with_fv_votes_estimate:combined.filter(p=>Number.isFinite(p.fv_votes_estimate)).length,identity_held:combined.filter(p=>p.identity_hold===true).length};
+            assert(counts.rostered===540 && counts.free_agents===1607,'incorrect universe breakdown');
+            const output={schema:'a-v2f01-legacy-v1-runtime-capture-v1',freeze_sha:SHA,frozen_clock_utc:CLOCK,ui_pages:['index.html','free-agent-board.html'],data_hashes:{league_rosters:sha(path.join(ROOT,'data/league_rosters.json')),free_agents:sha(path.join(ROOT,'data/free_agents.json')),my_roster:sha(path.join(ROOT,'data/my_roster.json')),index:sha(path.join(ROOT,'index.html')),free_agent_board:sha(path.join(ROOT,'free-agent-board.html'))},counts,market_notes:{mv_is_legacy_fv_distribution_calibrated:true,fv_votes_estimate_is_fv_informed:true,market_source_status:mainObservation.market_source_status,votes_source_status:mainObservation.votes_source_status},runtime_roster_players:combined,main_player_db:mainObservation.db,qa21_approved_fv:mainObservation.qa21_approved,cal26_owner_anchors:mainObservation.owner_anchors};
+            fs.writeFileSync(path.join(OUT,'runtime.json'),JSON.stringify(output,null,2)+'\n');
+            const provenance={schema:'a-v2f01-routing-provenance-v1',freeze_sha:SHA,allowed_local:notes.allowedLocal,allowed_frozen_sources:notes.allowedFrozen,blocked_cosmetic:notes.nonessentialBlocked,unexpected:notes.unexpected,missing_frozen_sources:notes.missingPinned,js_errors:errors,write_requests_blocked:notes.blockedWrites};
+            fs.writeFileSync(path.join(OUT,'network.json'),JSON.stringify(provenance,null,2)+'\n');
+            console.log(JSON.stringify({status:'PASS',counts,allowed_frozen_requests:notes.allowedFrozen,source_status:output.market_notes}));
+           }finally{if(browser)await browser.close()}
+          }
+          main().catch(e=>{console.error(e.stack||String(e));process.exitCode=1});
+          JS_CAPTURE
+          node --check "$RUNNER_TEMP/v2f01-runtime.js"
+      - name: Capture both live V1 pages against frozen source files
+        shell: bash
+        env:
+          FROZEN_ROOT: ${{ github.workspace }}/frozen
+          CAPTURE_OUTPUT: ${{ runner.temp }}/v2f01-output
+        run: |
+          set -euo pipefail
+          python3 -m http.server 8765 --bind 127.0.0.1 --directory frozen > "$RUNNER_TEMP/v2f01-http.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          for n in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -sf 'http://127.0.0.1:8765/index.html' -o /dev/null;then break;fi
+            sleep 1
+          done
+          curl -sf 'http://127.0.0.1:8765/index.html' -o /dev/null
+          node "$RUNNER_TEMP/v2f01-runtime.js"
+      - name: Upload read-only evidence for independent comparison
+        uses: actions/upload-artifact@v4
+        with:
+          name: A-V2F01-${{ matrix.capture_id }}
+          path: ${{ runner.temp }}/v2f01-output/
+          if-no-files-found: error
+          retention-days: 90
+  compare:
+    name: Verify identical runtime and immutable hashes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    needs: capture
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Download the two independent read-only captures
+        uses: actions/download-artifact@v4
+        with:
+          pattern: A-V2F01-*
+          path: captured
+      - name: Require full reproducibility and reconcile all 2147 IDs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmp captured/A-V2F01-r1/inputs.sha256 captured/A-V2F01-r2/inputs.sha256
+          cmp captured/A-V2F01-r1/manifest.json captured/A-V2F01-r2/manifest.json
+          cmp captured/A-V2F01-r1/runtime.json captured/A-V2F01-r2/runtime.json
+          python3 - <<'PY_CHECK'
+          import json,pathlib,collections
+          p=pathlib.Path('captured/A-V2F01-r1')
+          m=json.loads((p/'manifest.json').read_text())
+          r=json.loads((p/'runtime.json').read_text())
+          for who in ('r1','r2'):
+              net=json.loads((pathlib.Path('captured')/f'A-V2F01-{who}'/'network.json').read_text())
+              assert net['unexpected']==[] and net['missing_frozen_sources']==[]
+              assert net['js_errors']==[] and net['write_requests_blocked']==0
+          assert r['freeze_sha']==m['freeze_sha']
+          assert r['frozen_clock_utc']==m['frozen_clock_utc']
+          x=r['counts']
+          assert (x['universe'],x['rostered'],x['free_agents'])==(2147,540,1607)
+          assert x['with_fv']+x['without_fv']==2147
+          assert len(r['runtime_roster_players'])==2147
+          assert len({a['id'] for a in r['runtime_roster_players']})==2147
+          assert len(r['qa21_approved_fv'])==3 and len(r['cal26_owner_anchors'])==15
+          counts=dict(collections.Counter(a.get('reason') or 'PRICED' for a in r['runtime_roster_players']))
+          summary={
+              'status':'REPRODUCIBLE_BROWSER_FREEZE',
+              'release':'NONE',
+              'fv_mutations':0,
+              'freeze_sha':m['freeze_sha'],
+              'tracked_file_hashes':m['tracked_file_count'],
+              'counts':x,
+              'reason_counts':counts,
+              'note':'MV and FV+Votes are legacy FV-dependent display layers, NOT independent targets for V2',
+              'next_step':'A-V2U02 full-universe identity and source coverage audit',
+          }
+          pathlib.Path('A-V2F01-Summary.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+          md=[
+              '# A-V2F01 — Legacy V1 Reproducible Browser Freeze', '',
+              '**Technical result: PASS. Economic valuation quality is NOT implied.**','',
+              f"- Git commit: `{m['freeze_sha']}`",
+              f"- Repo tracked-file hashes: **{m['tracked_file_count']:,}**",
+              f"- Universe: **{x['universe']:,}** Sleeper IDs ({x['rostered']} rostered, {x['free_agents']} free agents)",
+              f"- Live FV captured: **{x['with_fv']:,}**; explicit null statuses: **{x['without_fv']:,}**",
+              f"- Browser main database entries: **{x['main_db_count']:,}**; free-agent board displayed: **{x['board_displayed']:,}**",
+              '- Dual-browser captures: **byte-identical**; code/data hashes: **byte-identical**',
+              '- Owner controls: **3 QA21-approved QBs and 15 CAL26 anchors unchanged**',
+              '- No V1 formulas, values, website content, data, tags, or releases were modified',
+              '- Important: Only FV is universal in the existing UI; market and FV+Votes can be null or FV-dependent',
+              '', '**Source/status breakdown:**','',
+          ]
+          for k,v in sorted(counts.items()):md.append(f'- {k}: {v:,}')
+          md.extend(['','**Next:** A-V2U02 full-universe source and identity audit.'])
+          pathlib.Path('A-V2F01-Report.md').write_text('\n'.join(md)+'\n')
+          print('Freeze PASS; records',x)
+          PY_CHECK
+      - name: Publish immutable evidence bundle (artifact, not tag)
+        uses: actions/upload-artifact@v4
+        with:
+          name: A-V2F01-Frozen-Legacy-V1-Evidence
+          path: |
+            captured/A-V2F01-r1/runtime.json
+            captured/A-V2F01-r1/inputs.sha256
+            captured/A-V2F01-r1/manifest.json
+            captured/A-V2F01-r1/network.json
+            captured/A-V2F01-r2/runtime.json
+            captured/A-V2F01-r2/inputs.sha256
+            captured/A-V2F01-r2/manifest.json
+            captured/A-V2F01-r2/network.json
+            A-V2F01-Summary.json
+            A-V2F01-Report.md
+          retention-days: 90
+          if-no-files-found: error
