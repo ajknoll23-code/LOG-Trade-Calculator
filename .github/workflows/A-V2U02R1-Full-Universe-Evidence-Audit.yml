@@ -1,0 +1,367 @@
+name: A-V2U02R1 - Full Player Universe and Independent Evidence Audit (Read Only)
+run-name: A-V2U02 Audit every player and evidence source
+'on':
+  workflow_dispatch:
+    inputs:
+      freeze_sha:
+        description: Exact A-V2F01 legacy code/data SHA (do not use moving main)
+        type: string
+        required: true
+        default: f68aad61ae5588e728b7495ff8590bc35738c808
+      freeze_run_id:
+        description: Successful A-V2F01 evidence run ID
+        type: string
+        required: true
+        default: '41248692211'
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: a-v2u02-evidence-audit-${{ inputs.freeze_sha }}
+  cancel-in-progress: false
+jobs:
+  audit:
+    name: Complete population evidence inventory (no valuation)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      FREEZE_SHA: ${{ inputs.freeze_sha }}
+      FREEZE_RUN_ID: ${{ inputs.freeze_run_id }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Reject any change to the approved frozen SHA or V1 run
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$FREEZE_SHA" = 'f68aad61ae5588e728b7495ff8590bc35738c808'
+          test "$FREEZE_RUN_ID" = '41248692211'
+      - name: Checkout exact immutable V1 commit as inputs only
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.freeze_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          path: frozen
+      - name: Retrieve independently verified A-V2F01 browser evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: A-V2F01-Frozen-Legacy-V1-Evidence
+          repository: ajknoll23-code/LOG-Trade-Calculator
+          run-id: ${{ inputs.freeze_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: baseline
+      - name: Audit every player and candidate evidence source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p v2-audit
+          cat > "$RUNNER_TEMP/v2u02.py" <<'PY_AUDIT'
+          import collections,csv,datetime,hashlib,json,math,os,pathlib,re,subprocess,sys,unicodedata
+          from collections import Counter,defaultdict
+
+          F=pathlib.Path('frozen')
+          B=pathlib.Path('baseline')
+          O=pathlib.Path('v2-audit')
+          SHA=os.environ['FREEZE_SHA']
+          F01_RUN=os.environ['FREEZE_RUN_ID']
+          O.mkdir(exist_ok=True)
+          issues=[]
+          notices=[]
+
+          def digest(data):
+              return hashlib.sha256(data).hexdigest()
+          def readjson(path):
+              with open(path,encoding='utf-8') as fp:return json.load(fp)
+          def required(condition,message):
+              if not condition:raise AssertionError(message)
+          def value_present(v):
+              return v is not None and v != '' and v != []
+          def finite(v):
+              return isinstance(v,(int,float)) and not isinstance(v,bool) and math.isfinite(v)
+          def normalize(s):
+              s=unicodedata.normalize('NFKD',str(s or '')).encode('ascii','ignore').decode('ascii').lower()
+              return re.sub(r'[^a-z0-9]+',' ',s).strip()
+          def side(pid):
+              return str(pid).strip()
+          def source_meta(path,kind,semantics,license_note):
+              p=F/path
+              m={'path':str(path),'kind':kind,'semantics':semantics,'license_note':license_note,
+                 'exists':p.is_file(),'bytes':p.stat().st_size if p.is_file() else None,
+                 'sha256':digest(p.read_bytes()) if p.is_file() else None}
+              return m
+
+          # Re-verify the original double capture, independent of live main or current prices.
+          r1=B/'captured/A-V2F01-r1'
+          r2=B/'captured/A-V2F01-r2'
+          for name in ('runtime.json','manifest.json','inputs.sha256'):
+              required((r1/name).is_file() and (r2/name).is_file(),'missing original capture '+name)
+              required((r1/name).read_bytes()==(r2/name).read_bytes(),'F01 dual captures differ: '+name)
+          required(digest((r1/'runtime.json').read_bytes())=='4e41fc02d734ae331009eea368149b326868f95985bf0bba69429dfa94675dff','F01 runtime digest drift')
+          required(digest((r1/'inputs.sha256').read_bytes())=='44978ef4f3213a0efc3cd07043dbfdccdb87dbe83a2165878735e93c98584354','F01 repository digest drift')
+          summary=readjson(B/'A-V2F01-Summary.json')
+          manifest=readjson(r1/'manifest.json')
+          runtime=readjson(r1/'runtime.json')
+          required(summary['status']=='REPRODUCIBLE_BROWSER_FREEZE' and summary['release']=='NONE' and summary['fv_mutations']==0,'F01 status/release/mutation mismatch')
+          required(runtime['schema']=='a-v2f01-legacy-v1-runtime-capture-v1','unrecognized F01 runtime schema')
+          required(manifest['freeze_sha']==runtime['freeze_sha']==summary['freeze_sha']==SHA,'wrong frozen commit')
+          required(manifest['tracked_file_count']==3039,'frozen tracked file count drift')
+          required(manifest['tracked_file_sha256']==digest((r1/'inputs.sha256').read_bytes()),'captured input manifest mismatch')
+          for path,hashval in [('data/league_rosters.json',runtime['data_hashes']['league_rosters']),
+                               ('data/free_agents.json',runtime['data_hashes']['free_agents']),
+                               ('data/my_roster.json',runtime['data_hashes']['my_roster']),
+                               ('index.html',runtime['data_hashes']['index']),
+                               ('free-agent-board.html',runtime['data_hashes']['free_agent_board'])]:
+              required(digest((F/path).read_bytes())==hashval,'frozen source hash drift: '+path)
+
+          players=runtime['runtime_roster_players']
+          required(len(players)==2147 and len({p['id'] for p in players})==2147,'F01 player population incomplete or duplicated')
+          roster=readjson(F/'data/league_rosters.json')
+          free=readjson(F/'data/free_agents.json')
+          slots=('starters','bench','taxi','reserve_ir')
+          roster_rows=[]
+          for team in roster['rosters']:
+              for slot in slots:
+                  for p in team.get(slot,[]):
+                      roster_rows.append((p,slot,team['roster_id']))
+          free_rows=free['free_agents']
+          roster_ids=[side(p['player_id']) for p,_,_ in roster_rows]
+          fa_ids=[side(p['player_id']) for p in free_rows]
+          required(len(roster_ids)==540 and len(fa_ids)==1607,'league source counts drifted')
+          required(len(set(roster_ids))==len(roster_ids) and len(set(fa_ids))==len(fa_ids),'duplicate Sleeper IDs in source')
+          required(not set(roster_ids).intersection(fa_ids),'rostered / FA overlap')
+          source_ids=set(roster_ids)|set(fa_ids)
+          required(source_ids=={p['id'] for p in players},'population ID reconciliation mismatch')
+          lookup={side(p['player_id']):dict(p,roster_slot=slot,source_roster_id=rid)
+                  for p,slot,rid in roster_rows}
+          lookup.update({side(p['player_id']):dict(p,roster_slot='FA',source_roster_id=None) for p in free_rows})
+          required(roster['league_id']==free['league_id'],'source league IDs disagree')
+
+          # These two files contain independent *projection inputs*, not observed outcomes,
+          # neither is necessarily a preseason snapshot. No legacy FV is an independent target.
+          spath=pathlib.Path('scripts/sleeper_2026_projections.json')
+          fpath=pathlib.Path('scripts/fantasypros_2026_projections.json')
+          rolepath=pathlib.Path('data/player_role_v2_week5.json')
+          spr=readjson(F/spath) if (F/spath).is_file() else []
+          fpr=readjson(F/fpath) if (F/fpath).is_file() else []
+          rol=readjson(F/rolepath) if (F/rolepath).is_file() else {}
+          required(isinstance(spr,list) and isinstance(fpr,list),'projection schema changed')
+          smap=defaultdict(list)
+          for p in spr:
+              if value_present(p.get('sleeper_id')):smap[side(p['sleeper_id'])].append(p)
+          # FP lacks authoritative Sleeper IDs. Identity matching is labeled
+          # strictly as candidate name+position+team, never a confirmed crosswalk.
+          fpmap=defaultdict(list)
+          for p in fpr:
+              key=(normalize(p.get('player')),str(p.get('pos') or '').upper(),str(p.get('team') or '').upper())
+              fpmap[key].append(p)
+          rolemap=defaultdict(list)
+          for p in rol.get('players',[]):
+              if value_present(p.get('sleeper_id')):rolemap[side(p['sleeper_id'])].append(p)
+
+          # Catalog plausible evidence files. Other research outputs can contain
+          # V1-derived values, targets, or post-holdout outcomes and are not scored.
+          catalog=[]
+          for path,kind,semantics,rights in [
+              (pathlib.Path('data/league_rosters.json'),'identity','Sleeper player identifiers and observed player metadata','League data - metadata only'),
+              (pathlib.Path('data/free_agents.json'),'identity','Sleeper free-agent identifiers and metadata','League data - metadata only'),
+              (pathlib.Path('data/player_role_v2_week5.json'),'role_feature','Prior role model output, NOT validated future production','Derived features, not outcome labels'),
+              (spath,'projection_candidate','Sleeper 2026 projected total; capture time uncertain','Repo source, never backtest as preseason without date'),
+              (fpath,'projection_candidate','FantasyPros 2026 projections; name-pos-team only identity candidate','Source identity not authoritative'),
+              (pathlib.Path('scripts/artifacts/generated/sleeper_2026_raw_weekly.json'),'historical_candidate','Raw weekly dataset; no player-level backtest certification in this audit','Snapshot/temporal leakage verification required'),
+              (pathlib.Path('research/roster-economics/weekly_points_by_season.json'),'historical_candidate','Historical scoring data; aggregation and ID lineage unverified','No validated player-level outcome link yet'),
+              (pathlib.Path('research/identity-v2/unified_fantasypros_sleeper_identity_v2.json'),'identity_candidate','Historical identity crosswalk; approval and date not established here','Must validate before promotion'),
+              (pathlib.Path('scripts/fantasypros_api_normalized_2026.json'),'projection_candidate','Additional FP API normalized material, not automatically joined','Time/as-of verification required'),
+              (pathlib.Path('data/trade_history.json'),'transaction_history','Historical multi-asset league trades, not pure player price targets','Selection bias, salary and pick confounding'),
+          ]:
+              catalog.append(source_meta(path,kind,semantics,rights))
+
+          # Systematically enumerate EVERY tracked candidate source file in the
+          # frozen repository, not merely a hand-picked shortlist. Discovery
+          # does NOT mean independently validated player-level truth.
+          tracked=subprocess.check_output(['git','-C',str(F),'ls-files','-z']).split(b'\0')
+          candidate_files=[]
+          for rawpath in tracked:
+              if not rawpath:continue
+              path=pathlib.PurePosixPath(rawpath.decode('utf-8','surrogateescape'))
+              rel=str(path)
+              if path.suffix.lower() not in ('.json','.jsonl','.csv','.tsv','.parquet','.xlsx','.sqlite','.db'):
+                  continue
+              if not (rel.startswith('data/') or rel.startswith('scripts/') or rel.startswith('research/') or rel.startswith('model/')):
+                  continue
+              file=F/rel
+              if not file.is_file():continue
+              low=rel.lower()
+              if any(t in low for t in ('projection','preseason','ros','forecast')):
+                  klass='PROJECTION_CANDIDATE_TEMPORAL_PROVENANCE_NEEDED'
+              elif any(t in low for t in ('weekly','historical','season','production','outcome','backtest')):
+                  klass='OUTCOME_OR_DERIVED_CANDIDATE_VERIFY_LINEAGE'
+              elif any(t in low for t in ('identity','crosswalk','players_cache','roster','free_agent')):
+                  klass='IDENTITY_OR_ROSTER_CANDIDATE'
+              elif any(t in low for t in ('market','ktc','dlf','vote','fv','anchor','release','shadow','pricing','calibration')):
+                  klass='POTENTIALLY_LEGACY_DERIVED_NO_TRAINING_TARGET'
+              else:
+                  klass='UNCLASSIFIED_VERIFY_SEMANTICS_BEFORE_USE'
+              candidate_files.append({'path':rel,'bytes':file.stat().st_size,
+                  'sha256':digest(file.read_bytes()),'discovery_class':klass,
+                  'validated_as_independent_player_outcome':False})
+          # Preserve all discovered paths and hashes, including research snapshots,
+          # to support the next source certification stage.
+          with (O/'A-V2U02-All-Tracked-Data-Source-Discovery.csv').open('w',newline='',encoding='utf-8') as f:
+              w=csv.DictWriter(f,fieldnames=['path','bytes','sha256','discovery_class','validated_as_independent_player_outcome'])
+              w.writeheader();w.writerows(candidate_files)
+
+          result=[]
+          for p in players:
+              pid=p['id']; src=lookup[pid]
+              pos=str(p.get('pos') or src.get('pos') or src.get('position') or '').upper()
+              if pos in ('DE','DT','EDGE'):pos='DL'
+              if pos in ('CB','S','FS','SS'):pos='DB'
+              if pos not in ('QB','RB','WR','TE','DL','LB','DB','K'):
+                  pos='UNKNOWN'
+              name=str(src.get('name') or p.get('name') or '')
+              team=str(src.get('team') or '').upper()
+              rawpos=str(src.get('position') or src.get('pos') or '')
+              m=smap.get(pid,[])
+              # Multiple rows for the same ID: no unsafe arbitrary choice.
+              sp=m[0] if len(m)==1 and finite(m[0].get('sleeper_2026_proj_total')) else None
+              fps=fpmap.get((normalize(name),pos,team),[]) if team else []
+              fp=fps[0] if len(fps)==1 and finite(fps[0].get('fantasypros_2026_proj')) else None
+              roles=rolemap.get(pid,[])
+              rp=roles[0] if len(roles)==1 and str(roles[0].get('position') or '').upper()==pos else None
+              row={
+               'sleeper_id':pid,'player':name,'position':pos,'raw_position':rawpos,
+               'team':team,'rostered':p.get('league_rostered') is True,'roster_slot':src['roster_slot'],
+               'age':src.get('age'),'birth_date':src.get('birth_date'),
+               'years_exp':src.get('years_exp'),'status':src.get('status'),
+               'injury_status':src.get('injury_status'),
+               'depth_chart_order':src.get('depth_chart_order'),
+               'player_identity_complete':pid!='0' and pos!='UNKNOWN' and value_present(name),
+               'sleeper_projection_2026':sp.get('sleeper_2026_proj_total') if sp else None,
+               'sleeper_projection_match':'DIRECT_SID' if sp else ('DUPLICATE_SID' if len(m)>1 else 'NO_MATCH_OR_INVALID'),
+               'fantasypros_projection_2026':fp.get('fantasypros_2026_proj') if fp else None,
+               'fantasypros_match':'UNCONFIRMED_NAME_POS_TEAM_CANDIDATE' if fp else ('AMBIGUOUS' if len(fps)>1 else 'NO_MATCH_OR_INVALID'),
+               'role_week5':rp.get('role_tier') if rp else None,
+               'role_match':'DIRECT_SID_POS' if rp else ('AMBIGUOUS_OR_POS_MISMATCH' if roles else 'NO_MATCH'),
+               'legacy_has_real_data_flag':p.get('has_real_data') if 'has_real_data' in p else None,
+               'legacy_value_reason':p.get('reason'),
+               'source_quality_flags':[],
+              }
+              if pid=='0':row['source_quality_flags'].append('SLEEPER_PLACEHOLDER_0')
+              if not row['player_identity_complete']:row['source_quality_flags'].append('INCOMPLETE_IDENTITY')
+              if p.get('identity_hold') is True:row['source_quality_flags'].append('LEGACY_IDENTITY_HOLD')
+              if p.get('fv') is None:row['source_quality_flags'].append('V1_FV_MISSING_REFERENCE_ONLY')
+              if row['rostered']!= (pid in set(roster_ids)):row['source_quality_flags'].append('ROSTER_MEMBERSHIP_DISAGREES')
+              if not value_present(row['birth_date']):row['source_quality_flags'].append('NO_DOB')
+              if not finite(row['age']):row['source_quality_flags'].append('NO_AGE')
+              if not sp:row['source_quality_flags'].append('NO_DIRECT_SLEEPER_PROJECTION')
+              if not fp:row['source_quality_flags'].append('NO_STRICT_FP_PROJECTION_CANDIDATE')
+              if not rp:row['source_quality_flags'].append('NO_WEEK5_ROLE_MATCH')
+              if not value_present(row['status']):row['source_quality_flags'].append('MISSING_STATUS')
+              row['source_quality_flags']=';'.join(row['source_quality_flags'])
+              result.append(row)
+
+          result.sort(key=lambda p:(p['position'],p['player'].lower(),p['sleeper_id']))
+          required(len(result)==2147 and len({p['sleeper_id'] for p in result})==2147,'audit output population changed')
+          positions=['QB','RB','WR','TE','DL','LB','DB','K','UNKNOWN']
+          coverage={}
+          for pos in positions:
+              grp=[r for r in result if r['position']==pos]
+              coverage[pos]={
+                'universe':len(grp),'rostered':sum(r['rostered'] for r in grp),
+                'identity_complete':sum(r['player_identity_complete'] for r in grp),
+                'age_present':sum(finite(r['age']) for r in grp),
+                'birth_date_present':sum(value_present(r['birth_date']) for r in grp),
+                'depth_present':sum(finite(r['depth_chart_order']) for r in grp),
+                'sleeper_projection_direct':sum(r['sleeper_projection_match']=='DIRECT_SID' for r in grp),
+                'fp_projection_candidate':sum(r['fantasypros_match']=='UNCONFIRMED_NAME_POS_TEAM_CANDIDATE' for r in grp),
+                'week5_role_direct':sum(r['role_match']=='DIRECT_SID_POS' for r in grp),
+                'v1_fv_missing':sum('V1_FV_MISSING_REFERENCE_ONLY' in r['source_quality_flags'] for r in grp),
+              }
+          required(sum(c['universe'] for c in coverage.values())==2147,'coverage subtotals mismatch')
+
+          # Reserve a deliberately separate V1 comparator. No A-V2S03 feature
+          # importer should ever ingest this file as a label or training target.
+          legacy=[{'sleeper_id':p['id'],'name':p.get('name'),'position':p.get('pos'),
+                   'v1_fv_reference':p.get('fv'),'v1_mv_fv_dependent_not_truth':p.get('mv'),
+                   'v1_vote_estimate_fv_dependent_not_truth':p.get('fv_votes_estimate'),
+                   'missing_reason':p.get('reason')} for p in players]
+          def write_csv(path,rows):
+              if not rows:return
+              with path.open('w',encoding='utf-8',newline='') as fp:
+                  writer=csv.DictWriter(fp,fieldnames=list(rows[0].keys()),extrasaction='ignore')
+                  writer.writeheader();writer.writerows(rows)
+          write_csv(O/'A-V2U02-All-2147-Independent-Evidence.csv',result)
+          write_csv(O/'A-V2U02-Legacy-V1-Comparison-ONLY.csv',legacy)
+          write_csv(O/'A-V2U02-Needs-Identity-Review.csv',[
+             r for r in result if not r['player_identity_complete'] or
+               'LEGACY_IDENTITY_HOLD' in r['source_quality_flags'] or
+               r['fantasypros_match']=='AMBIGUOUS'])
+          write_csv(O/'A-V2U02-Coverage-By-Position.csv',[
+              {'position':pos,**coverage[pos]} for pos in positions])
+          dataset={
+              'schema':'a-v2u02-population-independent-evidence-audit-v1',
+              'status':'STRUCTURAL_PASS_ONLY_EVIDENCE_SUFFICIENCY_NOT_ASSESSED',
+              'release':'NONE','v1_price_changes':0,
+              'universe':2147,'freeze_sha':SHA,'freeze_run_id':F01_RUN,
+              'f01_runtime_sha256':'4e41fc02d734ae331009eea368149b326868f95985bf0bba69429dfa94675dff',
+              'coverage_by_position':coverage,
+              'source_inventory':catalog,
+              'all_candidate_source_files':len(candidate_files),
+              'candidate_source_class_counts':dict(Counter(x['discovery_class'] for x in candidate_files)),
+              'holdout_protection':[
+                 'No V1 FV/MV/FV+votes as independent truth',
+                 'Historical outcomes not joined until temporal lineage is verified',
+                 '2026 provider forecasts NOT certified preseason or rest-of-season',
+                 'FantasyPros same-name/position/team joins are candidate identity only',
+                 'No inference or imputation of missing projection observations',
+                 'Never train on hand-selected price correction anchors',
+              ],
+              'next':'A-V2S03 design and independently evaluate scoring/replacement model after source certification',
+          }
+          (O/'A-V2U02-Summary.json').write_text(json.dumps(dataset,indent=2,sort_keys=True)+'\n')
+          md=[
+             '# A-V2U02 — Full Player Universe and Evidence Audit', '',
+             '**Result: Structural audit only. This does not establish economic validity or authorize deployment.**','',
+             f'- Frozen V1 commit: `{SHA}`',f'- Evidence run: `{F01_RUN}`',
+             '- Reconciled rostered + free agents: **540 + 1,607 = 2,147 unique Sleeper IDs**',
+             '- Complete side-by-side evidence coverage below; no player selection or manual price review',
+             f'- Frozen-repository candidate data files discovered: **{len(candidate_files):,}** (all hashed, unverified lineage)',
+             '- Price neutrality: **zero** mutations to FV, MV, anchors, voting, model code, or production',
+             '- Values/market/votes are stored ONLY in a separate legacy comparator CSV',
+             '', '## Evidence coverage', '',
+             '| Pos | All | Rostered | Identity | Age | Sleeper projection | FP candidate | Week5 role | No V1 FV |',
+             '|---|---:|---:|---:|---:|---:|---:|---:|---:|'
+          ]
+          for pos in positions:
+              d=coverage[pos]
+              md.append('| '+ ' | '.join([pos,str(d['universe']),str(d['rostered']),str(d['identity_complete']),str(d['age_present']),str(d['sleeper_projection_direct']),str(d['fp_projection_candidate']),str(d['week5_role_direct']),str(d['v1_fv_missing'])])+' |')
+          md.extend(['','## Interpretation', '',
+             '- Sleeper 2026 projection is a direct-SID candidate forecast, **not a future realized outcome**.',
+             '- FantasyPros is a strict name/position/team **candidate** only; confirm authoritative identity before modeling.',
+             '- Week-5 role is a derived feature, not independent target data.',
+             '- Source dates and weekly historical outcomes are not certified for temporal backtesting in this workflow.',
+             '- MV and FV+Votes are legacy FV-informed, not independent benchmarks.',
+             '- Data gaps are reported rather than filled by fallback estimates.',
+             '', '## Available source inventory (tracked files)', ''])
+          for x in catalog:
+              md.append('- `'+x['path']+'` — '+('present' if x['exists'] else '**MISSING**')+'; '+x['semantics'])
+          md.extend(['','## Stop conditions before scoring or promotion','',
+             '1. Certify independent observed weekly production with chronological timestamps and position-scoring rules.',
+             '2. Resolve unverified crosswalks and placeholder/missing identities without manual valuation edits.',
+             '3. Split development, validation, and true holdouts before trying model weights.',
+             '4. Document replacement population, league scoring, and fantasy starter demand.',
+             '5. Use comparison file for after-the-fact divergence analysis only, never as a training label.',
+             '', '**Next:** A-V2S03 independent scoring and replacement methodology (shadow development only).',
+          ])
+          (O/'A-V2U02-Report.md').write_text('\n'.join(md)+'\n')
+          print(json.dumps({'status':dataset['status'],'coverage':coverage},indent=2))
+          PY_AUDIT
+          python3 "$RUNNER_TEMP/v2u02.py"
+      - name: Publish full coverage and identity gap reports (read only)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A-V2U02-R1-Population-Evidence-Audit
+          path: v2-audit/
+          if-no-files-found: warn
+          retention-days: 90
