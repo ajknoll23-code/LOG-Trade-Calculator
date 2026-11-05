@@ -2,12 +2,12 @@
 
 ## Status
 
-**EARLY_DIAGNOSTIC_ONLY**
+**CALIBRATION_REVIEW_ELIGIBLE_NOT_DEPLOYMENT**
 
 - Production files mutated: **0**
 - Deployment authorized: **No**
 - Frozen candidate matrix: **120 V2 variants + deployed control**
-- Completed consecutive weeks: **7**
+- Completed consecutive weeks: **8**
 
 ## Frozen protocol
 
@@ -27,9 +27,9 @@
 
 ## Completed outcome state
 
-- Outcome refresh: `2026-10-28T13:35:11.820755Z`
-- Completed weeks recognized: **[1, 2, 3, 4, 5, 6, 7]**
-- Consecutive prefix used: **[1, 2, 3, 4, 5, 6, 7]**
+- Outcome refresh: `2026-11-05T18:32:49.022314Z`
+- Completed weeks recognized: **[1, 2, 3, 4, 5, 6, 7, 8]**
+- Consecutive prefix used: **[1, 2, 3, 4, 5, 6, 7, 8]**
 
 ## weeks_1_to_4
 
@@ -51,12 +51,56 @@ Phase-8 monitoring reference rank: **62 / 121**
 | 9 | `fp_0.25__history_0.25__documented__floor_0.20` | 25% | 25% | documented | 0.20 | 0.646352 | 0.040841 | 0.737455 |
 | 10 | `fp_0.75__history_0.25__evidence_hybrid__floor_0.05` | 75% | 25% | evidence_hybrid | 0.05 | 0.646153 | 0.040642 | 0.735714 |
 
+## weeks_5_to_8
+
+Weeks: **[5, 6, 7, 8]**  
+Active normal-candidate players: **460**  
+Deployed control rank: **93 / 121**  
+Phase-8 monitoring reference rank: **72 / 121**
+
+| Rank | Variant | FP wt | History wt | Ranks | Floor | Primary Spearman | Δ vs deployed | Pairwise |
+|---:|---|---:|---:|---|---:|---:|---:|---:|
+| 1 | `fp_0.75__history_0.25__documented__floor_0.15` | 75% | 25% | documented | 0.15 | 0.549937 | 0.029117 | 0.69592 |
+| 2 | `fp_0.75__history_0.25__documented__floor_0.20` | 75% | 25% | documented | 0.20 | 0.5496 | 0.02878 | 0.696679 |
+| 3 | `fp_1.00__history_0.25__documented__floor_0.20` | 100% | 25% | documented | 0.20 | 0.549193 | 0.028373 | 0.696339 |
+| 4 | `fp_1.00__history_0.25__documented__floor_0.15` | 100% | 25% | documented | 0.15 | 0.548735 | 0.027915 | 0.6954 |
+| 5 | `fp_0.75__history_0.25__evidence_hybrid__floor_0.15` | 75% | 25% | evidence_hybrid | 0.15 | 0.548718 | 0.027898 | 0.695611 |
+| 6 | `fp_0.75__history_0.25__documented__floor_0.05` | 75% | 25% | documented | 0.05 | 0.548702 | 0.027882 | 0.694389 |
+| 7 | `fp_0.25__history_0.25__documented__floor_0.20` | 25% | 25% | documented | 0.20 | 0.548387 | 0.027567 | 0.696403 |
+| 8 | `fp_0.75__history_0.25__documented__floor_0.10` | 75% | 25% | documented | 0.10 | 0.548225 | 0.027405 | 0.694461 |
+| 9 | `fp_0.50__history_0.25__documented__floor_0.20` | 50% | 25% | documented | 0.20 | 0.548169 | 0.027349 | 0.696234 |
+| 10 | `fp_1.00__history_0.25__documented__floor_0.05` | 100% | 25% | documented | 0.05 | 0.548018 | 0.027198 | 0.693999 |
+
+## weeks_1_to_8
+
+Weeks: **[1, 2, 3, 4, 5, 6, 7, 8]**  
+Active normal-candidate players: **493**  
+Deployed control rank: **97 / 121**  
+Phase-8 monitoring reference rank: **65 / 121**
+
+| Rank | Variant | FP wt | History wt | Ranks | Floor | Primary Spearman | Δ vs deployed | Pairwise |
+|---:|---|---:|---:|---|---:|---:|---:|---:|
+| 1 | `fp_0.25__history_0.25__documented__floor_0.20` | 25% | 25% | documented | 0.20 | 0.644522 | 0.037782 | 0.73739 |
+| 2 | `fp_0.75__history_0.25__documented__floor_0.20` | 75% | 25% | documented | 0.20 | 0.643918 | 0.037178 | 0.736747 |
+| 3 | `fp_0.75__history_0.25__evidence_hybrid__floor_0.15` | 75% | 25% | evidence_hybrid | 0.15 | 0.643849 | 0.037109 | 0.735763 |
+| 4 | `fp_0.00__history_0.25__documented__floor_0.20` | 0% | 25% | documented | 0.20 | 0.643476 | 0.036736 | 0.737051 |
+| 5 | `fp_0.75__history_0.25__documented__floor_0.15` | 75% | 25% | documented | 0.15 | 0.643465 | 0.036725 | 0.7354 |
+| 6 | `fp_0.50__history_0.25__documented__floor_0.20` | 50% | 25% | documented | 0.20 | 0.643243 | 0.036503 | 0.736679 |
+| 7 | `fp_0.75__history_0.25__evidence_hybrid__floor_0.20` | 75% | 25% | evidence_hybrid | 0.20 | 0.643012 | 0.036272 | 0.73679 |
+| 8 | `fp_0.00__history_0.25__documented__floor_0.15` | 0% | 25% | documented | 0.15 | 0.6429 | 0.03616 | 0.734681 |
+| 9 | `fp_0.25__history_0.25__documented__floor_0.15` | 25% | 25% | documented | 0.15 | 0.642781 | 0.036041 | 0.735109 |
+| 10 | `fp_0.00__history_0.25__documented__floor_0.10` | 0% | 25% | documented | 0.10 | 0.64212 | 0.03538 | 0.733744 |
+
 ## Stability
 
-Requires at least 8 completed consecutive weeks.
+- Weeks 1–4 top: `fp_0.75__history_0.25__evidence_hybrid__floor_0.15`
+- Weeks 5–8 top: `fp_0.75__history_0.25__documented__floor_0.15`
+- Weeks 1–8 top: `fp_0.25__history_0.25__documented__floor_0.20`
+- Exact top stable across independent 4-week windows: **False**
+- Top-10 overlap between Weeks 1–4 and 5–8: **2 / 10**
 
 ## Interpretation
 
-The first 4-week diagnostic is available. It is intentionally too early to select provider/history/rank/floor settings.
+Phase 9 has enough evidence for calibration review. Compare the first and second four-week windows, cumulative results, position guardrails, and paired bootstrap before shortlisting settings.
 
 Phase 9 never deploys a coefficient automatically. Any eventual winner must survive independent-window stability, position guardrails, bootstrap uncertainty, and comparison against the frozen deployed model before Phase 10.

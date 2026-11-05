@@ -1,7 +1,7 @@
 # Replacement Level / Positional Scale V2 — Phase 5 Prospective Evaluator
 
 Method: `replacement-level-v2-phase5-prospective-v1`  
-Status: **`EARLY_DIAGNOSTIC_ONLY`**
+Status: **`CALIBRATION_REVIEW_ELIGIBLE`**
 
 ## Guardrail
 
@@ -10,10 +10,10 @@ Status: **`EARLY_DIAGNOSTIC_ONLY`**
 - Frozen candidate SHA256: `ab24d5d1a1483ada04c6ce44154dc58bba6b1ba16c520fbeaf71e199851297e6`
 - Frozen at: **2026-09-05T22:16:28.841347Z**
 - First eligible future week: **1**
-- Completed consecutive weeks used: **[1, 2, 3, 4, 5, 6, 7]**
+- Completed consecutive weeks used: **[1, 2, 3, 4, 5, 6, 7, 8]**
 - Full frozen candidate universe: **518**
 - Primary real-history cohort: **426**
-- Primary players with an active game: **408**
+- Primary players with an active game: **411**
 
 ## Frozen replacement-rank families
 
@@ -34,22 +34,22 @@ The future replacement point is derived from the realized future data itself via
 
 | Family | Pos-balanced MAE | Pos-balanced RMSE | Pooled MAE | Δ MAE vs control | Positions available |
 |---|---:|---:|---:|---:|---:|
-| `legacy_control` | 0.3780 | 0.4681 | 0.3564 | — | 7 |
-| `prior_limited_evidence` | 0.3608 | 0.4489 | 0.3363 | -0.0172 | 7 |
-| `stable_positions_only` | 0.3525 | 0.4390 | 0.3263 | -0.0255 | 7 |
-| `full_phase2_leaders` | 0.3376 | 0.4256 | 0.3144 | -0.0404 | 7 |
+| `legacy_control` | 0.3495 | 0.4384 | 0.3374 | — | 7 |
+| `prior_limited_evidence` | 0.3322 | 0.4163 | 0.3165 | -0.0173 | 7 |
+| `stable_positions_only` | 0.3233 | 0.4057 | 0.3057 | -0.0262 | 7 |
+| `full_phase2_leaders` | 0.3098 | 0.3942 | 0.2951 | -0.0397 | 7 |
 
 ## Future-only replacement structure
 
 | Pos | Future split rank | Replacement player | Active PPG at split |
 |---|---:|---|---:|
-| QB | 35 | jj mccarthy | 9.2333 |
-| RB | 20 | aaron jones | 15.3833 |
-| WR | 28 | stefon diggs | 11.4800 |
-| TE | 20 | mason taylor | 6.5400 |
-| DL | 15 | boye mafe | 10.9167 |
-| LB | 34 | jeremy chinn | 12.5714 |
-| DB | 31 | malaki starks | 9.0714 |
+| QB | 32 | tanner mckee | 10.4400 |
+| RB | 19 | breece hall | 16.5667 |
+| WR | 19 | luther burden | 12.4625 |
+| TE | 19 | kyle pitts | 6.9312 |
+| DL | 18 | mason graham | 10.6250 |
+| LB | 29 | kaden elliss | 12.6875 |
+| DB | 31 | chamarri conner | 8.8750 |
 
 ## Secondary availability-inclusive metric
 
@@ -57,10 +57,10 @@ The same candidate-independent future-relative-production test using cumulative 
 
 | Family | Pos-balanced MAE | Δ MAE vs control | Pooled MAE |
 |---|---:|---:|---:|
-| `legacy_control` | 0.3632 | — | 0.3648 |
-| `prior_limited_evidence` | 0.3482 | -0.0150 | 0.3460 |
-| `stable_positions_only` | 0.3402 | -0.0231 | 0.3361 |
-| `full_phase2_leaders` | 0.3334 | -0.0299 | 0.3303 |
+| `legacy_control` | 0.3881 | — | 0.3852 |
+| `prior_limited_evidence` | 0.3708 | -0.0172 | 0.3635 |
+| `stable_positions_only` | 0.3615 | -0.0266 | 0.3520 |
+| `full_phase2_leaders` | 0.3526 | -0.0355 | 0.3447 |
 
 ## Readiness ladder
 
