@@ -1,0 +1,262 @@
+name: A-RG05 - One-Time Sleeper Sync Kicker Exception
+run-name: A-RG05 ${{ inputs.mode }} - roster 7 temporary missing K, strict 17-slot rule preserved
+
+'on':
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'PREVIEW_ONLY validates without committing; APPLY commits approved current data only'
+        required: true
+        type: choice
+        default: PREVIEW_ONLY
+        options:
+          - PREVIEW_ONLY
+          - APPLY
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  one_time_sync:
+    name: Strictly scoped Sleeper sync; postpone lineup artifact only for roster 7 missing K
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check out latest main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Confirm temporary window and snapshot protected files
+        shell: bash
+        run: |
+          set -euo pipefail
+          # This is a one-time recovery tool, not a new permanent acceptance policy.
+          test "$(date -u +%s)" -lt "$(date -u -d '2026-11-08T00:00:00Z' +%s)" || {
+            echo '::error::Temporary kicker exception expired. Use normal Sleeper Maintenance after roster is complete.'
+            exit 1
+          }
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          git rev-parse HEAD > "$RUNNER_TEMP/rg05_base_sha.txt"
+          sha256sum index.html free-agent-board.html \
+            scripts/validation/repo_regression_checks.py \
+            scripts/validation/snapshot_values.py \
+            scripts/projections/build_team_utility_lineup_projections.py \
+            .github/workflows/sync-sleeper.yml \
+            > "$RUNNER_TEMP/rg05_protected.sha"
+          echo 'PASS: immutable pricing and lineup validation files protected.'
+
+      - name: Run existing sync and lineup builder self-tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/sync/sync_sleeper.py --selftest
+          python3 scripts/utilities/generate_player_positions.py --selftest
+          python3 scripts/projections/build_team_utility_lineup_projections.py --selftest
+
+      - name: Download live Sleeper roster and regenerate canonical position map in runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/sync/sync_sleeper.py
+          python3 scripts/utilities/generate_player_positions.py
+
+      - name: Prove only Jersey Bagels roster 7 lacks a K, otherwise run normally
+        id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from collections import Counter
+          from pathlib import Path
+          import json, os, sys
+          sys.path.insert(0, 'scripts/projections')
+          import build_team_utility_lineup_projections as b
+
+          rosters = json.loads(Path('data/league_rosters.json').read_text(encoding='utf-8'))
+          config = json.loads(Path('config.json').read_text(encoding='utf-8'))
+          positions = json.loads(Path('scripts/artifacts/generated/player_positions.json').read_text(encoding='utf-8'))
+          assert str(rosters['league_id']) == str(config['league_id']), 'Wrong live league; no bypass permitted'
+          teams = rosters['rosters']
+          assert len(teams) == 12 and len({t['roster_id'] for t in teams}) == 12, 'Expected 12 unique teams'
+          assert b.EXPECTED_STARTERS == 17, '17-starter league contract changed'
+          requirements = [(pos, n) for pos, n in b.DEDICATED] + [(label, n) for label, _, n in b.FLEXES]
+          exceptions = []
+          report = []
+          for team in teams:
+              active = []
+              for slot in ('starters', 'bench'):
+                  for raw in team.get(slot, []) or []:
+                      sid = str(raw.get('player_id') or '')
+                      pos = b.roster_position(raw, positions)
+                      if sid and pos:
+                          active.append(b.RosterPlayer(sleeper_id=sid, name=str(raw.get('name') or sid), pos=pos, projection=0.0))
+              selected, _ = b.optimize_projection_lineup(active)
+              counts = Counter(label for label, _ in selected)
+              missing = {label: n - counts[label] for label, n in requirements if counts[label] != n}
+              row = {'roster_id': team['roster_id'], 'team_name': team.get('team_name'),
+                     'filled': len(selected), 'missing': missing, 'active_k_count': sum(p.pos == 'K' for p in active)}
+              report.append(row)
+              print(f"Roster {row['roster_id']} {row['team_name']}: {row['filled']}/17 missing={missing}")
+              if missing:
+                  exceptions.append(row)
+          if not exceptions:
+              mode = 'FULL'
+              print('All 12 legal lineups are complete: run the normal Team Utility builder.')
+          elif (len(exceptions) == 1 and exceptions[0]['roster_id'] == 7
+                and str(exceptions[0]['team_name'] or '').strip().lower() == 'jersey bagels'
+                and exceptions[0]['filled'] == 16 and exceptions[0]['missing'] == {'K': 1}
+                and exceptions[0]['active_k_count'] == 0):
+              mode = 'DEFER_LINEUP'
+              print('AUTHORIZED TEMPORARY EXCEPTION: Jersey Bagels roster 7 has no kicker.')
+              print('Team Utility lineup projections will NOT be rebuilt or marked valid. No lineup rule is changed.')
+          else:
+              raise RuntimeError(f'Unexpected roster insufficiency; fail closed: {exceptions}')
+          Path(os.environ['RUNNER_TEMP'], 'rg05_lineup_diagnosis.json').write_text(
+              json.dumps({'mode': mode, 'expected_starters':17, 'teams':report}, indent=2) + '\n', encoding='utf-8')
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as f:
+              f.write(f'lineup_mode={mode}\n')
+          PY
+
+      - name: Build normal projection artifact if all teams now have complete lineups
+        if: steps.gate.outputs.lineup_mode == 'FULL'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/projections/build_team_utility_lineup_projections.py --write
+          python3 scripts/projections/build_team_utility_lineup_projections.py --check
+
+      - name: Confirm deferred lineup artifact remains byte-identical
+        if: steps.gate.outputs.lineup_mode == 'DEFER_LINEUP'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code -- \
+            scripts/artifacts/generated/team_utility_lineup_projections.json \
+            scripts/artifacts/reports/team_utility_lineup_projection_report.md
+          echo '::warning::Team Utility lineup projections intentionally remain on their prior snapshot. Do NOT treat them as refreshed.'
+
+      - name: Continue original maintenance after lineup checkpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/sync/sync_trade_history.py
+          python3 - <<'PY'
+          import sys
+          sys.path.insert(0, 'scripts')
+          from maintenance.refresh_repo_derived_state import FREE_AGENTS, expected_artifacts
+          expected = expected_artifacts()[FREE_AGENTS]
+          if FREE_AGENTS.read_bytes() != expected:
+              FREE_AGENTS.write_bytes(expected)
+              print('Reconciled data/free_agents.json to canonical roster/player pool')
+          assert FREE_AGENTS.read_bytes() == expected
+          PY
+
+      - name: Check protected content, derived parity, and exact allowed output paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum --check "$RUNNER_TEMP/rg05_protected.sha"
+          python3 scripts/sync/sync_free_agent_valuation.py --check
+          python3 scripts/validation/validate_free_agent_valuation_parity.py
+          git diff --check
+          python3 - <<'PY'
+          import os, subprocess
+          allowed = {
+            'data/free_agents.json', 'data/league_rosters.json', 'data/my_roster.json',
+            'data/draft_picks.json', 'data/last_synced.json', 'data/players_cache.json',
+            'data/trade_history.json', 'scripts/artifacts/generated/player_positions.json',
+          }
+          if os.environ['LINEUP_MODE'] == 'FULL':
+              allowed |= {
+                'scripts/artifacts/generated/team_utility_lineup_projections.json',
+                'scripts/artifacts/reports/team_utility_lineup_projection_report.md',
+              }
+          result = subprocess.run(['git','status','--porcelain=v1','--untracked-files=all'],
+                                  check=True, capture_output=True, text=True)
+          modified = [line[3:] for line in result.stdout.splitlines()]
+          extra = set(modified) - allowed
+          assert not extra, f'Unexpected file modifications: {sorted(extra)}'
+          assert not any(' -> ' in p for p in modified), 'Unexpected rename'
+          print('PASS: only approved Sleeper data/position artifacts changed:', modified)
+          PY
+        env:
+          LINEUP_MODE: ${{ steps.gate.outputs.lineup_mode }}
+
+      - name: Document read-only preview and explicitly deferred validations
+        shell: bash
+        run: |
+          {
+            echo '## A-RG05 one-time Sleeper maintenance exception'
+            echo '- Scope: exactly roster 7 Jersey Bagels, missing dedicated kicker, if applicable'
+            echo '- 17-starter validation rule: UNCHANGED'
+            echo "- Actual lineup mode: $LINEUP_MODE"
+            echo '- Frozen V1 and live valuation code: BYTE IDENTICAL'
+            echo '- Sleeper roster + draft picks + trade history + free-agent cache: REFRESHED IN RUNNER'
+            if [ "$LINEUP_MODE" = 'DEFER_LINEUP' ]; then
+              echo '- Team Utility projection artifact: DEFERRED, NOT refreshed or certified'
+              echo '- Free Agent Utility ranks: may become stale when free_agents.json synced_at advances; run its existing refresh after APPLY'
+            else
+              echo '- Team Utility projection artifact: normal write and validation completed'
+            fi
+            echo "- Selected action: $REPAIR_MODE"
+            if [ "$REPAIR_MODE" = 'PREVIEW_ONLY' ]; then
+              echo '- No commit will be made.'
+            else
+              echo '- APPLY commits only the approved data and generated positions/artifacts.'
+            fi
+            echo '- Expiration: 2026-11-08 00:00 UTC; this workflow is manual-only.'
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          LINEUP_MODE: ${{ steps.gate.outputs.lineup_mode }}
+          REPAIR_MODE: ${{ inputs.mode }}
+
+      - name: APPLY one-time data-only commit
+        if: inputs.mode == 'APPLY'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$(cat "$RUNNER_TEMP/rg05_base_sha.txt")"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          # Only the exact audited output set can exist at this stage.
+          # Stage the data directory as a whole to handle optional my_roster.json.
+          git add -- data/ scripts/artifacts/generated/player_positions.json
+          if [ "$LINEUP_MODE" = 'FULL' ]; then
+            git add -- scripts/artifacts/generated/team_utility_lineup_projections.json \
+              scripts/artifacts/reports/team_utility_lineup_projection_report.md
+          fi
+          if git diff --cached --quiet; then
+            echo 'No data changes to commit.'
+            exit 0
+          fi
+          git diff --cached --name-only
+          git commit -m "A-RG05: one-time Sleeper data sync (roster 7 K gap tracked; Team Utility deferred if missing)"
+          git push origin HEAD:main
+        env:
+          LINEUP_MODE: ${{ steps.gate.outputs.lineup_mode }}
+
+      - name: Upload lineup diagnosis and protected fingerprints
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A-RG05-one-time-sleeper-${{ inputs.mode }}-${{ github.run_id }}
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/rg05_lineup_diagnosis.json
+            ${{ runner.temp }}/rg05_protected.sha
+            ${{ runner.temp }}/rg05_base_sha.txt
