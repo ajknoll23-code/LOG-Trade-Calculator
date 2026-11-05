@@ -1,0 +1,350 @@
+name: A-NL15R1 - LOG War Room Editorial PDF Shadow (Read Only)
+run-name: A-NL15R1 Week ${{ inputs.target_week }} - LOG branded shadow PDF, no private scouting
+
+'on':
+  workflow_dispatch:
+    inputs:
+      target_week:
+        description: "NFL pregame week 1-18; auto uses current Sleeper week"
+        required: true
+        type: string
+        default: 'auto'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: log-newsletter-shadow-readonly
+  cancel-in-progress: false
+
+jobs:
+  shadow-pdf:
+    name: Generate evidence-backed branded PDF, no publishing
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check out main read-only
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned HTML-to-PDF renderer
+        run: python3 -m pip install --disable-pip-version-check --no-cache-dir 'weasyprint==68.0'
+      - name: Stage independent pregame editorial renderer outside repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/log_pregame_shadow.py" <<'PY'
+          #!/usr/bin/env python3
+          """LOG newsletter pregame PDF shadow: read-only NFL matchup evidence, no private boards.
+          
+          No free-agent data, no injury guessing, no archival picks, no email, no repo writes.
+          """
+          from __future__ import annotations
+          import argparse
+          import base64
+          import hashlib
+          from html import escape
+          import json
+          import math
+          import os
+          from pathlib import Path
+          import re
+          import statistics
+          import time
+          from datetime import datetime, timezone
+          from urllib.request import Request, urlopen
+          from zoneinfo import ZoneInfo
+          
+          ROOT=Path(os.environ.get('GITHUB_WORKSPACE', Path(__file__).resolve().parents[2]))
+          API='https://api.sleeper.app/v1'
+          AZ=ZoneInfo('America/Phoenix')
+          SEASON=2026
+          LEAGUE_ID='1326679131051532288'
+          
+          def h(v): return escape(str(v),quote=True)
+          
+          def get(path):
+              endpoint=f'{API}/{path}'
+              for trial in range(3):
+                  try:
+                      with urlopen(Request(endpoint,headers={'User-Agent':'LOG-newsletter-PDF-shadow/1.0'}),timeout=25) as response:
+                          return json.load(response)
+                  except Exception:
+                      if trial==2: raise
+                      time.sleep(1+trial)
+          
+          def points(r):
+              n=r.get('custom_points')
+              if n is None: n=r.get('points')
+              if n is None: return None
+              n=float(n)
+              if not math.isfinite(n) or n<0: raise ValueError('Invalid score in matchup source')
+              return n
+          
+          def pairing(rows, required_ids=None):
+              if not isinstance(rows,list) or len(rows)!=12: raise RuntimeError('Not exactly 12 matchup rows')
+              games={}
+              for r in rows:
+                  k=r.get('matchup_id')
+                  if k is None: raise RuntimeError('Missing matchup ID')
+                  games.setdefault(str(k),[]).append(r)
+              if len(games)!=6 or any(len(v)!=2 for v in games.values()): raise RuntimeError('Expected 6 complete pairings')
+              ids=[int(r['roster_id']) for g in games.values() for r in g]
+              if len(set(ids))!=12: raise RuntimeError('Duplicate roster')
+              if required_ids is not None and set(ids)!=set(required_ids): raise RuntimeError('Current roster mapping mismatch')
+              return sorted([sorted(g,key=lambda r:int(r['roster_id'])) for g in games.values()],key=lambda g:int(g[0]['matchup_id']))
+          
+          def team_names(rosters, users):
+              m={str(u['user_id']):u for u in users}
+              out={}
+              for r in rosters:
+                  u=m.get(str(r['owner_id']),{})
+                  name=(u.get('metadata') or {}).get('team_name') or u.get('display_name') or f"Team {r['roster_id']}"
+                  out[int(r['roster_id'])]=str(name).strip()
+              if len(out)!=12 or len(set(out.values()))!=12: raise RuntimeError('Could not resolve all team identities')
+              return out
+          
+          def get_history(target,ids,fetcher):
+              history={i:[] for i in ids}
+              against={i:[] for i in ids}
+              for week in range(1,target):
+                  groups=pairing(fetcher(f'league/{LEAGUE_ID}/matchups/{week}'),ids)
+                  for a,b in groups:
+                      pa,pb=points(a),points(b)
+                      if pa is None or pb is None: raise RuntimeError(f'Incomplete historical week {week}; no invented data')
+                      ia,ib=int(a['roster_id']),int(b['roster_id'])
+                      history[ia].append(pa);history[ib].append(pb)
+                      against[ia].append(pb);against[ib].append(pa)
+              return history,against
+          
+          def safe_mean(x): return statistics.mean(x) if x else None
+          
+          def recent(x,n): return sum(x[-n:]) if len(x)>=n else None
+          
+          def predicted(a,b):
+              """Explicitly uncalibrated, no claims of sportsbook probability."""
+              if len(a)<6 or len(b)<6: return None,None
+              ma,mb=statistics.mean(a[-6:]),statistics.mean(b[-6:])
+              sa=max(20,statistics.stdev(a[-6:]));sb=max(20,statistics.stdev(b[-6:]))
+              z=(ma-mb)/math.sqrt(sa*sa+sb*sb)
+              chance=max(.15,min(.85,.5*(1+math.erf(z/math.sqrt(2)))))
+              if abs(chance-.5)<.05: return None,None
+              preferred=0 if chance>.5 else 1
+              pct=max(chance,1-chance)
+              stars=1 if pct<.60 else 2 if pct<.65 else 3 if pct<.70 else 4 if pct<.75 else 5
+              return preferred,stars
+          
+          def logo_from_site(path):
+              text=path.read_text(encoding='utf-8')
+              m=re.search(r'<img\s+src="(data:image/png;base64,[^"]+)"[^>]*class="league-logo"',text,re.I)
+              if not m: raise RuntimeError('Original LOG logo not found; refusing to replace with an imitation')
+              uri=m.group(1)
+              raw=base64.b64decode(uri.split(',',1)[1],validate=True)
+              if not raw.startswith(b'\x89PNG\r\n\x1a\n'): raise RuntimeError('LOG logo is not a PNG')
+              return uri,hashlib.sha256(raw).hexdigest()
+          
+          def rank_snapshot(rosters, names, hist, against):
+              # Not official rank: clearly labeled provisional wins + PF sort, no guessed tie-breaker.
+              out=[]
+              for r in rosters:
+                  rid=int(r['roster_id']);settings=r.get('settings') or {}
+                  w=settings.get('wins');l=settings.get('losses');t=settings.get('ties') or 0
+                  if not isinstance(w,(int,float)) or not isinstance(l,(int,float)):
+                      continue
+                  out.append({'id':rid,'name':names[rid],'wins':w,'losses':l,'ties':t,
+                              'pf':round(sum(hist[rid]),2),'pa':round(sum(against[rid]),2)})
+              if len(out)!=12: raise RuntimeError('Incomplete standings source')
+              out.sort(key=lambda r:(-r['wins'],-r['pf'],r['id']))
+              return out
+          
+          def assemble(target,fetcher=get):
+              state=fetcher('state/nfl')
+              if str(state.get('season'))!=str(SEASON): raise RuntimeError('Current Sleeper season differs from requested data')
+              if target>int(state['week']): raise RuntimeError('Cannot project a future unposted league matchup slate')
+              league=fetcher(f'league/{LEAGUE_ID}')
+              if str(league.get('season'))!=str(SEASON): raise RuntimeError('League season mismatch')
+              rosters=fetcher(f'league/{LEAGUE_ID}/rosters');users=fetcher(f'league/{LEAGUE_ID}/users')
+              names=team_names(rosters,users)
+              ids=set(names)
+              games=pairing(fetcher(f'league/{LEAGUE_ID}/matchups/{target}'),ids)
+              pf,pa=get_history(target,ids,fetcher)
+              standing=rank_snapshot(rosters,names,pf,pa)
+              by_id={int(r['roster_id']):r for r in rosters}
+              data=[]
+              for a,b in games:
+                  ia,ib=int(a['roster_id']),int(b['roster_id'])
+                  pa3,pb3=recent(pf[ia],3),recent(pf[ib],3)
+                  aa3,ab3=recent(pa[ia],3),recent(pa[ib],3)
+                  pick,stars=predicted(pf[ia],pf[ib])
+                  candidate=[ia,ib][pick] if pick is not None else None
+                  data.append({'a':ia,'b':ib,'name_a':names[ia],'name_b':names[ib],
+                      'record_a':str(by_id[ia]['settings'].get('wins','?'))+'-'+str(by_id[ia]['settings'].get('losses','?')),
+                      'record_b':str(by_id[ib]['settings'].get('wins','?'))+'-'+str(by_id[ib]['settings'].get('losses','?')),
+                      'last3_pf_a':round(pa3,2) if pa3 is not None else None,
+                      'last3_pf_b':round(pb3,2) if pb3 is not None else None,
+                      'last3_pa_a':round(aa3,2) if aa3 is not None else None,
+                      'last3_pa_b':round(ab3,2) if ab3 is not None else None,
+                      'last3_pf_gap':round(abs(pa3-pb3),2) if pa3 is not None and pb3 is not None else None,
+                      'pick':names[candidate] if candidate else None,'stars':stars,'pick_status':'ESTIMATE_TOSS_UP' if candidate is None else 'ESTIMATE',
+                      'injury_source':'data not provided','byes':'data not provided'})
+              worst=None
+              for rid in ids:
+                  v=pf[rid]
+                  if len(v)<6: continue
+                  before=sum(v[-6:-3]);after=sum(v[-3:]);drop=before-after
+                  if worst is None or drop>worst['decline']:
+                      worst={'name':names[rid],'before':round(before,2),'after':round(after,2),'decline':round(drop,2)}
+              return {'season':SEASON,'league':str(league.get('name') or 'League of Ordinary Gentlemen'),
+                      'league_id':LEAGUE_ID,'edition':'pre','week':target,'games':data,
+                      'standings_sort':'PROVISIONAL_BY_WINS_THEN_POINTS_FOR__OFFICIAL_TIEBREAK_UNVERIFIED',
+                      'standing':standing,'pressure_cooker':worst,
+                      'receipts':'No archived LOG newsletter picks yet. Archive record begins with first immutable published picks.',
+                      'injury_status':'data not provided (dated official reports not connected)',
+                      'source':'Public Sleeper league API; no private player boards',
+                      'generated_at_utc':datetime.now(timezone.utc).isoformat(),
+                      'publication_authorized':False,'picks_archived':False,
+                      'privacy_contract':'NO_FREE_AGENT_RANKINGS_OR_AVAILABLE_PLAYER_RECOMMENDATIONS'}
+          
+          def fmt(v): return f'{v:,.1f}' if isinstance(v,(int,float)) else 'data not provided'
+          
+          def render_html(d,logo_uri):
+              best=max((g for g in d['games'] if g['last3_pf_gap'] is not None),key=lambda g:g['last3_pf_gap'],default=None)
+              if best:
+                  heavy=best['name_a'] if best['last3_pf_a']>best['last3_pf_b'] else best['name_b']
+                  light=best['name_b'] if heavy==best['name_a'] else best['name_a']
+                  lead=f"{h(heavy)} outscored {h(light)} by <b>{best['last3_pf_gap']:,.1f} points</b> across Weeks {d['week']-3}–{d['week']-1}. That's not a prediction—it's the scoreboard filing a complaint."
+              else: lead='Not enough verified prior scoring for a numerical roast. Data not provided.'
+              match=[]
+              for i,g in enumerate(d['games'],1):
+                  if g['pick']:
+                      line=f"<strong>Estimated pick:</strong> {h(g['pick'])} <span class='stars'>{'★'*g['stars']}{'☆'*(5-g['stars'])}</span> <small>Uncalibrated scoring-form model; not betting odds.</small>"
+                  else: line="<strong>Estimated pick:</strong> Toss-up — no confidence stars awarded."
+                  diff=g['last3_pf_gap']; gap=f"{diff:,.1f}" if diff is not None else 'data not provided'
+                  roast=f"{h(g['name_a'])} and {h(g['name_b'])} are separated by <b>{gap} points</b> of three-week scoring. Someone can frame that as momentum; the other can call it exhibit A."
+                  match.append(f"<section class='game'><div class='num'>MATCHUP {i:02d}</div><h3>{h(g['name_a'])} <span>vs</span> {h(g['name_b'])}</h3><div class='stats'>"
+                    f"<div><label>RECORD</label><b>{h(g['record_a'])} / {h(g['record_b'])}</b></div>"
+                    f"<div><label>LAST 3 PF</label><b>{fmt(g['last3_pf_a'])} / {fmt(g['last3_pf_b'])}</b></div>"
+                    f"<div><label>LAST 3 PA</label><b>{fmt(g['last3_pa_a'])} / {fmt(g['last3_pa_b'])}</b></div></div>"
+                    f"<p class='pick'>{line}</p><p>{roast}</p><p class='micro'>Byes and dated injuries: data not provided.</p></section>")
+              top=d['standing'][:3];bottom=d['standing'][-3:]
+              def standrow(r):return f"<li><b>{h(r['name'])}</b> — {r['wins']}-{r['losses']} · {r['pf']:,.1f} PF</li>"
+              pressure=d.get('pressure_cooker')
+              cooker=(f"<b>{h(pressure['name'])}</b> slid from <b>{pressure['before']:,.1f}</b> to <b>{pressure['after']:,.1f}</b> points in two consecutive three-week blocks: a <b>{pressure['decline']:,.1f}-point</b> decline. The panic button has a receipt."
+                 if pressure and pressure['decline']>0 else 'No verified six-week scoring decline. Data not provided.')
+              return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><title>LOG | The Weekly War Room | Week {d['week']}</title><style>
+          @page{{size:letter;margin:13mm 12mm 13mm 12mm;@bottom-right{{content:'LOG • SHADOW DRAFT  ·  ' counter(page);font-size:9px;color:#a1b6c8}}}}
+          *{{box-sizing:border-box}} html,body{{margin:0;background:#0E2841;color:#F8FAFC;font:11px/1.5 Arial,sans-serif;-webkit-print-color-adjust:exact;print-color-adjust:exact}}
+          body{{background:#0E2841}} .cover{{background:#16324F;border:1px solid #294a6b;border-radius:9px;padding:18px 21px;display:flex;align-items:center;gap:18px;page-break-inside:avoid}}
+          .cover img{{width:80px;height:auto;object-fit:contain;flex:none}}.cover h1{{font:bold 29px/1.05 Arial,sans-serif;letter-spacing:1px;text-transform:uppercase;margin:6px 0;color:#F8FAFC}}
+          .eyebrow,.num,label,.stamp{{font:bold 9px/1.3 Arial,sans-serif;letter-spacing:1.5px;text-transform:uppercase;color:#EB6261}}.sub{{color:#B5C4D6;font-size:11px}}
+          .stamp{{display:inline-block;border:1px solid #EB6261;border-radius:20px;padding:4px 9px;margin:10px 0;color:#EB6261}}.intro{{background:#1E3E60;border-left:4px solid #EB6261;border-radius:5px;padding:12px 15px;font-size:12px}}
+          .h2{{margin:21px 0 9px;border-bottom:1px solid #355474;padding-bottom:6px;font-size:15px;text-transform:uppercase;letter-spacing:.7px}}.grid{{display:grid;grid-template-columns:1fr 1fr;gap:10px}}
+          .game{{background:#16324F;border:1px solid #33516e;border-radius:7px;padding:11px 13px;break-inside:avoid;page-break-inside:avoid}}.game h3{{font-size:12px;line-height:1.25;margin:7px 0 10px}}.game h3 span{{color:#EB6261;font-size:9px;margin:0 3px}}
+          .stats{{display:grid;grid-template-columns:1fr 1fr 1fr;gap:7px;border-top:1px solid #36516b;border-bottom:1px solid #36516b;padding:7px 0}}.stats b{{font-size:10px;color:#F8FAFC;display:block;margin-top:4px}}
+          .stats label{{font-size:7px;letter-spacing:.7px;color:#B5C4D6}}.pick{{color:#d9f8e5}}.stars{{color:#3FCB7C;letter-spacing:1px;font-size:13px}}small,.micro{{font-size:8px;color:#B5C4D6}}
+          .two{{display:grid;grid-template-columns:1fr 1fr;gap:11px}}.panel{{background:#16324F;border:1px solid #33516e;padding:12px 14px;border-radius:7px;break-inside:avoid}}.panel h3{{color:#EB6261;text-transform:uppercase;font-size:11px;letter-spacing:.7px;margin:0 0 6px}}
+          .panel ul{{margin:6px 0;padding-left:16px}}li{{margin:4px 0}}.foot{{font-size:9px;color:#B5C4D6;margin-top:17px;border-top:1px solid #33516e;padding-top:7px}}.pagebreak{{break-before:page}}
+          </style></head><body><header class="cover"><img src="{logo_uri}" alt="Exact LOG Calculator site logo"/><div><div class="eyebrow">League of Ordinary Gentlemen · {d['season']} · Week {d['week']}</div><h1>The Weekly<br/>War Room</h1><div class="sub">Pregame Edition · Verified facts, uncalibrated estimates, justified trash talk</div></div></header>
+          <div class="stamp">SHADOW PREVIEW · NO PICKS ARCHIVED</div><p class="intro">{lead}</p><h2 class="h2">01 / Six Matchups, Six Judgments</h2><div class="grid">{''.join(match)}</div>
+          <h2 class="h2">02 / Standings Snapshot</h2><div class="two"><div class="panel"><h3>Front of the pack (provisional)</h3><ul>{''.join(standrow(x) for x in top)}</ul></div><div class="panel"><h3>The cellar (provisional)</h3><ul>{''.join(standrow(x) for x in bottom)}</ul></div></div><p class="micro">Provisional wins-then-PF order. Official Sleeper tiebreak rank not verified; standings movement not claimed.</p>
+          <h2 class="h2">03 / Most Likely to Panic + The Pressure Cooker</h2><div class="panel"><p>{cooker}</p></div>
+          <h2 class="h2">04 / Lineup Landmines</h2><p>Dated official injury and bye evidence: <b>data not provided</b>. We do not guess who is questionable, out, or unavailable.</p>
+          <h2 class="h2">05 / The Receipts</h2><p>{h(d['receipts'])} No unarchived or fabricated predictions are graded.</p>
+          <p class="foot">Public Sleeper league API · {h(d['generated_at_utc'])}. All estimates are explicitly uncalibrated. No private free-agent, ownership-target, or waiver ranking information was read or published. This draft is not an authorized Week {d['week']} pre-kickoff publication.</p></body></html>'''
+          
+          def selftest():
+              assert predicted([100]*6,[100]*6)==(None,None)
+              assert len(pairing([{'roster_id':i,'matchup_id':(i+1)//2} for i in range(1,13)]))==6
+              assert recent([1,2,3,4,5],3)==12
+              try:pairing([{'roster_id':i,'matchup_id':(i+1)//2} for i in range(1,12)])
+              except RuntimeError:pass
+              else:raise AssertionError('Malformed matchup was accepted')
+              print('SELFTEST PASS')
+          
+          def main():
+              p=argparse.ArgumentParser()
+              p.add_argument('--week',default='auto')
+              p.add_argument('--out',default='out/log-newsletter-preview')
+              p.add_argument('--selftest',action='store_true')
+              args=p.parse_args()
+              if args.selftest: selftest();return
+              target=int(get('state/nfl')['week']) if args.week=='auto' else int(args.week)
+              if not 1<=target<=18: raise RuntimeError('Invalid week')
+              d=assemble(target)
+              uri,logohash=logo_from_site(ROOT/'index.html')
+              d['official_logo_png_sha256']=logohash
+              html=render_html(d,uri)
+              out=Path(args.out);out.mkdir(parents=True,exist_ok=True)
+              base=out/f'LOG-{SEASON}-W{target:02d}-WEEKLY-WAR-ROOM-SHADOW'
+              base.with_suffix('.html').write_text(html,encoding='utf-8')
+              base.with_suffix('.json').write_text(json.dumps(d,indent=2,ensure_ascii=False)+'\n',encoding='utf-8')
+              from weasyprint import HTML
+              HTML(string=html,base_url=str(ROOT)).write_pdf(base.with_suffix('.pdf'))
+              data=base.with_suffix('.pdf').read_bytes()
+              if not data.startswith(b'%PDF-') or len(data)<15000:raise RuntimeError('PDF invalid or suspiciously short')
+              assert len(d['games'])==6 and len(set([g[x] for g in d['games'] for x in ['a','b']]))==12
+              assert 'Unrostered' not in html and 'Add of the Week' not in html
+              print(f'PASS 12 teams 6 matchups | private scouting excluded | official logo sha256={logohash} | PDF={base.with_suffix(".pdf")} ({len(data)} bytes)')
+          
+          if __name__=='__main__':main()
+          PY
+          python3 -m py_compile "$RUNNER_TEMP/log_pregame_shadow.py"
+          python3 "$RUNNER_TEMP/log_pregame_shadow.py" --selftest
+      - name: Render six live Week matchups to LOG-branded shadow PDF
+        shell: bash
+        env:
+          WEEK: ${{ inputs.target_week }}
+        run: |
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/log_pregame_shadow.py" --week "$WEEK" --out "$RUNNER_TEMP/log-pregame-pdf"
+          python3 - <<'PY'
+          import json,os,pathlib
+          p=pathlib.Path(os.environ['RUNNER_TEMP'])/'log-pregame-pdf'
+          docs=list(p.glob('*.json'))
+          assert len(docs)==1, docs
+          d=json.loads(docs[0].read_text(encoding='utf-8'))
+          assert d['picks_archived'] is False and d['publication_authorized'] is False
+          assert len(d['games'])==6
+          assert len(set([g[k] for g in d['games'] for k in ('a','b')]))==12
+          assert 'free_agents' not in d and 'waiver_board' not in d
+          assert len(list(p.glob('*.pdf')))==1
+          pdf=list(p.glob('*.pdf'))[0]
+          assert pdf.stat().st_size > 15000
+          print(f'PASS: validated genuine PDF ({pdf.stat().st_size} bytes) / 6 games / zero private recommendations / no picks archived')
+          PY
+      - name: Verify git tree remains unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain --untracked-files=all)"
+          echo 'PASS: repository and all frozen model files unchanged'
+      - name: Upload independent LOG-branded shadow PDF and evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LOG-War-Room-Shadow-PDF-${{ github.run_id }}
+          path: ${{ runner.temp }}/log-pregame-pdf/
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Explain status
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## LOG Weekly War Room — Shadow PDF'
+            echo '- Read-only and not authorized for distribution'
+            echo '- Official LOG site logo and navy/coral visual style'
+            echo '- Six matchups, recent 3 PF/PA, six-week estimate minimum'
+            echo '- No injury guesses; unverified official rank marked provisional'
+            echo '- No free agent recommendations, no private board access'
+            echo '- No emailed newsletter and no predictions archive committed'
+            echo '- PDF available as Actions artifact when render step passed'
+            echo '- This is the pregame shadow only, not the final Tuesday recap implementation'
+          } >> "$GITHUB_STEP_SUMMARY"
