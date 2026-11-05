@@ -196,39 +196,12 @@ def local_player_lookup():
             for x in r.get(section, []):
                 if isinstance(x, dict) and x.get("player_id"):
                     byid[str(x["player_id"])] = x
-    free = read_repo_json("data/free_agents.json", {}) or {}
-    for p in free.get("free_agents", []):
-        byid[str(p["player_id"])] = p
     return byid
 
 
 def best_free_agents(rosters, lookup):
-    """Only players actually unrostered in live Sleeper league; local rank is editorial."""
-    occupied = set()
-    for r in rosters:
-        occupied.update(str(x) for x in (r.get("players") or []))
-    ranking = read_repo_json("data/free_agent_utility_v1.json", {}) or {}
-    pool = read_repo_json("data/free_agents.json", {}) or {}
-    source = ranking.get("source") or {}
-    # Never publish a stale local utility against a newer canonical free-agent pool.
-    if (source.get("league_id") != pool.get("league_id")
-            or source.get("free_agents_synced_at") != pool.get("synced_at")
-            or source.get("free_agents_count") != pool.get("count")):
-        return []
-    entries = sorted(ranking.get("players", []), key=lambda p: (int(p.get("priority_rank") or 999), p.get("pos", "")))
-    found, perpos = [], defaultdict(int)
-    for ent in entries:
-        pid, pos = str(ent.get("player_id")), str(ent.get("pos") or "?")
-        p = lookup.get(pid)
-        if pid in occupied or not p or not p.get("name") or p.get("status") not in (None, "Active"):
-            continue
-        if perpos[pos] >= 2:
-            continue
-        if len(found) >= 8:
-            break
-        perpos[pos] += 1
-        found.append({"name": p["name"], "pos": pos, "team": p.get("team") or "FA", "rank": ent.get("priority_rank")})
-    return found
+    """Retained for old unit-test compatibility. Never read or publish private FA data."""
+    return []
 
 
 def transactions(api, lid, week, lookup, names):
@@ -351,7 +324,7 @@ def build_payload(api, config, edition, week_override=None):
     lookup = local_player_lookup()
     studs, benches = players_of_week(rows, lookup) if edition == "post" else ([], [])
     return {"edition": edition, "week": week, "season": season, "league": league.get("name") or "League of Ordinary Gentlemen",
-            "games": outgames, "median": median, "names": names, "free_agents": best_free_agents(rosters, lookup),
+            "games": outgames, "median": median, "names": names,
             "transactions": transactions(api, lid, week, lookup, names), "studs": studs, "benches": benches,
             "data_asof": datetime.now(PHOENIX).strftime("%B %-d, %Y %I:%M %p MST"), "league_id": lid}
 
@@ -393,8 +366,6 @@ def render_html(payload):
         side += "<section><h2>Bench Fireworks</h2><p class='fine'>High-scoring reserves; not an assertion that a legal lineup swap was available.</p><ul>" + list_rows([f"{p['name']} ({payload['names'].get(p['roster_id'])}): {p['points']:.2f} bench points" for p in payload["benches"]]) + "</ul></section>"
     if payload["transactions"]:
         side += "<section><h2>Trade & Waiver Wire</h2><ul>" + list_rows([x["description"] for x in payload["transactions"][:6]]) + "</ul></section>"
-    if payload["free_agents"]:
-        side += "<section><h2>Unrostered Players to Investigate</h2><p class='fine'>League roster availability checked live. Rankings from the repo's existing free-agent utility, not independently projected weekly points.</p><ul>" + list_rows([f"{x['name']} · {x['pos']}, {x['team']} · board #{x['rank']}" for x in payload["free_agents"]]) + "</ul></section>"
     caveat = "Projections are transparent, historical-score form estimates, not betting odds, sportsbook lines, or proprietary player FVs." if preview else "Scores are from Sleeper. No assertion about optimized lineups is made without reliable eligibility analysis."
     return f"""<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
     <title>{e(payload['league'])} | {heading} | Week {payload['week']}</title><style>
@@ -415,7 +386,7 @@ def render_html(payload):
     <h1>{heading}</h1><p>2026 Week {payload['week']} · {e(subtitle)}</p><p>{e(payload['league'])}</p></header><main>
     <section class='feature'><p>{'Every team faces an opponent and the league median this week, so two wins are possible.' if preview else 'Final head-to-head results and league-median results are shown separately for all 12 teams.'}</p></section>
     <h2>All Six Matchups</h2>{allgames}{side}</main><footer>Data checked: {e(payload['data_asof'])}. {e(caveat)}
-    <p>Editorial coverage only. Independent of the frozen legacy dynasty valuation engine. This email is not affiliated with Sleeper. To stop receiving this newsletter, reply to the sender and request removal.</p></footer></div></body></html>"""
+    <p>Editorial coverage only. Independent of the frozen legacy dynasty valuation engine. This independent newsletter is not affiliated with Sleeper.</p></footer></div></body></html>"""
 
 
 def render_text(payload):
@@ -431,10 +402,10 @@ def render_text(payload):
         lines.extend([f"All-time H2H: {g['series_a']}-{g['series_b']}; {g['last']}", ""])
     if payload["median"] is not None:
         lines.append(f"League median: {payload['median']:.2f}")
-    for title, entries in (("Weekly MVPs", [f"{p['name']} {p['points']:.2f}" for p in payload['studs']]), ("Recent moves", [x['description'] for x in payload['transactions']]), ("Free agent watch", [f"{p['name']} ({p['pos']})" for p in payload['free_agents']])):
+    for title, entries in (("Weekly MVPs", [f"{p['name']} {p['points']:.2f}" for p in payload['studs']]), ("Recent moves", [x['description'] for x in payload['transactions']])):
         if entries:
             lines.extend(["", title.upper()] + ["- " + x for x in entries])
-    lines.append("\nSources: Sleeper league API + repository free-agent board. Generated " + payload["data_asof"])
+    lines.append("\nSources: Sleeper league API and completed league transactions. Generated " + payload["data_asof"])
     return "\n".join(lines) + "\n"
 
 
