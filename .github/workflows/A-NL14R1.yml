@@ -1,0 +1,174 @@
+name: A-NL14R1 - Private free-agent exclusion from newsletters
+run-name: A-NL14R1 ${{ inputs.mode }} - remove all available-player recommendations
+
+'on':
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'PREVIEW_ONLY proves redaction; APPLY_CONTENT_ONLY commits newsletter engine only'
+        type: choice
+        options: [PREVIEW_ONLY, APPLY_CONTENT_ONLY]
+        required: true
+        default: PREVIEW_ONLY
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  newsletter-privacy:
+    name: Verify private free-agent content never reaches newsletter artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Guard source version and record all protected paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain --untracked-files=all)"
+          test "$(git hash-object scripts/newsletters/league_newsletter.py)" = 0172698128296182d44617725dc09db641825eda
+          sha256sum index.html config.json data/free_agents.json data/free_agent_utility_v1.json \
+            scripts/validation/repo_regression_checks.py > "$RUNNER_TEMP/nl14_protected.sha"
+      - name: Patch newsletter source only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          def patch(src):
+              # SOURCE MUST MATCH THE KNOWN DEPLOYED ORIGINAL STRUCTURE; fail closed otherwise.
+              original = src
+              block = '''    free = read_repo_json("data/free_agents.json", {}) or {}
+              for p in free.get("free_agents", []):
+                  byid[str(p["player_id"])] = p
+          '''
+              assert src.count(block) == 1, 'Unable to locate exact free-agent player-cache lookup'
+              src = src.replace(block, '', 1)
+              pat = r'\ndef best_free_agents\(rosters, lookup\):.*?(?=\ndef transactions\()'
+              assert len(re.findall(pat, src, flags=re.S)) == 1, 'Expected one free-agent board function'
+              src = re.sub(pat, '\ndef best_free_agents(rosters, lookup):\n    """Retained for old unit-test compatibility. Never read or publish private FA data."""\n    return []\n\n', src, count=1, flags=re.S)
+              old = '"games": outgames, "median": median, "names": names, "free_agents": best_free_agents(rosters, lookup),'
+              new = '"games": outgames, "median": median, "names": names,'
+              assert src.count(old) == 1, 'payload free agent field not uniquely located'
+              src = src.replace(old, new, 1)
+              pat = r'    if payload\["free_agents"\]:\n        side \+= .*?\n'
+              assert len(re.findall(pat, src)) == 1, 'expected exactly one HTML recommendation section'
+              src = re.sub(pat, '', src, count=1)
+              old = '("Recent moves", [x[\'description\'] for x in payload[\'transactions\']]), ("Free agent watch", [f"{p[\'name\']} ({p[\'pos\']})" for p in payload[\'free_agents\']])'
+              new = '("Recent moves", [x[\'description\'] for x in payload[\'transactions\']])'
+              assert src.count(old) == 1, 'free-agent text section not uniquely found'
+              src = src.replace(old, new, 1)
+              old = 'Sources: Sleeper league API + repository free-agent board. Generated '
+              assert src.count(old) == 1
+              src = src.replace(old, 'Sources: Sleeper league API and completed league transactions. Generated ', 1)
+              old = "This email is not affiliated with Sleeper. To stop receiving this newsletter, reply to the sender and request removal."
+              assert src.count(old) == 1
+              src = src.replace(old, "This independent newsletter is not affiliated with Sleeper.", 1)
+              # It is okay to have the word "free_agent" for historical transaction types,
+              # but no file reads, output fields, or published recommendation labels.
+              for forbidden in ('data/free_agents.json', 'data/free_agent_utility_v1.json', 'payload["free_agents"]', "payload['free_agents']", '"free_agents":', 'Unrostered Players to Investigate', 'Free agent watch', 'Add of the Week'):
+                  assert forbidden not in src, f'Private recommendation data not fully excluded: {forbidden}'
+              assert src != original
+              return src
+
+
+          engine=Path('scripts/newsletters/league_newsletter.py')
+          engine.write_text(patch(engine.read_text(encoding='utf-8')),encoding='utf-8')
+          print('PRIVACY PATCH PASS: newsletter engine no longer reads or emits private available-player data')
+          PY
+      - name: Verify existing unit tests plus private-data exclusion for both editions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile scripts/newsletters/league_newsletter.py
+          python3 -m unittest discover -s tests/newsletters -p 'test_*.py' -v
+          python3 scripts/newsletters/league_newsletter.py --selftest
+          python3 - <<'PY'
+          import importlib.util
+          from pathlib import Path
+          p=Path('scripts/newsletters/league_newsletter.py')
+          s=p.read_text(encoding='utf-8')
+          for forbidden in ('data/free_agents.json', 'data/free_agent_utility_v1.json',
+                            'Unrostered Players to Investigate','Free agent watch',
+                            'payload["free_agents"]', "payload['free_agents']", '"free_agents":'):
+              assert forbidden not in s, forbidden
+          mod=importlib.util.spec_from_file_location('newsletter_privacy',str(p))
+          news=importlib.util.module_from_spec(mod)
+          mod.loader.exec_module(news)
+          # Import the repository's synthetic 12-team API fixture, which does not query the internet.
+          test_spec=importlib.util.spec_from_file_location('newsletter_test', 'tests/newsletters/test_newsletter.py')
+          test_mod=importlib.util.module_from_spec(test_spec)
+          test_spec.loader.exec_module(test_mod)
+          orig=news.read_repo_json
+          def private_guard(path, default=None):
+              if 'free_agent' in path.lower() or 'waiver' in path.lower():
+                  raise AssertionError('Private file read attempted: '+path)
+              if path == 'data/trade_history.json': return {'seasons': []}
+              return default
+          news.read_repo_json=private_guard
+          try:
+              for edition in ['pre','post']:
+                  payload=news.build_payload(test_mod.make_api(final=(edition=='post')),
+                                             {'league_id':'league26','season':'2026'},edition,9)
+                  assert not any('free_agent' in k.lower() or 'waiver' in k.lower() for k in payload), payload.keys()
+                  html=news.render_html(payload)
+                  plain=news.render_text(payload)
+                  import json
+                  dat=json.dumps(payload)
+                  for forbidden in ('Unrostered Players', 'Free agent watch', 'best available',
+                                    'Add of the Week', 'free_agents', 'priority_rank'):
+                      assert forbidden.lower() not in html.lower(), (edition,forbidden,'HTML')
+                      assert forbidden.lower() not in plain.lower(), (edition,forbidden,'TEXT')
+                      assert forbidden.lower() not in dat.lower(), (edition,forbidden,'JSON')
+                  assert len(payload['games'])==6
+                  print(f'PRIVACY PROOF PASS: {edition}, 6 games, no private input read or output emitted')
+          finally:
+              news.read_repo_json=orig
+          PY
+      - name: Verify protected files unchanged and exact one-file diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum --check "$RUNNER_TEMP/nl14_protected.sha"
+          test "$(git diff --name-only)" = 'scripts/newsletters/league_newsletter.py'
+          git diff --check
+          echo 'PASS: private free-agent board untouched; newsletter engine only'
+      - name: APPLY only the newsletter engine, not a workflow
+        if: ${{ inputs.mode == 'APPLY_CONTENT_ONLY' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum --check "$RUNNER_TEMP/nl14_protected.sha"
+          git add -- scripts/newsletters/league_newsletter.py
+          test "$(git diff --cached --name-only)" = 'scripts/newsletters/league_newsletter.py'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'A-NL14R1: keep private free agent research out of both newsletters'
+          git push origin HEAD:main
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## A-NL14R1 newsletter owner-only free-agent privacy'
+            echo '- Private available-player rankings, free-agent watch, waiver targets, and Add of the Week: prohibited'
+            echo '- All newsletter HTML, plain text, and JSON tested without free-agent data'
+            echo '- Completed historical transactions retained'
+            echo '- Private free-agent board untouched'
+            echo "- Mode: ${{ inputs.mode }}"
+            echo '- No email and no league publication by this workflow'
+          } >> "$GITHUB_STEP_SUMMARY"
