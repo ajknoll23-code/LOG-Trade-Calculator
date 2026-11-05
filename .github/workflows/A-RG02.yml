@@ -1,0 +1,211 @@
+name: A-RG02 - Shared Regression Checker QA21 Repair
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "PREVIEW_ONLY tests without committing; APPLY changes only the regression harness"
+        required: true
+        default: PREVIEW_ONLY
+        type: choice
+        options:
+          - PREVIEW_ONLY
+          - APPLY
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  qa21_harness_repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RG02_MODE: ${{ inputs.mode }}
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout exact main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install regression dependency
+        run: python3 -m pip install --disable-pip-version-check "requests>=2.32,<3"
+
+      - name: Stage exact QA21-only regression harness fix
+        shell: bash
+        run: |
+          python3 - <<'PY_RG02'
+          from pathlib import Path
+          import hashlib, json, re, subprocess
+
+          source = Path('scripts/validation/repo_regression_checks.py')
+          index = Path('index.html')
+          board = Path('free-agent-board.html')
+          expected = {'drew lock': 1104, 'sam howell': 1098, 'tyler huntley': 1250}
+
+          def sha(p):
+              return hashlib.sha256(p.read_bytes()).hexdigest()
+
+          # Preserve the exact production files, and verify both copies of the QA21 prices.
+          for f in (index, board):
+              code = f.read_text(encoding='utf-8')
+              match = re.search(r'const QA21_OWNER_APPROVED_QB_ROSTER_FV\s*=\s*\{(.*?)\}\s*;', code, re.S)
+              assert match, f'Missing deployed QA21 table in {f}'
+              found = {name: int(value) for name, value in re.findall(r"'([^']+)'\s*:\s*(\d+)", match.group(1))}
+              assert found == expected, f'QA21 production price drift in {f}: {found!r}'
+              assert "if(pos==='QB' && Object.prototype.hasOwnProperty.call(QA21_OWNER_APPROVED_QB_ROSTER_FV,qa21ApprovedKey))" in code, f'QA21 QB-only guard changed in {f}'
+              print(f'PASS: {f} QA21 contract unchanged (SHA256={sha(f)})')
+
+          original = source.read_text(encoding='utf-8')
+          const_marker = '        _extract_const_object(text, "CAL26_FV_OWNER_ANCHORS"),\n'
+          const_added = '''        # QA21 is part of the deployed playerValue() dependency graph.
+                  # Include the live constant; never invent substitute pricing in tests.
+                  _extract_const_object(text, "QA21_OWNER_APPROVED_QB_ROSTER_FV"),
+          '''
+          assert original.count(const_marker) == 1, 'Unexpected test harness constants layout'
+          if const_added.strip() in original:
+              print('NOTE: QA21 extraction already present; validating existing repair')
+              patched = original
+          else:
+              patched = original.replace(const_marker, const_marker + const_added, 1)
+
+          js_marker = 'const __rows = {};\nfor (const [key, info] of Object.entries(PLAYER_DB)) {'
+          qa21_assertions = '''// QA21 prices affect three approved QBs, including players outside the
+          // current 565-player PLAYER_DB. Verify the live function directly.
+          const __qa21Expected = {
+            'drew lock': 1104,
+            'sam howell': 1098,
+            'tyler huntley': 1250,
+          };
+          if (Object.keys(QA21_OWNER_APPROVED_QB_ROSTER_FV).length !== Object.keys(__qa21Expected).length) {
+            throw Error('QA21 approved QB price set drift');
+          }
+          for (const [key, expected] of Object.entries(__qa21Expected)) {
+            if (QA21_OWNER_APPROVED_QB_ROSTER_FV[key] !== expected) {
+              throw Error('QA21 approved QB price changed: ' + key);
+            }
+            if (playerValue('QB', 27, 'Depth', key) !== expected) {
+              throw Error('QA21 approved QB override not active: ' + key);
+            }
+            if (playerValue('RB', 27, 'Depth', key) === expected) {
+              throw Error('QA21 QB override leaked to RB position: ' + key);
+            }
+          }
+
+          '''
+          assert patched.count(js_marker) == 1, 'Unexpected Node harness body layout'
+          if '__qa21Expected' in patched:
+              assert qa21_assertions.strip() in patched, 'Existing QA21 test differs; manual inspection required'
+              print('NOTE: QA21 runtime assertions already present')
+          else:
+              patched = patched.replace(js_marker, qa21_assertions + js_marker, 1)
+
+          assert original != patched or (const_added.strip() in original and qa21_assertions.strip() in original), 'Patch failed'
+          source.write_text(patched, encoding='utf-8')
+
+          # Only change the test harness; index, board, model code and frozen research stay unchanged.
+          diff = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          assert set(diff) <= {source.as_posix()}, f'Unexpected changes: {diff}'
+          assert patched.count('_extract_const_object(text, "QA21_OWNER_APPROVED_QB_ROSTER_FV")') == 1
+          assert patched.count('const __qa21Expected') == 1
+          print('PASS: staged QA21 harness-only repair; changed paths:', diff)
+          PY_RG02
+      - name: Test live JS owner prices and all 565 curated Python/JS values
+        shell: bash
+        run: |
+          python3 - <<'PY_RG02_TEST'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, str(Path('scripts/validation').resolve()))
+          import repo_regression_checks as regression
+          import snapshot_values
+
+          cfg = snapshot_values.load_from_html(regression.INDEX)
+          assert len(cfg['player_db']) == 565, f"Unexpected current PLAYER_DB size: {len(cfg['player_db'])}"
+          for name in ('drew lock', 'sam howell', 'tyler huntley'):
+              # These three approved QB roster prices do not belong to the curated PLAYER_DB.
+              # Their regressions must be checked by the JS guard, not by rewriting Python FV.
+              assert name not in cfg['player_db'], f'QA21 source scope changed: {name}'
+          regression.check_snapshot_parity()
+          print('PASS: shared 565-player JS/Python parity and direct QA21 owner controls')
+          PY_RG02_TEST
+      - name: Run full repository regression suite and report residual failures
+        shell: bash
+        run: |
+          set +e
+          python3 scripts/validation/repo_regression_checks.py > "$RUNNER_TEMP/rg02-full-suite.log" 2>&1
+          status=$?
+          set -e
+          printf 'Full repository suite status: %s\n' "$status"
+          tail -n 45 "$RUNNER_TEMP/rg02-full-suite.log"
+          if [ "$status" -ne 0 ]; then
+            echo "::warning::Full suite remains red. The QA21 harness test is a separate required gate; inspect the remaining failure before declaring the repository recovered."
+            echo 'FULL_SUITE_STATUS=RED' >> "$GITHUB_ENV"
+          else
+            echo 'FULL_SUITE_STATUS=GREEN' >> "$GITHUB_ENV"
+          fi
+      - name: Upload read-only diagnostic evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: A-RG02-QA21-Harness-Review-${{ github.run_id }}
+          path: |
+            scripts/validation/repo_regression_checks.py
+            ${{ runner.temp }}/rg02-full-suite.log
+          retention-days: 14
+
+      - name: Apply only after required tests pass and user selects APPLY
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RG02_MODE" != 'APPLY' ]; then
+            echo 'PREVIEW_ONLY: tested patch is not committed or pushed.'
+            exit 0
+          fi
+          if git diff --quiet -- scripts/validation/repo_regression_checks.py; then
+            echo 'QA21 regression harness already repaired; nothing to push.'
+            exit 0
+          fi
+          changed=$(git diff --name-only)
+          if [ "$changed" != 'scripts/validation/repo_regression_checks.py' ]; then
+            echo "::error::Unexpected modified files: $changed"
+            exit 1
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add scripts/validation/repo_regression_checks.py
+          git commit -m 'A-RG02: repair QA21 owner-price JS regression harness'
+          # This push is non-force and will reject intervening main changes.
+          git push origin HEAD:main
+      - name: Summarize result
+        if: always() && env.FULL_SUITE_STATUS != ''
+        shell: bash
+        run: |
+          {
+            echo '## A-RG02 shared regression checker repair'
+            echo "- Mode: $RG02_MODE"
+            echo '- Scope: scripts/validation/repo_regression_checks.py only'
+            echo '- Live index.html, free-agent-board.html, model data and frozen V1 unchanged'
+            echo '- Required QA21 contract and curated PLAYER_DB parity: PASS'
+            echo "- Full repository regression suite: $FULL_SUITE_STATUS"
+            if [ "$RG02_MODE" = 'APPLY' ]; then
+              echo '- APPLY requested: guarded git commit/push attempted (see Apply step)'
+            else
+              echo '- PREVIEW_ONLY: no repository write'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
