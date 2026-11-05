@@ -1,0 +1,186 @@
+name: A-RG09 - Archive Two Retired QA Workflows
+run-name: A-RG09 ${{ inputs.mode }} - preserve QA21 and QA22 evidence, stop invalid push runs
+
+'on':
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'PREVIEW_ONLY validates exact byte-identical archive; APPLY commits just two renames'
+        required: true
+        type: choice
+        default: PREVIEW_ONLY
+        options:
+          - PREVIEW_ONLY
+          - APPLY
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    name: Byte-preserving archival of retired QA21 and QA22 workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      REPAIR_MODE: ${{ inputs.mode }}
+    steps:
+      - name: Check out latest main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install validation dependency
+        run: python3 -m pip install --disable-pip-version-check 'requests>=2.32,<3'
+
+      - name: Pin historical workflows and unchanged calculator files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          test "$(git hash-object .github/workflows/A-QA21R1-Approved-3QB-Production-Release.yml)" = '22e3b958d1c9c25085a11fb56eafbf694aced220'
+          test "$(git hash-object .github/workflows/A-QA22R2-Six-Player-Value-Investigation.yml)" = 'b09e2c27327c5744de7eec50e0c6da5c1ebc671d'
+          git rev-parse HEAD > "$RUNNER_TEMP/rg09_initial_head.txt"
+          sha256sum \
+            index.html free-agent-board.html \
+            data/free_agents.json data/free_agent_utility_v1.json \
+            research/model-history/identity/2026-w06-sleeper-registry.json \
+            research/model-history/outcomes/2026.json \
+            scripts/validation/repo_regression_checks.py \
+            scripts/validation/snapshot_values.py \
+            scripts/validation/capture_realized_outcomes.py \
+            scripts/projections/build_team_utility_lineup_projections.py \
+            > "$RUNNER_TEMP/rg09_protected_before.sha"
+          echo 'PASS: historical workflow blobs and protected calculator files pinned.'
+
+      - name: Stage exactly two byte-identical moves outside the workflows directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .github/workflow-archive
+          git mv -- \
+            .github/workflows/A-QA21R1-Approved-3QB-Production-Release.yml \
+            .github/workflow-archive/A-QA21R1-Approved-3QB-Production-Release.yml
+          git mv -- \
+            .github/workflows/A-QA22R2-Six-Player-Value-Investigation.yml \
+            .github/workflow-archive/A-QA22R2-Six-Player-Value-Investigation.yml
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          expected = {
+              ('.github/workflows/A-QA21R1-Approved-3QB-Production-Release.yml',
+               '.github/workflow-archive/A-QA21R1-Approved-3QB-Production-Release.yml'),
+              ('.github/workflows/A-QA22R2-Six-Player-Value-Investigation.yml',
+               '.github/workflow-archive/A-QA22R2-Six-Player-Value-Investigation.yml'),
+          }
+          raw = subprocess.check_output([
+              'git', 'diff', '--cached', '--name-status', '-z', '--find-renames=100%'
+          ]).decode('utf-8')
+          fields = [field for field in raw.split('\0') if field]
+          actual = set()
+          i = 0
+          while i < len(fields):
+              status = fields[i]
+              assert status == 'R100', f'Unexpected change status: {status!r}'
+              actual.add((fields[i+1], fields[i+2]))
+              i += 3
+          assert actual == expected, f'Unexpected staged changes: {actual}'
+          for source, destination in expected:
+              assert not Path(source).exists(), f'Original workflow remains active: {source}'
+              archived = Path(destination)
+              assert archived.is_file(), destination
+              original = subprocess.check_output(['git', 'show', 'HEAD:' + source])
+              assert archived.read_bytes() == original, f'Archive changed content: {destination}'
+          unstaged = subprocess.check_output(['git', 'diff', '--name-only'], text=True)
+          assert not unstaged.strip(), f'Unexpected unstaged changes: {unstaged}'
+          print('PASS: exactly two R100 renames; original workflow bytes are unchanged.')
+          PY
+          git diff --cached --check
+
+      - name: Re-run unaffected safety checks without revalidating deferred Team Utility artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/validate_free_agent_utility_v1.py
+          python3 - <<'PY'
+          import sys
+          sys.path.insert(0, 'scripts/validation')
+          import repo_regression_checks as reg
+          checks = [
+              reg.check_snapshot_parity,
+              reg.check_position_rules_and_free_agents,
+              reg.check_dual_eligibility_audit,
+              reg.check_team_identity,
+              reg.check_aliases_and_ktc_positions,
+              reg.check_idp_v1_projection_invariants,
+              reg.check_canonical_history_and_v1_bridge,
+              reg.check_preferred_bake_preview_invariants,
+              reg.check_deployed_idp_v1_invariants,
+              reg.check_free_agent_board_parity,
+              reg.check_package_adjustment_live.validate,
+              reg.check_package_sampling_contract,
+              reg.check_index_js_syntax,
+          ]
+          for check in checks:
+              check()
+          assert len(checks) == 13
+          assert reg._check_cal22_current_successor()['status'] == 'PASS'
+          print('PASS: 13 unaffected regression groups, QA21 price protection, CAL22, Free Agent Utility.')
+          print('KNOWN DEFERRED: Team Utility projection freshness until roster 7 acquires a kicker.')
+          PY
+          sha256sum --check "$RUNNER_TEMP/rg09_protected_before.sha"
+          git diff --exit-code -- index.html free-agent-board.html data/ scripts/ research/
+
+      - name: Summary and immutable evidence
+        shell: bash
+        run: |
+          {
+            echo '## A-RG09 historical QA workflow archive'
+            echo "- Mode: $REPAIR_MODE"
+            echo '- Archived QA21R1 production release and QA22R2 investigation from .github/workflows to .github/workflow-archive.'
+            echo '- Content: BYTE IDENTICAL (two exact R100 renames).'
+            echo '- Git history and archived workflow source: PRESERVED.'
+            echo '- No new QB price deployment; no FV, FV+, MV, or frozen V1 changes.'
+            echo '- Other 13 regression groups, CAL22, QA21 price protection, Free Agent Utility: PASS.'
+            echo '- Team Utility projection freshness: intentionally deferred by prior one-time kicker exception.'
+            if [ "$REPAIR_MODE" = 'PREVIEW_ONLY' ]; then
+              echo '- Preview only: no commit or push.'
+            else
+              echo '- APPLY: only the two archived workflow renames committed.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          git diff --cached --name-status --find-renames=100% > "$RUNNER_TEMP/rg09_exact_moves.txt"
+
+      - name: APPLY only the two archived workflow renames
+        if: ${{ inputs.mode == 'APPLY' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$(cat "$RUNNER_TEMP/rg09_initial_head.txt")"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'A-RG09: archive obsolete QA21/QA22 workflows without changing historical source'
+          git push origin HEAD:main
+
+      - name: Upload audit evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A-RG09-exact-archive-${{ inputs.mode }}-${{ github.run_id }}
+          retention-days: 30
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/rg09_initial_head.txt
+            ${{ runner.temp }}/rg09_protected_before.sha
+            ${{ runner.temp }}/rg09_exact_moves.txt
