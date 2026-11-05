@@ -1,0 +1,850 @@
+name: A-NL18R2 - LOG War Room Mobile Reader PDF — Editorial Polish (Read Only)
+run-name: A-NL18R2 Week ${{ inputs.target_week }} - phone-first PDF with vetted editorial fixes and audit
+
+'on':
+  workflow_dispatch:
+    inputs:
+      target_week:
+        description: "NFL pregame week 1-18; auto uses current Sleeper week"
+        required: true
+        type: string
+        default: 'auto'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: log-newsletter-shadow-readonly
+  cancel-in-progress: false
+
+jobs:
+  shadow-pdf:
+    name: Generate evidence-backed branded PDF, no publishing
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check out main read-only
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned HTML-to-PDF renderer
+        run: python3 -m pip install --disable-pip-version-check --no-cache-dir 'weasyprint==68.0' 'pymupdf==1.26.7'
+      - name: Stage evidence-backed unique-storyline PDF renderer outside repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/log_pregame_shadow.py" <<'PY'
+          #!/usr/bin/env python3
+          """LOG newsletter pregame PDF shadow: read-only NFL matchup evidence, no private boards.
+
+          No free-agent data, no injury guessing, no archival picks, no email, no repo writes.
+          """
+          from __future__ import annotations
+          import argparse
+          from functools import lru_cache
+          from collections import defaultdict
+          import base64
+          import hashlib
+          from html import escape
+          import json
+          import math
+          import os
+          from pathlib import Path
+          import re
+          import statistics
+          import time
+          from datetime import datetime, timezone
+          from urllib.request import Request, urlopen
+          from zoneinfo import ZoneInfo
+
+          ROOT=Path(os.environ.get('GITHUB_WORKSPACE', Path(__file__).resolve().parents[2]))
+          API='https://api.sleeper.app/v1'
+          AZ=ZoneInfo('America/Phoenix')
+          SEASON=2026
+          LEAGUE_ID='1326679131051532288'
+
+          def h(v): return escape(str(v),quote=True)
+
+          def get(path):
+              endpoint=f'{API}/{path}'
+              for trial in range(3):
+                  try:
+                      with urlopen(Request(endpoint,headers={'User-Agent':'LOG-newsletter-PDF-shadow/1.0'}),timeout=25) as response:
+                          return json.load(response)
+                  except Exception:
+                      if trial==2: raise
+                      time.sleep(1+trial)
+
+          def points(r):
+              n=r.get('custom_points')
+              if n is None: n=r.get('points')
+              if n is None: return None
+              n=float(n)
+              if not math.isfinite(n) or n<0: raise ValueError('Invalid score in matchup source')
+              return n
+
+          def pairing(rows, required_ids=None):
+              if not isinstance(rows,list) or len(rows)!=12: raise RuntimeError('Not exactly 12 matchup rows')
+              games={}
+              for r in rows:
+                  k=r.get('matchup_id')
+                  if k is None: raise RuntimeError('Missing matchup ID')
+                  games.setdefault(str(k),[]).append(r)
+              if len(games)!=6 or any(len(v)!=2 for v in games.values()): raise RuntimeError('Expected 6 complete pairings')
+              ids=[int(r['roster_id']) for g in games.values() for r in g]
+              if len(set(ids))!=12: raise RuntimeError('Duplicate roster')
+              if required_ids is not None and set(ids)!=set(required_ids): raise RuntimeError('Current roster mapping mismatch')
+              return sorted([sorted(g,key=lambda r:int(r['roster_id'])) for g in games.values()],key=lambda g:int(g[0]['matchup_id']))
+
+          def team_names(rosters, users):
+              m={str(u['user_id']):u for u in users}
+              out={}
+              for r in rosters:
+                  u=m.get(str(r['owner_id']),{})
+                  name=(u.get('metadata') or {}).get('team_name') or u.get('display_name') or f"Team {r['roster_id']}"
+                  out[int(r['roster_id'])]=str(name).strip()
+              if len(out)!=12 or len(set(out.values()))!=12: raise RuntimeError('Could not resolve all team identities')
+              return out
+
+          def get_history(target,ids,fetcher):
+              history={i:[] for i in ids}
+              against={i:[] for i in ids}
+              meetings=defaultdict(list)
+              # Only historical STARTERS and their completed Sleeper scores; not private scouting.
+              starter_scores=defaultdict(lambda: defaultdict(list))
+              for week in range(1,target):
+                  groups=pairing(fetcher(f'league/{LEAGUE_ID}/matchups/{week}'),ids)
+                  if week>=target-3:
+                      for ga,gb in groups:
+                          for row in (ga,gb):
+                              rid=int(row['roster_id'])
+                              details=row.get('players_points') or {}
+                              for player_id in row.get('starters') or []:
+                                  pid=str(player_id)
+                                  raw=details.get(pid)
+                                  if isinstance(raw,(int,float)) and math.isfinite(raw):
+                                      starter_scores[rid][pid].append((week,round(float(raw),2)))
+                  for a,b in groups:
+                      pa,pb=points(a),points(b)
+                      if pa is None or pb is None: raise RuntimeError(f'Incomplete historical week {week}; no invented data')
+                      ia,ib=int(a['roster_id']),int(b['roster_id'])
+                      history[ia].append(pa);history[ib].append(pb)
+                      against[ia].append(pb);against[ib].append(pa)
+                      key=tuple(sorted((ia,ib)))
+                      meetings[key].append({'week':week,'points':{ia:pa,ib:pb}})
+              return history,against,meetings,starter_scores
+
+          def safe_mean(x): return statistics.mean(x) if x else None
+
+          def recent(x,n): return sum(x[-n:]) if len(x)>=n else None
+
+          def predicted(a,b):
+              """Explicitly uncalibrated, no claims of sportsbook probability."""
+              if len(a)<6 or len(b)<6: return None,None
+              ma,mb=statistics.mean(a[-6:]),statistics.mean(b[-6:])
+              sa=max(20,statistics.stdev(a[-6:]));sb=max(20,statistics.stdev(b[-6:]))
+              z=(ma-mb)/math.sqrt(sa*sa+sb*sb)
+              chance=max(.15,min(.85,.5*(1+math.erf(z/math.sqrt(2)))))
+              if abs(chance-.5)<.05: return None,None
+              preferred=0 if chance>.5 else 1
+              pct=max(chance,1-chance)
+              stars=1 if pct<.60 else 2 if pct<.65 else 3 if pct<.70 else 4 if pct<.75 else 5
+              return preferred,stars
+
+          def logo_from_site(path):
+              text=path.read_text(encoding='utf-8')
+              m=re.search(r'<img\s+src="(data:image/png;base64,[^"]+)"[^>]*class="league-logo"',text,re.I)
+              if not m: raise RuntimeError('Original LOG logo not found; refusing to replace with an imitation')
+              uri=m.group(1)
+              raw=base64.b64decode(uri.split(',',1)[1],validate=True)
+              if not raw.startswith(b'\x89PNG\r\n\x1a\n'): raise RuntimeError('LOG logo is not a PNG')
+              return uri,hashlib.sha256(raw).hexdigest()
+
+          def rank_snapshot(rosters, names, hist, against):
+              # Not official rank: clearly labeled provisional wins + PF sort, no guessed tie-breaker.
+              out=[]
+              for r in rosters:
+                  rid=int(r['roster_id']);settings=r.get('settings') or {}
+                  w=settings.get('wins');l=settings.get('losses');t=settings.get('ties') or 0
+                  if not isinstance(w,(int,float)) or not isinstance(l,(int,float)):
+                      continue
+                  out.append({'id':rid,'name':names[rid],'wins':w,'losses':l,'ties':t,
+                              'pf':round(sum(hist[rid]),2),'pa':round(sum(against[rid]),2)})
+              if len(out)!=12: raise RuntimeError('Incomplete standings source')
+              out.sort(key=lambda r:(-r['wins'],-r['pf'],r['id']))
+              return out
+
+          def assemble(target,fetcher=get):
+              state=fetcher('state/nfl')
+              if str(state.get('season'))!=str(SEASON): raise RuntimeError('Current Sleeper season differs from requested data')
+              if target>int(state['week']): raise RuntimeError('Cannot project a future unposted league matchup slate')
+              league=fetcher(f'league/{LEAGUE_ID}')
+              if str(league.get('season'))!=str(SEASON): raise RuntimeError('League season mismatch')
+              rosters=fetcher(f'league/{LEAGUE_ID}/rosters');users=fetcher(f'league/{LEAGUE_ID}/users')
+              names=team_names(rosters,users)
+              ids=set(names)
+              games=pairing(fetcher(f'league/{LEAGUE_ID}/matchups/{target}'),ids)
+              pf,pa,meetings,starter_scores=get_history(target,ids,fetcher)
+              standing=rank_snapshot(rosters,names,pf,pa)
+              by_id={int(r['roster_id']):r for r in rosters}
+              rank={r['id']:i+1 for i,r in enumerate(standing)}
+              player_names={}
+              roster_cache_synced_at=None
+              roster_cache=ROOT/'data/league_rosters.json'
+              if roster_cache.exists():
+                  try:
+                      raw=json.loads(roster_cache.read_text(encoding='utf-8'))
+                      if str(raw.get('league_id'))==LEAGUE_ID:
+                          if isinstance(raw.get('synced_at'), (int,float)):
+                              roster_cache_synced_at=datetime.fromtimestamp(raw['synced_at'],timezone.utc).isoformat()
+                          for entry in raw.get('rosters') or []:
+                              for group in ('starters','bench','taxi','reserve_ir'):
+                                  for item in entry.get(group) or []:
+                                      if isinstance(item,dict) and item.get('player_id') and item.get('name'):
+                                          player_names[str(item['player_id'])]={'name':str(item['name']),
+                                              'position':str(item.get('position') or '')}
+                  except (ValueError,OSError):
+                      player_names={}  # optional names; never invent identities
+
+              def leaders(rid):
+                  items=[]
+                  for pid,scores in starter_scores[rid].items():
+                      p=player_names.get(pid)
+                      if not p or len(scores)<2:continue
+                      total=sum(pts for _,pts in scores)
+                      items.append({'player_id':pid,'name':p['name'],'position':p['position'],
+                                    'total':round(total,2),'starts':len(scores)})
+                  items.sort(key=lambda x:(-x['total'],-x['starts'],x['name']))
+                  return items[:2]
+
+              recent_rank={i:place+1 for place,(i,_) in enumerate(sorted(
+                  ((i,sum(pf[i][-3:])) for i in ids if len(pf[i])>=3),key=lambda x:(-x[1],x[0])))}
+              data=[]
+              for a,b in games:
+                  ia,ib=int(a['roster_id']),int(b['roster_id'])
+                  pa3,pb3=recent(pf[ia],3),recent(pf[ib],3)
+                  aa3,ab3=recent(pa[ia],3),recent(pa[ib],3)
+                  pick,stars=predicted(pf[ia],pf[ib])
+                  candidate=[ia,ib][pick] if pick is not None else None
+                  data.append({'a':ia,'b':ib,'name_a':names[ia],'name_b':names[ib],
+                      'record_a':str(by_id[ia]['settings'].get('wins','?'))+'-'+str(by_id[ia]['settings'].get('losses','?')),
+                      'record_b':str(by_id[ib]['settings'].get('wins','?'))+'-'+str(by_id[ib]['settings'].get('losses','?')),
+                      'last3_pf_a':round(pa3,2) if pa3 is not None else None,
+                      'last3_pf_b':round(pb3,2) if pb3 is not None else None,
+                      'last3_pa_a':round(aa3,2) if aa3 is not None else None,
+                      'last3_pa_b':round(ab3,2) if ab3 is not None else None,
+                      'last3_pf_gap':round(abs(pa3-pb3),2) if pa3 is not None and pb3 is not None else None,
+                      'pick':names[candidate] if candidate else None,'stars':stars,'pick_status':'ESTIMATE_TOSS_UP' if candidate is None else 'ESTIMATE',
+                      'injury_source':'data not provided','byes':'data not provided',
+                      'rank_a_provisional':rank[ia],'rank_b_provisional':rank[ib],
+                      'recent_scoring_rank_a':recent_rank.get(ia),'recent_scoring_rank_b':recent_rank.get(ib),
+                      'last3_weekly_a':[round(x,2) for x in pf[ia][-3:]],
+                      'last3_weekly_b':[round(x,2) for x in pf[ib][-3:]],
+                      'last_week_a':round(pf[ia][-1],2) if pf[ia] else None,
+                      'last_week_b':round(pf[ib][-1],2) if pf[ib] else None,
+                      'previous3_pf_a':round(sum(pf[ia][-6:-3]),2) if len(pf[ia])>=6 else None,
+                      'previous3_pf_b':round(sum(pf[ib][-6:-3]),2) if len(pf[ib])>=6 else None,
+                      'trend_change_a':round(sum(pf[ia][-3:])-sum(pf[ia][-6:-3]),2) if len(pf[ia])>=6 else None,
+                      'trend_change_b':round(sum(pf[ib][-3:])-sum(pf[ib][-6:-3]),2) if len(pf[ib])>=6 else None,
+                      'three_week_range_a':round(max(pf[ia][-3:])-min(pf[ia][-3:]),2) if len(pf[ia])>=3 else None,
+                      'three_week_range_b':round(max(pf[ib][-3:])-min(pf[ib][-3:]),2) if len(pf[ib])>=3 else None,
+                      'prior_meetings':[{'week':m['week'],'points_a':m['points'][ia],'points_b':m['points'][ib]}
+                                        for m in meetings.get(tuple(sorted((ia,ib))),[])],
+                      'key_starters_a':leaders(ia),'key_starters_b':leaders(ib)})
+              worst=None
+              for rid in ids:
+                  v=pf[rid]
+                  if len(v)<6: continue
+                  before=sum(v[-6:-3]);after=sum(v[-3:]);drop=before-after
+                  if worst is None or drop>worst['decline']:
+                      worst={'name':names[rid],'before':round(before,2),'after':round(after,2),'decline':round(drop,2)}
+              assign_storylines(data)
+              return {'season':SEASON,'league':str(league.get('name') or 'League of Ordinary Gentlemen'),
+                      'league_id':LEAGUE_ID,'edition':'pre','week':target,'games':data,
+                      'standings_sort':'PROVISIONAL_BY_WINS_THEN_POINTS_FOR__OFFICIAL_TIEBREAK_UNVERIFIED',
+                      'standing':standing,'pressure_cooker':worst,
+                      'receipts':'No archived LOG newsletter picks yet. Archive record begins with first immutable published picks.',
+                      'injury_status':'data not provided (dated official reports not connected)',
+                      'source':'Public Sleeper league API; no private player boards',
+          'name_cache_synced_at_utc':roster_cache_synced_at,
+                      'generated_at_utc':datetime.now(timezone.utc).isoformat(),
+                      'publication_authorized':False,'picks_archived':False,
+                      'privacy_contract':'NO_FREE_AGENT_RANKINGS_OR_AVAILABLE_PLAYER_RECOMMENDATIONS'}
+
+          def fmt(v): return f'{v:,.2f}' if isinstance(v,(int,float)) else 'data not provided'
+
+
+          def time_az(iso_time):
+              """A documented Arizona timezone rather than a machine UTC stamp."""
+              try:
+                  return datetime.fromisoformat(str(iso_time).replace('Z', '+00:00')).astimezone(AZ).strftime('%b %-d, %Y, %-I:%M %p Arizona time')
+              except (TypeError, ValueError):
+                  return 'data not provided'
+
+
+          def f1(value):
+              return f'{value:,.1f}'
+
+
+          def record_wins(g, side):
+              return int(g['record_'+side].split('-')[0])
+
+
+          def form_avg(g, side):
+              x=g.get('last3_pf_'+side)
+              return x/3 if x is not None else None
+
+
+          def candidates(g):
+              """Every title must have a verified numerical predicate; generic fallback last."""
+              a,b=g['name_a'],g['name_b']
+              ra,rb=g['rank_a_provisional'],g['rank_b_provisional']
+              gap=g.get('last3_pf_gap')
+              wins=abs(record_wins(g,'a')-record_wins(g,'b'))
+              out=[]
+              if ra<=3 and rb<=3: out.append(('contenders',130))
+              if min(ra,rb)==1: out.append(('leader_test',122))
+              if max(ra,rb)==12 and min(ra,rb)<10: out.append(('cellar',118))
+              if gap is not None and gap<=20 and wins>=3: out.append(('record_mirage',125))
+              if gap is not None and gap>=135: out.append(('mismatch',108))
+              trends=[g.get('trend_change_a'),g.get('trend_change_b')]
+              if any(v is not None and v<=-80 for v in trends): out.append(('slump',110))
+              if gap is not None and gap<=22: out.append(('knife_edge',95))
+              if any(v is not None and v>=90 for v in trends): out.append(('hot_streak',79))
+              if g.get('prior_meetings'): out.append(('rematch',88))
+              aa,bb=g.get('last3_pa_a'),g.get('last3_pa_b')
+              if aa is not None and bb is not None and abs(aa-bb)>60:out.append(('schedule_luck',66))
+              x,y=g.get('three_week_range_a'),g.get('three_week_range_b')
+              if x is not None and y is not None and max(x,y)>=30:out.append(('volatility',51))
+              if gap is not None:out.append(('scoring_edge',45))
+              out.append(('record_comparison',31))
+              out.append(('form_vs_fate',21))
+              out.append(('recent_week',17))
+              out.append(('opponent_scores',12))
+              return out
+
+
+          def assign_storylines(games):
+              """Globally select distinct, high-salience story angles; never write six clones."""
+              choices=[candidates(g) for g in games]
+              names=sorted({k for c in choices for k,_ in c})
+              bits={name:1<<i for i,name in enumerate(names)}
+
+              @lru_cache(None)
+              def solve(i,used):
+                  if i==len(games):return (0,())
+                  best=(-1,())
+                  for label,score in choices[i]:
+                      if used&bits[label]:continue
+                      rest,route=solve(i+1,used|bits[label])
+                      if score+rest>best[0]:best=(score+rest,(label,)+route)
+                  return best
+              total,route=solve(0,0)
+              if len(route)!=len(games) or len(set(route))!=len(games):
+                  raise RuntimeError('Unable to make six distinct matchup angles')
+              for g,label in zip(games,route):
+                  g['editorial_angle']=label
+                  title,insight,key,trash=write_story(g,label)
+                  if not all(x and x.strip() for x in (title,insight,key,trash)):
+                      raise RuntimeError('Empty angle copy')
+                  g['editorial_headline']=title
+                  g['editorial_insight']=insight
+                  g['editorial_swing_factor']=key
+                  g['editorial_trash_talk']=trash
+              return total
+
+
+          def write_story(g,angle):
+              """Data-backed writing, no unsupported player availability or opponent-as-defense claims."""
+              a,b=g['name_a'],g['name_b']
+              av,bv=form_avg(g,'a'),form_avg(g,'b')
+              if av is None or bv is None:
+                  return ('Not Enough Evidence','Three complete scoring weeks: data not provided.',
+                          'Scoring comparison: data not provided.',
+                          'Trash talk withheld because no numerical support was provided.')
+              heavy,light=(a,b) if av>=bv else (b,a)
+              high,low=max(av,bv),min(av,bv)
+              gap=high-low
+              wa,wb=record_wins(g,'a'),record_wins(g,'b')
+              ha,hb=g['last3_pf_a'],g['last3_pf_b']
+              trends=[(g.get('trend_change_a'),a,g.get('previous3_pf_a'),ha),
+                      (g.get('trend_change_b'),b,g.get('previous3_pf_b'),hb)]
+              falling=[t for t in trends if t[0] is not None]
+              sl=min(falling,key=lambda t:t[0]) if falling else None
+              rising=max(falling,key=lambda t:t[0]) if falling else None
+              greater_record=a if wa>=wb else b
+              weaker_record=b if wa>=wb else a
+              ranka,rankb=g['rank_a_provisional'],g['rank_b_provisional']
+              pairrank=sorted([(ranka,a),(rankb,b)])
+              recent=g.get('prior_meetings') or []
+              # Each angle carries different consequences and different numerical evidence.
+              if angle=='contenders':
+                  return ('HEAVYWEIGHT COLLISION',
+                          f'Provisional #{pairrank[0][0]} {pairrank[0][1]} meets #{pairrank[1][0]} {pairrank[1][1]}. Together these teams own {wa+wb} wins, but {heavy} has scored {gap:.1f} more per week across the last three games.',
+                          f'{light} needs to add {gap:.1f} points per week to match {heavy}\'s recent scoring pace; that is a comparison, not a forecast.',
+                          f'{wa+wb} combined wins buy a title-fight ticket. They do not buy the extra {gap:.1f} points a week.')
+              if angle=='leader_test':
+                  leader=a if ranka==1 else b
+                  challenger=b if leader==a else a
+                  lr=g['record_a'] if leader==a else g['record_b']
+                  lead_avg=av if leader==a else bv
+                  chall_avg=bv if leader==a else av
+                  return ('EVERYBODY WANTS THE TOP SEED',
+                          f'Provisional leader {leader} is {lr} and averaging {lead_avg:.1f} points per game over three weeks. {challenger} is at {chall_avg:.1f}. This is the weekly measuring stick, not a victory parade.',
+                          f'To match the leader\'s recent pace, {challenger} needs {max(0,lead_avg-chall_avg):.1f} more points per game than its own three-week average.',
+                          f'The provisional #1 team has a {lead_avg:.1f}-point weekly baseline. The opponent should probably bring more than its {chall_avg:.1f}.')
+              if angle=='cellar':
+                  last=a if ranka==12 else b
+                  other=b if last==a else a
+                  rec=g['record_a'] if last==a else g['record_b']
+                  vl=av if last==a else bv
+                  vo=bv if last==a else av
+                  return ('EMERGENCY BROADCAST FROM THE CELLAR',
+                          f'{last} sits provisional last at {rec}, averaging just {vl:.1f} points per game lately. {other} is at {vo:.1f}; the divide is {abs(vo-vl):.1f} points each week.',
+                          f'The last-place side needs {max(0,vo-vl):.1f} more points per game to reach {other}\'s recent scoring pace.',
+                          f'A {rec} record is difficult to defend when the scoring gap is {abs(vo-vl):.1f} points a game.')
+              if angle=='record_mirage':
+                  record_a=g['record_a'] if greater_record==a else g['record_b']
+                  record_b=g['record_b'] if greater_record==a else g['record_a']
+                  return ('THE RECORDS ARE LYING TO YOU',
+                          f'{greater_record} owns the stronger {record_a} record against {record_b}, but the last three weeks are separated by only {gap:.1f} points per game. The standings say mismatch; recent scoring says knife fight.',
+                          (f'The latest three-week scoring favors {heavy} by {gap:.1f} per game, while the longer six-week model favors {g["pick"]}. Those different windows explain the disagreement.' if g.get('pick') and g['pick']!=heavy else f'{heavy} holds a tiny {gap:.1f}-point weekly scoring edge, so this is not a runaway.'),
+                          f'A {wins_delta(wa,wb)}-win record gap looks huge until the actual scoring gap is {gap:.1f} a week.')
+              if angle=='mismatch':
+                  return ('THE SCOREBOARD NEEDS A MERCY RULE',
+                          f'{heavy} has banked {high*3:.1f} points in three weeks. {light} has {low*3:.1f}. That is a {gap:.1f}-point advantage every week, and no amount of confidence talk erases it.',
+                          f'{light} must improve by {gap:.1f} points per game to reach {heavy}\'s recent scoring average.',
+                          f'{light} is {gap:.1f} points per week off the pace. Even the excuse department has a scoring deficit.')
+              if angle=='slump' and sl:
+                  change,name,previous,current=sl
+                  counterpart=b if name==a else a
+                  other_avg=bv if name==a else av
+                  return ('SOMEBODY CHECK THE BRAKES',
+                          f'{name} has dropped {abs(change):.1f} points from its previous three-game block ({previous:.1f}) to its latest three ({current:.1f}). {counterpart} is averaging {other_avg:.1f} per game. That skid is the real storyline.',
+                          f'{name} must stop the {abs(change)/3:.1f}-point weekly decline versus its own previous three games to recover its earlier pace.',
+                          f'When a three-week block falls {abs(change):.1f} points, the panic button is no longer decorative.')
+              if angle=='knife_edge':
+                  return ('A SPREADSHEET KNIFE FIGHT',
+                          f'Three-week production: {a} {ha:.1f}, {b} {hb:.1f}. That is only {gap:.1f} points per week separating them; nobody has earned a victory speech.',
+                          f'The {gap:.1f}-point weekly gap is smaller than a typical scoring swing; neither recent scoring baseline establishes a decisive favorite.',
+                          f'Arguing over a {gap:.1f}-point weekly gap is a bold use of everyone\'s time.')
+              if angle=='hot_streak' and rising:
+                  change,name,previous,current=rising
+                  return ('THE HEAT CHECK',
+                          f'{name} added {change:.1f} points to its most recent three-game total compared with the preceding three ({previous:.1f} to {current:.1f}). {heavy} still owns the higher recent weekly pace at {high:.1f}.',
+                          f'The test is whether {name} can sustain that {change/3:.1f}-point-per-week scoring improvement.',
+                          f'A {change:.1f}-point three-week jump makes the bandwagon louder. Sunday decides whether it has wheels.')
+              if angle=='rematch' and recent:
+                  m=recent[-1]
+                  winner=a if m['points_a']>m['points_b'] else b if m['points_b']>m['points_a'] else 'neither team'
+                  return ('THE REMATCH RECEIPT',
+                          f'These teams already met in Week {m["week"]}: {a} {m["points_a"]:.1f}, {b} {m["points_b"]:.1f}. {winner} won that meeting.' if winner!='neither team' else f'These teams tied in Week {m["week"]} at {m["points_a"]:.1f}.',
+                          f'This time {heavy} brings the stronger recent scoring pace by {gap:.1f} per game.',
+                          f'Week {m["week"]} already produced a {abs(m["points_a"]-m["points_b"]):.1f}-point verdict. Now they get another one.')
+              if angle=='schedule_luck':
+                  opponent_a=g['last3_pa_a'];opponent_b=g['last3_pa_b']
+                  burden=a if opponent_a>opponent_b else b
+                  easier=b if burden==a else a
+                  return ('THE SCHEDULE DID SOME DAMAGE',
+                          f'Over the last three games, opponents scored {max(opponent_a,opponent_b):.1f} against {burden} versus {min(opponent_a,opponent_b):.1f} against {easier}. That {abs(opponent_a-opponent_b):.1f}-point difference reflects opponent scoring, not either team\'s defense.',
+                          f'This week the actual scoring lens is {heavy}\'s {high:.1f}-point recent average versus {light}\'s {low:.1f}.',
+                          f'A {abs(opponent_a-opponent_b):.1f}-point schedule gap is a decent grievance. It is not a substitute for points.')
+              if angle=='volatility':
+                  unstable=a if g['three_week_range_a']>=g['three_week_range_b'] else b
+                  span=max(g['three_week_range_a'],g['three_week_range_b'])
+                  return ('HIGH VARIANCE, HIGH DRAMA',
+                          f'{unstable}\'s highest and lowest weekly scores were {span:.1f} points apart across three weeks. Meanwhile {heavy} has a {gap:.1f}-point recent weekly advantage.',
+                          f'The swing factor is whether {unstable} lands nearer the top or bottom of that verified {span:.1f}-point range.',
+                          f'A {span:.1f}-point scoring range can turn a confident prediction into a very long Monday.')
+              if angle=='record_comparison':
+                  return ('THE STANDINGS ARE NOT A SCOREBOARD',
+                          f'{a} owns {wa} wins; {b} has {wb}. But the scoring form shows {heavy} averaging {high:.1f} versus {light}\'s {low:.1f}. Both facts matter, and they are not the same metric.',
+                          f'To equal the stronger scoring form, {light} needs {gap:.1f} additional weekly points.',
+                          f'The {wins_delta(wa,wb)}-win gap gets the headline; the {gap:.1f}-point weekly gap decides the bragging rights.')
+              if angle=='form_vs_fate':
+                  return ('THE FORM BOOK IS ON TRIAL',
+                          f'{heavy} scored {high:.1f} a week over the past three games to {light}\'s {low:.1f}. Whether that carries into this matchup is still unknown.',
+                          f'The recent scoring comparison is {gap:.1f} points per week in favor of {heavy}.',
+                          f'Three weeks of {high:.1f}-point scoring form buys attention. It does not buy the win.')
+              if angle=='recent_week':
+                  x,y=g.get('last_week_a'),g.get('last_week_b')
+                  if x is not None and y is not None:
+                      winner=a if x>y else b if y>x else 'neither'
+                      return ('LAST SUNDAY WAS LOUD',
+                              f'Last week: {a} {x:.1f}, {b} {y:.1f}. {winner} posted the bigger score that week.' if winner!='neither' else f'Last week both teams posted {x:.1f}.',
+                              f'Three-week scoring pace still favors {heavy} by {gap:.1f} a week.',
+                              f'A {abs(x-y):.1f}-point difference last Sunday gives the group chat something measurable.')
+              if angle=='opponent_scores':
+                  aa,bb=g['last3_pa_a'],g['last3_pa_b']
+                  return ('SCHEDULE LUCK IS NOT TALENT',
+                          f'Opponents scored {aa:.1f} against {a} and {bb:.1f} against {b} in three weeks. The difference is {abs(aa-bb):.1f} points, and it says nothing about a fantasy roster stopping those opponents.',
+                          f'{heavy}\'s stronger recent offensive production is {gap:.1f} per week.',
+                          f'The other guys\' {abs(aa-bb):.1f}-point gap belongs on the complaint form, not a depth chart.')
+              return ('SCORING EDGE',
+                      f'{heavy} averages {high:.1f} points a week compared with {light}\'s {low:.1f}. The three-week margin is {gap:.1f} per game.',
+                      f'{light} needs {gap:.1f} more points per game to match the recent pace.',
+                      f'A {gap:.1f}-point weekly gap is measurable. The game still has to be played.')
+
+
+          def wins_delta(a,b):
+              return abs(a-b)
+
+
+          def render_html(d,logo_uri):
+              """Single-column matchup features for both print PDF and phone screens."""
+              best=max((g for g in d['games'] if g['last3_pf_gap'] is not None),key=lambda g:g['last3_pf_gap'],default=None)
+              if best:
+                  hv=best['name_a'] if best['last3_pf_a']>best['last3_pf_b'] else best['name_b']
+                  lv=best['name_b'] if hv==best['name_a'] else best['name_a']
+                  lead=(f'<strong>{h(hv)}</strong> outscored {h(lv)} by <strong>{best["last3_pf_gap"]:,.1f} points</strong> '
+                        f'across Weeks {d["week"]-3}–{d["week"]-1}. The numbers are giving {h(lv)} a rather stern pregame briefing.')
+              else:
+                  lead='Most lopsided verified scoring matchup: data not provided.'
+              match=[]
+              for i,g in enumerate(d['games'],1):
+                  if g['pick']:
+                      muted = ' stars-muted' if g['stars'] <= 2 else ''
+                      pick=f'<strong>Estimated pick:</strong> {h(g["pick"])} <span class="stars{muted}">{"★"*g["stars"]}{"☆"*(5-g["stars"])}</span> <small>Six-week scoring-form heuristic; not calibrated odds.</small>' 
+                  else:
+                      pick='<strong>Estimated pick:</strong> Toss-up · no stars.'
+                  previous=g.get('prior_meetings') or []
+                  prior=f'Previous meeting: W{previous[-1]["week"]}, {h(g["name_a"])} {previous[-1]["points_a"]:.1f}–{previous[-1]["points_b"]:.1f} {h(g["name_b"])}.' if previous else ('Prior head-to-head: not available in offline snapshot.' if g.get('prior_meetings') is None else 'Prior 2026 head-to-head: none in verified weekly history.')
+                  ranges=('Week-by-week scoring (last 3): '
+                          + f'{g["name_a"]} '
+                          + '/'.join(f'{v:.2f}' for v in g['last3_weekly_a'])
+                          + '; '+f'{g["name_b"]} '
+                          + '/'.join(f'{v:.2f}' for v in g['last3_weekly_b']))
+                  if len(g.get('last3_weekly_a') or [])!=3 or len(g.get('last3_weekly_b') or [])!=3:
+                      ranges='Individual week scores: data not provided in offline evidence snapshot.'
+                  anchors=[]
+                  for label,side in ((g['name_a'],'a'),(g['name_b'],'b')):
+                      top=g.get('key_starters_'+side) or []
+                      if top:
+                          ent=top[0]
+                          anchors.append(f'{h(label)}: {h(ent["name"])} ({h(ent["position"])}), {ent["total"]:.1f} points in {ent["starts"]} verified starts')
+                  if anchors:
+                      week_span=f'Weeks {d["week"]-3}–{d["week"]-1}'
+                      source_time=time_az(d['generated_at_utc'])
+                      cache_time=time_az(d.get('name_cache_synced_at_utc'))
+                      source_label=(f'Source: Sleeper weekly matchup players_points, {week_span}; '
+                                    f'retrieved {source_time}. Player identities: local Sleeper roster '
+                                    f'cache synced {cache_time}.')
+                      anchorline='<br/>'.join(anchors)+'<br/><span class="source-line">'+h(source_label)+'</span>'
+                  else:
+                      anchorline='Key starting-player contributions: data not provided.'
+                  match.append(f"""<section class="game">
+                    <div class="card-header"><span class="number">MATCHUP {i:02d}</span><span class="lens">{h(g['editorial_angle'].replace('_',' '))}</span></div>
+                    <h3>{h(g['editorial_headline'])}</h3>
+                    <div class="teams">{h(g['name_a'])}<span>VS</span>{h(g['name_b'])}</div>
+                    <div class="stats"><div><label>RECORD · H2H+MEDIAN</label><b>{h(g['record_a'])} / {h(g['record_b'])}</b></div>
+                    <div><label>RECENT 3 PF</label><b>{fmt(g['last3_pf_a'])} / {fmt(g['last3_pf_b'])}</b></div>
+                    <div><label>RECENT 3 PA</label><b>{fmt(g['last3_pa_a'])} / {fmt(g['last3_pa_b'])}</b></div></div>
+                    <p class="analysis">{h(g['editorial_insight'])}</p>
+                    <p class="swing"><strong>THE SWING:</strong> {h(g['editorial_swing_factor'])}</p>
+                    <p class="roast">{h(g['editorial_trash_talk'])}</p>
+                    <p class="pick">{pick}</p>
+                    <p class="detail"><strong>KEY STARTERS:</strong> {anchorline}<br/>{h(ranges)}<br/>{prior}</p>
+                    </section>""")
+              standings=d['standing'];top=standings[:3];bottom=standings[-3:]
+              def standrow(r):return f'<li><b>{h(r["name"])}</b> — {r["wins"]}-{r["losses"]} · {r["pf"]:,.1f} PF</li>'
+              pressure=d.get('pressure_cooker')
+              cooker=(f'<b>{h(pressure["name"])}</b> dropped from <b>{pressure["before"]:,.1f}</b> to <b>{pressure["after"]:,.1f}</b> points between consecutive three-week blocks—a verified <b>{pressure["decline"]:,.1f}-point</b> slide.'
+                      if pressure and pressure['decline']>0 else 'Six-week scoring decline: data not provided.')
+              toc_html = ''.join(
+                  f'<li><b class="toc-num">{i:02d}</b><div><strong>{h(g["editorial_headline"])}</strong>'
+                  f'<small>{h(g["name_a"])} vs {h(g["name_b"])}</small></div></li>'
+                  for i, g in enumerate(d['games'], 1)
+              )
+              return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"/>
+          <title>LOG | Weekly War Room | Week {d['week']}</title><style>
+          @page{{size:letter;margin:13mm 12mm 13mm 12mm;@bottom-right{{content:'LOG • PREVIEW  ·  ' counter(page);font-size:9px;color:#b4c4d4}}}}
+          *{{box-sizing:border-box}}html,body{{margin:0;background:#0E2841;color:#F8FAFC;font:11px/1.48 Arial,sans-serif;-webkit-print-color-adjust:exact;print-color-adjust:exact}}
+          body{{background:#0E2841}}.cover{{background:#16324F;border:1px solid #294a6b;border-radius:9px;padding:18px 21px;display:flex;align-items:center;gap:18px;break-inside:avoid}}
+          .cover img{{width:78px;height:auto;object-fit:contain;flex:none}}.cover h1{{font:bold 28px/1.05 Arial,sans-serif;letter-spacing:.7px;text-transform:uppercase;margin:5px 0;color:#F8FAFC}}
+          .eyebrow,.number,label,.stamp,.lens{{font:bold 9px/1.3 Arial,sans-serif;letter-spacing:1.1px;text-transform:uppercase;color:#EB6261}}.sub{{color:#B5C4D6;font-size:10px}}
+          .stamp{{display:inline-block;border:1px solid #EB6261;border-radius:20px;padding:4px 9px;margin:9px 0;color:#EB6261}}.intro{{background:#1E3E60;border-left:4px solid #EB6261;border-radius:5px;padding:12px 15px;font-size:12px}}
+          .h2{{margin:22px 0 10px;border-bottom:1px solid #355474;padding-bottom:6px;font-size:14px;letter-spacing:.7px;text-transform:uppercase}}
+          .grid{{display:block}}.game{{margin-bottom:11px;background:#16324F;border:1px solid #33516e;border-radius:8px;padding:13px 15px;break-inside:avoid;page-break-inside:avoid}}
+          .card-header{{display:flex;justify-content:space-between}}.lens{{color:#bcd6e8}}.game h3{{font-size:16px;line-height:1.15;color:#F8FAFC;margin:6px 0 5px;text-transform:uppercase}}
+          .teams{{font-size:11px;font-weight:bold;color:#f3a5a4;margin-bottom:9px}}.teams span{{color:#B5C4D6;font-size:9px;margin:0 10px}}
+          .stats{{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;border-top:1px solid #36516b;border-bottom:1px solid #36516b;padding:7px 0}}
+          .stats b{{font-size:10px;color:#F8FAFC;display:block;margin-top:3px}}.stats label{{font-size:7px;letter-spacing:.5px;color:#B5C4D6}}
+          .analysis{{margin:10px 0 5px;font-size:11px}}.swing{{margin:5px 0;background:#1E3E60;padding:8px 10px;border-left:3px solid #3FCB7C;border-radius:3px}}.swing strong{{color:#94eac0}}
+          .roast{{font-size:10.5px;font-style:italic;color:#f3c4ba;margin:8px 0 6px}}.pick{{color:#d9f8e5;font-size:10px;margin:6px 0}}
+          .stars{{color:#3FCB7C;letter-spacing:.5px}}small,.detail,.micro{{font-size:8.5px;color:#B5C4D6}}.detail{{margin:7px 0 0;border-top:1px dashed #36516b;padding-top:5px}}
+          .two{{display:grid;grid-template-columns:1fr 1fr;gap:11px}}.panel{{background:#16324F;border:1px solid #33516e;padding:12px 14px;border-radius:7px;break-inside:avoid}}
+          .panel h3{{color:#EB6261;text-transform:uppercase;font-size:11px;letter-spacing:.7px;margin:0 0 6px}}.panel ul{{margin:6px 0;padding-left:16px}}li{{margin:4px 0}}
+          .foot{{font-size:8.5px;color:#B5C4D6;margin-top:17px;border-top:1px solid #33516e;padding-top:7px}}
+          @media screen and (max-width:620px){{.cover{{padding:11px}}.cover img{{width:55px}}.cover h1{{font-size:23px}}.two{{grid-template-columns:1fr}}.stats{{gap:3px}}.game{{padding:12px}}}}
+          /* A-NL18R2: narrow-page, no-pan, readable-at-fit-width PDF layout. */
+          @page {{
+            size: 4.25in 12in;
+            margin: 10mm 8.5mm 14mm;
+            @bottom-right {{
+              content: 'LOG  •  PREVIEW   ' counter(page);
+              font: bold 12px Arial,sans-serif;
+              color: #B5C4D6;
+            }}
+          }}
+          html,body {{
+            font: 17px/1.52 Arial,sans-serif !important;
+            background: #0E2841 !important;
+            max-width: 100% !important;
+            overflow-wrap: anywhere;
+            word-break: normal;
+          }}
+          .cover {{
+            display:block;
+            padding: 14px 15px;
+            margin: 0 0 12px;
+            border-radius: 8px;
+          }}
+          .cover img {{ display:block; width:65px; height:auto; margin:0 0 9px; }}
+          .cover h1 {{ font-size:25px; line-height:1.09; letter-spacing:0; margin:7px 0; }}
+          .eyebrow,.number,label,.stamp,.lens {{ font-size:13px; line-height:1.3; letter-spacing:.35px; }}
+          .sub {{ font-size:15px; line-height:1.42; }}
+          .stamp {{padding:6px 9px; margin:4px 0 10px; font-size:12.5px;}}
+          .intro {{ padding:12px 13px; font-size:17px; line-height:1.48; }}
+          .h2 {{font-size:19px; line-height:1.2; margin:18px 0 11px; break-after:avoid;}}
+          .grid {{display:block; min-width:0;}}
+          .game {{
+            padding:14px 13px;
+            margin:0 0 15px;
+            break-inside:auto;
+            page-break-inside:auto;
+            border-radius:8px;
+            min-width:0;
+            max-width:100%;
+          }}
+          .game + .game {{break-before:page; page-break-before:always;}}
+          .card-header {{ display:flex; flex-direction:column; gap:3px; }}
+          .game h3 {{font-size:22px; line-height:1.15; letter-spacing:0; margin:7px 0;}}
+          .teams {{font-size:17px; line-height:1.35; margin-bottom:11px;}}
+          .teams span {{font-size:13px; margin:0 5px; display:inline;}}
+          .stats {{display:block; margin:7px 0; padding:5px 0;}}
+          .stats > div {{
+            display:flex;
+            flex-wrap:wrap;
+            align-items:baseline;
+            justify-content:space-between;
+            gap:3px 8px;
+            padding:7px 0;
+            border-bottom:1px solid #36516b;
+          }}
+          .stats > div:last-child {{border-bottom:0;}}
+          .stats label {{font-size:12.5px; line-height:1.25; letter-spacing:.2px; flex:1 1 46%;}}
+          .stats b {{font-size:16px; line-height:1.3; margin:0; font-weight:bold; text-align:right;}}
+          .analysis {{font-size:17px; line-height:1.5; margin:11px 0 8px;}}
+          .swing {{font-size:16px; line-height:1.47; padding:11px 12px; margin:9px 0;}}
+          .roast {{font-size:16px; line-height:1.48; margin:9px 0;}}
+          .pick {{font-size:16px; line-height:1.5; margin:10px 0;}}
+          .stars {{letter-spacing:0;}}
+          small,.detail,.micro {{font-size:14px; line-height:1.48;}}
+          .detail {{margin:10px 0 0; padding-top:9px; overflow-wrap:anywhere;}}
+          .two {{display:block;}}
+          .panel {{padding:12px 13px; margin:0 0 14px; break-inside:auto; font-size:16px; line-height:1.5;}}
+          .panel h3 {{font-size:18px; line-height:1.2; margin:0 0 8px;}}
+          .panel ul {{padding-left:20px; margin:8px 0;}}
+          li {{margin:7px 0;}}
+          .foot {{font-size:14px; line-height:1.55; margin-top:17px; padding-top:9px;}}
+
+          @page {{@top-left {{content:'LOG  •  WAR ROOM';font:bold 13px Arial,sans-serif;color:#9eafc6}}}}
+          @page {{@bottom-right {{content:'LOG  •  ' counter(page);font:bold 13px Arial,sans-serif;color:#9eafc6}}}}
+          .toc + .h2 {{break-before:page;page-break-before:always;}}
+          .grid + .h2 {{break-before:page;page-break-before:always;}}
+          .stats label {{font-size:13px;}}
+          .stamp {{font-size:13px;}}
+          .foot{{font-size:13.5px;line-height:1.40;margin-top:8px;padding-top:6px}}
+          .panel{{padding:9px 10px;margin-bottom:9px}}
+          .h2{{margin:12px 0 7px}}
+          .micro{{font-size:13.5px;line-height:1.4}}
+          .toc {{background:#16324F;border:1px solid #33516e;border-radius:8px;padding:12px 13px;margin:16px 0 0;break-inside:avoid;}}
+          .toc h2 {{font-size:17px;line-height:1.25;color:#EB6261;letter-spacing:.6px;margin:0 0 9px;}}
+          .toc ol {{list-style:none;margin:0;padding:0;}}
+          .toc li {{display:flex;gap:11px;padding:7px 0;margin:0;border-top:1px solid #36516b;align-items:flex-start;}}
+          .toc li > div {{min-width:0;flex:1;}}
+          .toc .toc-num {{font-size:14px;color:#EB6261;margin:2px 0 0;}}
+          .toc strong {{display:block;font-size:15px;line-height:1.33;color:#F8FAFC;}}
+          .toc small {{display:block;font-size:13.5px;line-height:1.4;color:#B5C4D6;margin-top:3px;}}
+          .game:first-child {{break-before:page;page-break-before:always;}}
+                    /* NL18R2: consistent section gutter and readable high-contrast notes. */
+                    .editorial-section {{background:#16324F;border:1px solid #33516e;border-radius:8px;padding:16px;margin:0 0 12px;break-inside:avoid;max-width:100%;}}
+                    .editorial-section .h2 {{margin:0 0 10px;font-size:18px;line-height:1.2;}}
+                    .editorial-section .panel {{background:#1E3E60;border:1px solid #36516b;padding:11px 12px;border-radius:6px;}}
+                    .editorial-section p {{margin:9px 0 0;font-size:14.5px;line-height:1.45;}}
+                    .editorial-section .micro {{font-size:14px;line-height:1.46;color:#DFEAF4;}}
+                    .editorial-section .two {{display:block;}}
+                    .toc {{padding:16px;}}
+                    .toc small,.detail,.source-line,.foot {{color:#DFEAF4;}}
+                    .source-line {{display:inline-block;margin-top:5px;font-size:13px;line-height:1.5;}}
+                    .detail,.foot {{font-size:14px;line-height:1.48;overflow-wrap:anywhere;}}
+                    .stars-muted {{color:#A2BCB4;}}
+                    .stamp {{font-size:13px;}}
+                    .cover .weekline {{display:block;font-size:13px;color:#EB6261;font-weight:bold;margin-top:7px;letter-spacing:.35px;}}
+                    .foot {{padding:11px 16px 5px;margin:0;}}
+                    .closing {{break-before:page;page-break-before:always;}}
+                    </style></head><body><header class="cover"><img src="{logo_uri}" alt="Original LOG Calculator site logo"/><div><div class="eyebrow">League of Ordinary Gentlemen · {d['season']}</div><span class="weekline">WEEK {d['week']:02d}</span><h1>The Weekly War Room</h1><div class="sub">Pregame feature edition · Verified scoring, different story in every matchup</div></div></header>
+          <div class="stamp">SHADOW PREVIEW · PICKS NOT ARCHIVED</div><p class="intro">{lead}</p>
+          <section class="toc"><h2>01 / SIX MATCHUPS · SIX STORYLINES</h2><ol>{toc_html}</ol></section>
+          <div class="grid">{''.join(match)}</div>
+          <div class="closing">
+          <section class="editorial-section"><h2 class="h2">02 / Standings Snapshot</h2>
+          <div class="two"><div class="panel"><h3>Front of the pack (provisional)</h3><ul>{''.join(standrow(x) for x in top)}</ul></div><div class="panel"><h3>The cellar (provisional)</h3><ul>{''.join(standrow(x) for x in bottom)}</ul></div></div>
+          <p class="micro">Your league awards wins for head-to-head results and for beating the weekly median. This is a provisional standings order until Sleeper's official tiebreaks are verified. PA means the fantasy points opponents scored against a team; it is not a roster defense statistic.</p></section>
+          <section class="editorial-section"><h2 class="h2">03 / Most Likely to Panic</h2><p>{cooker}</p></section>
+          <section class="editorial-section"><h2 class="h2">04 / Lineup Landmines</h2><p>Dated injury and bye reports: <b>data not provided.</b> No fabricated player availability claims.</p></section>
+          <section class="editorial-section"><h2 class="h2">05 / The Receipts</h2><p>{h(d['receipts'])} No picks are archived by this preview.</p></section>
+          <p class="foot">Sleeper NFL · Data as of {h(time_az(d['generated_at_utc']))}. Totals computed from unrounded weekly scores; displayed weekly values rounded to 2 decimals. Estimates are not calibrated odds. Private free-agent data excluded. Preview only; picks not archived.</p>
+          </div></body></html>"""
+
+          def selftest():
+              assert predicted([100]*6,[100]*6)==(None,None)
+              assert time_az('2026-11-05T21:03:25.272538+00:00') == 'Nov 5, 2026, 2:03 PM Arizona time'
+              assert len(pairing([{'roster_id':i,'matchup_id':(i+1)//2} for i in range(1,13)]))==6
+              assert recent([1,2,3,4,5],3)==12
+              try:pairing([{'roster_id':i,'matchup_id':(i+1)//2} for i in range(1,12)])
+              except RuntimeError:pass
+              else:raise AssertionError('Malformed matchup was accepted')
+              # Synthetic fixture: no actual players or invented real team scoring.
+              fx=[]
+              for i in range(6):
+                  fx.append({'name_a':f'Synthetic A{i}','name_b':f'Synthetic B{i}',
+                      'record_a':f'{10+i}-6','record_b':f'{i+2}-14',
+                      'rank_a_provisional':2*i+1,'rank_b_provisional':2*i+2,
+                      'last3_pf_a':600+i*30,'last3_pf_b':590-i*9,
+                      'last3_pf_gap':abs((600+i*30)-(590-i*9)),
+                      'last3_pa_a':560,'last3_pa_b':600,'prior_meetings':[],
+                      'trend_change_a':i*30,'trend_change_b':-i*20,
+                      'three_week_range_a':38,'three_week_range_b':35,
+                      'previous3_pf_a':570,'previous3_pf_b':630})
+              assign_storylines(fx)
+              assert len({x['editorial_angle'] for x in fx})==6
+              assert all(any(c.isdigit() for c in x['editorial_insight']) for x in fx)
+              print('SELFTEST PASS: six distinct numerically grounded storylines')
+
+          def main():
+              p=argparse.ArgumentParser()
+              p.add_argument('--week',default='auto')
+              p.add_argument('--out',default='out/log-newsletter-preview')
+              p.add_argument('--selftest',action='store_true')
+              args=p.parse_args()
+              if args.selftest: selftest();return
+              target=int(get('state/nfl')['week']) if args.week=='auto' else int(args.week)
+              if not 1<=target<=18: raise RuntimeError('Invalid week')
+              d=assemble(target)
+              uri,logohash=logo_from_site(ROOT/'index.html')
+              d['official_logo_png_sha256']=logohash
+              html=render_html(d,uri)
+              out=Path(args.out);out.mkdir(parents=True,exist_ok=True)
+              base=out/f'LOG-{SEASON}-W{target:02d}-WEEKLY-WAR-ROOM-MOBILE-READER-R2-SHADOW'
+              base.with_suffix('.html').write_text(html,encoding='utf-8')
+              base.with_suffix('.json').write_text(json.dumps(d,indent=2,ensure_ascii=False)+'\n',encoding='utf-8')
+              from weasyprint import HTML
+              doc=HTML(string=html,base_url=str(ROOT)).render()
+              if not all(abs(p.width-408)<0.5 and abs(p.height-1152)<0.5 for p in doc.pages):
+                  raise RuntimeError('Mobile page geometry changed; expected 4.25 × 12 inches')
+              doc.write_pdf(base.with_suffix('.pdf'))
+              data=base.with_suffix('.pdf').read_bytes()
+              if not data.startswith(b'%PDF-') or len(data)<15000:raise RuntimeError('PDF invalid or suspiciously short')
+              assert len(d['games'])==6 and len(set([g[x] for g in d['games'] for x in ['a','b']]))==12
+              assert 'Unrostered' not in html and 'Add of the Week' not in html
+              assert len({g['editorial_angle'] for g in d['games']})==6
+              assert '&amp;lt;' not in html and '&amp;#x27;' not in html
+              assert 'Opponent PF' not in html
+              assert 'RECENT 3 PA' in html
+              assert 'Data as of ' in html
+              assert html.count('class="editorial-section"') == 4
+              assert 'name_cache_synced_at_utc' in d
+              assert len(doc.pages) in range(7, 16), 'Unexpected mobile PDF pagination'
+              # Verify the PDF as seen by a reader, not merely the HTML source.
+              import fitz
+              with fitz.open(base.with_suffix('.pdf')) as rendered:
+                  pdf_text='\n'.join(page.get_text() for page in rendered)
+                  assert not any(x in pdf_text for x in ('&lt;', '&gt;', '&#x27;', 'Opponent PF', '2026-11-05T'))
+                  assert 'RECENT 3 PA' in pdf_text
+                  assert 'Arizona time' in pdf_text
+                  assert pdf_text.count('MATCHUP 01') == 1 and pdf_text.count('MATCHUP 06') == 1
+                  for page in rendered:
+                      assert abs(page.rect.width-306)<0.5 and abs(page.rect.height-864)<0.5
+                      for block in page.get_text('dict')['blocks']:
+                          for line in block.get('lines', []):
+                              for span in line.get('spans', []):
+                                  if not span['text'].strip():continue
+                                  assert span['size']>=9.0, (span['text'],span['size'])
+                                  assert span['bbox'][0]>=-0.5 and span['bbox'][2]<=page.rect.width+0.5, (span['text'],span['bbox'])
+              for game in d['games']:
+                  for side in ('a','b'):
+                      weekly=game.get('last3_weekly_'+side) or []
+                      total=game.get('last3_pf_'+side)
+                      if len(weekly)==3 and total is not None:
+                          assert abs(round(sum(weekly),2)-total)<=0.03, (game['name_'+side],weekly,total)
+              assert all('editorial_trash_talk' in g and 'editorial_swing_factor' in g for g in d['games'])
+              print(f'PASS 12 teams 6 matchups | private scouting excluded | official logo sha256={logohash} | PDF={base.with_suffix(".pdf")} ({len(data)} bytes)')
+
+          if __name__=='__main__':main()
+          PY
+          python3 -m py_compile "$RUNNER_TEMP/log_pregame_shadow.py"
+          python3 "$RUNNER_TEMP/log_pregame_shadow.py" --selftest
+      - name: Render six distinct game stories with verified starter scoring
+        shell: bash
+        env:
+          WEEK: ${{ inputs.target_week }}
+        run: |
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/log_pregame_shadow.py" --week "$WEEK" --out "$RUNNER_TEMP/log-pregame-pdf"
+          python3 - <<'PY'
+          import json,os,pathlib
+          p=pathlib.Path(os.environ['RUNNER_TEMP'])/'log-pregame-pdf'
+          docs=list(p.glob('*.json'))
+          assert len(docs)==1, docs
+          d=json.loads(docs[0].read_text(encoding='utf-8'))
+          assert d['picks_archived'] is False and d['publication_authorized'] is False
+          assert len(d['games'])==6
+          assert len(set([g[k] for g in d['games'] for k in ('a','b')]))==12
+          assert 'free_agents' not in d and 'waiver_board' not in d
+          assert len({g['editorial_angle'] for g in d['games']}) == 6, 'Duplicate matchup storylines'
+          assert all(g.get('editorial_insight') and g.get('editorial_swing_factor') and g.get('editorial_trash_talk') for g in d['games'])
+          assert len(list(p.glob('*.pdf')))==1
+          pdf=list(p.glob('*.pdf'))[0]
+          assert pdf.stat().st_size > 15000
+          print(f'PASS: PDF ({pdf.stat().st_size} bytes) / 6 distinctive editorial angles / narrow-page mobile PDF / 12 teams / zero private free agents / no picks archived')
+          PY
+      - name: Verify git tree remains unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain --untracked-files=all)"
+          echo 'PASS: repository and all frozen model files unchanged'
+      - name: Upload LOG matchup deep-dive PDF, HTML and evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LOG-War-Room-Mobile-Reader-R2-PDF-${{ github.run_id }}
+          path: ${{ runner.temp }}/log-pregame-pdf/
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Explain status
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## LOG Weekly War Room — Distinct Matchup Deep Dive PDF'
+            echo '- Read-only and not authorized for distribution'
+            echo '- Official LOG site logo and navy/coral visual style'
+            echo '- Six distinct storyline lenses, accessible type, one-time HTML escaping, and corrected PA labels'
+            echo '- Verified starters cite Sleeper weekly points and dated roster-cache provenance'
+            echo '- Live week-by-week form and prior H2H included when source data exists'
+            echo '- No injury guesses; unverified official rank marked provisional'
+            echo '- Human-readable Arizona timestamps, historical-starter source lines, and 16px section panels'
+            echo '- No free agent recommendations, no private board access'
+            echo '- No emailed newsletter and no predictions archive committed'
+            echo '- Checked for text spill, source labels, HTML entities, rounding, and accessible minimum font size; PDF available as Actions artifact'
+            echo '- This is the pregame shadow only, not the final Tuesday recap implementation'
+          } >> "$GITHUB_STEP_SUMMARY"
