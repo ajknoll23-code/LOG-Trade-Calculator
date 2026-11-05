@@ -1,0 +1,150 @@
+name: A-NL01R2 - LOOG Weekly War Room and Aftermath
+run-name: A-NL01R2 ${{ github.event_name == 'workflow_dispatch' && inputs.edition || 'scheduled' }} newsletter, preview safe
+
+'on':
+  schedule:
+    - cron: '0 8 * * 2'
+      timezone: 'America/Phoenix'
+    - cron: '0 8 * * 4'
+      timezone: 'America/Phoenix'
+  workflow_dispatch:
+    inputs:
+      edition:
+        description: 'pre=Thursday Weekly War Room; post=Tuesday Aftermath'
+        required: true
+        type: choice
+        options: [pre, post]
+        default: pre
+      week:
+        description: 'NFL week (1-18); blank uses current Sleeper week'
+        required: false
+        type: string
+        default: ''
+      send_email:
+        description: 'Explicitly send this manual edition by SMTP (requires verified secrets)'
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a-nl01r1-${{ github.event.schedule || github.event.inputs.edition || 'manual' }}
+  cancel-in-progress: false
+
+jobs:
+  newsletter:
+    name: Safe verified 12-team newsletter
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check out main read-only
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run newsletter self-test and synthetic 12-team integration tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/newsletters/league_newsletter.py --selftest
+          python3 -m unittest discover -s tests/newsletters -p 'test_*.py' -v
+          python3 -m py_compile scripts/newsletters/league_newsletter.py
+
+      - name: Resolve edition, week, and explicit send authorization
+        id: control
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+          INPUT_EDITION: ${{ inputs.edition }}
+          INPUT_WEEK: ${{ inputs.week }}
+          INPUT_SEND: ${{ inputs.send_email }}
+          SCHEDULE_SEND: ${{ vars.NEWSLETTER_SEND_ENABLED }}
+          LAUNCH_APPROVED: ${{ vars.NEWSLETTER_LAUNCH_APPROVED }}
+        run: |
+          set -euo pipefail
+          week="$INPUT_WEEK"
+          if [ "$EVENT_NAME" = 'schedule' ]; then
+            case "$SCHEDULE" in
+              '0 8 * * 2') edition=post ;;
+              '0 8 * * 4') edition=pre ;;
+              *) echo '::error::Unknown schedule'; exit 1 ;;
+            esac
+            week=''
+            send=false
+            if [ "$SCHEDULE_SEND" = true ] && [ "$LAUNCH_APPROVED" = true ]; then send=true; fi
+          else
+            edition="$INPUT_EDITION"
+            send="$INPUT_SEND"
+          fi
+          case "$edition" in pre|post) ;; *) echo '::error::Invalid edition'; exit 1 ;; esac
+          if [ -n "$week" ] && ! [[ "$week" =~ ^([1-9]|1[0-8])$ ]]; then
+            echo '::error::Invalid NFL week 1..18'; exit 1
+          fi
+          if [ "$send" != true ]; then send=false; fi
+          echo "edition=$edition" >> "$GITHUB_OUTPUT"
+          echo "week=$week" >> "$GITHUB_OUTPUT"
+          echo "send=$send" >> "$GITHUB_OUTPUT"
+          echo "Edition=$edition, explicit_week=${week:-auto}, email_send=$send"
+
+      - name: Render source-validated newsletter, optionally send only when explicitly approved
+        shell: bash
+        env:
+          NEWS_EDITION: ${{ steps.control.outputs.edition }}
+          NEWS_WEEK: ${{ steps.control.outputs.week }}
+          NEWS_SEND: ${{ steps.control.outputs.send }}
+          NEWSLETTER_TO: ${{ secrets.NEWSLETTER_TO }}
+          NEWSLETTER_FROM: ${{ secrets.NEWSLETTER_FROM }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          args=(--edition "$NEWS_EDITION" --output-dir out/newsletters)
+          if [ -n "$NEWS_WEEK" ]; then args+=(--week "$NEWS_WEEK"); fi
+          if [ "$NEWS_SEND" = true ]; then args+=(--send); fi
+          python3 scripts/newsletters/league_newsletter.py "${args[@]}"
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          docs = list(Path('out/newsletters').glob('*.json'))
+          assert len(docs) == 1, f'Expected one newsletter payload, got {len(docs)}'
+          d = json.loads(docs[0].read_text(encoding='utf-8'))
+          assert len(d['games']) == 6
+          ids = [x[k] for x in d['games'] for k in ('a', 'b')]
+          assert len(set(ids)) == 12
+          assert d['season'] == 2026
+          assert d['league_id'] == '1326679131051532288'
+          if d['edition'] == 'post':
+              assert d['median'] is not None
+              assert all(g['score_a'] is not None and g['score_b'] is not None for g in d['games'])
+          print('PASS: 6 matchups / 12 unique teams / correct league and season / recap finality gate')
+          PY
+          {
+            echo '## LOOG newsletter'
+            echo "- Edition: $NEWS_EDITION"
+            echo "- NFL week: ${NEWS_WEEK:-automatic}"
+            echo "- Email sending requested: $NEWS_SEND"
+            echo '- Output: HTML, text, JSON report, 90-day Actions artifact'
+            echo '- No trade-calculator FV, FV+, MV, or frozen research files modified'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload newsletter preview and data proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LOOG-newsletter-${{ steps.control.outputs.edition || 'unknown' }}-${{ github.run_id }}
+          path: out/newsletters/
+          if-no-files-found: warn
+          retention-days: 90
