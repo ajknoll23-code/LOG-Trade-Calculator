@@ -1,0 +1,212 @@
+name: A-RG04 - Sleeper Lineup Blocker Diagnosis
+run-name: A-RG04 live Sleeper 17-slot roster diagnosis (read-only)
+
+'on':
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a-rg04-sleeper-readonly-diagnosis
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    name: Identify exact live-roster lineup blocker
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout current main, read-only
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Sleeper sync dependency
+        run: python3 -m pip install --disable-pip-version-check 'requests>=2.32,<3'
+
+      - name: Capture frozen inputs and current HEAD
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD | tee "$RUNNER_TEMP/rg04_head.txt"
+          sha256sum index.html free-agent-board.html scripts/projections/build_team_utility_lineup_projections.py \
+            > "$RUNNER_TEMP/rg04_protected.sha"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Refresh live Sleeper rosters in runner only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/sync/sync_sleeper.py
+          python3 scripts/utilities/generate_player_positions.py
+          echo 'Live Sleeper sync completed in this temporary runner. Nothing has been pushed.'
+
+      - name: Analyze exact 17-slot optimizer and eligible roster
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/rg04_diagnose.py" <<'PY'
+          import json
+          import sys
+          from collections import Counter
+          from pathlib import Path
+          sys.path.insert(0, 'scripts/projections')
+          import build_team_utility_lineup_projections as b
+
+          rosters = json.loads(Path('data/league_rosters.json').read_text())
+          positions = json.loads(Path('scripts/artifacts/generated/player_positions.json').read_text())
+          slot_spec = [(name, count) for name, count in b.DEDICATED] + [
+              (name, count) for name, _, count in b.FLEXES
+          ]
+          output = {
+              'status': 'DIAGNOSED',
+              'read_only': True,
+              'league_id': rosters.get('league_id'),
+              'synced_at': rosters.get('synced_at'),
+              'expected_starters': b.EXPECTED_STARTERS,
+              'team_count': len(rosters.get('rosters', [])),
+              'teams': [],
+          }
+          assert b.EXPECTED_STARTERS == 17, f'Expected 17 starters; code says {b.EXPECTED_STARTERS}'
+          for team in rosters.get('rosters', []):
+              player_rows = []
+              ignored = []
+              for slot in ('starters', 'bench'):
+                  for raw in team.get(slot, []) or []:
+                      sid = str(raw.get('player_id') or '')
+                      pos = b.roster_position(raw, positions)
+                      if not sid or not pos:
+                          ignored.append({
+                              'player': raw.get('name'),
+                              'player_id': sid,
+                              'raw_position': raw.get('position'),
+                              'fantasy_positions': raw.get('fantasy_positions'),
+                              'reason': 'unresolved_id_or_position',
+                          })
+                          continue
+                      player_rows.append(b.RosterPlayer(
+                          sleeper_id=sid,
+                          name=str(raw.get('name') or sid),
+                          pos=pos,
+                          projection=0.0,
+                      ))
+              selected, remaining = b.optimize_projection_lineup(player_rows)
+              label_counts = Counter(label for label, _ in selected)
+              pos_counts = Counter(p.pos for p in player_rows)
+              missing = [
+                  {'slot': name, 'count': count - label_counts[name]}
+                  for name, count in slot_spec if label_counts[name] < count
+              ]
+              record = {
+                  'roster_id': team.get('roster_id'),
+                  'team_name': team.get('team_name') or team.get('owner_username'),
+                  'active_player_count': len(player_rows),
+                  'active_positions': dict(sorted(pos_counts.items())),
+                  'legal_starter_count': len(selected),
+                  'missing_slots': missing,
+                  'excluded_taxi_count': len(team.get('taxi') or []),
+                  'excluded_ir_count': len(team.get('reserve_ir') or []),
+                  'unresolved_players': ignored,
+                  'active_players': [
+                      {'name': p.name, 'position': p.pos, 'player_id': p.sleeper_id}
+                      for p in player_rows
+                  ] if missing else [],
+              }
+              output['teams'].append(record)
+              summary = f"{record['team_name']} (roster {record['roster_id']}): {len(selected)}/17, positions={dict(pos_counts)}"
+              if missing:
+                  print('BLOCKER:', summary, 'MISSING:', missing, 'UNRESOLVED:', ignored)
+              else:
+                  print('PASS:', summary)
+          blockers = [t for t in output['teams'] if t['missing_slots']]
+          output['blocker_count'] = len(blockers)
+          report = Path('rg04_live_roster_diagnosis.json')
+          report.write_text(json.dumps(output, indent=2, ensure_ascii=False) + '\n')
+          print(f"DIAGNOSIS: {len(blockers)} / {len(output['teams'])} teams cannot fill 17 slots")
+          with open(Path.cwd() / 'rg04_summary.md', 'w') as f:
+              f.write('# A-RG04 Live Sleeper Lineup Diagnosis\n\n')
+              f.write(f"- Team count: **{len(output['teams'])}**\n")
+              f.write(f"- Cannot fill 17 slots: **{len(blockers)}**\n")
+              f.write(f"- Synced timestamp: `{output['synced_at']}`\n")
+              f.write('- No repository commits or formula changes.\n\n')
+              for t in output['teams']:
+                  if t['missing_slots']:
+                      f.write(f"## {t['team_name']} — {t['legal_starter_count']}/17\n")
+                      f.write(f"Positions: `{t['active_positions']}`\n\n")
+                      f.write(f"Missing slots: `{t['missing_slots']}`\n\n")
+                      if t['unresolved_players']:
+                          f.write(f"Unresolved: `{t['unresolved_players']}`\n\n")
+          if len(output['teams']) != 12:
+              raise RuntimeError('Live Sleeper roster sync returned unexpected team count; do not trust diagnosis')
+          PY
+          python3 "$RUNNER_TEMP/rg04_diagnose.py"
+          cat rg04_summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Reproduce Team Utility projection validation (without commit)
+        id: reproduce
+        shell: bash
+        run: |
+          set -uo pipefail
+          python3 scripts/projections/build_team_utility_lineup_projections.py --selftest \
+            > rg04_selftest.log 2>&1
+          selftest_rc=$?
+          if [ "$selftest_rc" -ne 0 ]; then
+            cat rg04_selftest.log
+            echo '::error::Team Utility self-test failed before live validation.'
+            exit "$selftest_rc"
+          fi
+          python3 scripts/projections/build_team_utility_lineup_projections.py --write \
+            > rg04_builder.log 2>&1
+          build_rc=$?
+          cat rg04_builder.log
+          if [ "$build_rc" -eq 0 ]; then
+            echo 'Build succeeded; live sync no longer reproduces the previous failure.'
+            echo 'outcome=full-build-pass' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if grep -Fq 'at least one current roster cannot fill the legal 17-slot lineup' rg04_builder.log; then
+            python3 - <<'PY'
+          import json
+          d = json.load(open('rg04_live_roster_diagnosis.json'))
+          if not d['blocker_count']:
+              raise RuntimeError('Builder reports insufficient lineup but direct analyzer found none; investigate inconsistent inputs')
+          print('CONFIRMED: live roster insufficiency reproduces the exact production failure.')
+          PY
+            code=$?
+            if [ "$code" -ne 0 ]; then exit "$code"; fi
+            echo 'outcome=confirmed-live-roster-blocker' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo '::error::Unexpected Team Utility builder failure; see rg04_builder.log.'
+          exit "$build_rc"
+
+      - name: Prove protected files unchanged and no Git push
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum --check "$RUNNER_TEMP/rg04_protected.sha"
+          git diff --exit-code -- index.html free-agent-board.html scripts/projections/build_team_utility_lineup_projections.py
+          echo 'PASS: read-only inspection, no tracked valuation code changed and no Git push.'
+
+      - name: Upload detailed diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A-RG04-Live-Sleeper-Lineup-Diagnosis-${{ github.run_id }}
+          retention-days: 30
+          if-no-files-found: warn
+          path: |
+            rg04_live_roster_diagnosis.json
+            rg04_summary.md
+            rg04_builder.log
+            rg04_selftest.log
