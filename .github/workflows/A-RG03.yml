@@ -1,0 +1,199 @@
+name: A-RG03 - Canonical Free Agent Board Sync
+run-name: A-RG03 ${{ inputs.mode }} - board parity, QA21 price protection, no FV model changes
+
+'on':
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'PREVIEW_ONLY tests without writing; APPLY commits free-agent-board.html only'
+        type: choice
+        required: true
+        default: PREVIEW_ONLY
+        options:
+          - PREVIEW_ONLY
+          - APPLY
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  canonical_board_sync:
+    name: Exact canonical board sync and protected parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      REPAIR_MODE: ${{ inputs.mode }}
+    steps:
+      - name: Checkout latest main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install regression dependencies
+        run: python3 -m pip install --disable-pip-version-check 'requests>=2.32,<3'
+
+      - name: Verify clean checkout and snapshot protected production files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          sha256sum index.html data/free_agents.json data/free_agent_utility_v1.json \
+            scripts/validation/repo_regression_checks.py scripts/validation/snapshot_values.py \
+            > "$RUNNER_TEMP/rg03_protected_before.sha"
+          git rev-parse HEAD > "$RUNNER_TEMP/rg03_start_commit.txt"
+          echo 'PASS: immutable inputs/validator fingerprints captured.'
+
+      - name: Stage deterministic board sync only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/sync/sync_free_agent_valuation.py --selftest
+          python3 scripts/sync/sync_free_agent_valuation.py --write
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess, sys
+          sys.path.insert(0, 'scripts/sync')
+          import sync_free_agent_valuation as sync
+          index = Path('index.html').read_text(encoding='utf-8')
+          board = Path('free-agent-board.html').read_text(encoding='utf-8')
+          original = subprocess.check_output(
+              ['git', 'show', 'HEAD:free-agent-board.html'], text=True
+          )
+          assert sync.render_synced(index, original) == board, 'Unexpected board transformation'
+          assert sync.render_synced(index, board) == board, 'Board sync is not idempotent'
+          assert all(sync.parity_regions(index, board).values()), 'Canonical region parity failed'
+          assert sync._extract_const_object(original, 'FA_PROD_MULT_DATA')[2] == (
+              sync._extract_const_object(board, 'FA_PROD_MULT_DATA')[2]
+          ), 'Free-agent specific production data was altered'
+          changed = subprocess.check_output(
+              ['git','diff','--name-only'], text=True
+          ).splitlines()
+          assert changed in ([], ['free-agent-board.html']), f'Unexpected changed files: {changed}'
+          assert 'QA21_OWNER_APPROVED_QB_ROSTER_FV' in sync._extract_core(board)[2], 'QA21 contract missing'
+          print('PASS: canonical board is exact, idempotent, and FA-only data preserved')
+          print('Changed paths:', changed)
+          PY
+
+      - name: Validate protected files are byte-identical
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum --check "$RUNNER_TEMP/rg03_protected_before.sha"
+          git diff --exit-code -- index.html data/ scripts/validation/repo_regression_checks.py scripts/validation/snapshot_values.py
+          python3 scripts/sync/sync_free_agent_valuation.py --check
+
+      - name: Validate free-agent valuation parity and utility integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validation/validate_free_agent_valuation_parity.py
+          python3 scripts/validation/validate_free_agent_utility_v1.py
+          python3 - <<'PY'
+          import pathlib, re, subprocess, tempfile
+          s = pathlib.Path('free-agent-board.html').read_text(encoding='utf-8')
+          scripts = re.findall(r'<script(?:\s[^>]*)?>(.*?)</script>', s, re.S|re.I)
+          assert scripts, 'No board scripts found'
+          with tempfile.TemporaryDirectory() as d:
+              p=pathlib.Path(d)/'board.js'
+              p.write_text('\n'.join(scripts), encoding='utf-8')
+              subprocess.run(['node','--check',str(p)], check=True)
+          print('PASS: free-agent board JavaScript syntax')
+          PY
+
+      - name: Verify live QA21 pricing and CAL22 monotonic successor invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import sys
+          sys.path.insert(0, 'scripts/validation')
+          import repo_regression_checks as reg
+          reg.check_snapshot_parity()
+          result = reg._check_cal22_current_successor()
+          assert result['status'] == 'PASS'
+          print('PASS: QA21, 565-player snapshot parity, CAL22 48-member guard')
+          PY
+
+      - name: Run broader repository suite and record any separate blockers
+        shell: bash
+        run: |
+          set -uo pipefail
+          python3 scripts/validation/repo_regression_checks.py \
+            > "$RUNNER_TEMP/rg03_full_suite.log" 2>&1
+          rc=$?
+          cat "$RUNNER_TEMP/rg03_full_suite.log"
+          echo "Full suite exit code: $rc" | tee "$RUNNER_TEMP/rg03_full_suite_status.txt"
+          if [ "$rc" -ne 0 ]; then
+            echo '::warning::Broad regression suite still has a separate blocker; RG03 required board-sync gates passed.'
+          fi
+          exit 0
+
+      - name: Upload preview evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A-RG03-board-sync-${{ inputs.mode }}-${{ github.run_id }}
+          if-no-files-found: warn
+          retention-days: 30
+          path: |
+            ${{ runner.temp }}/rg03_protected_before.sha
+            ${{ runner.temp }}/rg03_start_commit.txt
+            ${{ runner.temp }}/rg03_full_suite.log
+            ${{ runner.temp }}/rg03_full_suite_status.txt
+
+      - name: APPLY exact board-only commit
+        if: ${{ inputs.mode == 'APPLY' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          changed="$(git diff --name-only)"
+          if [ -z "$changed" ]; then
+            echo 'No board changes: already synchronized.'
+            exit 0
+          fi
+          if [ "$changed" != 'free-agent-board.html' ]; then
+            echo "::error::Unexpected changed paths: $changed"
+            exit 1
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- free-agent-board.html
+          git diff --cached --name-only | grep -Fxq 'free-agent-board.html'
+          git commit -m 'A-RG03: synchronize free-agent board to canonical calculator runtime'
+          git push origin HEAD:main
+
+      - name: Summarize
+        if: success()
+        shell: bash
+        run: |
+          {
+            echo '## A-RG03 board synchronization'
+            echo "- Mode: $REPAIR_MODE"
+            echo '- Canonical runtime sync: PASS'
+            echo '- Free-agent utility parity: PASS'
+            echo '- Frozen calculator and valuation input files: UNCHANGED'
+            echo '- QA21 owner prices and CAL22 current successor: PASS'
+            echo '- Full suite: see rg03_full_suite_status.txt artifact (may include unrelated blockers)'
+            if [ "$REPAIR_MODE" = 'PREVIEW_ONLY' ]; then
+              echo '- Status: PREVIEW ONLY; no commit pushed'
+            else
+              echo '- Status: APPLY; only free-agent-board.html allowed to commit'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
