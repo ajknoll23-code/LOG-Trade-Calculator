@@ -1,0 +1,452 @@
+name: A-NL19R1 - LOG Aftermath Phone-First PDF Shadow (Read Only)
+run-name: A-NL19R1 Week ${{ inputs.target_week }} - mobile Aftermath PDF, verified finals
+
+'on':
+  workflow_dispatch:
+    inputs:
+      target_week:
+        description: 'NFL postgame week 1-18; auto uses last completed Sleeper week'
+        required: true
+        type: string
+        default: 'auto'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: log-aftermath-mobile-shadow-readonly
+  cancel-in-progress: false
+
+jobs:
+  shadow-pdf:
+    name: Render league-validated Aftermath PDF without publishing
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check out main read-only
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned PDF renderer
+        run: python3 -m pip install --disable-pip-version-check --no-cache-dir 'weasyprint==68.0' 'pymupdf==1.26.5'
+      - name: Stage phone-first Aftermath renderer and self-test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/log_aftermath_shadow.py" <<'PY'
+          #!/usr/bin/env python3
+          """Read-only LOG Aftermath shadow. Public Sleeper league results only. No FA research."""
+          from __future__ import annotations
+          import argparse, importlib.util, json, math, os, pathlib, statistics, sys
+          from datetime import datetime,timezone
+          from html import escape
+          from collections import defaultdict
+
+          ROOT=pathlib.Path(os.environ.get('GITHUB_WORKSPACE','/mnt/data/loog_source'))
+          SEASON=2026
+          LID='1326679131051532288'
+
+          def h(x):return escape(str(x),quote=True)
+
+          def reuse():
+              # Reuse the previously verified LOG site-logo and Sleeper six-matchup guards.
+              source=ROOT/'.github/workflows/A-NL15R1.yml'
+              content=source.read_text(encoding='utf-8')
+              start='          cat > "$RUNNER_TEMP/log_pregame_shadow.py" <<\'PY\'\n'
+              if start not in content:raise RuntimeError('A-NL15R1 source anchor absent; cannot safely reuse parser')
+              script=content.split(start,1)[1].split('\n          PY\n',1)[0]
+              text='\n'.join(line[10:] if line.startswith('          ') else line for line in script.splitlines())
+              path=pathlib.Path(os.environ.get('RUNNER_TEMP','/tmp'))/'log_nl16_shared'/'src'/'log_nl15_shared.py'
+              path.parent.mkdir(parents=True,exist_ok=True)
+              path.write_text(text+'\n',encoding='utf-8')
+              spec=importlib.util.spec_from_file_location('log_nl15_shared',path)
+              module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+              return module
+
+          def replay(src, rows_by_week, n, ids):
+              rows={i:{'wins':0,'losses':0,'ties':0,'pf':0.0,'pa':0.0} for i in ids}
+              for week in range(1,n+1):
+                  grp=src.pairing(rows_by_week[week],ids)
+                  pts={int(r['roster_id']):src.points(r) for g in grp for r in g}
+                  if any(v is None for v in pts.values()):raise RuntimeError(f'Week {week} incomplete')
+                  median=statistics.median(pts.values())
+                  for a,b in grp:
+                      ia,ib=int(a['roster_id']),int(b['roster_id']);x,y=pts[ia],pts[ib]
+                      rows[ia]['pf']+=x;rows[ib]['pf']+=y
+                      rows[ia]['pa']+=y;rows[ib]['pa']+=x
+                      if x>y:rows[ia]['wins']+=1;rows[ib]['losses']+=1
+                      elif y>x:rows[ib]['wins']+=1;rows[ia]['losses']+=1
+                      else:rows[ia]['ties']+=1;rows[ib]['ties']+=1
+                  for rid,p in pts.items():
+                      key='wins' if p>median else 'losses' if p<median else 'ties';rows[rid][key]+=1
+              return rows
+
+          def standings(records,names):
+              return sorted([{'id':rid,'name':names[rid],**v} for rid,v in records.items()],key=lambda x:(-x['wins'],-x['pf'],x['id']))
+
+          def power(records,names):
+              pf_order=sorted(records,key=lambda k:(-records[k]['pf'],k))
+              perc={rid:(11-i)/11 for i,rid in enumerate(pf_order)}
+              a=[]
+              for rid,v in records.items():
+                  denom=v['wins']+v['losses']+v['ties']
+                  wr=(v['wins']+v['ties']*.5)/denom if denom else 0.0
+                  a.append({'id':rid,'name':names[rid],'score':round(60*wr+40*perc[rid],2),
+                    'wins':v['wins'],'losses':v['losses'],'pf':round(v['pf'],2),'win_pct':round(wr,4),'pf_percentile':round(perc[rid]*100,2)})
+              return sorted(a,key=lambda x:(-x['score'],-x['wins'],-x['pf'],x['id']))
+
+          def lookup_player_names():
+              # Never read free_agents.json, private FA utility, or player availability.
+              cache=ROOT/'data/league_rosters.json'
+              if not cache.exists():return {}
+              data=json.loads(cache.read_text(encoding='utf-8'));out={}
+              for r in data.get('rosters',[]):
+                  for section in ('starters','bench','taxi','reserve_ir'):
+                      for p in (r.get(section) or []):
+                          if isinstance(p,dict) and p.get('name') and p.get('player_id'):
+                              out[str(p['player_id'])]=str(p['name'])
+              return out
+
+          def named_transactions(src,week,names,lookup):
+              result=[]
+              for w in sorted({max(week-1,1),week}):
+                  for t in src.get(f'league/{LID}/transactions/{w}') or []:
+                      if t.get('status')!='complete' or t.get('type') not in ('trade','waiver','free_agent'):continue
+                      actors=[names.get(int(x)) for x in t.get('roster_ids',[]) if str(x).isdigit()]
+                      actors=[x for x in actors if x]
+                      if not actors:continue
+                      added=[lookup.get(str(x)) for x in (t.get('adds') or {})]
+                      dropped=[lookup.get(str(x)) for x in (t.get('drops') or {})]
+                      details=[]
+                      added=[x for x in added if x];dropped=[x for x in dropped if x]
+                      if added:details.append('added '+', '.join(added[:3]))
+                      if dropped and t['type']!='trade':details.append('dropped '+', '.join(dropped[:3]))
+                      draft=len(t.get('draft_picks') or [])
+                      if draft:details.append(f'{draft} draft picks involved')
+                      if details:result.append({'week':w,'text':', '.join(actors)+': '+'; '.join(details)})
+              return result[:8]
+
+          def build(src,week):
+              state=src.get('state/nfl')
+              if str(state.get('season'))!=str(SEASON):raise RuntimeError('Sleeper year mismatch')
+              current=int(state.get('week') or 0)
+              if not 1<=week<current:raise RuntimeError('Refusing to recap current/uncompleted week')
+              league=src.get(f'league/{LID}')
+              if str(league.get('season'))!=str(SEASON):raise RuntimeError('League season mismatch')
+              rosters=src.get(f'league/{LID}/rosters')
+              names=src.team_names(rosters,src.get(f'league/{LID}/users'))
+              ids=set(names)
+              data={w:src.get(f'league/{LID}/matchups/{w}') for w in range(1,week+1)}
+              for w in data:src.pairing(data[w],ids)
+              records=replay(src,data,week,ids)
+              prev=replay(src,data,week-1,ids) if week>1 else None
+              nowrank=standings(records,names)
+              prevrank=standings(prev,names) if prev else []
+              before={r['id']:i+1 for i,r in enumerate(prevrank)}
+              rankchanges=[{'team':x['name'],'from':before.get(x['id']),'to':i+1,
+                            'delta':(before[x['id']]-i-1) if x['id'] in before else None}
+                           for i,x in enumerate(nowrank)]
+              parity='NOT_CHECKED_HISTORICAL_WEEK'
+              if week==current-1:
+                  bad=[]
+                  for r in rosters:
+                      v=records[int(r['roster_id'])];s=r.get('settings') or {}
+                      for key in ('wins','losses','ties'):
+                          if float(s.get(key) or 0)!=v[key]:bad.append((r['roster_id'],key))
+                  if bad:raise RuntimeError(f'Live record replay mismatch: {bad[:4]}')
+                  parity='H2H_PLUS_MEDIAN_REPLAY_MATCHES_LIVE_RECORDS'
+              rows=src.pairing(data[week],ids)
+              med=statistics.median([src.points(r) for g in rows for r in g])
+              finals=[]
+              for g in rows:
+                  a,b=g;ia,ib=int(a['roster_id']),int(b['roster_id']);x,y=src.points(a),src.points(b)
+                  finals.append({'a':ia,'b':ib,'name_a':names[ia],'name_b':names[ib],
+                      'score_a':round(x,2),'score_b':round(y,2),'margin':round(abs(x-y),2),
+                      'winner':names[ia] if x>y else names[ib] if y>x else 'Tie',
+                      'median_a':'W' if x>med else 'L' if x<med else 'T',
+                      'median_b':'W' if y>med else 'L' if y<med else 'T'})
+              lookup=lookup_player_names()
+              mvp=None
+              for g in rows:
+                  for r in g:
+                      pp=r.get('players_points') or {}
+                      for pid in (r.get('starters') or []):
+                          pts=pp.get(str(pid))
+                          if not isinstance(pts,(float,int)) or not math.isfinite(pts) or pts<0:continue
+                          if str(pid) not in lookup:continue
+                          row={'name':lookup[str(pid)],'points':round(float(pts),2),'team':names[int(r['roster_id'])]}
+                          if mvp is None or row['points']>mvp['points']:mvp=row
+              hscore=max(((src.points(r),names[int(r['roster_id'])]) for g in rows for r in g),key=lambda x:x[0])
+              up=sorted([x for x in rankchanges if x['delta'] and x['delta']>0],key=lambda r:(-r['delta'],r['to']))
+              down=sorted([x for x in rankchanges if x['delta'] and x['delta']<0],key=lambda r:(r['delta'],r['to']))
+              lucky=[]
+              for g in finals:
+                  for k in ('a','b'):
+                      if g['winner']==g['name_'+k] and g['median_'+k]=='L':
+                          lucky.append({'team':g['winner'],'score':g['score_'+k],
+                            'below_median':round(med-g['score_'+k],2)})
+              lucky.sort(key=lambda x:-x['below_median'])
+              teaser='data not provided'
+              if week+1<=18:
+                  try:
+                      nxt=src.pairing(src.get(f'league/{LID}/matchups/{week+1}'),ids)
+                      p=max(nxt,key=lambda g:sum(records[int(r['roster_id'])]['wins'] for r in g))
+                      a,b=[int(r['roster_id']) for r in p]
+                      teaser=f"Week {week+1}: {names[a]} ({records[a]['wins']}-{records[a]['losses']}) vs {names[b]} ({records[b]['wins']}-{records[b]['losses']}); {records[a]['wins']+records[b]['wins']} combined wins."
+                  except (RuntimeError,ValueError):pass
+              return {'season':SEASON,'league':league.get('name') or 'League of Ordinary Gentlemen',
+                'league_id':LID,'edition':'post','week':week,'games':finals,'median':round(med,2),
+                'high_score_team':{'team':hscore[1],'points':round(hscore[0],2)},'mvp':mvp,
+                'bench_crime':'data not provided — no verified position-legal lineup optimization',
+                'receipts':'data not provided — no archived immutable newsletter predictions',
+                'standings_movement':rankchanges,'riser':up[0] if up else None,'faller':down[0] if down else None,
+                'lucky':lucky[0] if lucky else None,'power_rankings':power(records,names),
+                'power_formula':'60 × (H2H+median win percentage) + 40 × season PF percentile (0 to 1)',
+                'transactions':named_transactions(src,week,names,lookup),'teaser':teaser,
+                'record_parity':parity,'standings_label':'PROVISIONAL_WINS_THEN_PF__OFFICIAL_TIEBREAK_UNVERIFIED',
+                'picks_archived':False,'publication_authorized':False,
+                'privacy_contract':'PRIVATE_FREE_AGENT_RESEARCH_NEVER_READ_OR_PUBLISHED',
+                'source':'Public Sleeper league API + repo roster identity labels only',
+                'generated_at_utc':datetime.now(timezone.utc).isoformat()}
+
+          def render(d,logo):
+              jokes=[
+                'There is a {margin:.1f}-point difference between a victory lap and a very long Monday.',
+                'The losing side has exactly {margin:.1f} points of evidence to appeal. No refunds.',
+                'The scoreboard delivered a {margin:.1f}-point verdict and did not ask for rebuttal.',
+                'A {margin:.1f}-point deficit: less of a rivalry, more of an audited shortfall.',
+                'Put that {margin:.1f}-point margin on the fridge. Someone earned it.',
+                'This one ended {margin:.1f} points apart. The group chat has documentation.'
+              ]
+              cards=[]
+              for i,g in enumerate(d['games']):
+                  joke=jokes[i].format(margin=g['margin'])
+                  cards.append(f"<div class='card'><div class='tag'>FINAL {i+1:02d}</div><h3>{h(g['name_a'])} <span>vs</span> {h(g['name_b'])}</h3>"
+                    f"<div class='result'>{g['score_a']:.2f} <i>–</i> {g['score_b']:.2f}</div>"
+                    f"<p class='detail'><b>Winner:</b> {h(g['winner'])} · <b>Margin:</b> {g['margin']:.2f} · <b>Median:</b> {g['median_a']}/{g['median_b']}</p>"
+                    f"<p>{h(joke)}</p></div>")
+              mvp=d['mvp']
+              mvp_text=(f"<b>{h(mvp['name'])}</b> scored <b>{mvp['points']:.2f}</b> points as a starter for {h(mvp['team'])}."
+                if mvp else '<b>data not provided</b> — reliable named player-point evidence unavailable.')
+              top=d['high_score_team'];mvp_text+=f"<br><b>{h(top['team'])}</b> led the league with <b>{top['points']:.2f}</b> team points."
+              def movement(r,verb):
+                  return (f"{h(r['team'])} {verb} <b>{abs(r['delta'])}</b> provisional position(s), from #{r['from']} to #{r['to']}." if r
+                    else 'No verified movement in this direction.')
+              lucky=d['lucky'];luck=(f"{h(lucky['team'])} won the H2H while scoring <b>{lucky['below_median']:.2f}</b> below the {d['median']:.2f}-point median."
+                 if lucky else f"No H2H winner finished below the {d['median']:.2f}-point median; no lucky-winner award.")
+              transactions=''.join(f"<li>{h(x['text'])}</li>" for x in d['transactions']) or '<li>Completed moves with verifiable player names: data not provided.</li>'
+              power=''.join(f"<div class='rank'><span>{i+1:02d}</span><strong>{h(r['name'])}</strong><b>{r['score']:.1f}</b><small>{r['wins']}-{r['losses']} · {r['pf']:,.1f} PF</small></div>" for i,r in enumerate(d['power_rankings']))
+              return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><title>LOG The Aftermath W{d['week']}</title><style>
+              @page{{size:letter;margin:13mm 12mm 13mm 12mm;@bottom-right{{content:'LOG • SHADOW AFTERMATH · ' counter(page);font-size:8px;color:#a1b6c8}}}}
+              *{{box-sizing:border-box}}html,body{{margin:0;background:#0E2841;color:#F8FAFC;font:10.5px/1.52 Arial,sans-serif;print-color-adjust:exact}}
+              .cover{{background:#16324F;border:1px solid #33516e;border-radius:8px;padding:17px 19px;display:flex;align-items:center;gap:16px;break-inside:avoid}}
+              .cover img{{width:74px;object-fit:contain}}.cover h1{{font:bold 32px/1 Arial,sans-serif;text-transform:uppercase;letter-spacing:1px;margin:7px 0}}
+              .tag,.smallcaps{{font:bold 9px/1.4 Arial,sans-serif;text-transform:uppercase;letter-spacing:1.3px;color:#EB6261}}.sub,.detail,small{{color:#B5C4D6}}
+              .stamp{{border:1px solid #EB6261;border-radius:30px;color:#EB6261;display:inline-block;padding:4px 9px;margin-top:10px;font:9px Arial,sans-serif;letter-spacing:.8px}}
+              h2{{font: bold 15px/1.2 Arial,sans-serif;letter-spacing:.5px;border-bottom:1px solid #36516b;text-transform:uppercase;margin:19px 0 8px;padding-bottom:5px}}
+              .grid,.twocol,.rankgrid{{display:grid;grid-template-columns:1fr 1fr;gap:9px}}.card,.panel{{background:#16324F;border:1px solid #33516e;border-radius:7px;padding:10px 12px;break-inside:avoid}}
+              .card h3{{font-size:12px;margin:7px 0 3px;line-height:1.3}}.card h3 span{{font-size:9px;color:#EB6261;margin:0 3px}}.card .result{{font:bold 17px/1.3 Arial;margin-top:4px}}
+              .result i{{font-style:normal;color:#EB6261}}.card p{{margin:6px 0}}.detail{{font-size:9px}}.panel h3{{font-size:10.5px;color:#EB6261;margin:0 0 7px}}
+              .panel ul{{padding-left:17px;margin:3px 0}}.panel li{{margin:5px 0}}.rank{{background:#16324F;border:1px solid #33516e;border-radius:5px;padding:6px 8px;display:grid;grid-template-columns:23px 1fr 37px;gap:4px;break-inside:avoid}}
+              .rank span{{color:#EB6261;font-weight:bold}}.rank strong{{font-size:9.4px}}.rank b{{color:#3FCB7C;text-align:right}}.rank small{{grid-column:2 / 4;font-size:8.5px}}.foot{{margin-top:13px;padding-top:7px;border-top:1px solid #33516e;color:#B5C4D6;font-size:8.5px}}
+              </style></head><body><header class='cover'><img src='{logo}' alt='Original LOG Calculator logo'><div><div class='tag'>League of Ordinary Gentlemen · {d['season']} · Week {d['week']}</div><h1>The Aftermath</h1><div class='sub'>Postgame Edition · Final scores, receipts and earned bragging rights</div></div></header>
+              <div class='stamp'>SHADOW PREVIEW · NO PICKS ARCHIVED</div>
+              <h2>01 / Final Scores and Awards</h2><div class='grid'>{''.join(cards)}</div><div class='twocol' style='margin-top:9px'><div class='panel'><h3>MVP of the Week</h3><p>{mvp_text}</p></div><div class='panel'><h3>Bench Crime of the Week</h3><p>Not awarded: {h(d['bench_crime'])}. No invented legal lineup swaps.</p></div></div>
+              <h2>02 / The Receipts</h2><div class='panel'><p>{h(d['receipts'])}. The historical record begins with the first immutable published picks, not backfilled guesses.</p></div>
+              <h2>03 / Standings Movement</h2><div class='panel'><p><b>Riser:</b> {movement(d['riser'],'climbed')}</p><p><b>Faller:</b> {movement(d['faller'],'fell')}</p><p><b>Lucky:</b> {luck}</p><p class='detail'>Provisional rank movement uses wins then PF (official Sleeper tiebreak not verified). Records include both H2H and median outcomes. {h(d['record_parity'])}.</p></div>
+              <h2>04 / Transactions Recap</h2><div class='panel'><ul>{transactions}</ul></div>
+              <h2>05 / Power Rankings</h2><p class='detail'>Formula: 60% H2H+median win rate + 40% season PF percentile. Editorial score, not official Sleeper order.</p><div class='rankgrid'>{power}</div>
+              <h2>06 / Next Week's Big Matchup</h2><div class='panel'><p>{h(d['teaser'])}</p></div>
+              <p class='foot'>Source: Sleeper public league API · {h(d['generated_at_utc'])}. Missing evidence labeled. Private FA rankings, available-player research and waiver-target recommendations not read or published. No email, picks archive, or calculator changes.</p></body></html>'''
+
+          """Phone-first presentation-only transformation for verified LOG Aftermath HTML."""
+          import re
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+
+          MOBILE_CSS = r'''
+          @page {
+            size: 4.25in 12in;
+            margin: 7mm 7mm 11mm 7mm;
+            @bottom-right {content: 'LOG / THE AFTERMATH · ' counter(page);font: 9.75pt Arial,sans-serif;color:#B5C4D6}
+          }
+          html,body {background:#0E2841 !important;color:#F8FAFC !important;font:11pt/1.54 Arial,sans-serif !important;
+            -webkit-print-color-adjust:exact;print-color-adjust:exact;overflow-wrap:anywhere;word-break:normal}
+          body {width:100%;max-width:100%;padding:0;}
+          .cover {display:block !important;padding:16px 16px 14px !important;margin-bottom:10px;border:1px solid #33516e;
+            border-radius:9px;background:#16324F;break-inside:avoid}
+          .cover img {display:block;width:63px !important;height:auto;margin-bottom:8px}
+          .cover h1 {font:bold 25pt/1.1 Arial,sans-serif !important;margin:8px 0 6px !important;letter-spacing:.02em;
+            overflow-wrap:anywhere}
+          .cover .tag {font-size:9.75pt !important;letter-spacing:.07em !important}
+          .sub {font-size:10.75pt;line-height:1.45}
+          .stamp {display:block;text-align:center;font-size:9.75pt !important;letter-spacing:.03em !important;
+            margin:0 0 11px;padding:7px 9px;}
+          .section {border:1px solid #33516e;background:#102D49;border-radius:8px;padding:13px 13px 10px;
+            margin:0 0 11px;overflow-wrap:anywhere}
+          .section h2 {border-bottom:1px solid #36516b;letter-spacing:.03em;margin:0 0 12px !important;
+            padding:0 0 7px !important;font:bold 13pt/1.25 Arial,sans-serif !important;color:#F8FAFC;
+            break-after:avoid;}
+          .grid,.twocol,.rankgrid {display:block !important;grid-template-columns:none !important;gap:0 !important}
+          .card,.panel,.rank {display:block;background:#16324F !important;border:1px solid #33516e;
+            padding:12px 12px !important;border-radius:7px;margin:0 0 9px;break-inside:avoid;max-width:100%}
+          .card h3 {font-size:12.5pt !important;line-height:1.38 !important;margin:5px 0 7px !important;overflow-wrap:anywhere}
+          .card h3 span {font-size:9.75pt !important}
+          .card .result {font-size:18pt !important;margin:4px 0 !important}
+          .card p,.panel p {font-size:10.75pt !important;line-height:1.5;margin:7px 0 !important;}
+          .detail,.panel li {font-size:10pt !important;line-height:1.52;color:#CCD8E4 !important}
+          .panel h3 {font-size:11.5pt !important;line-height:1.34;color:#EB6261 !important;margin:0 0 9px !important}
+          .panel ul {padding-left:18px;margin:3px 0}
+          .panel li {margin:7px 0}
+          .rank {display:grid !important;grid-template-columns:28px minmax(0,1fr) 45px !important;gap:5px 7px !important;
+            align-items:start;margin:0 0 6px;padding:10px !important;}
+          .rank > span {font-size:10.5pt;color:#EB6261}
+          .rank > strong {font-size:10.5pt !important;min-width:0;overflow-wrap:anywhere}
+          .rank > b {font-size:10.5pt !important;text-align:right;color:#3FCB7C}
+          .rank > small {grid-column:2 / 4;display:block;color:#B5C4D6 !important;font-size:9.75pt !important}
+          .tag {font-size:9.75pt !important}
+          .foot {font-size:9.75pt !important;line-height:1.5;color:#CCD8E4 !important;
+            background:#16324F;border:1px solid #33516e;border-radius:7px;margin:9px 0 0;padding:12px 13px !important;
+            overflow-wrap:anywhere;}
+          .section > .detail {font-size:10pt !important;}
+          '''
+
+          def mobile_polish(html,payload):
+              """Keep all evidence numbers; replace only presentation, footer timestamp."""
+              assert html.count('</style>') == 1
+              html = html.replace('</style>', MOBILE_CSS + '</style>', 1)
+              seen=[]
+              def heading(m):
+                  label=m.group(1)
+                  num=int(label[:2])
+                  assert num == len(seen)+1, f'Unexpected Aftermath section order: {label}'
+                  seen.append(num)
+                  return ("</section>" if num>1 else "") + "<section class='section'><h2>"+label+"</h2>"
+              html = re.sub(r'<h2>(0[1-6] / [^<]+)</h2>',heading,html)
+              assert seen==[1,2,3,4,5,6],seen
+              assert html.count("<p class='foot'>")==1
+              html=html.replace("<p class='foot'>","</section><p class='foot'>",1)
+              stamp=payload.get('generated_at_utc')
+              assert stamp and stamp in html, 'Data timestamp not found in source HTML'
+              local=datetime.fromisoformat(stamp.replace('Z','+00:00')).astimezone(ZoneInfo('America/Phoenix'))
+              human=local.strftime('Data as of %b %-d, %Y, %-I:%M %p Arizona time')
+              html=html.replace(stamp,human)
+              assert 'size: 4.25in 12in' in html
+              assert 'data/free_agents.json' not in html
+              assert all(s not in html for s in ('Unrostered Players to Investigate','Free agent watch','Add of the Week'))
+              return html
+
+          def main():
+              p=argparse.ArgumentParser();p.add_argument('--week',default='auto');p.add_argument('--out',default='out/log-aftermath-shadow');p.add_argument('--selftest',action='store_true')
+              args=p.parse_args()
+              if args.selftest:
+                  x=[{'matchup_id':(i+1)//2,'roster_id':i,'points':90+i} for i in range(1,13)]
+                  # Tests for six unique complete pairs; malformed sources fail closed.
+                  src=reuse();assert len(src.pairing(x))==6
+                  try:src.pairing(x[:-1])
+                  except RuntimeError:pass
+                  else:raise AssertionError('Incomplete matchup accepted')
+                  print('SELFTEST PASS');return
+              src=reuse();current=int(src.get('state/nfl')['week']);week=(current-1 if args.week=='auto' else int(args.week))
+              payload=build(src,week);logo,logo_hash=src.logo_from_site(ROOT/'index.html');payload['official_logo_png_sha256']=logo_hash
+              html=mobile_polish(render(payload,logo),payload)
+              assert html.count("class='section'") == 6, 'Expected six boxed editorial sections'
+              assert 'size: 4.25in 12in' in html
+              assert 'Arizona time' in html
+              assert len(payload['power_rankings']) == 12
+              out=pathlib.Path(args.out);out.mkdir(parents=True,exist_ok=True)
+              base=out/f'LOG-{SEASON}-W{week:02d}-THE-AFTERMATH-MOBILE-R1-SHADOW'
+              base.with_suffix('.json').write_text(json.dumps(payload,indent=2,ensure_ascii=False)+'\n',encoding='utf-8')
+              base.with_suffix('.html').write_text(html,encoding='utf-8')
+              from weasyprint import HTML
+              HTML(string=html,base_url=str(ROOT)).write_pdf(base.with_suffix('.pdf'))
+              pdf=base.with_suffix('.pdf').read_bytes()
+              if not pdf.startswith(b'%PDF-') or len(pdf)<15000:raise RuntimeError('Bad/missing PDF')
+              import fitz
+              pdf_doc=fitz.open(base.with_suffix('.pdf'))
+              font_sizes=[]
+              for page in pdf_doc:
+                  if abs(page.rect.width-306)>1 or abs(page.rect.height-864)>1:
+                      raise RuntimeError('PDF no longer uses the approved phone-first page size')
+                  for block in page.get_text('dict')['blocks']:
+                      for line in block.get('lines',[]):
+                          for span in line['spans']:
+                              if not span['text'].strip():continue
+                              font_sizes.append(span['size'])
+                              rect=fitz.Rect(span['bbox'])
+                              if not page.rect.contains(rect):
+                                  raise RuntimeError('PDF text outside page bounds: '+span['text'][:80])
+                              if any(v in span['text'] for v in ('&lt;','&gt;','&#x27;')):
+                                  raise RuntimeError('Double-escaped text leaked into PDF')
+              if not font_sizes or min(font_sizes)<9.7:
+                  raise RuntimeError('PDF font too small: '+str(min(font_sizes) if font_sizes else 'none'))
+              print('Mobile PDF checks passed: pages',len(pdf_doc),'minimum font',round(min(font_sizes),2))
+              pdf_doc.close()
+              assert len(payload['games'])==6 and len(set([g[k] for g in payload['games'] for k in ('a','b')]))==12
+              assert payload['picks_archived'] is False and payload['publication_authorized'] is False
+              assert not any(x in payload for x in ('free_agents','waiver_board','targets'))
+              for banned in ('Unrostered Players to Investigate','Add of the Week','Free agent watch'):
+                  if banned in html:raise RuntimeError(f'Private player content reappeared: {banned}')
+              print(f'PASS Week {week}: 6 final matchups, 12 teams, no private FA data, LOG logo {logo_hash}, PDF bytes={len(pdf)}')
+          if __name__=='__main__':main()
+          PY
+          python3 -m py_compile "$RUNNER_TEMP/log_aftermath_shadow.py"
+          python3 "$RUNNER_TEMP/log_aftermath_shadow.py" --selftest
+      - name: Render mobile Aftermath for completed week
+        shell: bash
+        env:
+          TARGET_WEEK: ${{ inputs.target_week }}
+        run: |
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/log_aftermath_shadow.py" --week "$TARGET_WEEK" --out "$RUNNER_TEMP/log-aftermath-pdf"
+          python3 - <<'PY'
+          import json,os,pathlib
+          folder=pathlib.Path(os.environ['RUNNER_TEMP'])/'log-aftermath-pdf'
+          docs=list(folder.glob('*.json'))
+          assert len(docs)==1, docs
+          data=json.loads(docs[0].read_text(encoding='utf-8'))
+          assert len(data['games'])==6
+          assert len(set(g[k] for g in data['games'] for k in ('a','b')))==12
+          assert data['edition']=='post'
+          assert data['picks_archived'] is False and data['publication_authorized'] is False
+          assert data['record_parity']=='H2H_PLUS_MEDIAN_REPLAY_MATCHES_LIVE_RECORDS' or data['record_parity']=='NOT_CHECKED_HISTORICAL_WEEK'
+          assert len(data['power_rankings'])==12
+          assert not any(k in data for k in ('free_agents','waiver_targets','waiver_board','best_free_agents'))
+          assert data['privacy_contract']=='PRIVATE_FREE_AGENT_RESEARCH_NEVER_READ_OR_PUBLISHED'
+          pdf=list(folder.glob('*.pdf'))
+          assert len(pdf)==1 and pdf[0].stat().st_size>15000
+          print(f'PASS: 12 teams, 6 finals, 12 power ranks, zero private FA data, PDF {pdf[0].stat().st_size} bytes')
+          PY
+      - name: Guard all calculator and frozen research files from changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain --untracked-files=all)"
+          echo 'PASS: no repository writes, no predictions archived, no emails'
+      - name: Upload phone-first Aftermath PDF and evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LOG-Aftermath-Mobile-R1-PDF-${{ github.run_id }}
+          path: ${{ runner.temp }}/log-aftermath-pdf/
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## LOG The Aftermath - evidence-only PDF shadow'
+            echo '- All six finalized games, H2H + median records, provisional rank changes'
+            echo '- Transparent 60% record + 40% PF percentile editorial power formula'
+            echo '- Bench-crime and archived receipts withheld until verified'
+            echo '- Original embedded LOG logo, navy/coral layout, PDF uploaded as artifact'
+            echo '- NO private free-agent research, NO email, NO archive/production changes'
+          } >> "$GITHUB_STEP_SUMMARY"
