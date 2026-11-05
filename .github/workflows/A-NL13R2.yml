@@ -1,0 +1,313 @@
+name: A-NL13R2 - LOG Pregame Data Audit (Read Only)
+run-name: A-NL13R2 Week ${{ inputs.target_week }} - evidence-only validation
+
+'on':
+  workflow_dispatch:
+    inputs:
+      target_week:
+        description: 'NFL pregame week 1-18; auto uses live Sleeper week'
+        required: true
+        type: string
+        default: 'auto'
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: Six-matchup and historical-standings audit, no publication
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      TARGET_WEEK: ${{ inputs.target_week }}
+    steps:
+      - name: Checkout main without write credentials
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Write frozen diagnostic to runner (never to repository)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/a_nl13r2_audit.py" <<'PY'
+          #!/usr/bin/env python3
+          """LOG pregame only: validate league data, no PDF and no picks write.
+
+          Script intentionally has no environment variables for SMTP and no
+          repository write operations. It reads public Sleeper API and config.
+          """
+          import hashlib
+          import json
+          import math
+          import os
+          import pathlib
+          import statistics
+          import sys
+          import time
+          from collections import defaultdict
+          from datetime import datetime, timezone
+          from urllib.request import Request, urlopen
+
+          API = 'https://api.sleeper.app/v1'
+          TARGET = os.environ.get('TARGET_WEEK', 'auto').strip()
+          DEST = pathlib.Path(os.environ.get('RUNNER_TEMP','/tmp')) / 'log_newsletter_diagnostics'
+          DEST.mkdir(parents=True, exist_ok=True)
+
+          def sha(obj):
+              normalized = json.dumps(obj, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+              return hashlib.sha256(normalized).hexdigest()
+
+          def fetch(path):
+              url = f'{API}/{path}'
+              last = None
+              for tries in range(3):
+                  try:
+                      with urlopen(Request(url, headers={'User-Agent':'LOG-newsletter-evidence-audit/1.0'}), timeout=22) as r:
+                          data = json.load(r)
+                      return data, {'source': url, 'fetched_at_utc': datetime.now(timezone.utc).isoformat(), 'canonical_json_sha256': sha(data)}
+                  except Exception as e:
+                      last = e
+                      if tries < 2: time.sleep(1 + tries)
+              raise RuntimeError(f'Unable to fetch {path}: {last}')
+
+          def pts(row):
+              v = row.get('custom_points')
+              if v is None: v = row.get('points')
+              if v is None: return None
+              v = float(v)
+              if not math.isfinite(v): raise ValueError('Nonfinite points')
+              return v
+
+          def pairs(rows):
+              if not isinstance(rows, list) or len(rows) != 12: raise ValueError('Expected exactly 12 Sleeper matchup rows')
+              groups=defaultdict(list)
+              for r in rows:
+                  if r.get('matchup_id') is None: raise ValueError('Missing matchup ID')
+                  groups[str(r['matchup_id'])].append(r)
+              if len(groups)!=6 or any(len(v)!=2 for v in groups.values()):
+                  raise ValueError('Not exactly six 2-team matchups')
+              seen=[int(x['roster_id']) for g in groups.values() for x in g]
+              if len(set(seen))!=12: raise ValueError('Duplicate roster in matchups')
+              return [sorted(g, key=lambda x:int(x['roster_id'])) for g in groups.values()]
+
+          def week_summary(rows):
+              pp=pairs(rows)
+              if any(pts(r) is None for g in pp for r in g):
+                  raise ValueError('Prior-week score missing; cannot treat as completed')
+              pf, pa={},{}
+              for a,b in pp:
+                  aid,bid=int(a['roster_id']),int(b['roster_id'])
+                  pf[aid], pf[bid] = pts(a), pts(b)
+                  pa[aid], pa[bid] = pts(b), pts(a)
+              med=statistics.median(pf.values())
+              return pp, pf, pa, med
+
+          def reconstruct(weeks, allids, include_median):
+              wins={i:0.0 for i in allids}
+              losses={i:0.0 for i in allids}
+              ties={i:0.0 for i in allids}
+              season_pf={i:0.0 for i in allids}
+              for w in weeks:
+                  for a,b in w['pairs']:
+                      aid,bid=int(a['roster_id']),int(b['roster_id'])
+                      x,y=pts(a),pts(b)
+                      season_pf[aid]+=x
+                      season_pf[bid]+=y
+                      if x>y: wins[aid]+=1; losses[bid]+=1
+                      elif y>x: wins[bid]+=1; losses[aid]+=1
+                      else: ties[aid]+=1; ties[bid]+=1
+                  if include_median:
+                      for i,x in w['pf'].items():
+                          if x>w['median']: wins[i]+=1
+                          elif x<w['median']: losses[i]+=1
+                          else: ties[i]+=1
+              return {str(i):{'wins':wins[i],'losses':losses[i],'ties':ties[i],'season_pf':round(season_pf[i],4)} for i in allids}
+
+          def parity_check(reconstructed, rosters, compare_pf=False):
+              mismatches=[]
+              for r in rosters:
+                  rid=str(r['roster_id'])
+                  settings=r.get('settings') or {}
+                  for name in ('wins','losses','ties'):
+                      live=float(settings.get(name) or 0)
+                      calc=float(reconstructed[rid][name])
+                      if abs(live-calc)>0.0001:
+                          mismatches.append({'roster_id':rid,'field':name,'live':live,'replayed':calc})
+                  if compare_pf:
+                      live_pf=settings.get('fpts')
+                      if live_pf is not None:
+                          live_pf=float(live_pf) + float(settings.get('fpts_decimal') or 0)/100
+                          calc_pf=float(reconstructed[rid]['season_pf'])
+                          if abs(live_pf-calc_pf)>0.05:
+                              mismatches.append({'roster_id':rid,'field':'season_pf','live':live_pf,'replayed':calc_pf})
+              return mismatches
+
+          def selftest():
+              rows=[]
+              for i in range(1,7):
+                  rows += [{'roster_id':2*i-1,'matchup_id':i,'points':50+i},
+                           {'roster_id':2*i,'matchup_id':i,'points':60+i}]
+              p, pf, pa, med = week_summary(rows)
+              assert len(p)==6 and len(pf)==12 and len(pa)==12
+              assert abs(med-statistics.median(range(51,57)))>0  # both sides represented
+              assert pa[1]==61 and pf[1]==51
+              rec=reconstruct([{'pairs':p, 'pf':pf, 'median':med}], list(range(1,13)), False)
+              assert rec['1']['losses']==1 and rec['2']['wins']==1
+              try:
+                  pairs(rows[:-1])
+              except ValueError: pass
+              else: raise AssertionError('Should reject partial week')
+              dup=[dict(r) for r in rows]
+              dup[-1]['roster_id']=1
+              try:
+                  pairs(dup)
+              except ValueError: pass
+              else: raise AssertionError('Should reject repeated team')
+              print('PASS: built-in strict matchup and historical-score tests')
+
+          def main():
+              selftest()
+              config=json.loads(pathlib.Path('config.json').read_text(encoding='utf-8'))
+              lid=str(config['league_id']); season=int(config['season'])
+              state,ss=fetch('state/nfl')
+              league,ls=fetch(f'league/{lid}')
+              rosters,rs=fetch(f'league/{lid}/rosters')
+              users,us=fetch(f'league/{lid}/users')
+              assert str(state.get('season'))==str(season), 'Live NFL season differs from repo config'
+              assert str(league.get('season'))==str(season), 'League season mismatch'
+              assert len(rosters)==12, 'Not 12 league rosters'
+              roster_ids=[int(r['roster_id']) for r in rosters]
+              assert len(set(roster_ids))==12 and len(set(str(r.get('owner_id')) for r in rosters))==12
+              current_week=int(state.get('week') or 0)
+              wk = current_week if TARGET.lower()=='auto' else int(TARGET)
+              assert 1<=wk<=18, 'Invalid target week'
+              assert wk<=current_week, 'Cannot inspect future week before the league advances'
+              current_rows,curmeta=fetch(f'league/{lid}/matchups/{wk}')
+              current_pairs=pairs(current_rows)
+              current_ids={int(r['roster_id']) for g in current_pairs for r in g}
+              assert current_ids==set(roster_ids), 'Matchups do not cover the actual twelve league rosters'
+              users_by_id={str(u.get('user_id')):u for u in users}
+              names={}
+              for r in rosters:
+                  owner=users_by_id.get(str(r.get('owner_id'))) or {}
+                  names[int(r['roster_id'])]=(owner.get('metadata') or {}).get('team_name') or owner.get('display_name') or f"Roster {r['roster_id']}"
+              history=[]; missing=[]; hashes={}
+              for prior in range(1,wk):
+                  rows,metadata=fetch(f'league/{lid}/matchups/{prior}')
+                  hashes[str(prior)]=metadata
+                  try:
+                      prs,pf,pa,med=week_summary(rows)
+                      if {int(r['roster_id']) for p in prs for r in p}!=set(roster_ids):
+                          raise ValueError("Previous week roster IDs do not align")
+                      history.append({'week':prior,'pairs':prs,'pf':pf,'pa':pa,'median':med})
+                  except (ValueError,TypeError) as exc:
+                      missing.append({'week':prior,'reason':str(exc)})
+              byweek={w['week']:w for w in history}
+              recent_three=list(range(max(1,wk-3),wk))
+              recent_six=list(range(max(1,wk-6),wk))
+              three_ready=len(recent_three)==3 and all(w in byweek for w in recent_three)
+              six_ready=len(recent_six)==6 and all(w in byweek for w in recent_six)
+              per_team={}
+              for rid in roster_ids:
+                  row={'team':names[rid],'roster_id':rid,'last_3_weeks':recent_three,'last_6_weeks':recent_six,
+                       'recent3_pf_total':None,'recent3_pa_total':None,'estimate_eligible_6_complete_weeks':six_ready}
+                  if three_ready:
+                      row['recent3_pf_total']=round(sum(byweek[w]['pf'][rid] for w in recent_three),3)
+                      row['recent3_pa_total']=round(sum(byweek[w]['pa'][rid] for w in recent_three),3)
+                  per_team[str(rid)]=row
+              games=[]
+              for a,b in current_pairs:
+                  x,y=int(a['roster_id']),int(b['roster_id'])
+                  gap=abs(per_team[str(x)]['recent3_pf_total']-per_team[str(y)]['recent3_pf_total']) if three_ready else None
+                  games.append({'matchup_id':a['matchup_id'],'a':x,'b':y,'team_a':names[x],'team_b':names[y],
+                                'recent3_pf_gap_points':round(gap,3) if gap is not None else None,
+                                'three_week_pf_pa_available':three_ready,
+                                'six_week_estimate_eligible':six_ready,'prediction_archived':False,
+                                'verified_injury_report':None})
+              games.sort(key=lambda g:int(g['matchup_id']))
+              replay_h2h=reconstruct(history,roster_ids,False)
+              replay_median=reconstruct(history,roster_ids,True)
+              h2h_mismatch=parity_check(replay_h2h,rosters)
+              med_mismatch=parity_check(replay_median,rosters)
+              mode=league.get('settings',{}).get('league_average_match')
+              if not missing and not h2h_mismatch and med_mismatch:
+                  record_parity='H2H_REPLAY_MATCHES_LIVE_RECORDS'
+              elif not missing and not med_mismatch and h2h_mismatch:
+                  record_parity='H2H_PLUS_MEDIAN_REPLAY_MATCHES_LIVE_RECORDS'
+              elif not missing and not med_mismatch and not h2h_mismatch:
+                  record_parity='BOTH_RECORD_REPLAYS_MATCH'
+              else:
+                  record_parity='MISMATCH_OR_UNVERIFIED'
+              result={
+                  'study_id':'LOG-newsletter-pregame-data-audit-v2','status':'READ_ONLY_DIAGNOSTIC',
+                  'generated_at_utc':datetime.now(timezone.utc).isoformat(),
+                  'league_name':league.get('name'),'league_id':lid,'season':season,'target_pregame_week':wk,
+                  'current_nfl_week':current_week,'six_current_matchups_validated':True,
+                  'twelve_unique_teams_validated':True,'three_completed_weeks_available':three_ready,
+                  'six_completed_weeks_available':six_ready,
+                  'completed_week_issues':missing,
+                  'record_parity_status':record_parity,'league_average_match_setting':mode,
+                  'h2h_only_replay_mismatch_count':len(h2h_mismatch),
+                  'h2h_plus_median_replay_mismatch_count':len(med_mismatch),
+                  'live_standings_rank_tiebreak_verified':False,
+                  'standings_rank_tiebreak_note':'Precise league ranking and tie order must be confirmed separately; records parity alone is insufficient.',
+                  'injury_data':'data not provided (no dated injury API audited)',
+                  'publishes_picks':False,'generates_pdf':False,'repository_modified':False,'sends_email':False,
+                  'matchups':games,'team_history':per_team,
+                  'source_hashes':{'state':ss,'league':ls,'rosters':rs,'users':us,'current_matchups':curmeta,'historical_matchups':hashes},
+              }
+              dst=DEST/f'LOG-{season}-W{wk:02d}-PREGAME-DATA-AUDIT.json'
+              dst.write_text(json.dumps(result,sort_keys=True,indent=2,ensure_ascii=False)+'\n',encoding='utf-8')
+              md=DEST/f'LOG-{season}-W{wk:02d}-PREGAME-DATA-AUDIT.md'
+              lines=[f'# LOG Week {wk} Pregame — Read-Only Evidence Audit','',
+                     '**No newsletter, PDF, email, or picks archive generated.**','',
+                     f"- League: {result['league_name']} ({lid})",
+                     f"- Current matchups: **6 pairs / 12 unique rosters — PASS**",
+                     f'- Three completed weeks for PF/PA: **{three_ready}**',
+                     f'- Six completed weeks for estimating picks: **{six_ready}**',
+                     f'- Record reconstruction: **{record_parity}**',
+                     '- Official standings rank/tiebreak parity: **UNVERIFIED** (do not publish rank movement yet)',
+                     '- Dated injury reports: **data not provided** (not audited by this workflow)',
+                     '', '## Matchup data coverage', '']
+              for g in games:
+                  gap=(f"{g['recent3_pf_gap_points']:.1f}" if g['recent3_pf_gap_points'] is not None else 'data not provided')
+                  lines.append(f"- **{g['team_a']} vs {g['team_b']}** — last-three PF gap {gap} points; six-week eligibility {g['six_week_estimate_eligible']}")
+              if missing:
+                  lines+=['','## Missing or incomplete prior weeks','']+[f"- W{x['week']:02d}: {x['reason']}" for x in missing]
+              lines+=['','## Next validation',
+                      'Confirm exact official standings and tiebreak semantics and dated injury-report source before publication.',
+                      'No origin picks were created or backdated.']
+              md.write_text('\n'.join(lines)+'\n',encoding='utf-8')
+              print(f'PASS: six valid current matchups, season {season}, Week {wk}')
+              print(f'Last-three complete: {three_ready}; last-six complete: {six_ready}')
+              print(f'Record parity: {record_parity}; official rank tiebreak: UNVERIFIED')
+              print(f'REPORT: {dst}')
+              print(f'REPORT: {md}')
+
+          if __name__=='__main__':
+              try: main()
+              except Exception as e:
+                  print('FAILED CLOSED: '+str(e),file=sys.stderr)
+                  raise
+          PY
+          python3 "$RUNNER_TEMP/a_nl13r2_audit.py"
+      - name: Verify no newsletter archive, production or frozen research was changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain --untracked-files=all)"
+          echo 'PASS: working tree unmodified, no picks ledger created, no PDF/email sent'
+      - name: Upload evidence-only audit for download
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LOG-pregame-data-audit-${{ github.run_id }}
+          path: ${{ runner.temp }}/log_newsletter_diagnostics/
+          if-no-files-found: warn
+          retention-days: 90
