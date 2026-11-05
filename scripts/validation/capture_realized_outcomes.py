@@ -364,13 +364,38 @@ def resolve_with_frozen_outcome_registry(player_db, current_projection_rows):
         removed = sorted(set(entries)-set(player_db))
         added = sorted(set(player_db)-set(entries))
         raise RuntimeError(f"Model identity pool changed; audit new identities first. added={added} removed={removed}")
+    # One audited historical position successor; frozen Week-6 records remain immutable.
+    current_positions = {k: player_db[k]["pos"] for k in sorted(player_db)}
     current_signature = json.dumps(
-        {k: player_db[k]["pos"] for k in sorted(player_db)},
-        sort_keys=True, separators=(",", ":"),
+        current_positions, sort_keys=True, separators=(",", ":"),
     )
     current_hash = hashlib.sha256(current_signature.encode()).hexdigest()
+    approved_position_successors = {}
     if current_hash != registry.get("model_key_pos_sha256"):
-        raise RuntimeError("Model position/identity signature differs from validated historical registry")
+        differences = {
+            key: (entries[key].get("model_pos"), current_positions[key])
+            for key in sorted(player_db)
+            if entries[key].get("model_pos") != current_positions[key]
+        }
+        expected = {"james pearce": ("LB", "DL")}
+        pearce = entries.get("james pearce") or {}
+        if differences != expected or not (
+            str(pearce.get("sleeper_id")) == "12585"
+            and pearce.get("pos") == "DL"
+            and "DL" in (pearce.get("fantasy_positions") or [])
+        ):
+            raise RuntimeError(
+                "Unapproved model position/identity change against frozen Week-6 registry: "
+                + json.dumps(differences, sort_keys=True)
+            )
+        historical_positions = dict(current_positions)
+        historical_positions["james pearce"] = "LB"
+        historical_signature = json.dumps(
+            historical_positions, sort_keys=True, separators=(",", ":"),
+        )
+        if hashlib.sha256(historical_signature.encode()).hexdigest() != registry.get("model_key_pos_sha256"):
+            raise RuntimeError("Frozen 565-player position signature cannot be reproduced")
+        approved_position_successors["james pearce"] = "12585"
 
     by_name, by_id = build_sleeper_identity_index(current_projection_rows)
     projected, _ = resolve_model_identities(
@@ -381,7 +406,11 @@ def resolve_with_frozen_outcome_registry(player_db, current_projection_rows):
     for key in sorted(player_db):
         frozen = entries[key]
         sid = str(frozen.get("sleeper_id") or "")
-        if not sid or frozen.get("model_pos") != player_db[key]["pos"]:
+        successor = approved_position_successors.get(key)
+        if not sid or (
+            frozen.get("model_pos") != player_db[key]["pos"]
+            and sid != successor
+        ):
             raise RuntimeError(f"Invalid frozen stable-ID record: {key}")
         fresh = projected.get(key)
         if fresh and fresh["sleeper_id"] != sid:
@@ -395,8 +424,11 @@ def resolve_with_frozen_outcome_registry(player_db, current_projection_rows):
             "model_pos": player_db[key]["pos"],
             "model_team": str(player_db[key].get("team") or "").upper(),
             "match_method": (
-                "historical_stable_id_reconfirmed_by_current_projection"
-                if fresh else "historical_stable_id_player_dropped_from_projection"
+                "audited_james_pearce_lb_to_dl_stable_id_successor"
+                if successor else (
+                    "historical_stable_id_reconfirmed_by_current_projection"
+                    if fresh else "historical_stable_id_player_dropped_from_projection"
+                )
             ),
         }
     if mismatch:
