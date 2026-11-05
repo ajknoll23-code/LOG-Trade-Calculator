@@ -181,6 +181,9 @@ def live_js_values():
         _extract_const_object(text, "PLAYER_DB"),
         _extract_const_object(text, "RB_BIRTH_DATE_DATA"),
         _extract_const_object(text, "CAL26_FV_OWNER_ANCHORS"),
+        # QA21 is part of the deployed playerValue() dependency graph.
+        # Include the live constant; never invent substitute pricing in tests.
+        _extract_const_object(text, "QA21_OWNER_APPROVED_QB_ROSTER_FV"),
         re.search(r"function normalizeName\(s\)\{.*?\n\}", text, re.S).group(0),
         _extract_function(text, "productionMultiplier"),
         _extract_function(text, "ageMultiplier"),
@@ -190,6 +193,28 @@ def live_js_values():
         _extract_function(text, "effectiveAgeMultiplier"),
         _extract_function(text, "playerValue"),
         r"""
+// QA21 prices affect three approved QBs, including players outside the
+// current 565-player PLAYER_DB. Verify the live function directly.
+const __qa21Expected = {
+  'drew lock': 1104,
+  'sam howell': 1098,
+  'tyler huntley': 1250,
+};
+if (Object.keys(QA21_OWNER_APPROVED_QB_ROSTER_FV).length !== Object.keys(__qa21Expected).length) {
+  throw Error('QA21 approved QB price set drift');
+}
+for (const [key, expected] of Object.entries(__qa21Expected)) {
+  if (QA21_OWNER_APPROVED_QB_ROSTER_FV[key] !== expected) {
+    throw Error('QA21 approved QB price changed: ' + key);
+  }
+  if (playerValue('QB', 27, 'Depth', key) !== expected) {
+    throw Error('QA21 approved QB override not active: ' + key);
+  }
+  if (playerValue('RB', 27, 'Depth', key) === expected) {
+    throw Error('QA21 QB override leaked to RB position: ' + key);
+  }
+}
+
 const __rows = {};
 for (const [key, info] of Object.entries(PLAYER_DB)) {
   const rm = productionMultiplier(key, info.role);
