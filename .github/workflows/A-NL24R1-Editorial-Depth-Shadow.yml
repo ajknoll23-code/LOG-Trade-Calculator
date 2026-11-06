@@ -1,0 +1,472 @@
+name: A-NL24R1 - LOG Editorial Narrative Depth (Read Only)
+run-name: A-NL24R1 War Room W${{ inputs.war_week }} + Aftermath W${{ inputs.aftermath_week }} - content preview
+
+'on':
+  workflow_dispatch:
+    inputs:
+      war_week:
+        description: '2026 War Room week (default: 9)'
+        required: true
+        type: string
+        default: '9'
+      aftermath_week:
+        description: '2026 completed Aftermath week (default: 8)'
+        required: true
+        type: string
+        default: '8'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: log-nl24-editorial-shadow-readonly
+  cancel-in-progress: false
+
+jobs:
+  editorial-shadow:
+    name: Evidence-led War Room and Aftermath content preview; no publishing
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check out main without credentials
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned PDF and inspection dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir 'weasyprint==68.0' 'pymupdf==1.26.5'
+      - name: Stage editorial-only source outside repository and self-test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/log_nl24_shadow.py" <<'PY'
+          #!/usr/bin/env python3
+          """A-NL24R1: source-backed editorial narrative-depth read-only preview."""
+          from __future__ import annotations
+          import argparse
+          import base64
+          from collections import defaultdict
+          from datetime import datetime, timezone
+          from decimal import Decimal, ROUND_HALF_UP
+          from html import escape
+          import hashlib
+          import json
+          from pathlib import Path
+          import re
+          import statistics
+          import time
+          from urllib.request import Request, urlopen
+          
+          LEAGUE_ID = '1326679131051532288'
+          SEASON = '2026'
+          API = 'https://api.sleeper.app/v1/'
+          
+          
+          def money(n):
+              return str(Decimal(str(n)).quantize(Decimal('.01'), rounding=ROUND_HALF_UP))
+          
+          
+          def get(path):
+              for attempt in range(3):
+                  try:
+                      req = Request(API + path, headers={'User-Agent': 'LOG-NL24R1-Shadow/1.0'})
+                      with urlopen(req, timeout=25) as response:
+                          return json.load(response)
+                  except Exception:
+                      if attempt == 2:
+                          raise
+                      time.sleep(attempt + 1)
+          
+          
+          def matchups(rows, team_ids, scored):
+              if not isinstance(rows, list) or len(rows) != 12:
+                  raise RuntimeError('Required: twelve Sleeper matchup records')
+              groups = defaultdict(list)
+              for row in rows:
+                  if row.get('matchup_id') is None:
+                      raise RuntimeError('Missing matchup id')
+                  groups[str(row['matchup_id'])].append(row)
+              if len(groups) != 6 or any(len(v) != 2 for v in groups.values()):
+                  raise RuntimeError('Required: six complete head-to-head matchups')
+              all_ids = [int(r['roster_id']) for group in groups.values() for r in group]
+              if len(set(all_ids)) != 12 or set(all_ids) != set(team_ids):
+                  raise RuntimeError('Duplicate or unexpected team IDs')
+              games = []
+              for group in groups.values():
+                  a, b = sorted(group, key=lambda r: int(r['roster_id']))
+                  if scored:
+                      for row in (a, b):
+                          raw = row.get('custom_points')
+                          if raw is None:
+                              raw = row.get('points')
+                          if raw is None or not isinstance(raw, (int, float)) or raw < 0:
+                              raise RuntimeError('Incomplete or invalid scored matchup')
+                  games.append((a, b))
+              return sorted(games, key=lambda pair: int(pair[0]['matchup_id']))
+          
+          
+          def resolve_names(rosters, users):
+              owners = {str(u.get('user_id')):u for u in users}
+              names = {}
+              for roster in rosters:
+                  u = owners.get(str(roster.get('owner_id')), {})
+                  name = ((u.get('metadata') or {}).get('team_name') or u.get('display_name')
+                          or 'Team ' + str(roster.get('roster_id')))
+                  names[int(roster['roster_id'])] = str(name).strip()
+              if len(names) != 12 or len(set(names.values())) != 12:
+                  raise RuntimeError('Required: twelve uniquely named teams')
+              return names
+          
+          
+          def score(row):
+              val = row.get('custom_points')
+              if val is None:
+                  val = row.get('points')
+              return Decimal(str(val))
+          
+          
+          def snapshot(pre_week, post_week):
+              if pre_week != post_week + 1:
+                  raise RuntimeError('Comparison must use adjoining War Room and Aftermath weeks')
+              state, league = get('state/nfl'), get('league/' + LEAGUE_ID)
+              if str(state.get('season')) != SEASON or str(league.get('season')) != SEASON:
+                  raise RuntimeError('2026 Sleeper season/league mismatch')
+              if pre_week > int(state.get('week') or 0):
+                  raise RuntimeError('Pregame week not available in current Sleeper season')
+              names = resolve_names(get(f'league/{LEAGUE_ID}/rosters'), get(f'league/{LEAGUE_ID}/users'))
+              hist = {rid: [] for rid in names}
+              results = []
+              standings_at = {}
+              for week in range(1, pre_week+1):
+                  raw = get(f'league/{LEAGUE_ID}/matchups/{week}')
+                  games = matchups(raw, names, scored=week<pre_week)
+                  if week < pre_week:
+                      weekly = {}
+                      for a,b in games:
+                          ia,ib = int(a['roster_id']),int(b['roster_id'])
+                          pa,pb = score(a), score(b)
+                          hist[ia].append(pa); hist[ib].append(pb)
+                          weekly[ia] = pa;weekly[ib] = pb
+                      median = statistics.median(weekly.values())
+                      results.append({'week':week, 'median':median, 'scores':weekly,
+                          'pairs':[(int(a['roster_id']),int(b['roster_id'])) for a,b in games]})
+                  else:
+                      current_pairs = [(int(a['roster_id']),int(b['roster_id'])) for a,b in games]
+              def standings(until):
+                  rec = {i:{'wins':Decimal(0),'losses':Decimal(0),'ties':Decimal(0),'pf':Decimal(0)} for i in names}
+                  for item in results[:until]:
+                      pts,med = item['scores'],item['median']
+                      for a,b in item['pairs']:
+                          for x,y in ((a,b),(b,a)):
+                              if pts[x]>pts[y]:rec[x]['wins']+=1
+                              elif pts[x]<pts[y]:rec[x]['losses']+=1
+                              else:rec[x]['ties']+=1
+                      for rid,n in pts.items():
+                          rec[rid]['pf']+=n
+                          if n>med:rec[rid]['wins']+=1
+                          elif n<med:rec[rid]['losses']+=1
+                          else:rec[rid]['ties']+=1
+                  order=sorted(rec,key=lambda i:(-rec[i]['wins'],-rec[i]['pf'],i))
+                  return rec,{rid:k+1 for k,rid in enumerate(order)}
+              before,rankbefore = standings(max(0,post_week-1))
+              after,rankafter = standings(post_week)
+              rows = []
+              for ia,ib in current_pairs:
+                  if len(hist[ia])!=post_week or len(hist[ib])!=post_week:
+                      raise RuntimeError('Pregame features incomplete')
+                  rows.append({'id_a':ia,'id_b':ib,'name_a':names[ia],'name_b':names[ib],
+                    'scores_a':[float(x) for x in hist[ia]],'scores_b':[float(x) for x in hist[ib]],
+                    'record_a':f"{int(after[ia]['wins'])}-{int(after[ia]['losses'])}-{int(after[ia]['ties'])}",
+                    'record_b':f"{int(after[ib]['wins'])}-{int(after[ib]['losses'])}-{int(after[ib]['ties'])}",
+                    'rank_a':rankafter[ia],'rank_b':rankafter[ib]})
+              last = results[post_week-1]
+              recap = []
+              for ia,ib in last['pairs']:
+                  pa,pb = last['scores'][ia], last['scores'][ib]
+                  recap.append({'id_a':ia,'id_b':ib,'name_a':names[ia],'name_b':names[ib],
+                      'score_a':money(pa),'score_b':money(pb),
+                      'median_a':'W' if pa>last['median'] else 'L' if pa<last['median'] else 'T',
+                      'median_b':'W' if pb>last['median'] else 'L' if pb<last['median'] else 'T',
+                      'rank_delta_a':rankbefore[ia]-rankafter[ia],
+                      'rank_delta_b':rankbefore[ib]-rankafter[ib],
+                      'prior_rank_a':rankbefore[ia], 'prior_rank_b':rankbefore[ib],
+                      'rank_a':rankafter[ia], 'rank_b':rankafter[ib]})
+              stamp = datetime.now(timezone.utc).isoformat(timespec='seconds')
+              return {'generated_at_utc':stamp,'season':SEASON,'league_id':LEAGUE_ID,
+                'league':str(league.get('name') or 'League of Ordinary Gentlemen'),
+                'war_week':pre_week,'aftermath_week':post_week,
+                'war_games':rows,'after_games':recap,'median':money(last['median']),
+                'standings_label':'Provisional reconstruction: combined H2H + median wins, then PF; official tie-break parity unconfirmed',
+                'source':'Sleeper public league matchups, rosters and users; historical scored weeks 1-'+str(post_week),
+                'snapshot_sha256':'will_be_computed_at_serialization'}
+          
+          
+          def recent(a):
+              return statistics.mean(a[-3:])
+          
+          
+          def cand_story(game):
+              a,b=game['scores_a'],game['scores_b']
+              ar,br=recent(a),recent(b)
+              avgdiff=abs(ar-br)
+              rang_a=max(a[-3:])-min(a[-3:]);rang_b=max(b[-3:])-min(b[-3:])
+              order=(a[-1]-statistics.mean(a[-4:-1]),b[-1]-statistics.mean(b[-4:-1])) if len(a)>=4 else (0,0)
+              record_a=int(game['record_a'].split('-')[0]);record_b=int(game['record_b'].split('-')[0])
+              high=game['name_a'] if ar>br else game['name_b']
+              low=game['name_b'] if ar>br else game['name_a']
+              compare=f"{game['name_a']} has averaged {ar:.2f} points per week over Weeks {len(a)-2}–{len(a)}; {game['name_b']} has averaged {br:.2f}."
+              candidates=[]
+              if (record_a-record_b)*(ar-br)<0:
+                  candidates.append((150+avgdiff,'standings paradox', f'Form Favors {high}; Standings Tell Another Story',
+                    compare+f" The records favor a different team from the recent scoring numbers. {high} has the {avgdiff:.2f}-point weekly form edge, a historical comparison rather than a forecast.",
+                    'Record leader differs from recent scoring leader'))
+              if avgdiff>=12:
+                  candidates.append((60+min(avgdiff,60),'recent scoring divide',f'{high} Brings a {avgdiff:.1f}-Point Weekly Edge',
+                    compare+f" That {avgdiff:.2f}-point weekly gap is the clearest numerical separation in this pairing. It favors {high} on past production, but is not a projection of the next result.",
+                    'Three-week points-per-week gap'))
+              if abs(rang_a-rang_b)>=15:
+                  stable=game['name_a'] if rang_a<rang_b else game['name_b']
+                  swing=game['name_b'] if rang_a<rang_b else game['name_a']
+                  candidates.append((55+abs(rang_a-rang_b)/3,'scoring volatility',f'{stable} Shows a Narrower Scoring Range',
+                    compare+f" Across those same three completed weeks, {game['name_a']} ranged {rang_a:.2f} points from best to worst and {game['name_b']} ranged {rang_b:.2f}. {stable} has shown the narrower range; {swing} the larger swings.",
+                    'Observed three-week high-low scoring ranges'))
+              if len(a)>=4 and max(abs(order[0]),abs(order[1]))>=22:
+                  nm=game['name_a'] if abs(order[0])>=abs(order[1]) else game['name_b']
+                  v=order[0] if abs(order[0])>=abs(order[1]) else order[1]
+                  action='above' if v>0 else 'below'
+                  candidates.append((60+abs(v)/3,'latest-week divergence',f'{nm} Makes the Latest Week Worth Revisiting',
+                     compare+f" {nm}'s latest score finished {abs(v):.2f} points {action} its preceding three-week average. One result does not establish a new baseline, but it makes the next performance especially informative.",
+                     'Latest week versus preceding-three-week scoring mean'))
+              if avgdiff<=10:
+                  candidates.append((85-avgdiff,'close recent form',f'Only {avgdiff:.1f} Points Per Week Apart',
+                    compare+f" Only {avgdiff:.2f} points per week divide the teams on this short window. Recent production alone offers no commanding favorite.",
+                    'Three-week scoring means within ten points'))
+              candidates.append((15,'measured form comparison',f'Three Weeks Put {high} Ahead on Points',
+                compare+' The comparison measures completed performances; it does not adjust for injuries or predict the next starting lineup.',
+                'Observed three-week scoring means'))
+              return sorted(candidates,key=lambda x:-x[0])
+          
+          
+          def war_stories(games):
+              used=defaultdict(int)
+              selected=[]
+              for game in games:
+                  # Choose the strongest available evidenced angle, applying only a mild repetition penalty.
+                  ranked=cand_story(game)
+                  _,angle,head,copy,reason=max(ranked,key=lambda c:c[0]-14*used[c[1]])
+                  used[angle]+=1
+                  ref=f"Weeks {len(game['scores_a'])-2}–{len(game['scores_a'])}, 2026; public Sleeper completed matchups"
+                  selected.append({'team_a':game['name_a'],'team_b':game['name_b'],
+                     'angle':angle,'headline':head,'body':copy,
+                     'swing':f"Check whether the Week {len(game['scores_a'])+1} outcome matches the recent scoring evidence; no lineup or injury assumptions were made.",
+                     'evidence':ref,'reason':reason,'baseline':f"{game['name_a']} meets {game['name_b']}. Records: {game['record_a']} and {game['record_b']}. Both teams will try to build momentum.",
+                     'pick':'Withheld: prediction calibration was not established by this study.'})
+              return selected
+          
+          
+          def aftermath_stories(games,median,week):
+              outputs=[]
+              for g in games:
+                  a,b=Decimal(g['score_a']),Decimal(g['score_b'])
+                  diff=abs(a-b)
+                  win=g['name_a'] if a>b else g['name_b'] if b>a else 'Tie'
+                  result=f"{g['name_a']} {g['score_a']} — {g['name_b']} {g['score_b']}."
+                  if a==b:
+                      headline=f"{g['name_a']} and {g['name_b']} Finish Level"
+                      context='Neither team won the head-to-head contest.'
+                  elif diff<=12:
+                      headline=f'{win} Survives a {money(diff)}-Point Finish'
+                      context=f"{win} escaped with a {money(diff)}-point win."
+                  elif diff>=60:
+                      headline=f'{win} Wins by {money(diff)} Points'
+                      context=f"{win} won by {money(diff)} points."
+                  else:
+                      headline=f'{win} Finishes {money(diff)} Points Clear'
+                      context=f"{win} won by {money(diff)} points."
+                  med_a,med_b=g['median_a'],g['median_b']
+                  context+=f" Relative to the Week {week} league median of {median}, the sides posted {med_a} and {med_b} respectively."
+                  movers=[]
+                  for k in ('a','b'):
+                      d=g['rank_delta_'+k]
+                      if d:
+                          movement='rose' if d>0 else 'fell'
+                          movers.append(f"{g['name_'+k]} {movement} {abs(d)} provisional {'place' if abs(d)==1 else 'places'} ({g['prior_rank_'+k]} to {g['rank_'+k]})")
+                  if movers:
+                      context+=' In provisional reconstructed standings, '+'; '.join(movers)+'.'
+                  text=result+' '+context
+                  outputs.append({'team_a':g['name_a'],'team_b':g['name_b'],'headline':headline,
+                      'body':text,'evidence':f"Sleeper Week {week} matchups, final scores and median; reconstructed provisional standings through Week {week}",
+                      'reason':'Final margin, H2H and median outcomes, and any verifiable rank movement',
+                      'baseline':f"{result} The game delivered another memorable chapter in the league season."})
+              return outputs
+          
+          
+          def original_logo(root):
+              path=root/'index.html'
+              if not path.is_file():
+                  raise RuntimeError('Original LOG index.html not found. No substitute logo permitted.')
+              html=path.read_text(encoding='utf-8')
+              mat=re.search(r'<img\s+src="(data:image/png;base64,[^"]+)"[^>]*class="league-logo"',html,re.I)
+              if not mat:
+                  raise RuntimeError('Original embedded LOG logo missing from index.html')
+              uri=mat.group(1)
+              raw=base64.b64decode(uri.split(',',1)[1],validate=True)
+              if not raw.startswith(b'\x89PNG\r\n\x1a\n'):
+                  raise RuntimeError('Logo is not a PNG')
+              return uri,hashlib.sha256(raw).hexdigest()
+          
+          
+          def esc(x):return escape(str(x),quote=True)
+          
+          
+          def render_pdf_html(title,sub,stories,logo,stamp):
+              cards=[]
+              for index,c in enumerate(stories,1):
+                  cards.append(f'''<section class="card"><div class="kicker">{index:02d} / {esc(c['team_a'])} v {esc(c['team_b'])}</div>
+                    <h2>{esc(c['headline'])}</h2><p>{esc(c['body'])}</p>
+                    <div class="proof">Evidence: {esc(c['evidence'])}</div></section>''')
+              return '''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+              <style>
+              @page{size:105mm 180mm;margin:9mm 8mm 11mm 8mm;@bottom-right{content:counter(page);font:10pt Arial;color:#536477}}
+              *{box-sizing:border-box}body{margin:0;background:#f5f1e9;color:#142a42;font:12pt/1.48 Arial,sans-serif}
+              .header{border-bottom:3px solid #d77265;padding:5mm 1mm 5mm;display:flex;align-items:center;gap:5mm}
+              .header img{width:18mm;height:auto}.brand{font-size:9pt;letter-spacing:1.5px;text-transform:uppercase;color:#526579}
+              h1{font-size:20pt;line-height:1.14;margin:2mm 0 1mm} .subtitle{font-size:11pt;color:#526579}
+              .card{padding:5mm 1mm 6mm;border-bottom:1px solid #c4ced4;break-inside:avoid} .kicker{font:bold 9pt Arial;color:#c55d50;letter-spacing:.6px}
+              h2{font-size:14.5pt;margin:2mm 0 2mm;line-height:1.2}p{margin:2mm 0 3mm}
+              .proof{font-size:9.5pt;color:#526579} .footer{font-size:9pt;color:#526579;padding:5mm 1mm}
+              </style></head><body><header class="header"><img src="''' + esc(logo) + '''" alt="LOG logo"><div><div class="brand">League of Ordinary Gentlemen</div><h1>''' + esc(title) + '''</h1><div class="subtitle">''' + esc(sub) + '''</div></div></header>''' + ''.join(cards) + '''<div class="footer">READ-ONLY EDITORIAL SHADOW · Retrieved ''' + esc(stamp) + ''' UTC · No published picks or private scouting data</div></body></html>'''
+          
+          
+          def markdown(title,week,stories,stamp):
+              out=[f'# {title} — Week {week}',f'Public Sleeper snapshot: {stamp} UTC. Read-only editorial shadow; not an archived publication.','']
+              for i,c in enumerate(stories,1):
+                  out.extend([f'## {i:02d}. {c["team_a"]} vs {c["team_b"]}',
+                       f'**BEFORE (controlled generic baseline, not the archived newsletter):** {c["baseline"]}',
+                       f'**AFTER — {c["headline"]}:** {c["body"]}',f'**Evidence:** {c["evidence"]}',
+                       f'**Why selected:** {c["reason"]}', ''])
+              return '\n'.join(out)
+          
+          
+          def verify_pdf(pdf,stories):
+              import fitz
+              doc=fitz.open(pdf)
+              assert len(doc)>0
+              alltxt='\n'.join(p.get_text() for p in doc)
+              for g in stories:
+                  # Page text is independently extracted, not assumed to match HTML.
+                  if ' '.join(g['headline'].split()) not in ' '.join(alltxt.split()):
+                      raise RuntimeError('PDF/text parity mismatch: '+g['headline'])
+              for page in doc:
+                  if page.rect.width>310 or page.rect.height>525:
+                      raise RuntimeError('Not phone-width PDF geometry')
+                  for block in page.get_text('blocks'):
+                      if len(block)<4:continue
+                      if block[0]<-1 or block[2]>page.rect.width+1:
+                          raise RuntimeError('Horizontal PDF overflow')
+              doc.close()
+          
+          
+          def run(out,root,pre_week,post_week):
+              out.mkdir(parents=True,exist_ok=True)
+              payload=snapshot(pre_week,post_week)
+              # Snapshot stays derived and safe: no raw API, no availability, no private player lists.
+              payload['snapshot_sha256']=hashlib.sha256(json.dumps({k:v for k,v in payload.items() if k!='snapshot_sha256'},sort_keys=True).encode()).hexdigest()
+              (out/'verified-derived-snapshot.json').write_text(json.dumps(payload,indent=2,sort_keys=True)+'\n')
+              war,after=war_stories(payload['war_games']),aftermath_stories(payload['after_games'],payload['median'],post_week)
+              if len(war)!=6 or len(after)!=6:
+                  raise RuntimeError('Exactly six narratives per edition required')
+              if len({(g['team_a'],g['team_b']) for g in war})!=6 or len({(g['team_a'],g['team_b']) for g in after})!=6:
+                  raise RuntimeError('Non-unique matchup narratives')
+              logo,logo_sha=original_logo(root)
+              manifest={'week_war':pre_week,'week_after':post_week,'retrieved_at':payload['generated_at_utc'],
+                 'source_snapshot_sha256':payload['snapshot_sha256'],'original_logo_sha256':logo_sha,
+                 'war_angle_counts':{k:sum(v['angle']==k for v in war) for k in sorted({v['angle'] for v in war})},
+                 'prohibitions':['no repo writes','no email','no publication','no picks archival','no unrostered player data','no FV/MV changes'],
+                 'editorial_review_required':True,'publication_authorized':False}
+              (out/'editorial-evidence-ledger.json').write_text(json.dumps({'manifest':manifest,'war':[{'matchup':[s['team_a'],s['team_b']],'reason':s['reason'],'evidence':s['evidence']} for s in war],
+                  'aftermath':[{'matchup':[s['team_a'],s['team_b']],'reason':s['reason'],'evidence':s['evidence']} for s in after]},indent=2)+'\n')
+              from weasyprint import HTML
+              for tag,heading,week,stories in [('WarRoom','The Weekly War Room',pre_week,war),('Aftermath','The Aftermath',post_week,after)]:
+                  stem=f'LOG-NL24R1-{tag}-W{week:02d}-Shadow'
+                  (out/(stem+'-Before-After.md')).write_text(markdown(heading,week,stories,payload['generated_at_utc']))
+                  html=render_pdf_html(heading,f'2026 · Week {week} · narrative-depth study',stories,logo,payload['generated_at_utc'])
+                  (out/(stem+'.html')).write_text(html)
+                  pdf=out/(stem+'.pdf')
+                  HTML(string=html,base_url=str(root)).write_pdf(str(pdf))
+                  verify_pdf(pdf,stories)
+              (out/'ACCEPTANCE.txt').write_text('PASS: 6 War Room + 6 Aftermath matchup stories; public derived evidence; single frozen source snapshot per run; original logo; phone-width PDF checked; read-only; no private player board, no email or archival writes.\nOriginal newsletter BEFORE content is NOT claimed; baseline is intentionally controlled generic text.\nManual editorial approval still required.\n')
+              print('PASS: NL24R1 evidence-only narrative-depth shadow. 2 PDFs, 2 HTML, 2 before/after Markdown, derived snapshot, evidence ledger.')
+          
+          
+          def selftest():
+              fake={'name_a':'Alpha','name_b':'Bravo','scores_a':[200,215,220,230], 'scores_b':[170,165,190,180],
+                    'record_a':'2-6-0','record_b':'6-2-0'}
+              r=cand_story(fake)
+              assert r and r[0][1]=='standings paradox'
+              assert money(Decimal('668.53')-Decimal('439.58'))=='228.95'
+              print('PASS: narrative selection and 2-decimal arithmetic self-test')
+          
+          
+          if __name__=='__main__':
+              p=argparse.ArgumentParser()
+              p.add_argument('--out',type=Path)
+              p.add_argument('--root',type=Path)
+              p.add_argument('--war-week',type=int,default=9)
+              p.add_argument('--aftermath-week',type=int,default=8)
+              p.add_argument('--selftest',action='store_true')
+              a=p.parse_args()
+              if a.selftest:selftest()
+              else:run(a.out,a.root,a.war_week,a.aftermath_week)
+          PY
+          python3 -m py_compile "$RUNNER_TEMP/log_nl24_shadow.py"
+          python3 "$RUNNER_TEMP/log_nl24_shadow.py" --selftest
+      - name: Generate evidence-backed editorial previews
+        shell: bash
+        env:
+          WAR_WEEK: ${{ inputs.war_week }}
+          AFTERMATH_WEEK: ${{ inputs.aftermath_week }}
+        run: |
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/log_nl24_shadow.py" \
+            --root "$GITHUB_WORKSPACE" \
+            --out "$RUNNER_TEMP/log-nl24-evidence" \
+            --war-week "$WAR_WEEK" \
+            --aftermath-week "$AFTERMATH_WEEK"
+      - name: Assert read-only repository state
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          test -z "$(git status --porcelain --untracked-files=all)"
+          echo 'PASS: no repository files changed, no picks written, no email sent'
+      - name: Upload read-only PDFs and before/after evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LOG-NL24R1-Editorial-Shadow-${{ github.run_id }}
+          path: ${{ runner.temp }}/log-nl24-evidence/
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## A-NL24R1 editorial shadow'
+            echo '- Six War Room and six Aftermath narratives, derived from one verified Sleeper pull'
+            echo '- Controlled BEFORE (generic comparison) versus AFTER (evidence-backed); not an old archived edition'
+            echo '- No uncalibrated stars or claims of player injuries, no free-agent research'
+            echo '- Original LOG site logo required; phone-width PDF and text checks'
+            echo '- No publication, email, picks archives, workflow schedules, FV/MV or frozen research changes'
+          } >> "$GITHUB_STEP_SUMMARY"
