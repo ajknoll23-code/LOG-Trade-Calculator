@@ -1,0 +1,288 @@
+name: A-NL38R2 — Adaptive Readable Matchup Design Repair (Shadow Only)
+run-name: A-NL38R2 - NL36 copy, adaptive per-match pagination, shadow only
+'on':
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Successful NL36R1 artifact run ID containing approved immutable copy
+        required: true
+        type: string
+        default: '42408338784'
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: log-nl38r2-adaptive-design-readonly
+  cancel-in-progress: false
+jobs:
+  nl38r2-adaptive-layout:
+    name: Render and verify two shadow-only hybrid newsletter PDFs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download frozen NL36 editorial artifact (read only)
+        uses: actions/download-artifact@v4
+        with:
+          name: LOG-NL36R1-Final-Editorial-Shadow-${{ inputs.source_run_id }}
+          run-id: ${{ inputs.source_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: nl36_input
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned PDF and HTML inspector dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir 'weasyprint==68.0' 'pymupdf==1.26.5' 'beautifulsoup4==4.14.3'
+      - name: Render and adapt only overflowing matchup pages to the current runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/nl38r2_hybrid_design.py" <<'NL38R2_ENGINE'
+          #!/usr/bin/env python3
+          """NL38 design-only layout concept: one structured matchup per page, preserve NL36 copy.
+          No live data, repo writes, or editorial changes.
+          """
+          from __future__ import annotations
+          import argparse, html, json, re
+          from pathlib import Path
+          from bs4 import BeautifulSoup
+          from weasyprint import HTML
+          import fitz
+
+          CSS='''
+          @page {size:108mm 244mm; margin:7.5mm 7mm 11mm;
+           @bottom-left {content:'LOG EDITORIAL SHADOW  •  NOT PUBLISHED';font:7.3pt Arial;color:#75858A}
+           @bottom-right {content:'LOG  /  ' counter(page);font:7.3pt Arial;color:#75858A}}
+          *{box-sizing:border-box}html,body{margin:0;padding:0;overflow-wrap:anywhere}
+          body{color:#18374C;background:#FCFAF5;font:11.8pt/1.39 Georgia,'Times New Roman',serif;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+          .cover{break-after:page}.masthead{background:#112E46;color:#FFF9EE;border-bottom:3pt solid #BA6B5C;padding:4.7mm 4.5mm 4.5mm}
+          .masthead-inner{display:flex;gap:3mm;align-items:center}.logo{height:13mm;width:13mm;object-fit:contain;flex:none}
+          .eyebrow{font:700 8.2pt/1.2 Arial;color:#BC6D5E;letter-spacing:.8pt;text-transform:uppercase}.masthead .eyebrow{color:#EACDBB}
+          h1{color:#FFF8EB;font:23pt/1.03 Georgia;margin:1mm 0 .6mm}.week-label{font:10pt Arial;color:#E1CFBF}
+          .cover-main{padding:4.4mm 2.5mm 0}.cover-lead{font:15.3pt/1.13 Georgia;margin:1.8mm 0 2mm;color:#1A3950}
+          .cover-deck{font:10.5pt/1.36 Georgia;margin:0 0 4mm}
+          .index-title{font:700 8.6pt Arial;letter-spacing:1.1pt;color:#A55D53;text-transform:uppercase;margin:0 0 1.5mm}
+          .index{margin:0;padding:0;list-style:none}.index li{display:flex;gap:2.4mm;padding:2.25mm .4mm;border-top:.7pt solid #CFD5D5;break-inside:avoid}
+          .index-num{font:700 9.2pt Arial;color:#B66859;min-width:6mm}.index h3{font:700 10.5pt/1.2 Arial;margin:0;color:#1A374D}
+          .index p{font:9.2pt/1.17 Arial;margin:.5mm 0 0;color:#607687}
+          .cover-note{background:#EEEAE5;border-left:2.5pt solid #B66C5C;padding:2.4mm;margin:5mm 0 0;font:8.2pt/1.32 Arial;color:#506575}
+          .match{break-before:page;break-inside:avoid}
+          .topline{display:flex;justify-content:space-between;gap:3mm;border-bottom:.65pt solid #CCD2D2;padding:0 0 1.7mm;margin-bottom:3mm;font:700 8.3pt Arial;letter-spacing:1pt;text-transform:uppercase;color:#AF6359}
+          .headline{font:19.2pt/1.11 Georgia;color:#16334A;margin:0 0 2.4mm;letter-spacing:-.2pt}
+          .teams{font:700 11.3pt/1.26 Arial;color:#1D3D54;margin:0 0 3mm;padding-bottom:2.5mm;border-bottom:2pt solid #B76F60}
+          .kicker{font:700 8.5pt/1.16 Arial;letter-spacing:1.05pt;text-transform:uppercase;color:#AA5F53;margin:0 0 1.4mm}
+          .lead{background:#E7EEF0;border-left:2.5pt solid #B97969;padding:2.5mm 2.7mm 2.7mm;margin:0 0 3.8mm}
+          .lead p{margin:0;font:12.0pt/1.40 Georgia;color:#19384E}
+          .stats{margin:0 0 4mm}.stats-box{border-top:.6pt solid #CBD4D6;border-bottom:.6pt solid #CBD4D6}
+          .stat{padding:1.5mm 0;display:flex;justify-content:space-between;gap:3mm;border-bottom:.5pt solid #DEE2E2}
+          .stat:last-child{border-bottom:0}.stat-name{font:700 8.1pt/1.17 Arial;letter-spacing:.25pt;color:#637B88;max-width:48%}
+          .stat-value{font:700 10.7pt/1.19 Arial;color:#23445A;text-align:right;max-width:50%}
+          .analysis{border-top:.7pt solid #D4D9DA;padding-top:2.7mm;margin:0 0 3.5mm}
+          .analysis p{font:11.8pt/1.41 Georgia;color:#1A394F;margin:0}
+          .verdict{background:#F2EBE5;border-left:3pt solid #B56B5F;padding:3mm 3mm 3.2mm;margin:0 0 3.2mm}
+          .verdict .kicker{color:#985347}.verdict p{font:700 12.5pt/1.4 Georgia;color:#17374E;margin:0}
+          .source{border-top:.6pt solid #D7DADA;padding-top:1.6mm;margin:0;font:7.2pt/1.29 Arial;color:#718189}
+          .source b{font-weight:700;color:#936459}
+          .match.long .headline{font-size:18.7pt;margin-bottom:1.8mm}
+          .match.long .teams{margin-bottom:2mm;padding-bottom:1.7mm}
+          .match.long .lead{padding:2mm 2.5mm 2.1mm;margin-bottom:2.6mm}
+          .match.long .lead p{font:11.8pt/1.35 Georgia}
+          .match.long .stats{margin-bottom:2.8mm}
+          .match.long .stat{padding:1.1mm 0}
+          .match.long .analysis{padding-top:2.1mm;margin-bottom:2.6mm}
+          .match.long .analysis p{font:11.6pt/1.34 Georgia}
+          .match.long .verdict{padding:2.3mm 2.5mm 2.5mm;margin-bottom:2mm}
+          .match.long .verdict p{font:700 12.3pt/1.34 Georgia}
+          /* NL38R2: apply additional optical compression ONLY to a matchup that actually
+             overflows on the active GitHub runner; no global body-text downsizing. */
+          .match.tight .topline{padding-bottom:1mm;margin-bottom:1.8mm}
+          .match.tight .headline{font:17.8pt/1.08 Georgia;margin:0 0 1.5mm}
+          .match.tight .teams{font-size:10.9pt;margin-bottom:1.5mm;padding-bottom:1.4mm}
+          .match.tight .kicker{font-size:8pt;line-height:1.1;margin-bottom:1mm}
+          .match.tight .lead{padding:1.5mm 2mm;margin-bottom:2mm}
+          .match.tight .lead p{font:11.2pt/1.28 Georgia}
+          .match.tight .stats{margin-bottom:2mm}
+          .match.tight .stat{padding:.8mm 0}
+          .match.tight .stat-value{font-size:10.2pt}
+          .match.tight .analysis{padding-top:1.3mm;margin-bottom:1.7mm}
+          .match.tight .analysis p{font:11.1pt/1.28 Georgia}
+          .match.tight .verdict{padding:1.8mm 2mm;margin-bottom:1.4mm}
+          .match.tight .verdict p{font:700 11.7pt/1.27 Georgia}
+          .match.tight .source{padding-top:1mm;line-height:1.21}
+          .match.ultra .topline{margin-bottom:1.3mm}
+          .match.ultra .headline{font:17.2pt/1.06 Georgia;margin:0 0 1.1mm}
+          .match.ultra .teams{margin-bottom:1mm;padding-bottom:1mm}
+          .match.ultra .lead{padding:1.1mm 1.8mm;margin-bottom:1.35mm}
+          .match.ultra .lead p{font:10.9pt/1.24 Georgia}
+          .match.ultra .stats{margin-bottom:1.4mm}
+          .match.ultra .analysis{padding-top:1.1mm;margin-bottom:1.35mm}
+          .match.ultra .analysis p{font:10.8pt/1.24 Georgia}
+          .match.ultra .verdict{padding:1.4mm 1.8mm;margin-bottom:1.2mm}
+          .match.ultra .verdict p{font:700 11.3pt/1.24 Georgia}
+
+          '''
+
+          def inside(x):return ''.join(str(z) for z in x.contents) if x else ''
+          def norm(s):
+              # A PDF line break after a hyphen may appear as 'full- lineup'; this is
+              # text extraction normalization, not an editorial rewrite.
+              return re.sub(r'(?<=\w)-\s+(?=\w)', '-', re.sub(r'\s+',' ',s).strip())
+
+          def build(src:Path,dest:Path):
+              soup=BeautifulSoup(src.read_text(encoding='utf-8'),'html.parser');games=soup.select('.game-page')
+              if len(games)!=6:raise ValueError('Expected six matchups')
+              kind='WarRoom' if 'WarRoom' in src.name else 'Aftermath'; wk='09' if kind=='WarRoom' else '08'
+              title='The Weekly War Room' if kind=='WarRoom' else 'The Aftermath'; wkint=int(wk)
+              logonode=soup.select_one('.masthead img');logo=logonode.get('src','') if logonode else ''
+              idx=[];articles=[]; originals=[]
+              for i,g in enumerate(games,1):
+                  heading=g.select_one('h2');teams=g.select_one('.teams');body=g.select_one('.body');source=g.select_one('.source')
+                  if not all((heading,teams,body,source)):raise RuntimeError(f'Missing story components {i}')
+                  parts=body.find_all(recursive=False)
+                  if len(parts)!=3:raise RuntimeError(f'{i}: bad narrative sections')
+                  p=[norm(z.get_text(' ',strip=True)) for z in parts]; originals.append(p)
+                  stats=g.select('.stats > div');
+                  if len(stats)<2:raise RuntimeError(f'{i}: missing stats')
+                  sh=''.join(f'<div class="stat"><div class="stat-name">{inside(z.select_one("span"))}</div><div class="stat-value">{inside(z.select_one("b"))}</div></div>' for z in stats)
+                  h=html.escape(heading.get_text(' ',strip=True));t=html.escape(teams.get_text(' ',strip=True))
+                  idx.append(f'<li><span class="index-num">{i:02d}</span><div><h3>{h}</h3><p>{t}</p></div></li>')
+                  first='THE STAKES' if kind=='WarRoom' else 'WHAT HAPPENED'
+                  second='PLAYER SPOTLIGHT' if kind=='WarRoom' else 'THE EVIDENCE'
+                  third='MY PICK & FINAL WORD' if kind=='WarRoom' else 'THE FINAL VERDICT'
+                  articles.append(f'''<article class="match{' long' if kind=='WarRoom' and i==4 else ''}">
+                    <div class="topline"><span>MATCHUP {i:02d} / 06</span><span>{'WAR ROOM' if kind=='WarRoom' else 'AFTERMATH'} · WEEK {wkint}</span></div>
+                    <h2 class="headline">{h}</h2><div class="teams">{t}</div>
+                    <section class="lead"><h3 class="kicker">{first}</h3><p>{html.escape(p[0])}</p></section>
+                    <section class="stats"><h3 class="kicker">AT A GLANCE</h3><div class="stats-box">{sh}</div></section>
+                    <section class="analysis"><h3 class="kicker">{second}</h3><p>{html.escape(p[1])}</p></section>
+                    <section class="verdict"><h3 class="kicker">{third}</h3><p>{html.escape(p[2])}</p></section>
+                    <div class="source">{inside(source)}</div>
+                  </article>''')
+              cover=f'''<section class="cover"><header class="masthead"><div class="masthead-inner"><img class="logo" src="{logo}" /><div><div class="eyebrow">LEAGUE OF ORDINARY GENTLEMEN · EDITORIAL</div><h1>{title}</h1><div class="week-label">WEEK {wkint} / 2026</div></div></div></header>
+                <div class="cover-main"><div class="eyebrow">SIX MATCHUPS · ONE SHARP READ</div><h2 class="cover-lead">All the attitude.<br/>None of the clutter.</h2><p class="cover-deck">The NL36 writing you approved, presented with sharper sections, larger type, and stronger final verdicts.</p>
+                <h3 class="index-title">IN THIS ISSUE</h3><ol class="index">{''.join(idx)}</ol><div class="cover-note">DESIGN SHADOW • NOT PUBLISHED<br/>Content unchanged from the NL36 editorial edition.</div></div></section>'''
+              path=dest/f'LOG-NL38R2-{kind}-W{wk}-Hybrid-Design-Shadow'
+              # Font metrics differ between the local PDF builder and Ubuntu runners.
+              # Start with the original layout, then tighten ONLY the specific matchup(s)
+              # generating orphan overflow pages. Never claim a seven-page issue before
+              # inspecting the actual rendered PDF on this very runner.
+              tiers=[0,0,0,1 if kind=='WarRoom' else 0,0,0]
+              fit_log=[]
+              page=None
+              for attempt in range(1,13):
+                  items=[]
+                  for j,article in enumerate(articles):
+                      tier=tiers[j]
+                      classes='match'+(' long' if tier>=1 else '')+(' tight' if tier>=2 else '')+(' ultra' if tier>=3 else '')
+                      items.append(re.sub(r'<article class="match(?: long)?">',
+                                          f'<article class="{classes}">',article,count=1))
+                  page=f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>{CSS}</style></head><body>{cover}{''.join(items)}</body></html>'''
+                  HTML(string=page,base_url=str(dest)).write_pdf(str(path.with_suffix('.pdf')))
+                  with fitz.open(str(path.with_suffix('.pdf'))) as temp:
+                      page_matchups=[]; previous=None; overflow=[]; encountered=[]
+                      for pi,pg in enumerate(temp):
+                          if pi==0:
+                              continue
+                          text=' '.join(pg.get_text().split())
+                          match=re.search(r'MATCHUP\s+(\d{1,2})\s*/\s*06',text)
+                          if match:
+                              previous=int(match.group(1))
+                              encountered.append(previous)
+                          elif previous is not None:
+                              overflow.append(previous)
+                          else:
+                              raise RuntimeError(f'{kind}: unidentified page {pi+1}, cannot assess overflow safely')
+                          page_matchups.append(previous)
+                      if encountered != list(range(1,7)):
+                          raise RuntimeError(f'{kind}: missing/duplicate/out-of-order matchup headers: {encountered}')
+                      fit_log.append({'pass':attempt,'pages':len(temp),'density':tiers.copy(),'overflow_matchups':sorted(set(overflow))})
+                      if len(temp)==7 and not overflow:
+                          break
+                      if len(temp)<7 or not overflow:
+                          raise RuntimeError(f'{kind}: unexpected pagination: {fit_log[-1]}')
+                      for number in sorted(set(overflow)):
+                          j=number-1
+                          if tiers[j]>=3:
+                              raise RuntimeError(f'{kind}: article {number} still overflows at best permitted readability: {fit_log}')
+                          tiers[j]+=1
+              else:
+                  raise RuntimeError(f'{kind}: unable to fit one page per matchup after {len(fit_log)} attempts')
+              path.with_suffix('.html').write_text(page,encoding='utf-8')
+              doc=fitz.open(str(path.with_suffix('.pdf')))
+              nall=norm(' '.join(x.get_text() for x in doc));missing=[]
+              for i,pp in enumerate(originals,1):
+                  for j,p in enumerate(pp,1):
+                      words=norm(p).split();beg=' '.join(words[:min(5,len(words))]);end=' '.join(words[-min(5,len(words)):])
+                      if beg not in nall:missing.append((i,j,'start',beg))
+                      if end not in nall:missing.append((i,j,'end',end))
+              if missing:raise RuntimeError(f'Text integrity failure: {missing}')
+              widths=[round(x.rect.width,1) for x in doc];
+              info={'kind':kind,'pages':len(doc),'pdf':str(path.with_suffix('.pdf')),'min_font_pt':min(round(s['size'],1) for p in doc for b in p.get_text('dict')['blocks'] for line in b.get('lines',[]) for s in line.get('spans',[]) if s['text'].strip()),'page_dims':[[round(p.rect.width,1),round(p.rect.height,1)] for p in doc],'chars_per_page':[len(p.get_text()) for p in doc],'text_integrity':'PASS', 'render_fit_log':fit_log, 'selected_density_tiers':tiers }
+              return info
+
+          if __name__=='__main__':
+              ap=argparse.ArgumentParser();ap.add_argument('--source-dir',default='/mnt/data/nl36_review');ap.add_argument('--output-dir',default='/mnt/data/nl38_preview');a=ap.parse_args()
+              out=Path(a.output_dir);out.mkdir(parents=True,exist_ok=True);src=Path(a.source_dir)
+              info=[build(src/f'LOG-NL36R1-{k}-W{w}-Editorial-Shadow.html',out) for k,w in [('WarRoom','09'),('Aftermath','08')]]
+              (out/'NL38R2-DESIGN-QA.json').write_text(json.dumps(info,indent=2),encoding='utf-8')
+              print(json.dumps(info,indent=2))
+          NL38R2_ENGINE
+          python3 "$RUNNER_TEMP/nl38r2_hybrid_design.py" --source-dir nl36_input --output-dir nl38r2_output
+      - name: Verify exactly seven pages, no orphan pages, source text integrity and source stats
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'NL38R2_VERIFY'
+          import fitz, json, re
+          from pathlib import Path
+          from bs4 import BeautifulSoup
+          qa=json.loads(Path('nl38r2_output/NL38R2-DESIGN-QA.json').read_text(encoding='utf-8'))
+          assert len(qa)==2 and {a['kind'] for a in qa}=={'WarRoom','Aftermath'}
+          for result in qa:
+              kind=result['kind'];wk='09' if kind=='WarRoom' else '08'
+              assert result['pages']==7 and result['text_integrity']=='PASS', result
+              assert result['min_font_pt']>=7.0, result
+              assert result['render_fit_log'][-1]['pages']==7
+              assert not result['render_fit_log'][-1]['overflow_matchups']
+              original=BeautifulSoup(Path(f'nl36_input/LOG-NL36R1-{kind}-W{wk}-Editorial-Shadow.html').read_text(encoding='utf-8'),'html.parser')
+              doc=fitz.open(result['pdf'])
+              assert len(doc)==7
+              assert len(original.select('.game-page'))==6
+              for i,g in enumerate(original.select('.game-page'),1):
+                  t=' '.join(doc[i].get_text().split())
+                  t=re.sub(r'(?<=\w)-\s+(?=\w)', '-', t)  # extract-only line-break normalization
+                  assert f'MATCHUP {i:02d} / 06' in t, (kind,i,'header missing')
+                  assert len(t)>380, (kind,i,'possible orphan or missing text')
+                  for part in g.select_one('.body').find_all(recursive=False):
+                      text=' '.join(part.get_text(' ',strip=True).split())
+                      assert text in t, (kind,i,text[:100])
+                  for item in g.select('.stats > div'):
+                      val=' '.join(item.select_one('b').get_text(' ',strip=True).split())
+                      assert val in t, (kind,i,val)
+                  assert 'SOURCE' in t, (kind,i)
+              print(kind, 'PASS; pages=7; adaptive fit tiers=',result['selected_density_tiers'])
+          print('PASS: NL36 copy and facts preserved; no overflow; no publication')
+          NL38R2_VERIFY
+      - name: Upload adaptive PDFs, HTML previews and QA for human review
+        uses: actions/upload-artifact@v4
+        with:
+          name: LOG-NL38R2-Readable-Hybrid-Shadow-${{ github.run_id }}
+          path: nl38r2_output/
+          retention-days: 90
+          if-no-files-found: error
+      - name: Write editorial shadow summary
+        shell: bash
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'NL38R2_SUMMARY'
+          ## NL38R2 — Adaptive layout repair, read-only shadow
+          - Root cause repaired: War Room rendered nine pages on the GitHub runner, so the strict seven-page QA gate blocked upload.
+          - Renderer now inspects the actual runner PDF and compacts only specific overflowing matchups until each has a complete page.
+          - Output must still be seven pages per edition; no orphan pages, missing content, or text/stats mutation accepted.
+          - Preserves the approved NL36 editorial wording, tone and facts, and the NL38 visual direction (larger text, section labels, stronger punchlines).
+          - Uses frozen Week 8 Aftermath / Week 9 War Room NL36 artifacts, not future live data.
+          - No publication, sending, changing picks, production deployment, or repository writes. Human approval required.
+          NL38R2_SUMMARY
