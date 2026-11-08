@@ -24,55 +24,154 @@ concurrency:
 
 jobs:
   sync:
-    name: Sync Sleeper League Data
+    name: Sync Sleeper rosters and free agents
     if: github.event_name == 'schedule' || github.event.inputs.task == 'sync'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Run roster sync script
+      - name: Fetch current Sleeper roster and free-agent data
         run: python scripts/sync/sync_sleeper.py
       - name: Refresh generated player-position compatibility map
         run: python scripts/utilities/generate_player_positions.py
-      - name: Team Utility lineup projection self-test
-        run: python scripts/projections/build_team_utility_lineup_projections.py --selftest
-      - name: Refresh Team Utility lineup projections
-        run: python scripts/projections/build_team_utility_lineup_projections.py --write
-      - name: Verify Team Utility lineup projection artifact
-        run: python scripts/projections/build_team_utility_lineup_projections.py --check
-      - name: Run trade history sync script
-        run: python scripts/sync/sync_trade_history.py
-      - name: Reconcile free-agent cache with synced roster and player pool
+      - name: Reconcile free agents against freshly synced rosters
         run: |
           python3 - <<'PYCODE'
+          import json
           import sys
+          from pathlib import Path
           sys.path.insert(0, 'scripts')
-          from maintenance.refresh_repo_derived_state import FREE_AGENTS, expected_artifacts
+          from sync.sync_sleeper import compute_free_agents
+          from maintenance.refresh_repo_derived_state import _rostered_ids
 
-          expected = expected_artifacts()[FREE_AGENTS]
-          if FREE_AGENTS.read_bytes() != expected:
-              FREE_AGENTS.write_bytes(expected)
-              print('Reconciled data/free_agents.json to synced canonical inputs')
-          else:
-              print('data/free_agents.json is already in parity')
-          assert FREE_AGENTS.read_bytes() == expected
+          data = Path('data')
+          fa_file = data / 'free_agents.json'
+          fa = json.loads(fa_file.read_text())
+          rosters = json.loads((data / 'league_rosters.json').read_text())
+          cache = json.loads((data / 'players_cache.json').read_text())
+          pool = cache.get('players', cache)
+
+          assert len(rosters['rosters']) == 12, 'Expected all 12 league rosters'
+          rostered_ids = _rostered_ids(rosters)
+          expected = compute_free_agents(pool, rostered_ids)
+          actual_ids = [str(p['player_id']) for p in fa['free_agents']]
+          expected_ids = [str(p['player_id']) for p in expected]
+          assert len(actual_ids) == len(set(actual_ids)), 'Duplicate free agent IDs'
+          assert not rostered_ids.intersection(actual_ids), 'Rostered player shown as free agent'
+          assert actual_ids == expected_ids, 'Free-agent list differs from canonical Sleeper pool/rosters'
+          assert fa['count'] == len(expected), 'Free-agent count does not match list'
+          assert str(fa['league_id']) == str(rosters['league_id']), 'League ID mismatch'
+          print(f'PASS: {len(rosters["rosters"])} rosters and {len(actual_ids)} free agents verified')
           PYCODE
-      - name: Commit and push if data changed
+      - name: Commit verified league and free-agent snapshots FIRST
         run: |
           git config user.name "sleeper-sync-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add data/
-          git add scripts/artifacts/generated/player_positions.json
-          git add scripts/artifacts/generated/team_utility_lineup_projections.json
-          git add scripts/artifacts/reports/team_utility_lineup_projection_report.md
+          git add -- data/free_agents.json data/league_rosters.json data/my_roster.json data/draft_picks.json data/last_synced.json data/players_cache.json
+          git add -- scripts/artifacts/generated/player_positions.json
           if git diff --cached --quiet; then
-            echo "No changes to commit."
+            echo "No core league data changes to commit."
           else
-            git commit -m "Sync Sleeper data ($(date -u '+%Y-%m-%d %H:%M UTC'))"
-            git push
+            git commit -m "Refresh Sleeper rosters and free agents ($(date -u '+%Y-%m-%d %H:%M UTC'))"
+            git push origin HEAD:main
           fi
+      - name: Refresh trade history (does not block free-agent updates)
+        id: trade_history
+        continue-on-error: true
+        run: python scripts/sync/sync_trade_history.py
+      - name: Commit refreshed trade history
+        if: steps.trade_history.outcome == 'success'
+        run: |
+          git add -- data/trade_history.json
+          if git diff --cached --quiet; then
+            echo "No trade history changes."
+          else
+            git commit -m "Refresh Sleeper trade history ($(date -u '+%Y-%m-%d %H:%M UTC'))"
+            git push origin HEAD:main
+          fi
+      - name: Report trade history degradation
+        if: steps.trade_history.outcome == 'failure'
+        run: |
+          echo "::warning title=Trade history sync failed::Roster and free-agent data were safely committed. Trade history is unchanged."
+          echo "### Trade history refresh failed (non-blocking)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Live roster/free-agent sync was committed, but trade history refresh failed. Review the trade history step." >> "$GITHUB_STEP_SUMMARY"
+
+  team-utility:
+    name: Team Utility strict diagnostics (independent)
+    needs: sync
+    if: github.event_name == 'schedule' || github.event.inputs.task == 'sync'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Self-test Team Utility projection builder
+        run: python scripts/projections/build_team_utility_lineup_projections.py --selftest
+      - name: Build and STRICTLY validate Team Utility projections
+        run: |
+          rm -f scripts/artifacts/generated/team_utility_lineup_projections.json
+          rm -f scripts/artifacts/reports/team_utility_lineup_projection_report.md
+          python scripts/projections/build_team_utility_lineup_projections.py --write
+          python scripts/projections/build_team_utility_lineup_projections.py --check
+      - name: Publish projections ONLY after strict validation passed
+        run: |
+          git config user.name "sleeper-sync-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -- scripts/artifacts/generated/team_utility_lineup_projections.json
+          git add -- scripts/artifacts/reports/team_utility_lineup_projection_report.md
+          if git diff --cached --quiet; then
+            echo "No Team Utility projection changes."
+          else
+            git commit -m "Update validated Team Utility projections ($(date -u '+%Y-%m-%d %H:%M UTC'))"
+            git push origin HEAD:main
+          fi
+          echo "### Team Utility: PASS" >> "$GITHUB_STEP_SUMMARY"
+          echo "All current league roster constraints and projection coverage gates passed." >> "$GITHUB_STEP_SUMMARY"
+      - name: Explain Team Utility validation failure without hiding it
+        if: failure()
+        run: |
+          echo "::warning title=Team Utility validation FAILED::Live free-agent and roster snapshots remain committed. No unvalidated Team Utility projection artifact was published."
+          python3 - <<'PYCODE'
+          import json
+          import os
+          from pathlib import Path
+          artifact = Path('scripts/artifacts/generated/team_utility_lineup_projections.json')
+          summary = Path(os.environ['GITHUB_STEP_SUMMARY'])
+          with summary.open('a') as f:
+              f.write('### Team Utility: FAILED (non-blocking to free-agent sync)\n\n')
+              f.write('Canonical free-agent and roster updates were committed before this independent validation.\n\n')
+              f.write('No invalid Team Utility projections were published.\n\n')
+              if not artifact.exists():
+                  f.write('Projection artifact was not generated. Inspect the preceding failing step.\n')
+              else:
+                  v = json.loads(artifact.read_text()).get('current_league_validation', {})
+                  expected = int(v.get('expected_starters_per_team') or 17)
+                  failures = [r for r in v.get('teams', []) if r.get('legal_starter_count') != expected]
+                  if failures:
+                      f.write('| Roster | Legal starters |\n|---|---:|\n')
+                      for r in failures:
+                          f.write(f'| {r.get("team_name", "unknown")} | {r.get("legal_starter_count", "?")}/{expected} |\n')
+                      f.write('\n')
+                  else:
+                      f.write('Full-lineup coverage passed or could not be diagnosed; inspect the failed step.\n')
+          PYCODE
+      - name: Keep failed projection diagnostics available for inspection
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: team-utility-diagnostics
+          path: |
+            scripts/artifacts/generated/team_utility_lineup_projections.json
+            scripts/artifacts/reports/team_utility_lineup_projection_report.md
+          if-no-files-found: ignore
 
   dual-eligibility:
     name: Dual Eligibility Check
@@ -90,7 +189,7 @@ jobs:
       - name: Commit results back to repo
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.email "actions@users.noreply.github.com"
           git add scripts/artifacts/generated/dual_eligibility_results.json
           git diff --staged --quiet || git commit -m "Update dual eligibility results"
           git push
@@ -111,7 +210,7 @@ jobs:
       - name: Commit results
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.email "actions@users.noreply.github.com"
           git add scripts/artifacts/generated/player_team_refresh.json data/players_cache.json
           git diff --staged --quiet && echo "No changes to commit" || git commit -m "Refresh player team data from live Sleeper pool"
           git push
