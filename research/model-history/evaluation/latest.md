@@ -5,13 +5,13 @@ Protocol SHA256: `b6e66793b947e629d8ea238663fc4ab9e94dc7fb6c6b52495ac1207451ba0b
 
 ## Status
 
-- Snapshots seen: **42**
-- Prediction states after deduplication: **26**
+- Snapshots seen: **43**
+- Prediction states after deduplication: **27**
 - Deduplicated repeated snapshots: **16**
 - Outcome identity coverage: **100.0%**
-- Completed realized weeks available: **[1, 2, 3, 4, 5, 6, 7]**
-- Evaluated snapshot/horizon combinations: **18**
-- Pending snapshot/horizon combinations: **60**
+- Completed realized weeks available: **[1, 2, 3, 4, 5, 6, 7, 8]**
+- Evaluated snapshot/horizon combinations: **27**
+- Pending snapshot/horizon combinations: **54**
 
 ## Frozen V1 leakage rules
 
@@ -22,12 +22,19 @@ The scoring period containing a snapshot is excluded. Fixed 4-week and 8-week ho
 | Snapshot | First future week | Horizon | Value↔total Spearman | Pairwise acc. | ProdMult↔active PPG Spearman | Active players |
 |---|---:|---|---:|---:|---:|---:|
 | 2026-09-01T21:10:40.561467Z | 1 | future_4w | 0.652 | 0.741 | 0.521 | 492 |
+| 2026-09-01T21:10:40.561467Z | 1 | future_8w | 0.641 | 0.734 | 0.527 | 519 |
 | 2026-09-02T19:29:31.487917Z | 1 | future_4w | 0.652 | 0.741 | 0.521 | 492 |
+| 2026-09-02T19:29:31.487917Z | 1 | future_8w | 0.640 | 0.734 | 0.527 | 519 |
 | 2026-09-03T04:38:42.789796Z | 1 | future_4w | 0.652 | 0.741 | 0.521 | 492 |
+| 2026-09-03T04:38:42.789796Z | 1 | future_8w | 0.640 | 0.734 | 0.527 | 519 |
 | 2026-09-04T18:00:29.214394Z | 1 | future_4w | 0.652 | 0.741 | 0.521 | 492 |
+| 2026-09-04T18:00:29.214394Z | 1 | future_8w | 0.640 | 0.734 | 0.527 | 519 |
 | 2026-09-05T19:46:05.101299Z | 1 | future_4w | 0.652 | 0.741 | 0.521 | 492 |
+| 2026-09-05T19:46:05.101299Z | 1 | future_8w | 0.641 | 0.734 | 0.527 | 519 |
 | 2026-09-07T08:13:19.532310Z | 1 | future_4w | 0.652 | 0.741 | 0.521 | 492 |
+| 2026-09-07T08:13:19.532310Z | 1 | future_8w | 0.641 | 0.734 | 0.527 | 519 |
 | 2026-09-08T18:25:19.343501Z | 1 | future_4w | 0.652 | 0.741 | 0.521 | 492 |
+| 2026-09-08T18:25:19.343501Z | 1 | future_8w | 0.641 | 0.734 | 0.527 | 519 |
 | 2026-09-09T04:34:48.848129Z | 2 | future_4w | 0.618 | 0.729 | 0.512 | 487 |
 | 2026-09-11T18:07:00.902784Z | 2 | future_4w | 0.618 | 0.729 | 0.512 | 487 |
 | 2026-09-13T23:50:54.635067Z | 2 | future_4w | 0.618 | 0.728 | 0.512 | 487 |
@@ -35,10 +42,12 @@ The scoring period containing a snapshot is excluded. Fixed 4-week and 8-week ho
 | 2026-09-18T18:01:40.209941Z | 3 | future_4w | 0.581 | 0.715 | 0.462 | 481 |
 | 2026-09-18T21:46:15.738077Z | 3 | future_4w | 0.581 | 0.715 | 0.461 | 481 |
 | 2026-09-22T18:39:49.573622Z | 3 | future_4w | 0.581 | 0.715 | 0.461 | 481 |
-| 2026-09-23T14:31:27.159257Z | 4 | future_4w | 0.542 | 0.701 | 0.438 | 485 |
-| 2026-09-25T19:05:53.729491Z | 4 | future_4w | 0.542 | 0.701 | 0.438 | 485 |
-| 2026-09-28T19:50:00.062475Z | 4 | future_4w | 0.542 | 0.701 | 0.438 | 485 |
-| 2026-09-29T19:53:44.405453Z | 4 | future_4w | 0.542 | 0.701 | 0.438 | 485 |
+| 2026-09-23T14:31:27.159257Z | 4 | future_4w | 0.542 | 0.701 | 0.439 | 485 |
+| 2026-09-25T19:05:53.729491Z | 4 | future_4w | 0.542 | 0.701 | 0.439 | 485 |
+| 2026-09-28T19:50:00.062475Z | 4 | future_4w | 0.542 | 0.701 | 0.439 | 485 |
+| 2026-09-29T19:53:44.405453Z | 4 | future_4w | 0.542 | 0.701 | 0.439 | 485 |
+| 2026-10-03T15:42:38.355442Z | 5 | future_4w | 0.516 | 0.689 | 0.439 | 485 |
+| 2026-10-06T20:06:49.786634Z | 5 | future_4w | 0.516 | 0.689 | 0.439 | 485 |
 
 ## Interpretation guardrails
 

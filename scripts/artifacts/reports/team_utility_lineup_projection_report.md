@@ -15,9 +15,9 @@
 
 ## Artifact coverage
 
-- Total projected players: **1533**
-- Position counts: **{"DB": 353, "DL": 353, "LB": 231, "QB": 81, "RB": 150, "TE": 142, "WR": 223}**
-- Source counts: **{"fantasypros_normalized_fallback": 94, "idp_v1_both": 509, "idp_v1_fp_only": 8, "idp_v1_no_new_data": 1, "idp_v1_sleeper_only": 419, "sleeper_league_scored": 502}**
+- Total projected players: **1544**
+- Position counts: **{"DB": 350, "DL": 354, "LB": 231, "QB": 83, "RB": 158, "TE": 144, "WR": 224}**
+- Source counts: **{"fantasypros_normalized_fallback": 89, "idp_v1_both": 510, "idp_v1_fp_only": 7, "idp_v1_no_new_data": 1, "idp_v1_sleeper_only": 417, "sleeper_league_scored": 520}**
 
 ## Current league validation
 

@@ -22,9 +22,9 @@ Production resolver covering QB / RB / WR / TE / DL / LB / DB.
 
 - `name_collision_resolved_by_position_team`: **4**
 - `name_found_position_incompatible`: **2**
-- `name_position_team_confirmed`: **1037**
+- `name_position_team_confirmed`: **1042**
 - `no_sleeper_name_candidate`: **14**
-- `previous_authoritative_stable_id_preserved`: **23**
+- `previous_authoritative_stable_id_preserved`: **18**
 - `previous_authoritative_stable_id_preserved_position_changed`: **3**
 
 ## Manual-review rows
@@ -33,5 +33,5 @@ These remain deliberately unresolved; downstream consumers must use existing fal
 
 | Player | Pos | FP team | Candidate SID | Sleeper team | Method |
 |---|---|---|---|---|---|
-| Rob Beal Jr. | DL | MIA |  |  | name_found_position_incompatible |
+| Robert Beal Jr. | DL | SF |  |  | name_found_position_incompatible |
 | Jonah Elliss | LB | DEN |  |  | name_found_position_incompatible |
