@@ -1,0 +1,144 @@
+name: A-FA01R1 Live Sleeper Free Agents
+
+# Refresh league availability independently from Team Utility lineup projections.
+# A league member can temporarily have fewer than 17 eligible starters
+# (for example, an unfilled kicker slot). That must not block waiver data.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  live-free-agent-refresh:
+    name: Sync and validate live Sleeper free agents
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out current main branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify existing Sleeper synchronization logic
+        run: python3 scripts/sync/sync_sleeper.py --selftest
+
+      - name: Pull live rosters and regenerate free-agent availability
+        run: python3 scripts/sync/sync_sleeper.py
+
+      - name: Rebuild compatible player-position lookup
+        run: python3 scripts/utilities/generate_player_positions.py
+
+      - name: Reconcile canonical free-agent cache
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import sys
+          sys.path.insert(0, 'scripts')
+          from maintenance.refresh_repo_derived_state import FREE_AGENTS, expected_artifacts
+
+          expected = expected_artifacts()[FREE_AGENTS]
+          if FREE_AGENTS.read_bytes() != expected:
+              FREE_AGENTS.write_bytes(expected)
+              print('Reconciled data/free_agents.json against current Sleeper player cache and rosters.')
+          else:
+              print('Free-agent data already matches canonical source inputs.')
+          assert FREE_AGENTS.read_bytes() == expected
+          PY
+
+      - name: Validate free agents and show sync summary
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import datetime
+          import json
+          from pathlib import Path
+
+          root = Path('data')
+          config = json.loads(Path('config.json').read_text())
+          free_agents = json.loads((root / 'free_agents.json').read_text())
+          roster_doc = json.loads((root / 'league_rosters.json').read_text())
+          my_roster = json.loads((root / 'my_roster.json').read_text())
+          last_sync = json.loads((root / 'last_synced.json').read_text())
+          players_cache = json.loads((root / 'players_cache.json').read_text())
+
+          expected_league = str(config['league_id'])
+          assert str(free_agents.get('league_id')) == expected_league, 'Wrong free-agent league ID'
+          assert str(roster_doc.get('league_id')) == expected_league, 'Wrong roster league ID'
+
+          rosters = roster_doc.get('rosters', [])
+          assert len(rosters) == 12, f'Expected 12 league rosters, got {len(rosters)}'
+          ids = set()
+          for roster in rosters:
+              for slot in ('starters', 'bench', 'taxi', 'reserve_ir'):
+                  for player in roster.get(slot) or []:
+                      player_id = player.get('player_id')
+                      if player_id is not None:
+                          ids.add(str(player_id))
+
+          rows = free_agents.get('free_agents', [])
+          fa_ids = [str(row['player_id']) for row in rows]
+          assert len(rows) >= 100, f'Implausibly small free-agent pool: {len(rows)}'
+          assert free_agents.get('count') == len(rows), 'Free-agent count does not match rows'
+          assert len(fa_ids) == len(set(fa_ids)), 'Duplicate Sleeper player IDs in free agents'
+          overlap = ids.intersection(fa_ids)
+          assert not overlap, f'Rostered players incorrectly shown as free agents: {sorted(overlap)[:10]}'
+          assert my_roster.get('team_name'), 'Your team was not resolved'
+
+          sync_time = float(free_agents.get('synced_at', 0))
+          roster_time = float(roster_doc.get('synced_at', 0))
+          last_sync_time = float(last_sync.get('synced_at', 0))
+          now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+          assert 0 <= now - sync_time < 1800, 'Free-agent data did not refresh this run'
+          assert abs(sync_time - roster_time) < 180, 'Rosters and free agents are from different syncs'
+          assert abs(sync_time - last_sync_time) < 180, 'Last-sync timestamp does not match'
+          assert isinstance(players_cache.get('players'), dict), 'Sleeper players cache is invalid'
+
+          without_k = []
+          for roster in rosters:
+              active = (roster.get('starters') or []) + (roster.get('bench') or [])
+              has_k = any(
+                  p.get('position') == 'K' or 'K' in (p.get('fantasy_positions') or [])
+                  for p in active
+              )
+              if not has_k:
+                  without_k.append(roster.get('team_name') or str(roster.get('roster_id')))
+
+          print(f'PASS: {len(rows)} unrostered NFL players in {expected_league}')
+          print(f'PASS: {len(rosters)} rosters; {len(ids)} rostered IDs; zero FA/roster overlap')
+          print('Synced at UTC:', datetime.datetime.fromtimestamp(sync_time, datetime.timezone.utc).isoformat())
+          if without_k:
+              print('NOTICE: Team(s) without a kicker; unrelated Team Utility validation may fail:', without_k)
+              print('These lineup gaps intentionally DO NOT block the free-agent data refresh.')
+          PY
+
+      - name: Commit only synchronized league data
+        shell: bash
+        run: |
+          git config user.name "sleeper-sync-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -- \
+            data/free_agents.json \
+            data/league_rosters.json \
+            data/my_roster.json \
+            data/draft_picks.json \
+            data/last_synced.json \
+            data/players_cache.json \
+            scripts/artifacts/generated/player_positions.json
+          echo 'Staged files:'
+          git diff --cached --name-only
+          if git diff --cached --quiet; then
+            echo 'No data changes to commit.'
+          else
+            git commit -m "Refresh live Sleeper free agents and league rosters"
+            git push origin HEAD:main
+          fi
