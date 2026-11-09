@@ -1,0 +1,410 @@
+name: A-NL40R1 - Power Index and Split H2H Median Records (Shadow)
+run-name: A-NL40R1 - Restore Power Rankings, War Room W${{ inputs.war_week }}
+'on':
+  workflow_dispatch:
+    inputs:
+      war_week:
+        description: Upcoming War Room week; completed Aftermath is the preceding week
+        required: true
+        type: string
+        default: '10'
+      source_nl39_run_id:
+        description: Optional completed NL39 run ID for this exact week; blank finds latest successful matching run
+        required: false
+        type: string
+        default: ''
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: log-nl40r1-shadow-${{ inputs.war_week }}
+  cancel-in-progress: false
+jobs:
+  power-standings-shadow:
+    name: Append verified split records and power rankings to two PDFs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Select exact successful NL39 editorial/layout source run
+        id: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_ID: ${{ inputs.source_nl39_run_id }}
+          WAR_WEEK: ${{ inputs.war_week }}
+        run: |
+          set -euo pipefail
+          python3 - <<'NL40_RESOLVE'
+          import json, os, re, urllib.request
+          repo=os.environ['GITHUB_REPOSITORY']
+          token=os.environ['GH_TOKEN']
+          war=int(os.environ['WAR_WEEK'])
+          if war<2 or war>18:raise RuntimeError('War Room week must be in 2..18')
+          source=os.environ.get('SOURCE_ID','').strip()
+          if source and not source.isdecimal():raise RuntimeError('Source run ID must be numeric or blank')
+          api=f'https://api.github.com/repos/{repo}'
+          headers={'Accept':'application/vnd.github+json','Authorization':f'Bearer {token}',
+                   'X-GitHub-Api-Version':'2022-11-28','User-Agent':'LOG-NL40R1-Power-Shadow'}
+          def get(path):
+              req=urllib.request.Request(api+path,headers=headers)
+              with urllib.request.urlopen(req,timeout=35) as res:return json.load(res)
+          path='.github/workflows/A-NL39R1-Weekly-Newsletter-Integration-Shadow.yml'
+          def check(r):
+              title=str(r.get('display_title') or r.get('name') or '')
+              if (r.get('path')!=path or r.get('head_branch')!='main' or
+                  r.get('event')!='workflow_dispatch' or
+                  r.get('status')!='completed' or r.get('conclusion')!='success' or
+                  not re.search(r'\bW0?'+str(war)+r'\b',title,re.I)):
+                  return False
+              return True
+          if source:
+              run=get(f'/actions/runs/{int(source)}')
+              if not check(run):raise RuntimeError('Chosen NL39 source run is not a successful run for exactly this War Room week')
+          else:
+              lst=get('/actions/workflows/A-NL39R1-Weekly-Newsletter-Integration-Shadow.yml/runs?event=workflow_dispatch&branch=main&per_page=70')
+              valid=[r for r in lst.get('workflow_runs',[]) if check(r)]
+              if not valid:raise RuntimeError('No successful matching NL39 source run found; run NL39 first, or provide its run ID')
+              run=max(valid,key=lambda x:x['id'])
+          run_id=int(run['id'])
+          art=get(f'/actions/runs/{run_id}/artifacts?per_page=100')
+          exact=f'LOG-NL39R1-Weekly-Newsroom-Shadow-{run_id}'
+          found=[x for x in art.get('artifacts',[]) if x.get('name')==exact and not x.get('expired')]
+          if len(found)!=1:raise RuntimeError(f'NL39 artifact missing, expired or ambiguous for {run_id}')
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:f.write(f'run_id={run_id}\n')
+          print(f'PASS: NL39 W{war} source run {run_id}, exact artifact {exact}, no repository changes')
+          NL40_RESOLVE
+      - name: Download validated matching NL39 PDFs
+        uses: actions/download-artifact@v4
+        with:
+          name: LOG-NL39R1-Weekly-Newsroom-Shadow-${{ steps.source.outputs.run_id }}
+          run-id: ${{ steps.source.outputs.run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: nl39_input
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned PDF library
+        shell: bash
+        run: python3 -m pip install --disable-pip-version-check --no-cache-dir 'pymupdf==1.26.5'
+      - name: Compute independently from Sleeper and append read-only power pages
+        shell: bash
+        env:
+          WAR_WEEK: ${{ inputs.war_week }}
+          SOURCE_RUN_ID: ${{ steps.source.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/nl40_power.py" <<'NL40_POWER_PY'
+          #!/usr/bin/env python3
+          """NL40 read-only addition: original-style power index + verified H2H/median splits.
+          Consumes existing NL39 shadow PDFs. Never rewrites the underlying editorial pages.
+          """
+          from __future__ import annotations
+          import argparse
+          import copy
+          import csv
+          import hashlib
+          import json
+          import math
+          import statistics
+          from collections import defaultdict
+          from decimal import Decimal, InvalidOperation
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          import fitz
+          
+          API = 'https://api.sleeper.app/v1/'
+          DEFAULT_LEAGUE_ID = '1326679131051532288'
+          FONT_FILE = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
+          
+          
+          def fetch_json(resource):
+              req = Request(API+resource, headers={'User-Agent':'LOG-NL40R1-standings-read-only/1.0'})
+              with urlopen(req, timeout=35) as response:
+                  return json.load(response)
+          
+          
+          def as_points(matchup):
+              value = matchup.get('custom_points')
+              if value is None: value = matchup.get('points')
+              try: d = Decimal(str(value))
+              except (InvalidOperation, TypeError): raise ValueError('Missing or invalid final score')
+              if not d.is_finite() or d<0: raise ValueError('Invalid final score')
+              return d
+          
+          
+          def fresh_record():
+              return {'h2h':{'w':0,'l':0,'t':0},'median':{'w':0,'l':0,'t':0},'pf':Decimal(0)}
+          
+          
+          def validate_teams(rosters, users):
+              if not isinstance(rosters,list) or len(rosters)!=12: raise ValueError('Expected exactly 12 Sleeper rosters')
+              by_uid={str(u['user_id']):u for u in users}
+              names={}
+              for r in rosters:
+                  rid=int(r['roster_id']);u=by_uid.get(str(r.get('owner_id') or ''),{})
+                  name=((u.get('metadata') or {}).get('team_name') or u.get('display_name') or f'Team {rid}').strip()
+                  if not name: raise ValueError(f'Missing name for roster {rid}')
+                  if rid in names: raise ValueError('Duplicate roster ID')
+                  names[rid]=name
+              if len(set(names.values()))!=12: raise ValueError('Duplicate display team names')
+              return names
+          
+          
+          def add_result(outcome, left, right):
+              if left>right: outcome['w']+=1
+              elif left<right: outcome['l']+=1
+              else: outcome['t']+=1
+          
+          
+          def apply_week(records, raw, names, week):
+              if not isinstance(raw,list) or len(raw)!=12:
+                  raise ValueError(f'Week {week}: 12 completed matchups required, found {len(raw) if isinstance(raw,list) else "non-list"}')
+              by_id={}
+              matches=defaultdict(list)
+              for row in raw:
+                  rid=int(row['roster_id'])
+                  if rid not in names or rid in by_id or row.get('matchup_id') is None:
+                      raise ValueError(f'Week {week}: unexpected/duplicate roster or missing matchup ID')
+                  by_id[rid]=as_points(row)
+                  matches[str(row['matchup_id'])].append(rid)
+              if len(by_id)!=12 or len(matches)!=6 or any(len(pair)!=2 for pair in matches.values()):
+                  raise ValueError(f'Week {week}: incomplete pairing/identity')
+              median=statistics.median(by_id.values())
+              for rid,points in by_id.items():
+                  records[rid]['pf']+=points
+                  add_result(records[rid]['median'],points,median)
+              for pair in matches.values():
+                  a,b=pair
+                  add_result(records[a]['h2h'],by_id[a],by_id[b])
+                  add_result(records[b]['h2h'],by_id[b],by_id[a])
+              for rid,row in records.items():
+                  for field in ('h2h','median'):
+                      if sum(row[field].values())!=week:
+                          raise ValueError(f'Week {week} {rid} {field} totals do not reconcile')
+              return median
+          
+          
+          def power_table(records, names, weeks):
+              if weeks<1: return []
+              pf={rid:v['pf'] for rid,v in records.items()}
+              size=len(pf)
+              if size!=12: raise ValueError('Power index expects 12 teams')
+              result=[]
+              for rid,r in records.items():
+                  h=r['h2h'];m=r['median']
+                  total_w=h['w']+m['w'];total_l=h['l']+m['l'];total_t=h['t']+m['t']
+                  if total_w+total_l+total_t!=2*weeks: raise ValueError('Combined record out of balance')
+                  win_fraction=(Decimal(total_w)+Decimal(total_t)/2)/Decimal(2*weeks)
+                  lower=sum(1 for k,v in pf.items() if k!=rid and v<r['pf'])
+                  equal=sum(1 for k,v in pf.items() if k!=rid and v==r['pf'])
+                  pf_pct=(Decimal(lower)+Decimal(equal)/2)/Decimal(size-1)
+                  # Restore the original Week 8 editorial formula exactly:
+                  # 60% H2H+median win rate, 40% season PF percentile.
+                  score=Decimal(100)*(Decimal('0.60')*win_fraction+Decimal('0.40')*pf_pct)
+                  result.append({'roster_id':rid,'team':names[rid],'power_score':float(score),
+                      'points_for':float(r['pf']), 'h2h':h.copy(),'median':m.copy(),
+                      'combined':{'w':total_w,'l':total_l,'t':total_t},'combined_win_rate':float(win_fraction),
+                      'pf_percentile':float(pf_pct)})
+              result.sort(key=lambda x:(-x['power_score'],-x['points_for'],x['roster_id']))
+              for i,row in enumerate(result,1):row['power_rank']=i
+              return result
+          
+          
+          def compute_snapshot(league_id,through_week, getter=fetch_json):
+              if through_week not in range(1,19):raise ValueError('Completed through-week must be in 1..18')
+              league=getter(f'league/{league_id}')
+              if str(league.get('season'))!='2026':raise ValueError('Expected 2026 league season')
+              names=validate_teams(getter(f'league/{league_id}/rosters'),getter(f'league/{league_id}/users'))
+              rec={rid:fresh_record() for rid in names}
+              prior=[];medians=[]
+              for week in range(1,through_week+1):
+                  if week==through_week and week>1:
+                      prior=power_table(copy.deepcopy(rec),names,week-1)
+                  m=apply_week(rec,getter(f'league/{league_id}/matchups/{week}'),names,week)
+                  medians.append(float(m))
+              rankings=power_table(rec,names,through_week)
+              prev={row['roster_id']:row['power_rank'] for row in prior}
+              for row in rankings:
+                  row['rank_change']=prev.get(row['roster_id'],row['power_rank'])-row['power_rank'] if prior else None
+              return {'schema_version':1,'season':2026,'through_week':through_week,'league_id':league_id,
+                      'teams':rankings,'median_by_week':medians,
+                      'rank_algorithm':'0.60 * combined H2H+median win rate + 0.40 * PF percentile (12 teams)',
+                      'rank_status':'Editorial power index; not official Sleeper standings',
+                      'source':f'Sleeper public league/{league_id}/matchups/1..{through_week} + rosters + users',
+                      'ties_policy':'Ties count as half-wins in power win rate; H2H/median ties retained separately'}
+          
+          
+          def color(hexstr):
+              h=hexstr.lstrip('#')
+              return tuple(int(h[i:i+2],16)/255.0 for i in (0,2,4))
+          
+          
+          class PagePen:
+              def __init__(self,page):
+                  self.page=page
+                  self.f=fitz.Font(fontfile=FONT_FILE) if Path(FONT_FILE).is_file() else fitz.Font('helv')
+                  self.fn='LOGDEJ' if Path(FONT_FILE).is_file() else 'helv'
+                  if self.fn!='helv':page.insert_font(fontname=self.fn,fontfile=FONT_FILE)
+              def text(self,x,y,label,size=9,bold=False,ink='#14334A'):
+                  label=str(label)
+                  if self.fn=='helv':label=label.encode('latin-1','replace').decode('latin-1')
+                  self.page.insert_text(fitz.Point(x,y),label,fontname=self.fn,fontsize=size,color=color(ink))
+              def width(self,label,size): return self.f.text_length(str(label),fontsize=size)
+              def rect(self,x0,y0,x1,y1,fill):self.page.draw_rect(fitz.Rect(x0,y0,x1,y1),color=None,fill=color(fill))
+              def line(self,x0,y0,x1,y1,stroke):self.page.draw_line(fitz.Point(x0,y0),fitz.Point(x1,y1),color=color(stroke),width=.55)
+          
+          
+          def record_string(r):
+              return f"{r['w']}-{r['l']}"+(f"-{r['t']}" if r['t'] else '')
+          
+          
+          def append_rank_pages(doc, data, edition, week):
+              original_pages=len(doc)
+              dims=doc[0].rect
+              W,H=dims.width,dims.height
+              for part in range(2):
+                  page=doc.new_page(width=W,height=H)
+                  p=PagePen(page)
+                  p.rect(0,0,W,H,'#FCFAF5')
+                  p.rect(0,0,W,102,'#112E46')
+                  p.rect(0,100,W,103,'#BA6B5C')
+                  p.text(16,20,'LEAGUE OF ORDINARY GENTLEMEN',8,ink='#F1DCD0')
+                  p.text(16,48,'POWER RANKINGS',20,ink='#FFF8EB')
+                  p.text(16,69,f'{edition.upper()}  |  THROUGH WEEK {data["through_week"]}',9.0,ink='#F2E5D8')
+                  p.text(16,87,f'RANKINGS / PAGE {part+1} OF 2',8,ink='#F2E5D8')
+                  p.text(16,126,'60% COMBINED WIN RATE + 40% POINTS-FOR PERCENTILE',7.8,ink='#AF6359')
+                  p.text(16,145,'H2H and league-median records shown separately.',9.3,ink='#234A60')
+                  y=158
+                  for i,row in enumerate(data['teams'][part*6:(part+1)*6]):
+                      top=y+i*72
+                      if i%2==0:p.rect(13,top,W-13,top+66,'#E8EDF0')
+                      else:p.rect(13,top,W-13,top+66,'#F3F2EE')
+                      label=f"{row['power_rank']:02d}  {row['team']}"
+                      fs=10.4
+                      while p.width(label,fs)>W-90 and fs>8.0:fs-=.3
+                      p.text(20,top+17,label,fs,ink='#142F46')
+                      score=f"{row['power_score']:.1f}"
+                      p.text(W-18-p.width(score,11.7),top+17,score,11.7,ink='#186B50')
+                      p.text(20,top+36,f"H2H  {record_string(row['h2h'])}      MEDIAN  {record_string(row['median'])}      TOTAL  {record_string(row['combined'])}",8.4,ink='#365870')
+                      delta=row['rank_change']
+                      movement='NEW' if delta is None else 'UP '+str(delta) if delta>0 else 'DOWN '+str(-delta) if delta<0 else 'EVEN'
+                      p.text(20,top+53,f"PF  {row['points_for']:,.2f}      WEEKLY MOVEMENT  {movement}",8.4,ink='#365870')
+                  fy=H-55
+                  p.line(15,fy,W-15,fy,'#B8C5C8')
+                  p.text(16,fy+15,'EDITORIAL SCORE - NOT OFFICIAL SLEEPER STANDINGS',7.1,ink='#8B645E')
+                  p.text(16,fy+28,f'Sleeper matchups, Weeks 1-{data["through_week"]}; no private free-agent data.',7,ink='#667B86')
+                  p.text(16,H-12,f'LOG / {edition.upper()}  |  {original_pages+part+1}',7.4,ink='#667B86')
+              return doc
+          
+          
+          def write_csv(outpath, data):
+              fields=['power_rank','team','power_score','h2h_w','h2h_l','h2h_t','median_w','median_l','median_t',
+                      'combined_w','combined_l','combined_t','points_for','rank_change','roster_id']
+              with outpath.open('w',newline='',encoding='utf-8') as f:
+                  w=csv.DictWriter(f,fieldnames=fields);w.writeheader()
+                  for x in data['teams']:
+                      w.writerow({'power_rank':x['power_rank'],'team':x['team'],'power_score':f"{x['power_score']:.1f}",
+                          **{f'{kind}_{field}':x[kind][field] for kind in ['h2h','median','combined'] for field in ['w','l','t']},
+                          'points_for':f"{x['points_for']:.2f}",'rank_change':x['rank_change'],'roster_id':x['roster_id']})
+          
+          
+          def enhance(input_dir, output_dir, war_week, nl39_run_id, getter=fetch_json):
+              after=war_week-1
+              data=compute_snapshot(DEFAULT_LEAGUE_ID,after,getter)
+              output_dir.mkdir(parents=True,exist_ok=True)
+              manifest={'nl39_source_run_id':nl39_run_id,'war_week':war_week,'aftermath_week':after,
+                  'standings':data,'files':{},'modification_policy':'append exactly two standings pages; preserve all 7 source pages unchanged'}
+              for edition,w in [('WarRoom',war_week),('Aftermath',after)]:
+                  inp=input_dir/f'LOG-NL39R1-{edition}-W{w:02d}-Weekly-Integration-Shadow.pdf'
+                  if not inp.is_file():raise FileNotFoundError(f'Missing exact NL39 source PDF: {inp}')
+                  with fitz.open(inp) as source:
+                      if len(source)!=7:raise ValueError(f'{edition} source should have 7 validated pages')
+                      before=[hashlib.sha256(p.get_text().encode('utf-8')).hexdigest() for p in source]
+                      if not any('NOT PUBLISHED' in p.get_text() for p in source):
+                          raise ValueError(f'{edition}: not a validated NL39 shadow input')
+                      dest=output_dir/f'LOG-NL40R1-{edition}-W{w:02d}-Power-Standings-Shadow.pdf'
+                      with fitz.open() as doc:
+                          doc.insert_pdf(source)
+                          append_rank_pages(doc,data,edition,w)
+                          doc.save(dest,garbage=4,deflate=True)
+                  with fitz.open(dest) as result:
+                      if len(result)!=9:raise ValueError('Expected seven editorial + two rankings pages')
+                      if before!=[hashlib.sha256(p.get_text().encode('utf-8')).hexdigest() for p in list(result)[:7]]:
+                          raise ValueError('Existing newsletter editorial pages were modified')
+                      final=' '.join(result[-2].get_text().split())+' '+' '.join(result[-1].get_text().split())
+                      for row in data['teams']:
+                          # Team names with emojis may be visually rendered with replacement by PDF viewer;
+                          # identifiers, records and scores remain in manifest and CSV.
+                          if str(row['power_score'] and f"{row['power_score']:.1f}") not in final:
+                              raise ValueError('Missing score from appended rankings')
+                      for text in ('H2H','MEDIAN','TOTAL','PF','NOT OFFICIAL'):
+                          if text not in final:raise ValueError('Missing mandatory standings field '+text)
+                      manifest['files'][edition]={'file':dest.name,'pages':9,
+                          'source_sha256':hashlib.sha256(inp.read_bytes()).hexdigest(),
+                          'output_sha256':hashlib.sha256(dest.read_bytes()).hexdigest(),
+                          'original_page_text_sha256':before}
+              write_csv(output_dir/'LOG-NL40R1-power-standings.csv',data)
+              (output_dir/'LOG-NL40R1-standings-source.json').write_text(json.dumps(manifest,indent=2)+'\n',encoding='utf-8')
+              return manifest
+          
+          
+          def sample_selftest():
+              names={i:str(i) for i in range(1,13)}
+              pf={'Landry':2073.6,'Apex':1984.8,'Narroway':1914.9,'Toddy':1847.8,'Pullham':1722.6,'Serious':1787.6,'Moose':1633.6,'Sunday':1777.7,'Respectable':1550.9,'Cock':1432.4,'Just':1482.8,'Bagels':1340.6}
+              ws={'Landry':15,'Apex':14,'Narroway':10,'Toddy':10,'Pullham':12,'Serious':9,'Moose':9,'Sunday':7,'Respectable':4,'Cock':3,'Just':2,'Bagels':1}
+              r={};nm={}
+              for i,team in enumerate(pf,1):
+                  nm[i]=team;w=ws[team]
+                  r[i]={'h2h':{'w':0,'l':8,'t':0},'median':{'w':w,'l':16-w-8,'t':0},'pf':Decimal(str(pf[team]))}
+                  # This test requires only the combined record, because exact H2H/median splits were not in the PDF.
+                  r[i]['h2h']={'w':8,'l':0,'t':0}
+                  r[i]['median']={'w':w-8 if w>=8 else w,'l':16-w if w>=8 else 8-w,'t':0}
+                  if w<8: r[i]['h2h']={'w':0,'l':8,'t':0};r[i]['median']={'w':w,'l':8-w,'t':0}
+                  assert sum(r[i]['h2h'].values())==8 and sum(r[i]['median'].values())==8
+              table=power_table(r,nm,8)
+              expected=[('Landry',96.2),('Apex',88.9),('Narroway',70.2),('Toddy',66.6),('Pullham',63.2),('Serious',59.2),('Moose',48.3),('Sunday',48.1),('Respectable',25.9),('Cock',14.9),('Just',14.8),('Bagels',3.8)]
+              assert [(r['team'],round(r['power_score'],1)) for r in table]==expected,[(r['team'],round(r['power_score'],1)) for r in table]
+              print('PASS: original Week 8 power-index scores reproduced exactly from supplied PDF')
+          
+          
+          def main():
+              parser=argparse.ArgumentParser()
+              parser.add_argument('--input-dir',type=Path,required=True)
+              parser.add_argument('--output-dir',type=Path,required=True)
+              parser.add_argument('--war-week',type=int,required=True)
+              parser.add_argument('--nl39-run-id',required=True)
+              parser.add_argument('--selftest',action='store_true')
+              a=parser.parse_args()
+              sample_selftest()
+              manifest=enhance(a.input_dir,a.output_dir,a.war_week,a.nl39_run_id)
+              print('PASS: NL40 read-only power rankings, separate H2H and median records, 2 PDFs, 9 pages each')
+              print(json.dumps({'source_run':manifest['nl39_source_run_id'],'files':{k:v['file'] for k,v in manifest['files'].items()}},indent=2))
+          
+          if __name__=='__main__':main()
+          NL40_POWER_PY
+          python3 "$RUNNER_TEMP/nl40_power.py" \
+            --input-dir nl39_input --output-dir nl40_output \
+            --war-week "$WAR_WEEK" --nl39-run-id "$SOURCE_RUN_ID"
+      - name: Upload two nine-page newsletters plus reproducible standings evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: LOG-NL40R1-Power-and-Split-Standings-Shadow-${{ github.run_id }}
+          path: nl40_output/
+          if-no-files-found: error
+          retention-days: 90
+      - name: Newsletter layout extension summary
+        shell: bash
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'NL40_NOTES'
+          ## NL40R1 - league-requested standings restored (shadow only)
+          - Retains all 7 unchanged NL39 editorial pages in each edition.
+          - Appends 2 mobile-readable power-ranking pages per edition (9 pages total).
+          - Separate season H2H, median, and combined records; points for; movement.
+          - Uses the original verified formula: 60% combined H2H+median win rate, 40% season PF percentile.
+          - Power formula is separate from the 75/15/10 editorial voice policy.
+          - Strict 12-roster / 6-matchup / score / tie / week reconciliation; fails on incomplete data.
+          - JSON and CSV evidence are supplied for every team; rankings are editorial, not official Sleeper standings.
+          - No changes to NL36/NL39, no repository writes, no newsletter publication, no emails, no private free-agent data.
+          NL40_NOTES
