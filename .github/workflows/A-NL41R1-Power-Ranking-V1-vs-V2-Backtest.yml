@@ -1,0 +1,399 @@
+name: A-NL41R1 - Power Rankings V1 vs V2 Walk-Forward Backtest (Read Only)
+run-name: A-NL41R1 - Test 60-40 vs 35-30-25-10 through Week ${{ inputs.through_week }}
+'on':
+  workflow_dispatch:
+    inputs:
+      through_week:
+        description: Last fully completed NFL week in 2026 (Week 8 is a safe default as of Nov 8)
+        required: true
+        type: string
+        default: '8'
+permissions:
+  contents: read
+concurrency:
+  group: log-nl41r1-readonly-power-backtest
+  cancel-in-progress: false
+jobs:
+  power-rank-backtest:
+    name: Audit 2026 weekly results; test V1 vs V2 on subsequent weeks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run offline contract tests and actual chronology-safe Sleeper backtest
+        shell: bash
+        env:
+          THROUGH_WEEK: ${{ inputs.through_week }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/nl41r1_backtest.py" <<'NL41_BACKTEST'
+          #!/usr/bin/env python3
+          """Read-only, chronological LOG power-rank V1 vs V2 backtest.
+          
+          No trade pricing, publication, pick archives, or repository writes.
+          Data: Sleeper league matchup scores, users, rosters. 2026, through completed week.
+          """
+          from __future__ import annotations
+          import argparse, collections, csv, datetime, hashlib, json, math, random, statistics
+          import urllib.request
+          from pathlib import Path
+          
+          LEAGUE_ID='1326679131051532288'
+          SEASON='2026'
+          ROOT_API='https://api.sleeper.app/v1/'
+          RNG_SEED=41
+          
+          
+          def fetch_json(endpoint):
+              request=urllib.request.Request(ROOT_API+endpoint,headers={'User-Agent':'LOG-NL41R1-Power-Backtest-ReadOnly/1.0'})
+              with urllib.request.urlopen(request,timeout=35) as response:
+                  return json.load(response)
+          
+          
+          def clamp(x, lo=0., hi=100.):return min(hi,max(lo,x))
+          
+          
+          def rmean(x):return statistics.fmean(x) if x else 0.0
+          
+          
+          def midranks(values):
+              pairs=sorted(enumerate(values),key=lambda z:z[1]);out=[0.0]*len(values)
+              i=0
+              while i<len(pairs):
+                  j=i+1
+                  while j<len(pairs) and pairs[j][1]==pairs[i][1]:j+=1
+                  rank=(i+1+j)/2.0
+                  for k in range(i,j):out[pairs[k][0]]=rank
+                  i=j
+              return out
+          
+          
+          def pearson(x,y):
+              if len(x)!=len(y) or len(x)<2:return 0.0
+              mx,my=rmean(x),rmean(y)
+              sxx=sum((a-mx)**2 for a in x);syy=sum((b-my)**2 for b in y)
+              return sum((a-mx)*(b-my) for a,b in zip(x,y))/(math.sqrt(sxx*syy)) if sxx>0 and syy>0 else 0.0
+          
+          
+          def spearman(x,y):return pearson(midranks(x),midranks(y))
+          
+          
+          def zscore100(x):
+              vals=list(x.values());mean=rmean(vals);sd=statistics.pstdev(vals)
+              return {k:clamp(50+20*(v-mean)/sd) if sd>1e-9 else 50.0 for k,v in x.items()}
+          
+          
+          def check_point(x):
+              if not isinstance(x,(int,float)) or isinstance(x,bool) or not math.isfinite(x) or x<0:
+                  raise ValueError('Incomplete, missing, negative, or non-finite Sleeper matchup score')
+              return float(x)
+          
+          
+          def names_from(rosters,users):
+              if not isinstance(rosters,list) or len(rosters)!=12:raise ValueError('Expect 12 team rosters')
+              mapped={str(x['user_id']):x for x in users}
+              names={}
+              for r in rosters:
+                  rid=int(r['roster_id']);user=mapped.get(str(r.get('owner_id') or ''),{})
+                  name=(user.get('metadata') or {}).get('team_name') or user.get('display_name') or f'Team {rid}'
+                  if rid in names or not str(name).strip():raise ValueError('Missing or duplicate team ID/name')
+                  names[rid]=str(name).strip()
+              if len(names)!=12 or len(set(names.values()))!=12:raise ValueError('Team count/name uniqueness violation')
+              return names
+          
+          
+          def one_week(rows,roster_ids,week):
+              if not isinstance(rows,list) or len(rows)!=12:raise ValueError(f'Week {week}: require 12 matchup scores')
+              pts={};pairs=collections.defaultdict(list)
+              for row in rows:
+                  rid=int(row['roster_id'])
+                  if rid in pts or rid not in roster_ids or row.get('matchup_id') is None:
+                      raise ValueError(f'Week {week}: missing matchup or duplicated/mismatched roster')
+                  v=row.get('custom_points');v=v if v is not None else row.get('points')
+                  pts[rid]=check_point(v)
+                  pairs[str(row['matchup_id'])].append(rid)
+              if len(pts)!=12 or len(pairs)!=6 or any(len(v)!=2 for v in pairs.values()):
+                  raise ValueError(f'Week {week}: six proper head-to-head pairs required')
+              med=statistics.median(pts.values())
+              return {'week':week,'points':pts,'pairs':[sorted(v) for k,v in sorted(pairs.items())], 'median':med}
+          
+          
+          def standings(history, upto):
+              ids=sorted(history[0]['points']); rec={i:{'h2h_w':0.,'median_w':0.,'all_w':0.,'pf':0.} for i in ids}
+              for wk in history[:upto]:
+                  scores=wk['points'];mid=wk['median']
+                  for rid,p in scores.items():
+                      rec[rid]['pf']+=p
+                      rec[rid]['median_w']+=1 if p>mid else .5 if p==mid else 0
+                      rec[rid]['all_w']+=sum((1.0 if p>q else 0.5 if p==q else 0.0) for oid,q in scores.items() if rid!=oid)
+                  for a,b in wk['pairs']:
+                      sa,sb=scores[a],scores[b]
+                      rec[a]['h2h_w']+=1 if sa>sb else .5 if sa==sb else 0
+                      rec[b]['h2h_w']+=1 if sb>sa else .5 if sa==sb else 0
+              return rec
+          
+          
+          def score_models(history,t):
+              if t<3:raise ValueError('Use at least 3 completed weeks for recent scoring')
+              rec=standings(history,t)
+              ids=sorted(rec)
+              n=len(ids)
+              # Original model: combine 1 H2H + 1 median W/L per week; PF rank mid-percentile.
+              pf={i:rec[i]['pf'] for i in ids}
+              def pf_rank_pct(i):
+                  v=pf[i]; below=sum(1 for j in ids if j!=i and pf[j]<v)
+                  equal=sum(1 for j in ids if j!=i and pf[j]==v)
+                  return 100*(below+equal/2)/(n-1)
+              # New model: scoring margins count, at a bounded 20 pts per std dev.
+              season_ppg={i:rec[i]['pf']/t for i in ids}
+              recent3={i:rmean([wk['points'][i] for wk in history[t-3:t]]) for i in ids}
+              season_score=zscore100(season_ppg)
+              recent_score=zscore100(recent3)
+              out={}
+              for i in ids:
+                  combined_wr=(rec[i]['h2h_w']+rec[i]['median_w'])/(2*t)*100
+                  all_play=rec[i]['all_w']/(t*(n-1))*100
+                  h2h_wr=rec[i]['h2h_w']/t*100
+                  v1=0.60*combined_wr+0.40*pf_rank_pct(i)
+                  v2=0.35*season_score[i]+0.30*all_play+0.25*recent_score[i]+0.10*h2h_wr
+                  out[i]={'v1':v1,'v2':v2,'combined_wr':combined_wr,'pf_pct':pf_rank_pct(i),
+                          'season_strength':season_score[i],'all_play_pct':all_play,
+                          'recent3_strength':recent_score[i],'h2h_pct':h2h_wr,
+                          'h2h_record_wins':rec[i]['h2h_w'],'median_record_wins':rec[i]['median_w'],
+                          'season_pf':rec[i]['pf'],'recent3_ppg':recent3[i]}
+              for key in ['v1','v2']:
+                  ordered=sorted(ids,key=lambda i:(-out[i][key],-out[i]['season_pf'],i))
+                  for rank,rid in enumerate(ordered,1):out[rid][key+'_rank']=rank
+              return out
+          
+          
+          def evaluate_week(prev, target):
+              pts=target['points'];ids=sorted(pts)
+              # All-play order equals weekly PF order. Report once, not as independent validation.
+              actual_ranks=midranks([-pts[i] for i in ids])
+              ranks={i:actual_ranks[k] for k,i in enumerate(ids)}
+              top_actual=set(sorted(ids,key=lambda i:(-pts[i],i))[:3])
+              lines={}
+              for model in ['v1','v2']:
+                  pred=[prev[i][model] for i in ids]
+                  rho=spearman(pred,[pts[i] for i in ids])
+                  mae=rmean([abs(prev[i][model+'_rank']-ranks[i]) for i in ids])
+                  pred_top=set(sorted(ids,key=lambda i:prev[i][model+'_rank'])[:3])
+                  top_hits=len(pred_top & top_actual)
+                  correct=total=0.0
+                  for a,b in target['pairs']:
+                      diff=prev[a][model]-prev[b][model]
+                      actual=pts[a]-pts[b]
+                      if actual==0:continue
+                      if diff==0:correct+=.5
+                      elif diff*actual>0:correct+=1
+                      total+=1
+                  lines[model]={'spearman':rho,'rank_mae':mae,'top3_hits':top_hits,'h2h_accuracy':correct/total if total else 0.0,
+                                 'correct_h2h':correct,'total_h2h':total}
+              return lines
+          
+          
+          def mean_metric(items,model,key):return rmean([r[model+'_'+key] for r in items])
+          
+          
+          def bootstrap_delta(weekly,key,rep=6000):
+              rng=random.Random(RNG_SEED)
+              n=len(weekly)
+              vals=[]
+              for _ in range(rep):
+                  picked=[weekly[rng.randrange(n)] for _ in range(n)]
+                  vals.append(mean_metric(picked,'v2',key)-mean_metric(picked,'v1',key))
+              vals.sort()
+              return vals[math.floor(.025*(rep-1))],vals[math.ceil(.975*(rep-1))]
+          
+          
+          def to_csv(path,rows,fields):
+              with open(path,'w',encoding='utf-8',newline='') as fh:
+                  writer=csv.DictWriter(fh,fieldnames=fields,extrasaction='ignore');writer.writeheader();writer.writerows(rows)
+          
+          
+          def report_metrics(week_rows,latest_ranks,through_week):
+              prim='spearman';better=lambda k:mean_metric(week_rows,'v2',k)-mean_metric(week_rows,'v1',k)
+              rows=[]
+              for metric,label,direction in [('spearman','Next-week scoring rank (Spearman)','higher'),('rank_mae','Next-week mean rank error','lower'),('top3_hits','Next-week top-3 matches out of 3','higher'),('h2h_accuracy','Next-week H2H pick accuracy','higher')]:
+                  v1=mean_metric(week_rows,'v1',metric);v2=mean_metric(week_rows,'v2',metric)
+                  ci=bootstrap_delta(week_rows,metric)
+                  rows.append({'metric':metric,'description':label,'v1':round(v1,5),'v2':round(v2,5),'delta_v2_minus_v1':round(v2-v1,5),
+                               'delta_95pct_week_bootstrap_ci':[round(x,5) for x in ci],'direction_better':direction})
+              # Since only five evaluation weeks (W4-8), don't authorize automatic replacement.
+              delta=better(prim);ci=bootstrap_delta(week_rows,prim)
+              if delta>=.03 and ci[0]>0 and better('h2h_accuracy')>=-.03:
+                  verdict='V2 supported directionally, but HOLD publication until more weeks or independent-season validation.'
+              elif delta>0:
+                  verdict='V2 directionally promising, but evidence inconclusive. KEEP V1 for now.'
+              else:
+                  verdict='V2 does not outperform V1 on the primary next-week ranking measure. KEEP V1 for now.'
+              return rows,verdict
+          
+          
+          def analyze(history,names):
+              total=len(history)
+              if total<4:raise ValueError('Need at least 4 complete weeks')
+              all_week=[];details=[];prior_ranks={}
+              for t in range(3,total):
+                  pred=score_models(history,t)
+                  result=evaluate_week(pred,history[t])
+                  row={'train_through_week':t,'predict_week':t+1,'median_of_predicted_week':history[t]['median']}
+                  for model in ['v1','v2']:
+                      for k,v in result[model].items():row[model+'_'+k]=v
+                  all_week.append(row)
+                  for rid in sorted(pred):
+                      p=pred[rid];score=history[t]['points'][rid];rank_obs=1+sum(1 for j,s in history[t]['points'].items() if s>score)
+                      details.append({'training_through_week':t,'target_week':t+1,'team':names[rid],'roster_id':rid,
+                                      'v1_score':round(p['v1'],3),'v1_rank':p['v1_rank'],
+                                      'v2_score':round(p['v2'],3),'v2_rank':p['v2_rank'],
+                                      'next_week_actual_points':score,'next_week_actual_rank':rank_obs})
+              latest=score_models(history,total)
+              current=[]
+              for rid,v in latest.items():
+                  current.append({'team':names[rid],'roster_id':rid,'v1_rank':v['v1_rank'],'v1_score':round(v['v1'],2),
+                                  'v2_rank':v['v2_rank'],'v2_score':round(v['v2'],2),
+                                  'rank_change_v2_vs_v1':v['v1_rank']-v['v2_rank'],
+                                  'season_pf':round(v['season_pf'],2),'recent_3_week_ppg':round(v['recent3_ppg'],2),
+                                  'all_play_win_pct':round(v['all_play_pct'],1)})
+              current.sort(key=lambda x:x['v2_rank'])
+              # Mean sequential ranking movement is volatility, not a predictive quality metric.
+              shifts={model:[] for model in ['v1','v2']}
+              for t in range(3,total+1):
+                  cur=score_models(history,t)
+                  if t>3:
+                      prior=score_models(history,t-1)
+                      for model in ['v1','v2']:
+                          shifts[model].extend(abs(cur[i][model+'_rank']-prior[i][model+'_rank']) for i in cur)
+              summary,verdict=report_metrics(all_week,current,total)
+              return all_week,details,current,summary,verdict,{k:round(rmean(v),3) for k,v in shifts.items()}
+          
+          
+          def markdown(history,names,week_rows,current,summary,verdict,shifts):
+              lines=[f'# NL41R1 — LOG 2026 Power Rankings: V1 vs V2 Walk-Forward Backtest',
+                  f'**Season:** 2026 · **Completed through:** Week {len(history)} · **League:** {LEAGUE_ID}',
+                  f'**Out-of-sample test:** rankings after Weeks 3–{len(history)-1}, scored against the following Weeks 4–{len(history)}.',
+                  f'**Test size:** {len(week_rows)} distinct next-week outcomes × 12 teams; 6 H2H games per week.',
+                  '', '**V1:** 60% (combined H2H + median win rate) + 40% season points-for percentile.',
+                  '**V2:** 35% season PPG z-score + 30% all-play win rate + 25% last-3-week PPG z-score + 10% H2H win rate.',
+                  'For z-scores: 50 + 20 × (player value − league mean)/population SD, capped to [0,100].',
+                  'All-play: weekly victories against each of 11 possible opponents, ties half credit.',
+                  'H2H and median outcomes are calculated independently, one result of each per completed week.',
+                  '', '## Evidence-based decision', verdict,'',
+                  'The five tested weeks are correlated and too few for reliable deployment claims. Bootstrap intervals resample entire weeks, not 12 teams as independent observations. No formula changes have been made.',
+                  '', '## Main comparisons',
+                  '| Metric | V1 | V2 | V2 minus V1 | Paired week-bootstrap 95% interval |',
+                  '|---|---:|---:|---:|---|']
+              for r in summary:
+                  lines.append(f"| {r['description']} | {r['v1']:.3f} | {r['v2']:.3f} | {r['delta_v2_minus_v1']:+.3f} | {r['delta_95pct_week_bootstrap_ci'][0]:+.3f} to {r['delta_95pct_week_bootstrap_ci'][1]:+.3f} |")
+              lines.extend(['', 'The primary metric is next-week Spearman correlation between **pre-week power scores** and actual **next-week scoring** across all 12 teams. All-play rank and points scored yield the same within-week ordering, so they are not counted as independent tests.',
+                            f"Average week-to-week rank movement: V1 **{shifts['v1']:.2f}** spots, V2 **{shifts['v2']:.2f}** spots. Lower means more stable; stability alone is not predictive accuracy.",
+                            '', '## Full-league latest ranks',
+                            '| Team | V1 rank | V2 rank | V1 score | V2 score | Change |',
+                            '|---|---:|---:|---:|---:|---:|'])
+              for r in current:
+                  team=r['team'].replace('|','/')
+                  lines.append(f"| {team} | {r['v1_rank']} | {r['v2_rank']} | {r['v1_score']:.1f} | {r['v2_score']:.1f} | {r['rank_change_v2_vs_v1']:+} |")
+              lines.extend(['','## Weekly holdout detail','| Training weeks | Test week | V1 Spearman | V2 Spearman | V1 H2H accuracy | V2 H2H accuracy |','|---|---|---:|---:|---:|---:|'])
+              for r in week_rows:
+                  lines.append(f"| 1–{r['train_through_week']} | {r['predict_week']} | {r['v1_spearman']:+.3f} | {r['v2_spearman']:+.3f} | {r['v1_h2h_accuracy']:.1%} | {r['v2_h2h_accuracy']:.1%} |")
+              lines.extend(['','## Data and scope','- Score source: public Sleeper `/league/<id>/matchups/{week}`; roster and user endpoints provide identities.','- Raw source data is included in the workflow artifact for audit.','- No free-agent data, rankings, valuations, newsletter predictions, or private board content was accessed.','- Read-only shadow study; nothing published or changed in GitHub.'])
+              return '\n'.join(lines)+'\n'
+          
+          
+          def test_offline():
+              # Synthetic deterministic 12-team x 6-week fixture proves code paths without Sleeper.
+              teams=list(range(1,13));names={i:'Team '+str(i) for i in teams}
+              hist=[]
+              for w in range(1,7):
+                  pts={i:float(110 + ((i*17+w*13)%47) + i*2 + (5 if w>=4 and i in [3,4,5] else 0)) for i in teams}
+                  hist.append({'week':w,'points':pts,'median':statistics.median(pts.values()),'pairs':[[i,i+1] for i in range(1,13,2)]})
+              before=score_models(hist,3)
+              # Tampering with later outcomes cannot leak backwards into prior scores.
+              future=[dict(x) for x in hist]
+              future[4]=dict(future[4],points={i:999.0-i for i in teams})
+              assert before==score_models(future,3)
+              assert all(0<=v['v1']<=100 and 0<=v['v2']<=100 for v in before.values())
+              assert len({v['v1_rank'] for v in before.values()})==12
+              x=analyze(hist,names)
+              assert len(x[0])==3 and len(x[1])==36 and len(x[2])==12
+              assert all(-1<=r['v1_spearman']<=1 for r in x[0])
+          
+              # Reproduce all twelve published NL40 Week 8 V1 power scores from the supplied
+              # original Aftermath page (combined records and PF only; not future data).
+              week8=[
+                  (15,2073.6,96.2),(14,1984.8,88.9),(10,1914.9,70.2),
+                  (10,1847.8,66.6),(12,1722.6,63.2),(9,1787.6,59.2),
+                  (9,1633.6,48.3),(7,1777.7,48.1),(4,1550.9,25.9),
+                  (3,1432.4,14.9),(2,1482.8,14.8),(1,1340.6,3.8)]
+              for w,pf,expected in week8:
+                  below=sum(1 for _,pp,_ in week8 if pp<pf)
+                  actual=round(60*w/16 +40*below/11,1)
+                  assert actual==expected,(pf,actual,expected)
+              print('PASS: original 12-team Week 8 power-index scores reproduced exactly from the supplied Aftermath')
+          
+              print('PASS: synthetic source-free chronological backtest, no future leakage, bounded scores, rank uniqueness, 12-team outputs')
+          
+          
+          def main():
+              p=argparse.ArgumentParser();p.add_argument('--through-week',type=int,default=8);p.add_argument('--output',default='nl41_report');p.add_argument('--offline-selftest',action='store_true');args=p.parse_args()
+              test_offline()
+              if args.offline_selftest:return
+              if not (4<=args.through_week<=18):raise SystemExit('through_week must be 4..18')
+              state=fetch_json('state/nfl');league=fetch_json('league/'+LEAGUE_ID)
+              if str(state.get('season'))!=SEASON or str(league.get('season'))!=SEASON:
+                  raise RuntimeError('Sleeper current NFL state and league season must be 2026')
+              # Prevent treating in-progress games as completed. Week < Sleeper current week only.
+              current_week=int(state.get('week') or 0)
+              if args.through_week>=current_week:
+                  raise RuntimeError(f'Week {args.through_week} may be in progress (Sleeper state week={current_week}); use last completed week')
+              raw={'state':state,'league':{'season':league.get('season'),'league_id':LEAGUE_ID},
+                   'rosters':fetch_json(f'league/{LEAGUE_ID}/rosters'),'users':fetch_json(f'league/{LEAGUE_ID}/users'),
+                   'matchups':{}}
+              names=names_from(raw['rosters'],raw['users'])
+              history=[]
+              for week in range(1,args.through_week+1):
+                  rec=fetch_json(f'league/{LEAGUE_ID}/matchups/{week}')
+                  raw['matchups'][str(week)]=rec
+                  history.append(one_week(rec,set(names),week))
+              weekly,details,latest,metrics,verdict,shifts=analyze(history,names)
+              out=Path(args.output);out.mkdir(parents=True,exist_ok=True)
+              source=out/'auditable_sleeper_scores.json';source.write_text(json.dumps(raw,indent=2,ensure_ascii=False,sort_keys=True)+'\n',encoding='utf-8')
+              report=markdown(history,names,weekly,latest,metrics,verdict,shifts)
+              (out/'BACKTEST-REPORT.md').write_text(report,encoding='utf-8')
+              to_csv(out/'week_by_week_results.csv',weekly,list(weekly[0]))
+              to_csv(out/'all_60_team_week_predictions.csv',details,list(details[0]))
+              to_csv(out/'latest_team_power_ranks.csv',latest,list(latest[0]))
+              manifest={'schema_version':1,'study':'A-NL41R1','generated_at_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                        'league_id':LEAGUE_ID,'through_week':args.through_week,'folds':len(weekly),
+                        'teams':12,'default_v1':'60/40','candidate_v2':'35/30/25/10','metrics':metrics,'verdict':verdict,
+                        'avg_weekly_rank_movement':shifts,'source_sha256':hashlib.sha256(source.read_bytes()).hexdigest(),
+                        'no_prices_changed':True,'no_publication':True}
+              (out/'BACKTEST-MANIFEST.json').write_text(json.dumps(manifest,indent=2)+'\n',encoding='utf-8')
+              print(report)
+              # CI GitHub summary, no repo files changed.
+              import os
+              if os.environ.get('GITHUB_STEP_SUMMARY'):
+                  with open(os.environ['GITHUB_STEP_SUMMARY'],'a',encoding='utf-8') as f:f.write(report)
+              print('PASS: all completed-week snapshots audited, two pre-registered formulas compared out-of-sample; no GitHub writes')
+          
+          
+          if __name__=='__main__':main()
+          NL41_BACKTEST
+          python3 "$RUNNER_TEMP/nl41r1_backtest.py" --through-week "$THROUGH_WEEK" --output nl41_output
+      - name: Upload backtest evidence, real scores and comparison report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LOG-NL41R1-ReadOnly-Power-Backtest-${{ github.run_id }}
+          path: nl41_output/
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Record deployment policy
+        if: always()
+        shell: bash
+        run: |
+          echo "No newsletter, model, free-agent, ranking formula or repository content changed. This workflow is research-only." >> "$GITHUB_STEP_SUMMARY"
