@@ -1,0 +1,465 @@
+name: A-NL42R1 - Power Ranking V1 V2 V3 Prospective Test (Read Only)
+run-name: A-NL42R1 - Freeze V1 V2 V3 and test completed through W${{ inputs.through_week }}
+'on':
+  workflow_dispatch:
+    inputs:
+      through_week:
+        description: Latest COMPLETED 2026 NFL week; leave 8 for replay; use 9 only once Sleeper advances to Week 10
+        required: true
+        type: string
+        default: '8'
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: log-nl42r1-power-triple-prospective-readonly
+  cancel-in-progress: false
+jobs:
+  power-ranking-prospective:
+    name: Read-only locked V1/V2/V3 walk-forward research
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install the fixed score-only league study and run tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/nl42_backtest.py" <<'NL42_FIXED_ENGINE'
+          #!/usr/bin/env python3
+          """NL42R1: immutable-weight V1/V2/V3 newsletter-power rank challenge (read only).
+
+          Future weeks 9+ are prospective. Weeks 4-8 are exploratory retrospective only.
+          Never imports newsletter publication, free agents, calculator or transaction data.
+          """
+          from __future__ import annotations
+          import argparse
+          import collections
+          import csv
+          from datetime import datetime, timezone
+          import hashlib
+          import json
+          import math
+          from pathlib import Path
+          import random
+          import statistics
+          from urllib.request import Request, urlopen
+
+          LEAGUE_ID='1326679131051532288'
+          SEASON='2026'
+          API='https://api.sleeper.app/v1/'
+          FREEZE_THROUGH_WEEK=8
+          FIRST_PROSPECTIVE_WEEK=9
+          MIN_PROSPECTIVE_WEEKS=4
+          RNG_SEED=4217
+          MODEL_WEIGHTS={
+              'V1':{'combined_win_rate':.60,'points_for_percentile':.40},
+              'V2':{'season_scoring_strength':.35,'all_play_win_rate':.30,'recent_three_week_scoring':.25,'h2h_win_rate':.10},
+              'V3':{'season_scoring_strength':.40,'all_play_win_rate':.35,'recent_three_week_scoring':.15,'h2h_win_rate':.10},
+          }
+
+
+          def fetch(endpoint):
+              req=Request(API+endpoint,headers={'User-Agent':'LOG-NL42R1-Prospective-Formula-Backtest/1.0'})
+              with urlopen(req,timeout=35) as response: return json.load(response)
+
+
+          def average(xs):return statistics.fmean(xs) if xs else 0.0
+
+
+          def ranks(vals):
+              ordered=sorted(enumerate(vals),key=lambda v:v[1]);out=[0.0]*len(vals);idx=0
+              while idx<len(ordered):
+                  end=idx+1
+                  while end<len(ordered) and ordered[end][1]==ordered[idx][1]:end+=1
+                  midpoint=(idx+1+end)/2.0
+                  for j in range(idx,end):out[ordered[j][0]]=midpoint
+                  idx=end
+              return out
+
+
+          def spearman(xs,ys):
+              a,b=ranks(xs),ranks(ys);ma,mb=average(a),average(b)
+              den=math.sqrt(sum((v-ma)**2 for v in a)*sum((v-mb)**2 for v in b))
+              return sum((x-ma)*(y-mb) for x,y in zip(a,b))/den if den else 0.0
+
+
+          def normalized_z(values):
+              vv=list(values.values());mean=average(vv);std=statistics.pstdev(vv)
+              return {k:min(100.0,max(0.0,50+20*(v-mean)/std)) if std>1e-9 else 50.0 for k,v in values.items()}
+
+
+          def team_names(rosters,users):
+              if not isinstance(rosters,list) or len(rosters)!=12:raise ValueError('Exactly 12 rosters required')
+              users_by_id={str(u['user_id']):u for u in users};names={}
+              for roster in rosters:
+                  rid=int(roster['roster_id'])
+                  owner=users_by_id.get(str(roster.get('owner_id') or ''),{})
+                  meta=owner.get('metadata') or {}
+                  name=str(meta.get('team_name') or owner.get('display_name') or f'Team {rid}').strip()
+                  if rid in names or not name: raise ValueError('Duplicate/missing roster ID or team name')
+                  names[rid]=name
+              if len(set(names.values()))!=12:raise ValueError('Team names must be unique')
+              return names
+
+
+          def parse_points(row,week):
+              value=row.get('custom_points')
+              if value is None:value=row.get('points')
+              if isinstance(value,bool) or not isinstance(value,(int,float)) or not math.isfinite(value) or value<0:
+                  raise ValueError(f'Week {week}: score missing, negative, or invalid')
+              return float(value)
+
+
+          def parse_week(rows,names,week):
+              if not isinstance(rows,list) or len(rows)!=12:raise ValueError(f'Week {week}: 12 scored rows required')
+              points={};groups=collections.defaultdict(list)
+              for item in rows:
+                  rid=int(item['roster_id']);mid=item.get('matchup_id')
+                  if rid in points or rid not in names or mid is None:
+                      raise ValueError(f'Week {week}: duplicate, unknown roster, or unpaired team')
+                  points[rid]=parse_points(item,week)
+                  groups[str(mid)].append(rid)
+              if len(groups)!=6 or any(len(x)!=2 for x in groups.values()):
+                  raise ValueError(f'Week {week}: six valid games required')
+              groups=sorted((tuple(sorted(x)) for x in groups.values()))
+              med=statistics.median(points.values())
+              return {'week':week,'points':points,'pairs':groups,'median':med}
+
+
+          def feature_records(history,t):
+              ids=sorted(history[0]['points'])
+              rec={i:{'h2h_w':0.0,'med_w':0.0,'all_w':0.0,'pf':0.0} for i in ids}
+              for wk in history[:t]:
+                  p=wk['points'];median=wk['median']
+                  for i,value in p.items():
+                      rec[i]['pf']+=value
+                      rec[i]['med_w']+=1.0 if value>median else 0.5 if value==median else 0.0
+                      rec[i]['all_w']+=sum((1.0 if value>v else 0.5 if value==v else 0.0) for j,v in p.items() if j!=i)
+                  for a,b in wk['pairs']:
+                      rec[a]['h2h_w']+=1.0 if p[a]>p[b] else 0.5 if p[a]==p[b] else 0.0
+                      rec[b]['h2h_w']+=1.0 if p[b]>p[a] else 0.5 if p[b]==p[a] else 0.0
+              return rec
+
+
+          def build_rankings(history,t):
+              if t<3 or t>len(history):raise ValueError('At least 3 completed weeks required for predictions')
+              rec=feature_records(history,t);ids=sorted(rec);n=len(ids)
+              pf={i:rec[i]['pf'] for i in ids}
+              season_ppg={i:pf[i]/t for i in ids}
+              recent_ppg={i:average([w['points'][i] for w in history[t-3:t]]) for i in ids}
+              season=normalized_z(season_ppg);recent=normalized_z(recent_ppg)
+              out={}
+              for i in ids:
+                  pct=(sum(pf[j]<pf[i] for j in ids if j!=i)+.5*sum(pf[j]==pf[i] for j in ids if j!=i))/(n-1)*100
+                  combined=(rec[i]['h2h_w']+rec[i]['med_w'])/(2*t)*100
+                  allplay=rec[i]['all_w']/(t*(n-1))*100
+                  h2h=rec[i]['h2h_w']/t*100
+                  out[i]={
+                      'V1':.60*combined+.40*pct,
+                      'V2':.35*season[i]+.30*allplay+.25*recent[i]+.10*h2h,
+                      'V3':.40*season[i]+.35*allplay+.15*recent[i]+.10*h2h,
+                      'season_pf':pf[i], 'recent_three_ppg':recent_ppg[i],
+                      'combined_win_rate':combined,'points_for_percentile':pct,
+                      'season_strength':season[i],'all_play_win_rate':allplay,
+                      'recent_strength':recent[i],'h2h_win_rate':h2h,
+                  }
+              for model in MODEL_WEIGHTS:
+                  order=sorted(ids,key=lambda i:(-out[i][model],-out[i]['season_pf'],i))
+                  for rank,rid in enumerate(order,1):out[rid][model+'_rank']=rank
+              return out
+
+
+          def evaluate(pred,week):
+              ids=sorted(pred)
+              actual=week['points']; actual_ranks=dict(zip(ids,ranks([-actual[i] for i in ids])))
+              actual_top=set(sorted(ids,key=lambda i:(-actual[i],i))[:3])
+              out={}
+              for model in MODEL_WEIGHTS:
+                  xs=[pred[i][model] for i in ids];ys=[actual[i] for i in ids]
+                  top=set(sorted(ids,key=lambda i:pred[i][model+'_rank'])[:3])
+                  h2h_wins=0.; h2h_games=0
+                  for a,b in week['pairs']:
+                      delta=pred[a][model]-pred[b][model];result=actual[a]-actual[b]
+                      if result==0:continue
+                      h2h_games+=1
+                      if delta*result>0:h2h_wins+=1
+                      elif delta==0:h2h_wins+=.5
+                  out[model]={
+                      'spearman':spearman(xs,ys),
+                      'mean_rank_error':average([abs(pred[i][model+'_rank']-actual_ranks[i]) for i in ids]),
+                      'top3_hits':len(top&actual_top),
+                      'h2h_correct':h2h_wins,
+                      'h2h_total':h2h_games,
+                      'h2h_accuracy':h2h_wins/h2h_games if h2h_games else 0.0,
+                  }
+              return out
+
+
+          def bootstrap_ci(rows,metric,challenger,baseline='V1',seed=4217,rep=6000):
+              if not rows:return None
+              delta=[row[challenger+'_'+metric]-row[baseline+'_'+metric] for row in rows]
+              rng=random.Random(seed);n=len(delta)
+              vals=sorted(average([delta[rng.randrange(n)] for _ in range(n)]) for _ in range(rep))
+              return [vals[math.floor(.025*(rep-1))],vals[math.ceil(.975*(rep-1))]]
+
+
+          def format_float(x):return f'{x:.3f}'
+
+
+          def write_csv(path,rows,fields):
+              with open(path,'w',encoding='utf-8',newline='') as handle:
+                  writer=csv.DictWriter(handle,fieldnames=fields,extrasaction='ignore')
+                  writer.writeheader();writer.writerows(rows)
+
+
+          def evaluate_history(history,names):
+              total=len(history);weekly=[];team_week=[]
+              for t in range(3,total):
+                  pred=build_rankings(history,t);target=history[t]
+                  metrics=evaluate(pred,target)
+                  row={'training_through_week':t,'test_week':t+1,'cohort':'PROSPECTIVE' if t+1>=FIRST_PROSPECTIVE_WEEK else 'EXPLORATORY'}
+                  for model in MODEL_WEIGHTS:
+                      for k,v in metrics[model].items():row[f'{model}_{k}']=v
+                  weekly.append(row)
+                  for rid in sorted(pred):
+                      base={'team':names[rid], 'roster_id':rid, 'training_through_week':t,'test_week':t+1,'cohort':row['cohort'],
+                            'actual_points':target['points'][rid]}
+                      for model in MODEL_WEIGHTS:
+                          base[f'{model}_score']=round(pred[rid][model],3)
+                          base[f'{model}_rank']=pred[rid][model+'_rank']
+                      team_week.append(base)
+              current=build_rankings(history,total)
+              now=[]
+              for rid,pred in current.items():
+                  row={'team':names[rid],'roster_id':rid,'points_for':round(pred['season_pf'],2),
+                       'recent_three_ppg':round(pred['recent_three_ppg'],2),
+                       'all_play_win_rate':round(pred['all_play_win_rate'],2)}
+                  for model in MODEL_WEIGHTS:
+                      row[f'{model}_score']=round(pred[model],3)
+                      row[f'{model}_rank']=pred[model+'_rank']
+                  now.append(row)
+              now.sort(key=lambda r:r['V1_rank'])
+              volatility={}
+              for model in MODEL_WEIGHTS:
+                  changes=[]
+                  for t in range(4,total+1):
+                      a=build_rankings(history,t-1);b=build_rankings(history,t)
+                      changes.extend(abs(a[rid][model+'_rank']-b[rid][model+'_rank']) for rid in a)
+                  volatility[model]=average(changes)
+              return weekly,team_week,now,volatility
+
+
+          def aggregate(rows):
+              if not rows:return None
+              means={}
+              for model in MODEL_WEIGHTS:
+                  for metric in ('spearman','mean_rank_error','top3_hits','h2h_accuracy'):
+                      means[f'{model}_{metric}']=average([r[f'{model}_{metric}'] for r in rows])
+                  means[f'{model}_h2h_correct']=sum(r[f'{model}_h2h_correct'] for r in rows)
+                  means[f'{model}_h2h_total']=sum(r[f'{model}_h2h_total'] for r in rows)
+              means['weeks']=len(rows)
+              means['bootstrap_95pct_delta_spearman']={
+                  'V2_minus_V1':bootstrap_ci(rows,'spearman','V2','V1'),
+                  'V3_minus_V1':bootstrap_ci(rows,'spearman','V3','V1'),
+                  'V3_minus_V2':bootstrap_ci(rows,'spearman','V3','V2'),
+              }
+              return means
+
+
+          def source_snapshot(data,history,names):
+              return {
+                  'league_id':LEAGUE_ID,'season':SEASON,
+                  'team_names':{str(i):names[i] for i in names},
+                  'weeks':[
+                      {'week':w['week'],'scores':{str(i):p for i,p in sorted(w['points'].items())},
+                       'pairs':[list(pair) for pair in w['pairs']],'median':w['median']}
+                      for w in history
+                  ],
+                  'source':'Sleeper public league matchups (final points only), users, rosters',
+              }
+
+
+          def create_report(through,weekly,current,volatility,allagg,prosagg,raw_sha):
+              explored=[r for r in weekly if r['cohort']=='EXPLORATORY'];pros=[r for r in weekly if r['cohort']=='PROSPECTIVE']
+              lines=[
+                  '# NL42R1 — Fixed-Weight Power Rankings Research',
+                  '',f'**Season:** 2026 · **Completed through:** Week {through} · **League:** {LEAGUE_ID}',
+                  '**Governance:** read-only; no newsletter edits, publication, FV changes, free-agent data or picks archiving.',
+                  f'**Freeze boundary:** after Week {FREEZE_THROUGH_WEEK}. Weeks 4–8 are exploratory; weeks {FIRST_PROSPECTIVE_WEEK}+ are forward holdout.',
+                  '', '## Locked formulas',
+                  '- **V1 (published):** 60% combined H2H+median win rate + 40% season points-for percentile.',
+                  '- **V2:** 35% season scoring z-score + 30% all-play win rate + 25% three-week scoring z-score + 10% H2H win rate.',
+                  '- **V3 (new challenger):** 40% season scoring z-score + 35% all-play win rate + 15% three-week scoring z-score + 10% H2H win rate.',
+                  '- Scoring z-score: `clamp(50 + 20 × (PPG − league mean PPG)/population SD, 0, 100)`.',
+                  '- Scores calculated strictly after Week N to predict Week N+1. Weeks with any missing team score fail closed.',
+                  '', '## Recommendation',
+              ]
+              if len(pros)<MIN_PROSPECTIVE_WEEKS:
+                  lines.append(f'**KEEP V1 PUBLISHED.** {len(pros)} completed prospectively tested week(s); minimum {MIN_PROSPECTIVE_WEEKS} before even considering a change. A higher past score alone does not authorize replacing V1.')
+              else:
+                  lines.append(f'**KEEP V1 PUBLISHED pending human review.** {len(pros)} future weeks are now available for evaluation. Compare the prospective table and uncertainty intervals before deciding whether to authorize a change.')
+              lines+=['','## Historical exploratory backtest (Weeks 4–8)']
+              for label,rows in [('Exploratory',explored),('Prospective holdout (Week 9 onward)',pros)]:
+                  agg=aggregate(rows)
+                  lines+=['',f'### {label}', '']
+                  if not agg:
+                      lines.append('No completed future holdout weeks yet. No conclusion can be drawn.');continue
+                  lines+=['| Metric | V1 | V2 | V3 |','|---|---:|---:|---:|']
+                  for label2,metric in [('Next-week score-rank Spearman','spearman'),('Mean rank error','mean_rank_error'),('Top-three hits per week','top3_hits'),('H2H winner accuracy','h2h_accuracy')]:
+                      vals=[f"{agg[f'{model}_{metric}']:.3f}" for model in MODEL_WEIGHTS]
+                      lines.append(f'| {label2} | '+' | '.join(vals)+' |')
+                  lines+=['',f"Evaluated weeks: {agg['weeks']}. All 12 teams are included per week; weekly resampling accounts for shared outcomes."]
+                  for comparison,lohi in agg['bootstrap_95pct_delta_spearman'].items():
+                      lines.append(f'- {comparison}: 95% week-bootstrap interval {lohi[0]:+.3f} to {lohi[1]:+.3f} (relative Spearman).')
+              lines+=['','## Latest full-league ranking (V1 remains authoritative)', '',
+                      '| Team | V1 | V2 | V3 | V1 score | V2 score | V3 score |',
+                      '|---|---:|---:|---:|---:|---:|---:|']
+              for x in current:
+                  safe=x['team'].replace('|','\\|')
+                  lines.append(f"| {safe} | {x['V1_rank']} | {x['V2_rank']} | {x['V3_rank']} | {x['V1_score']:.1f} | {x['V2_score']:.1f} | {x['V3_score']:.1f} |")
+              lines+=['', '## Week-by-week holdout evaluation','',
+                      '| Training cutoff | Test week | Cohort | V1 rho | V2 rho | V3 rho | V1 H2H | V2 H2H | V3 H2H |',
+                      '|---:|---:|---|---:|---:|---:|---:|---:|---:|']
+              for row in weekly:
+                  lines.append('| '+ ' | '.join([
+                      str(row['training_through_week']),str(row['test_week']),row['cohort'],
+                      *[f"{row[f'{m}_spearman']:.3f}" for m in MODEL_WEIGHTS],
+                      *[f"{row[f'{m}_h2h_correct']:.0f}/{row[f'{m}_h2h_total']:.0f}" for m in MODEL_WEIGHTS]
+                  ])+' |')
+              lines+=['','## Ranking stability','',
+                      'Average absolute rank change between consecutive completed weeks (lower means more stable, not necessarily more predictive):',
+                      ' / '.join(f'{m}: {volatility[m]:.3f}' for m in MODEL_WEIGHTS),
+                      '', f'**Source snapshot SHA-256:** `{raw_sha}`',
+                      'Snapshot contains only team identity, final weekly scores and matchup pairings, not player or free-agent details.',
+                      '### Limitations',
+                      'All 2026 observations are from one league. Matchup outcomes in the same week are correlated. V2 and V3 were designed with earlier Week 4–8 evidence in view; that history cannot be used as an unbiased validation of V3.',
+                      'Future weeks are scored with exactly the same frozen weights. No automated deployment or newsletter update is permitted.',
+                      '']
+              return '\n'.join(lines)
+
+
+          def selftest():
+              names={i:f'Synthetic {i}' for i in range(1,13)}
+              history=[]
+              for week in range(1,9):
+                  pts={i:float(100+(i*11+week*7)%63 + (week*i)%13) for i in names}
+                  pairings=[(i,i+1) for i in range(1,13,2)]
+                  history.append({'week':week,'points':pts,'pairs':pairings,'median':statistics.median(pts.values())})
+              b=build_rankings(history,3);c=build_rankings(history,8)
+              assert all(0<=p[model]<=100 for p in b.values() for model in MODEL_WEIGHTS)
+              assert all(sorted(p[model+'_rank'] for p in c.values())==list(range(1,13)) for model in MODEL_WEIGHTS)
+              # Mutating the target week cannot change frozen pre-week rankings.
+              future=[*history];future[3]={**history[3],'points':{i:v+1000 for i,v in history[3]['points'].items()}}
+              assert build_rankings(future,3)==b
+              # V1 and V2 must equal the NL41 historical formulas, including z-score cap.
+              example=next(iter(b.values()))
+              assert abs(example['V1']-(.60*example['combined_win_rate']+.40*example['points_for_percentile']))<1e-10
+              assert abs(example['V2']-(.35*example['season_strength']+.30*example['all_play_win_rate']+.25*example['recent_strength']+.10*example['h2h_win_rate']))<1e-10
+              assert abs(example['V3']-(.40*example['season_strength']+.35*example['all_play_win_rate']+.15*example['recent_strength']+.10*example['h2h_win_rate']))<1e-10
+              _,_,now,vol=evaluate_history(history,names)
+              assert len(now)==12 and all(x>=0 for x in vol.values())
+              print('PASS: synthetic parity, 12 team rankings, chronological boundary and V1/V2/V3 weight checks')
+
+
+          def main():
+              ap=argparse.ArgumentParser()
+              ap.add_argument('--through-week',type=int,default=8)
+              ap.add_argument('--fixture',type=Path,help='Offline replay of NL41 auditable Sleeper evidence; never fetches network')
+              ap.add_argument('--out',type=Path,default=Path('nl42_output'))
+              ap.add_argument('--selftest',action='store_true')
+              args=ap.parse_args()
+              if args.selftest:selftest();return
+              through=args.through_week
+              if through<8 or through>17:raise ValueError('Completed week must be between 8 and 17')
+              if args.fixture:
+                  source=json.loads(args.fixture.read_text(encoding='utf-8'))
+                  if set(source['matchups'])<set(str(x) for x in range(1,through+1)):
+                      raise ValueError('Offline fixture missing completed weeks')
+              else:
+                  state=fetch('state/nfl')
+                  if str(state.get('season'))!=SEASON:raise ValueError('NFL season has changed; 2026 frozen study only')
+                  if through>=int(state.get('week') or 0):
+                      raise ValueError(f'Week {through} is not yet completed according to Sleeper week state: {state.get("week")}. Do not score incomplete games.')
+                  league=fetch(f'league/{LEAGUE_ID}')
+                  if str(league.get('season'))!=SEASON:raise ValueError('2026 league season mismatch')
+                  source={'league':league,
+                          'rosters':fetch(f'league/{LEAGUE_ID}/rosters'),
+                          'users':fetch(f'league/{LEAGUE_ID}/users'),
+                          'matchups':{str(w):fetch(f'league/{LEAGUE_ID}/matchups/{w}') for w in range(1,through+1)}}
+              if str(source['league'].get('season'))!=SEASON:raise ValueError('Only 2026 league allowed')
+              names=team_names(source['rosters'],source['users'])
+              history=[parse_week(source['matchups'][str(w)],names,w) for w in range(1,through+1)]
+              weekly,team_week,current,volatility=evaluate_history(history,names)
+              # Original Week-8 parity targets reproduced by NL41; guards V1 and V2 against drift.
+              week8=build_rankings(history,8)
+              v1_expected=[96.2,88.9,70.2,66.6,63.2,59.2,48.3,48.1,25.9,14.9,14.8,3.8]
+              if sorted((round(v['V1'],1) for v in week8.values()),reverse=True)!=v1_expected:
+                  raise ValueError('V1 Week 8 historical leaderboard drift: formula or data no longer matches NL40/NL41')
+              rows8=[r for r in weekly if r['test_week']<=8]
+              if len(rows8)!=5:raise ValueError('Missing original 5 test weeks')
+              if abs(average([r['V1_spearman'] for r in rows8])-.5021)>.0002:
+                  raise ValueError('V1 historical Spearman differs from successful NL41 backtest')
+              if abs(average([r['V2_spearman'] for r in rows8])-.5371)>.0002:
+                  raise ValueError('V2 historical Spearman differs from successful NL41 backtest')
+              out=args.out;out.mkdir(parents=True,exist_ok=True)
+              snap=source_snapshot(source,history,names)
+              raw=json.dumps(snap,sort_keys=True,ensure_ascii=False,separators=(',',':')).encode()
+              (out/'NL42R1-score-only-Sleeper-evidence.json').write_bytes(raw+b'\n')
+              summary={'schema':'NL42R1/v1','league_id':LEAGUE_ID,'season':SEASON,
+                       'completed_through_week':through,
+                       'freeze_through_week':FREEZE_THROUGH_WEEK,
+                       'first_prospective_week':FIRST_PROSPECTIVE_WEEK,
+                       'min_prospective_weeks_for_review':MIN_PROSPECTIVE_WEEKS,
+                       'weights':MODEL_WEIGHTS,
+                       'historical_exploratory':aggregate([r for r in weekly if r['cohort']=='EXPLORATORY']),
+                       'prospective_holdout':aggregate([r for r in weekly if r['cohort']=='PROSPECTIVE']),
+                       'volatility':volatility,'scored_future_weeks':[r['test_week'] for r in weekly if r['cohort']=='PROSPECTIVE'],
+                       'snapshot_sha256':hashlib.sha256(raw).hexdigest(),
+                       'policy':'READ_ONLY_NO_AUTO_PROMOTION'}
+              (out/'NL42R1-summary.json').write_text(json.dumps(summary,indent=2)+'\n',encoding='utf-8')
+              write_csv(out/'NL42R1-weekly-model-comparison.csv',weekly,list(weekly[0]))
+              write_csv(out/'NL42R1-team-week-predictions.csv',team_week,list(team_week[0]))
+              write_csv(out/'NL42R1-latest-12-team-rankings.csv',current,list(current[0]))
+              report=create_report(through,weekly,current,volatility,summary['historical_exploratory'],summary['prospective_holdout'],summary['snapshot_sha256'])
+              (out/'NL42R1-READ-ME-BACKTEST.md').write_text(report,encoding='utf-8')
+              print('PASS: NL42R1 frozen-weight triple formula, read-only 2026 league backtest')
+              for phase in ('historical_exploratory','prospective_holdout'):
+                  metric=summary[phase]
+                  if metric:
+                      print(f"{phase} n={metric['weeks']}: " + ', '.join(f"{m} Spearman={metric[m+'_spearman']:.4f}" for m in MODEL_WEIGHTS))
+                  else:print(f'{phase}: no completed holdout weeks')
+              print(f"Evidence SHA256 {summary['snapshot_sha256']}")
+              print('Policy: NO NEWSLETTER CHANGES, NO AUTOMATIC WINNER. Human review required.')
+
+          if __name__=='__main__':main()
+          NL42_FIXED_ENGINE
+          python3 "$RUNNER_TEMP/nl42_backtest.py" --selftest
+          python3 -m py_compile "$RUNNER_TEMP/nl42_backtest.py"
+          mkdir -p nl42_output
+          sha256sum "$RUNNER_TEMP/nl42_backtest.py" | tee nl42_output/NL42R1-ENGINE-SHA256.txt
+      - name: Compare all 3 locked models using real completed Sleeper weeks
+        shell: bash
+        env:
+          THROUGH_WEEK: ${{ inputs.through_week }}
+        run: |
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/nl42_backtest.py" --through-week "$THROUGH_WEEK" --out nl42_output
+      - name: Upload reproducible evidence and backtest analysis (never publish)
+        uses: actions/upload-artifact@v4
+        with:
+          name: LOG-NL42R1-Frozen-Three-Model-Research-${{ github.run_id }}
+          path: nl42_output/
+          retention-days: 90
+          if-no-files-found: error
+      - name: Write read-only research summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '## A-NL42R1 — Frozen V1 / V2 / V3 prospective power-ranking study' >> "$GITHUB_STEP_SUMMARY"
+          echo 'No newsletter or model changes. All weights frozen. Week 4-8 exploratory; Week 9 onward true holdout.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Download the artifact for source-backed CSV, JSON, and Markdown evidence. V1 remains published until explicit human approval.' >> "$GITHUB_STEP_SUMMARY"
+          test -f nl42_output/NL42R1-READ-ME-BACKTEST.md
