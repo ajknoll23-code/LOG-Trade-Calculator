@@ -1,0 +1,424 @@
+name: A-NL47R1 - LOG Approved Weekly Newsletters (One Run)
+run-name: A-NL47R1 - Final War Room W${{ inputs.war_week }} and previous Aftermath with V7 and unit leaderboards
+'on':
+  workflow_dispatch:
+    inputs:
+      war_week:
+        description: Upcoming War Room week (completed Aftermath is one week earlier). W9 reissue uses completed W8.
+        type: string
+        required: true
+        default: '9'
+      refresh_sources:
+        description: Generate new underlying NL39, NL44 and NL45 artifacts rather than reuse matching successful runs
+        type: boolean
+        required: true
+        default: false
+permissions:
+  contents: read
+  actions: write
+concurrency:
+  group: log-nl47r1-owner-approved-week-${{ inputs.war_week }}
+  cancel-in-progress: false
+jobs:
+  approved-newsletters:
+    name: Reconcile sources and generate two share-ready 11-page PDFs
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Select or dispatch exact-week newsletter and starter-scoring evidence
+        id: sources
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WAR_WEEK: ${{ inputs.war_week }}
+          REFRESH_SOURCES: ${{ inputs.refresh_sources }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/nl47_resolve.py" <<'NL47_RESOLVE'
+          #!/usr/bin/env python3
+          """Select or dispatch the exact successful newsletter lineage for a selected NFL week.
+
+          Calls only approved existing GitHub Actions, never mutates repo files or scores.
+          Downstream render revalidates Week, NL44 V7 weights and NL45 season reconciliation.
+          """
+          from __future__ import annotations
+          import json, os, re, sys, time
+          import urllib.error
+          import urllib.request
+
+          REPO=os.environ['GITHUB_REPOSITORY']
+          TOKEN=os.environ['GH_TOKEN']
+          WAR=int(os.environ['WAR_WEEK'])
+          REFRESH=os.environ.get('REFRESH_SOURCES','false').lower()=='true'
+          BASE=f'https://api.github.com/repos/{REPO}'
+          if not 4<=WAR<=18:raise ValueError('War Room week must be between 4 and 18')
+          SCORED=WAR-1
+          HEADERS={
+              'Authorization':'Bearer '+TOKEN,
+              'Accept':'application/vnd.github+json',
+              'X-GitHub-Api-Version':'2022-11-28',
+              'User-Agent':'LOG-NL47R1-Approved-Weekly-PDFs'}
+          SPEC={
+              'nl39':{
+                  'filename':'A-NL39R1-Weekly-Newsletter-Integration-Shadow.yml',
+                  'regex':rf'\bWar Room W0?{WAR}(?!\d)',
+                  'inputs':{'war_week':str(WAR)},
+                  'artifact':lambda rid:f'LOG-NL39R1-Weekly-Newsroom-Shadow-{rid}'},
+              'nl44':{
+                  'filename':'A-NL44R1-V7-WarRoom-Release-Renamed-v2.yml',
+                  'regex':rf'\bWar Room W0?{WAR}(?!\d)',
+                  'inputs':{},
+                  'artifact':lambda rid:f'LOG-W{WAR}-V7-WarRoom-RELEASE-{rid}'},
+              'nl45':{
+                  'filename':'A-NL45R1-Offense-IDP-Leaderboard-ReadOnly.yml',
+                  'regex':rf'\bWeek\s+0?{SCORED}(?!\d)',
+                  'inputs':{'through_week':str(SCORED)},
+                  'artifact':lambda rid:f'LOG-NL45R1-Offense-IDP-Scoring-Through-W{SCORED}-{rid}'},
+          }
+
+          def call(method,path,payload=None):
+              data=json.dumps(payload).encode('utf-8') if payload is not None else None
+              hdr=dict(HEADERS)
+              if payload is not None:hdr['Content-Type']='application/json'
+              request=urllib.request.Request(BASE+path,data=data,headers=hdr,method=method)
+              for attempt in range(3):
+                  try:
+                      with urllib.request.urlopen(request,timeout=35) as response:
+                          raw=response.read()
+                          return json.loads(raw) if raw else None
+                  except urllib.error.HTTPError as exc:
+                      if exc.code not in (429,500,502,503,504) or attempt==2:raise
+                  except (TimeoutError,urllib.error.URLError):
+                      if attempt==2:raise
+                  time.sleep(2*(attempt+1))
+
+          def matches(kind,run,require_success=True):
+              cfg=SPEC[kind]
+              result=(run.get('path')=='.github/workflows/'+cfg['filename']
+                      and run.get('head_branch')=='main'
+                      and run.get('event')=='workflow_dispatch'
+                      and bool(re.search(cfg['regex'],str(run.get('display_title') or ''),re.I)))
+              return result and (not require_success or (run.get('status')=='completed' and run.get('conclusion')=='success'))
+
+          def list_runs(kind):
+              cfg=SPEC[kind];out=[]
+              for page in range(1,5):
+                  js=call('GET',f'/actions/workflows/{cfg["filename"]}/runs?event=workflow_dispatch&branch=main&per_page=100&page={page}')
+                  all_runs=js.get('workflow_runs',[])
+                  out.extend(r for r in all_runs if matches(kind,r,False))
+                  if len(all_runs)<100:break
+              return out
+
+          def wait_for_new(kind,old_ids):
+              deadline=time.monotonic()+20*60
+              new_id=None
+              while time.monotonic()<deadline:
+                  new=[r for r in list_runs(kind) if int(r['id']) not in old_ids]
+                  if len(new)>1:raise RuntimeError(f'Ambiguous newly dispatched {kind} runs: {[r["id"] for r in new]}')
+                  if new:
+                      new_id=int(new[0]['id'])
+                      break
+                  time.sleep(5)
+              if not new_id:raise RuntimeError(f'Could not identify newly dispatched {kind} run')
+              print(f'INFO: dispatched {kind} run #{new_id}',flush=True)
+              while time.monotonic()<deadline:
+                  r=call('GET',f'/actions/runs/{new_id}')
+                  if not matches(kind,r,False):raise RuntimeError(f'{kind} run identity changed mid-flight')
+                  if r.get('status')=='completed':
+                      if r.get('conclusion')!='success':raise RuntimeError(f'{kind} #{new_id} concluded {r.get("conclusion")}; cannot release')
+                      return r
+                  time.sleep(8)
+              raise RuntimeError(f'Timed out waiting for {kind} #{new_id}')
+
+          def choose(kind):
+              cfg=SPEC[kind]
+              existing=list_runs(kind)
+              ready=sorted((r for r in existing if matches(kind,r)),key=lambda x:int(x['id']),reverse=True)
+              if ready and not REFRESH:
+                  print(f'REUSE {kind} #{ready[0]["id"]} for War W{WAR}, scored through W{SCORED}',flush=True)
+                  return ready[0]
+              inputs=dict(cfg['inputs'])
+              if kind=='nl44':
+                  if 'nl39' not in chosen:raise RuntimeError('NL44 requires an exact known NL39 run')
+                  inputs={'war_week':str(WAR),'source_nl39_run_id':str(chosen['nl39']['id'])}
+              before={int(r['id']) for r in existing}
+              print(f'DISPATCH {kind} via approved {cfg["filename"]} with {inputs}',flush=True)
+              call('POST',f'/actions/workflows/{cfg["filename"]}/dispatches',{'ref':'main','inputs':inputs})
+              return wait_for_new(kind,before)
+
+          def verify_artifact(kind,run):
+              rid=int(run['id']);expected=SPEC[kind]['artifact'](rid)
+              response=call('GET',f'/actions/runs/{rid}/artifacts?per_page=100')
+              matches_=[x for x in response.get('artifacts',[]) if x.get('name')==expected and not x.get('expired')]
+              if len(matches_)!=1:raise RuntimeError(f'Expected one unexpired artifact {expected}, found {len(matches_)}')
+              return expected
+
+          chosen={}
+          for key in ('nl39','nl44','nl45'):
+              run=choose(key)
+              name=verify_artifact(key,run)
+              chosen[key]={'id':int(run['id']),'artifact':name,'path':run['path'],'status':'success','week':WAR if key!='nl45' else SCORED}
+              print(f'PASS: {key} GitHub run #{run["id"]}: {name}',flush=True)
+          with open(os.environ['GITHUB_OUTPUT'],'a',encoding='utf-8') as f:
+              for key,value in chosen.items():
+                  f.write(f'{key}_id={value["id"]}\n{key}_artifact={value["artifact"]}\n')
+          with open('NL47-SOURCE-RUN-IDS.json','w',encoding='utf-8') as f:
+              json.dump({'war_week':WAR,'scored_through_week':SCORED,'source_runs':chosen,'refresh_sources':REFRESH},f,indent=2)
+          print('PASS: all exact-week approved upstream artifacts present; proceeding to independent PDF audit',flush=True)
+          NL47_RESOLVE
+          python3 "$RUNNER_TEMP/nl47_resolve.py"
+      - name: Download approved NL44 production V7 War Room source
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.sources.outputs.nl44_artifact }}
+          run-id: ${{ steps.sources.outputs.nl44_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: nl47_input/nl44
+      - name: Download reconciled offense and IDP starter-scoring source
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.sources.outputs.nl45_artifact }}
+          run-id: ${{ steps.sources.outputs.nl45_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: nl47_input/nl45
+      - name: Download exact matched NL39 original matchup articles
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.sources.outputs.nl39_artifact }}
+          run-id: ${{ steps.sources.outputs.nl39_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: nl47_input/nl39
+      - name: Install pinned PDF renderer
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-cache-dir 'pymupdf==1.26.5'
+      - name: Rehydrate approved NL46 layout with production-safe Aftermath metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/nl47_module.b64" <<'NL47_MODULE_B64'
+          H4sIAAAAAAAC/8Vd61LjSpL+z1NU94kJ2YeSsQzmYkYdQYPoJpoGFtPNzLIOh2yXsQ6y5JVkwMPyDvsG
+          +xL7YPsIm5lVpZtlQ8/sxJ6Ioa26ZFVlZWV+mXWZ3z5szeNoa+AFWyJ4ZLNFMgmD7Y2PHz9enO/sddgs
+          CkfzYeKFgRkJd7TgLHwKRGS6M8h5FCP2JMSDv2CBeIp9kSQiYlcnp8yNEm/sDhM2mHv+SESNjY2fIvLG
+          noiZeMaMOJxHQ8GglR32c49FbvDgBfcxx5Q2871AzGcxc4MRJGwfsKMxkJ66yYSJkZeEkef6jY3vrhck
+          8L+Yxd4zmwfDiRvcQ5+g3HAyn1Evhj40OYNuYT0YBpFMe588hVDPS5gPgxPRIHSjUdzYuBZTyI7LTccT
+          dxQ+mWEAA/bdgfChm/fsyQOezRPm+lAOE+YBkPIX+DOehVESs2E4WyBVd0SVOywIWSRmYYxDWTDZbxi7
+          mLqez2IRjOBjHAnB3HsRAIEwYkkEPWRD1x/OfReqsfls5CYCeguTtTGOwinr98fzZB6Jfp95U2wZBhuE
+          iYvjjjd0UnQ/c6NY6O9h/Chrj8TQm7q+rnoiPzk7Cx5d3xtdAhOJkq44ceOJ7w305x8xZBGhGfAKMjSh
+          K/iUGcPQ9wUJU6wzR2Lszv1k5A0TTQhZrX+PveRvGxvnztGXH07/7MQ2rO3W7u7egbVtNdtWe7vV2t83
+          Nr45f+3aNeNfPhvcuMY/t9fw58aBPyfn8Occ007wzzf43xV+dG+M+sZlf2XN+saJziyQqG98Pjr+9uX6
+          8scF9Oa30+PTo9O2ccgujn7+Fb4tq+Xs7ML32cU3/DzY3ts5hs/ujeOcQ8KutXewf2BsHB0fOxc3kPD5
+          YPdktwklro7OHfh2DhznFL/Pzy7w+3jvpHVyAN9fLs+xwaPjveOdbWPj9BKr09oFqYzE1jgEOdlKorlI
+          FjOxNRJ/uI/zrRP45+e86wZxI0nGslr/M5H6hbrm59AfSQIbGzBjzA/dUR8nvIZzXe9sMPgvEiB7AclB
+          AwvENZx5WaKByqOfiOekJoJhOIK1YRvzZGzuG/W6pEklQBjzJHFpsRyVcCaCGqgaVA+2YfASLTP27o06
+          c2M2lvVz3fK9OKkB+cYJiNo1rfbaWLcNol97VG0m0aKj6qglUIuTCLJhDDPfHYoaSAI3jHoDkr1ZDWhg
+          NfE8FLOE1cqrhd8AS50oCiN+lECFwTyRn/VO5HqxYD9dfy5TamND1WbBfDoAnfXy+CF6NVQnx9MEO6n6
+          NjZeVK95ozV+NWSZiXjuR/eDWqwGE9txw5f9NH4z6oeqcjKf+aIGyrMW33kdb7PV49ZufavVbrMxaBaP
+          eQGrNXmL72gOgaDUBmnjauk3ILXV3oWMBjQ88kCHJTVVYTgRw4d+PJ/WSFNylw94EvrAlWAobM1Zo9lo
+          Wm2QAdldb8zcQVxzzUH9U1q4wyoY9UJUXzvsxX1lH2z2MiA+UdPEQlCNffjjwihn86Q/8iLOntyoj/aK
+          s2ge9Hd27IswEOqjTR9a7mxd1LQoYTYaowTaKbEtI/B3doytsXF++cW8fdHlO83W6NW8dSPzOgyn5s89
+          89QLwFYBAUPKya/QgerOozcCMRcNXFeSBEzRFGzAMhEDyl9dX578OL45u7wwTy+vv/84P8rVBP6CPdCj
+          aXhxf+yBINTRvmCGqE5WDWYZy6JrkCFP7WoGG7Sh92CpTkHqEmGoBaMGZmfKhJqvHw7H97lE1XhdD0DX
+          a9yLpGYoq27UP9gGcB2ZbmC3i6Wm4Uj4VObnXkW2ZjqW0L+XSyFE6SeTKJzfT6hkTsdUs0MNHcltqY5u
+          AdaZejEhFCMdE4xYtgEw5H4u+t4IG0jNHvYlLZKxtj8Ln0TUVwzKDy8rHPrecEFZl7cXznX/6AoE5Kdz
+          0s/kxFg3Dud5BhYbZrQI+zibeUEAyTCc3Fzr5pRGlFXtFyMWLkxlPx6GCJCMTmO7zQ3X9/ugUBfw2eJG
+          JIaAdHJFLG6oj/7YD8MIi0GtSWuCma96JbAH/ojqSrfW8BIxjWv1bFBKqQARF6yPmtI740l495MkNnrE
+          qQduWvW6+Vj/ZAnzAHmY1QFuri+etVXJxLFxGoV/EwEyS5FhIwDD0FvQXw+vil8oX7GddVBDYqOnxcQH
+          60elYD6tFnYyBpAkRrVnWdroEUeekR+6HNm9CPFlzeLWdp0WNRJ6wUphDJgVxa1c85WaWCcZMBjdVzYK
+          ASyjphiCcEQM+gag+t/ngmghzBbuNFbD9MXoXkQl5dWW+mnqBt4YjEhu+cviWwYoaVNnS42Wrh40z2lW
+          eRmV1xEavWJhKZwGzegHu9Vs7WK5Yhm17DMtUU0qAbDt93G0VDLWRK3W729pizaT/dgibWG1TKQi+Qk+
+          QFlnyLJ2ipk0l2S6CUuL6scNyFRVpKO2XEWmm+F4LIJYmN5oZsYz30vydeMEXCkRxcu1BfRvYaqFaqpy
+          uZpKamW/UrHFJNmuYo62NLohXUh/Q7E8t+8Up3W20au/yd4IPLdhOA8SnDdxH3nJoszVwQJExn7BloqL
+          o955ztaHHMtrfnhUMVuUIAo6BX9X0Cuv02qD2t4iMyIrrpSFwJ2KeEWvgVEgBsurWw/3CcerO0jC3avz
+          CkoFBsiZKzPgSXFATqYbLGo0xTyCdJpbqCmLESVIxhTqPCWQ0ZUdJF31tGnV187qdy+Oyf+WEQiUQYGz
+          rBWNaoVDkmrbq7YOUEDz6YNNHbqDej29xClbLucemf0KBX8BtZgehJ4fBhZRzd0LENR6Hv9zbUTGNUTw
+          SP5BSQQxQHqlda4xcrOe1RusqXeypl6GxgE6Y1+YWu8GAHNNzdBpvbU1z07Agx5ktUBj9AF2v6PmeO77
+          cp6g2c3BZkriwRs+yGWcpYXJREQojmlK7AsBbhXAHpiWuNCWsvFpUUATYTD0fI98MOien7hY4VPqeDQs
+          y1i17Cg2g4YV5Db4m4gwWJOnl5vIlPu1lHu8wBGeDo6rIfHyQPjvNHFFFLHMPal3mHt/H4l7cG8IOvBU
+          HuTaussWXS8Vj8qllZcTnhMonmNRy1g7nwABrk6NNRNEWQF6/aBPZuMlPYTzVqFtbBv7n++JdBLTZf20
+          NJxOYUbyyqUEzuyUT4pLK7kOztjD69a1HGpJAOSY8ytmU6UUV4NOLQt4WbyreLdqHsry/o9I+63SndKO
+          li0LsZJMnrKzBbVJZiMqmo2oZDaKir+iAz8CDdzTThAAklSMwgoH4kOQ+/swWoAkKcq4dN5HN62bAUeY
+          Z2Th80oWlq0+6H+sUMYhK2qvtV6KREmyylPwG7uWbgCjaDGWIBmNZWxsJDA27QUA8r0hrSmKb8OQB74A
+          Tc0ST5gDQG0PjXRGgQ987AmflshdXm+pX33yJeq8VlJk6pfK7mWjC6MRIHrli0hG8QexsH13Ohi57LlT
+          MyWboekV+KKoUQNOPBfBfIphNFGjFrhV0pGp9qDhoHEOqoNqYHKAzYncW3iBXrxKXmFb4Ad9ROP/sfea
+          SUZllKRCzLrSw8/tfkwlKtGgGycJg9gydKlIUohyVFhMCKIQPx2sCq3cuhHD6AabzmOMvT9Cq14gyKYu
+          2KPcXBmxGQDEuLhsjKvLW+eaXR9dfDu7+NJlWwyjBGr5jO72yKOVsVlyDt8ov58v/4bnq/njSe8QVF4+
+          WgDmI2Ncqc8Xlzfs6sfn87PuV+fEwJYNZjT+AOVYm+X7izM4o4692Zc0lEFBb7mdxYq81Vs5cqOHPbm0
+          8xM9aI6q8OcLRYwwpNdRM8ozb71Dlo1rt7Kj1oPys4yO/JcbUiUaHfkvN8hYGR36hxeGor1PqMuzWFUn
+          jWaSA93XOsno6F+UsdPXXrrR0b9K5KkUDKQPw4b+TlwtpzJqP1gkAiBzHYZEs9mn8uCPw1ApjJrPaOcy
+          2q8bG0PfjWN2JQI5Oxie7fdBXyX9PmgKf8xRYHNTh2kNTLPxTzEZWWNTnFRuTRiHlDwI/VE5CzcsjGWi
+          DQ/0V5T0ccOjhn+oXkqcYxKudRv3Seq/VF/3okiD9lpKhLCATTrhVJNZ1SYSXVU0Rxq5SuuBOPrMF1zG
+          3GPvb8I+4MPQDyP77OIbJ3qnrh8LPnWfn2T8G8wHFdxrtNq5mSASNsZW6FfWs99YNwEj40Yj2urFTkFh
+          NEnJBBa6mIZ/eIfsAeAMxX0IhYF+u/fQJKWbpVpRmvf+YjZhg/C5UWqa/mabLv/zX//534V9l5zFAIam
+          /EL1Qf8KGGbG8bx2wbEXtcXTBNjKkA2fFDvIjmLFBnK2D/r5PpmovQzaL0OW4Z/6JyKHP027YbXLFuoX
+          aFTYrhuoyNDxH/vhU4epbQ/mJuwFK76iAQzZC1bP+5dLEkviUQPRqPOK9nm1LFewkkRcCpTea6KvOsdO
+          +u7CvonmIhNLNLtKLJt80eTPFl9YAD98v97JOjmK3Kc+FSVhv8ZfufJ11SKJK9ZN2yZCWWu4L7jcGshL
+          +CBs3FHloGqTid1oL7VOVWWjgHwKzaabakSnrmjQX73lhHT64wiYUxuFQ554iS/ANRvwWO53cxX+56Sw
+          qbQX9FWmWnS3/KsNle+avQayokEN8HzKhILHckMKVSTkNcCC9vGjJnt1y2Uh+2v9cGZfIeZABSvrEJVa
+          kzc5tMWzjeyKbKu5x3FPG6joZKu5Qxn7XO5e61okWlabt5rckKFWdnnKLq9Pzi6Orv/KvkDRc+e7c2Hw
+          vQbYit+c/ePTz8cGR0GRaujW3G6Wqe3sKS5a+41tqHV6errvfC7XSpWX1W4skdjdpyk4aDSxfttpnbQN
+          ntN+Vc3u73HwbtVsNeYzcMlq9VcGIIjdOs439oITKL9fStP4isNuGXyf2nPax8fH1lujtFrbqYjgOCVn
+          Kysp7DHDuVNSpzBHHw+rTAUYCNzw5NrPUWI1nAP2RQUp4TkWudPgpLcSphOFtVh9FnmwNl7SMKAkrKFK
+          75Od2z14dH37rleA+ATwi50pAThvZFe0XihD3lcWEpPkFLDq3dU8FQfJxpNtb+vgQanb9er4mRpEwwWB
+          CEa1GsYVqfFcGcxHJtdKPH2+s3r8GRZxHRaTZBpU73iyL5xo9etFfwdogbcjeQvmUjNP1ij5RmqCC97R
+          CuYdypNGNnWDtiywca9uejiDlCp1PWrazL2bJ3rgL3KfqeNxGTDNIsw811AHqRoqktFZkilDy6vRkf15
+          LUg4NKfkW5frk8mqTbNTAlN0KbCT+kSCceHcpnvc00/N7JjEjyswj69Z3p9zeScX7MXUmZqS8xN0lepB
+          Es4IY1evLIAIdNAgLi4uhfTfvbjWxd0lZ57trC0QpJIvQt5Aidby9Kyajlc1VGkFs2NwZMho2Np26To6
+          QXofswjcCvGkeKJCCLYua9tpfCG3yfmG4kq3NWzj8vTUueg6Bk6dIiQl1Dg7uWInjsyVB3fQXOgaZz8d
+          Rn7s18sfXadbUV/WLZeTqg11rF1p00Fojo5vfhyds+7N0fUN+MlXl2cXN93UQnSZZb6QHHxUSgUDC0WP
+          K/0PiJ2f43bpjXP0XdJ4wXG/su7x5TV430bK/ALPraXhtJYsy06TMwOdeEhG8mh+25wOovEMo6kKt+aB
+          RVUMOZw3CrebsvD3y5/OqqIEqKgjbX5ryh+53cT+Amy2dRhN7O1Wo5nTbmq7JtNvaocs5eDCVgQ2vd+j
+          SR7Xe39q2XazoxCLtQ2OELQM/2xGE9PieMSuEGXwyqWtXV32S8Fv02zdh2zrABECxrs/Ys8+9uiojgHA
+          SFlvovznbTkvZb7kqAEDgdo+z20/AVbZ5eioQX1t/62d/ZyLtrtEBko0W5ISnhAjalkQ+QAgFxLMEMXu
+          XkpuX2Mm2nsPH+2SwiVaqbLuVTQNKI1ahkIgBlaOA6W65E6V0j41yzySPdzeTnu4qwfs4iHcdOKtFsz8
+          pvK1MlGjQlLY6KcOoX4jX3QiGEVaoUU88msCSBBsAmDZpyMZh2wUytNOwsVDtCCEI+/RG81dP4u9Sv0Y
+          N7Q1UWswE86ZcB/sFVZjSZx2ZTc3Wy3UK5+d7g3rwqI/d0iTgLeH1NLoJGP/ASpGpSF5nfaC8y6T5cR/
+          BK2+rHIQfUtWa2TZyvF5Rx3a8fOjiWcYAbKh/HrciHsRygAVYsg9QBYyuRA7RpRlro8CL7EInEbj9uwE
+          efTj4gwYdXV+dgMskl0sMglMAPstzcn3iEqAlkXjkZXId65SW+/hgaXVvGvV/7H537HS+ceO/b9NfraS
+          vprbu3Ih4a+ybflqtsCR617+uD52Oqx77jhXYAi1QUTT5XQb7NvZ8Tfnusucvxyf/zhxThoG322U2djM
+          9aK53A5oZQPZYd5cmuR/kUFDs/Md9czPLru6dn6ege1mx5ffr86dG+eE+EeNtVY21m7sFzAn2Rjty9Op
+          OjrtJ1Gv95xhIWS9Pu9MUEaui+ys1uEvufEUvgadlnkkrZylm/E+75dxSGV4HhbH0Skw//vRzdeio4rS
+          zm6+gp//Ree8F52o8PDp9eW/OhcYrUdaAEu+gGN/zr62vrJN9t05OTu6kKsRUIORXpYwdKgjSjatZdFH
+          OAAytN3+k4Y6RL3V/BMDSGRenR/9lRIsSLh20KggztgmW1ZyjEtk23vcaOXInp5fXl6ntL46RycoTPjv
+          WoqLpm3tHhyCyZrYe62C67rkgZEk3OFQf9/t1NSQf9/tlbYkFvaiuYkEf/eWtrFWIxcob+6UsMsSJtlH
+          TPJcRiRWPp5QWRvmgGo/5xBIqwQYoCPWXj5KXEnp1txtpz2R5yafUSXhWqIjH6CXOg1rLPtVbGHnoEhy
+          YkN/8KBn73CKP6cAfl2wOodD/BqG0wGoKTAYh4VaMmo8NlAwXyagJUG0Tfzhk65kKKvgCuqMaZZxc3kD
+          Av0y1FlDmWWs5BgoRxlF3WvsKR1TiCu1d3JqbX8159to1a5OpRJHdo1Re1Oxf7GU5Oo8OgQrlTtGmJCD
+          q9oszFFeqQPkVEp9p3LxgGLf5QYs6RtYO8ASWPNnFyfOX5jJcEMO7OrZMabnVP7FCWohXErNNap9u7o1
+          VO/ajPx0rs9Oz2CKMkVOZzF1W6Dajr/+uOqSZi8bsyYGYtU1EsBoYMtdrYj6cnOKdCfLqe+PHz8ehxgc
+          f3QT71H4C6iK2JTR9S66+aVcWzOeiaE39oZSxGJGl5nCyLvHo/1sT266NjaIbDeJvGGCSt29j9zZhLlz
+          8NwY1AO/5n4OyUEiRExwFG+tpdfZlm+tRXgdLFBH9RJhgu4x8QfDXTwog3e18OBzErm0r4l85cwle0Jd
+          xDbSbmInQX2FeD5TMyB/hA/4U/9g73XW7pyKRxGYRKl8NY6YrHYgdJu062DfUZC9vGeLNDACGA5lOMON
+          cZ+CZWaMNn0LlNCAqois7vjYyBm7dJN6Va115zGyocgzzJ48lYgsfIrC4J7p6wvyymPuhIzH9WAyi4DM
+          zFob+OEQoEKRD4ZMLZwlC+mQ7d2A6A7o4AwVoi3x88svLFua3a9HJ5e3xKTB3Y70ryp2zTGvVz5ooBrC
+          45pVe04ZK2hgL96m9doBn+khCJ8COhutTl6q9aE6nh+JrZoA5h/qWEoeDmXfOTCk5/TO6v0ZNFTr/X2T
+          rUEX9aEfWMFyP2oWszjJDv3orZOGOxr1IzGChdOnO5K5jSf0dsCZH0Pfze06x+6YBJbBxu3BZ6u3Ccn4
+          DZ2E7238rq/FUMgS3LbCI/gc95XA64n7GNglFb4clCgQG+F5n1VScTOhtbgLUgouKkzKIpyn93AqRIBC
+          ayHGLFcQBBfr7MvF3ydfeXWCnUYJ00e5qVESuSVOVR3fksJW0jJyafoujDEBRSXG8xj1XqhVd6ZMcYkZ
+          9SU22tk0Uwdhju86O736IfYul0md1ZnFE4LYhRIpkpg2nuR7aDw3UWjo5wJ+KrlJc63NVlNnW5u7FbRL
+          PVG0MRVpW1CbfgPxg4y4zLY22/s629osgapqsU+HU9xXze0NrhbWN6hiP/4OqpLibOYvFE28Llzzpmhj
+          7SYno+oN8SdZlzyOKe135tBGq4loo8Xpmh05AzdfHZa5TFX7e1dHXxypYBDdlH3J3Rzaar6xgFUnUl7D
+          RG62ePYJboEFuKsLcECBgLjBrgWIsbwHCl/diRvNWDjzAmRHA8ONCgRShzJapF/N7fqvdmC7xfVp0EjE
+          cz+JOW7eC2+WyGv4Y0IRWAPwzd/RA/JsUsGAHvDsY5H/eLbyORbupTrOkdM2/n6KMNpGq0g1v4ddxSZd
+          8aBAdNPa4QXMsSxLAM9L7k1GQLLG2vnlZjHecqQvV2ZaDucFb+Chl5U+odDIR+TXduB96IWWWQnDvXFW
+          L6FTKxEzclYE0968KFdt3jXOUPBb4uLigUHvU2nN/cbU2cMSrJbnJyUJ6pOZommOl1T9+YgebkCXVQr+
+          H+GDiBsF4gMBrBN2EWd6vQZdnKpVI7U6AtHy0aUstI0k8vWX5WolATylQx36YBOtdxjYVZwuGlCmH9QY
+          zelhC+VbFQ9Dlu6CG+qUZoE39Qbd1Be1eummuLxbjmPq43HGKAynoPUBXs6F2oNAt02fdMw8t1M8JAwS
+          oe7+UAVSWHRYDOZ6OPEeXd9UtNhUJC6Gvci54/J4Lxgg0cg5QbqVP+MhXBpbtkiy+NxePj6nDuHA1Gfb
+          KHhctICtVsB+WjrXzlm3+8MpwSy8V0FBPnK+V+N4aqsaxecQ1M5O+vbJElAf2EQDYTr7VZw+kDh9u111
+          r0CfqC22nIHyTNCwiV9H5wNE54CkB3l0TukAzy0Nz7fhG+B5658Kz5fR9LoZP1KiyZRoHmYeeqqp4GMR
+          e6jo8HUbMWqsh9oZsl7jusuDzngRyGpu6sYVoEYCJesa2BoCL421ApwqVykoTEYLvmEydjCdJuEdwHEZ
+          M2bW/58CGUVQBRpFsAo2FpdmHjcq7fFKmh+v1VeAxvZbQFE3rGHANvHOtHLWX6m8NcJCYe1cwznLv5tG
+          TvCCZkH9SD1WjtMUNN/aAMq1EqmCkRbyHhZo6lT0qFT6Vge9DyX3yVjupQ6Y5PS3NMq5iJ4toRXYE9u4
+          ktDA0MdP0nqN6QP8xWA8PqAkq4hnL0764UPujOqTF6gtnPRgfe8Q8YZdOhgmSwMIH43trJXs3Q4vWH76
+          41LdqT47uSo/A1K6GJJ1AUv06IKI1gsZ00uVytdIyMnVB36BTmqDiytvvbnlMJJieX2kZ/mAkNwSS5V9
+          doPIQCpyhnJTVPLG30+1cA3pbcqN2H0UNTlX/N6NBmimd8DpHvuAbu3lzZDc/RvLqrZm0phpZWpZMubL
+          ageZ+t5kLZT0evXVn6oZdnmWL7tLyYOlm0EDfMgB/nXrm3TDvAZMAJgi3zKDhTworlzAgeuXsqRVr795
+          Z+ZSDy592UVfmCGGSCaA8wEIKxzRDaQiLId+fio9j7EGT2X3yWSr5WGU8XEJJ60EyBKtPsLgRvbg/46k
+          dDtoEnSPP9iqnaprXKgF01tcdEE8Vd4KaBeZRyr66rJL5gQdCbWjee4cnTjXXdLa1Zeh6NGPQf3uoNN7
+          c4rlW3ej9IyLK69oI95Xp12YOqFMgYFoDAB7VLoBTWfj5C3o6uN3fMVxu+ULfZKUCuS/cedr9TBXvAMh
+          Z4AmQG3tD0F+i1f2pHKP7Zf0PaEOXoJR6zM97rxklfJuQfmFp+0D/cITBjSvLTP1vsB0oLVRtkM+xXFG
+          71PQdVCzSzfRMrtBmkVutrzRhOp9wTa9j76+/1j5FpRq/I23oApR20j8+9yL0pcfhRv5HqBOKoW7Ki7G
+          tPAuUeniIt5E080VbqJ9UMa5eL2td2ekTqe6zQYO6dKx8jU7P+q9JooQyAWK2z+y19TbdPlS3HmwyN9m
+          RMWY6z/C1AqckE12JgLrkULVNVJ9hzSOhp0qSwbptJf35tRkl0lpa6+4WxiXDOs74McSBMGeVOjiVXu0
+          dJp4uULlkRyJE6orrEQVufMpGVhBGhVnJN5NqIBP1hGTyATE4k1YsmrG85AB6JTxQgkzVKKZ3FOqGs/A
+          fODsV026tkNVWz/e0tXhwq7R+72J9yxOEtWBKNzeLd3XzV/VXQE3LF4JOPzROqzx/lge+cji6S2U8c7A
+          nj5k6o8+2EB1/VxmQWEV6KT3aFcF7/7JMOP/EGpgQ9liW+r92tvqg4rb7SvuB6Q1DpZqVEOXrIbVXH0l
+          /i2pBry5KV8gXglIcqDkLqd2enQ3F3WAisbipg2gFvnWYQefAuS5h9A66Sto2dV0PF9TuFEOrhU9uidG
+          /cKLZx1SasVb4/pYrZw5o/OirpyodNw8Xbp7gkeZ8vnpOfXXEnF9IrdMXKWvJJ7PX0mcDlSqpwo7RsGh
+          Ocg9YUm+zcyfx+DXaTGlxMOcAd3LTGYxpKke6NBbF2kAGlamG9ADipLyT3V8iNyIUkON0slMfc8eZoxc
+          9xzK6eQQkb7K36uura/vk1SoY92li/29pSv9lYXbqnCpGfVqoyqXvUuQdjH3WEG58izyHt3hIjc9IaO0
+          RLDTI0Y2mOdfwZahI3yohg6S41N080RpFHyAr0we5jZw6TUEw0FgZ9LjSPL1UnpsfKfNvnjJ1/kgfcQ8
+          VpOVA4JlzHgoT41pO1Sa7HIv1GoGsX4AyUYYbXTolePHurxgbehZRQiscwoQ+DX/9qWipx83e5VOSi0H
+          P1HKd019xM6UZ+7M70cXZ6dO90a9p9jAIyRCqjF6xXk0n87imtQs3Atwn8xu1TeNfwuWnl42ylf4sENc
+          VtW3+Vxw5JR6dGe2foe8cRTdz/FCyBV+6bNd7oyCw67KqxmmSe6OwfGJaht5wpVfMcpBp4pqsi+/Xg8W
+          GcmGqgm65J0VUQEbfDgJUZfbaPWk4eV47oNeO7fTtJVEgtB0M4QpQ9q2gUeZYIKi+bqasIhNfC0TVmza
+          IL1tvKZGe12N6D62oRrNFlaMs/N3+NVIn8xVFlEdZOfWgXYOuwtYm1PnGTFQ9tgKvZWnUF3LtLQM4cqx
+          i284UzM0/7zQovzKKbQ0QSutgk/P0/dFc2HnMm1ZFk/RyNEFYeanyBI4wekdaGTh1VG328ne4NGPdz6X
+          zgzqSOoWXvJAZSMVSmpApLFWW89GRQvj9BlZueOPS/KZV1sgdfw0Vu9BgfKY+hSPz/8/HeROMVarkpWx
+          58cq7092dqx6+/Lwyl5kXPVV2jMd12cvj6+cvWjFFicuYeSkL5+0IB1XGH9OG70sAY/sMa5STo8v4Yis
+          bCmn95opuPrGhofP1KAq7vdt2+j3UXf1+1gfddjG/wKrBu3DNmMAAA==
+          NL47_MODULE_B64
+          python3 - <<'NL47_UNPACK'
+          from pathlib import Path
+          import base64,gzip,hashlib,os
+          src=Path(os.environ['RUNNER_TEMP'])
+          encoded=(src/'nl47_module.b64').read_text()
+          engine=gzip.decompress(base64.b64decode(encoded))
+          if hashlib.sha256(engine).hexdigest()!='075dbd20d44a46cd46bcae89d0a993cbfb90dc32957a85000b3e3e0567b4a3d9':
+              raise RuntimeError('NL47 immutable production renderer checksum mismatch')
+          (src/'nl47_production.py').write_bytes(engine)
+          print('PASS: self-contained NL47 production PDF engine verified by SHA256')
+          NL47_UNPACK
+          python3 -m py_compile "$RUNNER_TEMP/nl47_production.py"
+      - name: Render and verify both final PDF editions
+        shell: bash
+        env:
+          WAR_WEEK: ${{ inputs.war_week }}
+          NL44_RUN: ${{ steps.sources.outputs.nl44_id }}
+          NL45_RUN: ${{ steps.sources.outputs.nl45_id }}
+        run: |
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/nl47_production.py" \
+            --input nl47_input --output nl47_output --war-week "$WAR_WEEK" \
+            --mode Release --nl44-run-id "$NL44_RUN" --nl45-run-id "$NL45_RUN"
+          cp NL47-SOURCE-RUN-IDS.json nl47_output/NL47-SOURCE-RUN-IDS.json
+          python3 - <<'NL47_FINAL_AUDIT'
+          from pathlib import Path
+          import fitz, json, os, re
+          w=int(os.environ['WAR_WEEK']);p=w-1
+          d=Path('nl47_output')
+          candidates={'WarRoom':d/f'LOG-W{w:02d}-War-Room-V7-Offense-IDP-Final.pdf',
+                      'Aftermath':d/f'LOG-W{p:02d}-Aftermath-V7-Offense-IDP-Final.pdf'}
+          for edition,path in candidates.items():
+              if not path.is_file():raise RuntimeError(f'{edition} final PDF missing')
+              with fitz.open(path) as pdf:
+                  if len(pdf)!=11:raise RuntimeError(f'{edition}: expected 11 pages, got {len(pdf)}')
+                  body=' '.join(page.get_text() for page in pdf)
+                  if 'NOT PUBLISHED' in body or 'SHADOW' in body:
+                      raise RuntimeError(f'{edition} still contains draft-only metadata')
+                  if 'POSITIONAL SCORING LEADERS' in body:
+                      raise RuntimeError(f'{edition}: removed section resurfaced')
+                  for index,title in [(7,'POWER RANKINGS / V7'),(9,'OFFENSIVE POWERHOUSES'),(10,'DEFENSIVE POWERHOUSES')]:
+                      if title not in pdf[index].get_text():
+                          raise RuntimeError(f'{edition}: missing approved section {title}')
+                  for index in range(1,7):
+                      if f'MATCHUP {index:02d} / 06' not in pdf[index].get_text():
+                          raise RuntimeError(f'{edition}: missing matchup #{index}')
+                  if re.search(r'(?i)free.agent.*(ranking|scouting|target)',body):
+                      raise RuntimeError(f'{edition}: possible private FA-board reference')
+                  print(f'PASS FINAL {edition}: {len(pdf)} pages, 6 matchups, V7, H2H/median, 12 offenses and 12 IDP teams, no removed section: {path}')
+          manifest=json.loads((d/'NL46-VERIFIED-SOURCE-MANIFEST.json').read_text())
+          if manifest.get('model')!='V7' or int(manifest.get('war_week'))!=w or int(manifest.get('scored_through_week'))!=p:
+              raise RuntimeError('Cross-week or formula drift in final manifests')
+          print('PASS: two fully reconciled final newsletter PDFs; no repository, mail, picks-archive or private FA changes')
+          NL47_FINAL_AUDIT
+      - name: Upload approved share-ready PDFs and source evidence (no email or repository writes)
+        uses: actions/upload-artifact@v4
+        with:
+          name: LOG-NL47R1-W${{ inputs.war_week }}-APPROVED-WEEKLY-PDFS-${{ github.run_id }}
+          path: nl47_output/
+          retention-days: 90
+          if-no-files-found: error
+      - name: Show weekly newsletter release summary
+        shell: bash
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'NL47_SUMMARY'
+          ## LOG NL47R1 — Approved weekly newsletter PDF editions
+          - ONE workflow invocation finds or builds the exact-week approved NL39 writing, NL44 V7 power ranks, and NL45 verified starter scoring.
+          - **Both PDFs are share-ready**: War Room W${{ inputs.war_week }} and the preceding completed-week Aftermath.
+          - Each edition has six matchup articles, two V7 rankings pages with H2H/median records, and two full 12-team offense / IDP scoring leaderboards (11 pages total).
+          - The **Positional Scoring Leaders** section is permanently excluded from this workflow.
+          - The original article copy is preserved. Only draft/shadow metadata is cleaned from the Aftermath source.
+          - Frozen V7 weights: 35% season scoring, 20% all-play, 10% recent, 25% scoring floor, 10% H2H.
+          - No automatic email, social posting, git commits, FA scouting, trade values, or production data modifications.
+          - Your downloadable artifact has two ready-to-share PDFs plus two source integrity manifests.
+          NL47_SUMMARY
