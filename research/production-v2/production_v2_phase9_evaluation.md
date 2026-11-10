@@ -7,7 +7,7 @@
 - Production files mutated: **0**
 - Deployment authorized: **No**
 - Frozen candidate matrix: **120 V2 variants + deployed control**
-- Completed consecutive weeks: **8**
+- Completed consecutive weeks: **9**
 
 ## Frozen protocol
 
@@ -27,9 +27,9 @@
 
 ## Completed outcome state
 
-- Outcome refresh: `2026-11-08T12:03:50.762532Z`
-- Completed weeks recognized: **[1, 2, 3, 4, 5, 6, 7, 8]**
-- Consecutive prefix used: **[1, 2, 3, 4, 5, 6, 7, 8]**
+- Outcome refresh: `2026-11-10T21:15:09.041456Z`
+- Completed weeks recognized: **[1, 2, 3, 4, 5, 6, 7, 8, 9]**
+- Consecutive prefix used: **[1, 2, 3, 4, 5, 6, 7, 8, 9]**
 
 ## weeks_1_to_4
 
