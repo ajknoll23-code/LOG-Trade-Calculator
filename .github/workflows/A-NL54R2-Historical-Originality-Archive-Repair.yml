@@ -1,0 +1,324 @@
+name: A-NL54R2 - Historical Newsletter Archive Retrieval Repair (Read-Only)
+run-name: A-NL54R2 - Download approved editions and audit both LOG newsletters
+'on':
+  workflow_dispatch:
+    inputs:
+      history_run_pages:
+        description: Search latest 1-12 pages of Actions runs for approved releases
+        type: string
+        required: true
+        default: '4'
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: log-nl54r2-historical-retrieval-preview
+  cancel-in-progress: false
+jobs:
+  discover:
+    name: Discover approved historical PDF artifacts, not shadow previews
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.sources.outputs.matrix }}
+      count: ${{ steps.sources.outputs.count }}
+    steps:
+      - name: Discover exact successful release runs and their artifacts
+        id: sources
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HISTORY_PAGES: ${{ inputs.history_run_pages }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,os,urllib.request,re
+          pages=int(os.environ['HISTORY_PAGES'])
+          if not 1<=pages<=12:raise SystemExit('history_run_pages must be 1..12')
+          repo=os.environ['GITHUB_REPOSITORY']
+          base='https://api.github.com/repos/'+repo
+          headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json',
+                   'X-GitHub-Api-Version':'2022-11-28','User-Agent':'LOG-NL54R2-ReadOnly'}
+          def get(path):
+              req=urllib.request.Request(base+path,headers=headers)
+              with urllib.request.urlopen(req,timeout=30) as f:return json.load(f)
+          types={'.github/workflows/A-NL47R1-Weekly-Approved-V7-Newsletters.yml':'NL47',
+                 '.github/workflows/A-NL44R1-V7-WarRoom-Release-Renamed-v2.yml':'NL44'}
+          sources=[];seen=set()
+          for page in range(1,pages+1):
+              batch=get('/actions/runs?per_page=100&page='+str(page)).get('workflow_runs',[])
+              for r in batch:
+                  typ=types.get(r.get('path'))
+                  if not typ or r.get('conclusion')!='success' or r.get('status')!='completed' or r.get('head_branch')!='main':continue
+                  rid=int(r['id'])
+                  if rid in seen:continue
+                  artifacts=get(f'/actions/runs/{rid}/artifacts?per_page=100').get('artifacts',[])
+                  permitted=[a for a in artifacts if not a.get('expired') and (
+                      (typ=='NL47' and 'APPROVED-WEEKLY-PDFS' in a.get('name','')) or
+                      (typ=='NL44' and 'WarRoom-RELEASE' in a.get('name','')))]
+                  if len(permitted)>1:raise RuntimeError(f'Ambiguous approved release artifacts for run {rid}')
+                  if not permitted:continue
+                  a=permitted[0]
+                  name=a['name']
+                  if not re.fullmatch(r'[a-zA-Z0-9_.-]{1,200}',name):raise RuntimeError('Unexpected artifact name')
+                  sources.append({'run_id':rid,'artifact_name':name,'workflow':typ,
+                                  'created_at':r.get('created_at'),'url':r.get('html_url')})
+                  seen.add(rid)
+              if len(batch)<100:break
+          sources.sort(key=lambda z:z['run_id'],reverse=True)
+          if not sources:raise RuntimeError('No successful approved release artifacts discovered. Preview must not pass empty.')
+          matrix={'include':[{'run_id':s['run_id'],'artifact_name':s['artifact_name']} for s in sources]}
+          with open(os.environ['GITHUB_OUTPUT'],'a',encoding='utf8') as f:
+              f.write('matrix='+json.dumps(matrix,separators=(',',':'))+'\n')
+              f.write('count='+str(len(sources))+'\n')
+          with open('NL54R2-SOURCES.json','w') as f:json.dump({'repository':repo,'sources':sources},f,indent=2)
+          print('PASS: identified',len(sources),'approved releases; artifact downloads occur through actions/download-artifact@v4')
+          PY
+      - name: Upload immutable archive source manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: NL54R2-SOURCE-MANIFEST-${{ github.run_id }}
+          path: NL54R2-SOURCES.json
+          retention-days: 30
+          if-no-files-found: error
+
+  download:
+    name: Read approved PDF release from run ${{ matrix.run_id }}
+    needs: discover
+    if: needs.discover.outputs.count != '0'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    steps:
+      - name: Download GitHub-approved release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          repository: ${{ github.repository }}
+          run-id: ${{ matrix.run_id }}
+          github-token: ${{ github.token }}
+          path: payload/${{ matrix.run_id }}
+      - name: Require at least one real PDF
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$(find 'payload/${{ matrix.run_id }}' -type f -iname '*.pdf' -print -quit)"
+      - name: Carry read-only source into audit job
+        uses: actions/upload-artifact@v4
+        with:
+          name: NL54R2-INTERNAL-${{ matrix.run_id }}
+          path: payload/
+          retention-days: 7
+          if-no-files-found: error
+
+  audit:
+    name: Verify PDF identities and report exact history coverage and repetition
+    needs: [discover, download]
+    if: always() && needs.discover.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuse to pass if any source download failed
+        shell: bash
+        env:
+          DOWNLOAD_STATUS: ${{ needs.download.result }}
+        run: |
+          test "$DOWNLOAD_STATUS" = success || { echo 'Approved release download failed; cannot certify archive' >&2; exit 1; }
+      - name: Restore GitHub approved source manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: NL54R2-SOURCE-MANIFEST-${{ github.run_id }}
+          path: metadata/
+      - name: Collect all approved source PDFs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: NL54R2-INTERNAL-*
+          merge-multiple: true
+          path: downloaded_history/
+      - name: Install pinned PDF inspector
+        run: python3 -m pip install --disable-pip-version-check 'pymupdf==1.26.5'
+      - name: Restore checksum-pinned historical audit engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/nl54r2.b64" <<'NL54R2_ENGINE'
+          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
+          NL54R2_ENGINE
+          python3 - <<'PY'
+          import base64,gzip,hashlib,os
+          from pathlib import Path
+          p=Path(os.environ['RUNNER_TEMP'])
+          code=gzip.decompress(base64.b64decode((p/'nl54r2.b64').read_text()))
+          assert hashlib.sha256(code).hexdigest()=='cb40c6b6481ed1edea951def3b867fccf572d4a63b076ebba2ec1e35cb81a9d4','NL54R2 embedded code SHA256 mismatch'
+          (p/'nl54r2.py').write_bytes(code)
+          print('PASS: immutable NL54R2 code verified')
+          PY
+          python3 -m py_compile "$RUNNER_TEMP/nl54r2.py"
+      - name: Run inherited originality regression tests
+        shell: bash
+        run: python3 "$RUNNER_TEMP/nl54r2.py" --self-test
+      - name: Audit approved PDFs; report missing historical editions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/nl54r2.py" \
+            --repo "$GITHUB_REPOSITORY" \
+            --archive-root downloaded_history \
+            --manifest metadata/NL54R2-SOURCES.json \
+            --out-dir nl54r2_output
+      - name: Upload audit and source provenance
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LOG-NL54R2-Historical-Originality-PREVIEW-${{ github.run_id }}
+          path: nl54r2_output/
+          retention-days: 90
+          if-no-files-found: warn
+      - name: Display audit report
+        if: always()
+        shell: bash
+        run: |
+          if test -s nl54r2_output/NL54R2-PREVIEW.md; then
+            cat nl54r2_output/NL54R2-PREVIEW.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Archive audit failed; no publication authorized.' >> "$GITHUB_STEP_SUMMARY"
+          fi
