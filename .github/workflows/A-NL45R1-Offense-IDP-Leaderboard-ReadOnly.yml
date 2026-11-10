@@ -1,0 +1,379 @@
+name: A-NL45R1 - LOG Offense vs IDP Scoring Leaders (Read Only)
+run-name: A-NL45R1 - Offense and IDP leaderboards through completed Week ${{ inputs.through_week }}
+'on':
+  workflow_dispatch:
+    inputs:
+      through_week:
+        description: Last COMPLETED NFL week (8 for Week 9 War Room; use 9 only once Sleeper advances to Week 10)
+        type: string
+        default: '8'
+        required: true
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: log-nl45r1-scoring-breakdown-readonly-${{ inputs.through_week }}
+  cancel-in-progress: false
+jobs:
+  scoring-split:
+    name: Classify all weekly starters into offense / IDP / kickers and audit totals
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Read-only Sleeper season scoring audit and standings
+        shell: bash
+        env:
+          THROUGH_WEEK: ${{ inputs.through_week }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/log_nl45_scoring.py" <<'NL45_SCORING_PY'
+          #!/usr/bin/env python3
+          """LOG: read-only, starter-only 2026 offense/IDP point split.
+
+          External inputs: official Sleeper league, users, rosters, players/nfl registry,
+          weekly matchup endpoints. Never projects, invents or changes scoring.
+          """
+          from __future__ import annotations
+          import argparse
+          import csv
+          import json
+          import os
+          import random
+          import sys
+          import time
+          from collections import defaultdict
+          from decimal import Decimal, InvalidOperation
+          from pathlib import Path
+          from urllib.error import HTTPError, URLError
+          from urllib.request import Request, urlopen
+
+          LEAGUE_ID = '1326679131051532288'
+          SEASON = '2026'
+          API = 'https://api.sleeper.app/v1/'
+          TOLERANCE = Decimal('0.11')
+          O_GROUPS = {'QB':'QB','RB':'RB','FB':'RB','WR':'WR','TE':'TE'}
+          D_GROUPS = {
+              'DL':'DL','DE':'DL','DT':'DL','EDGE':'DL','NT':'DL','LE':'DL','RE':'DL',
+              'LB':'LB','OLB':'LB','ILB':'LB','MLB':'LB',
+              'DB':'DB','S':'DB','FS':'DB','SS':'DB','CB':'DB','NB':'DB',
+          }
+          SPECIAL = {'K':'K','PK':'K','P':'P','DEF':'DST','DST':'DST'}
+          CATEGORIES = ('QB','RB','WR','TE','DL','LB','DB','K','P','DST')
+          ZERO = Decimal('0')
+
+
+          def number(v, context='points'):
+              try:
+                  n = Decimal(str(v))
+              except (InvalidOperation, TypeError, ValueError):
+                  raise ValueError(f'{context}: missing or invalid points {v!r}')
+              if not n.is_finite():
+                  raise ValueError(f'{context}: nonfinite points')
+              return n
+
+
+          def money(n):
+              return f'{n.quantize(Decimal("0.01")):,.2f}'
+
+
+          def fetch(path):
+              req=Request(API+path,headers={'User-Agent':'LOG-newsletter-offense-IDP-split/1.0','Accept':'application/json'})
+              for attempt in range(3):
+                  try:
+                      with urlopen(req,timeout=70) as res:
+                          return json.load(res)
+                  except (HTTPError, URLError, TimeoutError) as exc:
+                      if attempt==2 or (isinstance(exc,HTTPError) and exc.code not in (429,500,502,503,504)):
+                          raise
+                      time.sleep(2*(attempt+1))
+              raise RuntimeError('Unreachable')
+
+
+          def team_names(rosters,users):
+              if not isinstance(rosters,list) or len(rosters)!=12:
+                  raise ValueError('Requires 12 team rosters')
+              lookup={str(x.get('user_id')):x for x in users}
+              names={}
+              for row in rosters:
+                  rid=int(row['roster_id'])
+                  u=lookup.get(str(row.get('owner_id') or ''),{})
+                  raw=(u.get('metadata') or {}).get('team_name') or u.get('display_name') or f'Roster {rid}'
+                  name=str(raw).strip()
+                  if rid in names or not name:
+                      raise ValueError('Duplicate roster ID or missing team name')
+                  names[rid]=name
+              if len(names)!=12 or len(set(names.values()))!=12:
+                  raise ValueError('Missing teams or duplicate names')
+              return names
+
+
+          def player_category(player):
+              pos=str((player or {}).get('position') or '').upper().strip()
+              if pos in O_GROUPS:return O_GROUPS[pos]
+              if pos in D_GROUPS:return D_GROUPS[pos]
+              if pos in SPECIAL:return SPECIAL[pos]
+              choices={}
+              for alt in ((player or {}).get('fantasy_positions') or []):
+                  alt=str(alt or '').upper().strip()
+                  group=O_GROUPS.get(alt) or D_GROUPS.get(alt) or SPECIAL.get(alt)
+                  if group:choices[group]=True
+              if len(choices)==1:return next(iter(choices))
+              return None
+
+
+          def player_label(player,pid):
+              name=(player or {}).get('full_name') or ' '.join(str((player or {}).get(x) or '') for x in ('first_name','last_name')).strip()
+              return name or str(pid)
+
+
+          def starter_points(row, context):
+              ids=row.get('starters')
+              if not isinstance(ids,list) or not ids:
+                  raise ValueError(f'{context}: missing starting lineup')
+              points=row.get('starters_points')
+              by_pid=row.get('players_points')
+              if isinstance(points,list) and len(points)==len(ids) and all(x is not None for x in points):
+                  pairs=[(str(pid) if pid is not None else '0',number(v,f'{context} starter {pid}')) for pid,v in zip(ids,points)]
+                  # Cross-check against starter-specific entries in full player points when both are supplied.
+                  if isinstance(by_pid,dict):
+                      for pid,value in pairs:
+                          if pid in by_pid and abs(value-number(by_pid[pid],f'{context} player {pid}'))>Decimal('0.11'):
+                              raise ValueError(f'{context}: conflicting starters_points and players_points for {pid}')
+              elif isinstance(by_pid,dict):
+                  pairs=[]
+                  for pid in ids:
+                      pid='0' if pid is None else str(pid)
+                      if pid not in by_pid:
+                          if pid in ('0',''):
+                              pairs.append((pid,ZERO));continue
+                          raise ValueError(f'{context}: player {pid} missing player-specific scored points')
+                      pairs.append((pid,number(by_pid[pid],f'{context} player {pid}')))
+              else:
+                  raise ValueError(f'{context}: neither aligned starters_points nor players_points available')
+              present=[pid for pid,_ in pairs if pid not in ('0','')]
+              if len(set(present))!=len(present):
+                  raise ValueError(f'{context}: duplicate player in starting lineup')
+              return pairs
+
+
+          def score_week(week, rows, names, players):
+              if not isinstance(rows,list) or len(rows)!=12:
+                  raise ValueError(f'Week {week}: exactly 12 scored roster entries required')
+              seen=set();matchups=defaultdict(list);result=[];player_rows=[]
+              for row in rows:
+                  rid=int(row['roster_id']);ctx=f'Week {week} / roster {rid}'
+                  if rid not in names or rid in seen:
+                      raise ValueError(f'{ctx}: unknown or duplicate roster')
+                  seen.add(rid)
+                  if row.get('matchup_id') is None:
+                      raise ValueError(f'{ctx}: missing matchup_id')
+                  matchups[str(row['matchup_id'])].append(rid)
+                  scores=starter_points(row,ctx)
+                  categories={c:ZERO for c in CATEGORIES}
+                  for pid,pts in scores:
+                      if pid in ('0',''):
+                          if pts:raise ValueError(f'{ctx}: empty starter slot has nonzero points')
+                          continue
+                      player=players.get(pid)
+                      # Sleeper's team-defense starter IDs can be 2-3-letter NFL abbreviations.
+                      cat='DST' if player is None and len(pid) in (2,3) and pid.isalpha() and pid.isupper() else player_category(player)
+                      if not cat:
+                          raise ValueError(f'{ctx}: cannot classify starter {pid} ({player_label(player,pid)}) / '
+                                           f'position={None if player is None else player.get("position")!r}; refuses inaccurate totals')
+                      categories[cat]+=pts
+                      player_rows.append({'week':week,'roster_id':rid,'team':names[rid],
+                                          'player_id':pid,'player':player_label(player,pid),
+                                          'position':str((player or {}).get('position') or ''),
+                                          'category':cat,'points':money(pts)})
+                  offense=sum((categories[x] for x in ('QB','RB','WR','TE')),ZERO)
+                  defense=sum((categories[x] for x in ('DL','LB','DB')),ZERO)
+                  kicker=categories['K'];other=categories['P']+categories['DST']
+                  starter_sum=offense+defense+kicker+other
+                  reported=number(row.get('points'),ctx+' official Sleeper points')
+                  difference=starter_sum-reported
+                  if abs(difference)>TOLERANCE:
+                      raise ValueError(f'{ctx}: starter subtotal {money(starter_sum)} != official matchup '
+                                       f'points {money(reported)} (delta {money(difference)}). '
+                                       'Do not silently misattribute points.')
+                  result.append({'week':week,'roster_id':rid,'team':names[rid],
+                                 **categories,'offense':offense,'idp_defense':defense,
+                                 'kickers':kicker,'other':other,'starter_sum':starter_sum,
+                                 'sleeper_points':reported,'reconciliation_delta':difference,
+                                 'custom_points':row.get('custom_points')})
+              if len(seen)!=12 or len(matchups)!=6 or any(len(pair)!=2 for pair in matchups.values()):
+                  raise ValueError(f'Week {week}: expected 6 valid paired head-to-head matchups')
+              return result,player_rows
+
+
+          def accumulate(weekly,names):
+              totals={rid:{'roster_id':rid,'team':name,**{x:ZERO for x in (*CATEGORIES,'offense','idp_defense','kickers','other','starter_sum','sleeper_points','reconciliation_delta')},'weeks':0} for rid,name in names.items()}
+              for row in weekly:
+                  t=totals[row['roster_id']]
+                  for k in CATEGORIES+('offense','idp_defense','kickers','other','starter_sum','sleeper_points','reconciliation_delta'):
+                      t[k]+=row[k]
+                  t['weeks']+=1
+              if len(weekly)!=12*len(set(x['week'] for x in weekly)):
+                  raise ValueError('Team-week coverage incomplete')
+              if len(set(t['weeks'] for t in totals.values()))!=1:
+                  raise ValueError('Unequal week coverage')
+              for field,rnk in [('offense','offense_rank'),('idp_defense','defense_rank')]:
+                  ordered=sorted(totals.values(),key=lambda row:(-row[field],row['roster_id']))
+                  for i,t in enumerate(ordered,1):
+                      t[rnk]=i
+              return list(totals.values())
+
+
+          def write_csv(path,rows,fields):
+              with open(path,'w',newline='',encoding='utf-8') as f:
+                  w=csv.DictWriter(f,fieldnames=fields,extrasaction='ignore');w.writeheader()
+                  for row in rows:
+                      w.writerow({k:money(row[k]) if isinstance(row.get(k),Decimal) else row.get(k,'') for k in fields})
+
+
+          def markdown_table(rows,cols):
+              lines=['| '+' | '.join(head for head,_ in cols)+' |', '| '+' | '.join('---' for _ in cols)+' |']
+              for t in rows:
+                  vals=[]
+                  for head,key in cols:
+                      v=t[key]
+                      vals.append(money(v) if isinstance(v,Decimal) else str(v).replace('|','\\|'))
+                  lines.append('| '+' | '.join(vals)+' |')
+              return '\n'.join(lines)
+
+
+          def write_results(weekly,players_rows,names,out,through_week):
+              out.mkdir(parents=True,exist_ok=True)
+              season=accumulate(weekly,names)
+              offense=sorted(season,key=lambda x:(-x['offense'],x['roster_id']))
+              defense=sorted(season,key=lambda x:(-x['idp_defense'],x['roster_id']))
+              date_utc=__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(timespec='seconds')
+              cols=['roster_id','team','weeks','offense_rank','defense_rank','offense','idp_defense','kickers','other','sleeper_points','reconciliation_delta',*CATEGORIES]
+              write_csv(out/'season-all-teams.csv',sorted(season,key=lambda x:x['roster_id']),cols)
+              write_csv(out/'offense-leaderboard.csv',offense,cols)
+              write_csv(out/'idp-defense-leaderboard.csv',defense,cols)
+              write_csv(out/'weekly-offense-idp-splits.csv',weekly,['week','roster_id','team','offense','idp_defense','kickers','other','sleeper_points','reconciliation_delta',*CATEGORIES])
+              write_csv(out/'every-scoring-starter.csv',players_rows,['week','roster_id','team','player_id','player','position','category','points'])
+              report=[f'# LOG — 2026 Offense and IDP Scoring Leaders (Weeks 1–{through_week})',
+                f'Generated {date_utc}; source: Sleeper league `{LEAGUE_ID}` official weekly starters and points.',
+                '', '**Scoring rules:** Offensive players = starting QB, RB, WR and TE. IDP defense = starting DL, LB and DB. '
+                'Kickers are separate. Team D/ST and punters are separate if present. '
+                '**Bench, IR, taxi and median wins are excluded.**',
+                '', '## Highest-scoring offense', '',
+                markdown_table(offense,[('Rank','offense_rank'),('Team','team'),('Offense points','offense'),('IDP points','idp_defense'),('IDP rank','defense_rank')]),
+                '', '## Highest-scoring IDP defense', '',
+                markdown_table(defense,[('Rank','defense_rank'),('Team','team'),('IDP points','idp_defense'),('Offense points','offense'),('Offense rank','offense_rank')]),
+                '', '## Full team totals and reconciliation', '',
+                markdown_table(offense,[('Team','team'),('Offense','offense'),('IDP','idp_defense'),('Kicker','kickers'),('Other','other'),('Sleeper total','sleeper_points'),('Delta','reconciliation_delta')]),
+                '', '### Exact position splits', '',
+                markdown_table(offense,[('Team','team'),('QB','QB'),('RB','RB'),('WR','WR'),('TE','TE'),('DL','DL'),('LB','LB'),('DB','DB')]),
+                '', 'Data quality: each of 12 teams has exactly '+str(through_week)+' completed weeks; every weekly starting player was mapped to an official player position; every weekly starter total matched the Sleeper matchup score within 0.11 points. '
+                'Raw unrounded numbers remain in memory; displayed totals round to 2 decimals.',
+                '', '**This workflow only audits and reports. It does not edit any newsletter, rankings formula, free-agent board, or calculator.**','']
+              (out/'READ-ME-OFFENSE-VS-IDP.md').write_text('\n'.join(report),encoding='utf-8')
+              proof={'generated_at_utc':date_utc,'league_id':LEAGUE_ID,'season':2026,'through_week':through_week,
+                     'total_team_weeks':len(weekly),'total_starters':len(players_rows),
+                     'offense_leader':{'team':offense[0]['team'],'points':money(offense[0]['offense'])},
+                     'idp_leader':{'team':defense[0]['team'],'points':money(defense[0]['idp_defense'])},
+                     'total_reconciliation_delta':money(sum((x['reconciliation_delta'] for x in season),ZERO)),
+                     'policy':'Read-only, starter-only, offense=QB/RB/WR/TE, IDP=DL/LB/DB; K separately; team points checked'}
+              (out/'run-manifest.json').write_text(json.dumps(proof,indent=2)+'\n',encoding='utf-8')
+              print('\n'.join(report[:14]));print('\n=== LEADERS ===');print(json.dumps(proof,indent=2))
+              if os.environ.get('GITHUB_STEP_SUMMARY'):
+                  with open(os.environ['GITHUB_STEP_SUMMARY'],'a',encoding='utf-8') as f:f.write('\n'.join(report[:18])+'\n')
+              return proof
+
+
+          def offline_test():
+              # 12 teams, 6 paired games, 2 seasons weeks; exact starter classification and reconciliation.
+              players={'1':{'full_name':'Quarterback One','position':'QB'},'2':{'full_name':'Receiver One','position':'WR'},
+                       '3':{'full_name':'IDP DL','position':'DE'},'4':{'full_name':'IDP LB','position':'LB'},
+                       '5':{'full_name':'IDP DB','position':'S'},'6':{'full_name':'Kicker','position':'K'}}
+              names={rid:f'Team {rid}' for rid in range(1,13)}
+              full=[];pfull=[]
+              for week in (1,2):
+                  rows=[]
+                  for rid in names:
+                      pts=[Decimal('10')+rid,Decimal('5.5'),Decimal('4'),Decimal('6'),Decimal('7'),Decimal('1')]
+                      if rid==1 and week==2:pts[2]=Decimal('-2')
+                      rows.append({'roster_id':rid,'matchup_id':(rid+1)//2,'starters':['1','2','3','4','5','6'],
+                                  'starters_points':[float(p) for p in pts],'players_points':{str(i):float(p) for i,p in enumerate(pts,1)},
+                                  'points':float(sum(pts,ZERO))})
+                  totals,pr=score_week(week,rows,names,players)
+                  full.extend(totals);pfull.extend(pr)
+              season=accumulate(full,names)
+              assert len(season)==12 and len(pfull)==144
+              assert next(x for x in season if x['roster_id']==1)['idp_defense']==Decimal('4')+Decimal('6')+Decimal('7')-Decimal('2')+Decimal('6')+Decimal('7')
+              assert next(x for x in season if x['roster_id']==1)['weeks']==2
+              # Detect corruption rather than sending false rankings.
+              rows[0]['points']=999.0
+              try:score_week(2,rows,names,players)
+              except ValueError as exc:assert 'starter subtotal' in str(exc)
+              else:raise AssertionError('Failed to detect incorrect reconciliation')
+              assert player_category({'position':'CB'})=='DB'
+              assert player_category({'position':'DT'})=='DL'
+              assert player_category({'position':'FB'})=='RB'
+              print('PASS offline 12-team, two-week test; negative IDP, scoring crosschecks, classification and aggregation')
+
+
+          def main(argv=None):
+              ap=argparse.ArgumentParser()
+              ap.add_argument('--through-week',type=int,default=8)
+              ap.add_argument('--output',type=Path,default=Path('score_split_results'))
+              ap.add_argument('--self-test',action='store_true')
+              args=ap.parse_args(argv)
+              if args.self_test:
+                  offline_test();return
+              week=args.through_week
+              if week<1 or week>18:raise ValueError('Completed through-week must be between 1 and 18')
+              state=fetch('state/nfl')
+              if str(state.get('season'))!=SEASON:
+                  raise ValueError(f'Sleeper state season {state.get("season")} not {SEASON}; use pinned season 2026')
+              current=int(state.get('week') or 0)
+              if week>=current:
+                  raise ValueError(f'Week {week} may still be active: Sleeper current week={current}. '
+                                   'Select last COMPLETED week only.')
+              league=fetch(f'league/{LEAGUE_ID}')
+              if str(league.get('season'))!=SEASON:
+                  raise ValueError('League season mismatch')
+              names=team_names(fetch(f'league/{LEAGUE_ID}/rosters'),fetch(f'league/{LEAGUE_ID}/users'))
+              players=fetch('players/nfl')
+              if not isinstance(players,dict) or len(players)<5000:
+                  raise ValueError('Sleeper NFL players database missing or incomplete')
+              weekly=[];player_rows=[]
+              for wk in range(1,week+1):
+                  rows=fetch(f'league/{LEAGUE_ID}/matchups/{wk}')
+                  t,p=score_week(wk,rows,names,players)
+                  weekly.extend(t);player_rows.extend(p)
+                  print(f'PASS Week {wk}: 12 roster matchups; per-starting-player points classified and reconciled',flush=True)
+              write_results(weekly,player_rows,names,args.output,week)
+
+          if __name__=='__main__':
+              try:main()
+              except Exception as exc:
+                  print(f'FAIL CLOSED: {exc}',file=sys.stderr)
+                  raise
+          NL45_SCORING_PY
+          python3 "$RUNNER_TEMP/log_nl45_scoring.py" --self-test
+          python3 "$RUNNER_TEMP/log_nl45_scoring.py" --through-week "$THROUGH_WEEK" --output nl45_output
+      - name: Upload season offense/IDP report, rankings, weekly detail and full starter audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: LOG-NL45R1-Offense-IDP-Scoring-Through-W${{ inputs.through_week }}-${{ github.run_id }}
+          path: nl45_output/
+          retention-days: 90
+          if-no-files-found: error
+      - name: Read-only release notes
+        shell: bash
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'NL45_SUMMARY'
+          ### LOG NL45 — all teams' season points by offensive and IDP starters
+          - QB/RB/WR/TE are offense; DL/LB/DB are defensive players; K and D/ST separate.
+          - Each weekly lineup is sourced from official Sleeper per-starter scoring; no bench, IR or taxi points.
+          - Full 12-team coverage and week-by-week reconciliation gates must pass; errors fail closed.
+          - Download the artifact for a formatted Markdown report and offense/defense leaderboards (CSV).
+          - Research/report only: newsletter PDFs, published V7 power ranks, calculator, private free agent board and repository files are NOT changed.
+          NL45_SUMMARY
