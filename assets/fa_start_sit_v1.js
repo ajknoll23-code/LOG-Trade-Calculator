@@ -1,6 +1,6 @@
 /* LOG A-FA11R1 — owner-local Week 10 two-expert IDP Start/Sit comparison.
  * Public module contains NO subscriber rank data and NO private scouting data.
- * User-selects a local JSON; ranks/projections stay only in this browser tab.
+ * Private rankings are installed with a one-time local activation and restored from this device; no subscriber data is hosted.
  * Does not modify player valuations, roster transactions, or existing IDP panels.
  */
 (() => {
@@ -24,14 +24,15 @@
   const maxPick=12;
   const trustedClassification='PRIVATE_OWNER_SUPPLIED_WEEKLY_IDP_START_SIT_NOT_FOR_PUBLIC_REPO';
   let catalog=new Map(), userRoster=new Set(), selected=[], ranks=new Map(),rankNames=new Map(), loaded=false, capturedWeek=null, sourceMeta=null;
-  let rosterSync=null, catalogReady=false, noRosterError=null;
+  let rosterSync=null, catalogReady=false, noRosterError=null, privateRestoreDone=false;
   root.insertAdjacentHTML('beforeend', `
-    <section id="faSsApp" class="fa-ss" aria-labelledby="faSsTitle">
-      <div class="fa-ss-steps"><span>1 · Import privately</span><span>2 · Choose 2–12 players</span><span>3 · Compare</span></div>
+    <section id="faSsApp" class="fa-ss" aria-label="Week 10 start sit comparison">
+      <div class="fa-ss-steps"><span>1 · Rankings load privately</span><span>2 · Choose 2–12 players</span><span>3 · Compare</span></div>
       <div class="fa-ss-import">
-        <label for="faSsFile"><strong>Private weekly expert consensus JSON</strong><small>Choose the provided private file from your phone. Nothing is uploaded, saved, or sent.</small></label>
-        <input id="faSsFile" type="file" accept=".json,application/json">
-        <div id="faSsStatus" class="fa-ss-status" role="status">Loading the LOG player pool. Import your private Week 10 ranking snapshot to start.</div>
+        <div class="fa-ss-import-info"><strong>Private expert consensus</strong><small>Activates once on this browser, then automatically loads on future visits. Rankings are stored locally on this device—not posted to GitHub.</small></div>
+        <div id="faSsStatus" class="fa-ss-status" role="status">Loading LOG players and checking for your privately saved Week 10 rankings…</div>
+        <details class="fa-ss-backup"><summary>Import / replace private ranking file</summary><label for="faSsFile">Optional JSON file fallback</label><input id="faSsFile" type="file" accept=".json,application/json"></details>
+        <button type="button" id="faSsForget" class="fa-ss-forget" hidden>Forget rankings saved on this device</button>
       </div>
       <div class="fa-ss-searchtools">
         <label>Find a player<input id="faSsSearch" type="search" placeholder="Search your roster or free agents" autocomplete="off" aria-label="Search IDP player"></label>
@@ -46,7 +47,7 @@
       <p class="fa-ss-fine">Weekly start/sit guidance, not dynasty value. The IDP Show and Woellert each contribute one rank when present; missing screenshot ranks are not zero. Cross-position rankings are not comparable. Projections are an optional separate Woellert signal and do not count as a third expert.</p>
     </section>`);
   const $=id=>root.querySelector('#'+id);
-  const ui={file:$('faSsFile'),status:$('faSsStatus'),search:$('faSsSearch'),scope:$('faSsScope'),group:$('faSsGroup'),suggestions:$('faSsSuggestions'),selected:$('faSsSelected'),count:$('faSsCount'),compare:$('faSsCompare'),clear:$('faSsClear'),results:$('faSsResults')};
+  const ui={file:$('faSsFile'),status:$('faSsStatus'),search:$('faSsSearch'),scope:$('faSsScope'),group:$('faSsGroup'),suggestions:$('faSsSuggestions'),selected:$('faSsSelected'),count:$('faSsCount'),compare:$('faSsCompare'),clear:$('faSsClear'),results:$('faSsResults'),forget:$('faSsForget')};
   const fail=(condition,message)=>{if(!condition)throw Error(message);};
   const val=(x,d=1)=>typeof x==='number'&&Number.isFinite(x)?x.toFixed(d):'—';
   const strId=x=>String(x?.player_id??'');
@@ -83,6 +84,81 @@
       next.set(sig,r);
     }
     return next;
+  }
+  /* The public website has no paid rankings; only this user's browser holds them.
+     The one-time launcher transfers the ranking payload in a URL FRAGMENT (never
+     an HTTP request body or query), which is cleared from the URL immediately.
+     The private cache uses IndexedDB on this browser/device; another device needs
+     its own activation. All import methods use the exact same strict validator. */
+  const DB_NAME='LOG_Private_StartSit_Weekly_2026_v1';
+  const STORE='snapshots';
+  const KEY='2026-W10-two-expert';
+  function openDB(){return new Promise((resolve,reject)=>{
+    if(!window.indexedDB){reject(Error('Browser private storage unavailable'));return;}
+    const req=indexedDB.open(DB_NAME,1);
+    req.onupgradeneeded=()=>{if(!req.result.objectStoreNames.contains(STORE))req.result.createObjectStore(STORE);};
+    req.onerror=()=>reject(req.error||Error('Could not open private store'));
+    req.onsuccess=()=>resolve(req.result);
+  });}
+  async function privateGet(){const db=await openDB();return new Promise((resolve,reject)=>{
+    const t=db.transaction(STORE,'readonly'),req=t.objectStore(STORE).get(KEY);
+    req.onsuccess=()=>resolve(req.result??null);
+    req.onerror=()=>reject(req.error||Error('Cannot read private store'));
+    t.oncomplete=()=>db.close();
+  });}
+  async function privatePut(data){const db=await openDB();return new Promise((resolve,reject)=>{
+    const t=db.transaction(STORE,'readwrite'); t.objectStore(STORE).put(data,KEY);
+    t.oncomplete=()=>{db.close();resolve();};
+    t.onerror=()=>{db.close();reject(t.error||Error('Cannot save private ranks'));};
+  });}
+  async function privateDelete(){const db=await openDB();return new Promise((resolve,reject)=>{
+    const t=db.transaction(STORE,'readwrite');t.objectStore(STORE).delete(KEY);
+    t.oncomplete=()=>{db.close();resolve();};
+    t.onerror=()=>{db.close();reject(t.error||Error('Cannot erase private ranks'));};
+  });}
+  function acceptRanks(doc,from){
+    const candidate=validSnap(doc),coverage=[...candidate.values()].filter(r=>r.rankings.idp_show!==null&&r.rankings.woellert!==null).length;
+    ranks=candidate;rankNames=new Map();
+    for(const row of ranks.values()){const k=key(row.name);if(!rankNames.has(k))rankNames.set(k,[]);rankNames.get(k).push(row);}
+    capturedWeek=doc.week;sourceMeta=doc.source_coverage;loaded=true;
+    ui.status.classList.remove('fa-ss-error');
+    ui.status.textContent=`Week ${capturedWeek} private consensus ${from}: ${candidate.size} ranked players (${coverage} with both experts). Compare 2–12 players below. Data is not hosted in GitHub.`;
+    ui.forget.hidden=false;
+    refresh();
+  }
+  async function decodeActivation(encoded){
+    fail(/^[A-Za-z0-9_-]{100,40000}$/.test(encoded),'Invalid private activation payload');
+    fail(typeof DecompressionStream==='function','Your browser cannot decode private activation. Use file import fallback.');
+    const padded=encoded.replace(/-/g,'+').replace(/_/g,'/');
+    const binary=atob(padded+'='.repeat((4-padded.length%4)%4));
+    const bytes=Uint8Array.from(binary,c=>c.charCodeAt(0));
+    const stream=new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate'));
+    const data=await new Response(stream).text();
+    fail(data.length>100&&data.length<900000,'Invalid decoded ranking data size');
+    return JSON.parse(data);
+  }
+  async function restorePrivate(){
+    const marker='#fa-ss-install=';
+    if(location.hash.startsWith(marker)){
+      const encoded=location.hash.slice(marker.length);
+      try{
+        const doc=await decodeActivation(encoded);
+        validSnap(doc);
+        acceptRanks(doc,'activated');
+        try{await privatePut(doc);ui.status.textContent+=' Saved on this device for automatic reuse.';}
+        catch(err){ui.status.textContent+=' Browser denied local storage: activation is valid for this tab only. You may need to allow site storage.';}
+      }catch(err){ui.status.classList.add('fa-ss-error');ui.status.textContent='Private activation failed: '+String(err.message||err);}
+      try{history.replaceState(null,'',location.pathname+location.search+'#fa-ws-startsit');}catch(_){location.hash='#fa-ws-startsit';}
+      window.dispatchEvent(new Event('hashchange'));
+      privateRestoreDone=true;
+      return;
+    }
+    try{
+      const saved=await privateGet();
+      if(saved){acceptRanks(saved,'restored automatically');privateRestoreDone=true;return;}
+    }catch(err){console.info('LOG Start/Sit: private browser storage is unavailable; file fallback remains available.');}
+    privateRestoreDone=true;
+    ui.status.textContent=`Activate your private Week 10 consensus once using the personal activation page; it will load automatically on subsequent visits on this device. You can also use the optional JSON fallback.`;
   }
   function getRank(p){
     const matches=rankNames.get(key(p.name))||[];
@@ -209,7 +285,7 @@
       userRoster=myIds;rosterSync=fa.synced_at;catalogReady=true;
       fail(catalog.size>=250,'Unexpectedly few IDPs in current league');
       noRosterError=null;
-      ui.status.textContent=`${catalog.size} LOG IDPs matched. My roster and free agents available · synced ${synced()}. Choose your private Week 10 rankings file.`;
+      if(!loaded && !privateRestoreDone)ui.status.textContent=`${catalog.size} LOG IDPs matched. My roster and free agents available · synced ${synced()}. Checking saved private rankings…`;
       showMatches();
     }catch(e){noRosterError=String(e.message||e);ui.status.textContent='Cannot reliably identify LOG players: '+noRosterError;ui.status.classList.add('fa-ss-error');ui.file.disabled=true;}
   }
@@ -218,14 +294,10 @@
     try{
       fail(catalogReady,'Roster/player source not ready');
       fail(file&&file.size>0&&file.size<=900000,'Private JSON file missing or too large');
-      const doc=JSON.parse(await file.text()),candidate=validSnap(doc);
-      const coverage=[...candidate.values()].filter(r=>r.rankings.idp_show!==null&&r.rankings.woellert!==null).length;
-      ranks=candidate;rankNames=new Map();
-      for(const row of ranks.values()){const k=key(row.name);if(!rankNames.has(k))rankNames.set(k,[]);rankNames.get(k).push(row);}
-      capturedWeek=doc.week;sourceMeta=doc.source_coverage;loaded=true;
-      ui.status.classList.remove('fa-ss-error');
-      ui.status.textContent=`Private Week ${capturedWeek} consensus loaded: ${candidate.size} ranked names (${coverage} with both experts). Data remains in this browser tab; no upload.`;
-      refresh();
+      const doc=JSON.parse(await file.text());
+      acceptRanks(doc,'imported locally');
+      try{await privatePut(doc);ui.status.textContent+=' Saved on this device for automatic reuse.';}
+      catch(err){ui.status.textContent+=' Browser denied local storage: rankings remain available until this tab is closed.';}
     }catch(e){ui.status.textContent='Private ranking import rejected: '+String(e.message||e);ui.status.classList.add('fa-ss-error');}
     ui.file.value='';
   });
@@ -234,7 +306,16 @@
   ui.group.addEventListener('change',showMatches);
   ui.clear.addEventListener('click',()=>{selected=[];refresh()});
   ui.compare.addEventListener('click',compare);
+  ui.forget.addEventListener('click',async()=>{
+    if(!window.confirm('Remove privately cached Week 10 rankings from this browser?'))return;
+    try{await privateDelete();ranks.clear();rankNames.clear();capturedWeek=null;sourceMeta=null;loaded=false;
+      ui.forget.hidden=true;ui.status.classList.remove('fa-ss-error');
+      ui.status.textContent='Private rankings erased from this browser. Use your private activation page to reinstall.';
+      refresh();}
+    catch(err){ui.status.textContent='Could not erase saved private rankings: '+String(err.message||err);ui.status.classList.add('fa-ss-error');}
+  });
   loadCatalog();
+  restorePrivate();
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded',initializeStartSit,{once:true});
   else initializeStartSit();
