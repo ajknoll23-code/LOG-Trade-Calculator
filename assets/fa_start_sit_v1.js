@@ -1,4 +1,4 @@
-/* LOG A-FA11R1 — owner-local Week 10 two-expert IDP Start/Sit comparison.
+/* LOG A-FA13R1 — LOG lineup-slot-aware IDP Start/Sit (presentation/scoring evidence only).
  * Public module contains NO subscriber rank data and NO private scouting data.
  * Private rankings are installed with a one-time local activation and restored from this device; no subscriber data is hosted.
  * Does not modify player valuations, roster transactions, or existing IDP panels.
@@ -19,8 +19,12 @@
     ['kev inwinston'.replace(' ',''),'kevinwinston'],
   ]);
   const key = name => aliases.get(norm(name)) || norm(name);
-  const groupNames = {LB:'Linebacker',EDGE:'EDGE',DT:'Interior DL',S:'Safety',CB:'Cornerback'};
-  const groups = Object.keys(groupNames);
+  const groupNames = {LB:'Linebacker',EDGE:'EDGE',DT:'Interior DL',S:'Safety',CB:'Cornerback',DL:'Defensive line (DL)',DB:'Defensive back (DB)'};
+  const groups = ['LB','EDGE','DT','S','CB'];
+  // LOG permits S and CB in any DB slot; EDGE and DT in any DL slot.
+  // Expert source ranks remain tied to their ORIGINAL subposition groups.
+  const lineupSlot = group => group==='S'||group==='CB'?'DB':group==='EDGE'||group==='DT'?'DL':group;
+
   const maxPick=12;
   const trustedClassification='PRIVATE_OWNER_SUPPLIED_WEEKLY_IDP_START_SIT_NOT_FOR_PUBLIC_REPO';
   let catalog=new Map(), userRoster=new Set(), selected=[], ranks=new Map(),rankNames=new Map(), loaded=false, capturedWeek=null, sourceMeta=null;
@@ -37,14 +41,14 @@
       <div class="fa-ss-searchtools">
         <label>Find a player<input id="faSsSearch" type="search" placeholder="Search your roster or free agents" autocomplete="off" aria-label="Search IDP player"></label>
         <label>Where to search<select id="faSsScope"><option value="mine">My roster</option><option value="available">Free agents</option><option value="all">Everyone</option></select></label>
-        <label>Position<select id="faSsGroup"><option value="ALL">All IDP</option><option value="LB">LB</option><option value="EDGE">EDGE</option><option value="DT">DT</option><option value="S">S</option><option value="CB">CB</option></select></label>
+        <label>Playable LOG slot<select id="faSsGroup"><option value="ALL">All IDP</option><option value="DB">DB — safety + corner</option><option value="DL">DL — EDGE + interior</option><option value="LB">LB</option><option value="S">S only</option><option value="CB">CB only</option><option value="EDGE">EDGE only</option><option value="DT">DT only</option></select></label>
       </div>
       <div id="faSsSuggestions" class="fa-ss-suggestions" aria-live="polite"></div>
       <div class="fa-ss-selected-heading"><h3>Players to compare <span id="faSsCount">0 / 12</span></h3><button type="button" id="faSsClear">Clear selection</button></div>
       <div id="faSsSelected" class="fa-ss-selected"><p class="fa-ss-empty">Choose any 2–12 players. Your roster and free agents are both supported.</p></div>
       <button type="button" id="faSsCompare" class="fa-ss-compare" disabled>Compare selected players</button>
       <div id="faSsResults" class="fa-ss-results" aria-live="polite"></div>
-      <p class="fa-ss-fine">Weekly start/sit guidance, not dynasty value. The IDP Show and Woellert each contribute one rank when present; missing screenshot ranks are not zero. Cross-position rankings are not comparable. Projections are an optional separate Woellert signal and do not count as a third expert.</p>
+      <p class="fa-ss-fine">LOG lineup eligibility: S + CB can fill DB; EDGE + DT can fill DL. Expert ranks remain within each source's original subposition, so cross-subposition ordinal averages are not used. For cross-subposition decisions, Woellert's LOG linear-base point projections are a separate one-source estimate; threshold/event bonuses and current injury news require manual review. No dynasty value changes.</p>
     </section>`);
   const $=id=>root.querySelector('#'+id);
   const ui={file:$('faSsFile'),status:$('faSsStatus'),search:$('faSsSearch'),scope:$('faSsScope'),group:$('faSsGroup'),suggestions:$('faSsSuggestions'),selected:$('faSsSelected'),count:$('faSsCount'),compare:$('faSsCompare'),clear:$('faSsClear'),results:$('faSsResults'),forget:$('faSsForget')};
@@ -55,7 +59,7 @@
   const rosterMembers=t=>['starters','bench','taxi','reserve_ir'].flatMap(k=>Array.isArray(t[k])?t[k]:[]);
   function inferGroup(player){
     const raw=String(player.raw_position||player.position||'').toUpperCase();
-    return groups.includes(raw)?raw:(raw==='DE'||raw==='OLB'?'EDGE':raw==='NT'?'DT':null);
+    return groups.includes(raw)?raw:(raw==='DE'||raw==='OLB'?'EDGE':raw==='NT'?'DT':raw==='DB'?'DB':raw==='DL'?'DL':null);
   }
   function playerGroup(player){
     const possible=rankNames.get(key(player.name))||[];
@@ -177,7 +181,8 @@
     let list=[...catalog.values()].filter(p=>{
       if(scope==='mine'&&!userRoster.has(p.player_id))return false;
       if(scope==='available'&&p.source!=='available')return false;
-      if(filter!=='ALL'&&playerGroup(p)!==filter)return false;
+      const playerSubposition=playerGroup(p);
+      if(filter!=='ALL'&&playerSubposition!==filter&&lineupSlot(playerSubposition)!==filter)return false;
       if(query&&!key(p.name).includes(query))return false;
       return !selected.includes(p.player_id);
     });
@@ -204,7 +209,7 @@
     ui.count.textContent=`${selected.length} / ${maxPick}`;
     ui.selected.innerHTML=selected.length?selected.map(id=>{
       const p=catalog.get(id),r=present(p);
-      const label=r?`${r.group} · ${r.rankings.idp_show===null?'IDP Show —':'IDP Show #'+r.rankings.idp_show} · ${r.rankings.woellert===null?'Woellert —':'Woellert #'+r.rankings.woellert}`:'No Week 10 rank in supplied screenshots';
+      const label=r?`${lineupSlot(r.group)} slot · ${r.group} ranks · ${r.rankings.idp_show===null?'IDP Show —':'IDP Show #'+r.rankings.idp_show} · ${r.rankings.woellert===null?'Woellert —':'Woellert #'+r.rankings.woellert}`:'No Week 10 rank in supplied screenshots';
       return `<div class="fa-ss-chip"><span><strong>${escape(p.name)}</strong><small>${escape(poolStatus(p))} · ${escape(label)}</small></span><button type="button" data-remove-id="${escape(id)}" aria-label="Remove ${escape(p.name)}">Remove</button></div>`;
     }).join(''):'<p class="fa-ss-empty">Choose any 2–12 players. Your roster and free agents are both supported.</p>';
     ui.selected.querySelectorAll('[data-remove-id]').forEach(b=>b.addEventListener('click',()=>remove(b.dataset.removeId)));
@@ -213,7 +218,8 @@
   }
   function dataOf(p){
     const r=getRank(p),a=r?.rankings.idp_show??null,b=r?.rankings.woellert??null;
-    return {p,r,a,b,n:(a===null?0:1)+(b===null?0:1),avg:a===null||b===null?null:(a+b)/2,gap:a===null||b===null?null:Math.abs(a-b),group:r?.group||playerGroup(p)||'UNKNOWN'};
+    const group=r?.group||playerGroup(p)||'UNKNOWN';
+    return {p,r,a,b,n:(a===null?0:1)+(b===null?0:1),avg:a===null||b===null?null:(a+b)/2,gap:a===null||b===null?null:Math.abs(a-b),group,slot:lineupSlot(group)};
   }
   function fmtNum(n){return Number.isInteger(n)?String(n):val(n,1);}
   function explain(groupData){
@@ -232,30 +238,74 @@
     const conflict=(first.gap>=Math.max(10,first.avg*.4));
     return `<p class="fa-ss-lean"><strong>Start lean: ${escape(first.p.name)}</strong> over ${escape(second.p.name)} among the two-source candidates in this ${escape(first.group)} group. Both experts place that player ahead. Average ranks ${fmtNum(first.avg)} vs ${fmtNum(second.avg)}.${conflict?' Experts disagree on the magnitude of his ranking; verify the role before locking a starter.':''} This is an ordinal comparison, not a probability or projected scoring margin.</p>`;
   }
+  function slotForecastSummary(arr,slot) {
+    const subgroups=[...new Set(arr.map(x=>x.group))];
+    if(subgroups.length===1)return explain([...arr]);
+    const projected=arr.filter(x=>Number.isFinite(x.r?.projection?.log_linear_base_points))
+      .sort((a,b)=>b.r.projection.log_linear_base_points-a.r.projection.log_linear_base_points);
+    let message=`<p class="fa-ss-caveat"><strong>All these players are eligible for the same LOG ${escape(slot)} slot.</strong> `+
+      `However, the saved expert ranks are ${slot==='DB'?'S vs CB':'EDGE vs DT'} positional lists. ${slot==='DB'?'A rank #3 safety is NOT automatically better than a rank #5 corner.':'A rank #3 EDGE is NOT automatically better than a rank #5 defensive tackle.'} `+
+      `We do not average incompatible ranks to manufacture a two-expert cross-position consensus.</p>`;
+    if(projected.length>=2){
+      const best=projected[0],next=projected[1];
+      const spread=best.r.projection.log_linear_base_points-next.r.projection.log_linear_base_points;
+      message+=`<p class="fa-ss-caveat"><strong>Projected LOG base points (${escape(slot)}-eligible):</strong> `+
+        projected.map(x=>escape(x.p.name)+' '+val(x.r.projection.log_linear_base_points)+' pts').join(' · ')+`.</p>`;
+      message+=`<p class="fa-ss-caveat"><strong>Projection-only lean: ${escape(best.p.name)}</strong> `+
+        `(${val(best.r.projection.log_linear_base_points)} vs ${val(next.r.projection.log_linear_base_points)}; +${val(spread)} pts). `+
+        `This is based ONLY on Woellert's projected statistics converted to LOG linear scoring. It excludes bonus/rare events and is NOT a two-expert consensus or a guaranteed starter.</p>`;
+    }else if(projected.length===1){
+      message+='<p class="fa-ss-caveat">Only one selected player has a comparable LOG linear-base forecast. No cross-subposition projected start lean.</p>';
+    }else{
+      message+='<p class="fa-ss-caveat">No cross-subposition LOG base-point forecasts for these selections. Cannot recommend a slot starter from these incomplete rankings.</p>';
+    }
+    for(const sub of subgroups){
+      const subset=arr.filter(x=>x.group===sub);
+      if(subset.length>=2){
+        message+=`<div class="fa-ss-subposition-context"><p class="fa-ss-fine"><strong>Within ${escape(groupNames[sub]||sub)} rankings:</strong></p>${explain([...subset])}</div>`;
+        const complete=subset.filter(x=>x.n===2).sort((a,b)=>a.avg-b.avg);
+        const expertLeader=complete[0];
+        const projectedFromSub=projected.filter(x=>x.group===sub);
+        if(expertLeader&&projectedFromSub.length>=2&&projectedFromSub[0]!==expertLeader){
+          const other=projectedFromSub[0];
+          if(expertLeader.a<other.a&&expertLeader.b<other.b){
+            message+=`<p class="fa-ss-caveat"><strong>Conflicting start signals:</strong> Both weekly ${escape(groupNames[sub]||sub)} rankings prefer ${escape(expertLeader.p.name)} over ${escape(other.p.name)}, but the separate LOG-scored projection prefers ${escape(other.p.name)}. This is not a clean consensus pick.</p>`;
+          }
+        }
+      }
+    }
+    return message;
+  }
   function compare(){
     if(!loaded||selected.length<2)return;
     const rows=selected.map(id=>dataOf(catalog.get(id)));
-    const by=new Map();for(const x of rows){if(!by.has(x.group))by.set(x.group,[]);by.get(x.group).push(x);}
+    // Group by legal LOG lineup slot, not expert source subgroup.
+    const by=new Map();for(const x of rows){if(!by.has(x.slot))by.set(x.slot,[]);by.get(x.slot).push(x);}
     const multi=by.size>1;
-    let out=`<div class="fa-ss-result-head"><h3>Week ${capturedWeek} start/sit comparison</h3><p>${selected.length} players · equal-weight expert rankings · ${[...by.keys()].map(x=>groupNames[x]||x).join(' / ')}</p></div>`;
-    if(multi)out+='<p class="fa-ss-caveat">You selected multiple positions. LB, EDGE, DT, safety and corner ranks use different pools: we will NOT declare one overall winner across positions. Compare players within each position group or inspect the optional LOG base-point projections separately.</p>';
-    for(const [group,arr] of by){
-      arr.sort((a,b)=>(a.n===2?0:a.n===1?1:2)-(b.n===2?0:b.n===1?1:2)||(a.avg??a.a??a.b??999)-(b.avg??b.a??b.b??999)||a.p.name.localeCompare(b.p.name));
-      out+=`<section class="fa-ss-result-group"><h4>${escape(groupNames[group]||group)}</h4>`;
-      out+=explain(arr);
+    let out=`<div class="fa-ss-result-head"><h3>Week ${capturedWeek} start/sit comparison</h3><p>${selected.length} players · LOG lineup slots · ${[...by.keys()].map(x=>groupNames[x]||x).join(' / ')}</p></div>`;
+    if(multi)out+='<p class="fa-ss-caveat">You selected different LOG lineup slots. We compare DB with DB, DL with DL, and LB with LB. We do not declare an overall winner across separate slots.</p>';
+    for(const [slot,arr] of by){
+      const mixedSubposition=new Set(arr.map(x=>x.group)).size>1;
+      arr.sort((a,b)=>mixedSubposition?
+        (Number.isFinite(b.r?.projection?.log_linear_base_points)?b.r.projection.log_linear_base_points:-1)-
+        (Number.isFinite(a.r?.projection?.log_linear_base_points)?a.r.projection.log_linear_base_points:-1)||a.p.name.localeCompare(b.p.name):
+        (a.n===2?0:a.n===1?1:2)-(b.n===2?0:b.n===1?1:2)||
+        (a.avg??a.a??a.b??999)-(b.avg??b.a??b.b??999)||a.p.name.localeCompare(b.p.name));
+      out+=`<section class="fa-ss-result-group"><h4>${escape(groupNames[slot]||slot)}</h4>`;
+      out+=slotForecastSummary(arr,slot);
       out+=arr.map(x=>{
         const r=x.r,proj=r?.projection;
         const difference=x.gap===null?'Not enough for a rank spread':x.gap>=Math.max(10,x.avg*.4)?'Experts disagree materially':x.gap<=5?'Strong agreement':'Some disagreement';
-        const meta=x.n===2?'Two-source consensus':x.n===1?'One source visible':'No captured rank';
+        const meta=x.n===2?'Two-source '+x.group+' ranking':x.n===1?'One '+x.group+' rank':'No captured rank';
         const positionOf=r?.group||'—';
-        return `<article class="fa-ss-result-card"><div class="fa-ss-result-top"><div><strong>${escape(x.p.name)}</strong><small>${escape(x.p.team||'—')} · ${escape(poolStatus(x.p))} · ${escape(positionOf)}</small></div><span class="fa-ss-quality">${escape(meta)}</span></div>
-          <div class="fa-ss-ranks"><div><small>IDP Show W${capturedWeek}</small><strong>${x.a===null?'—':'#'+x.a}</strong></div><div><small>Woellert W${capturedWeek}</small><strong>${x.b===null?'—':'#'+x.b}</strong></div><div><small>Average rank</small><strong>${x.avg===null?'—':'#'+fmtNum(x.avg)}</strong></div></div>
-          <p class="fa-ss-result-comment">${escape(difference)}${r?.idp_show_tier?' · IDP Show tier '+escape(r.idp_show_tier):''}.</p>
+        return `<article class="fa-ss-result-card"><div class="fa-ss-result-top"><div><strong>${escape(x.p.name)}</strong><small>${escape(x.p.team||'—')} · ${escape(poolStatus(x.p))} · ${escape(positionOf)} → ${escape(slot)} eligible</small></div><span class="fa-ss-quality">${escape(meta)}</span></div>
+          <div class="fa-ss-ranks"><div><small>IDP Show ${escape(positionOf)} W${capturedWeek}</small><strong>${x.a===null?'—':'#'+x.a}</strong></div><div><small>Woellert ${escape(positionOf)} W${capturedWeek}</small><strong>${x.b===null?'—':'#'+x.b}</strong></div><div><small>${escape(positionOf)} avg rank</small><strong>${x.avg===null?'—':'#'+fmtNum(x.avg)}</strong></div></div>
+          <p class="fa-ss-result-comment">${escape(difference)}${r?.idp_show_tier?' · IDP Show tier '+escape(r.idp_show_tier):''}. These numbers rank ${escape(positionOf)} players, not all ${escape(slot)}-eligible players.</p>
           ${proj?`<div class="fa-ss-proj">Woellert stat projection → <strong>${val(proj.log_linear_base_points)} LOG linear-base pts</strong> · ${val(proj.projected_defensive_snaps)} defensive snaps <small>(one expert’s separate projection; scoring bonuses excluded)</small></div>`:'<p class="fa-ss-proj fa-ss-subtle">No matched LOG linear-base projection in the selected private snapshot.</p>'}
           </article>`;
       }).join('');out+='</section>';
     }
-    out+='<p class="fa-ss-fine">Consensus averages published position ranks exactly as captured; two-source coverage varies because some Woellert DL/DB screenshots were cropped. Missing does not mean unranked. Verify current injuries, active status, matchup, and league eligibility before setting your lineup.</p>';
+    out+='<p class="fa-ss-fine">LOG slots: S+CB = DB; EDGE+DT = DL; LB = LB. Expert S and CB ranks (or EDGE and DT ranks) retain their source-specific meaning. Two-source ordinal consensus is only valid WITHIN the same original expert subgroup. If different subgroups compete for one slot, the cross-group base-point comparison is one expert’s incomplete projection—not a validated consensus. Verify current role, injuries, active status and lineup rules before starting.</p>';
     ui.results.innerHTML=out;
     ui.results.scrollIntoView({block:'start',behavior:window.matchMedia?.('(prefers-reduced-motion: reduce)').matches?'auto':'smooth'});
   }
