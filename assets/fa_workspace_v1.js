@@ -9,12 +9,13 @@
     {key:'board', label:'All Free Agents', kicker:'Browse', detail:'All positions and original LOG values'},
     {key:'idp', label:'IDP Targets', kicker:'Evaluate', detail:'Waiver rankings and season opportunity'},
     {key:'trends', label:'Weekly Trends', kicker:'Discover', detail:'Rising snaps and weekly defensive stats'},
+    {key:'startsit', label:'Start / Sit', kicker:'Decide', detail:'Compare 2–12 IDP options'},
     {key:'watch', label:'My Watchlist', kicker:'Research', detail:'Private imports and frozen research'},
   ];
   const slug = key => 'fa-ws-' + key;
   const get = selector => document.querySelector(selector);
   const safeHash = () => {
-    const found = /^#fa-ws-(board|idp|trends|watch)$/.exec(location.hash);
+    const found = /^#fa-ws-(board|idp|trends|startsit|watch)$/.exec(location.hash);
     return found ? found[1] : 'board';
   };
   function init() {
@@ -61,6 +62,9 @@
       </div>
       <div class="fa-ws-panel" id="fa-ws-trends-panel" role="tabpanel" aria-labelledby="fa-ws-trends-tab" hidden>
         <div class="fa-ws-intro"><h2>Weekly snap trends</h2><p>Public Sleeper data identifies changing playing time. A rising snap signal is not a verified breakout or a projection.</p></div>
+      </div>
+      <div class="fa-ws-panel" id="fa-ws-startsit-panel" role="tabpanel" aria-labelledby="fa-ws-startsit-tab" hidden>
+        <div class="fa-ws-intro"><h2>Week 10 IDP Start / Sit</h2><p>Pick any 2–12 players from your roster or LOG free agents. Use the owner-only import to compare The IDP Show and Woellert weekly positional ranks without publishing paid source data.</p></div>
       </div>
       <div class="fa-ws-panel" id="fa-ws-watch-panel" role="tabpanel" aria-labelledby="fa-ws-watch-tab" hidden>
         <div class="fa-ws-intro"><h2>My private watchlist</h2><p>Load your private scouting notes and weekly projections locally in this browser. Historical frozen research is below the active watchlist.</p></div>
