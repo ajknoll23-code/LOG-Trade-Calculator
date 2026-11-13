@@ -1,0 +1,185 @@
+name: A-B39S01R1 - Weekly Pre-Kickoff B39 Capture Guard (Read Only Dispatcher)
+
+'on':
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Safety test: true reports the decision without dispatching B39'
+        type: boolean
+        required: true
+        default: true
+  schedule:
+    # 09:05 Arizona time Wednesday and Thursday; existing B50 audit is at 10:07 Arizona.
+    # A Thursday retry is useful when Wednesday provider data is not yet ready.
+    - cron: '5 16 * * 3,4'
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: a-b39s01-capture-dispatch-guard
+  cancel-in-progress: false
+
+jobs:
+  protect-b39:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+      TARGET_SEASON: '2026'
+      B39_WORKFLOW: B39-weekly-floor-ceiling-volatility-v1-reusable-prospective-weekly-capture.yml
+
+    steps:
+      - name: Checkout main without write credentials
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: Identify upcoming true first kickoff and enforce frozen chronology
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          test -f ".github/workflows/$B39_WORKFLOW"
+          test "$(git hash-object research/weekly-floor-ceiling-volatility-v1/weekly_floor_ceiling_volatility_v1_b38_prospective_prereg.json)" = 'f6f397c590883e1a56e50d17825739faa092fb06'
+          test "$(git hash-object research/weekly-floor-ceiling-volatility-v1/weekly_floor_ceiling_volatility_v1_snapshot_builder.py)" = '0daff9768a2806985877b3b21675a55d8926a54a'
+          test -f research/weekly-floor-ceiling-volatility-v1/prospective-snapshots/2026-W04.partial.json
+
+          curl --fail --location --retry 3 --retry-delay 2 --silent --show-error \
+            --output "$RUNNER_TEMP/games.csv" \
+            https://github.com/nflverse/nflverse-data/releases/download/schedules/games.csv
+          test -s "$RUNNER_TEMP/games.csv"
+
+          python3 - <<'PY'
+          from __future__ import annotations
+          from collections import defaultdict
+          from datetime import datetime, timezone, timedelta
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+          import csv, json, os
+
+          now = datetime.now(timezone.utc)
+          eastern = ZoneInfo('America/New_York')
+          games = defaultdict(list)
+          schedule = Path(os.environ['RUNNER_TEMP']) / 'games.csv'
+          with schedule.open(encoding='utf-8-sig', newline='') as stream:
+              for row in csv.DictReader(stream):
+                  try:
+                      season, week = int(row.get('season','')), int(row.get('week',''))
+                  except (ValueError, TypeError):
+                      continue
+                  if season != 2026 or not 5 <= week <= 17 or str(row.get('game_type','')).upper() != 'REG':
+                      continue
+                  date, time = row.get('gameday',''), row.get('gametime','')
+                  if not date or not time:
+                      raise RuntimeError(f'NFLVERSE_MISSING_SCHEDULE_TIME_FOR_WEEK_{week}')
+                  kickoff = datetime.fromisoformat(f'{date}T{time}:00').replace(tzinfo=eastern).astimezone(timezone.utc)
+                  games[week].append((kickoff, row.get('game_id')))
+
+          if any(len(v) < 12 for v in games.values()) or len(games) != 13:
+              raise RuntimeError(f'IMPLAUSIBLE_2026_WEEKS_5_TO_17_SCHEDULE: { {w:len(v) for w,v in games.items()} }')
+          cutoffs = {w: min(k for k, _ in v) for w, v in games.items()}
+          upcoming = sorted(((dt,w) for w,dt in cutoffs.items() if dt > now))
+          week = upcoming[0][1] if upcoming else None
+          cutoff = upcoming[0][0] if upcoming else None
+          remaining = (cutoff-now).total_seconds()/3600 if cutoff else None
+          base = Path('research/weekly-floor-ceiling-volatility-v1/prospective-snapshots')
+          required=8
+          count = 1 + sum((base / f'2026-W{w:02d}.json').exists() for w in range(5,18))
+          mode = 'SEASON_COMPLETE' if week is None else 'OUTSIDE_WINDOW'
+
+          if count >= required:
+              mode = 'STUDY_ORIGINS_COMPLETE'
+          elif week is not None and 2.0 < remaining <= 48:
+              # Every earlier origin must be either a frozen full-week snapshot or a documented irreversible miss.
+              for prior in range(5,week):
+                  full = (base / f'2026-W{prior:02d}.json').exists()
+                  missed = (base / f'2026-W{prior:02d}.missed.json').exists()
+                  if full == missed:
+                      raise RuntimeError(f'B39_PRIOR_ORIGIN_UNRESOLVED_OR_DUPLICATED_WEEK_{prior}')
+              full = (base / f'2026-W{week:02d}.json').exists()
+              miss = (base / f'2026-W{week:02d}.missed.json').exists()
+              if full and miss:
+                  raise RuntimeError(f'B39_DUPLICATED_CAPTURE_AND_MISS_WEEK_{week}')
+              mode = 'ALREADY_RESOLVED' if full or miss else 'READY_TO_DISPATCH'
+          elif week is not None and remaining <= 2.0:
+              mode = 'TOO_CLOSE_TO_KICKOFF_DO_NOT_DISPATCH'
+
+          state = {
+              'season': 2026,
+              'checked_at_utc': now.isoformat(),
+              'study': 'weekly-floor-ceiling-volatility-v1',
+              'target_week': week,
+              'first_kickoff_utc': cutoff.isoformat() if cutoff else None,
+              'hours_before_first_kickoff': round(remaining,3) if remaining is not None else None,
+              'eligible_origins_so_far': count,
+              'required_eligible_origins': required,
+              'mode': mode,
+              'read_only_except_dispatching_existing_B39': True,
+          }
+          dest = Path(os.environ['RUNNER_TEMP']) / 'b39-dispatch-state.json'
+          dest.write_text(json.dumps(state,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(state,indent=2))
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write(f'B39_MODE={mode}\n')
+              if week is not None:
+                  env.write(f'B39_TARGET_WEEK={week}\n')
+          PY
+
+      - name: Dispatch existing B39 only when needed and permitted
+        if: env.B39_MODE == 'READY_TO_DISPATCH'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$DRY_RUN" = 'true' ]; then
+            echo "DRY RUN: eligible origin Week $B39_TARGET_WEEK; B39 dispatch intentionally skipped."
+            exit 0
+          fi
+
+          # Avoid scheduling a second run while the first is queued or executing.
+          gh api "repos/${GH_REPO}/actions/workflows/${B39_WORKFLOW}/runs?per_page=20" \
+            --jq '[.workflow_runs[] | select(.status == "queued" or .status == "in_progress" or .status == "waiting" or .status == "requested" or .status == "pending")] | length' \
+            > "$RUNNER_TEMP/b39-active.txt"
+          running="$(cat "$RUNNER_TEMP/b39-active.txt")"
+          if [ "$running" -gt 0 ]; then
+            echo "Existing B39 run is active: no duplicate dispatch."
+            exit 0
+          fi
+          # Read fresh main to avoid dispatching if a capture just completed.
+          git fetch --quiet origin main
+          if git cat-file -e "origin/main:research/weekly-floor-ceiling-volatility-v1/prospective-snapshots/2026-W$(printf '%02d' "$B39_TARGET_WEEK").json" 2>/dev/null; then
+            echo 'B39 weekly snapshot already committed on main; no new run.'
+            exit 0
+          fi
+          if git cat-file -e "origin/main:research/weekly-floor-ceiling-volatility-v1/prospective-snapshots/2026-W$(printf '%02d' "$B39_TARGET_WEEK").missed.json" 2>/dev/null; then
+            echo 'B39 origin already documented as missed; no new run.'
+            exit 0
+          fi
+          # Existing B39 enforces the authoritative no-backfill and source checks itself.
+          gh workflow run "$B39_WORKFLOW" --ref main -f "origin_week=$B39_TARGET_WEEK"
+          echo "Requested B39 frozen capture for Week $B39_TARGET_WEEK."
+          echo 'The dispatcher success is not evidence that the subsequent B39 capture succeeded.'
+
+      - name: Publish decision and prove no direct repository mutation
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -s "$RUNNER_TEMP/b39-dispatch-state.json" ]; then
+            python3 - <<'PY'
+          import json,os
+          from pathlib import Path
+          data=json.loads((Path(os.environ['RUNNER_TEMP'])/'b39-dispatch-state.json').read_text())
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:
+              f.write('## B39 pre-kickoff safety dispatcher\n\n')
+              for key in ('mode','target_week','first_kickoff_utc','hours_before_first_kickoff','eligible_origins_so_far','required_eligible_origins'):
+                  f.write(f'- {key}: `{data[key]}`\n')
+              f.write('\nThis control never edits the scientific model, thresholds, or old snapshots. It only invokes existing B39 if eligible.\n')
+          PY
+          fi
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
