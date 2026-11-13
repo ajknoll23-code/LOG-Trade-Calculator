@@ -17,20 +17,20 @@ Policy SHA256: `f40340a475829d6b0d5b3f63ab25dcf9be976749a307710fd0fc67f602702959
 | Player | Pos | Fundamental | Market | Δ | Market rank |
 |---|---|---:|---:|---:|---:|
 | fernando mendoza | QB | 2,182 | 9,497 | +7,315 | 1.0 |
-| sonny styles | LB | 3,277 | 8,086 | +4,809 | 2.0 |
+| sonny styles | LB | 3,277 | 8,066 | +4,789 | 2.0 |
 | kc concepcion | WR | 2,111 | 6,578 | +4,467 | 6.0 |
 | jahmyr gibbs | RB | 9,497 | 5,336 | -4,161 | 23.0 |
-| malik davis | RB | 843 | 4,849 | +4,006 | 49.0 |
-| bijan robinson | RB | 8,086 | 4,152 | -3,934 | 84.0 |
+| malik davis | RB | 842 | 4,849 | +4,007 | 49.0 |
+| bijan robinson | RB | 8,066 | 4,152 | -3,914 | 84.0 |
 | kenyon sadiq | TE | 1,328 | 5,013 | +3,685 | 40.0 |
 | ty simpson | QB | 1,169 | 4,672 | +3,503 | 58.0 |
-| ashton jeanty | RB | 7,056 | 3,571 | -3,485 | 138.0 |
+| ashton jeanty | RB | 7,053 | 3,571 | -3,482 | 138.0 |
 | dorian williams | LB | 2,466 | 5,847 | +3,381 | 11.0 |
 | dj giddens | RB | 737 | 4,109 | +3,372 | 86.0 |
-| jihaad campbell | LB | 2,527 | 5,861 | +3,334 | 10.0 |
 | malik willis | QB | 3,697 | 7,030 | +3,333 | 4.0 |
+| jihaad campbell | LB | 2,527 | 5,857 | +3,330 | 10.0 |
 | christian watson | WR | 4,480 | 1,169 | -3,311 | 422.0 |
-| devin singletary | RB | 668 | 3,966 | +3,298 | 100.0 |
+| devin singletary | RB | 667 | 3,966 | +3,299 | 100.0 |
 | devin lloyd | LB | 4,613 | 1,328 | -3,285 | 404.0 |
 | tyrel dodson | LB | 4,295 | 1,013 | -3,282 | 456.0 |
 | drake london | WR | 5,847 | 2,579 | -3,268 | 276.0 |
@@ -44,8 +44,8 @@ Policy SHA256: `f40340a475829d6b0d5b3f63ab25dcf9be976749a307710fd0fc67f602702959
 | nick bolton | LB | 5,297 | 2,342 | -2,955 | 310.0 |
 | micah parsons | DL | 3,933 | 6,871 | +2,938 | 5.0 |
 | azeez alshaair | LB | 4,018 | 1,095 | -2,923 | 434.0 |
-| rueben bain | DL | 1,958 | 4,867 | +2,909 | 47.0 |
-| rhamondre stevenson | RB | 2,350 | 5,252 | +2,902 | 28.0 |
+| rueben bain | DL | 1,958 | 4,864 | +2,906 | 47.0 |
+| rhamondre stevenson | RB | 2,348 | 5,252 | +2,904 | 28.0 |
 
 ## Deployed policy
 
