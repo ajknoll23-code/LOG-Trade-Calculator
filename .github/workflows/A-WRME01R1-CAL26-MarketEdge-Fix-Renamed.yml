@@ -1,0 +1,209 @@
+name: A-WRME01R1 - CAL26 WR01 Identity Repair and Market Edge Verification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install regression dependency
+        run: python3 -m pip install --disable-pip-version-check --no-cache-dir "requests>=2.32,<3"
+
+      - name: Verify clean repo and frozen approved player identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git branch --show-current)" = main
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          python3 scripts/validation/dual_eligibility_pipeline.py --selftest
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path('index.html').read_text(encoding='utf-8')
+          assert "'james pearce':{pos:'DL'" in s
+          assert '"12585": Object.freeze({synced:"james pearce jr",curated:"james pearce",pos:"DL"})' in s
+          print('PASS: A-ID03 canonical DL / Sleeper 12585 identity verified')
+          PY
+      - name: Download and verify exact frozen Week 6 role bootstrap
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/cal26-repair-bootstrap"
+          gh run download 39643851866 \
+            --repo "$GITHUB_REPOSITORY" \
+            --name CAL26-V1R5-Frozen-Role-V2-Through-Week6-READ-ONLY \
+            --dir "$RUNNER_TEMP/cal26-repair-bootstrap"
+      - name: Apply exact guarded CAL26 WR01 repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_PATCH'
+          from pathlib import Path
+          import subprocess
+
+          p = Path('.github/workflows/CAL26_WR01_Weekly_Frozen_Role_V2_FV_Neutral_Auto_Update.yml')
+          src = p.read_text(encoding='utf-8')
+          original_blob = subprocess.check_output(['git', 'hash-object', str(p)], text=True).strip()
+          base_sha = '3072d97660824015dba20eef2bcde263a6a796ce'
+          helper = '''          def approved_pearce_transition(player, prior, pos, index):
+                        # Allow exactly A-ID03 verified LB-to-DL metadata correction; no automatic role upgrade.
+                        if player != 'james pearce' or prior.get('position') != 'LB' or pos != 'DL':
+                            return False
+                        sid = str(prior.get('sleeper_id') or '')
+                        require(sid in ('', '12585'), 'PEARCE_WEEK6_SLEEPER_ID_DRIFT')
+                        approved = '"12585": Object.freeze({synced:"james pearce jr",curated:"james pearce",pos:"DL"})'
+                        require(approved in index, 'PEARCE_A_ID03_APPROVED_IDENTITY_MISSING')
+                        return True
+
+
+          '''
+          needle_fn = '          def analyze(repo,shadow_dir,out,prev,week,mode,synthetic=False):\n'
+          needle_guard = "                  require(pos==prior['position'] and old in ROLES,'LIVE_ID_OR_ROLE_DRIFT_'+player)\n"
+          new_guard = (
+              '                  audited_pearce_transition=approved_pearce_transition(player,prior,pos,index)\n'
+              "                  require((pos==prior['position'] or audited_pearce_transition) and old in ROLES,\n"
+              "                          'LIVE_ID_OR_ROLE_DRIFT_'+player)\n"
+          )
+          needle_branch = '                  elif shift==0:\n'
+          new_branch = (
+              '                  elif audited_pearce_transition:\n'
+              "                      status='APPROVED_PEARCE_POSITION_CORRECTION_REVIEW_HOLD'\n"
+              '                  elif shift==0:\n'
+          )
+          if helper in src and new_guard in src and new_branch in src:
+              print('PASS: approved CAL26 correction already installed; no change')
+          else:
+              assert original_blob == base_sha, (
+                  'CAL26 parent workflow changed since reviewed; refusing blind patch',
+                  original_blob,
+                  base_sha,
+              )
+              assert all(src.count(x) == 1 for x in (needle_fn, needle_guard, needle_branch)), (
+                  'Expected CAL26 insertion points not unique'
+              )
+              src = src.replace(needle_fn, helper + needle_fn, 1)
+              src = src.replace(needle_guard, new_guard, 1)
+              src = src.replace(needle_branch, new_branch, 1)
+              p.write_text(src, encoding='utf-8')
+              print('PASS: installed one-player A-ID03 position transition with mandatory manual-review hold')
+
+          PY_PATCH
+      - name: Validate corrected workflow and regression invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_VERIFY'
+          from pathlib import Path
+          import ast
+          import csv
+          import hashlib
+          import subprocess
+          import os
+
+          p=Path('.github/workflows/CAL26_WR01_Weekly_Frozen_Role_V2_FV_Neutral_Auto_Update.yml')
+          src=p.read_text(encoding='utf-8')
+          mark_a="<<'PY_CAL26_WR01'\n"
+          mark_b='\n          PY_CAL26_WR01'
+          assert src.count(mark_a)==1 and src.count(mark_b)==1
+          engine=src.split(mark_a,1)[1].split(mark_b,1)[0]
+          assert all(not line.strip() or line.startswith('          ') for line in engine.splitlines())
+          code='\n'.join(line[10:] if line.startswith('          ') else line for line in engine.splitlines())+'\n'
+          ast.parse(code)
+          ns={'__name__':'role_repair_validation'}
+          exec(compile(code,'cal26-weekly-role-engine.py','exec'),ns)
+          verify_transition=ns['approved_pearce_transition']
+          valid_alias='"12585": Object.freeze({synced:"james pearce jr",curated:"james pearce",pos:"DL"})'
+          prior={'position':'LB','sleeper_id':'12585'}
+          assert verify_transition('james pearce',prior,'DL',valid_alias) is True
+          assert verify_transition('james pearce',{'position':'LB','sleeper_id':''},'DL',valid_alias) is True
+          assert verify_transition('another player',prior,'DL',valid_alias) is False
+          assert verify_transition('james pearce',prior,'WR',valid_alias) is False
+          assert verify_transition('james pearce',{'position':'DL','sleeper_id':'12585'},'DL',valid_alias) is False
+          for bad_prior,bad_alias in [({'position':'LB','sleeper_id':'99999'},valid_alias), (prior,'no approved mapping')]:
+              try:verify_transition('james pearce',bad_prior,'DL',bad_alias)
+              except RuntimeError:pass
+              else:raise AssertionError('A-ID03 identity gate did not fail closed')
+          assert src.count("status='APPROVED_PEARCE_POSITION_CORRECTION_REVIEW_HOLD'")==1
+          assert src.index('elif audited_pearce_transition:')<src.index('elif shift==0:')
+          assert "mode='AUTO_SAFE_FV_NEUTRAL'" not in src
+
+          # The frozen Week 6 artifact is immutable. Verify the original corrected player
+          # row without copying it to any tracked repository path.
+          b=Path(os.environ['RUNNER_TEMP'])/'cal26-repair-bootstrap/cal26-v1r5-output/CAL26_V1R5_565_Week6_Role_Comparison.csv'
+          assert b.exists(),b
+          assert hashlib.sha256(b.read_bytes()).hexdigest()==(
+              '7eafb0410c02625d3b0daff89182b391df6483e9d766901ec0a3f916f99810fe'
+          )
+          with b.open(encoding='utf-8',newline='') as f:
+              rows=list(csv.DictReader(f))
+          assert len(rows)==565
+          selected=[r for r in rows if r['player']=='james pearce']
+          assert len(selected)==1,selected
+          row=selected[0]
+          assert row['position']=='LB',row
+          assert row.get('week6_sleeper_id','') in ('','12585'),row
+          assert "'james pearce':{pos:'DL'" in Path('index.html').read_text(encoding='utf-8')
+          print('PASS: 565 frozen Week 6 rows and approved James Pearce LB->DL metadata transition')
+          print('PASS: misidentified player, unrelated position change, or wrong approved ID fail closed')
+          print('PASS: affected player always held from automatic upgrade during correction week')
+
+          PY_VERIFY
+
+          python3 scripts/validation/repo_regression_checks.py
+          git diff --check
+      - name: Commit only corrected CAL26 workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          file='.github/workflows/CAL26_WR01_Weekly_Frozen_Role_V2_FV_Neutral_Auto_Update.yml'
+          git add -- "$file"
+          if git diff --cached --quiet; then
+            echo 'CAL26 repair already present. No new commit.'
+          else
+            test "$(git diff --cached --name-only)" = "$file"
+            git diff --cached --check
+            git -c user.name='github-actions[bot]' \
+                -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+                commit -m 'Repair CAL26 WR01 A-ID03 Pearce bootstrap metadata transition'
+            git push origin HEAD:main
+          fi
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - name: Start CAL26 report-only and Market Edge V1 verification
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Never trigger CAL26 AUTO_SAFE_FV_NEUTRAL from a repair workflow.
+          # REPORT_ONLY preserves all deployed prices and roles while exercising the
+          # original weekly data pipeline and independent 565-player checks.
+          gh workflow run CAL26_WR01_Weekly_Frozen_Role_V2_FV_Neutral_Auto_Update.yml \
+            --repo "$GITHUB_REPOSITORY" --ref main --raw-field release_mode=REPORT_ONLY
+          gh workflow run market-edge-v1-prospective-study.yml \
+            --repo "$GITHUB_REPOSITORY" --ref main
+          echo '### Verification dispatched' >> "$GITHUB_STEP_SUMMARY"
+          echo '- CAL26 WR01: REPORT_ONLY (never publishes roles)' >> "$GITHUB_STEP_SUMMARY"
+          echo '- Market Edge V1: unchanged frozen prospective research pipeline' >> "$GITHUB_STEP_SUMMARY"
+          echo '- Check the separately launched Actions runs for green/red final outcomes.' >> "$GITHUB_STEP_SUMMARY"
