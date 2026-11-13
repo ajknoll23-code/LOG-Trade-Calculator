@@ -345,7 +345,14 @@ def check_dual_eligibility_audit():
     assert all("recommended_bucket" not in r for r in rows), "retired economic recommended_bucket still present"
     mismatches = [r for r in rows if r.get("current_position_is_eligible") is False]
     names = {r["player"] for r in mismatches}
-    assert "james pearce" in names, "known stale-position audit case no longer surfaced"
+    # A-ID03 fixed James Pearce Jr. (Sleeper 12585) from the stale LB bucket
+    # to the independently verified DL bucket. The old live mismatch is now
+    # expected to disappear; the synthetic stale-LB case remains covered by
+    # dual_eligibility_pipeline.run_selftest().
+    assert dual_eligibility_pipeline.load_trade_desk_positions().get("james pearce") == "DL", (
+        "A-ID03 approved James Pearce DL classification regressed"
+    )
+    assert "james pearce" not in names, "corrected James Pearce still flagged as stale"
     assert "travis hunter" in names, "known two-way/manual-review case no longer surfaced"
     print(f"PASS eligibility audit: {len(rows)} review rows, {len(mismatches)} current-position mismatches surfaced")
 
