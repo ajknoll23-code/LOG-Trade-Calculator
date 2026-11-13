@@ -1,4 +1,4 @@
-/* A-FA19R1: LOG Free Agent Board experience refresh.
+/* A-FA19R1 + A-FA20R1: LOG Free Agent Board experience refresh.
  * UI-only. Existing valuation logic, research models, rankings, private imports,
  * IDs, and event handlers are not replaced. Source modules keep their own state.
  */
@@ -93,31 +93,30 @@
     const field=search.querySelector('#fa19PlayerQuery');
     const feedback=search.querySelector('#fa19PlayerFeedback');
     const clear=search.querySelector('#fa19SearchClear');
-    let oldPosition='ALL';
+    let selectedPosition='ALL';
     const details=()=>Array.from(board.children).filter(x=>x.tagName==='DETAILS');
     const normal=x=>String(x||'').trim().toLocaleLowerCase();
     function applySearch(){
       const query=normal(field.value);
       const sections=details();
-      const all=sections.find(x=>normal(x.querySelector('summary')?.textContent).startsWith('all '));
-      if (!sections.length || !all) {feedback.textContent='Loading players…';return;}
+      const selected=sections.find(x=>normal(x.querySelector(':scope > summary')?.textContent).split(/\s+/)[0]===normal(selectedPosition));
+      if (!sections.length || !selected) {feedback.textContent='Loading players…';return;}
       const rows=Array.from(board.querySelectorAll('.row'));
       if (!query) {
         rows.forEach(row=>row.hidden=false);
         feedback.textContent='';
         return;
       }
-      sections.forEach(x=>x.open=(x===all));
+      sections.forEach(x=>x.open=(x===selected));
       let found=0,shown=0;
       for(const row of rows){
-        const fromAll=all.contains(row);
-        const matched=fromAll && normal(row.querySelector('.row-title')?.textContent+' '+row.querySelector('.row-meta')?.textContent).includes(query);
+        const matched=selected.contains(row) && normal((row.querySelector('.row-title')?.textContent||'')+' '+(row.querySelector('.row-meta')?.textContent||'')).includes(query);
         if(matched)found++;
         const show=matched&&shown<50;
         if(show)shown++;
         row.hidden=!show;
       }
-      feedback.textContent=found===0?'No matches':`${found} match${found===1?'':'es'}${found>50?' · first 50 shown':''}`;
+      feedback.textContent=found===0?`No ${selectedPosition==='ALL'?'player':selectedPosition} matches`:`${found} match${found===1?'':'es'}${found>50?' · first 50 shown':''}`;
     }
     field.addEventListener('input',applySearch);
     clear.addEventListener('click',()=>{field.value='';applySearch();field.focus();});
@@ -128,8 +127,8 @@
     positionNav?.addEventListener('click',e=>{
       const button=e.target.closest('[data-fa-position]');
       if(!button)return;
-      oldPosition=button.dataset.faPosition;
-      if(field.value){field.value='';applySearch();}
+      selectedPosition=button.dataset.faPosition;
+      if(field.value) applySearch();
     },{capture:true});
     // renderBoard() reconstructs board nodes after coverage setting/data sync.
     new MutationObserver(records=>{
