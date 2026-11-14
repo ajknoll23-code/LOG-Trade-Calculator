@@ -1,0 +1,282 @@
+# WFC02R1: READ ONLY. Follow-up to a green WFC01 audit. NEVER archives or writes files.
+# Reads the pinned WFC01 audit artifact, checks path hashes and Git history,
+# and creates a manual review queue. "Older" does not mean archive-authorized.
+name: '01 | DATA & REFRESH | WFC02R1 - Archive Candidate Triage (Read Only)'
+run-name: 'WFC02R1 read-only archive triage from WFC01 run ${{ inputs.wfc01_audit_run_id }}'
+'on':
+  workflow_dispatch:
+    inputs:
+      wfc01_audit_run_id:
+        description: 'Successful WFC01 AUDIT_ONLY GitHub Actions run ID (not the workflow number)'
+        required: true
+        type: string
+        default: '43646967090'
+permissions:
+  actions: read
+  contents: read
+concurrency:
+  group: log-wfc02-readonly-triage
+  cancel-in-progress: false
+jobs:
+  triage:
+    name: 'Compare WFC01 audit with history before cosmetic five-group rename'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository history (read only)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Restore read-only triage engine
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/log_wfc02_triage.py" <<'PY_WFC02R1_ENGINE'
+          #!/usr/bin/env python3
+          """WFC02R1 read-only triage. Never moves, modifies, or authorizes workflow archival."""
+          from __future__ import annotations
+          import csv, datetime as dt, hashlib, io, json, os, re, subprocess, sys, urllib.request, urllib.parse, zipfile
+          from collections import Counter, defaultdict
+          from pathlib import Path
+
+          ROOT = Path('.github/workflows')
+          OUT = Path(os.environ.get('TRIAGE_OUTPUT', '/tmp/log-wfc02-triage'))
+          REPO = os.environ.get('GITHUB_REPOSITORY', 'ajknoll23-code/LOG-Trade-Calculator')
+          RUN_ID = os.environ.get('TRIAGE_WFC01_RUN_ID','').strip()
+          TOKEN = os.environ.get('GH_TOKEN', '')
+          ACTIVE_STEMS = (
+              'scheduled-data-refresh', 'sync-sleeper', 'free-agent-utility-v1-refresh',
+              'fantasypros-api-pipeline', 'ktc-vote-aggregation', 'market-edge-v1',
+              'B51-', 'CAL26_WR01_', 'A-B39S01', 'prospective-trade-evidence-capture',
+              'package-adjustment-audit-step4', 'WFC01_Deep_', 'A-WF02R3',
+              'A-FA26R1', 'A-FA26R2',
+          )
+          GROUP_NAMES={1:'Data & Refresh',2:'Player Research',3:'Valuation & Market',4:'Team & Free Agents',5:'Newsletters & Publishing'}
+          FAMILY_PATTERN=re.compile(r'^((?:A[-_])?(?:FA|NL|WF|QA|CAL|RG|B\d{2}[A-Z]?|QF)\d+[A-Z0-9]*?)R(\d+)(?=[-_().]|$)',re.I)
+
+
+          def run(*args, check=True):
+              r=subprocess.run(args,text=True,capture_output=True)
+              if check and r.returncode: raise RuntimeError(f'Command error {args!r}: {r.stderr[:600]}')
+              return r.stdout.strip()
+
+
+          def json_api(endpoint):
+              if not TOKEN: raise ValueError('GITHUB_TOKEN_MISSING')
+              uri=f'https://api.github.com/repos/{REPO}/{endpoint}'
+              req=urllib.request.Request(uri,headers={'Authorization':f'Bearer {TOKEN}', 'Accept':'application/vnd.github+json', 'X-GitHub-Api-Version':'2022-11-28'})
+              with urllib.request.urlopen(req,timeout=40) as h: return json.load(h)
+
+
+          class StripCrossOriginAuth(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  new_req=super().redirect_request(req,fp,code,msg,headers,newurl)
+                  if new_req is not None and urllib.parse.urlparse(newurl).netloc!=urllib.parse.urlparse(req.full_url).netloc:
+                      new_req.remove_header('Authorization')
+                  return new_req
+
+
+          def load_prior_audit():
+              local=os.environ.get('TRIAGE_LOCAL_ZIP','')
+              if local: raw=Path(local).read_bytes()
+              else:
+                  if not RUN_ID.isdigit(): raise ValueError('WFC01_AUDIT_RUN_ID_REQUIRED')
+                  data=json_api(f'actions/runs/{RUN_ID}')
+                  if data.get('conclusion')!='success' or data.get('event')!='workflow_dispatch':
+                      raise ValueError('WFC01_AUDIT_NOT_SUCCESSFUL_DISPATCH')
+                  if not str(data.get('path','')).endswith('WFC01_Deep_Legacy_Workflow_Audit_And_Guarded_Archive.yml'):
+                      raise ValueError('RUN_IS_NOT_EXPECTED_WFC01_WORKFLOW')
+                  arts=json_api(f'actions/runs/{RUN_ID}/artifacts?per_page=100').get('artifacts',[])
+                  good=[x for x in arts if x.get('name')=='WFC01-Deep-Workflow-Audit-Read-Only' and not x.get('expired')]
+                  if len(good)!=1: raise ValueError('EXPECTED_EXACTLY_ONE_WFC01_AUDIT_ARTIFACT')
+                  uri=f'https://api.github.com/repos/{REPO}/actions/artifacts/{good[0]["id"]}/zip'
+                  req=urllib.request.Request(uri,headers={'Authorization':f'Bearer {TOKEN}','Accept':'application/vnd.github+json'})
+                  with urllib.request.build_opener(StripCrossOriginAuth()).open(req,timeout=65) as h: raw=h.read()
+                  if len(raw)>30_000_000: raise ValueError('AUDIT_ARTIFACT_TOO_LARGE')
+              with zipfile.ZipFile(io.BytesIO(raw)) as z:
+                  def read_exact(name):
+                      matches=[x for x in z.namelist() if x==name or x.endswith('/'+name)]
+                      if len(matches)!=1: raise ValueError('MISSING_OR_AMBIGUOUS_AUDIT_ENTRY_'+name)
+                      return z.read(matches[0]).decode('utf-8-sig')
+                  summary=json.loads(read_exact('WFC01_Audit_Summary.json'))
+                  inventory=list(csv.DictReader(io.StringIO(read_exact('WFC01_Workflow_Inventory.csv'))))
+                  references=list(csv.DictReader(io.StringIO(read_exact('WFC01_References.csv'))))
+                  gaps=list(csv.DictReader(io.StringIO(read_exact('WFC01_Scan_Gaps.csv'))))
+              if summary.get('mode')!='AUDIT_ONLY' or not summary.get('history_complete'):
+                  raise ValueError('WFC01_AUDIT_NOT_COMPLETE')
+              if gaps: raise ValueError('WFC01_REFERENCE_SCAN_HAS_GAPS')
+              if summary.get('workflows')!=len(inventory): raise ValueError('AUDIT_INVENTORY_ROW_COUNT_MISMATCH')
+              return summary,inventory,references
+
+
+          def get_baseline():
+              # Find the exact cosmetic-only batch rename. Never infer this from the audit date.
+              logs=run('git','log','--format=%H%x09%s','--max-count=150','--','.github/workflows')
+              matches=[x.split('\t',1)[0] for x in logs.splitlines() if '\tchore: group GitHub Actions display names into five domains' in x]
+              if len(matches)!=1:return '',{}
+              parent=run('git','rev-parse',matches[0]+'^')
+              # Scan substantive histories in one git operation, excluding the cosmetic naming commit.
+              output=run('git','log','--format=@@WFC02@@%H|%aI','--name-only',parent,'--','.github/workflows')
+              last={}; stamp=''
+              for line in output.splitlines():
+                  if line.startswith('@@WFC02@@'):
+                      stamp=line.split('|',1)[1].strip()
+                  elif line.startswith('.github/workflows/') and line not in last:
+                      last[line]=stamp
+              return parent,last
+
+
+          def classify_group(name,display):
+              m=re.match(r'^(0[1-5])\s*\|',display or '')
+              if m:return int(m.group(1))
+              s=name.lower()
+              if 'nl' in s or 'newsletter' in s:return 5
+              if 'fa' in s or 'free-agent' in s or 'waiver' in s:return 4
+              if 'cal' in s or 'market' in s or 'package' in s:return 3
+              if 'idp' in s or 'role' in s:return 2
+              return 1
+
+
+          def current_name(path):
+              if not path.exists():return ''
+              content=path.read_text(encoding='utf-8-sig')
+              m=re.search(r'(?m)^name:\s*(.*)$',content)
+              return m.group(1).strip().strip('"\'') if m else ''
+
+
+          def triage():
+              assert ROOT.is_dir(), 'MISSING_WORKFLOW_DIRECTORY'
+              head=run('git','rev-parse','HEAD')
+              summary,inventory,refs=load_prior_audit()
+              base=summary.get('head','')
+              if not re.fullmatch('[0-9a-f]{40}',base):raise ValueError('INVALID_WFC01_BASE_SHA')
+              if subprocess.run(['git','merge-base','--is-ancestor',base,head]).returncode:
+                  raise ValueError('WFC01_AUDIT_COMMIT_NOT_ANCESTOR_OF_CURRENT_HEAD')
+              baseline,substantive=get_baseline()
+              families=defaultdict(list); original_name=defaultdict(list)
+              for item in inventory:
+                  filename=Path(item['path']).name
+                  m=FAMILY_PATTERN.search(filename)
+                  if m:families[m.group(1).upper()].append((int(m.group(2)),item['path']))
+                  original_name[re.sub(r'\(\d+\)(?=\.ya?ml$)','',filename,flags=re.I).lower()].append(item['path'])
+              maxrev={k:max(x[0] for x in v) for k,v in families.items()}
+              rows=[]
+              for x in inventory:
+                  path=x['path'];filename=Path(path).name; file=Path(path)
+                  if not path.startswith('.github/workflows/') or not filename.endswith(('.yml','.yaml')):
+                      raise ValueError('INVALID_AUDIT_WORKFLOW_PATH_'+path)
+                  if file.is_symlink(): raise ValueError('SYMLINK_IN_WORKFLOW_PATH_'+path)
+                  exists=file.is_file()
+                  match_sha=exists and hashlib.sha256(file.read_bytes()).hexdigest()==x['sha256']
+                  events=x['triggers'].split(';')
+                  active=filename.lower().startswith(tuple(s.lower() for s in ACTIVE_STEMS))
+                  schedules=events!=['workflow_dispatch']
+                  links=int(x['reference_count'] or 0)
+                  writer=x['potential_writer']=='True'
+                  ran=x['recent_run']=='True'
+                  family=FAMILY_PATTERN.search(filename)
+                  older_rev=bool(family and int(family.group(2))<maxrev.get(family.group(1).upper(),0))
+                  duplicate_family=original_name[re.sub(r'\(\d+\)(?=\.ya?ml$)','',filename,flags=re.I).lower()]
+                  is_duplicate=len(duplicate_family)>1
+                  frozen=re.search(r'(freeze|frozen|immutable|pre.holdout|holdout|production|weekly|prospective|capture|research)',filename,re.I) is not None
+                  holds=[]
+                  if not exists:holds.append('REMOVED_SINCE_AUDIT')
+                  elif not match_sha:holds.append('CHANGED_SINCE_WFC01_AUDIT')
+                  if active:holds.append('ACTIVE_OR_CRITICAL_FAMILY')
+                  if schedules:holds.append('SCHEDULED_OR_AUTOMATED_TRIGGER')
+                  if links:holds.append(f'REFERENCED_IN_{links}_SOURCE_FILE(S)')
+                  if writer:holds.append('WRITE_CAPABLE')
+                  if ran:holds.append('RUN_WITHIN_35_DAYS')
+                  if frozen:holds.append('FROZEN_PROSPECTIVE_PRODUCTION_OR_WEEKLY_NAMING')
+                  if not baseline:holds.append('COSMETIC_RENAME_BASELINE_NOT_IDENTIFIED')
+                  if not substantive.get(path):holds.append('NO_PRE_RENAME_SUBSTANTIVE_HISTORY')
+                  if not match_sha or active or schedules:
+                      classification='PROTECT'
+                  elif older_rev:
+                      classification='REVIEW_PRIOR_REVISION'
+                  elif is_duplicate:
+                      classification='REVIEW_DUPLICATE_FILENAME'
+                  elif not links and not writer and not ran and not frozen:
+                      classification='REVIEW_DORMANT_MANUAL'
+                  else: classification='HOLD'
+                  # Triage is advisory only, including when a candidate has no holds.
+                  safety='HIGH' if active or schedules or links or writer or frozen else ('MODERATE' if ran or not match_sha else 'LOWER')
+                  rows.append(dict(path=path,display_name=current_name(file),group=classify_group(filename,current_name(file)),
+                      classification=classification,safety_risk=safety,family=family.group(1).upper() if family else '',
+                      revision=int(family.group(2)) if family else '',newer_revision_exists=older_rev,
+                      duplicate_paths=';'.join(p for p in duplicate_family if p!=path),
+                      audit_recent_run=ran,audit_writer=writer,audit_references=links,
+                      previous_substantive_edit_utc=substantive.get(path,''),
+                      cosmetic_baseline_commit=baseline,unchanged_since_wfc01=match_sha,
+                      hold_reasons=';'.join(holds)))
+              counts=Counter(r['classification'] for r in rows)
+              all_groups=Counter(r['group'] for r in rows)
+              leads=[r for r in rows if r['classification'].startswith('REVIEW_')]
+              leads.sort(key=lambda r:({'LOWER':0,'MODERATE':1,'HIGH':2}[r['safety_risk']],r['group'],r['path'].lower()))
+              review_counts=Counter(x['classification'] for x in leads)
+              output={'schema':1,'tool':'WFC02R1_READ_ONLY_ARCHIVE_TRIAGE','wfc01_audit_run_id':RUN_ID,
+                  'wfc01_audit_sha':base,'current_head':head,'cosmetic_pre_rename_baseline':baseline,
+                  'workflow_count':len(rows),'counts':dict(counts),'groups':dict(all_groups),'review_count':len(leads),
+                  'archive_authorized_count':0,'items':rows}
+              OUT.mkdir(parents=True,exist_ok=True)
+              (OUT/'WFC02_Archive_Triage.json').write_text(json.dumps(output,indent=2)+'\n')
+              with (OUT/'WFC02_All_Workflows.csv').open('w',newline='') as f:
+                  w=csv.DictWriter(f,fieldnames=list(rows[0]));w.writeheader();w.writerows(rows)
+              with (OUT/'WFC02_Manual_Review_Leads.csv').open('w',newline='') as f:
+                  w=csv.DictWriter(f,fieldnames=list(rows[0]));w.writeheader();w.writerows(leads)
+              md=['# LOG WFC02R1 — Read-only archival triage','',
+                  '**No files moved, archived, changed, deleted, or authorized for archival.**',
+                  '',f'- WFC01 audit run ID: `{RUN_ID}`',f'- WFC01 base commit: `{base}`',
+                  f'- Current commit: `{head}`', f'- Pre-rename baseline: `{baseline or "NOT FOUND — HOLD"}`',
+                  f'- Workflows from WFC01: **{len(rows)}**',f'- Advisory review leads: **{len(leads)}**',
+                  '- Archive-authorized workflows: **0** (owner and dependency review required)',
+                  '', '## Review category counts','']
+              md.extend(f'- {c}: **{review_counts[c]}**' for c in sorted(review_counts))
+              md.extend(['','## Current group counts',''])
+              md.extend(f'- {n:02d} — {GROUP_NAMES[n]}: **{all_groups.get(n,0)}**' for n in range(1,6))
+              md.extend(['','## Cautions','',
+                  '- A cosmetic-only GitHub Actions display-name edit is *not* proof of recent substantive work.',
+                  '- A workflow_run, schedule, write-capability, recent run, frozen evidence marker, or repository reference is a protective hold, not a reason to delete.',
+                  '- Prior revisions can contain distinct snapshots; newer revision number alone is not permission to archive.',
+                  '- Any file changed after the WFC01 audit stays protected; rerun the audit before approval.',
+                  '- References are static and cannot rule out dynamic or external callers.',
+                  '', '## Advisory review leads (not automatically safe to archive)','',
+                  '| Group | Workflow | Reason | Risk | Recent run | Pre-rename change |',
+                  '|---|---|---|---|---|---|'])
+              for item in leads[:120]:
+                  md.append(f'| {item["group"]:02d} | `{Path(item["path"]).name}` | {item["classification"]} | {item["safety_risk"]} | {"Yes" if item["audit_recent_run"] else "No"} | {item["previous_substantive_edit_utc"][:10]} |')
+              md.extend(['','## Next action','',
+                  'Review each proposed workflow and its purpose, external callers, scheduled/production connections, and history. '
+                  'Do not use WFC01 `ARCHIVE_APPROVED` with its current zero-candidate manifest. '
+                  'If any workflow is approved later, a separate exact-path, pinned-manifest archival proposal must be generated.', ''])
+              (OUT/'WFC02_Archive_Triage_Report.md').write_text('\n'.join(md)+'\n')
+              for line in md[:22]:print(line)
+              summary_path=os.environ.get('GITHUB_STEP_SUMMARY')
+              if summary_path:
+                  with open(summary_path,'a') as f:f.write('\n'.join(md[:25])+'\n')
+
+          if __name__=='__main__':
+              try:triage()
+              except Exception as e:
+                  print(f'WFC02R1 blocked safely: {type(e).__name__}: {e}',file=sys.stderr)
+                  raise
+          PY_WFC02R1_ENGINE
+      - name: Produce read-only review queue
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          TRIAGE_WFC01_RUN_ID: ${{ inputs.wfc01_audit_run_id }}
+          TRIAGE_OUTPUT: ${{ runner.temp }}/wfc02-results
+        run: |
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/log_wfc02_triage.py"
+      - name: Upload read-only triage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LOG-WFC02R1-Archive-Triage-Read-Only
+          path: ${{ runner.temp }}/wfc02-results/
+          if-no-files-found: warn
+          retention-days: 60
