@@ -1,0 +1,327 @@
+# WFC04R1: Bulk archive review of exactly 63 hand-curated, single-use workflow files.
+# Based on WFC01 and WFC02 audit data. Frozen studies, active weekly pipelines and publication workflows excluded.
+# Default preview leaves GitHub unchanged. Apply requires SHA/digest pins and existing LOG_WORKFLOW_WRITE_TOKEN.
+name: '01 | DATA & REFRESH | WFC04R1 Bulk Legacy Workflow Archive (Preview / Apply)'
+run-name: 'WFC04R1 ${{ inputs.mode }} - 63 legacy workflow candidates'
+'on':
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Run preview first; apply only after reviewing the exact report and pins.'
+        type: choice
+        required: true
+        default: preview
+        options:
+          - preview
+          - apply
+      approved_commit_sha:
+        description: 'Apply only: exact git HEAD from green preview'
+        type: string
+        required: false
+      approved_manifest_sha256:
+        description: 'Apply only: SHA256 digest from green preview'
+        type: string
+        required: false
+      approval_phrase:
+        description: 'Apply only: ARCHIVE REVIEWED LEGACY BATCH'
+        type: string
+        required: false
+permissions:
+  contents: write
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+jobs:
+  bulk_archive:
+    name: 'Preview 63 or archive only verified reviewed files'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Require workflow-scoped PAT if applying
+        if: ${{ inputs.mode == 'apply' }}
+        shell: bash
+        env:
+          WRITE_TOKEN: ${{ secrets.LOG_WORKFLOW_WRITE_TOKEN }}
+        run: |
+          test -n "$WRITE_TOKEN" || { echo '::error::Missing secret LOG_WORKFLOW_WRITE_TOKEN'; exit 1; }
+      - name: Check out main with approved credentials
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ inputs.mode == 'apply' && secrets.LOG_WORKFLOW_WRITE_TOKEN || github.token }}
+      - name: Install pinned YAML reader
+        run: python3 -m pip install --quiet PyYAML==6.0.2
+      - name: Materialize fixed-roster archive engine
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/wfc04_engine.py" <<'PY_WFC04_R1'
+          #!/usr/bin/env python3
+          """WFC04R1 bulk archive preview/apply. Candidate roster is exact and fixed.
+          Only byte-identical, manually triggered workflows with zero tracked live references can move.
+          No data or history deletion. Requires pinned SHA, manifest SHA and scoped workflow PAT on apply.
+          """
+          from __future__ import annotations
+          import csv, datetime as dt, hashlib, json, os, re, subprocess
+          from pathlib import Path
+          import yaml
+          
+          REPO = 'ajknoll23-code/LOG-Trade-Calculator'
+          ROOT = Path('.github/workflows')
+          ARCHIVE = Path('.github/workflow-archive/cleanup-workflows/WFC04-bulk-wave1-2026-11-14')
+          RECEIPT = Path('.github/workflow-archive/cleanup-manifests/WFC04-bulk-wave1-2026-11-14-receipt.json')
+          SELF = '.github/workflows/A-WFC04R1-Bulk-Legacy-Archive-Preview-Apply.yml'
+          APPROVAL = 'ARCHIVE REVIEWED LEGACY BATCH'
+          MODE = os.getenv('WFC04_MODE','preview').strip().lower()
+          OUT = Path(os.getenv('WFC04_OUTPUT','/tmp/wfc04-bulk-results'))
+          # source filename: (group, exact byte SHA256 from WFC01's green 280-file audit)
+          TARGETS = {
+              'A-FA01R1(1).yml': (4, 'aaafbc55ff934ce754135e62f27753730412158aee6b9e66557dd904c05ba11e'),
+              'A-FA02R1-Sleeper-Repair.yml': (4, '6df6b33218fd5c72d4ba7d741482196f0bf854404422b799e03c75e39aec6476'),
+              'A-FA03R1-IDP-Waiver-Intelligence.yml': (4, 'b3646f721fddf8fa47b7ab95bc071cffdd624cd0ad24d14e55e50a6cfcb3be8b'),
+              'A-FA04R1.yml': (4, '631bafd2e7eb0282dc5e1966653add8da7f1222eb9ddfdf03958c6f000babfc5'),
+              'A-FA04R2-CSV-Line-Ending-Fix-v2.yml': (4, 'e1e335f0fb71ab4f13fa227ea4b5e0a95cbde3acba6ce9880e8c01f182462f42'),
+              'A-FA05R1-IDP-Dashboard-Preview-v2.yml': (4, '138ed1339f93aa472d5ab505d4c56b7a48d89e7db0e5dda431918611e9cedcf9'),
+              'A-FA05R1.yml': (4, '138ed1339f93aa472d5ab505d4c56b7a48d89e7db0e5dda431918611e9cedcf9'),
+              'A-FA06R1-IDP-Early-Opportunity-Lab.yml': (4, 'b50f0c38b8bb58187bf9d56faaffdd27f7f792df7e58fcfd7da6ed35ef2f4ca9'),
+              'A-FA07R1.yml': (4, '4fe06755d6c2118da256c5326ea66dbe0b55c768baf7b286fd4f09cbf2d47d4a'),
+              'A-FA09R1-Free-Agent-Board-Workspace-Redesign.yml': (4, '30f650862088c69077289f9e2fad6aa62aea1674e44471b22efd800fa0c338fc'),
+              'A-FA10R1-Free-Agent-Mobile-Readability-Polish(1).yml': (4, 'e3724b4ca8554a60350f7a34b5f006b6983132d01974fbcb1d469627a4634c2a'),
+              'A-FA11R1-StartSit-v2.yml': (4, '7882119bf1984b88adb11419b9f5304dcc6f0fb851a800d6c2497a56db874e3c'),
+              'A-FA12R1-StartSit-AutoLoad-Private(1).yml': (4, 'd23d0ca786d6ca4f804e1c1c1126fedf750caaa5339dee1255c91b39a7919c8b'),
+              'A-FA13R1-LOG-DB-DL-Start-Sit-Fix.yml': (4, 'ddc58cde16cfcb82aaebf91b0c711c5825fceceec231d46749a6aa6076bbd095'),
+              'A-FA17R1-StartSit-FourSignal-Compact.yml': (4, 'e46518b9290829dd27c2b8641fc9f69985f8cc45d47b36ffc12557903c391375'),
+              'A-NL11R1.yml': (5, 'ffbb87460d7e70c798a8b4e8460f14ff29760a4d7ba95f36ec6d2b7ac5a3cffb'),
+              'A-NL12R1.yml': (5, '2ff7c8a034e0c02beaed5344cc98a0a6cd5802abdae2469ab08c495419cc068c'),
+              'A-NL13R2.yml': (5, 'b607c9f3a789587ae8d1af304dd564e6ea8bbfb31d462e2741804bb2202c5cf8'),
+              'A-NL14R1.yml': (5, '15c1a8b455f74c2d63c5dd35844b04201ad97595e255b627010f16eed427813a'),
+              'A-NL16R1.yml': (5, '51b3544d37e00b5464eb1b7005234e79046ea821a14283991397b3b2da891891'),
+              'A-NL17R1.yml': (5, '0be84cfa7d7e014b4e453d5dcc93986373a86dd657ad86e92f2d912af64c1023'),
+              'A-NL18R2.yml': (5, 'b3a38d2ceeb8aa803cffe239877be557a3d6701236f5f30fe846dd5a09d64216'),
+              'A-NL19R1-NEW.yml': (5, 'd561a773f12bd68c2a0e1f9d1a473703d2e559a9ac10a38582858c5fe21d3093'),
+              'A-NL24R1-Editorial-Depth-Shadow.yml': (5, '9022e535f55555ab4cf878519570ec6064be221109175eeaa37fd3e06217b215'),
+              'A-NL25R1-Premium-Editorial-Shadow.yml': (5, '2e4cb1c1f2fb4d0cd830aafdbc3353c3aeea56e51537bbb56621c93547d99213'),
+              'A-NL26R1-Premium-Editorial-Polish.yml': (5, '402afa70c69f80c5d4374b4f2f7077a845ed0ee710b267bd49a2fab9084bc55f'),
+              'A-NL26R2-Overflow-Repair.yml': (5, '02f865e1cf01cdf36378eacaa0ae0a507042e2e42d05bedd8bca986974d07438'),
+              'A-NL26R3-Editorial-Pagination-Fix.yml': (5, '6cbc41161f555f0d9bf1ae1e93282b0ce6822c24d10de6eda316b261653d6913'),
+              'A-NL28R1-LOG-55-15-30-Editorial-Upgrade.yml': (5, '1af66792fddb802e95e55af2a7b2a4c2b56d86dbd76b277fd5cb8a63b18a7e37'),
+              'A-NL28R2-PATCHED.yml': (5, 'f35430226224848043689e6f8f146308a037bfc1f9e08d4cd2453bb4cd5809d6'),
+              'A-NL29R1.yml': (5, '3f8ec881063f124f216ef06f1c356d3374f63d46adef153264974d5a3886cd8b'),
+              'A-NL30R1.yml': (5, '384ae68781323f2e80fcf3c0da2880807e24703fd9e7f675a15bc28d83151862'),
+              'A-NL30R2-Editorial-Patch.yml': (5, '4e4be83ddab120cb6fcdbc451be6b7684589160a8509c9657f849227069f60ee'),
+              'A-NL30R3-Player-Fact-Gate-Repair.yml': (5, 'cad68de4cffb967be092a700c2be0ee9116b2e73b7c106970f964f847ad2ab3d'),
+              'A-NL30R4-Editorial-Fix.yml': (5, '49d92511a9b29384a742b371a6579e55c34553518d285f476d20ea17e30bd101'),
+              'A-NL30R5.yml': (5, 'd69bcb5abf152bc1d31ac1e859e9cff517c51a10babfff7108365b6e2a830c4d'),
+              'A-NL31R1.yml': (5, '17f335dfea7ad5eedf2a6fcb6fbde52ff536bfdd253cc60da38c9caf1997adf3'),
+              'A-NL31R2-Turning-Point-Repair.yml': (5, '4507dc1508a4fef8cde1006a23db0808ca434dca387a59a1c683732a844f73d4'),
+              'A-NL32R1.yml': (5, '08f2f6e5996725f45404d75f02a476958313ce0e940db6dc7c9dd256d296f9fd'),
+              'A-NL32R2(1).yml': (5, '5b62c7b7e665d4a20dac8db2ea4bdc6c069f91e05fcc6bbe0f4a5e3a3d100927'),
+              'A-NL32R3(1).yml': (5, 'dcfc07bf523095e244b9fabb604071ba3f6bc64f3b265705c9365d563692e037'),
+              'A-NL33R1.yml': (5, 'f592a4bf5aeb0f55dc49e18336ed8afd47886319c3e4bee2d1aba63afb172d87'),
+              'A-NL34R1.yml': (5, 'a54536f43fb11a5b909fe55f17d70bfb3a6a9a3c6a861defbcda25ac013ea83d'),
+              'A-NL35R1.yml': (5, '5fd1b99a70beceadf3b76ba8a02722cea5ce2f2e1c0594a9a2ae677c0e137cfe'),
+              'A-NL35R2.yml': (5, 'c88c6edcbb732565d8997630391609f386059c82a5d60ee14bcb1a8b4cb13f3a'),
+              'A-NL38R1-Readable-Hybrid-v2.yml': (5, 'e65b9a253f06f964fe0b3b58c15a026f8a43069cfc9d099845f767b098826de8'),
+              'A-NL38R2-Adaptive-Pagination-Shadow(1).yml': (5, 'ba76446bca615771b4ce93218530ad43288191c1e8875f3c32039622868185d6'),
+              'A-NL40R1-Power-Rankings-H2H-Median-Shadow.yml': (5, '119c1472f91c7dd14e84fe05376e4fe4b24711ee49245d76a735eaf870dc6d25'),
+              'A-NL41R1-Power-Ranking-V1-vs-V2-Backtest.yml': (5, '005c70b76163606932e0368dedf0c092bcd20f6a74d9225158e90d52b62fae6a'),
+              'A-NL42R1-Power-Ranking-Comparison-Renamed.yml': (5, '55463608362e0ae5c9ff902983876885a5b137427959cdba479715d4b043e875'),
+              'A-NL43R1-Eight-Formula-Power-Rankings-ReadOnly(1).yml': (5, 'dffd081388fbffd0f5d7c185a080c02fcaf8c7bc84b767976aac33f4beb69e80'),
+              'A-NL46R2-Streamlined-Offense-IDP-Leaderboards.yml': (5, '6ba5f52ba4ae27eda88674fb40ec02969a1d9e4ce1f122b4e48d3cca8c3b661f'),
+              'A-NL48R1-Week9-Editorial-Closers-Repair.yml': (5, 'a3fd2ce01a351db90601efc6aeec8a77691cc6b96598238f5afd2d8e456e230f'),
+              'A-NL48R2-YAML-Safe-Editorial-Repair.yml': (5, 'b395e4a1a613b18bec16c56e5cdb192cea8769d64f623ae15c34e025f2be2c92'),
+              'A-NL48R3-Export-Verified-NL36.yml': (5, '0016a55ebf9f00b9f467875545010d0c3921b68a559fcf316bee879c8d4b2ecf'),
+              'A-NL48R4-Direct-NL36-Export-Fixed(1).yml': (5, 'e101f44f94c0ef1de2e617ba3a71c91852c14a4c249fc4bdcdcca64010dada88'),
+              'A-NL54R1-Historical-Originality-Preview.yml': (5, '19f22cacd921da68c00aead93ec8c507c0b71dc093f5e1a27a268ffa726fa2bf'),
+              'A-NL55R1-Historical-Originality-Gate-Preview.yml': (5, '7d45347c05ace4196969fea5aa3f267e62c2eed4a9d9864d49421620de4df718'),
+              'A-NL56R1-NL47-Release-Identity-Preview.yml': (5, '4a90501ca842c0846a4c15e9211d8c96f7cbeb26e355749155fdb994ba78e955'),
+              'A-NL60R1-Approved-Editorial-Identity-Gate-PREVIEW(1).yml': (5, '580222312ae3319ac03692a9e384b2d2d6a064bdaca917580e56465e017acfdb'),
+              'A-NL62R1-Protected-Editorial-Integration-PREVIEW.yml': (5, '3552dbd0b5cb7faf69ed5462a41cad0ace9d2410b4da633c9d1c2ab3362e3cf9'),
+              'A-WF02R1-Five-Group-Workflow-Organizer(1).yml': (1, 'f3c75bcc6e301b584b2337eb2db8cb6a53065fc7574f083dbed8db023cfdce79'),
+              'A-WF02R2-Five-Group-Workflow-Safe-Apply.yml': (1, 'bb1d7ca044e9147f224106fbad9c5b591c7115163cde3ad6a5fb57a71d3b8f2a'),
+          }
+          LABELS = {1:'01-data-refresh',4:'04-team-free-agent',5:'05-newsletter'}
+          
+          
+          def cmd(*parts):
+              result = subprocess.run(parts, capture_output=True, text=True)
+              if result.returncode:
+                  raise RuntimeError(f'Git command failed: {parts!r}: {(result.stderr or result.stdout)[:1200]}')
+              return result.stdout.strip()
+          
+          
+          def sha(blob):
+              return hashlib.sha256(blob).hexdigest()
+          
+          
+          def jbytes(obj):
+              return (json.dumps(obj, sort_keys=True, separators=(',',':'))+'\n').encode()
+          
+          
+          def events(blob):
+              doc=yaml.safe_load(blob.decode('utf-8-sig'))
+              if not isinstance(doc,dict): return []
+              value=doc.get('on',doc.get(True))  # PyYAML treats unquoted `on` as true
+              if isinstance(value,dict): return sorted(map(str,value.keys()))
+              if isinstance(value,list): return sorted(map(str,value))
+              return []
+          
+          
+          def main():
+              assert MODE in ('preview','apply'), 'Unknown execution mode'
+              assert os.getenv('GITHUB_REPOSITORY',REPO)==REPO, 'Wrong repository'
+              assert ROOT.is_dir(), 'Not inside a GitHub workflow checkout'
+              assert cmd('git','branch','--show-current')=='main', 'Must check out main'
+              assert not cmd('git','status','--porcelain'), 'Initial checkout is dirty'
+              assert len(TARGETS)==63, 'Candidate roster modified; refuse to run'
+              assert all(g in LABELS for g,_ in TARGETS.values()), 'Unexpected group'
+              head=cmd('git','rev-parse','HEAD')
+              assert not RECEIPT.exists(), 'This wave already has a receipt; do not repeat'
+              records=[]
+              for filename,(group,pinned_sha) in sorted(TARGETS.items()):
+                  src=str(ROOT/filename)
+                  dest=str(ARCHIVE/LABELS[group]/filename)
+                  holds=[]
+                  data=b''
+                  if not (ROOT/filename).is_file(): holds.append('SOURCE_MISSING')
+                  elif Path(dest).exists(): holds.append('DESTINATION_ALREADY_EXISTS')
+                  else:
+                      data=Path(src).read_bytes()
+                      if sha(data)!=pinned_sha: holds.append('SOURCE_SHA_CHANGED_SINCE_WFC01')
+                      try: ev=events(data)
+                      except Exception as exc: ev=[];holds.append('YAML_NOT_PARSEABLE_'+type(exc).__name__)
+                      if ev!=['workflow_dispatch']: holds.append('NOT_MANUAL_ONLY')
+                  display_name = None
+                  if data:
+                      try:
+                          parsed=yaml.safe_load(data.decode('utf-8-sig'))
+                          display_name=parsed.get('name') if isinstance(parsed,dict) else None
+                      except Exception:
+                          pass
+                  records.append({'file':filename,'source':src,'destination':dest,'group':group,
+                                  'sha256':pinned_sha,'events':events(data) if data else [],
+                                  'display_name':display_name,'holds':holds})
+              # Examine all other tracked nonarchive repo files, exactly as WFC01's dependency audit did.
+              # Own workflow holds the source name allowlist; exclude it, otherwise self-references misclassify.
+              tracked=[x for x in cmd('git','ls-files','-z').split('\0') if x]
+              excluded={r['source'] for r in records}|{SELF}
+              scanned=0
+              keys=[(r,r['source'].encode(),r['file'].encode()) for r in records]
+              for path in tracked:
+                  if path in excluded or path.startswith('.github/workflow-archive/'):
+                      continue
+                  try: raw=Path(path).read_bytes()
+                  except OSError as exc:
+                      raise AssertionError(f'Incomplete reference scan. Source {path}: {exc}')
+                  scanned+=1
+                  for r,full,base in keys:
+                      if full in raw or base in raw:
+                          r['holds'].append('TRACKED_REFERENCE_FROM:'+path)
+                      if (path.startswith('.github/workflows/')
+                              and re.search(rb'(?m)^\s*workflow_run\s*:',raw)
+                              and r['display_name']
+                              and str(r['display_name']).encode() in raw):
+                          r['holds'].append('WORKFLOW_RUN_NAME_REFERENCE_FROM:'+path)
+              for r in records:
+                  r['holds']=sorted(set(r['holds']))
+                  r['status']='READY_FOR_OWNER_APPROVAL' if not r['holds'] else 'HOLD_UNTOUCHED'
+              ready=[r for r in records if not r['holds']]
+              held=[r for r in records if r['holds']]
+              counts={label:sum(r['group']==n and not r['holds'] for r in records) for n,label in LABELS.items()}
+              manifest={'schema':1,'tool':'WFC04R1','repo':REPO,'commit':head,
+                        'candidate_roster_size':63,'ready_count':len(ready),'held_count':len(held),
+                        'tracked_reference_sources_scanned':scanned,
+                        'target_records':records,
+                        'archive_root':str(ARCHIVE),'receipt':str(RECEIPT)}
+              digest=sha(jbytes(manifest))
+              OUT.mkdir(parents=True,exist_ok=True)
+              (OUT/'WFC04R1-bulk-manifest.json').write_bytes(jbytes(manifest))
+              report=[
+                  '# WFC04R1 — Bulk legacy workflow archival',
+                  '',
+                  '**Preview is read-only; no source workflow has been archived yet.**' if MODE=='preview' else '**Apply requested: approved ready targets only.**',
+                  '',
+                  f'- Mode: **{MODE}**',f'- Head commit: `{head}`',
+                  f'- Approval manifest SHA256: `{digest}`',
+                  f'- Explicit candidates: **{len(records)}**',
+                  f'- Eligible for approval: **{len(ready)}**',
+                  f'- Held, not moved: **{len(held)}**',
+                  f'- Other tracked repo files searched for references: **{scanned}**',
+                  '', '## Eligible by group', '',
+              ]
+              report += [f'- {LABELS[g]}: **{counts[LABELS[g]]}**' for g in [1,4,5]]
+              report += ['', '## Target disposition', '',
+                         '| Workflow | Group | Status | Hold reason |', '|---|---|---|---|']
+              for r in records:
+                  report.append(f"| `{r['file']}` | {r['group']:02d} | {r['status']} | {', '.join(r['holds']) or 'manual only, WFC01 SHA pinned, no tracked references'} |")
+              report += ['', '## Safeguards', '',
+                         '- Exact 63-name allowlist, SHA256 pinned to green WFC01 audit',
+                         '- No schedules, workflow_run triggers, or automated events; manual dispatch only',
+                         '- Tracked repo file references and workflow_run display-name dependencies trigger holds; dynamic external callers cannot be proven absent',
+                         '- CAL26, QF, B studies, production newsletter and newer waiver jobs are OUT OF SCOPE',
+                         '- All archived source bytes are preserved via git mv in the repository, with receipts',
+                         '- Apply needs approval of the exact preview SHA and digest plus the existing scoped PAT',
+                         '- A modified file or changed repo commit prevents stale approval reuse',
+                         '']
+              (OUT/'WFC04R1-bulk-preview-report.md').write_text('\n'.join(report),encoding='utf8')
+              with (OUT/'WFC04R1-bulk-review.csv').open('w',newline='',encoding='utf8') as f:
+                  writer=csv.DictWriter(f,fieldnames=['file','group','status','holds','sha256','source','destination'])
+                  writer.writeheader()
+                  writer.writerows({k:(';'.join(v) if isinstance(v,list) else v) for k,v in r.items() if k in writer.fieldnames} for r in records)
+              summary=os.getenv('GITHUB_STEP_SUMMARY')
+              if summary:
+                  with open(summary,'a') as f: f.write('\n'.join(report[:20])+'\n\nSee artifact for full 63-file review roster.\n')
+              print('\n'.join(report[:20]))
+              if MODE=='preview':
+                  print('PREVIEW GREEN — no workflow file touched')
+                  return
+              assert os.getenv('WFC04_APPROVAL','')==APPROVAL, 'Approval phrase missing/mismatched'
+              assert os.getenv('WFC04_APPROVED_SHA','')==head, 'Main SHA differs from reviewed preview; rerun preview'
+              assert os.getenv('WFC04_APPROVED_DIGEST','')==digest, 'Candidate manifest digest differs; rerun preview'
+              assert os.getenv('WFC04_TOKEN_PRESENT','false')=='true', 'Workflow-writing secret missing'
+              assert len(ready)>=25, f'Only {len(ready)} passed safety checks; abort bulk apply'
+              for r in ready:
+                  dest=Path(r['destination']);dest.parent.mkdir(parents=True,exist_ok=True)
+                  cmd('git','mv','--',r['source'],r['destination'])
+                  assert not Path(r['source']).exists(), 'Original workflow still exists after git mv'
+                  assert sha(dest.read_bytes())==r['sha256'], 'Archived content unexpectedly changed'
+              RECEIPT.parent.mkdir(parents=True,exist_ok=True)
+              receipt={'schema':1,'operation':'GIT_MOVE_BYTE_IDENTICAL_NO_DELETE',
+                       'head_before':head,'manifest_sha256':digest,
+                       'archived_files':ready,'held_files':held,
+                       'archived_at_utc':dt.datetime.now(dt.timezone.utc).isoformat()}
+              RECEIPT.write_text(json.dumps(receipt,sort_keys=True,indent=2)+'\n',encoding='utf8')
+              cmd('git','add','--',str(RECEIPT))
+              actual=set(cmd('git','diff','--cached','--name-only','--no-renames').splitlines())
+              expected={str(RECEIPT)} | {r['source'] for r in ready}|{r['destination'] for r in ready}
+              assert actual==expected, f'Unexpected staged paths: {sorted(actual.symmetric_difference(expected))}'
+              cmd('git','diff','--cached','--check')
+              cmd('git','config','user.name','github-actions[bot]')
+              cmd('git','config','user.email','41898282+github-actions[bot]@users.noreply.github.com')
+              cmd('git','commit','-m',f'chore: archive {len(ready)} reviewed, superseded manual workflows')
+              cmd('git','push','origin','HEAD:main')
+              print(f'APPLY PASS — {len(ready)} byte-identical workflow files archived; {len(held)} held; production files untouched')
+          
+          
+          if __name__=='__main__': main()
+          PY_WFC04_R1
+      - name: Preview / apply approved bulk archival plan
+        shell: bash
+        env:
+          WFC04_MODE: ${{ inputs.mode }}
+          WFC04_APPROVED_SHA: ${{ inputs.approved_commit_sha }}
+          WFC04_APPROVED_DIGEST: ${{ inputs.approved_manifest_sha256 }}
+          WFC04_APPROVAL: ${{ inputs.approval_phrase }}
+          WFC04_TOKEN_PRESENT: ${{ inputs.mode == 'apply' && secrets.LOG_WORKFLOW_WRITE_TOKEN != '' }}
+          WFC04_OUTPUT: ${{ runner.temp }}/wfc04-results
+        run: |
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/wfc04_engine.py"
+      - name: Publish review manifest and archive receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LOG-WFC04R1-Bulk-Archive-Preview-Apply
+          path: ${{ runner.temp }}/wfc04-results/
+          if-no-files-found: warn
+          retention-days: 60
