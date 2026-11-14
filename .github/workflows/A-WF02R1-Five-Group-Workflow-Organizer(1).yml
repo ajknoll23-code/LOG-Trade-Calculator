@@ -1,0 +1,238 @@
+name: '01 | DATA & REFRESH | WF02 Five-Group Workflow Organizer'
+run-name: 'WF02 ${{ inputs.mode }} - five workflow groups'
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'First run audit. Apply only after reviewing exact manifest SHA256 and current main SHA.'
+        type: choice
+        required: true
+        default: audit
+        options:
+          - audit
+          - apply
+      approved_commit_sha:
+        description: 'Apply only: main commit SHA from green audit'
+        type: string
+        required: false
+      approved_manifest_sha256:
+        description: 'Apply only: manifest SHA256 from green audit'
+        type: string
+        required: false
+      approval_phrase:
+        description: 'Apply only: enter APPLY FIVE GROUP NAMES'
+        type: string
+        required: false
+permissions:
+  contents: write
+concurrency:
+  group: trade-desk-data-writes
+  cancel-in-progress: false
+jobs:
+  organize:
+    name: 'Audit five groups and guarded display-name grouping'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout current main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Install pinned YAML reader
+        run: python3 -m pip install --quiet PyYAML==6.0.2
+      - name: Restore five-group classification engine
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/log_workflow_group_engine_v1.py" <<'PY_ENGINE_V1'
+          #!/usr/bin/env python3
+          """LOG five-group workflow name audit/apply, no file moves or archiving."""
+          from __future__ import annotations
+          import hashlib, json, os, re, subprocess, sys
+          from collections import Counter
+          from pathlib import Path
+          
+          ROOT = Path('.github/workflows')
+          OUTPUT = Path(os.environ.get('LOG_GROUP_OUTPUT','/tmp/log-workflow-five-groups'))
+          MODE = os.environ.get('LOG_GROUP_MODE','audit').lower()
+          LABELS = {
+            1:'DATA & REFRESH',
+            2:'PLAYER RESEARCH',
+            3:'VALUATION & MARKET',
+            4:'TEAM & FREE AGENTS',
+            5:'NEWSLETTERS & PUBLISHING',
+          }
+          NAME_LINE = re.compile(r'(?m)^name:[ \t]*(.*?)[ \t]*$')
+          NEW_PREFIX = re.compile(r'^\d{2}\s*\|\s*(?:DATA & REFRESH|PLAYER RESEARCH|VALUATION & MARKET|TEAM & FREE AGENTS|NEWSLETTERS & PUBLISHING)\s*\|\s*')
+          
+          
+          def run(*args):
+              result=subprocess.run(args, text=True, capture_output=True)
+              if result.returncode:
+                  raise RuntimeError(f"Command failed: {args!r}: {result.stderr[:800]}")
+              return result.stdout.strip()
+          
+          
+          def classify(name):
+              s=name.lower()
+              def match(pattern,group,why):
+                  if re.search(pattern,s): return (group,'high',why)
+              return (
+                  match(r'(^a-nl\d|^nl\d|newsletter|war.room|aftermath|editorial|power.rank)',5,'newsletter and publishing')
+                  or match(r'(^a[-_]fa\d|^fa\d|free.agent|waiver|start.?sit|schedule.utility|team.utility|lineup|optimizer|board.usage|forward.outcome)',4,'team, waiver and schedule tools')
+                  or match(r'(^cal\d|^a-cal|^a-qa|^qa\d|^qf\d|^a-rg\d|^a-v2|^a-wrme|^a03_|^log_cal|^b10|^b34|^b49-v2|^b52|^b56|^b57|market|ktc|dlf|package|trade|price|valuation|draft.pick|voter|cross.position|no.history.rookie|replacement.level)',3,'valuation, pricing and market studies')
+                  or match(r'(^a-id\d|^id\d|^b39-|^b4[678]|^b49-v1|^b53|^b54|^b55|player.role|role.engine|idp|age.curve|durability|opportunity|position.weight|research.program|^sr[45]|pearce)',2,'player models and research')
+                  or match(r'(weekly|refresh|sync|fantasypros|sleeper|capture|prekickoff|snapshot|source|data|repo.regression|^wfc|^a-b39s|^b50)',1,'data refresh and workflow operations')
+                  or (1,'review','unclear purpose from filename; manual review')
+              )
+          
+          
+          def name_field(contents):
+              m=NAME_LINE.search(contents)
+              if not m: return None
+              raw=m.group(1).strip()
+              if not raw or raw in ('|','>','|-','>-'):
+                  return None
+              if raw[0:1] in ('"', "'"):
+                  try:
+                      import yaml
+                      value=yaml.safe_load(raw)
+                      return str(value) if isinstance(value,str) else None
+                  except Exception:
+                      return None
+              return raw.split(' #',1)[0].strip()
+          
+          
+          def value_replacement(contents,new_name):
+              return NAME_LINE.sub(lambda m:'name: '+json.dumps(new_name,ensure_ascii=False),contents,count=1)
+          
+          
+          def review_hints(filename):
+              s=filename.lower()
+              h=[]
+              if re.search(r'(redownload|fresh|resend|patched|repair|shadow|preview|read.only|legacy|v1r\d{2,}|\(1\))',s):
+                  h.append('CHECK_SUPERSEDED')
+              if 'private-newsletter' in s or ('newsletter' in s and 'private' in s):
+                  h.append('CHECK_REPO_OWNERSHIP')
+              return h
+          
+          
+          def main():
+              assert MODE in ('audit','apply'), 'Invalid workflow mode'
+              assert ROOT.is_dir(), 'Not in the expected LOG repository checkout'
+              files=sorted([*ROOT.glob('*.yml'),*ROOT.glob('*.yaml')],key=lambda p:p.name.casefold())
+              assert len(files)>10, 'Unexpectedly small workflow directory: fail closed'
+              current_sha=run('git','rev-parse','HEAD')
+              raw_by_file={str(p):p.read_text(encoding='utf-8-sig') for p in files}
+              candidates=[]
+              for p in files:
+                  raw=raw_by_file[str(p)]
+                  existing_name=name_field(raw)
+                  group,confidence,why=classify(p.name)
+                  clean=NEW_PREFIX.sub('',existing_name) if existing_name else ''
+                  next_name=f'{group:02d} | {LABELS[group]} | {clean}' if clean else None
+                  safe=confidence=='high' and next_name is not None
+                  candidates.append({'path':str(p),'group':group,'label':LABELS[group],
+                      'current_name':existing_name,'proposed_name':next_name,
+                      'confidence':confidence,'purpose_inferred_from':why,
+                      'review_hints':review_hints(p.name),'eligible':safe,
+                      'change':safe and existing_name!=next_name})
+              # The digest is calculated from exact paths, blob content, and proposed display names.
+              manifest=[{'path':c['path'],'blob_sha256':hashlib.sha256(raw_by_file[c['path']].encode()).hexdigest(),
+                         'group':c['group'],'proposed_name':c['proposed_name'],
+                         'confidence':c['confidence']} for c in candidates]
+              manifest_bytes=(json.dumps(manifest,sort_keys=True,separators=(',',':'))+'\n').encode()
+              digest=hashlib.sha256(manifest_bytes).hexdigest()
+              refs=[]
+              for p,raw in raw_by_file.items():
+                  if re.search(r'(?m)^\s*workflow_run\s*:',raw):
+                      refs.append(p)
+              for c in candidates:
+                  if c['change'] and c['current_name']:
+                      dependents=[p for p,raw in raw_by_file.items() if p!=c['path'] and c['current_name'] in raw]
+                      if dependents:
+                          c['eligible']=False
+                          c['change']=False
+                          c['review_hints'].append('REFERENCED_ELSEWHERE')
+                          c['reference_paths']=dependents[:10]
+              counts=Counter(c['group'] for c in candidates)
+              eligible=sum(1 for c in candidates if c['eligible'])
+              changes=sum(1 for c in candidates if c['change'])
+              review=sum(1 for c in candidates if not c['eligible'])
+              OUTPUT.mkdir(parents=True,exist_ok=True)
+              (OUTPUT/'groups.json').write_text(json.dumps({'repo_sha':current_sha,'manifest_sha256':digest,
+                  'mode':MODE,'counts':dict(counts),'eligible':eligible,'would_change':changes,
+                  'held_for_review':review,'workflow_run_files':refs,'items':candidates},indent=2)+'\n')
+              (OUTPUT/'pinned_manifest.json').write_bytes(manifest_bytes)
+              lines=['# LOG five-group workflow inventory','',f'Git SHA: `{current_sha}`',
+                     f'Pinned manifest SHA256: `{digest}`','',
+                     f'Workflows: **{len(files)}** | Eligible: **{eligible}** | Would rename: **{changes}** | Held for review: **{review}**','',
+                     'No YAML files will be moved into subfolders. GitHub Actions requires `.github/workflows` for discovery.',
+                     'Names are grouped for sidebar organization; no workflows are archived or deleted by this organizer.','',
+                     '## Group totals','']
+              lines += [f'- **{k:02d} | {LABELS[k]}**: {counts.get(k,0)} workflows' for k in range(1,6)]
+              lines+=['','## Workflows referenced by workflow_run (review before renaming)','']
+              lines += ['- '+p for p in refs] or ['- None detected']
+              for group in range(1,6):
+                  lines += ['',f'## {group:02d} | {LABELS[group]}','',
+                            '| Workflow file | Current display name | Change | Audit note |',
+                            '|---|---|---|---|']
+                  for c in candidates:
+                      if c['group']!=group: continue
+                      flag=('RENAME' if c['change'] else ('UNCHANGED' if c['eligible'] else 'REVIEW'))
+                      hint=', '.join(c['review_hints']) or c['purpose_inferred_from']
+                      lines.append(f"| `{c['path'].split('/')[-1]}` | {str(c['current_name'] or 'MISSING').replace('|','/')} | {flag} | {hint.replace('|','/')} |")
+              (OUTPUT/'five-groups-audit.md').write_text('\n'.join(lines)+'\n')
+              summary=os.environ.get('GITHUB_STEP_SUMMARY')
+              if summary:
+                  with open(summary,'a') as fh:
+                      fh.write('\n'.join(lines[:18])+'\n\n')
+                      fh.write('Detailed per-workflow audit: download `LOG-five-groups-audit` artifact.\n')
+              print('\n'.join(lines[:18]))
+              if MODE=='apply':
+                  phrase=os.environ.get('LOG_GROUP_APPROVAL','')
+                  requested_commit=os.environ.get('LOG_GROUP_APPROVED_COMMIT','')
+                  requested_digest=os.environ.get('LOG_GROUP_APPROVED_MANIFEST','')
+                  assert phrase=='APPLY FIVE GROUP NAMES', 'Explicit owner phrase missing'
+                  assert requested_commit==current_sha, 'Audit commit no longer matches main; rerun audit'
+                  assert requested_digest==digest, 'Manifest no longer matches reviewed audit; rerun audit'
+                  # Avoid workflow name-trigger breakage until their exact reference graph is reviewed.
+                  assert not refs, 'workflow_run dependencies detected: refuse apply, see audit'
+                  assert changes>0, 'No eligible display-name changes to apply'
+                  for c in candidates:
+                      if not c['change']: continue
+                      p=Path(c['path'])
+                      p.write_text(value_replacement(raw_by_file[c['path']],c['proposed_name']),encoding='utf-8')
+                  actual=run('git','diff','--name-only').splitlines()
+                  expected=sorted(c['path'] for c in candidates if c['change'])
+                  assert sorted(actual)==expected, 'Unexpected modified path; refusing commit'
+                  run('git','diff','--check')
+                  run('git','config','user.name','github-actions[bot]')
+                  run('git','config','user.email','41898282+github-actions[bot]@users.noreply.github.com')
+                  run('git','add','--',*expected)
+                  run('git','commit','-m','chore: group GitHub Actions display names into five domains')
+                  run('git','push','origin','HEAD:main')
+                  print(f'PASS: changed {len(expected)} workflow display names; no paths moved or deleted')
+          
+          if __name__=='__main__':
+              main()
+          PY_ENGINE_V1
+      - name: Produce safe audit or apply pinned names
+        shell: bash
+        env:
+          LOG_GROUP_MODE: ${{ inputs.mode }}
+          LOG_GROUP_APPROVED_COMMIT: ${{ inputs.approved_commit_sha }}
+          LOG_GROUP_APPROVED_MANIFEST: ${{ inputs.approved_manifest_sha256 }}
+          LOG_GROUP_APPROVAL: ${{ inputs.approval_phrase }}
+          LOG_GROUP_OUTPUT: ${{ runner.temp }}/log-five-group-results
+        run: |
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/log_workflow_group_engine_v1.py"
+      - name: Upload inventory, plan and checksums
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LOG-five-groups-audit
+          path: ${{ runner.temp }}/log-five-group-results/
+          if-no-files-found: warn
+          retention-days: 30
