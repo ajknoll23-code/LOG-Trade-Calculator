@@ -453,6 +453,43 @@
         viewCount=15;render();
       }catch(e){status.textContent='FA24 paused: '+String(e.message||e);$('fa24Pulse').textContent='Research unavailable';count.textContent='No candidate recommendations shown.';}
     }
+    // FA26 read-only snapshot seam. No storage, network request, or model mutation here.
+    // The caller must initiate the local pregame capture; all candidate rows are included,
+    // not just the currently visible/paginated player cards.
+    window.LOG_FA26_READ = () => {
+      if(!results || !sourceDocs?.fa || activeWeek!==selectedWeek())return null;
+      const fa=sourceDocs.fa, sourceWeek=sourceDocs.weekly?.last_completed_week;
+      return {
+        schema_version:1, source:'FA25_FULL_POOL_EVIDENCE_AS_OF_LOCAL_CAPTURE',
+        season:2026, week:activeWeek, league_id:fa.league_id,
+        free_agent_sync_unix:fa.synced_at, fa_count:results.rows.length,
+        observed_last_completed_week:Number.isInteger(sourceWeek)?sourceWeek:null,
+        scoring:activeFourScoring||null,
+        coverage:{...results.sourceStatus},
+        candidates:results.rows.map(p=>{
+          const w=diagnose(p,'week'), d=diagnose(p,'dynasty');
+          const a=p.expert?.rankings?.idp_show,b=p.expert?.rankings?.woellert;
+          return {
+            id:p.id,name:p.name,team:p.team,group:p.group,subposition:roleOf(p),
+            age:p.age,injury:p.injury,weekly_category:w.code,weekly_order:w.order,
+            weekly_top:w.weeklyTop,weekly_disagreement:w.disagreement,
+            dynasty_category:d.code,dynasty_order:d.order,
+            macri_weekly_rank:Number.isInteger(a)?a:null,
+            woellert_weekly_rank:Number.isInteger(b)?b:null,
+            four_group_rank:p.four?.groupRank??null,
+            four_points:finite(p.four?.points)?p.four.points:null,
+            four_vor:finite(p.four?.vor)?p.four.vor:null,
+            prev_week:p.weekly?.week??null,
+            prev_snaps:finite(p.weekly?.snaps)?p.weekly.snaps:null,
+            prev_delta:finite(p.weekly?.delta)?p.weekly.delta:null,
+            usage_snaps_per_game:finite(p.usage?.snaps_per_game)?p.usage.snaps_per_game:null,
+            ros_rank:Number.isInteger(p.ros?.rank)?p.ros.rank:null,
+            ros_group:p.ros?.group??null,
+            utility_rank:p.utility,
+          };
+        }),
+      };
+    };
     $('fa24Refresh').addEventListener('click',refresh);
     for(const name of ['fa24Group','fa24Search','fa24AllAges','fa24ShowAll','fa25Category'])$(name).addEventListener(name==='fa24Search'?'input':'change',()=>{viewCount=15;render();});
     $('fa24Week').addEventListener('change',()=>{results=null;status.textContent='Week changed. Refresh sources to enforce same-week imports.';count.textContent='';out.replaceChildren();});
