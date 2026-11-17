@@ -208,7 +208,12 @@
     const ma=isTop(a,sub),wo=isTop(b,sub),ff=isFFTop(row.four);
     const weeklyTop=Number(ma)+Number(wo)+Number(ff);
     const latestWeek=row.weekly?.week===activeWeek-1;
-    const latestSnaps=latestWeek&&finite(row.weekly?.snaps)?row.weekly.snaps:null;
+    const roleEvidence=typeof window.LOG_IDP_ROLE27_READ==='function'
+      ?window.LOG_IDP_ROLE27_READ(row.id,activeWeek):null;
+    // New Week-10 results may support the next week, but are never backfilled into W10.
+    const timelyRoleRise=activeWeek===11&&roleEvidence?.role_surge===true;
+    const week10RoleSnaps=activeWeek===11&&finite(roleEvidence?.w10_snaps)?roleEvidence.w10_snaps:null;
+    const latestSnaps=week10RoleSnaps??(latestWeek&&finite(row.weekly?.snaps)?row.weekly.snaps:null);
     const seasonSnaps=finite(row.usage?.snaps_per_game)?row.usage.snaps_per_game:null;
     const roleSupported=latestSnaps!==null?latestSnaps>=40:seasonSnaps!==null&&seasonSnaps>=45;
     const roleThin=latestSnaps!==null&&latestSnaps<30;
@@ -218,6 +223,15 @@
     const projectionConflict=ff&&fullyRanked&&!ma&&!wo;
     const unavailable=/^(IR|OUT|PUP|SUSPENDED)\b/i.test(String(row.injury||''))||row.team==='FA';
     const why=[],checks=[],sources=[];
+    if(roleEvidence){
+      sources.push('Private W10 snap / alignment source');
+      if(timelyRoleRise)why.push(`W10 role opportunity: ${number(roleEvidence.w10_snap_pct)}% team snaps vs ${number(roleEvidence.season_snap_pct)}% season-to-date (+${number(roleEvidence.delta_pct_points)} pp; season includes W10)`);
+      if(roleEvidence.green_dot_status==='GREEN_DOT')why.push('Green dot in owner LB source (season-level designation; verify current role)');
+      if(roleEvidence.green_dot_status==='W10_GREEN_DOT')why.push('Green dot specifically marked Week 10 in owner source');
+      if(roleEvidence.position_disagreement)checks.push('Owner alignment role differs from Sleeper raw position: confirm eligibility');
+      if(roleEvidence.role_surge&&activeWeek>11)checks.push('Role surge comes from Week 10; this signal is stale for this analysis week');
+      if(finite(roleEvidence.w10_snap_pct)&&roleEvidence.w10_snap_pct<35&&weeklyTop>0)checks.push('Strong weekly rank versus low observed W10 participation: confirm defensive workload');
+    }
     if(row.four){sources.push('4for4');if(ff)why.push(`4for4 top-${FF_TOP[row.group]} ${row.group} weekly band (#${row.four.groupRank})`);}
     if(Number.isInteger(a)){sources.push('Macri weekly');if(ma)why.push(`Macri weekly ${sub} #${a} (top-${TOP[sub]} screening band)`);}
     if(Number.isInteger(b)){sources.push('Woellert weekly');if(wo)why.push(`Woellert weekly ${sub} #${b} (top-${TOP[sub]} screening band)`);}
@@ -248,13 +262,13 @@
       else if((weeklyTop>=1&&roleThin)||projectionConflict){[code,label,order]=['risk','Projection needs role check',4];}
       else if(weeklyTop>=2&&roleSupported){[code,label,order]=['starter','Weekly starter candidate',0];}
       else if(weeklyTop>=2||weeklyTop>=1&&roleSupported){[code,label,order]=['streamer','Weekly streaming candidate',1];}
-      else if(rise){[code,label,order]=['rise','Rising weekly opportunity',2];}
+      else if(rise||timelyRoleRise){[code,label,order]=['rise','Rising weekly opportunity',2];}
       else if(weeklyTop>=1){[code,label,order]=['single','Single weekly signal',3];}
       else if(sources.length>0){[code,label,order]=['monitor','Monitor / contextual evidence',5];}
       else {[code,label,order]=['thin','Unverified player',6];}
     }else if(unavailable){[code,label,order]=['injured','Injured stash · verify status',6];}
     else if(row.age!==null&&row.age>25){[code,label,order]=['veteran','Veteran research option',6];}
-    else if(rise){[code,label,order]=['youngrise','Young role expanding',0];}
+    else if(rise||timelyRoleRise){[code,label,order]=['youngrise','Young role expanding',0];}
     else if(row.ros){[code,label,order]=['youngros','Young ROS-backed stash',1];}
     else if(roleSupported){[code,label,order]=['youngusage','Young, observed usage',2];}
     else if(weeklyTop>0){[code,label,order]=['youngweek','Young weekly signal',3];}
@@ -400,7 +414,7 @@
         const verify=a.checks.length?a.checks.map(s=>`<li>${safe(s)}</li>`).join(''):'<li>Confirm current role, depth chart and league scoring before a transaction.</li>';
         const bullets=viewDescription(p,horizon).map(s=>`<li>${safe(s)}</li>`).join('');
         const sources=a.sources.length?a.sources.map(s=>`<span>${safe(s)}</span>`).join(''):'<span>No independently matched data</span>';
-        return `<article class="fa24-card fa25-card"><div class="fa24-cardtop"><div><strong>${safe(p.name)}</strong><small>${safe(p.team)} · ${safe(p.group)}${p.raw_position?' / '+safe(p.raw_position):''} · Age ${p.age??'unknown'}${injury}</small></div><span class="fa24-tier fa25-badge">${safe(a.label)}</span></div>
+        return `<article class="fa24-card fa25-card" data-player-id="${safe(p.id)}"><div class="fa24-cardtop"><div><strong>${safe(p.name)}</strong><small>${safe(p.team)} · ${safe(p.group)}${p.raw_position?' / '+safe(p.raw_position):''} · Age ${p.age??'unknown'}${injury}</small></div><span class="fa24-tier fa25-badge">${safe(a.label)}</span></div>
           <div class="fa25-sources">${sources}</div>
           <div class="fa25-columns"><section class="fa25-why"><h4>Why this player</h4><ul>${why}</ul></section><section class="fa25-check"><h4>${a.disagreement?'Disagreement & checks':'What to verify'}</h4><ul>${verify}</ul></section></div>
           <details class="fa25-details"><summary>Full evidence & screening rule</summary><p>${safe(a.transparentRule)}. Uncalibrated, not an add probability.</p><ul>${bullets}</ul></details>
@@ -490,6 +504,7 @@
         }),
       };
     };
+    window.addEventListener('log-idp-role-updated',()=>{viewCount=15;render();});
     $('fa24Refresh').addEventListener('click',refresh);
     for(const name of ['fa24Group','fa24Search','fa24AllAges','fa24ShowAll','fa25Category'])$(name).addEventListener(name==='fa24Search'?'input':'change',()=>{viewCount=15;render();});
     $('fa24Week').addEventListener('change',()=>{results=null;status.textContent='Week changed. Refresh sources to enforce same-week imports.';count.textContent='';out.replaceChildren();});
