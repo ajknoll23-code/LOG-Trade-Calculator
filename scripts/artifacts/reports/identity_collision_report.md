@@ -15,17 +15,17 @@ Production resolver covering QB / RB / WR / TE / DL / LB / DB.
 | WR | 203 | 201 | 99.0% | 201 | 0 |
 | TE | 130 | 129 | 99.2% | 129 | 0 |
 | DL | 177 | 174 | 98.3% | 174 | 1 |
-| LB | 159 | 157 | 98.7% | 157 | 1 |
-| DB | 202 | 197 | 97.5% | 197 | 0 |
+| LB | 160 | 158 | 98.8% | 158 | 1 |
+| DB | 201 | 196 | 97.5% | 196 | 0 |
 
 ## Match methods
 
 - `name_collision_resolved_by_position_team`: **4**
 - `name_found_position_incompatible`: **2**
-- `name_position_team_confirmed`: **1041**
+- `name_position_team_confirmed`: **1044**
 - `no_sleeper_name_candidate`: **14**
-- `previous_authoritative_stable_id_preserved`: **19**
-- `previous_authoritative_stable_id_preserved_position_changed`: **3**
+- `previous_authoritative_stable_id_preserved`: **17**
+- `previous_authoritative_stable_id_preserved_position_changed`: **2**
 
 ## Manual-review rows
 
