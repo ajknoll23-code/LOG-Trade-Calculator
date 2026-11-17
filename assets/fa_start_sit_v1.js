@@ -30,11 +30,12 @@
   let catalog=new Map(), userRoster=new Set(), selected=[], ranks=new Map(),rankNames=new Map(), loaded=false, capturedWeek=null, sourceMeta=null;
   let rosterSync=null, catalogReady=false, noRosterError=null, privateRestoreDone=false;
   root.insertAdjacentHTML('beforeend', `
-    <section id="faSsApp" class="fa-ss" aria-label="Week 10 start sit comparison">
+    <section id="faSsApp" class="fa-ss" aria-label="Weekly start sit ranking comparison">
       <div class="fa-ss-steps"><span>1 · Rankings load privately</span><span>2 · Choose 2–12 players</span><span>3 · Compare</span></div>
       <div class="fa-ss-import">
+        <label>Analysis week <select id="faSsWeek" aria-label="Weekly expert ranking snapshot"><option value="10">Week 10</option><option value="11" selected>Week 11</option><option value="12">Week 12</option><option value="13">Week 13</option><option value="14">Week 14</option><option value="15">Week 15</option><option value="16">Week 16</option><option value="17">Week 17</option><option value="18">Week 18</option></select></label>
         <div class="fa-ss-import-info"><strong>Private expert consensus</strong><small>Activates once on this browser, then automatically loads on future visits. Rankings are stored locally on this device—not posted to GitHub.</small></div>
-        <div id="faSsStatus" class="fa-ss-status" role="status">Loading LOG players and checking for your privately saved Week 10 rankings…</div>
+        <div id="faSsStatus" class="fa-ss-status" role="status">Loading LOG players and checking for privately saved rankings…</div>
         <details class="fa-ss-backup"><summary>Import / replace private ranking file</summary><label for="faSsFile">Optional JSON file fallback</label><input id="faSsFile" type="file" accept=".json,application/json"></details>
         <button type="button" id="faSsForget" class="fa-ss-forget" hidden>Forget rankings saved on this device</button>
       </div>
@@ -51,7 +52,7 @@
       <p class="fa-ss-fine">LOG lineup eligibility: S + CB can fill DB; EDGE + DT can fill DL. Expert ranks remain within each source's original subposition, so cross-subposition ordinal averages are not used. For cross-subposition decisions, Woellert's LOG linear-base point projections are a separate one-source estimate; threshold/event bonuses and current injury news require manual review. No dynasty value changes.</p>
     </section>`);
   const $=id=>root.querySelector('#'+id);
-  const ui={file:$('faSsFile'),status:$('faSsStatus'),search:$('faSsSearch'),scope:$('faSsScope'),group:$('faSsGroup'),suggestions:$('faSsSuggestions'),selected:$('faSsSelected'),count:$('faSsCount'),compare:$('faSsCompare'),clear:$('faSsClear'),results:$('faSsResults'),forget:$('faSsForget')};
+  const ui={week:$('faSsWeek'),file:$('faSsFile'),status:$('faSsStatus'),search:$('faSsSearch'),scope:$('faSsScope'),group:$('faSsGroup'),suggestions:$('faSsSuggestions'),selected:$('faSsSelected'),count:$('faSsCount'),compare:$('faSsCompare'),clear:$('faSsClear'),results:$('faSsResults'),forget:$('faSsForget')};
   const fail=(condition,message)=>{if(!condition)throw Error(message);};
   const val=(x,d=1)=>typeof x==='number'&&Number.isFinite(x)?x.toFixed(d):'—';
   const strId=x=>String(x?.player_id??'');
@@ -96,7 +97,8 @@
      its own activation. All import methods use the exact same strict validator. */
   const DB_NAME='LOG_Private_StartSit_Weekly_2026_v1';
   const STORE='snapshots';
-  const KEY='2026-W10-two-expert';
+  const KEY=week=>`2026-W${week}-two-expert`;
+  let selectedWeek=11;
   function openDB(){return new Promise((resolve,reject)=>{
     if(!window.indexedDB){reject(Error('Browser private storage unavailable'));return;}
     const req=indexedDB.open(DB_NAME,1);
@@ -105,28 +107,28 @@
     req.onsuccess=()=>resolve(req.result);
   });}
   async function privateGet(){const db=await openDB();return new Promise((resolve,reject)=>{
-    const t=db.transaction(STORE,'readonly'),req=t.objectStore(STORE).get(KEY);
+    const t=db.transaction(STORE,'readonly'),req=t.objectStore(STORE).get(KEY(selectedWeek));
     req.onsuccess=()=>resolve(req.result??null);
     req.onerror=()=>reject(req.error||Error('Cannot read private store'));
     t.oncomplete=()=>db.close();
   });}
   async function privatePut(data){const db=await openDB();return new Promise((resolve,reject)=>{
-    const t=db.transaction(STORE,'readwrite'); t.objectStore(STORE).put(data,KEY);
+    const t=db.transaction(STORE,'readwrite'); t.objectStore(STORE).put(data,KEY(data.week));
     t.oncomplete=()=>{db.close();resolve();};
     t.onerror=()=>{db.close();reject(t.error||Error('Cannot save private ranks'));};
   });}
   async function privateDelete(){const db=await openDB();return new Promise((resolve,reject)=>{
-    const t=db.transaction(STORE,'readwrite');t.objectStore(STORE).delete(KEY);
+    const t=db.transaction(STORE,'readwrite');t.objectStore(STORE).delete(KEY(selectedWeek));
     t.oncomplete=()=>{db.close();resolve();};
     t.onerror=()=>{db.close();reject(t.error||Error('Cannot erase private ranks'));};
   });}
   function acceptRanks(doc,from){
     const candidate=validSnap(doc),coverage=[...candidate.values()].filter(r=>r.rankings.idp_show!==null&&r.rankings.woellert!==null).length;
-    ranks=candidate;rankNames=new Map();
+    selectedWeek=doc.week;ui.week.value=String(doc.week);ranks=candidate;rankNames=new Map();
     for(const row of ranks.values()){const k=key(row.name);if(!rankNames.has(k))rankNames.set(k,[]);rankNames.get(k).push(row);}
     capturedWeek=doc.week;sourceMeta=doc.source_coverage;loaded=true;
     ui.status.classList.remove('fa-ss-error');
-    ui.status.textContent=`Week ${capturedWeek} private consensus ${from}: ${candidate.size} ranked players (${coverage} with both experts). Compare 2–12 players below. Data is not hosted in GitHub.`;
+    ui.status.textContent=`Week ${capturedWeek} private expert rankings ${from}: ${candidate.size} ranked players (${coverage} with both experts). Compare 2–12 players below. Data is not hosted in GitHub.`;
     ui.forget.hidden=false;
     refresh();
   }
@@ -162,7 +164,7 @@
       if(saved){acceptRanks(saved,'restored automatically');privateRestoreDone=true;return;}
     }catch(err){console.info('LOG Start/Sit: private browser storage is unavailable; file fallback remains available.');}
     privateRestoreDone=true;
-    ui.status.textContent=`Activate your private Week 10 consensus once using the personal activation page; it will load automatically on subsequent visits on this device. You can also use the optional JSON fallback.`;
+    ui.status.textContent=`No Week ${selectedWeek} rankings installed on this device. Import the private weekly JSON file below. Previously saved weeks stay available through the selector.`;
   }
   function getRank(p){
     const matches=rankNames.get(key(p.name))||[];
@@ -209,7 +211,7 @@
     ui.count.textContent=`${selected.length} / ${maxPick}`;
     ui.selected.innerHTML=selected.length?selected.map(id=>{
       const p=catalog.get(id),r=present(p);
-      const label=r?`${lineupSlot(r.group)} slot · ${r.group} ranks · ${r.rankings.idp_show===null?'IDP Show —':'IDP Show #'+r.rankings.idp_show} · ${r.rankings.woellert===null?'Woellert —':'Woellert #'+r.rankings.woellert}`:'No Week 10 rank in supplied screenshots';
+      const label=r?`${lineupSlot(r.group)} slot · ${r.group} ranks · ${r.rankings.idp_show===null?'IDP Show —':'IDP Show #'+r.rankings.idp_show} · ${r.rankings.woellert===null?'Woellert —':'Woellert #'+r.rankings.woellert}`:`No Week ${selectedWeek} rank in private rankings`;
       return `<div class="fa-ss-chip"><span><strong>${escape(p.name)}</strong><small>${escape(poolStatus(p))} · ${escape(label)}</small></span><button type="button" data-remove-id="${escape(id)}" aria-label="Remove ${escape(p.name)}">Remove</button></div>`;
     }).join(''):'<p class="fa-ss-empty">Choose any 2–12 players. Your roster and free agents are both supported.</p>';
     ui.selected.querySelectorAll('[data-remove-id]').forEach(b=>b.addEventListener('click',()=>remove(b.dataset.removeId)));
@@ -351,13 +353,25 @@
     }catch(e){ui.status.textContent='Private ranking import rejected: '+String(e.message||e);ui.status.classList.add('fa-ss-error');}
     ui.file.value='';
   });
+  ui.week.addEventListener('change',async()=>{
+    const w=Number(ui.week.value);
+    if(!Number.isInteger(w)||w<10||w>18)return;
+    selectedWeek=w; ranks.clear();rankNames.clear();capturedWeek=null;sourceMeta=null;loaded=false; selected=[];
+    ui.forget.hidden=true;ui.results.replaceChildren();ui.status.classList.remove('fa-ss-error');
+    try{
+      const saved=await privateGet();
+      if(saved){fail(saved.week===w,'Saved week does not match selection');acceptRanks(saved,'restored for selected week');}
+      else ui.status.textContent=`No Week ${w} rankings installed. Import that week's private JSON file below; other weeks remain saved.`;
+    }catch(e){ui.status.classList.add('fa-ss-error');ui.status.textContent=`Could not read Week ${w} rankings: `+String(e.message||e);}
+    refresh();
+  });
   ui.search.addEventListener('input',showMatches);
   ui.scope.addEventListener('change',showMatches);
   ui.group.addEventListener('change',showMatches);
   ui.clear.addEventListener('click',()=>{selected=[];refresh()});
   ui.compare.addEventListener('click',compare);
   ui.forget.addEventListener('click',async()=>{
-    if(!window.confirm('Remove privately cached Week 10 rankings from this browser?'))return;
+    if(!window.confirm(`Remove privately cached Week ${selectedWeek} rankings from this browser? Other weeks stay saved.`))return;
     try{await privateDelete();ranks.clear();rankNames.clear();capturedWeek=null;sourceMeta=null;loaded=false;
       ui.forget.hidden=true;ui.status.classList.remove('fa-ss-error');
       ui.status.textContent='Private rankings erased from this browser. Use your private activation page to reinstall.';
