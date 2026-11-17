@@ -198,6 +198,7 @@
    delta_pct_points:delta,role_surge:surge,
    green_dot_status:lb||null,
    lb_role_security_tier:val(row,'lb','role_security_tier'),lb_role_security_score:val(row,'lb','role_security_score'),
+   lb_sample_snaps:val(row,'lb','Defensive Snaps'),
    lb_tackle_rate:val(row,'lb','Tackle Rate'),lb_missed_tackle_rate:val(row,'lb','Missed Tackle %'),
    w10_box_pct:box,w10_slot_pct:slot,season_box_pct:seasonBox,box_delta_pct_points:boxDelta,
    w10_los_rate:val(row,'w10Snap','LOS Rate'),season_los_rate:val(row,'seasonSnap','LOS Rate'),
