@@ -26,7 +26,7 @@
 
 ## Exclusions
 
-- `one_or_more_assets_unresolved`: 1
+- `one_or_more_assets_unresolved`: 2
 - `pick_or_nonplayer_asset_present`: 9
 - `trade_not_strictly_after_candidate_freeze`: 15
 
