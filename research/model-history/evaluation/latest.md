@@ -5,12 +5,12 @@ Protocol SHA256: `b6e66793b947e629d8ea238663fc4ab9e94dc7fb6c6b52495ac1207451ba0b
 
 ## Status
 
-- Snapshots seen: **47**
-- Prediction states after deduplication: **30**
+- Snapshots seen: **49**
+- Prediction states after deduplication: **32**
 - Deduplicated repeated snapshots: **17**
 - Outcome identity coverage: **100.0%**
-- Completed realized weeks available: **[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]**
-- Evaluated snapshot/horizon combinations: **39**
+- Completed realized weeks available: **[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]**
+- Evaluated snapshot/horizon combinations: **43**
 - Pending snapshot/horizon combinations: **51**
 
 ## Frozen V1 leakage rules
@@ -50,15 +50,19 @@ The scoring period containing a snapshot is excluded. Fixed 4-week and 8-week ho
 | 2026-09-22T18:39:49.573622Z | 3 | future_4w | 0.581 | 0.715 | 0.461 | 481 |
 | 2026-09-22T18:39:49.573622Z | 3 | future_8w | 0.589 | 0.713 | 0.490 | 518 |
 | 2026-09-23T14:31:27.159257Z | 4 | future_4w | 0.542 | 0.701 | 0.439 | 485 |
+| 2026-09-23T14:31:27.159257Z | 4 | future_8w | 0.571 | 0.707 | 0.489 | 514 |
 | 2026-09-25T19:05:53.729491Z | 4 | future_4w | 0.542 | 0.701 | 0.439 | 485 |
+| 2026-09-25T19:05:53.729491Z | 4 | future_8w | 0.570 | 0.706 | 0.489 | 514 |
 | 2026-09-28T19:50:00.062475Z | 4 | future_4w | 0.542 | 0.701 | 0.439 | 485 |
+| 2026-09-28T19:50:00.062475Z | 4 | future_8w | 0.570 | 0.706 | 0.489 | 514 |
 | 2026-09-29T19:53:44.405453Z | 4 | future_4w | 0.542 | 0.701 | 0.439 | 485 |
+| 2026-09-29T19:53:44.405453Z | 4 | future_8w | 0.570 | 0.706 | 0.489 | 514 |
 | 2026-10-03T15:42:38.355442Z | 5 | future_4w | 0.516 | 0.689 | 0.439 | 485 |
 | 2026-10-06T20:06:49.786634Z | 5 | future_4w | 0.516 | 0.689 | 0.439 | 485 |
 | 2026-10-07T19:34:40.907471Z | 6 | future_4w | 0.509 | 0.685 | 0.419 | 486 |
 | 2026-10-09T19:58:24.408739Z | 6 | future_4w | 0.509 | 0.685 | 0.419 | 486 |
 | 2026-10-13T20:42:14.868088Z | 6 | future_4w | 0.509 | 0.685 | 0.419 | 486 |
-| 2026-10-16T18:35:02.577990Z | 7 | future_4w | 0.498 | 0.683 | 0.421 | 480 |
+| 2026-10-16T18:35:02.577990Z | 7 | future_4w | 0.497 | 0.683 | 0.421 | 480 |
 | 2026-10-20T19:05:47.647359Z | 7 | future_4w | 0.515 | 0.689 | 0.438 | 480 |
 
 ## Interpretation guardrails

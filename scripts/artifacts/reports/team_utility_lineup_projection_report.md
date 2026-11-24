@@ -15,16 +15,16 @@
 
 ## Artifact coverage
 
-- Total projected players: **1572**
-- Position counts: **{"DB": 362, "DL": 357, "LB": 233, "QB": 83, "RB": 157, "TE": 148, "WR": 232}**
-- Source counts: **{"fantasypros_normalized_fallback": 78, "idp_v1_both": 513, "idp_v1_fp_only": 4, "idp_v1_no_new_data": 2, "idp_v1_sleeper_only": 433, "sleeper_league_scored": 542}**
+- Total projected players: **1576**
+- Position counts: **{"DB": 362, "DL": 357, "LB": 233, "QB": 83, "RB": 159, "TE": 148, "WR": 234}**
+- Source counts: **{"fantasypros_normalized_fallback": 77, "idp_v1_both": 513, "idp_v1_fp_only": 4, "idp_v1_no_new_data": 2, "idp_v1_sleeper_only": 433, "sleeper_league_scored": 547}**
 
 ## Current league validation
 
 - Teams checked: **12**
 - Teams with all 17 legal slots fillable: **12 / 12**
 - Teams with a projection-complete non-K starting lineup: **12 / 12**
-- Active non-K roster projection coverage: **99.06%**
+- Active non-K roster projection coverage: **99.05%**
 - Selected non-K players needing fallback: **0**
 
 ## Team detail
@@ -36,7 +36,7 @@
 | Narroway Farms M714 | 100.0% | 17/17 | 0 |
 | Landry's Hat | 100.0% | 17/17 | 0 |
 | Pullham Bluecocks  | 97.2% | 17/17 | 0 |
-| Cock Mchorse 🐴 | 94.6% | 17/17 | 0 |
+| Cock Mchorse 🐴 | 94.4% | 17/17 | 0 |
 | Jersey Bagels | 100.0% | 17/17 | 0 |
 | Apex Predators | 100.0% | 17/17 | 0 |
 | Toddy2times | 100.0% | 17/17 | 0 |
