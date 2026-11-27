@@ -12,7 +12,7 @@ This evaluation freezes a KTC rating snapshot, then scores raw and voter-balance
 
 ## Evidence volume
 
-- Distinct rating snapshots: **84**
+- Distinct rating snapshots: **85**
 - Eligible future ballots: **89**
 - Distinct future voters: **5**
 - Evidence threshold: **30 ballots** and **4 voters**
@@ -115,7 +115,8 @@ Negative `balanced_minus_raw` log-loss/Brier deltas favor the balanced model.
 | 2026-11-24T20:46:34.386756Z | 2026-11-24T23:33:54.622465Z | 0 | 0 | — | — |
 | 2026-11-24T23:33:54.622465Z | 2026-11-25T23:10:40.350734Z | 0 | 0 | — | — |
 | 2026-11-25T23:10:40.350734Z | 2026-11-26T23:07:43.031695Z | 0 | 0 | — | — |
-| 2026-11-26T23:07:43.031695Z | current | 0 | 0 | — | — |
+| 2026-11-26T23:07:43.031695Z | 2026-11-27T22:47:43.683256Z | 0 | 0 | — | — |
+| 2026-11-27T22:47:43.683256Z | current | 0 | 0 | — | — |
 
 ## Decision rule
 
