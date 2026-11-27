@@ -9,9 +9,9 @@ Generated from a real, full-population fetch (declared_count == actual_players_r
 
 | Position | Players normalized |
 |---|---|
-| DB | 201 |
+| DB | 202 |
 | DL | 177 |
-| LB | 160 |
+| LB | 159 |
 | QB | 80 |
 | RB | 132 |
 | TE | 130 |

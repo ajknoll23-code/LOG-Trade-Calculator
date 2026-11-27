@@ -3,7 +3,7 @@
 Production resolver covering QB / RB / WR / TE / DL / LB / DB.
 
 - FantasyPros tracked rows: **1083**
-- Authoritative stable-ID matches: **1067**
+- Authoritative stable-ID matches: **1068**
 - Manual-review rows: **2**
 
 ## Coverage by position
@@ -12,18 +12,18 @@ Production resolver covering QB / RB / WR / TE / DL / LB / DB.
 |---|---:|---:|---:|---:|---:|
 | QB | 80 | 78 | 97.5% | 78 | 0 |
 | RB | 132 | 131 | 99.2% | 131 | 0 |
-| WR | 203 | 201 | 99.0% | 201 | 0 |
+| WR | 203 | 202 | 99.5% | 202 | 0 |
 | TE | 130 | 129 | 99.2% | 129 | 0 |
 | DL | 177 | 174 | 98.3% | 174 | 1 |
-| LB | 160 | 158 | 98.8% | 158 | 1 |
-| DB | 201 | 196 | 97.5% | 196 | 0 |
+| LB | 159 | 157 | 98.7% | 157 | 1 |
+| DB | 202 | 197 | 97.5% | 197 | 0 |
 
 ## Match methods
 
 - `name_collision_resolved_by_position_team`: **4**
 - `name_found_position_incompatible`: **2**
-- `name_position_team_confirmed`: **1038**
-- `no_sleeper_name_candidate`: **14**
+- `name_position_team_confirmed`: **1039**
+- `no_sleeper_name_candidate`: **13**
 - `previous_authoritative_stable_id_preserved`: **23**
 - `previous_authoritative_stable_id_preserved_position_changed`: **2**
 
